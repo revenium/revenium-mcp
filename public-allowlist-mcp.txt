@@ -1,0 +1,15 @@
+src/revenium_mcp_server/
+tests/
+scripts/
+pyproject.toml
+.env.example
+.gitignore
+README.md
+LICENSE
+CHANGELOG.md
+CONTRIBUTING.md
+SECURITY.md
+CODE_OF_CONDUCT.md
+DEVELOPMENT.md
+.claude/commands/
+public-allowlist-mcp.txt
