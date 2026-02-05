@@ -98,4 +98,4 @@ jobs:
         run: python -c "from revenium_mcp_server.enhanced_server import create_enhanced_server; print('Server module imports OK')"
 
       - name: Verify server can be instantiated
-        run: python -c "from revenium_mcp_server.enhanced_server import create_enhanced_server; server = create_enhanced_server(); print(f'Server instantiated: {server.name}')"
+        run: python -c "from revenium_mcp_server.enhanced_server import create_enhanced_server; server = create_enhanced_server(); print('Server instantiated:', server.name)"
