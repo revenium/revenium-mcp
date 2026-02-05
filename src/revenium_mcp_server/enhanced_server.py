@@ -205,20 +205,6 @@ Set REVENIUM_API_KEY environment variable with your Revenium API key.
 2. Use `tool_introspection(action="get_tool_metadata", tool_name="...")` for detailed tool info
 3. Use `tool_introspection(action="get_all_metadata")` for comprehensive tool information
 """,
-        dependencies=[
-            "fastmcp>=2.10.0",
-            "httpx>=0.25.0",
-            "pydantic>=2.0.0",
-            "loguru>=0.7.0",
-            "structlog>=23.0.0",
-            "python-dotenv>=1.0.0",
-            "openai>=1.0.0",
-            "revenium-middleware-openai>=0.4.6",
-            "matplotlib>=3.7.0",
-            "numpy>=1.24.0",
-            "aiofiles>=23.0.0",
-            "diskcache>=5.6.0",
-        ],
     )
 
     return mcp
