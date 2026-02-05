@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ruff mypy
+          pip install ruff
 
       - name: Run ruff linter
         run: ruff check src/ tests/
@@ -95,13 +95,7 @@ jobs:
         run: pip show fastmcp | grep Version
 
       - name: Verify server module imports successfully
-        run: |
-          python -c "from revenium_mcp_server.enhanced_server import create_enhanced_server; print('Server module imports OK')"
+        run: python -c "from revenium_mcp_server.enhanced_server import create_enhanced_server; print('Server module imports OK')"
 
       - name: Verify server can be instantiated
-        run: |
-          python -c "
-          from revenium_mcp_server.enhanced_server import create_enhanced_server
-          server = create_enhanced_server()
-          print(f'Server instantiated: {server.name}')
-          "
+        run: python -c "from revenium_mcp_server.enhanced_server import create_enhanced_server; server = create_enhanced_server(); print(f'Server instantiated: {server.name}')"
