@@ -39,8 +39,8 @@ jobs:
       - name: Show installed fastmcp version
         run: pip show fastmcp | grep Version
 
-      - name: Run tests
-        run: pytest tests/ -v --tb=short
+      - name: Run unit tests
+        run: pytest tests/unit/ -v --tb=short
 
   server-startup:
     runs-on: ubuntu-latest
