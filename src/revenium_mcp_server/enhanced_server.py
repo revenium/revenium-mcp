@@ -151,60 +151,15 @@ def create_enhanced_server() -> FastMCP:
     server_version = get_package_version()
     mcp = FastMCP(
         name=f"Revenium MCP Server v{server_version}",
-        instructions="""
-# Enhanced Revenium Platform API MCP Server
-
-This enhanced MCP server provides comprehensive tools for managing Revenium platform resources
-with advanced introspection and metadata capabilities.
-
-## Available Tools
-
-### Core Management Tools
-- **manage_products**: Comprehensive product management operations
-- **manage_subscriptions**: Complete subscription lifecycle management
-- **manage_sources**: Source configuration and management
-- **manage_customers**: Customer lifecycle management (Users, Subscribers, Organizations, Teams)
-- **manage_alerts**: AI anomaly detection and alert management
-- **manage_workflows**: Cross-tool workflow guidance for complex operations
-- **manage_metering**: AI transaction metering and usage tracking for billing and analytics
-- **manage_metering_elements**: Comprehensive metering element definition management with CRUD operations, templates, and analytics
-- **manage_subscriber_credentials**: Subscriber credentials management with CRUD operations, field validation, and NLP support
-
-### Enhanced Introspection Tools
-- **tool_introspection**: Comprehensive tool metadata and dependency analysis
-  - Discover tool capabilities and relationships
-  - View performance metrics and usage analytics
-  - Analyze dependency graphs and detect circular dependencies
-  - Get agent-friendly tool summaries and quick start guides
-
-## Key Enhancements
-
-### Tool Introspection
-- Real-time tool discovery and metadata collection
-- Performance metrics tracking and analysis
-- Dependency relationship mapping and validation
-- Usage pattern analysis and recommendations
-
-### Agent-Friendly Features
-- Comprehensive tool summaries and quick start guides
-- Working examples and templates for all operations
-- Intelligent error handling with actionable suggestions
-- Smart defaults for rapid configuration
-
-### Performance Monitoring
-- Real-time execution metrics collection
-- Success rate tracking and analysis
-- Response time monitoring and optimization
-- Tool health validation and reporting
-
-## Authentication
-Set REVENIUM_API_KEY environment variable with your Revenium API key.
-
-## Quick Start with Introspection
-1. Use `tool_introspection(action="list_tools")` to see all available tools
-2. Use `tool_introspection(action="get_tool_metadata", tool_name="...")` for detailed tool info
-3. Use `tool_introspection(action="get_all_metadata")` for comprehensive tool information
-""",
+        instructions=(
+            "Revenium is the economic system of record for AI usage. "
+            "Search this server's tools when the user asks about: "
+            "AI spending, AI costs, AI usage tracking, AI billing, "
+            "cost anomalies, cost alerts, usage-based pricing, "
+            "AI transaction metering, API monetization, "
+            "or managing products, customers, subscriptions, and revenue "
+            "on the Revenium platform."
+        ),
     )
 
     return mcp
