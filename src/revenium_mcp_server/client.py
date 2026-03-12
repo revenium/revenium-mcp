@@ -11,7 +11,7 @@ import asyncio
 import json
 import os
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urljoin
 
 import httpx
@@ -385,7 +385,7 @@ class ReveniumClient:
         max_retries: Optional[int] = None,
         base_url: Optional[str] = None,
         use_bearer: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> Union[Dict[str, Any], List[Any]]:
         """Make HTTP request with retry logic for transient failures.
 
         Args:
@@ -478,7 +478,7 @@ class ReveniumClient:
         json_data: Optional[Dict[str, Any]] = None,
         base_url: Optional[str] = None,
         use_bearer: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> Union[Dict[str, Any], List[Any]]:
         """Make HTTP request to Revenium API.
 
         Args:
@@ -684,14 +684,14 @@ class ReveniumClient:
             The first list found inside _embedded (HAL+JSON), the data itself if it is
             already a list, or the data unchanged for all other types.
         """
-        if "_embedded" in data:
+        if isinstance(data, dict) and "_embedded" in data:
             embedded = data["_embedded"]
-            for _, value in embedded.items():
-                if isinstance(value, list):
-                    return value
+            if isinstance(embedded, dict):
+                for _, value in embedded.items():
+                    if isinstance(value, list):
+                        return value
             # _embedded found but contained no list — return whole response and warn
-            import logging
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "_extract_embedded_data: _embedded present but no list value found; returning raw response"
             )
             return data
@@ -712,7 +712,7 @@ class ReveniumClient:
         use_retry: bool = True,
         base_url: Optional[str] = None,
         use_bearer: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> Union[Dict[str, Any], List[Any]]:
         """Make a GET request to the API."""
         if use_retry:
             return await self._request_with_retry("GET", endpoint, params=params, base_url=base_url, use_bearer=use_bearer)
@@ -726,7 +726,7 @@ class ReveniumClient:
         use_retry: bool = True,
         base_url: Optional[str] = None,
         use_bearer: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> Union[Dict[str, Any], List[Any]]:
         """Make a POST request to the API."""
         if use_retry:
             return await self._request_with_retry("POST", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
@@ -740,7 +740,7 @@ class ReveniumClient:
         use_retry: bool = True,
         base_url: Optional[str] = None,
         use_bearer: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> Union[Dict[str, Any], List[Any]]:
         """Make a PUT request to the API."""
         if use_retry:
             return await self._request_with_retry("PUT", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
@@ -753,7 +753,7 @@ class ReveniumClient:
         use_retry: bool = True,
         base_url: Optional[str] = None,
         use_bearer: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> Union[Dict[str, Any], List[Any]]:
         """Make a DELETE request to the API."""
         if use_retry:
             return await self._request_with_retry("DELETE", endpoint, params=params, base_url=base_url, use_bearer=use_bearer)

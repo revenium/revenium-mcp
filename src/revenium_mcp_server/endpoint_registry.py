@@ -8,7 +8,7 @@ new analytics host (REVENIUM_APP_BASE_URL / https://app.revenium.ai).
 """
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 from .config_store import get_config_value
@@ -141,6 +141,8 @@ def get_endpoint_config(key: str) -> EndpointConfig:
 
     Raises:
         KeyError: If the key is not in the registry
+        NotImplementedError: If REVENIUM_USE_NEW_ANALYTICS_API is enabled and the
+            endpoint's mapping_status is 'TBD' (new API path not yet confirmed)
     """
     if key not in _ENDPOINT_REGISTRY:
         raise KeyError(

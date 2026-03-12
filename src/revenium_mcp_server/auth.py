@@ -80,15 +80,6 @@ class AuthConfig(BaseModel):
             "User-Agent": "revenium-platformapi-mcp-server/1.0.0",
         }
 
-    def get_bearer_auth_headers(self) -> Dict[str, str]:
-        """Generate Bearer token authentication headers for new analytics API requests."""
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "revenium-platformapi-mcp-server/1.0.0",
-        }
-
     def get_team_query_param(self) -> Dict[str, str]:
         """Get team ID as query parameter."""
         return {"teamId": self.team_id}
