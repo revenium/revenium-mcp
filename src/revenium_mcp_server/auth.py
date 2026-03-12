@@ -80,6 +80,15 @@ class AuthConfig(BaseModel):
             "User-Agent": "revenium-platformapi-mcp-server/1.0.0",
         }
 
+    def get_bearer_auth_headers(self) -> Dict[str, str]:
+        """Generate Bearer token authentication headers for new analytics API requests."""
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "revenium-platformapi-mcp-server/1.0.0",
+        }
+
     def get_team_query_param(self) -> Dict[str, str]:
         """Get team ID as query parameter."""
         return {"teamId": self.team_id}
@@ -197,6 +206,23 @@ def get_auth_headers() -> Dict[str, str]:
     """Get authentication headers for API requests."""
     config = get_auth_config()
     return config.get_auth_headers()
+
+
+def get_bearer_auth_headers(api_key: str) -> Dict[str, str]:
+    """Get Bearer token authentication headers for new analytics API requests.
+
+    Args:
+        api_key: The API key to use as Bearer token
+
+    Returns:
+        Dictionary of headers with Authorization: Bearer <key>
+    """
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "revenium-platformapi-mcp-server/1.0.0",
+    }
 
 
 def get_team_id() -> str:

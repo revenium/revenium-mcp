@@ -247,3 +247,61 @@ class DateRangeParser:
                     continue
 
         return None
+
+
+def _format_iso8601(dt: datetime) -> str:
+    """Format a datetime as ISO 8601 with milliseconds and Z suffix.
+
+    Args:
+        dt: A UTC datetime object
+
+    Returns:
+        ISO 8601 string in format YYYY-MM-DDTHH:mm:ss.SSSZ
+    """
+    # Format with milliseconds: replace microseconds with milliseconds precision
+    ms = dt.microsecond // 1000
+    return dt.strftime(f"%Y-%m-%dT%H:%M:%S.{ms:03d}Z")
+
+
+def period_to_date_range(period: "TimePeriod") -> Tuple[str, str]:
+    """Convert a TimePeriod enum value to an ISO 8601 date range (startDate, endDate).
+
+    Args:
+        period: A TimePeriod enum value
+
+    Returns:
+        Tuple of (startDate, endDate) as ISO 8601 strings in format YYYY-MM-DDTHH:mm:ss.SSSZ
+
+    Raises:
+        ValueError: If the period is not a recognized TimePeriod value
+    """
+    from .analytics_parameters import TimePeriod
+
+    now = datetime.now(timezone.utc)
+
+    if period == TimePeriod.HOUR:
+        start = now - timedelta(hours=1)
+    elif period == TimePeriod.EIGHT_HOURS:
+        start = now - timedelta(hours=8)
+    elif period == TimePeriod.TWENTY_FOUR_HOURS:
+        start = now - timedelta(hours=24)
+    elif period == TimePeriod.SEVEN_DAYS:
+        start = now - timedelta(days=7)
+    elif period == TimePeriod.THIRTY_DAYS:
+        start = now - timedelta(days=30)
+    elif period == TimePeriod.TWELVE_MONTHS:
+        # Go back exactly 12 calendar months
+        month = now.month - 12
+        year = now.year
+        if month <= 0:
+            month += 12
+            year -= 1
+        # Handle day overflow (e.g. March 31 → 12 months back is March 31 of prev year)
+        import calendar
+        max_day = calendar.monthrange(year, month)[1]
+        day = min(now.day, max_day)
+        start = now.replace(year=year, month=month, day=day)
+    else:
+        raise ValueError(f"Unrecognized TimePeriod: {period!r}")
+
+    return _format_iso8601(start), _format_iso8601(now)

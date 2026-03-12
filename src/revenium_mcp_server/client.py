@@ -18,7 +18,7 @@ import httpx
 from loguru import logger
 
 from .api_field_mapper import APIFieldMapper
-from .auth import AuthConfig, get_auth_config
+from .auth import AuthConfig, get_auth_config, get_bearer_auth_headers
 from .config_store import get_config_value
 from .error_handlers import translate_http_error
 from .exceptions import AlertToolsError
@@ -472,6 +472,8 @@ class ReveniumClient:
         endpoint: str,
         params: Optional[Dict[str, Any]] = None,
         json_data: Optional[Dict[str, Any]] = None,
+        base_url: Optional[str] = None,
+        use_bearer: bool = False,
     ) -> Dict[str, Any]:
         """Make HTTP request to Revenium API.
 
@@ -480,6 +482,8 @@ class ReveniumClient:
             endpoint: API endpoint path
             params: Query parameters
             json_data: JSON request body
+            base_url: Optional base URL override for this single call (e.g. new analytics host)
+            use_bearer: If True, use Authorization: Bearer header instead of x-api-key
 
         Returns:
             Response data as dictionary
@@ -487,7 +491,10 @@ class ReveniumClient:
         Raises:
             ReveniumAPIError: If the API request fails
         """
-        url = self._build_url(endpoint)
+        if base_url is not None:
+            url = urljoin(base_url.rstrip("/") + "/", endpoint.lstrip("/"))
+        else:
+            url = self._build_url(endpoint)
 
         async with async_operation_context(
             f"api_request_{method}_{endpoint.replace('/', '_')}",
@@ -502,7 +509,10 @@ class ReveniumClient:
                 logger.info(f"Making {method} request to {url}", operation_id=operation_id)
 
                 # Merge auth headers with any existing headers for this request
-                request_headers = self.auth_config.get_auth_headers()
+                if use_bearer:
+                    request_headers = get_bearer_auth_headers(self.auth_config.api_key)
+                else:
+                    request_headers = self.auth_config.get_auth_headers()
 
                 response = await self.client.request(
                     method=method, url=url, params=params, json=json_data, headers=request_headers
@@ -632,6 +642,9 @@ class ReveniumClient:
                         operation_id=operation_id,
                         response_size=len(response.content),
                     )
+                    # Auto-unwrap HAL+JSON _embedded when using new analytics API host
+                    if base_url is not None and isinstance(result, dict):
+                        result = self._extract_embedded_data(result)
                     return result
                 else:
                     logger.debug(f"Empty response", operation_id=operation_id)
@@ -656,15 +669,26 @@ class ReveniumClient:
                 logger.error("Unexpected error: {}", str(e), operation_id=operation_id)
                 raise ReveniumAPIError(f"Unexpected error: {str(e)}")
 
-    def _extract_embedded_data(self, response: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Extract data from _embedded response structure."""
-        if isinstance(response, dict) and "_embedded" in response:
-            # Find the first key in _embedded that contains a list
-            embedded = response["_embedded"]
+    def _extract_embedded_data(self, data: Any) -> Any:
+        """Extract data from HAL+JSON _embedded response structure.
+
+        Args:
+            data: Response data — may be a HAL+JSON dict with _embedded, a plain list, or
+                  any other value.
+
+        Returns:
+            The first list found inside _embedded (HAL+JSON), the data itself if it is
+            already a list, or the data unchanged for all other types.
+        """
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and "_embedded" in data:
+            # Find the first value in _embedded that is a list
+            embedded = data["_embedded"]
             for _key, value in embedded.items():
                 if isinstance(value, list):
                     return value
-        return []
+        return data
 
     def _extract_pagination_info(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """Extract pagination information from response."""
