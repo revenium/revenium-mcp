@@ -166,5 +166,8 @@ tool_config.json
 # Internal working documents and test files
 .internal/
 
+# Dev credentials (API keys — never commit)
+docs/dev-credentials.md
+
 # Publication staging directories (generated, not tracked)
 *-public-staging/
