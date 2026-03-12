@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+  # Integration tests are triggered manually only — they require real credentials.
+  # See the integration-tests job below.
+  workflow_dispatch:
+    inputs:
+      run_integration:
+        description: "Run integration tests (requires REVENIUM_API_KEY and REVENIUM_TEAM_ID secrets)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+jobs:
+  unit-tests:
+    name: Unit Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run unit tests with coverage
+        # NOTE: Overall coverage is low (≈16%) because most tool modules in
+        # tools_decomposed/ have no unit tests yet. The threshold is set to 15%
+        # so CI passes today; raise it incrementally as coverage improves.
+        run: |
+          python -m pytest tests/unit/ -v --tb=short \
+            --cov=src/revenium_mcp_server \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=15
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-py${{ matrix.python-version }}
+          path: coverage.xml
+          retention-days: 7
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install linting dependencies
+        # flake8 is configured under [project.optional-dependencies] dev in pyproject.toml
+        run: pip install flake8
+
+      - name: Run flake8
+        run: flake8 src/ tests/ --max-line-length=88 --extend-ignore=E203,W503
+
+  integration-tests:
+    # Integration tests require real Revenium credentials.
+    # They only run when this workflow is triggered manually (workflow_dispatch)
+    # with run_integration=true.
+    #
+    # Required GitHub secrets:
+    #   REVENIUM_API_KEY  — your Revenium API key
+    #   REVENIUM_TEAM_ID  — your Revenium team ID
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_integration == 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run integration tests
+        env:
+          REVENIUM_API_KEY: ${{ secrets.REVENIUM_API_KEY }}
+          REVENIUM_TEAM_ID: ${{ secrets.REVENIUM_TEAM_ID }}
+        run: |
+          python -m pytest tests/integration/ -v --tb=short
