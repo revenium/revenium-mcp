@@ -180,6 +180,7 @@ class ConfigurationStore:
                                 default_email=email,
                                 api_key=api_key,
                                 base_url=base_url,
+                                app_base_url=os.environ.get("REVENIUM_APP_BASE_URL"),
                             )
 
                             logger.info(

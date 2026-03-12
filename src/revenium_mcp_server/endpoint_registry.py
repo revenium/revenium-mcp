@@ -142,9 +142,18 @@ def get_endpoint_config(key: str) -> EndpointConfig:
     Raises:
         KeyError: If the key is not in the registry
     """
+    if key not in _ENDPOINT_REGISTRY:
+        raise KeyError(
+            f"Unknown endpoint key '{key}'. Valid keys: {sorted(_ENDPOINT_REGISTRY.keys())}"
+        )
     config = _ENDPOINT_REGISTRY[key]
 
     if _use_new_api():
+        if config.new_path is None and config.mapping_status == "TBD":
+            raise NotImplementedError(
+                f"Endpoint '{key}' has no new API mapping yet (BACK-717). "
+                "Disable REVENIUM_USE_NEW_ANALYTICS_API or use the old path."
+            )
         # Patch new_base_url to whatever is currently configured
         app_base_url = _resolved_app_base_url()
         if app_base_url != config.new_base_url:

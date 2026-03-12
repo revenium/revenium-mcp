@@ -383,6 +383,8 @@ class ReveniumClient:
         params: Optional[Dict[str, Any]] = None,
         json_data: Optional[Dict[str, Any]] = None,
         max_retries: Optional[int] = None,
+        base_url: Optional[str] = None,
+        use_bearer: bool = False,
     ) -> Dict[str, Any]:
         """Make HTTP request with retry logic for transient failures.
 
@@ -392,6 +394,8 @@ class ReveniumClient:
             params: Query parameters
             json_data: JSON request body
             max_retries: Maximum number of retries (uses config default if None)
+            base_url: Optional base URL override for this single call
+            use_bearer: If True, use Authorization: Bearer header instead of x-api-key
 
         Returns:
             Response data as dictionary
@@ -406,7 +410,7 @@ class ReveniumClient:
 
         for attempt in range(max_retries + 1):
             try:
-                return await self._request(method, endpoint, params, json_data)
+                return await self._request(method, endpoint, params, json_data, base_url=base_url, use_bearer=use_bearer)
 
             except ReveniumAPIError as e:
                 last_error = e
@@ -643,7 +647,7 @@ class ReveniumClient:
                         response_size=len(response.content),
                     )
                     # Auto-unwrap HAL+JSON _embedded when using new analytics API host
-                    if base_url is not None and isinstance(result, dict):
+                    if use_bearer and isinstance(result, dict):
                         result = self._extract_embedded_data(result)
                     return result
                 else:
@@ -680,14 +684,19 @@ class ReveniumClient:
             The first list found inside _embedded (HAL+JSON), the data itself if it is
             already a list, or the data unchanged for all other types.
         """
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict) and "_embedded" in data:
-            # Find the first value in _embedded that is a list
+        if "_embedded" in data:
             embedded = data["_embedded"]
-            for _key, value in embedded.items():
+            for _, value in embedded.items():
                 if isinstance(value, list):
                     return value
+            # _embedded found but contained no list — return whole response and warn
+            import logging
+            logging.getLogger(__name__).warning(
+                "_extract_embedded_data: _embedded present but no list value found; returning raw response"
+            )
+            return data
+        if isinstance(data, list):
+            return data
         return data
 
     def _extract_pagination_info(self, response: Dict[str, Any]) -> Dict[str, Any]:
@@ -697,12 +706,17 @@ class ReveniumClient:
         return {}
 
     async def get(
-        self, endpoint: str, params: Optional[Dict[str, Any]] = None, use_retry: bool = True
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        use_retry: bool = True,
+        base_url: Optional[str] = None,
+        use_bearer: bool = False,
     ) -> Dict[str, Any]:
         """Make a GET request to the API."""
         if use_retry:
-            return await self._request_with_retry("GET", endpoint, params=params)
-        return await self._request("GET", endpoint, params=params)
+            return await self._request_with_retry("GET", endpoint, params=params, base_url=base_url, use_bearer=use_bearer)
+        return await self._request("GET", endpoint, params=params, base_url=base_url, use_bearer=use_bearer)
 
     async def post(
         self,
@@ -710,11 +724,13 @@ class ReveniumClient:
         data: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         use_retry: bool = True,
+        base_url: Optional[str] = None,
+        use_bearer: bool = False,
     ) -> Dict[str, Any]:
         """Make a POST request to the API."""
         if use_retry:
-            return await self._request_with_retry("POST", endpoint, params=params, json_data=data)
-        return await self._request("POST", endpoint, params=params, json_data=data)
+            return await self._request_with_retry("POST", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
+        return await self._request("POST", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
 
     async def put(
         self,
@@ -722,19 +738,26 @@ class ReveniumClient:
         data: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         use_retry: bool = True,
+        base_url: Optional[str] = None,
+        use_bearer: bool = False,
     ) -> Dict[str, Any]:
         """Make a PUT request to the API."""
         if use_retry:
-            return await self._request_with_retry("PUT", endpoint, params=params, json_data=data)
-        return await self._request("PUT", endpoint, params=params, json_data=data)
+            return await self._request_with_retry("PUT", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
+        return await self._request("PUT", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
 
     async def delete(
-        self, endpoint: str, params: Optional[Dict[str, Any]] = None, use_retry: bool = True
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        use_retry: bool = True,
+        base_url: Optional[str] = None,
+        use_bearer: bool = False,
     ) -> Dict[str, Any]:
         """Make a DELETE request to the API."""
         if use_retry:
-            return await self._request_with_retry("DELETE", endpoint, params=params)
-        return await self._request("DELETE", endpoint, params=params)
+            return await self._request_with_retry("DELETE", endpoint, params=params, base_url=base_url, use_bearer=use_bearer)
+        return await self._request("DELETE", endpoint, params=params, base_url=base_url, use_bearer=use_bearer)
 
     # Products API methods
     async def get_products(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
