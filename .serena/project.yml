@@ -1,0 +1,11 @@
+project_name: "revenium-mcp"
+languages: ["python"]
+encoding: "utf-8"
+line_ending: lf
+ignore_all_files_in_gitignore: true
+ignored_paths:
+  - "__pycache__/**"
+  - "*.pyc"
+  - ".venv/**"
+  - "dist/**"
+read_only: false
