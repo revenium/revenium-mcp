@@ -922,7 +922,7 @@ class TestValidateTransactionInputsAsync:
     async def test_exception_in_validation_task_captured(self):
         mgr = _mgr()
         with patch.object(
-            mgr, "_validate_numeric_fields", side_effect=RuntimeError("boom")
+            mgr, "_validate_numeric_fields", new=AsyncMock(side_effect=RuntimeError("boom"))
         ):
             with patch(
                 "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
