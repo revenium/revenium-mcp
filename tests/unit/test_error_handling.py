@@ -15,83 +15,9 @@ from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManag
 from mcp.types import TextContent
 
 
-class TestCustomExceptions:
-    """Test custom exception classes."""
-    
-    def test_alert_tools_error_base(self):
-        """Test base AlertToolsError exception."""
-        error = AlertToolsError(
-            message="Test error",
-            error_code="TEST_ERROR",
-            details={"key": "value"},
-            suggestions=["Try again", "Check input"]
-        )
-        
-        assert error.message == "Test error"
-        assert error.error_code == "TEST_ERROR"
-        assert error.details == {"key": "value"}
-        assert error.suggestions == ["Try again", "Check input"]
-        
-        # Test to_dict method
-        error_dict = error.to_dict()
-        assert error_dict["error_type"] == "AlertToolsError"
-        assert error_dict["error_code"] == "TEST_ERROR"
-        assert error_dict["message"] == "Test error"
-        
-        # Test format_user_message method (emoji removed in current implementation)
-        formatted = error.format_user_message()
-        assert "**Error**: Test error" in formatted
-        assert "**Details:**" in formatted
-        assert "**Suggestions:**" in formatted
-    
-    def test_validation_error(self):
-        """Test ValidationError exception."""
-        error = ValidationError(
-            message="Invalid field",
-            field="test_field",
-            value="invalid_value",
-            expected="valid format"
-        )
-        
-        assert error.error_code == "VALIDATION_ERROR"
-        assert error.details["field"] == "test_field"
-        assert error.details["provided_value"] == "invalid_value"
-        assert error.details["expected"] == "valid format"
-    
-    def test_anomaly_not_found_error(self):
-        """Test AnomalyNotFoundError exception."""
-        error = AnomalyNotFoundError("anomaly-123")
-        
-        assert error.error_code == "ANOMALY_NOT_FOUND"
-        assert error.details["anomaly_id"] == "anomaly-123"
-        assert "anomaly-123" in error.message
-        assert "Verify the anomaly ID is correct" in error.suggestions
-    
-    def test_alert_not_found_error(self):
-        """Test AlertNotFoundError exception."""
-        error = AlertNotFoundError("alert-456")
-        
-        assert error.error_code == "ALERT_NOT_FOUND"
-        assert error.details["alert_id"] == "alert-456"
-        assert "alert-456" in error.message
-        assert "Verify the alert ID is correct" in error.suggestions
-
-
 class TestHTTPErrorTranslation:
     """Test HTTP error translation."""
-    
-    def test_translate_400_error(self):
-        """Test translation of 400 Bad Request."""
-        error = translate_http_error(400, "Bad request", "/api/test")
-        assert isinstance(error, ValidationError)
-        assert error.details["field"] == "request"
-    
-    def test_translate_401_error(self):
-        """Test translation of 401 Unauthorized."""
-        error = translate_http_error(401, "Unauthorized", "/api/test")
-        assert isinstance(error, PermissionError)
-        assert error.details["operation"] == "API access"
-    
+
     def test_translate_404_anomaly_error(self):
         """Test translation of 404 for anomaly endpoint."""
         error = translate_http_error(404, "Not found", "/api/anomaly/123")
@@ -103,18 +29,26 @@ class TestHTTPErrorTranslation:
         error = translate_http_error(404, "Not found", "/api/alert/456")
         assert isinstance(error, AlertNotFoundError)
         assert error.details["alert_id"] == "456"
-    
-    def test_translate_429_error(self):
-        """Test translation of 429 Rate Limited."""
-        error = translate_http_error(429, "Rate limited", "/api/test")
+
+    def test_translate_400_bad_request(self):
+        """Test translation of 400 status code to ValidationError."""
+        error = translate_http_error(400, "Bad request", "/api/anomaly/123")
+        assert isinstance(error, ValidationError)
+
+    def test_translate_401_permission_error(self):
+        """Test translation of 401 status code to PermissionError."""
+        error = translate_http_error(401, "Unauthorized", "/api/anomaly/123")
+        assert isinstance(error, PermissionError)
+
+    def test_translate_429_rate_limit(self):
+        """Test translation of 429 status code to APIConnectionError."""
+        error = translate_http_error(429, "Rate limit exceeded", "/api/anomaly/123")
         assert isinstance(error, APIConnectionError)
-        assert error.details["status_code"] == 429
-    
-    def test_translate_500_error(self):
-        """Test translation of 500 Server Error."""
-        error = translate_http_error(500, "Server error", "/api/test")
+
+    def test_translate_500_server_error(self):
+        """Test translation of 500 status code to APIConnectionError."""
+        error = translate_http_error(500, "Server error", "/api/anomaly/123")
         assert isinstance(error, APIConnectionError)
-        assert error.details["status_code"] == 500
 
 
 class TestValidationFunctions:

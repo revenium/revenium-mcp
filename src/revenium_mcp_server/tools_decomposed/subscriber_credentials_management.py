@@ -431,12 +431,11 @@ class SubscriberCredentialsManagement(ToolBase):
                 raise create_resource_not_found_error(
                     resource_type="credential",
                     resource_id=arguments.get("credential_id", "unknown"),
-                    action=action,
-                    examples={
-                        "usage": "Use list() to find valid credential IDs",
-                        "valid_format": "Credential IDs are short alphanumeric codes",
-                        "example_ids": ["X5oon5", "mvMYRv", "GlkRbv"],
-                    },
+                    suggestions=[
+                        f"Use list() to find valid credential IDs for the '{action}' action",
+                        "Credential IDs are short alphanumeric codes (e.g., X5oon5, mvMYRv, GlkRbv)",
+                        "Verify the credential ID is correct and the credential has not been deleted",
+                    ],
                 )
             else:
                 raise ToolError(

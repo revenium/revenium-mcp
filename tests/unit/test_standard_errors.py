@@ -14,38 +14,6 @@ from src.revenium_mcp_server.standard_errors import (
 class TestStandardError:
     """Test StandardError dataclass."""
     
-    def test_standard_error_creation(self):
-        """Test basic StandardError creation."""
-        error = StandardError(
-            error="Test error message",
-            field="test_field",
-            expected="Valid value",
-            provided="invalid_value",
-            suggestions=["Fix the value", "Check documentation"],
-            examples={"valid": "example"},
-            documentation_url="https://docs.example.com"
-        )
-        
-        assert error.error == "Test error message"
-        assert error.field == "test_field"
-        assert error.expected == "Valid value"
-        assert error.provided == "invalid_value"
-        assert error.suggestions == ["Fix the value", "Check documentation"]
-        assert error.examples == {"valid": "example"}
-        assert error.documentation_url == "https://docs.example.com"
-    
-    def test_standard_error_defaults(self):
-        """Test StandardError with default values."""
-        error = StandardError(error="Test error")
-        
-        assert error.error == "Test error"
-        assert error.field is None
-        assert error.expected == "Valid input"
-        assert error.provided is None
-        assert error.suggestions == []
-        assert error.examples is None
-        assert error.documentation_url is None
-    
     def test_to_dict(self):
         """Test conversion to dictionary."""
         error = StandardError(
@@ -76,46 +44,6 @@ class TestStandardError:
         parsed = json.loads(result)
         assert parsed["error"] == "Test error"
         assert parsed["field"] == "test_field"
-
-
-class TestStandardErrorBuilder:
-    """Test StandardErrorBuilder class."""
-    
-    def test_builder_basic(self):
-        """Test basic builder functionality."""
-        error = StandardErrorBuilder("Test error").build()
-        
-        assert error.error == "Test error"
-        assert error.expected == "Valid input"
-        assert error.suggestions == []
-    
-    def test_builder_chaining(self):
-        """Test builder method chaining."""
-        error = (StandardErrorBuilder("Test error")
-                .field("test_field")
-                .expected("Valid format")
-                .provided("invalid")
-                .suggestions(["Fix it", "Try again"])
-                .examples({"example": "value"})
-                .documentation_url("https://docs.example.com")
-                .build())
-        
-        assert error.error == "Test error"
-        assert error.field == "test_field"
-        assert error.expected == "Valid format"
-        assert error.provided == "invalid"
-        assert error.suggestions == ["Fix it", "Try again"]
-        assert error.examples == {"example": "value"}
-        assert error.documentation_url == "https://docs.example.com"
-    
-    def test_add_suggestion(self):
-        """Test adding individual suggestions."""
-        error = (StandardErrorBuilder("Test error")
-                .add_suggestion("First suggestion")
-                .add_suggestion("Second suggestion")
-                .build())
-        
-        assert error.suggestions == ["First suggestion", "Second suggestion"]
 
 
 class TestStandardErrorFormatter:

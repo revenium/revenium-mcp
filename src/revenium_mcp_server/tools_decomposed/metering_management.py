@@ -27,6 +27,7 @@ from ..common.error_handling import (
 # Performance monitoring removed - infrastructure monitoring handled externally
 from ..core.response_cache import response_cache, cache_response
 from ..introspection.metadata import ToolType, ToolCapability, ToolDependency, DependencyType
+from ..trace_fields import extract_trace_fields, TRACE_FIELD_NAMES
 
 
 # Import Prometheus metrics if available
@@ -715,7 +716,10 @@ The subscriber data structure has been updated. The old individual fields are no
         """Async validation for optional fields."""
         errors = []
 
-        # Validate optional string fields
+        # Get usage_metadata early for consistent access throughout validation
+        usage_metadata = arguments.get("usage_metadata") if isinstance(arguments.get("usage_metadata"), dict) else None
+
+        # Validate optional string fields (non-trace fields - top-level only)
         optional_string_fields = [
             "organization_id",
             "task_type",
@@ -742,6 +746,131 @@ The subscriber data structure has been updated. The old individual fields are no
                 if any(char in value for char in ["<", ">", '"', "'", "&"]):
                     errors.append(f"• {field}: Contains invalid characters (<, >, \", ', &)")
                     continue
+
+        # Validate trace string fields from BOTH top-level AND usage_metadata
+        # These fields support both snake_case and camelCase aliases
+        trace_string_fields = {
+            "environment": ["environment"],
+            "region": ["region"],
+            "credential_alias": ["credential_alias", "credentialAlias"],
+            "trace_name": ["trace_name", "traceName"],
+            "parent_transaction_id": ["parent_transaction_id", "parentTransactionId", "parentSpanId"],
+            "transaction_name": ["transaction_name", "transactionName"],
+            "operation_subtype": ["operation_subtype", "operationSubtype"],
+        }
+
+        for canonical_name, aliases in trace_string_fields.items():
+            value = None
+            source = None
+
+            # Check top-level arguments first (all aliases)
+            for alias in aliases:
+                if alias in arguments and arguments[alias] is not None:
+                    value = arguments[alias]
+                    source = alias
+                    break
+
+            # Check usage_metadata if not found in top-level
+            if value is None and usage_metadata:
+                for alias in aliases:
+                    if alias in usage_metadata and usage_metadata[alias] is not None:
+                        value = usage_metadata[alias]
+                        source = f"usage_metadata.{alias}"
+                        break
+
+            # Validate the value if found
+            if value is not None:
+                if not isinstance(value, str):
+                    errors.append(f"• {source}: Expected string, got {type(value).__name__}")
+                elif not value.strip():
+                    errors.append(f"• {source}: Cannot be empty")
+                elif len(value) > 500:
+                    errors.append(f"• {source}: Too long (max 500 characters), got {len(value)}")
+                elif any(char in value for char in ["<", ">", '"', "'", "&"]):
+                    errors.append(f"• {source}: Contains invalid characters (<, >, \", ', &)")
+
+        # Validate operation_type from BOTH top-level AND usage_metadata
+        operation_type_value = None
+        operation_type_source = None
+
+        # Check top-level arguments (snake_case and camelCase)
+        for key in ["operation_type", "operationType"]:
+            if key in arguments and arguments[key] is not None:
+                operation_type_value = arguments[key]
+                operation_type_source = key
+                break
+
+        # Check usage_metadata if not found in top-level
+        if operation_type_value is None and usage_metadata:
+            for key in ["operation_type", "operationType"]:
+                if key in usage_metadata and usage_metadata[key] is not None:
+                    operation_type_value = usage_metadata[key]
+                    operation_type_source = f"usage_metadata.{key}"
+                    break
+
+        if operation_type_value is not None:
+            if not isinstance(operation_type_value, str):
+                errors.append(f"• {operation_type_source}: Expected string, got {type(operation_type_value).__name__}")
+            elif not operation_type_value.strip():
+                errors.append(f"• {operation_type_source}: Cannot be empty")
+            # Note: operation_type values are not restricted to a fixed set anymore
+            # The API accepts various operation types and validation is handled server-side
+
+        # Validate trace_type with special constraints
+        # Check all possible sources: top-level (snake_case and camelCase) and usage_metadata
+        trace_type_value = None
+        trace_type_source = None
+
+        # Check top-level arguments (snake_case and camelCase)
+        for key in ["trace_type", "traceType"]:
+            if key in arguments and arguments[key] is not None:
+                trace_type_value = arguments[key]
+                trace_type_source = key
+                break
+
+        # Check usage_metadata if not found in top-level
+        if trace_type_value is None and usage_metadata:
+            for key in ["trace_type", "traceType"]:
+                if key in usage_metadata and usage_metadata[key] is not None:
+                    trace_type_value = usage_metadata[key]
+                    trace_type_source = f"usage_metadata.{key}"
+                    break
+
+        if trace_type_value is not None:
+            if not isinstance(trace_type_value, str):
+                errors.append(f"• {trace_type_source}: Expected string, got {type(trace_type_value).__name__}")
+            elif len(trace_type_value) > 128:
+                errors.append(f"• {trace_type_source}: Too long (max 128 characters), got {len(trace_type_value)}")
+            elif not all(c.isalnum() or c in "-_" for c in trace_type_value):
+                errors.append(f"• {trace_type_source}: Only alphanumeric, hyphens, and underscores allowed")
+
+        # Validate retry_number as integer
+        # Check all possible sources: top-level (snake_case and camelCase) and usage_metadata
+        retry_number_value = None
+        retry_number_source = None
+
+        # Check top-level arguments (snake_case and camelCase)
+        for key in ["retry_number", "retryNumber"]:
+            if key in arguments and arguments[key] is not None:
+                retry_number_value = arguments[key]
+                retry_number_source = key
+                break
+
+        # Check usage_metadata if not found in top-level
+        if retry_number_value is None and usage_metadata:
+            for key in ["retry_number", "retryNumber"]:
+                if key in usage_metadata and usage_metadata[key] is not None:
+                    retry_number_value = usage_metadata[key]
+                    retry_number_source = f"usage_metadata.{key}"
+                    break
+
+        if retry_number_value is not None:
+            try:
+                int_value = int(retry_number_value)
+                if int_value < 0:
+                    errors.append(f"• {retry_number_source}: Must be non-negative")
+            except (ValueError, TypeError):
+                errors.append(f"• {retry_number_source}: Expected integer, got {type(retry_number_value).__name__}")
 
         return errors
 
@@ -1470,6 +1599,14 @@ The subscriber data structure has been updated. The old individual fields are no
         for key, value in optional_fields.items():
             if value is not None:
                 payload[key] = value
+
+        # Extract and add trace fields (10 tracing fields for distributed tracing)
+        # These are extracted from arguments with env var fallback
+        # Note: trace fields from usage_metadata CAN override default operationType
+        # as per the distributed tracing design (user-provided values take precedence)
+        trace_fields = extract_trace_fields(arguments)
+        for key, value in trace_fields.items():
+            payload[key] = value
 
         # Handle new subscriber object structure
         if "subscriber" in arguments and arguments["subscriber"] is not None:
@@ -5780,7 +5917,48 @@ Use `validate()` before submission."""
                     "maximum": 50,
                     "description": "Number of transactions per page (1-50, default: 20) - used with lookup_recent_transactions",
                 },
-
+                # Distributed Tracing Fields (optional, for observability)
+                "environment": {
+                    "type": "string",
+                    "description": "Deployment environment (e.g., 'production', 'staging', 'development'). Falls back to REVENIUM_ENVIRONMENT, ENVIRONMENT, or DEPLOYMENT_ENV env vars.",
+                },
+                "region": {
+                    "type": "string",
+                    "description": "Cloud region or data center (e.g., 'us-east-1', 'eu-west-1'). Falls back to REVENIUM_REGION, AWS_REGION, AZURE_REGION, or GCP_REGION env vars.",
+                },
+                "credential_alias": {
+                    "type": "string",
+                    "description": "Human-readable credential name (e.g., 'prod-api-key'). Falls back to REVENIUM_CREDENTIAL_ALIAS env var.",
+                },
+                "trace_type": {
+                    "type": "string",
+                    "description": "Categorical identifier for grouping similar workflows (e.g., 'customer-support', 'document-analysis'). Max 128 chars, alphanumeric/hyphens/underscores only.",
+                },
+                "trace_name": {
+                    "type": "string",
+                    "description": "Human-readable label for trace instances (e.g., 'Support Chat Session'). Max 256 chars, auto-truncates if longer.",
+                },
+                "parent_transaction_id": {
+                    "type": "string",
+                    "description": "Parent transaction reference for distributed tracing. Also accepts 'parentSpanId' or 'parentTransactionId'.",
+                },
+                "transaction_name": {
+                    "type": "string",
+                    "description": "Human-friendly operation name (e.g., 'Generate Response'). Also accepts 'transactionName'.",
+                },
+                "operation_subtype": {
+                    "type": "string",
+                    "description": "Additional operation context (e.g., 'function_call', 'web_search', 'sql_query').",
+                },
+                "retry_number": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Retry attempt number (0 = first attempt, 1 = first retry, etc.).",
+                },
+                "usage_metadata": {
+                    "type": "object",
+                    "description": "Nested object containing trace fields. All trace fields can be passed here as an alternative to top-level arguments.",
+                },
 
                 # Note: Full field list available in get_capabilities() and get_examples()
                 # Note: All timestamp, quality, verification, and discovery fields supported

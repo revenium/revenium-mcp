@@ -31,11 +31,10 @@ class TestAlertManagement:
     """Test the AlertManagement class."""
 
     def test_initialization(self, alert_tools):
-        """Test that AlertManagement initializes correctly."""
-        assert alert_tools is not None
-        assert hasattr(alert_tools, 'handle_action')
-        assert hasattr(alert_tools, 'anomaly_manager')
-        assert hasattr(alert_tools, 'alert_manager')
+        """Test that AlertManagement initializes with callable action handler and managers."""
+        assert callable(alert_tools.handle_action)
+        assert callable(getattr(alert_tools.anomaly_manager, "create_anomaly", None))
+        assert callable(getattr(alert_tools.alert_manager, "list_alerts", None))
 
     @pytest.mark.asyncio
     async def test_get_capabilities(self, alert_tools):

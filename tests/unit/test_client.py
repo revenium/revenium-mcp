@@ -43,9 +43,10 @@ class TestReveniumClient:
         monkeypatch.delenv("REVENIUM_TEAM_ID", raising=False)
 
         # Client now uses delayed auth loading - doesn't raise on initialization
-        # Instead, validate that auth_config is not available until first use
+        # Validate initialization completes but auth is not yet loaded
         client = ReveniumClient()
         assert client is not None
+        assert client._auth_config_loaded is False
     
     def test_build_url(self, mock_env_vars):
         """Test URL building."""

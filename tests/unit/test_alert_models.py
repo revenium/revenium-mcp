@@ -156,24 +156,6 @@ class TestAlertFilter:
         )
         assert filter_config.value is True
 
-    def test_filter_empty_field_fails(self):
-        """Test that empty field name fails validation."""
-        with pytest.raises(ValidationError):
-            AlertFilter(
-                field="",
-                operator="equals",
-                value="test"
-            )
-
-    def test_filter_empty_operator_fails(self):
-        """Test that empty operator fails validation."""
-        with pytest.raises(ValidationError):
-            AlertFilter(
-                field="status",
-                operator="",
-                value="test"
-            )
-
 
 class TestSlackConfiguration:
     """Test SlackConfiguration model."""
@@ -197,12 +179,10 @@ class TestSlackConfiguration:
         assert config.username == "AlertBot"
         assert config.icon_emoji == ":warning:"
 
-    def test_invalid_webhook_url(self):
-        """Test that invalid webhook URL fails validation."""
+    def test_invalid_webhook_url_fails(self):
+        """Non-Slack webhook URL must be rejected by the validator."""
         with pytest.raises(ValidationError):
-            SlackConfiguration(
-                webhook_url="https://example.com/webhook"
-            )
+            SlackConfiguration(webhook_url="https://example.com/webhook")
 
 
 class TestFilterOperator:

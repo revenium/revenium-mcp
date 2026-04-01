@@ -84,17 +84,17 @@ class TestProduct:
 class TestTier:
     """Test Tier model."""
 
-    def test_tier_creation(self):
-        """Test creating a tier with required fields."""
+    def test_tier_unit_amount_excludes_flat_amount(self):
+        """A tier with unit_amount does not auto-populate flat_amount."""
         tier = Tier(
             name="Basic Tier",
             up_to=None,
             unit_amount=10.0
         )
-        assert tier.name == "Basic Tier"
+        # flat_amount must remain None when only unit_amount is provided
+        assert tier.flat_amount is None
+        # up_to=None means unlimited tier — must remain None
         assert tier.up_to is None
-        assert tier.unit_amount == 10.0
-        assert tier.flat_amount is None  # Optional field
 
     def test_tier_pricing_validation(self):
         """Test tier pricing validation."""
@@ -126,8 +126,8 @@ class TestTier:
 class TestPlan:
     """Test Plan model."""
 
-    def test_plan_creation_subscription(self):
-        """Test creating a SUBSCRIPTION plan (CHARGE deprecated in 2024)."""
+    def test_plan_defaults_graduated_false_period_count_one(self):
+        """New subscription plans default to non-graduated with period_count=1."""
         tier = Tier(name="Basic", up_to=None, unit_amount=10)
         plan = Plan(
             type=PlanType.SUBSCRIPTION,
@@ -135,25 +135,24 @@ class TestPlan:
             currency=Currency.USD,
             tiers=[tier]
         )
-        assert plan.type == PlanType.SUBSCRIPTION
-        assert plan.name == "Basic Plan"
-        assert plan.currency == Currency.USD
+        # graduated=False is the default; CHARGE plans are graduated
+        assert plan.graduated is False
+        # period_count=1 means monthly billing interval of 1 period
+        assert plan.period_count == 1
+        # tiers list must contain the provided tier
         assert len(plan.tiers) == 1
-        assert plan.graduated is False  # Default value
-        assert plan.period_count == 1  # Default value
+        assert plan.tiers[0].unit_amount == 10
 
-    def test_plan_creation_monthly_subscription(self):
-        """Test creating a monthly SUBSCRIPTION plan."""
-        tier = Tier(name="Monthly", up_to=None, unit_amount=29.99)
-        plan = Plan(
-            type=PlanType.SUBSCRIPTION,
-            name="Monthly Plan",
-            currency=Currency.USD,
-            period=BillingPeriod.MONTH,
-            tiers=[tier]
-        )
-        assert plan.type == PlanType.SUBSCRIPTION
-        assert plan.period == BillingPeriod.MONTH
+    def test_plan_with_monthly_period_rejects_empty_tiers(self):
+        """A plan with explicit MONTH period still requires at least one tier."""
+        with pytest.raises(ValidationError):
+            Plan(
+                type=PlanType.SUBSCRIPTION,
+                name="Monthly Plan",
+                currency=Currency.USD,
+                period=BillingPeriod.MONTH,
+                tiers=[]
+            )
 
     def test_plan_tiers_validation(self):
         """Test that at least one tier is required."""
@@ -168,25 +167,18 @@ class TestPlan:
 
 class TestSubscription:
     """Test Subscription model."""
-    
-    def test_subscription_creation_minimal(self):
-        """Test creating a subscription with minimal required fields."""
+
+    def test_subscription_defaults_to_active_status(self):
+        """New subscriptions default to ACTIVE status without being told to."""
         subscription = Subscription(
             product_id="prod_123",
             name="Test Subscription"
         )
-        assert subscription.product_id == "prod_123"
-        assert subscription.name == "Test Subscription"
+        # Default status must be ACTIVE — not None, not INACTIVE
         assert subscription.status == SubscriptionStatus.ACTIVE
-    
-    def test_subscription_creation_full(self, sample_subscription_data):
-        """Test creating a subscription with all fields."""
-        subscription = Subscription(**sample_subscription_data)
-        assert subscription.id == "sub_123"
-        assert subscription.product_id == "prod_123"
-        assert subscription.name == "Test Subscription"
-        assert subscription.status == SubscriptionStatus.ACTIVE
-    
+        # id should be None when not provided (not auto-generated)
+        assert subscription.id is None
+
     def test_subscription_required_fields(self):
         """Test that required fields are validated."""
         with pytest.raises(ValidationError):
@@ -199,32 +191,17 @@ class TestSubscription:
 class TestSource:
     """Test Source model."""
 
-    def test_source_creation_minimal(self):
-        """Test creating a source with minimal required fields."""
+    def test_source_optional_fields_default_to_none(self):
+        """Source optional fields (id, description, configuration) default to None."""
         source = Source(
             name="Test Source",
             type=SourceType.API,
             version="1.0.0"
         )
-        assert source.name == "Test Source"
-        assert source.type == SourceType.API
-        assert source.version == "1.0.0"
-
-    def test_source_creation_full(self):
-        """Test creating a source with all fields."""
-        source = Source(
-            id="src_123",
-            name="Test Source",
-            type=SourceType.API,
-            version="1.0.0",
-            description="A test source",
-            configuration={"endpoint": "https://api.example.com"}
-        )
-        assert source.id == "src_123"
-        assert source.name == "Test Source"
-        assert source.type == SourceType.API
-        assert source.version == "1.0.0"
-        assert source.configuration == {"endpoint": "https://api.example.com"}
+        # These fields are optional — must not be auto-populated
+        assert source.id is None
+        assert source.description is None
+        assert source.configuration is None
 
     def test_source_type_validation(self):
         """Test source type validation."""

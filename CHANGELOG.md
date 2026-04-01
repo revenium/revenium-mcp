@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-04-01
+
+### Added
+- BACK-322: Tracing fields support for MCP Server (10 new trace fields)
+- Branch protection bypass alert workflow
+
+### Fixed
+- Pin FastMCP to <3.0.0 to prevent breaking upgrades
+- Customer_id field name inconsistency (BACK-728)
+- ValidationError kwargs in slack_setup_assistant (BACK-726)
+- create_resource_not_found_error kwargs in call sites (BACK-727)
+- Variable-shadowing TypeError in _process_task_data (BACK-729)
+- Remove deprecated FastMCP `dependencies` kwarg
+- Privacy policy URL corrections in documentation
+- Bump pytest-asyncio to >=0.23.0 for async test support
+
+### Changed
+- Raise unit test coverage from 26% to 81%
+- Test quality audit: remove 120 vacuous tests, rewrite 196 tautological tests with behavioral assertions
+- Raise CI coverage threshold from 70% to 80%
+
+### Documentation
+- Add Serena onboarding memories for project context
+- Update contact info and URLs
+
 ## [0.2.2] - 2025-11-24 - Public Release
 
 ### Changed
@@ -74,7 +99,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration reference
 - Troubleshooting guide
 
-[Unreleased]: https://github.com/revenium/revenium-mcp/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/revenium/revenium-mcp/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/revenium/revenium-mcp/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/revenium/revenium-mcp/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/revenium/revenium-mcp/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/revenium/revenium-mcp/compare/v0.1.27...v0.2.0

@@ -317,7 +317,10 @@ class TestDateTimeValidation:
         result = InputValidator.validate_datetime_string(dt_string)
         assert isinstance(result, datetime)
         assert result.tzinfo is not None
-    
+        assert result.year == 2024
+        assert result.month == 1
+        assert result.day == 1
+
     def test_validate_datetime_string_formats(self):
         """Test datetime validation with various formats."""
         formats = [
@@ -328,10 +331,11 @@ class TestDateTimeValidation:
             "2024-01-01 12:00:00",
             "2024-01-01"
         ]
-        
+
         for dt_string in formats:
             result = InputValidator.validate_datetime_string(dt_string)
             assert isinstance(result, datetime)
+            assert result.year == 2024
     
     def test_validate_datetime_string_invalid(self):
         """Test datetime validation with invalid format."""

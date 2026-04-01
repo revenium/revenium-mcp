@@ -2002,18 +2002,18 @@ class TransactionLevelAnalyticsProcessor:
                         provider_name = group_data.get("groupName", "Unknown")
                         metrics = group_data.get("metrics", [])
 
-                        provider_performance = 0.0
+                        provider_perf_value = 0.0
                         for metric in metrics:
                             if isinstance(metric, dict):
                                 metric_result = metric.get("metricResult", 0)
                                 if isinstance(metric_result, (int, float)):
-                                    provider_performance += metric_result
+                                    provider_perf_value += metric_result
 
-                        if provider_performance > 0:
+                        if provider_perf_value > 0:
                             if provider_name not in providers:
                                 providers[provider_name] = {"cost": 0.0, "performance": 0.0}
-                            providers[provider_name]["performance"] = provider_performance
-                            total_performance += provider_performance
+                            providers[provider_name]["performance"] = provider_perf_value
+                            total_performance += provider_perf_value
         except Exception as e:
             logger.error(f"Error processing task performance by provider data: {e}")
 
@@ -2033,17 +2033,17 @@ class TransactionLevelAnalyticsProcessor:
                         model_name = group_data.get("groupName", "Unknown")
                         metrics = group_data.get("metrics", [])
 
-                        model_performance = 0.0
+                        model_perf_value = 0.0
                         for metric in metrics:
                             if isinstance(metric, dict):
                                 metric_result = metric.get("metricResult", 0)
                                 if isinstance(metric_result, (int, float)):
-                                    model_performance += metric_result
+                                    model_perf_value += metric_result
 
-                        if model_performance > 0:
+                        if model_perf_value > 0:
                             if model_name not in models:
                                 models[model_name] = {"cost": 0.0, "performance": 0.0}
-                            models[model_name]["performance"] = model_performance
+                            models[model_name]["performance"] = model_perf_value
         except Exception as e:
             logger.error(f"Error processing task performance by model data: {e}")
 
