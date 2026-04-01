@@ -197,7 +197,7 @@ class SlackSetupAssistant(ToolBase):
 
         except Exception as e:
             error = ValidationError(
-                message="Failed to perform guided setup", details={"error": str(e)}
+                message="Failed to perform guided setup", suggestion=str(e)
             )
             return [TextContent(type="text", text=error.format_user_message())]
 
@@ -284,7 +284,7 @@ class SlackSetupAssistant(ToolBase):
 
         except Exception as e:
             error = ValidationError(
-                message="Failed to detect and recommend configurations", details={"error": str(e)}
+                message="Failed to detect and recommend configurations", suggestion=str(e)
             )
             return [TextContent(type="text", text=error.format_user_message())]
 
@@ -296,10 +296,8 @@ class SlackSetupAssistant(ToolBase):
         if not config_id:
             error = ValidationError(
                 message="Configuration ID is required",
-                details={
-                    "action": "select_default_configuration",
-                    "missing_parameter": "config_id",
-                },
+                field="config_id",
+                suggestion="Provide a config_id parameter to select_default_configuration",
             )
             return [TextContent(type="text", text=error.format_user_message())]
 
@@ -352,7 +350,9 @@ class SlackSetupAssistant(ToolBase):
         except Exception as e:
             error = ValidationError(
                 message=f"Failed to set default Slack configuration {config_id}",
-                details={"error": str(e), "config_id": config_id},
+                field="config_id",
+                value=config_id,
+                suggestion=str(e),
             )
             return [TextContent(type="text", text=error.format_user_message())]
 
@@ -434,7 +434,7 @@ class SlackSetupAssistant(ToolBase):
             return [TextContent(type="text", text=result_text)]
 
         except Exception as e:
-            error = ValidationError(message="Failed to get setup status", details={"error": str(e)})
+            error = ValidationError(message="Failed to get setup status", suggestion=str(e))
             return [TextContent(type="text", text=error.format_user_message())]
 
     async def _handle_quick_setup(
@@ -479,7 +479,7 @@ class SlackSetupAssistant(ToolBase):
             raise
         except Exception as e:
             error = ValidationError(
-                message="Failed to perform quick setup", details={"error": str(e)}
+                message="Failed to perform quick setup", suggestion=str(e)
             )
             return [TextContent(type="text", text=error.format_user_message())]
 

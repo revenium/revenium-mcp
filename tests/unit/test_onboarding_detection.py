@@ -70,11 +70,11 @@ class TestConfigurationStore:
         store2 = ConfigurationStore()
         assert store1 is store2
 
-    def test_get_config_store_function(self):
-        """Test get_config_store returns singleton."""
-        store = get_config_store()
-        assert store is not None
-        assert isinstance(store, ConfigurationStore)
+    def test_get_config_store_returns_same_instance_as_direct_constructor(self):
+        """get_config_store and ConfigurationStore() must be the same singleton object."""
+        store_via_fn = get_config_store()
+        store_via_ctor = ConfigurationStore()
+        assert store_via_fn is store_via_ctor
 
     def test_clear_cache(self):
         """Test clear_cache resets discovery state."""
@@ -93,14 +93,14 @@ class TestConfigurationStore:
 class TestOnboardingDetectionHelpers:
     """Test helper functions for onboarding detection."""
 
-    def test_discovered_config_dataclass_fields(self):
-        """Test DiscoveredConfig has expected fields."""
+    def test_discovered_config_defaults_to_none_fields(self):
+        """All optional fields of DiscoveredConfig default to None."""
         config = DiscoveredConfig()
-        assert hasattr(config, 'team_id')
-        assert hasattr(config, 'tenant_id')
-        assert hasattr(config, 'owner_id')
-        assert hasattr(config, 'default_email')
-        assert hasattr(config, 'default_slack_config_id')
-        assert hasattr(config, 'api_key')
-        assert hasattr(config, 'base_url')
-        assert hasattr(config, 'app_base_url')
+        assert config.team_id is None
+        assert config.tenant_id is None
+        assert config.owner_id is None
+        assert config.default_email is None
+        assert config.default_slack_config_id is None
+        assert config.api_key is None
+        assert config.base_url is None
+        assert config.app_base_url is None

@@ -140,28 +140,47 @@ class TestConfigManager:
     """Test ConfigManager class."""
     
     def test_singleton_behavior(self):
-        """Test that ConfigManager is a singleton."""
+        """Test that ConfigManager singleton shares state across instances."""
         manager1 = ConfigManager()
         manager2 = ConfigManager()
+        # Verify same object identity (true singleton)
         assert manager1 is manager2
-    
+        # Verify shared mutable state: clearing cache on one affects the other
+        try:
+            manager1._config = AuthConfig(api_key="shared_api_key_xyz", team_id="shared_team")
+            assert manager2._config is manager1._config
+            assert manager2._config.api_key == "shared_api_key_xyz"
+        finally:
+            # Guarantee cleanup even if an assertion fails, so singleton state
+            # does not leak into subsequent tests.
+            manager1._config = None
+
     def test_load_from_env_success(self, mock_env_vars):
-        """Test successful loading from environment variables."""
+        """Test successful loading from environment variables produces usable auth headers."""
         manager = ConfigManager()
         config = manager.load_from_env()
-        
+
         assert config.api_key == "test_api_key_12345"
         assert config.team_id == "test_team_id_456"
         assert config.base_url == "https://api.test.revenium.ai"
         assert config.timeout == 30.0
-    
+
+        # Verify the loaded config produces valid auth headers for API use
+        headers = config.get_auth_headers()
+        assert headers["x-api-key"] == "test_api_key_12345"
+        assert headers["accept"] == "application/json"
+
+        # Verify team query param uses the loaded team ID
+        params = config.get_team_query_param()
+        assert params["teamId"] == "test_team_id_456"
+
     def test_load_from_env_missing_api_key(self, monkeypatch):
-        """Test loading from environment with missing API key."""
+        """Test loading from environment with missing API key raises descriptive error."""
         monkeypatch.delenv("REVENIUM_API_KEY", raising=False)
         monkeypatch.setenv("REVENIUM_TEAM_ID", "team_123")
-        
+
         manager = ConfigManager()
-        with pytest.raises(ValueError, match="REVENIUM_API_KEY environment variable is required"):
+        with pytest.raises(ValueError, match=r"REVENIUM_API_KEY.*required"):
             manager.load_from_env()
     
     def test_load_from_env_missing_team_id(self, monkeypatch):
@@ -236,11 +255,16 @@ class TestUtilityFunctions:
     """Test utility functions."""
     
     def test_get_auth_config(self, mock_env_vars):
-        """Test get_auth_config utility function."""
+        """Test get_auth_config returns a config with correct field values and usable headers."""
         config = get_auth_config()
         assert isinstance(config, AuthConfig)
         assert config.api_key == "test_api_key_12345"
         assert config.team_id == "test_team_id_456"
+        # Confirm the base_url was read from the environment (not just default)
+        assert config.base_url == "https://api.test.revenium.ai"
+        # Confirm the config is operationally usable: headers include the correct api key
+        headers = config.get_auth_headers()
+        assert headers["x-api-key"] == config.api_key
     
     def test_get_auth_headers(self, mock_env_vars):
         """Test get_auth_headers utility function."""
@@ -254,7 +278,14 @@ class TestUtilityFunctions:
         assert team_id == "test_team_id_456"
     
     def test_ensure_authenticated(self, mock_env_vars):
-        """Test ensure_authenticated utility function."""
+        """Test ensure_authenticated returns a fully configured and operational auth config."""
         config = ensure_authenticated()
         assert isinstance(config, AuthConfig)
+        # Key fields must reflect actual environment, not just default placeholder values
         assert config.api_key == "test_api_key_12345"
+        assert config.team_id == "test_team_id_456"
+        # Config must be ready to use: generating headers should produce a non-empty x-api-key
+        headers = config.get_auth_headers()
+        assert headers.get("x-api-key") == "test_api_key_12345"
+        # Timeout must be positive — confirms pydantic validation passed
+        assert config.timeout > 0

@@ -16,9 +16,9 @@ class TestAnomalyManager:
         """Create AnomalyManager instance."""
         return AnomalyManager()
 
-    def test_initialization(self, manager):
-        """Test manager initialization."""
-        assert manager is not None
+    def test_initialization_exposes_list_anomalies(self, manager):
+        """AnomalyManager must expose callable list_anomalies method."""
+        assert callable(manager.list_anomalies)
         assert manager.config == {}
 
     def test_initialization_with_config(self):
@@ -68,13 +68,14 @@ class TestAlertManager:
         return AlertManager()
 
     def test_initialization(self, manager):
-        """Test manager initialization."""
-        assert manager is not None
+        """Test manager initialization sets expected attributes."""
+        assert manager.config == {}
+        assert manager.date_parser is not None
 
-    def test_has_required_methods(self, manager):
-        """Test that manager has expected methods."""
-        assert hasattr(manager, 'list_alerts')
-        assert hasattr(manager, 'get_alert')
+    def test_list_alerts_and_get_alert_are_callable(self, manager):
+        """Both list_alerts and get_alert must be callable methods."""
+        assert callable(manager.list_alerts)
+        assert callable(manager.get_alert)
 
 
 class TestAnomalyManagerHelperMethods:

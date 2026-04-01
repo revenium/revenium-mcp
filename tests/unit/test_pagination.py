@@ -22,15 +22,20 @@ class TestQueryCache:
     """Test QueryCache functionality."""
 
     def test_initialization(self):
-        """Test cache initialization with default TTL."""
+        """Fresh cache has 300s TTL and empty cache dict — not pre-populated."""
         cache = QueryCache()
         assert cache.ttl_seconds == 300
         assert cache.cache == {}
+        # Confirm a get on the fresh cache returns None (not stale data)
+        assert cache.get("/any/endpoint", {}) is None
 
     def test_initialization_custom_ttl(self):
-        """Test cache initialization with custom TTL."""
+        """Custom TTL is stored correctly and cache starts empty."""
         cache = QueryCache(ttl_seconds=600)
         assert cache.ttl_seconds == 600
+        # A separate cache instance with different TTL must not share state
+        default_cache = QueryCache()
+        assert cache.ttl_seconds != default_cache.ttl_seconds
 
     def test_set_and_get(self):
         """Test setting and getting cached values."""
@@ -93,6 +98,8 @@ class TestQueryCache:
 
         # Fresh entry should still exist
         assert cache.get("/api/fresh", {}) is not None
+        # Expired entry must be gone
+        assert cache.get("/api/old", {"old": True}) is None
 
     def test_generate_key_consistency(self):
         """Test that key generation is consistent."""

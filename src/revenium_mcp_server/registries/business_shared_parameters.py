@@ -231,13 +231,20 @@ def create_customer_parameters(action: str, **kwargs) -> CustomerRequest:
 
     customer_params = {
         "action": action,
-        "customer_id": kwargs.get("customer_id"),
+        "resource_type": kwargs.get("resource_type"),
+        "user_id": kwargs.get("user_id"),
+        "subscriber_id": kwargs.get("subscriber_id"),
+        "organization_id": kwargs.get("organization_id"),
+        "team_id": kwargs.get("team_id"),
         "email": kwargs.get("email"),
-        "name": kwargs.get("name"),
-        "organization": kwargs.get("organization"),
-        "metadata": kwargs.get("metadata"),
+        "user_data": kwargs.get("user_data"),
+        "subscriber_data": kwargs.get("subscriber_data"),
+        "organization_data": kwargs.get("organization_data"),
+        "team_data": kwargs.get("team_data"),
         "filters": kwargs.get("filters"),
-        "pagination": kwargs.get("pagination"),
+        "dry_run": kwargs.get("dry_run"),
+        "page": kwargs.get("page"),
+        "size": kwargs.get("size"),
     }
 
     return CustomerRequest(**customer_params)

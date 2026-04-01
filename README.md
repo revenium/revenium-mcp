@@ -123,7 +123,7 @@ When you use this MCP server, the following data flows between your AI assistant
 - All communication uses your Revenium API key for authentication
 - Data is transmitted securely over HTTPS
 - API keys are never logged or exposed in tool responses
-- Data handling is subject to [Revenium's privacy policy](https://revenium.io/privacy)
+- Data handling is subject to [Revenium's privacy policy](https://www.revenium.ai/privacy-policy)
 
 ## AI Query Routing (Optional Feature)
 

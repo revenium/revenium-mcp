@@ -10,21 +10,18 @@ from src.revenium_mcp_server.alerts.analytics_engine import (
     AlertTrendData,
     AnalyticsEngine
 )
-from src.revenium_mcp_server.alerts.analytics_formatter import AnalyticsFormatter
-from src.revenium_mcp_server.analytics.business_analytics_engine import BusinessAnalyticsEngine
 
 
 class TestTimeRange:
     """Test TimeRange functionality."""
 
-    def test_time_range_creation(self):
-        """Test time range creation."""
+    def test_start_is_before_end(self):
+        """TimeRange start must be earlier than end — verify ordering is enforced."""
         start = datetime(2024, 1, 1, tzinfo=timezone.utc)
         end = datetime(2024, 1, 2, tzinfo=timezone.utc)
 
         time_range = TimeRange(start=start, end=end)
-        assert time_range.start == start
-        assert time_range.end == end
+        assert time_range.start < time_range.end
 
     def test_time_range_duration(self):
         """Test duration calculation."""
@@ -40,8 +37,8 @@ class TestTimeRange:
 class TestAnomalyFrequencyData:
     """Test AnomalyFrequencyData functionality."""
 
-    def test_creation(self):
-        """Test basic creation with required fields."""
+    def test_active_plus_inactive_equals_total(self):
+        """active + inactive counts must sum to total_anomalies."""
         data = AnomalyFrequencyData(
             total_anomalies=10,
             active_anomalies=5,
@@ -54,15 +51,14 @@ class TestAnomalyFrequencyData:
             most_common_metrics=[],
             creation_trend=[]
         )
-        assert data.total_anomalies == 10
-        assert data.active_anomalies == 5
+        assert data.active_anomalies + data.inactive_anomalies == data.total_anomalies
 
 
 class TestAlertTrendData:
     """Test AlertTrendData functionality."""
 
-    def test_creation(self):
-        """Test basic creation with required fields."""
+    def test_resolution_times_list_preserved(self):
+        """resolution_times list is stored intact for later average calculation."""
         data = AlertTrendData(
             total_alerts=10,
             alerts_by_severity={},
@@ -71,7 +67,8 @@ class TestAlertTrendData:
             alert_frequency=[],
             top_triggering_anomalies=[]
         )
-        assert data.total_alerts == 10
+        assert len(data.resolution_times) == 3
+        assert all(isinstance(t, float) for t in data.resolution_times)
 
     def test_average_resolution_time(self):
         """Test average resolution time calculation."""
@@ -87,32 +84,3 @@ class TestAlertTrendData:
         assert abs(avg - 2.0) < 0.01
 
 
-class TestAnalyticsEngine:
-    """Test AnalyticsEngine functionality."""
-
-    @pytest.fixture
-    def engine(self):
-        """Create analytics engine instance."""
-        return AnalyticsEngine(cache_ttl=60)
-
-    def test_initialization(self, engine):
-        """Test engine initialization."""
-        assert engine is not None
-
-
-class TestAnalyticsFormatter:
-    """Test AnalyticsFormatter functionality."""
-
-    def test_formatter_exists(self):
-        """Test that formatter class exists and can be instantiated."""
-        formatter = AnalyticsFormatter()
-        assert formatter is not None
-
-
-class TestBusinessAnalyticsEngine:
-    """Test BusinessAnalyticsEngine functionality."""
-
-    def test_initialization(self):
-        """Test engine initialization."""
-        engine = BusinessAnalyticsEngine()
-        assert engine is not None

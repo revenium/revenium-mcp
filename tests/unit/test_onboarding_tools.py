@@ -17,9 +17,8 @@ class TestWelcomeSetup:
         return WelcomeSetup()
 
     def test_initialization(self, tool):
-        """Test tool initialization."""
-        assert tool is not None
-        assert hasattr(tool, 'handle_action')
+        """Test tool initialization exposes callable action handler."""
+        assert callable(tool.handle_action)
 
     def test_tool_name(self, tool):
         """Test tool has correct name."""
@@ -58,9 +57,8 @@ class TestConfigurationStatus:
         return ConfigurationStatus()
 
     def test_initialization(self, tool):
-        """Test tool initialization."""
-        assert tool is not None
-        assert hasattr(tool, 'handle_action')
+        """Test tool initialization exposes callable action handler."""
+        assert callable(tool.handle_action)
 
     def test_tool_name(self, tool):
         """Test tool has correct name."""
@@ -94,16 +92,18 @@ class TestOnboardingToolsCommonBehavior:
     """Test common behavior across onboarding tools."""
 
     def test_welcome_setup_inherits_from_tool_base(self):
-        """Test WelcomeSetup inherits properly."""
+        """WelcomeSetup must inherit ToolBase and expose execute()."""
         from src.revenium_mcp_server.tools_decomposed.unified_tool_base import ToolBase
         tool = WelcomeSetup()
         assert isinstance(tool, ToolBase)
+        assert callable(tool.execute)
 
     def test_configuration_status_inherits_from_tool_base(self):
-        """Test ConfigurationStatus inherits properly."""
+        """ConfigurationStatus must inherit ToolBase and expose execute()."""
         from src.revenium_mcp_server.tools_decomposed.unified_tool_base import ToolBase
         tool = ConfigurationStatus()
         assert isinstance(tool, ToolBase)
+        assert callable(tool.execute)
 
     def test_tools_have_different_names(self):
         """Test tools have unique names."""

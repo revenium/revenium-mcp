@@ -108,10 +108,11 @@ class TestLoggingConfig:
         assert config.performance_tracker is not None
     
     def test_get_logger(self):
-        """Test logger creation."""
+        """Test logger creation returns a functional logger."""
         config = LoggingConfig()
         logger = config.get_logger("test_logger")
         assert logger is not None
+        assert callable(logger.info)
 
 
 class TestPerformanceDecorator:

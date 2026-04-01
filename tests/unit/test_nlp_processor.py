@@ -20,12 +20,11 @@ class TestNLPProcessor:
         return NLPProcessor()
 
     def test_initialization(self, processor):
-        """Test processor initialization."""
-        assert processor is not None
-        assert hasattr(processor, 'parse_query')
-        assert hasattr(processor, 'generate_response')
-        assert hasattr(processor, 'intent_patterns')
-        assert hasattr(processor, 'entity_patterns')
+        """Test processor initialization exposes callable interface."""
+        assert callable(processor.parse_query)
+        assert callable(processor.generate_response)
+        assert len(processor.intent_patterns) > 0
+        assert len(processor.entity_patterns) > 0
 
     def test_parse_query_returns_parsed_query(self, processor):
         """Test that parse_query returns a ParsedQuery object."""
@@ -100,21 +99,24 @@ class TestNLPProcessor:
         assert len(response) > 0
 
     def test_generate_response_item(self, processor):
-        """Test response generation for single item."""
+        """Test response generation for single item includes item name."""
         data = {"id": "1", "name": "Test Anomaly"}
         response = processor.generate_response(data)
         assert isinstance(response, str)
+        assert "Test Anomaly" in response or "1" in response
 
     def test_generate_response_error(self, processor):
-        """Test response generation for error data."""
+        """Test response generation for error data mentions the error."""
         data = {"error": "Something went wrong"}
         response = processor.generate_response(data)
         assert isinstance(response, str)
+        assert "Something went wrong" in response or "error" in response.lower()
 
     def test_extract_entities_with_status(self, processor):
-        """Test entity extraction with status."""
+        """Test entity extraction with status includes status key."""
         entities = processor._extract_entities("show active anomalies")
         assert isinstance(entities, dict)
+        assert "status" in entities or "active" in str(entities).lower()
 
 
 class TestParsedQuery:

@@ -79,6 +79,15 @@ class EnvironmentVariableValidator:
         "LOG_LEVEL",
         "REQUEST_TIMEOUT",
         "UCM_WARNINGS_ENABLED",
+        # Trace fields environment variables
+        "REVENIUM_ENVIRONMENT",
+        "REVENIUM_REGION",
+        "REVENIUM_CREDENTIAL_ALIAS",
+        "REVENIUM_TRACE_TYPE",
+        "REVENIUM_TRACE_NAME",
+        "REVENIUM_PARENT_TRANSACTION_ID",
+        "REVENIUM_TRANSACTION_NAME",
+        "REVENIUM_RETRY_NUMBER",
     ]
 
     # Complete list = debug_auto_discovery base + extensions
