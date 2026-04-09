@@ -16,6 +16,7 @@ from ..common.error_handling import (
     create_structured_validation_error,
     format_structured_error,
 )
+from ..endpoint_registry import _resolved_app_base_url, _use_new_api, get_endpoint_path
 from ..introspection.metadata import ToolType
 from .unified_tool_base import ToolBase
 
@@ -114,17 +115,28 @@ class DebugAutoDiscovery(ToolBase):
             api_test_result = "NOT TESTED"
             api_key = os.getenv("REVENIUM_API_KEY")
             from ..constants import DEFAULT_BASE_URL
-            base_url = os.getenv("REVENIUM_BASE_URL", DEFAULT_BASE_URL)
+            base_url = (
+                _resolved_app_base_url()
+                if _use_new_api()
+                else os.getenv("REVENIUM_BASE_URL", DEFAULT_BASE_URL)
+            )
 
             if api_key:
                 try:
                     # Use a business endpoint for more reliable connectivity testing
-                    endpoint = "/profitstream/v2/api/sources/metrics/ai/data-connected"
-                    headers = {
-                        "x-api-key": api_key,
-                        "accept": "application/json",
-                        "Content-Type": "application/json",
-                    }
+                    endpoint = get_endpoint_path("data_connected")
+                    if _use_new_api():
+                        headers = {
+                            "Authorization": f"Bearer {api_key}",
+                            "accept": "application/json",
+                            "Content-Type": "application/json",
+                        }
+                    else:
+                        headers = {
+                            "x-api-key": api_key,
+                            "accept": "application/json",
+                            "Content-Type": "application/json",
+                        }
 
                     async with httpx.AsyncClient(timeout=10.0) as client:
                         response = await client.get(f"{base_url}{endpoint}", headers=headers)

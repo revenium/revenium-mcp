@@ -19,7 +19,6 @@ Covers:
 import re
 import pytest
 from datetime import datetime, timezone
-from unittest.mock import patch, MagicMock
 
 from src.revenium_mcp_server.tools_decomposed.metering_management import (
     MeteringTransactionManager,

@@ -20,6 +20,7 @@ from src.revenium_mcp_server.tools_decomposed.customer_management import (
 )
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.common.update_configs import UpdateConfigs
 from mcp.types import TextContent
 
 
@@ -1210,3 +1211,34 @@ class TestCustomerManagementAutoGeneration:
         )
         assert result["firstName"] == "Jane"
         assert result["lastName"] == "Smith"
+
+
+class TestCreateCustomersConfigDefaultFields:
+
+    def test_organization_injects_tenant_id(self, mock_client):
+        mock_client.auth_config.tenant_id = "t_123"
+        mock_client.auth_config.team_id = "team_456"
+        config = UpdateConfigs.create_customers_config(mock_client, "organization")
+        assert config.default_fields == {"tenantId": "t_123"}
+
+    def test_organization_falls_back_to_team_id(self, mock_client):
+        mock_client.auth_config.tenant_id = None
+        mock_client.auth_config.team_id = "team_456"
+        config = UpdateConfigs.create_customers_config(mock_client, "organization")
+        assert config.default_fields == {"tenantId": "team_456"}
+
+    def test_team_injects_tenant_id(self, mock_client):
+        mock_client.auth_config.tenant_id = "t_789"
+        mock_client.auth_config.team_id = "team_000"
+        config = UpdateConfigs.create_customers_config(mock_client, "team")
+        assert config.default_fields == {"tenantId": "t_789"}
+
+    def test_user_injects_team_id(self, mock_client):
+        mock_client.team_id = "team_456"
+        config = UpdateConfigs.create_customers_config(mock_client, "user")
+        assert config.default_fields == {"teamId": "team_456"}
+
+    def test_subscriber_injects_team_id(self, mock_client):
+        mock_client.team_id = "team_456"
+        config = UpdateConfigs.create_customers_config(mock_client, "subscriber")
+        assert config.default_fields == {"teamId": "team_456"}

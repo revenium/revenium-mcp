@@ -1,6 +1,5 @@
 """Unit tests for product_templates module."""
 
-import pytest
 
 from src.revenium_mcp_server.product_templates import (
     ProductExample,

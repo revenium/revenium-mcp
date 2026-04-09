@@ -1,6 +1,5 @@
 """Tests for api_field_mapper.py — field mapping between internal and API formats."""
 
-import pytest
 
 from src.revenium_mcp_server.api_field_mapper import APIFieldMapper
 

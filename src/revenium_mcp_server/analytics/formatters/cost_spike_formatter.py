@@ -89,7 +89,7 @@ class CostSpikeFormatter(AnalyticsResponseFormatter):
         threshold_formatted = self.utilities.format_currency(threshold)
         contributors_count = len(contributors)
 
-        response = f"## **WARNING: Cost Spike Detected**\n\n"
+        response = "## **WARNING: Cost Spike Detected**\n\n"
         response += f"Found {contributors_count} cost contributors above the {threshold_formatted} threshold.\n\n"
 
         # Group contributors by type for better organization
@@ -139,7 +139,7 @@ class CostSpikeFormatter(AnalyticsResponseFormatter):
         Returns:
             Formatted no contributors section
         """
-        return f"""## **WARNING: Cost Spike Detected**
+        return """## **WARNING: Cost Spike Detected**
 
 Spike detected but no specific contributors identified above threshold.
 

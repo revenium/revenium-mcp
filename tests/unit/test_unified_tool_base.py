@@ -6,8 +6,7 @@ generation for all MCP tools.
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
-from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.tools_decomposed.unified_tool_base import ToolBase
 from mcp.types import TextContent

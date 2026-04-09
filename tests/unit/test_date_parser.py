@@ -1,7 +1,6 @@
 """Unit tests for DateRangeParser — natural language date parsing."""
 
-import pytest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from src.revenium_mcp_server.date_parser import DateRangeParser
 

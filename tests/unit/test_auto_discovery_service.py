@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, patch, MagicMock
 from src.revenium_mcp_server.auto_discovery import (
     AutoDiscoveryService,
     AutoDiscoveryError,
-    discover_revenium_config,
 )
 
 
@@ -143,6 +142,6 @@ class TestConvenienceFunctions:
     async def test_discovered_config_missing_key_raises(self):
         """test_discovered_config raises when API key is absent."""
         from src.revenium_mcp_server import auto_discovery
-        func = getattr(auto_discovery, "test_discovered_config")
+        func = auto_discovery.test_discovered_config
         with pytest.raises(AutoDiscoveryError, match="REVENIUM_API_KEY"):
             await func({"REVENIUM_BASE_URL": "https://x"})

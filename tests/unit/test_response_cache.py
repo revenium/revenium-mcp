@@ -1,9 +1,6 @@
 """Tests for core/response_cache.py — multi-level caching with MockCache fallback."""
 
-import asyncio
-import hashlib
-import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 

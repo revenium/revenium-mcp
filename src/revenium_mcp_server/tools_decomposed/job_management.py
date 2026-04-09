@@ -1,0 +1,678 @@
+"""Job management tool for Revenium Jobs & Outcomes system.
+
+Exposes 7 API endpoints under /v2/api/jobs for tracking job performance,
+ROI, conversion funnels, and reporting outcomes.
+"""
+
+import asyncio
+import json
+import time
+from typing import Any, Dict, List, Union
+
+from loguru import logger
+from mcp.types import EmbeddedResource, ImageContent, TextContent
+
+from ..client import ReveniumAPIError, ReveniumClient
+from ..common.error_handling import ErrorCodes, ToolError
+from ..introspection.metadata import (
+    ResourceRelationship,
+    ToolCapability,
+    ToolType,
+    UsagePattern,
+)
+from .unified_tool_base import ToolBase
+
+
+class JobManager:
+    """Internal manager wrapping async client calls for Jobs & Outcomes API."""
+
+    def __init__(self, client: ReveniumClient):
+        self.client = client
+
+    async def list_jobs(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """List jobs with pagination."""
+        page = arguments.get("page", 0)
+        size = arguments.get("size", 20)
+        filters = arguments.get("filters", {})
+        response = await self.client.get_jobs(page=page, size=size, **filters)
+        jobs = self.client._extract_embedded_data(response)
+        page_info = self.client._extract_pagination_info(response)
+        return {
+            "action": "list_jobs",
+            "data": jobs,
+            "pagination": {
+                "page": page,
+                "size": size,
+                "total_pages": page_info.get("totalPages", 1),
+                "total_items": page_info.get("totalElements", len(jobs)),
+                "has_next": page < page_info.get("totalPages", 1) - 1,
+                "has_previous": page > 0,
+            },
+            "metadata": {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")},
+        }
+
+    async def get_job(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Get a specific job by ID."""
+        job_id = arguments.get("job_id")
+        if not job_id:
+            raise ToolError(
+                message="job_id is required for get_job action",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="job_id",
+                suggestions=["Use list_jobs to find valid job IDs"],
+            )
+        result = await self.client.get_job_by_id(job_id)
+        return {"action": "get_job", "job_id": job_id, "data": result}
+
+    async def get_job_transactions(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Get transactions for a job."""
+        job_id = arguments.get("job_id")
+        if not job_id:
+            raise ToolError(
+                message="job_id is required for get_job_transactions action",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="job_id",
+                suggestions=["Use list_jobs to find valid job IDs"],
+            )
+        page = arguments.get("page", 0)
+        size = arguments.get("size", 20)
+        response = await self.client.get_job_transactions(job_id, page=page, size=size)
+        transactions = self.client._extract_embedded_data(response)
+        page_info = self.client._extract_pagination_info(response)
+        return {
+            "action": "get_job_transactions",
+            "job_id": job_id,
+            "data": transactions,
+            "pagination": {
+                "page": page,
+                "size": size,
+                "total_pages": page_info.get("totalPages", 1),
+                "total_items": page_info.get("totalElements", len(transactions)),
+                "has_next": page < page_info.get("totalPages", 1) - 1,
+                "has_previous": page > 0,
+            },
+        }
+
+    async def get_job_roi(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Get ROI metrics for a job."""
+        job_id = arguments.get("job_id")
+        if not job_id:
+            raise ToolError(
+                message="job_id is required for get_job_roi action",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="job_id",
+                suggestions=["Use list_jobs to find valid job IDs"],
+            )
+        result = await self.client.get_job_roi(job_id)
+        return {"action": "get_job_roi", "job_id": job_id, "data": result}
+
+    async def get_job_types(self, arguments: Dict[str, Any]) -> Dict[str, Any]:  # noqa: ARG002
+        """Get available job types."""
+        result = await self.client.get_job_types()
+        types = self.client._extract_embedded_data(result) if isinstance(result, dict) else result
+        return {"action": "get_job_types", "data": types}
+
+    async def get_conversion_funnel(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Get global conversion funnel analytics with optional filters."""
+        filters = arguments.get("filters", {})
+        result = await self.client.get_job_conversion_funnel(**filters)
+        return {"action": "get_conversion_funnel", "data": result}
+
+    async def get_roi_summary(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Get ROI summary across all job types with per-type conversion funnels.
+
+        Orchestrates get_job_types + get_conversion_funnel(jobType=...) for each type.
+        Optional filters: startDate, endDate (passed through to each funnel call).
+        """
+        filters = arguments.get("filters", {})
+        if not isinstance(filters, dict):
+            filters = {}
+        date_filters = {k: filters[k] for k in ("startDate", "endDate") if k in filters}
+
+        # Step 1: Get all job types
+        types_result = await self.client.get_job_types()
+        job_types = (
+            self.client._extract_embedded_data(types_result)
+            if isinstance(types_result, dict)
+            else types_result
+        )
+
+        # Normalize: job_types may be a list of strings or list of dicts
+        type_names = []
+        for jt in job_types:
+            if isinstance(jt, str):
+                type_names.append(jt)
+            elif isinstance(jt, dict):
+                type_names.append(jt.get("name", jt.get("type", str(jt))))
+            else:
+                type_names.append(str(jt))
+
+        # Step 2: Fetch conversion funnel for each type concurrently
+        async def fetch_funnel(job_type: str) -> Dict[str, Any]:
+            try:
+                funnel_filters = {"jobType": job_type, **date_filters}
+                result = await self.client.get_job_conversion_funnel(**funnel_filters)
+                return {"jobType": job_type, "data": result, "status": "success"}
+            except Exception as e:
+                logger.warning(f"Failed to fetch funnel for job type '{job_type}': {e}")
+                status_code = getattr(e, "status_code", "unknown")
+                return {
+                    "jobType": job_type,
+                    "data": None,
+                    "status": "error",
+                    "error": f"Request failed (status={status_code})",
+                }
+
+        funnel_results = await asyncio.gather(
+            *[fetch_funnel(jt) for jt in type_names]
+        )
+
+        # Step 3: Aggregate results
+        successful = [r for r in funnel_results if r["status"] == "success"]
+        failed = [r for r in funnel_results if r["status"] == "error"]
+
+        # If all funnel calls failed, surface the error instead of returning zeroed data
+        if type_names and not successful:
+            raise ToolError(
+                message=(
+                    f"All {len(failed)} job type funnel requests failed. "
+                    f"First error: {failed[0].get('error', 'unknown')}"
+                ),
+                error_code=ErrorCodes.API_ERROR,
+                suggestions=["Check API connectivity", "Verify API key permissions for /v2/api/jobs/conversion-funnel"],
+            )
+
+        total_jobs = sum(r["data"].get("totalJobs", 0) for r in successful)
+        total_successful = sum(r["data"].get("successfulJobs", 0) for r in successful)
+        total_converted = sum(r["data"].get("convertedJobs", 0) for r in successful)
+
+        return {
+            "action": "get_roi_summary",
+            "summary": {
+                "totalJobTypes": len(type_names),
+                "totalJobs": total_jobs,
+                "successfulJobs": total_successful,
+                "convertedJobs": total_converted,
+                "overallSuccessRate": round(total_successful / total_jobs, 4) if total_jobs > 0 else 0,
+                "overallConversionRate": round(total_converted / total_jobs, 4) if total_jobs > 0 else 0,
+            },
+            "per_type_breakdown": list(funnel_results),
+            "filters_applied": date_filters if date_filters else None,
+            "partial_failures": len(failed),
+            "metadata": {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")},
+        }
+
+    async def report_outcome(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Report an outcome for a job."""
+        job_id = arguments.get("job_id")
+        if not job_id:
+            raise ToolError(
+                message="job_id is required for report_outcome action",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="job_id",
+                suggestions=["Use list_jobs to find valid job IDs"],
+            )
+        outcome_data = arguments.get("outcome_data")
+        if outcome_data is None:
+            raise ToolError(
+                message="outcome_data is required for report_outcome action",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="outcome_data",
+                examples={"report_outcome": {"outcome": "CONVERTED", "revenue": 99.99}},
+                suggestions=["Provide a dict with 'outcome' (CONVERTED or UNSUCCESSFUL), 'revenue', and optional 'notes'"],
+            )
+        try:
+            result = await self.client.report_job_outcome(job_id, outcome_data)
+            return {"action": "report_outcome", "job_id": job_id, "data": result}
+        except ReveniumAPIError as e:
+            if e.status_code == 409:
+                return {
+                    "action": "report_outcome",
+                    "job_id": job_id,
+                    "status": "conflict",
+                    "message": (
+                        f"Outcome already reported for job {job_id}. "
+                        "Duplicate outcomes are not allowed. "
+                        "Use get_job to verify the existing outcome."
+                    ),
+                }
+            raise
+
+
+class JobManagement(ToolBase):
+    """Job management tool for the Jobs & Outcomes system."""
+
+    tool_name = "manage_jobs"
+    tool_description = (
+        "Job and outcomes management for the Revenium platform. "
+        "Track job performance, ROI, conversion funnels, and report outcomes. "
+        "Key actions: list_jobs, get_job, get_job_transactions, get_job_roi, "
+        "get_job_types, get_conversion_funnel, get_roi_summary, report_outcome. "
+        "Use get_capabilities() for full details or get_examples() for usage templates."
+    )
+    business_category = "Core Business Management Tools"
+    tool_type = ToolType.CRUD
+    tool_version = "1.0.0"
+
+    async def handle_action(
+        self, action: str, arguments: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle job management actions."""
+        try:
+            client = await self.get_client()
+            job_manager = JobManager(client)
+
+            # --- Meta-actions ---
+
+            if action == "get_capabilities":
+                capabilities = {
+                    "tool": self.tool_name,
+                    "description": self.tool_description,
+                    "version": self.tool_version,
+                    "actions": await self._get_supported_actions(),
+                    "business_actions": [
+                        "list_jobs",
+                        "get_job",
+                        "get_job_transactions",
+                        "get_job_roi",
+                        "get_job_types",
+                        "get_conversion_funnel",
+                        "get_roi_summary",
+                        "report_outcome",
+                    ],
+                    "meta_actions": [
+                        "get_capabilities",
+                        "get_examples",
+                        "get_tool_metadata",
+                        "get_agent_summary",
+                    ],
+                    "parameters": {
+                        "list_jobs": {
+                            "page": "int (default 0)",
+                            "size": "int (default 20)",
+                            "filters": (
+                                "dict (optional) — supported keys: "
+                                "type (job type, case-insensitive), "
+                                "executionStatus (SUCCESS|FAILED|CANCELLED), "
+                                "outcomeType (CONVERTED|ESCALATED|DEFLECTED|UNSUCCESSFUL|CUSTOM|PENDING), "
+                                "startDate (ISO 8601), endDate (ISO 8601), sort"
+                            ),
+                        },
+                        "get_job": {"job_id": "str (required)"},
+                        "get_job_transactions": {
+                            "job_id": "str (required)",
+                            "page": "int (default 0)",
+                            "size": "int (default 20)",
+                        },
+                        "get_job_roi": {"job_id": "str (required)"},
+                        "get_job_types": {},
+                        "get_conversion_funnel": {
+                            "filters": (
+                                "dict (optional) — supported keys: "
+                                "jobType (case-insensitive), startDate (ISO 8601), endDate (ISO 8601)"
+                            ),
+                        },
+                        "get_roi_summary": {
+                            "filters": (
+                                "dict (optional) — supported keys: "
+                                "startDate (ISO 8601), endDate (ISO 8601). "
+                                "Orchestrates get_job_types + per-type conversion funnels."
+                            ),
+                        },
+                        "report_outcome": {
+                            "job_id": "str (required)",
+                            "outcome_data": "dict (required)",
+                        },
+                    },
+                }
+                return [TextContent(type="text", text=json.dumps(capabilities, indent=2))]
+
+            elif action == "get_examples":
+                examples = {
+                    "list_jobs": {
+                        "description": "List all jobs with pagination",
+                        "example": {"action": "list_jobs", "page": 0, "size": 20},
+                        "with_filters": {
+                            "action": "list_jobs",
+                            "page": 0,
+                            "size": 10,
+                            "filters": {"type": "loan_processing", "executionStatus": "SUCCESS"},
+                        },
+                    },
+                    "get_job": {
+                        "description": "Get a specific job by ID",
+                        "example": {"action": "get_job", "job_id": "job_123"},
+                    },
+                    "get_job_transactions": {
+                        "description": "Get transactions for a job",
+                        "example": {
+                            "action": "get_job_transactions",
+                            "job_id": "job_123",
+                            "page": 0,
+                            "size": 20,
+                        },
+                    },
+                    "get_job_roi": {
+                        "description": "Get ROI metrics for a job",
+                        "example": {"action": "get_job_roi", "job_id": "job_123"},
+                    },
+                    "get_job_types": {
+                        "description": "Get all available job types",
+                        "example": {"action": "get_job_types"},
+                    },
+                    "get_conversion_funnel": {
+                        "description": "Get global conversion funnel analytics (total/successful/converted)",
+                        "example": {"action": "get_conversion_funnel"},
+                        "with_filters": {
+                            "action": "get_conversion_funnel",
+                            "filters": {"startDate": "2025-01-01", "endDate": "2025-12-31", "jobType": "LEAD"},
+                        },
+                    },
+                    "get_roi_summary": {
+                        "description": "Get aggregated ROI summary across all job types with per-type breakdown",
+                        "example": {"action": "get_roi_summary"},
+                        "with_filters": {
+                            "action": "get_roi_summary",
+                            "filters": {"startDate": "2025-01-01", "endDate": "2025-12-31"},
+                        },
+                    },
+                    "report_outcome": {
+                        "description": "Report an outcome for a job (409 = duplicate, already reported)",
+                        "outcome_types": ["CONVERTED", "UNSUCCESSFUL"],
+                        "example_converted": {
+                            "action": "report_outcome",
+                            "job_id": "job_123",
+                            "outcome_data": {
+                                "outcome": "CONVERTED",
+                                "revenue": 99.99,
+                                "notes": "Customer purchased premium plan",
+                            },
+                        },
+                        "example_unsuccessful": {
+                            "action": "report_outcome",
+                            "job_id": "job_456",
+                            "outcome_data": {
+                                "outcome": "UNSUCCESSFUL",
+                                "notes": "Customer declined after trial period",
+                            },
+                        },
+                    },
+                }
+                return [TextContent(type="text", text=json.dumps(examples, indent=2))]
+
+            elif action == "get_tool_metadata":
+                metadata = await self.get_tool_metadata()
+                return [TextContent(type="text", text=json.dumps(metadata.to_dict(), indent=2))]
+
+            elif action == "get_agent_summary":
+                summary = await self._get_agent_summary()
+                return [TextContent(type="text", text=summary)]
+
+            # --- Business actions ---
+
+            elif action == "list_jobs":
+                result = await job_manager.list_jobs(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Jobs (page {arguments.get('page', 0) + 1}):\n\n"
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "get_job":
+                result = await job_manager.get_job(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Job details for {arguments.get('job_id')}:\n\n"
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "get_job_transactions":
+                result = await job_manager.get_job_transactions(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Transactions for job {arguments.get('job_id')}:\n\n"
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "get_job_roi":
+                result = await job_manager.get_job_roi(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"ROI for job {arguments.get('job_id')}:\n\n"
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "get_job_types":
+                result = await job_manager.get_job_types(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text="Available job types:\n\n" + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "get_conversion_funnel":
+                result = await job_manager.get_conversion_funnel(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text="Conversion funnel analytics:\n\n"
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "get_roi_summary":
+                result = await job_manager.get_roi_summary(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text="ROI summary across all job types:\n\n"
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "report_outcome":
+                result = await job_manager.report_outcome(arguments)
+                if result.get("status") == "conflict":
+                    prefix = f"Outcome already exists for job {arguments.get('job_id')}"
+                else:
+                    prefix = f"Outcome reported for job {arguments.get('job_id')}"
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"{prefix}:\n\n" + json.dumps(result, indent=2),
+                    )
+                ]
+
+            else:
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Unknown action '{action}'. "
+                        f"Use get_capabilities() to see all supported actions.",
+                    )
+                ]
+
+        except ReveniumAPIError as e:
+            logger.error(f"API error in manage_jobs: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error in manage_jobs: {e}")
+            raise
+
+    # --- ToolBase metadata method overrides ---
+
+    async def _get_supported_actions(self) -> List[str]:
+        """Return all supported actions."""
+        return [
+            "get_capabilities",
+            "get_examples",
+            "get_tool_metadata",
+            "get_agent_summary",
+            "list_jobs",
+            "get_job",
+            "get_job_transactions",
+            "get_job_roi",
+            "get_job_types",
+            "get_conversion_funnel",
+            "get_roi_summary",
+            "report_outcome",
+        ]
+
+    async def _get_tool_capabilities(self) -> List[ToolCapability]:
+        """Get job management tool capabilities."""
+        return [
+            ToolCapability(
+                name="Job Listing and Retrieval",
+                description="List and retrieve job details with pagination support",
+                parameters={
+                    "list_jobs": {"page": "int", "size": "int", "filters": "dict"},
+                    "get_job": {"job_id": "str"},
+                },
+                examples=["list_jobs(page=0, size=20)", "get_job(job_id='job_123')"],
+            ),
+            ToolCapability(
+                name="Job Analytics",
+                description="Access job transactions, ROI metrics, conversion funnel data, and aggregate ROI summaries",
+                parameters={
+                    "get_job_transactions": {"job_id": "str", "page": "int", "size": "int"},
+                    "get_job_roi": {"job_id": "str"},
+                    "get_conversion_funnel": {"filters": "dict (optional)"},
+                    "get_roi_summary": {"filters": "dict (optional: startDate, endDate)"},
+                },
+                examples=[
+                    "get_job_transactions(job_id='job_123')",
+                    "get_job_roi(job_id='job_123')",
+                    "get_conversion_funnel(filters={'jobType': 'LEAD'})",
+                    "get_roi_summary()",
+                    "get_roi_summary(filters={'startDate': '2025-01-01', 'endDate': '2025-12-31'})",
+                ],
+            ),
+            ToolCapability(
+                name="Job Types and Outcomes",
+                description="Retrieve available job types and report job outcomes",
+                parameters={
+                    "get_job_types": {},
+                    "report_outcome": {"job_id": "str", "outcome_data": "dict"},
+                },
+                examples=[
+                    "get_job_types()",
+                    "report_outcome(job_id='job_123', outcome_data={'outcome': 'CONVERTED'})",
+                ],
+            ),
+        ]
+
+    async def _get_resource_relationships(self) -> List[ResourceRelationship]:
+        """Get resource relationships for job management."""
+        return [
+            ResourceRelationship(
+                resource_type="subscriptions",
+                relationship_type="enhances",
+                description="Jobs track performance outcomes for subscription-based workflows",
+                cardinality="N:1",
+                optional=True,
+            ),
+            ResourceRelationship(
+                resource_type="customers",
+                relationship_type="requires",
+                description="Jobs are associated with customer organizations",
+                cardinality="N:1",
+                optional=False,
+            ),
+            ResourceRelationship(
+                resource_type="products",
+                relationship_type="enhances",
+                description="Jobs measure conversion performance against product offerings",
+                cardinality="N:M",
+                optional=True,
+            ),
+        ]
+
+    async def _get_usage_patterns(self) -> List[UsagePattern]:
+        """Get common usage patterns for job management."""
+        return [
+            UsagePattern(
+                pattern_name="Job Performance Review",
+                description="Analyze job performance with ROI and transaction data",
+                frequency=0.8,
+                typical_sequence=["list_jobs", "get_job", "get_job_roi", "get_job_transactions"],
+                common_parameters={"page": 0, "size": 20},
+                success_indicators=["Jobs listed", "ROI data retrieved"],
+            ),
+            UsagePattern(
+                pattern_name="Conversion Analysis",
+                description="Review conversion funnel and report outcomes",
+                frequency=0.6,
+                typical_sequence=["list_jobs", "get_conversion_funnel", "report_outcome"],
+                common_parameters={},
+                success_indicators=["Funnel data retrieved", "Outcome reported"],
+            ),
+            UsagePattern(
+                pattern_name="Job Discovery",
+                description="Explore available job types and current jobs",
+                frequency=0.5,
+                typical_sequence=["get_job_types", "list_jobs"],
+                common_parameters={},
+                success_indicators=["Job types listed", "Jobs enumerated"],
+            ),
+        ]
+
+    async def _get_agent_summary(self) -> str:
+        """Get agent-friendly summary for job management."""
+        return """**Job Management Tool (manage_jobs)**
+
+Track and analyze job performance in the Revenium Jobs & Outcomes system.
+
+**Key Actions:**
+• list_jobs — List all jobs with pagination
+• get_job — Get job details by ID
+• get_job_transactions — View transactions for a job
+• get_job_roi — Get ROI metrics for a job
+• get_job_types — List available job types
+• get_conversion_funnel — View conversion funnel data
+• get_roi_summary — Aggregated ROI across all job types (orchestrates types + funnels)
+• report_outcome — Report a job outcome (CONVERTED or UNSUCCESSFUL; 409 = already reported)
+
+**Quick Start:**
+1. Call get_capabilities() to explore all parameters
+2. Use list_jobs() to find existing jobs
+3. Analyze performance with get_job_roi(), get_conversion_funnel(), or get_roi_summary()
+4. Report results with report_outcome()"""
+
+    async def _get_quick_start_guide(self) -> List[str]:
+        """Get quick start guide for job management."""
+        return [
+            "Call get_capabilities() to see all available actions and parameters",
+            "Use list_jobs(page=0, size=20) to browse existing jobs",
+            "Get detailed job info with get_job(job_id='...')",
+            "Analyze performance using get_job_roi(), get_conversion_funnel(), or get_roi_summary()",
+            "Report job outcomes with report_outcome(job_id='...', outcome_data={...})",
+        ]
+
+    async def _get_common_use_cases(self) -> List[str]:
+        """Get common use cases for job management."""
+        return [
+            "Track AI job ROI to measure cost-effectiveness of automated workflows",
+            "Analyze conversion funnels to identify drop-off points in customer journeys",
+            "Report job outcomes to feed data back into the Revenium analytics pipeline",
+            "List and filter jobs to monitor active and completed job statuses",
+            "Retrieve job transactions for detailed billing and usage audits",
+        ]
+
+    async def _get_troubleshooting_tips(self) -> List[str]:
+        """Get troubleshooting tips for job management."""
+        return [
+            "If report_outcome returns a 409 conflict, the outcome was already reported — use get_job to verify",
+            "If list_jobs returns empty results, check filters or try with page=0 and no filters",
+            "If get_job_roi returns no data, the job may still be running or not have sufficient transaction history",
+            "Ensure job_id is a valid string identifier — use list_jobs to confirm IDs",
+            "For pagination, start with page=0 and check has_next to determine if more pages exist",
+        ]

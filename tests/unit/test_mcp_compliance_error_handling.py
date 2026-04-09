@@ -4,8 +4,6 @@ Covers MCPError, MCPErrorData, JSONRPCErrorCode, and convenience error
 creation functions.
 """
 
-import pytest
-import json
 
 from src.revenium_mcp_server.mcp_compliance.error_handling import (
     JSONRPCErrorCode,

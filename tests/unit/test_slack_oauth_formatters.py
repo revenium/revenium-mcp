@@ -4,8 +4,6 @@ Tests the pure formatting functions that transform OAuth and configuration
 data into user-facing TextContent output.
 """
 
-import pytest
-from mcp.types import TextContent
 
 from src.revenium_mcp_server.tools_decomposed.slack_oauth_formatters import (
     format_oauth_initiation_response,

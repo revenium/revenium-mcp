@@ -1,14 +1,11 @@
 """Unit tests for analytics functionality."""
 
-import pytest
-from datetime import datetime, timezone, timedelta
-from unittest.mock import AsyncMock, patch
+from datetime import datetime, timezone
 
 from src.revenium_mcp_server.alerts.analytics_engine import (
     TimeRange,
     AnomalyFrequencyData,
-    AlertTrendData,
-    AnalyticsEngine
+    AlertTrendData
 )
 
 

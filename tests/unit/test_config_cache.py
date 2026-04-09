@@ -7,7 +7,6 @@ from pathlib import Path
 
 from src.revenium_mcp_server.config_cache import (
     ConfigurationCache,
-    ConfigCacheError,
 )
 
 

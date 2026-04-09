@@ -1,6 +1,5 @@
 """Unit tests for json_schema_validator module."""
 
-import pytest
 
 from src.revenium_mcp_server.json_schema_validator import (
     JSONSchemaValidator,

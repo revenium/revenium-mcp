@@ -10,6 +10,14 @@ from pydantic import BaseModel, Field, field_validator
 
 from .constants import DEFAULT_BASE_URL
 
+# Shared headers sent on every request regardless of auth scheme.
+# Centralised here so version bumps and header changes only need to happen once.
+_COMMON_HEADERS: Dict[str, str] = {
+    "accept": "application/json",
+    "Content-Type": "application/json",
+    "User-Agent": "revenium-platformapi-mcp-server/1.0.0",
+}
+
 
 class EnvironmentType(str, Enum):
     """Environment types for configuration."""
@@ -73,12 +81,7 @@ class AuthConfig(BaseModel):
 
     def get_auth_headers(self) -> Dict[str, str]:
         """Generate authentication headers for API requests."""
-        return {
-            "x-api-key": self.api_key,
-            "accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "revenium-platformapi-mcp-server/1.0.0",
-        }
+        return {**_COMMON_HEADERS, "x-api-key": self.api_key}
 
     def get_team_query_param(self) -> Dict[str, str]:
         """Get team ID as query parameter."""
@@ -197,6 +200,18 @@ def get_auth_headers() -> Dict[str, str]:
     """Get authentication headers for API requests."""
     config = get_auth_config()
     return config.get_auth_headers()
+
+
+def get_bearer_auth_headers(api_key: str) -> Dict[str, str]:
+    """Get Bearer token authentication headers for new analytics API requests.
+
+    Args:
+        api_key: The API key to use as Bearer token
+
+    Returns:
+        Dictionary of headers with Authorization: Bearer <key>
+    """
+    return {**_COMMON_HEADERS, "Authorization": f"Bearer {api_key}"}
 
 
 def get_team_id() -> str:

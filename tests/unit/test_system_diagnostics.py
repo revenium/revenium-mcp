@@ -5,7 +5,7 @@ auto-discovery debugging, and log analysis into a single tool via delegation.
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock
 
 from src.revenium_mcp_server.tools_decomposed.system_diagnostics import SystemDiagnostics
 from mcp.types import TextContent

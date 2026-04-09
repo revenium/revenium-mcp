@@ -5,10 +5,8 @@ filtering of log entries by operation, status, and search term.
 """
 
 import pytest
-from unittest.mock import patch
 
 from src.revenium_mcp_server.tools_decomposed.log_filters import LogFilter
-from src.revenium_mcp_server.common.error_handling import ToolError
 
 
 @pytest.fixture

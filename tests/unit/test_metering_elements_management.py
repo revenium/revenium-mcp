@@ -12,7 +12,6 @@ from src.revenium_mcp_server.tools_decomposed.metering_elements_management impor
     MeteringElementsValidator,
     MeteringElementsManagement,
 )
-from src.revenium_mcp_server.common.error_handling import ToolError
 from mcp.types import TextContent
 
 

@@ -5,9 +5,8 @@ dry-run behavior, and error handling. All API calls are mocked.
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, patch
 
-from mcp.types import TextContent
 
 from src.revenium_mcp_server.tools_decomposed.slack_configuration_management import (
     SlackConfigurationManagement,

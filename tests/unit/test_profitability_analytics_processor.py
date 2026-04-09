@@ -11,7 +11,6 @@ Tests the behavioral correctness of:
 """
 
 import pytest
-from unittest.mock import MagicMock
 
 from src.revenium_mcp_server.analytics.profitability_analytics_processor import (
     ProfitabilityAnalyticsProcessor,
@@ -24,20 +23,6 @@ from src.revenium_mcp_server.analytics.profitability_analytics_processor import 
 # ─────────────────────────────────────────────────────────────────────────────
 # Initialization
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestProfitabilityAnalyticsProcessorInit:
-    """Verify processor initializes with correct endpoints."""
-
-    def test_has_revenue_endpoints(self):
-        proc = ProfitabilityAnalyticsProcessor()
-        assert "revenue_metric_by_organization" in proc.revenue_endpoints
-        assert "revenue_metric_by_product" in proc.revenue_endpoints
-
-    def test_has_cost_endpoints(self):
-        proc = ProfitabilityAnalyticsProcessor()
-        assert "cost_metric_by_organization" in proc.cost_endpoints
-        assert "cost_metric_by_product" in proc.cost_endpoints
 
 
 # ─────────────────────────────────────────────────────────────────────────────

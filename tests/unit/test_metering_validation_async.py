@@ -6,9 +6,8 @@ _validate_float_fields, _validate_timestamp_fields, _validate_special_fields,
 _validate_transaction_inputs_async, and _validate_transaction_inputs_with_details.
 """
 
-import asyncio
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 from src.revenium_mcp_server.tools_decomposed.metering_management import (
     MeteringTransactionManager,

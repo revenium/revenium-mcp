@@ -1,7 +1,6 @@
 """Unit tests for SmartDefaultsEngine — product/alert/customer/source defaults and merging."""
 
 import pytest
-from unittest.mock import AsyncMock, patch
 
 from src.revenium_mcp_server.smart_defaults import SmartDefaultsEngine
 

@@ -4,9 +4,7 @@ All matplotlib rendering calls are mocked to keep tests headless and fast.
 """
 
 import base64
-import io
-import os
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 

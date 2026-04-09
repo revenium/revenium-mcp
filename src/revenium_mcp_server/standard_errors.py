@@ -7,7 +7,7 @@ consistency issue identified in the expert evaluation.
 
 import json
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from mcp.types import TextContent
 

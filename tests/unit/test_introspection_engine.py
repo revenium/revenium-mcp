@@ -2,7 +2,7 @@
 
 import pytest
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.introspection.engine import ToolIntrospectionEngine
 from src.revenium_mcp_server.introspection.metadata import ToolMetadata, MetadataProvider

@@ -5,7 +5,7 @@ validation, and email configuration into a single onboarding tool.
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock
 
 from src.revenium_mcp_server.tools_decomposed.system_setup import SystemSetup
 from mcp.types import TextContent

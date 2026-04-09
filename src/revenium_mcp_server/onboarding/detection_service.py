@@ -150,7 +150,7 @@ class OnboardingDetectionService:
         logger.debug("📊 Getting comprehensive onboarding state...")
 
         # Get cache information using existing infrastructure
-        cache_info = get_cache_info()
+        cache_info = get_cache_info() or {}
         cache_exists = cache_info.get("exists", False)
         cache_valid = cache_info.get("valid", False)
 

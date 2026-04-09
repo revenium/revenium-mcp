@@ -16,7 +16,7 @@ Coverage areas:
 
 import pytest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.alerts.analytics_engine import (
     AlertTrendData,

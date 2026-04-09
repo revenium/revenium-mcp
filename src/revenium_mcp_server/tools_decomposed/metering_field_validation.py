@@ -21,11 +21,12 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
 from ..client import ReveniumClient
+from ..endpoint_registry import get_endpoint_path
 from ..common.error_handling import ErrorCodes, ToolError
 from ..introspection.metadata import ToolCapability, ToolType
 
 # Import existing managers for 100% code reuse
-from .metering_management import MeteringTransactionManager, MeteringValidator
+from .metering_management import MeteringTransactionManager, MeteringValidator, _extract_completions_filters
 from .unified_tool_base import ToolBase
 
 
@@ -312,6 +313,7 @@ class FieldMappingAnalyzer:
         client: ReveniumClient,
         verification_result: Dict[str, Any],
         submitted_transactions: Optional[Dict[str, Dict[str, Any]]] = None,
+        arguments: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Analyze field presence and optionally perform data integrity validation.
 
@@ -319,6 +321,8 @@ class FieldMappingAnalyzer:
             client: Revenium API client
             verification_result: Result from transaction verification
             submitted_transactions: Optional dict of submitted transaction data for integrity validation
+            arguments: Optional tool arguments dict; if provided, search filters (provider, date range,
+                etc.) are extracted and applied to the fallback transaction fetch.
 
         Returns:
             Analysis results with field presence and optionally integrity validation
@@ -333,8 +337,9 @@ class FieldMappingAnalyzer:
                     f"📊 Using {len(recent_transactions)} transactions from verification result (100% code reuse)"
                 )
             else:
-                # Fallback for backward compatibility
-                recent_transactions = await self._fetch_recent_transactions(client, limit=50)
+                # Fallback for backward compatibility — extract filters from arguments if available
+                filters = _extract_completions_filters(arguments) if arguments else None
+                recent_transactions = await self._fetch_recent_transactions(client, limit=50, filters=filters)
                 logger.warning(
                     "⚠️ Using fallback transaction fetch - consider enabling return_transaction_data for better performance"
                 )
@@ -403,24 +408,29 @@ class FieldMappingAnalyzer:
             }
 
     async def _fetch_recent_transactions(
-        self, client: ReveniumClient, limit: int = 50
+        self,
+        client: ReveniumClient,
+        limit: int = 50,
+        filters: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Fetch recent transactions from Revenium reporting API with pagination validation."""
         try:
             # ✅ PAGINATION VALIDATION: Enforce API limits with helpful guidance
-            if limit > 50:
+            if limit > 100:
                 logger.warning(
-                    f"Requested limit {limit} exceeds API maximum of 50, automatically capping to 50"
+                    f"Requested limit {limit} exceeds maximum of 100, automatically capping to 100"
                 )
-                limit = 50
+                limit = 100
 
-            endpoint = "/profitstream/v2/api/sources/metrics/ai/completions"
+            endpoint = get_endpoint_path("completions")
             params = {
                 "teamId": client.team_id,
                 "page": 0,
-                "size": limit,  # Already validated to be ≤ 50
+                "size": limit,  # Already validated to be ≤ 100
                 "sort": "timestamp,desc",
             }
+            if filters:
+                params.update(filters)
 
             logger.info(f"📡 Querying reporting API: {endpoint}")
             response = await client.get(endpoint, params=params)
@@ -515,7 +525,7 @@ class FieldMappingAnalyzer:
     def _build_expected_field_mappings(self) -> Dict[str, str]:
         """Build comprehensive mapping between submitted field names and actual API response field names.
 
-        Based on actual API response structure from /profitstream/v2/api/sources/metrics/ai/completions
+        Based on actual API response structure from completions endpoint (via endpoint_registry: 'completions')
         """
         return {
             # Core transaction fields - EXACT API field names

@@ -1,6 +1,5 @@
 """Unit tests for product_error_handler module."""
 
-import pytest
 
 from src.revenium_mcp_server.product_error_handler import (
     ErrorSeverity,

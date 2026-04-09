@@ -9,7 +9,6 @@ import pytest
 from src.revenium_mcp_server.ai_routing.models import ExtractedParameters
 from src.revenium_mcp_server.ai_routing.parameter_mapper import (
     ParameterMapper,
-    ParameterMappingError,
 )
 
 

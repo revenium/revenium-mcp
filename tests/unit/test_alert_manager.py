@@ -5,12 +5,10 @@ natural language query parsing, and duration calculation.
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from datetime import datetime, timezone
 
 from src.revenium_mcp_server.alerts.alert_manager import AlertManager
-from src.revenium_mcp_server.exceptions import ValidationError
-from mcp.types import TextContent
 
 
 @pytest.fixture

@@ -967,7 +967,7 @@ class JSONSchemaValidator:
                                     },
                                     "operator": {
                                         "type": "string",
-                                        "enum": [">=", ">", "<=", "<", "==", "!="],
+                                        "enum": [">=", ">", "<=", "<", "==", "!=", "INCREASES_BY", "DECREASES_BY"],
                                     },
                                     "value": {"type": "number", "minimum": 0},
                                     "time_window": {

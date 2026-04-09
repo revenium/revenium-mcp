@@ -6,7 +6,7 @@ and subscription management in the Revenium platform.
 
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from pydantic import Field, field_validator
 

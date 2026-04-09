@@ -1,8 +1,5 @@
 """Unit tests for environment variable validation."""
 
-import os
-import pytest
-from unittest.mock import patch
 
 from src.revenium_mcp_server.config_store import get_config_value, get_config_store
 

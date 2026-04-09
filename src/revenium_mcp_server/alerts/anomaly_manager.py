@@ -303,7 +303,7 @@ class AnomalyManager:
         operator_type = anomaly.get('operatorType')
 
         if alert_type:
-            result_text += f"\n\n**Alert Configuration:**"
+            result_text += "\n\n**Alert Configuration:**"
             result_text += f"\n  • **Type:** {alert_type}"
             if metric_type:
                 result_text += f"\n  • **Metric:** {metric_type}"
@@ -319,6 +319,8 @@ class AnomalyManager:
                         "LESS_THAN_OR_EQUAL_TO": "≤",
                         "EQUALS": "=",
                         "NOT_EQUALS": "≠",
+                        "INCREASES_BY": "increases by",
+                        "DECREASES_BY": "decreases by",
                     }
                     operator_symbol = operator_mapping.get(operator_type, operator_type)
                     result_text += f"\n  • **Threshold:** {operator_symbol} {threshold_text}"
@@ -481,8 +483,8 @@ class AnomalyManager:
                 # Set a sensible default based on alert type
                 if api_data.get("alertType") == "THRESHOLD":
                     api_data["periodDuration"] = "FIFTEEN_MINUTES"  # Default for threshold alerts
-                elif api_data.get("alertType") == "CUMULATIVE_USAGE":
-                    api_data["periodDuration"] = "DAILY"  # Default for cumulative usage
+                elif api_data.get("alertType") in ("CUMULATIVE_USAGE", "RELATIVE_CHANGE"):
+                    api_data["periodDuration"] = "DAILY"  # Default for cumulative/relative change
                 else:
                     api_data["periodDuration"] = "FIFTEEN_MINUTES"  # Safe default
 
@@ -557,7 +559,7 @@ class AnomalyManager:
         # Add filter information if available
         filters = created_anomaly.get("filters", [])
         if filters:
-            result_text += f"\n\n**Filters Applied:**"
+            result_text += "\n\n**Filters Applied:**"
             for filter_item in filters:
                 dimension = filter_item.get("dimension", "N/A")
                 operator = filter_item.get("operator", "N/A")
@@ -1012,6 +1014,8 @@ class AnomalyManager:
                 "LESS_THAN_OR_EQUAL",
                 "EQUAL",
                 "NOT_EQUAL",
+                "INCREASES_BY",
+                "DECREASES_BY",
             ],
             "threshold": "numeric",
         }
@@ -1036,7 +1040,7 @@ class AnomalyManager:
                     validated_data[field] = float(value)
                 except (ValueError, TypeError):
                     raise ValidationError(
-                        message=f"Invalid threshold value",
+                        message="Invalid threshold value",
                         field=field,
                         value=value,
                         expected="Numeric value",
@@ -1053,6 +1057,26 @@ class AnomalyManager:
                 validated_data[field] = value
             else:
                 validated_data[field] = value
+
+        # Cross-field validation: operator must match alertType
+        relative_change_operators = {"INCREASES_BY", "DECREASES_BY"}
+        alert_type = validated_data.get("alertType")
+        operator_type = validated_data.get("operatorType")
+
+        if operator_type in relative_change_operators and alert_type != "RELATIVE_CHANGE":
+            raise ValidationError(
+                message=f"Operator '{operator_type}' is only valid for RELATIVE_CHANGE alerts",
+                field="operatorType",
+                value=operator_type,
+                expected="INCREASES_BY/DECREASES_BY require alertType: RELATIVE_CHANGE",
+            )
+        if alert_type == "RELATIVE_CHANGE" and operator_type not in relative_change_operators:
+            raise ValidationError(
+                message="RELATIVE_CHANGE alerts require a relative operator",
+                field="operatorType",
+                value=operator_type,
+                expected="One of: INCREASES_BY, DECREASES_BY",
+            )
 
         # Validate optional fields
         optional_fields = {
@@ -1087,7 +1111,7 @@ class AnomalyManager:
                     and value not in field_type
                 ):
                     raise ValidationError(
-                        message=f"Invalid periodDuration value",
+                        message="Invalid periodDuration value",
                         field=field,
                         value=value,
                         expected=f"One of: {', '.join(field_type)}",

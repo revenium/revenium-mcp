@@ -12,7 +12,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 from loguru import logger
 
-from .error_handling import create_internal_error
 
 
 class NotificationType(Enum):

@@ -70,7 +70,7 @@ class TestActionRouting:
     @pytest.mark.asyncio
     async def test_onboarding_setup_action_is_routed(self, tool):
         """handle_action 'onboarding_setup' produces onboarding-specific output (not guided_setup)."""
-        configs = [{"id": "c1", "name": "N", "workspaceName": "WS"}]
+        configs = [{"id": "c1", "name": "N", "teamName": "WS"}]
         client = _make_client(configs)
         state = MagicMock(is_first_time=False)
         with (
@@ -88,7 +88,7 @@ class TestActionRouting:
     @pytest.mark.asyncio
     async def test_first_time_guidance_action_is_routed(self, tool):
         """handle_action 'first_time_guidance' produces first-time guidance specific output."""
-        configs = [{"id": "c1", "name": "N", "workspaceName": "WS"}]
+        configs = [{"id": "c1", "name": "N", "teamName": "WS"}]
         client = _make_client(configs)
         state = MagicMock()
         with (
@@ -119,7 +119,7 @@ class TestGuidedSetupDefaultNotFound:
     @pytest.mark.asyncio
     async def test_default_id_not_in_config_list_delegates_to_detect(self, tool):
         """When default config ID doesn't match any config, delegate to detect_and_recommend."""
-        configs = [{"id": "c1", "name": "Config A", "workspaceName": "WS-A", "channel": "gen"}]
+        configs = [{"id": "c1", "name": "Config A", "teamName": "WS-A", "channelName": "gen"}]
         client = _make_client(configs, total=1)
         # Default is set to a different ID not in the list
         with (
@@ -150,8 +150,8 @@ class TestDetectAndRecommend:
     async def test_configs_with_no_default_shows_recommendation(self, tool):
         """detect_and_recommend shows select command for each config when no default."""
         configs = [
-            {"id": "c1", "name": "Prod", "workspaceName": "WS", "channel": "gen", "createdDate": "2024"},
-            {"id": "c2", "name": "Dev",  "workspaceName": "WS", "channel": "dev", "createdDate": "2024"},
+            {"id": "c1", "name": "Prod", "teamName": "WS", "channelName": "gen", "createdDate": "2024"},
+            {"id": "c2", "name": "Dev",  "teamName": "WS", "channelName": "dev", "createdDate": "2024"},
         ]
         client = _make_client(configs, total=2)
         with (
@@ -167,7 +167,7 @@ class TestDetectAndRecommend:
     @pytest.mark.asyncio
     async def test_configs_with_default_shows_current_default_section(self, tool):
         """detect_and_recommend shows 'Current Default Configuration' when default matches."""
-        configs = [{"id": "c1", "name": "My Config", "workspaceName": "WS", "channel": "ch", "createdDate": "2024"}]
+        configs = [{"id": "c1", "name": "My Config", "teamName": "WS", "channelName": "ch", "createdDate": "2024"}]
         client = _make_client(configs, total=1)
         with (
             patch(_PATCH_CLIENT, return_value=client),
@@ -181,7 +181,7 @@ class TestDetectAndRecommend:
     @pytest.mark.asyncio
     async def test_default_id_not_matching_shows_issue_section(self, tool):
         """detect_and_recommend shows 'Default Configuration Issue' when default ID missing."""
-        configs = [{"id": "c1", "name": "My Config", "workspaceName": "WS", "channel": "ch", "createdDate": "2024"}]
+        configs = [{"id": "c1", "name": "My Config", "teamName": "WS", "channelName": "ch", "createdDate": "2024"}]
         client = _make_client(configs, total=1)
         with (
             patch(_PATCH_CLIENT, return_value=client),
@@ -293,7 +293,7 @@ class TestOnboardingSetup:
     @pytest.mark.asyncio
     async def test_first_time_configs_no_default_shows_choose_default(self, tool):
         """First-time user with configs but no default gets 'Set Default' prompt."""
-        configs = [{"id": "c1", "name": "N", "workspaceName": "WS"}]
+        configs = [{"id": "c1", "name": "N", "teamName": "WS"}]
         client = _make_client(configs, total=1)
         with (
             patch(_PATCH_CLIENT, return_value=client),
@@ -308,7 +308,7 @@ class TestOnboardingSetup:
     @pytest.mark.asyncio
     async def test_first_time_setup_complete_shows_progress(self, tool):
         """First-time user with default set sees onboarding progress section."""
-        configs = [{"id": "c1", "name": "N", "workspaceName": "WS"}]
+        configs = [{"id": "c1", "name": "N", "teamName": "WS"}]
         client = _make_client(configs, total=1)
         with (
             patch(_PATCH_CLIENT, return_value=client),
@@ -337,7 +337,7 @@ class TestOnboardingSetup:
     @pytest.mark.asyncio
     async def test_returning_user_setup_complete_shows_test_setup(self, tool):
         """Returning user with default set sees 'Test Your Setup' section, not onboarding progress."""
-        configs = [{"id": "c1", "name": "N", "workspaceName": "WS"}]
+        configs = [{"id": "c1", "name": "N", "teamName": "WS"}]
         client = _make_client(configs, total=1)
         with (
             patch(_PATCH_CLIENT, return_value=client),
@@ -388,7 +388,7 @@ class TestFirstTimeGuidance:
     @pytest.mark.asyncio
     async def test_configs_no_default_shows_choose_default_prompt(self, tool):
         """first_time_guidance with configs but no default shows detect_and_recommend prompt."""
-        configs = [{"id": "c1", "name": "Config A", "workspaceName": "WS"}]
+        configs = [{"id": "c1", "name": "Config A", "teamName": "WS"}]
         client = _make_client(configs, total=1)
         state = MagicMock()
         with (
@@ -404,7 +404,7 @@ class TestFirstTimeGuidance:
     @pytest.mark.asyncio
     async def test_setup_complete_shows_test_alert_command(self, tool):
         """first_time_guidance with full setup shows create_simple_alert command."""
-        configs = [{"id": "c1", "name": "Config A", "workspaceName": "WS"}]
+        configs = [{"id": "c1", "name": "Config A", "teamName": "WS"}]
         client = _make_client(configs, total=1)
         state = MagicMock()
         with (
@@ -433,7 +433,7 @@ class TestFirstTimeGuidance:
     @pytest.mark.asyncio
     async def test_always_shows_integration_with_onboarding_section(self, tool):
         """first_time_guidance always renders 'Integration with Onboarding' section (line 673)."""
-        configs = [{"id": "c1", "name": "N", "workspaceName": "WS"}]
+        configs = [{"id": "c1", "name": "N", "teamName": "WS"}]
         client = _make_client(configs, total=1)
         state = MagicMock()
         with (

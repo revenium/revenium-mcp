@@ -5,7 +5,7 @@ verification, caching, circuit breaker, and change notification.
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.capability_manager.core import UnifiedCapabilityManager
 from src.revenium_mcp_server.exceptions import ValidationError

@@ -10,7 +10,7 @@
 
 Once you've connected your AI applications to Revenium using any of the supported middleware libraries or via direct API integration, this MCP server allows agents to directly interact with your Revenium account. Connect Claude, OpenAI, or any MCP-compatible AI assistant to Revenium to configure AI cost alerts & tracking as well as usage-based billing for AI products.
 
-##  Features
+## Features
 
 ### AI Cost Tracking & Alerting - Never Be Surprised by Unexpected AI Costs Again
 - Ask AI agents to **set up AI cost alerts to avoid unexpected costs**
@@ -18,6 +18,16 @@ Once you've connected your AI applications to Revenium using any of the supporte
 - Ask Revenium to **calculate AI cost & usage trends over time** and set up alerts to immediately send slack or email notifications when anomalies occur
 - Quickly **investigate the reasons for AI cost spikes**. Identify abnormal changes in spending by agent, API key, product, customer, and more.
 - Use AI agents to **integrate Revenium metering into your applications** if not using Revenium's pre-built SDKs
+
+### Outcomes for AI - Track AI Agent Job ROI
+- Track AI agent **job execution, measure ROI, and report outcomes**
+- Analyze **conversion funnels** from job initiation through outcome delivery
+- Report business outcomes tied to specific AI agent jobs
+
+### Tool Registry - Register & Price Your AI Tools
+- **Register, manage, and analyze AI tools** with built-in pricing tiers
+- Support for multiple pricing models: per_request, tiered, and flat
+- Track tool usage events and analyze cost, latency, and success rates
 
 ### Usage-based Billing & Chargebacks (Optional)
 If or when you're ready to turn AI costs into AI revenue, the Revenium MCP will be there to help quickly make the transition.
@@ -28,7 +38,7 @@ If or when you're ready to turn AI costs into AI revenue, the Revenium MCP will 
 ### Profile-Based Tool Selection
 The MCP provides the appropriate tools for each use case depending on your chosen startup profile:
 - **Starter Profile (7 tools):** Cost monitoring, alerts, analytics, AI metering integration
-- **Business Profile (15 tools):** All Starter tools plus product management, customer management, subscriptions, billing
+- **Business Profile (17 tools):** All Starter tools plus product management, customer management, subscriptions, billing, tool registry
 
 ## Getting Started
 
@@ -74,7 +84,7 @@ See [Installation](#installation) for Cursor, Augment, and other integrations.
 
 Implements [Model Context Protocol](https://modelcontextprotocol.io/specification/2025-06-18) version **2025-06-18**.
 
-- **Framework:** FastMCP 2.10+
+- **Framework:** FastMCP 3.2+
 - **Transport:** stdio
 - **Protocol:** JSON-RPC 2.0
 
@@ -222,7 +232,7 @@ The MCP server supports two profiles to match your use case:
 | Profile | Tools | Target Users | Use Cases |
 |---------|-------|--------------|-----------|
 | **Starter** (default) | 7 tools | Cost monitoring & alerts | Cost analysis, AI transaction metering |
-| **Business** | 15 tools | Full platform | Product & subscription management, usage-based billing, comprehensive analytics |
+| **Business** | 17 tools | Full platform | Product & subscription management, usage-based billing, comprehensive analytics, tool registry |
 
 The server uses the **Starter** profile by default. To use the **Business** profile, set the `TOOL_PROFILE` environment variable:
 
@@ -235,7 +245,7 @@ TOOL_PROFILE=starter
 EOF
 uvx revenium-mcp
 
-# Business Profile (15 tools) - Usage-based billing & AI Analytics
+# Business Profile (17 tools) - Usage-based billing & AI Analytics
 cat > .env << EOF
 REVENIUM_API_KEY=hak_your_api_key_here
 TOOL_PROFILE=business
@@ -386,6 +396,21 @@ Set up intelligent monitoring for costs, usage, and performance metrics.
 - *Example: "Alert when my error rate exceeds 5% every 5 minutes"*
 - *Example: "Set up cost per transaction monitoring so any single AI call costing more than $1.50 triggers an immediate Slack alert"*
 
+#### Relative Change Alerts (Trend Detection)
+
+Detect percentage-based cost changes over configurable time periods. Use `RELATIVE_CHANGE` alerts with `INCREASES_BY` or `DECREASES_BY` operators to catch trends before they become problems.
+
+| Setting | Options |
+|---------|---------|
+| **Operators** | `INCREASES_BY`, `DECREASES_BY` |
+| **Periods** | `DAILY`, `WEEKLY`, `MONTHLY`, `QUARTERLY` |
+
+```
+"Alert me if weekly AI costs increase by more than 25%"
+"Create a relative change alert that triggers when monthly spend decreases by 15%"
+"Set up a daily trend alert — notify me on Slack if costs increase by 10% day over day"
+```
+
 ### Slack Integration
 - *Example: "Set up a Slack notification channel for Revenium alerts"*
 - *Example: "Add a new slack channel for all customer spending alerts"*
@@ -423,6 +448,27 @@ Track AI usage, token consumption, and transaction data with comprehensive integ
 - *Example: "Help me integrate this python AI function with Revenium's AI metering API"*
 - *Example: "Generate test transaction data from our application and ensure all metadata is properly mapped in Revenium."*
 
+### Jobs & Outcomes (Outcomes for AI)
+Track AI agent job execution, measure ROI, and report business outcomes. Jobs represent units of AI agent work; outcomes capture the business value delivered.
+
+**Key actions:**
+- `list_jobs` — List jobs with filtering and pagination
+- `get_job` — Retrieve a specific job by its `agenticJobId`
+- `get_job_transactions` — View transactions associated with a job
+- `get_job_roi` — Calculate return on investment for a job
+- `get_job_types` — List available job type classifications
+- `get_conversion_funnel` — Analyze conversion from job initiation through outcome
+- `report_outcome` — Report a business outcome tied to a job
+
+**Note:** When referencing jobs, use the `agenticJobId` field as the `job_id` parameter.
+
+```
+"List all AI agent jobs from the last 7 days"
+"Show me the ROI for job aj_abc123"
+"Report a successful outcome for job aj_xyz789 with revenue of $150"
+"Show the conversion funnel for jobs this month"
+```
+
 ---
 
 ## Usage-Based Billing Tools (Business Profile Only)
@@ -452,6 +498,31 @@ Control customer subscriptions, billing cycles, and plan changes.
 - *Example: "Create a monthly subscription for customer ABC Corp to the product 'analytics-suite'"*
 - *Example: "Show me all active subscriptions to the AI Analytics product"*
 - *Example: "List subscriptions that are about to expire this month"*
+
+###  Tool Registry Management
+Register, manage, and analyze AI tools in the Revenium Tool Registry with pricing tiers, event metering, and analytics.
+
+**Key actions:**
+- `list` — List registered tools with pagination
+- `get` — Retrieve a specific tool by ID
+- `create` — Register a new tool with full configuration including pricing
+- `create_simple` — Quick tool registration with sensible defaults
+- `update` — Update a tool's configuration
+- `delete` — Remove a tool from the registry
+- `search` — Search tools by name, type, or other criteria
+- `meter_event` — Submit a tool/function call for metering
+- `list_events` — List tool event logs (filterable)
+- `analytics` — Get usage analytics across tools
+
+**Pricing models:** `per_request`, `tiered`, `flat`
+
+```
+"Register a new tool called 'sentiment-analyzer' with per_call pricing at $0.02 per call"
+"Create a tool 'doc-summarizer' with tiered pricing — free up to 100 calls, then $0.01 each"
+"List all registered tools in the tool registry"
+"Show me tool analytics for the last 30 days"
+"Search for tools related to 'translation'"
+```
 
 ## Configuration Options
 
@@ -609,10 +680,9 @@ python -c "import os; from dotenv import load_dotenv; load_dotenv(); print(f'API
 pytest
 
 # Run linters
-black .
-isort .
+ruff check .
+ruff format .
 mypy .
-flake8
 ```
 
 **Important:** Never commit your `.env` file. The repository includes `.env.example` as a template.

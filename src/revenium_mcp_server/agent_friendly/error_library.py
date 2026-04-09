@@ -68,7 +68,7 @@ class ErrorLibrary:
             examples={"valid_request": {id_field: f"{resource_type.lower()}_123"}},
             recovery_actions=[
                 f"Add the '{id_field}' parameter to your request",
-                f"Get a valid ID from the list() action",
+                "Get a valid ID from the list() action",
             ],
         )
 

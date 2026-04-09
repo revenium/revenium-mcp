@@ -16,7 +16,6 @@ from datetime import datetime
 from src.revenium_mcp_server.analytics.chart_data_formatter import (
     ChartDataFormatter,
     ChartType,
-    ChartConfig,
     ChartData,
     ColorScheme,
 )

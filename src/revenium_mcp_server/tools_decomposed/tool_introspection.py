@@ -202,7 +202,7 @@ Essential tool introspection and metadata access for MCP tools including capabil
             value=action,
             suggestions=[
                 "Use 'get_capabilities' to see all available actions",
-                "Use 'get_examples' to see usage examples", 
+                "Use 'get_examples' to see usage examples",
                 "Check the action name for typos",
                 "Valid actions: list_tools, get_tool_metadata, get_capabilities, get_examples",
                 "DEPRECATED: get_all_metadata is no longer available - use standard MCP discovery patterns",
@@ -272,7 +272,7 @@ Essential tool introspection and metadata access for MCP tools including capabil
         """Get quick start guide."""
         return [
             "Start with list_tools() to see all available MCP tools",
-            "Use get_tool_metadata(tool_name='...') for detailed information about specific tools", 
+            "Use get_tool_metadata(tool_name='...') for detailed information about specific tools",
             "STANDARD MCP PATTERN: Call individual tools with get_capabilities action for detailed information",
             "Use get_capabilities() to understand introspection service features",
             "Reference get_examples() for usage patterns and best practices",

@@ -3,7 +3,6 @@
 import os
 import pytest
 from unittest.mock import AsyncMock, MagicMock
-from typing import AsyncGenerator
 
 # Set test environment variables
 os.environ["REVENIUM_API_KEY"] = "test_api_key_12345"
@@ -25,18 +24,18 @@ def mock_env_vars(monkeypatch):
 async def mock_revenium_client():
     """Mock Revenium API client for testing."""
     from src.revenium_mcp_server.client import ReveniumClient
-    
+
     client = MagicMock(spec=ReveniumClient)
     client.api_key = "test_api_key_12345"
     client.base_url = "https://api.test.revenium.ai"
     client.timeout = 30.0
-    
+
     # Mock async methods
     client._request = AsyncMock()
     client.close = AsyncMock()
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=None)
-    
+
     return client
 
 

@@ -4,7 +4,6 @@ Tests the SessionInfo dataclass including expiry detection, session data
 management, and serialization.
 """
 
-import pytest
 from datetime import datetime, timedelta
 
 from src.revenium_mcp_server.mcp_compliance.session_info import SessionInfo

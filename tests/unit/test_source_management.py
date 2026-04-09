@@ -4,7 +4,6 @@ Tests the SourceManager and SourceManagement classes from the decomposed tools m
 Focuses on CRUD operations, auto-generation logic, validation, and error handling.
 """
 
-import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 

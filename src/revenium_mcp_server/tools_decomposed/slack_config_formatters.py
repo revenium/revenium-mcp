@@ -26,7 +26,7 @@ def format_configurations_list(response: Dict[str, Any], page: int) -> List[Text
                 text="# No Slack Configurations Found\n\n"
                 "No Slack configurations are currently set up.\n\n"
                 "**To add a configuration:**\n"
-                "Use `slack_oauth_workflow(action='initiate_oauth')` to start setup.",
+                "Use `slack_management(action='initiate_oauth')` to start setup.",
             )
         ]
 
@@ -69,9 +69,9 @@ def format_pagination_info(page: int, total_pages: int) -> str:
 
     result = "---\n\n**Navigation:**\n"
     if page > 0:
-        result += f"- Previous page: `slack_configuration_management(action='list_configurations', page={page-1})`\n"
+        result += f"- Previous page: `slack_management(action='list_configurations', page={page-1})`\n"
     if page < total_pages - 1:
-        result += f"- Next page: `slack_configuration_management(action='list_configurations', page={page+1})`\n"
+        result += f"- Next page: `slack_management(action='list_configurations', page={page+1})`\n"
 
     return result
 
@@ -80,8 +80,8 @@ def format_usage_instructions() -> str:
     """Format usage instructions."""
     return (
         "\n**Usage:**\n"
-        "- View details: `slack_configuration_management(action='get_configuration', config_id='CONFIG_ID')`\n"
-        "- Set as default: `slack_configuration_management(action='set_default_configuration', config_id='CONFIG_ID')`\n"
+        "- View details: `slack_management(action='get_configuration', config_id='CONFIG_ID')`\n"
+        "- Set as default: `slack_management(action='set_default_configuration', config_id='CONFIG_ID')`\n"
     )
 
 
@@ -108,9 +108,9 @@ def format_configuration_details(config: Dict[str, Any], config_id: str) -> List
         result_text += "**This is your current default Slack configuration.**\n\n"
 
     result_text += "**Actions:**\n"
-    result_text += f"- Set as default: `slack_configuration_management(action='set_default_configuration', config_id='{config_id}')`\n"
+    result_text += f"- Set as default: `slack_management(action='set_default_configuration', config_id='{config_id}')`\n"
     result_text += (
-        "- Back to list: `slack_configuration_management(action='list_configurations')`\n"
+        "- Back to list: `slack_management(action='list_configurations')`\n"
     )
 
     return [TextContent(type="text", text=result_text)]
@@ -141,9 +141,9 @@ def format_no_default_message() -> List[TextContent]:
     result_text += "No default Slack configuration is currently set.\n\n"
     result_text += "**To set a default:**\n"
     result_text += (
-        "1. List configurations: `slack_configuration_management(action='list_configurations')`\n"
+        "1. List configurations: `slack_management(action='list_configurations')`\n"
     )
-    result_text += "2. Set default: `slack_configuration_management(action='set_default_configuration', config_id='CONFIG_ID')`\n"
+    result_text += "2. Set default: `slack_management(action='set_default_configuration', config_id='CONFIG_ID')`\n"
 
     return [TextContent(type="text", text=result_text)]
 
@@ -174,7 +174,7 @@ def format_oauth_url_response(oauth_url: str, app_base_url: str) -> List[TextCon
     result_text += "1. Click the link above or copy the URL to your browser\n"
     result_text += "2. Complete the Slack OAuth authorization\n"
     result_text += (
-        "3. Return and refresh: `slack_configuration_management(action='list_configurations')`\n"
+        "3. Return and refresh: `slack_management(action='list_configurations')`\n"
     )
 
     return [TextContent(type="text", text=result_text)]
@@ -187,36 +187,36 @@ def get_examples_text() -> str:
 ## Basic Operations
 ```python
 # List all configurations
-slack_configuration_management(action="list_configurations")
+slack_management(action="list_configurations")
 
 # Get specific configuration
-slack_configuration_management(action="get_configuration", config_id="slack-123")
+slack_management(action="get_configuration", config_id="slack-123")
 
 # Set default configuration
-slack_configuration_management(action="set_default_configuration", config_id="slack-123")
+slack_management(action="set_default_configuration", config_id="slack-123")
 
 # Get current default
-slack_configuration_management(action="get_default_configuration")
+slack_management(action="get_default_configuration")
 
 # Get OAuth setup URL
-slack_configuration_management(action="get_app_oauth_url")
+slack_management(action="get_app_oauth_url")
 ```
 
 ## Advanced Usage
 ```python
 # Pagination
-slack_configuration_management(action="list_configurations", page=1, size=10)
+slack_management(action="list_configurations", page=1, size=10)
 
 # Dry-run mode (validation only)
-slack_configuration_management(action="set_default_configuration", config_id="slack-123", dry_run=true)
+slack_management(action="set_default_configuration", config_id="slack-123", dry_run=true)
 ```
 
 ## Common Workflows
 ### Setup New Slack Integration
-1. Get OAuth URL: `slack_configuration_management(action="get_app_oauth_url")`
+1. Get OAuth URL: `slack_management(action="get_app_oauth_url")`
 2. Complete OAuth in browser
-3. List configurations: `slack_configuration_management(action="list_configurations")`
-4. Set default: `slack_configuration_management(action="set_default_configuration", config_id="new-config-id")`
+3. List configurations: `slack_management(action="list_configurations")`
+4. Set default: `slack_management(action="set_default_configuration", config_id="new-config-id")`
 """
 
 
@@ -245,7 +245,7 @@ Comprehensive management of Slack configurations for alert notifications with fu
 
 ## Integration Points
 - **Alert Management**: Default configurations automatically used in alert creation
-- **OAuth Workflow**: Integrates with slack_oauth_workflow for setup
+- **OAuth Workflow**: Integrates with slack_management for setup
 - **Configuration Store**: Persists default settings via environment variables
 
 ## Error Handling

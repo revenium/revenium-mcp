@@ -683,7 +683,7 @@ def print_regression_report(report: RegressionTestReport):
     print(f"Total Duration: {report.total_duration_seconds:.1f} seconds")
     print(f"Overall Result: {report.overall_result.value.upper()}")
 
-    print(f"\n📊 TEST SUMMARY:")
+    print("\n📊 TEST SUMMARY:")
     summary = report.summary
     print(f"   Total Tests: {summary['total_tests']}")
     print(f"   Passed: {summary['passed_tests']}")
@@ -691,7 +691,7 @@ def print_regression_report(report: RegressionTestReport):
     print(f"   Errors: {summary['error_tests']}")
     print(f"   Success Rate: {summary['success_rate']:.1f}%")
 
-    print(f"\n🔍 TEST EXECUTIONS:")
+    print("\n🔍 TEST EXECUTIONS:")
     for execution in report.test_executions:
         status_icon = (
             "✅"
@@ -704,7 +704,7 @@ def print_regression_report(report: RegressionTestReport):
         if execution.error_message:
             print(f"      Error: {execution.error_message[:100]}...")
 
-    print(f"\n📈 REGRESSION ANALYSIS:")
+    print("\n📈 REGRESSION ANALYSIS:")
     regression = report.regression_analysis
     if regression.get("status") == "completed":
         print(
@@ -713,7 +713,7 @@ def print_regression_report(report: RegressionTestReport):
     else:
         print(f"   Status: {regression.get('status', 'unknown')}")
 
-    print(f"\n📋 BASELINE COMPARISON:")
+    print("\n📋 BASELINE COMPARISON:")
     baseline = report.baseline_comparison
     if baseline.get("status") == "completed":
         print(f"   Duration Change: {baseline.get('duration_change_percent', 0):.1f}%")
@@ -725,7 +725,7 @@ def print_regression_report(report: RegressionTestReport):
     else:
         print(f"   Status: {baseline.get('status', 'unknown')}")
 
-    print(f"\n💡 RECOMMENDATIONS:")
+    print("\n💡 RECOMMENDATIONS:")
     for i, rec in enumerate(report.recommendations, 1):
         print(f"   {i}. {rec}")
 

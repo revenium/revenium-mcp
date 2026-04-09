@@ -13,9 +13,8 @@ Covers:
 - ProductManagement._generate_educational_feedback
 """
 
-import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -24,9 +23,6 @@ from mcp.types import TextContent
 from src.revenium_mcp_server.tools_decomposed.product_management import (
     ProductHierarchyManager,
     ProductManagement,
-    ProductEnhancementProcessor,
-    ProductManager,
-    ProductValidator,
 )
 from src.revenium_mcp_server.common.error_handling import ToolError
 

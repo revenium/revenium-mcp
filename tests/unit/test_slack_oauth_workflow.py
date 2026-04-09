@@ -7,7 +7,6 @@ OAuth URL generation, and error handling.
 import pytest
 from unittest.mock import AsyncMock, patch
 
-from mcp.types import TextContent
 
 from src.revenium_mcp_server.tools_decomposed.slack_oauth_workflow import SlackOAuthWorkflow
 from src.revenium_mcp_server.common.error_handling import ToolError

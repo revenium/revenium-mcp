@@ -4,13 +4,10 @@ Tests the FastMCPPerformanceErrors class which creates structured error
 responses when dashboard generation fails.
 """
 
-import pytest
-from unittest.mock import patch
 
 from src.revenium_mcp_server.tools_decomposed.fastmcp_performance_errors import (
     FastMCPPerformanceErrors,
 )
-from src.revenium_mcp_server.common.error_handling import ToolError
 from mcp.types import TextContent
 
 

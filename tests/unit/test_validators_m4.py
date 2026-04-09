@@ -502,10 +502,32 @@ class TestValidateDetectionRule:
         assert "metric" in exc_info.value.details["field"]
 
     def test_all_valid_rule_types_accepted(self):
-        for rt in ["THRESHOLD", "STATISTICAL", "PATTERN", "ANOMALY", "TREND", "CUMULATIVE_USAGE"]:
+        for rt in ["THRESHOLD", "STATISTICAL", "PATTERN", "ANOMALY", "CUMULATIVE_USAGE"]:
             rule = {**self._base_rule(), "rule_type": rt}
             result = InputValidator.validate_detection_rule(rule)
             assert result["rule_type"] == rt
+        # RELATIVE_CHANGE requires a relative operator
+        rule = {**self._base_rule(), "rule_type": "RELATIVE_CHANGE", "operator": "INCREASES_BY"}
+        result = InputValidator.validate_detection_rule(rule)
+        assert result["rule_type"] == "RELATIVE_CHANGE"
+
+    def test_relative_change_rejects_non_relative_operator(self):
+        rule = {**self._base_rule(), "rule_type": "RELATIVE_CHANGE", "operator": ">"}
+        with pytest.raises(ValidationError) as exc_info:
+            InputValidator.validate_detection_rule(rule)
+        assert "operator" in exc_info.value.details["field"]
+
+    def test_relative_operator_rejects_non_relative_rule_type(self):
+        rule = {**self._base_rule(), "rule_type": "THRESHOLD", "operator": "INCREASES_BY"}
+        with pytest.raises(ValidationError) as exc_info:
+            InputValidator.validate_detection_rule(rule)
+        assert "operator" in exc_info.value.details["field"]
+
+    def test_trend_rule_type_rejected(self):
+        rule = {**self._base_rule(), "rule_type": "TREND"}
+        with pytest.raises(ValidationError) as exc_info:
+            InputValidator.validate_detection_rule(rule)
+        assert "rule_type" in exc_info.value.details["field"]
 
 
 # ---------------------------------------------------------------------------

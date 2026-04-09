@@ -17,7 +17,6 @@ from ..common.error_handling import (
     ErrorCodes,
     ToolError,
     create_structured_missing_parameter_error,
-    create_structured_validation_error,
 )
 from ..config_store import get_config_value
 from ..introspection.metadata import ToolCapability, ToolType
@@ -155,7 +154,7 @@ class SlackConfigurationManagement(ToolBase):
                 parameter_name="config_id",
                 action=action,
                 examples={
-                    "usage": f"slack_configuration_management(action='{action}', config_id='slack-123')",
+                    "usage": f"slack_management(action='{action}', config_id='slack-123')",
                     "valid_format": "Configuration ID should be a string identifier",
                     "example_ids": ["slack-123", "slack-456", "slack-789"],
                 },

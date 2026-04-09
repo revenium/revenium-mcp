@@ -85,7 +85,7 @@ def apply_mcp_tool_decorator(mcp_instance: FastMCP, func: Callable) -> Any:
         func: Function with dynamic description already set
 
     Returns:
-        FunctionTool object decorated with @mcp.tool
+        The original function (FastMCP 3.x returns the decorated function itself)
     """
     try:
         # Apply the actual @mcp.tool decorator

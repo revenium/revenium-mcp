@@ -177,6 +177,24 @@ class TestExtractAlertType:
         result = processor._extract_alert_type("alert when cost goes over $500 per month")
         assert result == "CUMULATIVE_USAGE"
 
+    def test_relative_change_keyword(self, processor):
+        assert processor._extract_alert_type("relative change alert for cost") == "RELATIVE_CHANGE"
+
+    def test_percentage_change_keyword(self, processor):
+        assert processor._extract_alert_type("percentage change in spending") == "RELATIVE_CHANGE"
+
+    def test_trending_keyword(self, processor):
+        assert processor._extract_alert_type("alert when cost is trending up") == "RELATIVE_CHANGE"
+
+    def test_trend_alert_keyword(self, processor):
+        assert processor._extract_alert_type("set up a trend alert") == "RELATIVE_CHANGE"
+
+    def test_increases_by_keyword(self, processor):
+        assert processor._extract_alert_type("alert when cost increases by 20%") == "RELATIVE_CHANGE"
+
+    def test_decreases_by_keyword(self, processor):
+        assert processor._extract_alert_type("notify when usage decreases by 10%") == "RELATIVE_CHANGE"
+
 
 # ---------------------------------------------------------------------------
 # _extract_filters: regex-based filter extraction from natural language
@@ -297,6 +315,76 @@ class TestParseAlertRequest:
         assert rule["operator"] == ">"
         assert rule["value"] == 100.0
 
+    def test_relative_change_alert_parsed(self, processor):
+        """RELATIVE_CHANGE alerts should be recognized from NLP text."""
+        result = processor.parse_alert_request(
+            "relative change alert when cost per transaction goes above 25%"
+        )
+        assert result["alertType"] == "RELATIVE_CHANGE"
+        assert result["metric"] == "COST_PER_TRANSACTION"
+        assert result["threshold"] == 25.0
+
+    def test_relative_change_increases_by_operator(self, processor):
+        """RELATIVE_CHANGE alert with 'increases by' should produce INCREASES_BY operator and detection rule."""
+        result = processor.parse_alert_request(
+            "alert when error rate increases by 20%"
+        )
+        assert result["alertType"] == "RELATIVE_CHANGE"
+        assert result["threshold"] == 20.0
+        assert len(result["detection_rules"]) == 1
+        rule = result["detection_rules"][0]
+        assert rule["rule_type"] == "RELATIVE_CHANGE"
+        assert rule["operator"] == "INCREASES_BY"
+        assert rule["value"] == 20.0
+
+    def test_relative_change_decreases_by_operator(self, processor):
+        """RELATIVE_CHANGE alert with 'decreases by' should produce DECREASES_BY operator and detection rule."""
+        result = processor.parse_alert_request(
+            "alert when error rate decreases by 15%"
+        )
+        assert result["alertType"] == "RELATIVE_CHANGE"
+        assert result["threshold"] == 15.0
+        assert len(result["detection_rules"]) == 1
+        rule = result["detection_rules"][0]
+        assert rule["rule_type"] == "RELATIVE_CHANGE"
+        assert rule["operator"] == "DECREASES_BY"
+        assert rule["value"] == 15.0
+
+    def test_relative_change_increases_by_bare_number(self, processor):
+        """RELATIVE_CHANGE 'increases by N' without % should still extract threshold and produce a detection rule."""
+        result = processor.parse_alert_request(
+            "alert when error rate increases by 20"
+        )
+        assert result["alertType"] == "RELATIVE_CHANGE"
+        assert result["threshold"] == 20.0
+        assert len(result["detection_rules"]) == 1
+        rule = result["detection_rules"][0]
+        assert rule["rule_type"] == "RELATIVE_CHANGE"
+        assert rule["operator"] == "INCREASES_BY"
+        assert rule["value"] == 20.0
+
+    def test_relative_change_singular_increase_by(self, processor):
+        """Singular 'increase by' should classify as RELATIVE_CHANGE, not THRESHOLD."""
+        result = processor.parse_alert_request(
+            "alert when error rate increase by 20%"
+        )
+        assert result["alertType"] == "RELATIVE_CHANGE"
+        assert len(result["detection_rules"]) == 1
+        rule = result["detection_rules"][0]
+        assert rule["rule_type"] == "RELATIVE_CHANGE"
+        assert rule["operator"] == "INCREASES_BY"
+
+    def test_relative_change_time_interval_clamped_to_daily(self, processor):
+        """RELATIVE_CHANGE with a sub-day time interval should clamp to 'daily', not pass '5m' to validator."""
+        result = processor.parse_alert_request(
+            "alert when error rate increases by 20% every 5 minutes"
+        )
+        assert result["alertType"] == "RELATIVE_CHANGE"
+        assert len(result["detection_rules"]) == 1
+        rule = result["detection_rules"][0]
+        assert rule["rule_type"] == "RELATIVE_CHANGE"
+        assert rule["time_window"] == "daily"
+
     def test_no_metric_no_rule(self, processor):
         """Without a metric, no detection rule should be built."""
         result = processor.parse_alert_request("set up an alert please")
@@ -341,16 +429,16 @@ class TestValidateAndWarnLimitations:
         )
         assert any("Missing Threshold" in w for w in warnings)
 
-    def test_relative_change_warning(self, processor):
+    def test_relative_change_no_warning(self, processor):
+        """RELATIVE_CHANGE is supported — no warning should be emitted for change-related text."""
         warnings = processor.validate_and_warn_limitations(
             "alert when cost increase", {"metric": "TOTAL_COST", "operator": ">", "threshold": 10}
         )
-        assert any("Relative change" in w or "relative" in w.lower() for w in warnings)
+        assert not any("not supported" in w.lower() or "feature limitation" in w.lower() for w in warnings)
 
     def test_no_warnings_for_valid(self, processor):
         parsed = {"metric": "TOTAL_COST", "operator": ">", "threshold": 100}
         warnings = processor.validate_and_warn_limitations("cost above 100", parsed)
-        # Should only have the relative change warning for valid data
         error_warnings = [w for w in warnings if "Missing" in w]
         assert len(error_warnings) == 0
 

@@ -9,7 +9,7 @@ to verify behavior through strategy dispatch rather than internal dict state.
 
 import pytest
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.hierarchy.entity_lookup_service import (
     EntityLookupService,
@@ -1034,7 +1034,6 @@ class TestModuleLevelHelpers:
     def test_get_entity_lookup_service_returns_entity_lookup_service_instance(self, monkeypatch):
         """get_entity_lookup_service returns an EntityLookupService instance."""
         import sys
-        import src.revenium_mcp_server.hierarchy.entity_lookup_service  # ensure loaded
         mod = sys.modules["src.revenium_mcp_server.hierarchy.entity_lookup_service"]
         monkeypatch.setattr(mod, "_entity_lookup_service", None)
         svc = get_entity_lookup_service()
@@ -1044,7 +1043,6 @@ class TestModuleLevelHelpers:
     def test_get_entity_lookup_service_returns_same_singleton_on_repeated_calls(self, monkeypatch):
         """Repeated calls return the same singleton instance (not a new object each time)."""
         import sys
-        import src.revenium_mcp_server.hierarchy.entity_lookup_service  # ensure loaded
         mod = sys.modules["src.revenium_mcp_server.hierarchy.entity_lookup_service"]
         monkeypatch.setattr(mod, "_entity_lookup_service", None)
         svc1 = get_entity_lookup_service()
@@ -1054,7 +1052,6 @@ class TestModuleLevelHelpers:
     def test_entity_lookup_service_backward_compat_returns_same_singleton(self, monkeypatch):
         """entity_lookup_service() (backward compat) returns the same singleton."""
         import sys
-        import src.revenium_mcp_server.hierarchy.entity_lookup_service  # ensure loaded
         mod = sys.modules["src.revenium_mcp_server.hierarchy.entity_lookup_service"]
         monkeypatch.setattr(mod, "_entity_lookup_service", None)
         svc1 = get_entity_lookup_service()

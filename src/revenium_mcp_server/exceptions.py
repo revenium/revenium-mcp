@@ -47,12 +47,12 @@ class AlertToolsError(Exception):
         formatted_message = f"**Error**: {self.message}"
 
         if self.details:
-            formatted_message += f"\n\n**Details:**"
+            formatted_message += "\n\n**Details:**"
             for key, value in self.details.items():
                 formatted_message += f"\n  • {key}: {value}"
 
         if self.suggestions:
-            formatted_message += f"\n\n**Suggestions:**"
+            formatted_message += "\n\n**Suggestions:**"
             for suggestion in self.suggestions:
                 formatted_message += f"\n  • {suggestion}"
 

@@ -16,6 +16,7 @@ from loguru import logger
 
 from ..client import ReveniumAPIError, ReveniumClient
 from ..common.error_handling import ErrorCodes, ToolError, create_structured_validation_error
+from ..endpoint_registry import resolve_analytics_request
 
 
 @dataclass
@@ -42,19 +43,6 @@ class CostAnalyticsProcessor:
 
     def __init__(self):
         """Initialize the cost analytics processor."""
-        self.cost_endpoints = {
-            # Primary endpoint for cost analysis - tokens-per-minute-by-provider with tokenType=TOTAL
-            "tokens_per_minute_by_provider": "/profitstream/v2/api/sources/metrics/ai/tokens-per-minute-by-provider",
-            # Legacy endpoints (keeping for backward compatibility)
-            "total_cost_by_provider_over_time": "/profitstream/v2/api/sources/metrics/ai/total-cost-by-provider-over-time",
-            "cost_metric_by_provider_over_time": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-provider-over-time",
-            "total_cost_by_model": "/profitstream/v2/api/sources/metrics/ai/total-cost-by-model",
-            "cost_metrics_by_subscriber_credential": "/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-subscriber-credential",
-            "cost_metric_by_organization": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-organization",
-            "cost_metric_by_product": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-product",
-            # Agent breakdown endpoint
-            "cost_metrics_by_agents_over_time": "/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-agents-over-time",
-        }
 
     def _normalize_entity_name(self, entity_name: str, entity_type: str = "provider") -> str:
         """Normalize entity names for consistent aggregation.
@@ -312,18 +300,17 @@ class CostAnalyticsProcessor:
         """
         logger.info(f"Getting cost breakdown by {breakdown_type} for team {team_id}")
 
-        endpoint_map = {
-            "provider": self.cost_endpoints[
-                "total_cost_by_provider_over_time"
-            ],  # Use verified endpoint
-            "model": self.cost_endpoints["total_cost_by_model"],
-            "customer": self.cost_endpoints["cost_metric_by_organization"],
-            "product": self.cost_endpoints["cost_metric_by_product"],
-            "agent": "/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-agents-over-time",  # Agent breakdown endpoint
-            "agents": "/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-agents-over-time",  # Plural form support
+        # Maps breakdown_type to the endpoint registry key used in resolve_analytics_request
+        endpoint_key_map = {
+            "provider": "total_cost_by_provider_over_time",
+            "model": "total_cost_by_model",
+            "customer": "cost_metric_by_organization",
+            "product": "cost_metric_by_product",
+            "agent": "cost_metrics_by_agents_over_time",
+            "agents": "cost_metrics_by_agents_over_time",
         }
 
-        if breakdown_type not in endpoint_map:
+        if breakdown_type not in endpoint_key_map:
             raise create_structured_validation_error(
                 message=f"Unsupported breakdown type: {breakdown_type}",
                 field="breakdown_type",
@@ -334,7 +321,7 @@ class CostAnalyticsProcessor:
                     "Choose a breakdown that matches your analysis needs",
                 ],
                 examples={
-                    "supported_types": list(endpoint_map.keys()),
+                    "supported_types": list(endpoint_key_map.keys()),
                     "usage": "get_cost_breakdown(breakdown_type='provider')",
                     "recommendations": {
                         "provider": "Breakdown costs by AI provider (OpenAI, Anthropic, etc.)",
@@ -348,14 +335,14 @@ class CostAnalyticsProcessor:
             )
 
         try:
-            endpoint = endpoint_map[breakdown_type]
-            params = {"teamId": team_id, "period": period}
-
+            registry_key = endpoint_key_map[breakdown_type]
             # Add group parameter for product breakdown to match UI behavior
-            if breakdown_type == "product":
-                params["group"] = "TOTAL"
+            extra_old_params = {"group": "TOTAL"} if breakdown_type == "product" else None
+            path, params, call_kwargs = resolve_analytics_request(
+                registry_key, team_id, period, extra_old_params=extra_old_params
+            )
 
-            response = await client.get(endpoint, params=params)
+            response = await client.get(path, params=params, **call_kwargs)
 
             # Process and format the breakdown data
             breakdown_data = self._process_breakdown_data(response, breakdown_type)
@@ -380,36 +367,19 @@ class CostAnalyticsProcessor:
         self, client: ReveniumClient, team_id: str, period: str, group: str
     ) -> Dict[str, Any]:
         """Fetch cost data from multiple endpoints concurrently."""
-        params = {"teamId": team_id, "period": period}
-        if group != "TOTAL":
-            params["group"] = group
 
-        # Create concurrent API calls using verified endpoints from Playwright capture
+        def _make_call(key, extra_old_params=None):
+            path, params, call_kwargs = resolve_analytics_request(
+                key, team_id, period, extra_old_params=extra_old_params
+            )
+            return client._request_with_retry("GET", path, params=params, **call_kwargs)
+
+        # Create concurrent API calls using resolve_analytics_request for proper routing
         tasks = {
-            "cost_by_provider_over_time": client._request_with_retry(
-                "GET",
-                self.cost_endpoints["total_cost_by_provider_over_time"],  # Use verified endpoint
-                params={"teamId": team_id, "period": period},  # Simplified params as verified
-            ),
-            "total_cost_by_model": client._request_with_retry(
-                "GET",
-                self.cost_endpoints["total_cost_by_model"],
-                params={"teamId": team_id, "period": period},
-            ),
-            "cost_by_customer": client._request_with_retry(
-                "GET",
-                self.cost_endpoints["cost_metric_by_organization"],
-                params={"teamId": team_id, "period": period},  # Simplified params
-            ),
-            "cost_by_product": client._request_with_retry(
-                "GET",
-                self.cost_endpoints["cost_metric_by_product"],
-                params={
-                    "teamId": team_id,
-                    "period": period,
-                    "group": "TOTAL",
-                },  # Add group parameter to match UI
-            ),
+            "cost_by_provider_over_time": _make_call("total_cost_by_provider_over_time"),
+            "total_cost_by_model": _make_call("total_cost_by_model"),
+            "cost_by_customer": _make_call("cost_metric_by_organization"),
+            "cost_by_product": _make_call("cost_metric_by_product", extra_old_params={"group": "TOTAL"}),
         }
 
         # Execute all API calls concurrently

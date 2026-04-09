@@ -345,7 +345,7 @@ def create_structured_missing_parameter_error(
         field=parameter_name,
         suggestions=[
             f"Add the '{parameter_name}' parameter to your {action} request",
-            f"Check the action documentation for required parameters",
+            "Check the action documentation for required parameters",
             "Use get_examples() to see working examples",
         ],
         examples=examples or {},
@@ -488,7 +488,7 @@ def format_error_response(
                 return _format_api_validation_error(synthetic_api_error, context)
 
     # Generic error formatting for other exceptions
-    error_text = f"**TOOL_ERROR**\n\n"
+    error_text = "**TOOL_ERROR**\n\n"
     error_text += f"**Message**: {str(error)}\n\n"
 
     if context:
@@ -522,7 +522,7 @@ def _format_api_validation_error(
     validation_context = _extract_validation_context(error_message, status_code)
 
     # Build enhanced error response
-    error_text = f"🚨 **API_VALIDATION_ERROR**\n\n"
+    error_text = "🚨 **API_VALIDATION_ERROR**\n\n"
 
     # Add user-friendly error message
     if validation_context["user_friendly_message"]:
@@ -553,7 +553,7 @@ def _format_api_validation_error(
             error_text += f"• {example}\n"
 
     # Add technical details in collapsible section
-    error_text += f"\n<details><summary>Technical Details</summary>\n"
+    error_text += "\n<details><summary>Technical Details</summary>\n"
     error_text += f"**Status Code**: {status_code}\n"
     error_text += f"**Original Message**: {error_message}\n"
     if response_data:

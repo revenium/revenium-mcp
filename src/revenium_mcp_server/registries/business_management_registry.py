@@ -11,7 +11,7 @@ from typing import Any, ClassVar, List, Union
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
-from ..shared_parameters import CustomerRequest, ProductRequest, SourceRequest, SubscriptionRequest
+from ..shared_parameters import CustomerRequest, ProductRequest, SourceRequest, SubscriptionRequest, ToolRequest
 from .base_tool_registry import BaseToolRegistry
 
 
@@ -70,6 +70,29 @@ class BusinessManagementRegistry(BaseToolRegistry):
                     "get_capabilities",
                 ],
             },
+            "manage_tools": {
+                "description": "Manage tools with CRUD, pricing tiers, event-metering, and analytics operations",
+                "capabilities": [
+                    "list",
+                    "get",
+                    "get_by_tool_id",
+                    "create",
+                    "create_simple",
+                    "update",
+                    "replace",
+                    "delete",
+                    "restore",
+                    "search",
+                    "meter_event",
+                    "list_events",
+                    "get_cost_breakdown",
+                    "get_top_tools",
+                    "get_success_rate",
+                    "get_latency",
+                    "get_pricing_help",
+                    "get_capabilities",
+                ],
+            },
         }
 
         for tool_name, metadata in business_tools.items():
@@ -101,6 +124,8 @@ class BusinessManagementRegistry(BaseToolRegistry):
                 return await self._execute_manage_customers(request)
             elif tool_name == "manage_subscriptions":
                 return await self._execute_manage_subscriptions(request)
+            elif tool_name == "manage_tools":
+                return await self._execute_manage_tools(request)
             else:
                 error_msg = f"Tool execution not implemented for {tool_name}"
                 logger.error(error_msg)
@@ -596,3 +621,33 @@ class BusinessManagementRegistry(BaseToolRegistry):
             f"[MAIN BRANCH COMPATIBILITY] manage_sources called with action: {request.action}"
         )
         return await self._execute_manage_sources(request)
+
+    async def _execute_manage_tools(
+        self, request: ToolRequest
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Execute manage_tools by delegating to ToolManagement tool class."""
+        logger.info(f"Executing manage_tools with action: {request.action}")
+
+        if not request.action or request.action.strip() == "":
+            return [TextContent(type="text", text="Error: Action parameter is required and cannot be empty")]
+
+        try:
+            from ..tools_decomposed.tool_management import ToolManagement
+            from dataclasses import asdict
+
+            tool = ToolManagement()
+            arguments = asdict(request)
+            arguments = {k: v for k, v in arguments.items() if v is not None}
+            return await tool.handle_action(request.action, arguments)
+        except Exception as e:
+            logger.error(f"ToolManagement execution failed: {e}")
+            return [TextContent(type="text", text=f"Error executing manage_tools: {str(e)}")]
+
+    async def manage_tools(
+        self, request: ToolRequest
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Manage tools with full compatibility to main branch interface."""
+        logger.info(
+            f"[MAIN BRANCH COMPATIBILITY] manage_tools called with action: {request.action}"
+        )
+        return await self._execute_manage_tools(request)

@@ -63,10 +63,9 @@ class TestApplyMcpToolDecorator:
     """Test apply_mcp_tool_decorator which applies FastMCP @mcp.tool."""
 
     def test_applies_mcp_tool_decorator(self):
-        """Applies mcp.tool() to function and returns result."""
+        """Applies mcp.tool() to function and returns the original function (v3 behavior)."""
         mock_mcp = MagicMock()
-        mock_tool_result = MagicMock()
-        mock_mcp.tool.return_value = lambda f: mock_tool_result
+        mock_mcp.tool.return_value = lambda f: f
 
         async def my_func():
             pass
@@ -74,7 +73,7 @@ class TestApplyMcpToolDecorator:
         my_func._dynamic_mcp_tool_name = "test"
 
         result = apply_mcp_tool_decorator(mock_mcp, my_func)
-        assert result == mock_tool_result
+        assert result is my_func
 
     def test_returns_original_function_on_error(self):
         """Returns undecorated function when mcp.tool() raises."""

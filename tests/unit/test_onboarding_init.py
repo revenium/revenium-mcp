@@ -1,7 +1,6 @@
 """Unit tests for OnboardingManager (onboarding/__init__.py)."""
 
 import pytest
-from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.onboarding import OnboardingManager

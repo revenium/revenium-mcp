@@ -2,7 +2,7 @@
 
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 from src.revenium_mcp_server.tools_decomposed.metering_field_validation import (
     TestDataGenerator,
@@ -214,7 +214,7 @@ class TestFieldMappingAnalyzer:
     # -- _analyze_critical_fields --
 
     def test_analyze_critical_fields_all_excellent(self):
-        percentages = {f: 100.0 for f in self.analyzer.critical_fields}
+        percentages = dict.fromkeys(self.analyzer.critical_fields, 100.0)
         result = self.analyzer._analyze_critical_fields(percentages)
         assert result["overall_health"] == "excellent"
         assert len(result["issues"]) == 0
@@ -747,10 +747,10 @@ class TestFieldMappingAnalyzer:
         client = AsyncMock()
         client.team_id = "team1"
         client.get = AsyncMock(return_value={"content": [{"id": 1}]})
-        result = await self.analyzer._fetch_recent_transactions(client, limit=100)
-        # Should cap to 50
+        result = await self.analyzer._fetch_recent_transactions(client, limit=200)
+        # Should cap to 100
         call_args = client.get.call_args
-        assert call_args[1]["params"]["size"] == 50
+        assert call_args[1]["params"]["size"] == 100
         assert len(result) == 1
 
     @pytest.mark.asyncio

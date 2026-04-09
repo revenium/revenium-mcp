@@ -103,6 +103,11 @@ class AlertSemanticProcessor:
             "not equal": "!=",
             "not equals": "!=",
             "different from": "!=",
+            # Relative change operators
+            "increases by": "INCREASES_BY",
+            "increase by": "INCREASES_BY",
+            "decreases by": "DECREASES_BY",
+            "decrease by": "DECREASES_BY",
         }
 
     def _build_time_period_mappings(self) -> Dict[str, str]:
@@ -287,10 +292,20 @@ class AlertSemanticProcessor:
             "daily spending": "CUMULATIVE_USAGE",
             "quarterly spending": "CUMULATIVE_USAGE",
             # Note: "daily", "weekly" alone are ambiguous - context determines alert type
+            # Relative Change mappings
+            "relative change": "RELATIVE_CHANGE",
+            "relative change alert": "RELATIVE_CHANGE",
+            "percentage change": "RELATIVE_CHANGE",
+            "rate of change": "RELATIVE_CHANGE",
+            "trending": "RELATIVE_CHANGE",
+            "trend": "RELATIVE_CHANGE",
+            "trend alert": "RELATIVE_CHANGE",
+            "increases by": "RELATIVE_CHANGE",
+            "decreases by": "RELATIVE_CHANGE",
+            # Other alert types
             "statistical": "STATISTICAL",
             "pattern": "PATTERN",
             "anomaly": "ANOMALY",
-            "trend": "TREND",
         }
 
     def parse_alert_request(self, text: str) -> Dict[str, Any]:
@@ -358,10 +373,12 @@ class AlertSemanticProcessor:
             result["name"] = self._generate_alert_name(result)
 
         # Build detection rule
+        calendar_periods = ("daily", "weekly", "monthly", "quarterly")
         if metric and operator and threshold is not None:
-            # For cumulative usage alerts, use the time period directly
-            if alert_type == "CUMULATIVE_USAGE" and time_period:
-                time_window = time_period  # Use "weekly", "monthly", etc. directly
+            # For cumulative usage and relative change alerts, use calendar periods only
+            if alert_type in ("CUMULATIVE_USAGE", "RELATIVE_CHANGE"):
+                # Clamp to valid calendar period; ignore time intervals like "5m" or "1h"
+                time_window = time_period if time_period in calendar_periods else "daily"
             else:
                 time_window = time_period or "5m"  # Use time intervals like "5m", "1h"
 
@@ -417,6 +434,8 @@ class AlertSemanticProcessor:
             r"(\d+(?:\.\d+)?)\s*(?:million|mil|m)",  # 1 million, 1.5 million
             r"(\d+(?:\.\d+)?)\s*(?:thousand|k)",  # 10 thousand, 10k
             r"(\d+(?:\.\d+)?)\s*(?:billion|bil|b)",  # 1 billion
+            # Relative change operators followed by a bare number (no %)
+            r"(?:increases?\s+by|decreases?\s+by)\s+(\d+(?:,\d{3})*(?:\.\d+)?)",  # increases by 20
         ]
 
         threshold_value = None
@@ -479,6 +498,20 @@ class AlertSemanticProcessor:
         - THRESHOLD: Real-time monitoring over time windows (continuous)
         """
         text_lower = text.lower()
+
+        # Priority check for unambiguous RELATIVE_CHANGE phrases — must run before
+        # CUMULATIVE_USAGE check because calendar words like "daily"/"weekly" also
+        # appear in RELATIVE_CHANGE inputs (e.g. "increases by 20% daily")
+        relative_change_priority_indicators = [
+            "increases by",
+            "increase by",
+            "decreases by",
+            "decrease by",
+            "percentage change",
+            "relative change",
+        ]
+        if any(indicator in text_lower for indicator in relative_change_priority_indicators):
+            return "RELATIVE_CHANGE"
 
         # Strong indicators for CUMULATIVE_USAGE (budget/quota tracking)
         cumulative_strong_indicators = [
@@ -555,6 +588,21 @@ class AlertSemanticProcessor:
         for pattern in budget_patterns:
             if re.search(pattern, text_lower):
                 return "CUMULATIVE_USAGE"
+
+        # Check for RELATIVE_CHANGE indicators (after CUMULATIVE_USAGE checks)
+        # Note: "increases by", "decreases by", "percentage change", "relative change"
+        # are handled by the priority check above
+        relative_change_indicators = [
+            "rate of change",
+            "trend alert",
+            "trending",
+        ]
+        if any(indicator in text_lower for indicator in relative_change_indicators):
+            return "RELATIVE_CHANGE"
+        # Use word-boundary match for bare "trend" to avoid false positives
+        # on substrings like "trendy", "detrended", "the cost trend is"
+        if re.search(r"\btrend\b", text_lower):
+            return "RELATIVE_CHANGE"
 
         # Default to threshold for real-time monitoring
         return "THRESHOLD"
@@ -773,14 +821,6 @@ class AlertSemanticProcessor:
             warnings.append(
                 "❌ **Missing Threshold**: Could not identify threshold condition. "
                 "Please specify when the alert should trigger (e.g., 'above $100', 'over 5%')."
-            )
-
-        # Check for relative change attempts (not supported)
-        relative_indicators = ["increase", "decrease", "change", "compared to", "relative to"]
-        if any(indicator in text_lower for indicator in relative_indicators):
-            warnings.append(
-                "⚠️ **Feature Limitation**: Relative change alerts are temporarily not supported due to a backend issue. "
-                "Please use spike detection alerts instead."
             )
 
         return warnings

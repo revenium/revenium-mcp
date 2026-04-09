@@ -4,14 +4,12 @@ Tests the error creation functions that produce structured, agent-friendly
 error messages for capability management failures.
 """
 
-import pytest
 
 from src.revenium_mcp_server.tools_decomposed.manage_capabilities_errors import (
     create_missing_resource_type_error,
     create_missing_verify_params_error,
     create_unsupported_action_error,
     create_execution_error,
-    get_verify_params_examples,
     get_verify_params_suggestions,
     get_unsupported_action_examples,
     get_unsupported_action_suggestions,

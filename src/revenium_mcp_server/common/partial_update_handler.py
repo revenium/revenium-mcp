@@ -83,6 +83,22 @@ class FieldTransformers:
         return FieldTransformers.objects_array_to_ids(teams)
 
     @staticmethod
+    def extract_label(obj: Any) -> Optional[str]:
+        """Extract label from a resource metadata object.
+
+        Args:
+            obj: Object with a 'label' field or None
+
+        Returns:
+            The label string or None if object is None or has no label
+        """
+        if obj is None:
+            return None
+        if isinstance(obj, dict) and "label" in obj:
+            return obj["label"]
+        return None
+
+    @staticmethod
     def extract_owner_id(owner: Any) -> Optional[str]:
         """Extract owner ID from owner object (alias for object_to_id).
 
@@ -312,21 +328,19 @@ class PartialUpdateHandler:
                 source_value = data[source_field]
 
                 # Apply each transformation for this source field
+                any_success = False
                 for target_field, transformer_func in transformations.items():
                     try:
                         transformed_value = transformer_func(source_value)
                         transformed_data[target_field] = transformed_value
-
-                        # If target field is different from source field, remove source field
-                        if target_field != source_field and source_field in transformed_data:
-                            del transformed_data[source_field]
-
+                        any_success = True
                     except Exception as e:
                         logger.warning(
                             f"Field transformation failed for {source_field} -> {target_field}: {e}"
                         )
-                        # Continue with other transformations
-                        continue
+
+                if any_success and source_field in transformed_data and source_field not in transformations:
+                    del transformed_data[source_field]
 
         return transformed_data
 

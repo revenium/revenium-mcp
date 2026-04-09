@@ -5,10 +5,8 @@ requirements checking, system status, and recommendations.
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
-from types import SimpleNamespace
+from unittest.mock import patch, MagicMock
 
-from mcp.types import TextContent
 
 from src.revenium_mcp_server.tools_decomposed.setup_checklist import SetupChecklist
 

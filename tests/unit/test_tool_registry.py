@@ -4,7 +4,6 @@ Tests the tool registry which maps tool names to classes and provides
 description/category lookup with validation.
 """
 
-import pytest
 from unittest.mock import patch, MagicMock
 
 from src.revenium_mcp_server.tools_decomposed.tool_registry import (

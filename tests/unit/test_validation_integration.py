@@ -1,7 +1,5 @@
 """Unit tests for validation_integration module."""
 
-import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
 
 from src.revenium_mcp_server.validation_integration import (
     ValidationIntegration,

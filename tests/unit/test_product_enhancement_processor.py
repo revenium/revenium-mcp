@@ -11,7 +11,6 @@ Covers:
 """
 
 import pytest
-from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 

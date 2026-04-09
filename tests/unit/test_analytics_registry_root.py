@@ -1,7 +1,6 @@
 """Unit tests for the root-level analytics_registry module."""
 
 import pytest
-from unittest.mock import MagicMock, AsyncMock
 
 from src.revenium_mcp_server.analytics_registry import (
     MeteringTransactionRequest,

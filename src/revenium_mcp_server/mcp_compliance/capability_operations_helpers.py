@@ -4,7 +4,7 @@ This module contains helper functions extracted from the main capability manager
 to maintain compliance with the 300-line limit per module.
 """
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 from loguru import logger
 
@@ -20,7 +20,7 @@ def get_default_capabilities() -> Dict[str, Any]:
             sub_capabilities={"listChanged": True},
             metadata={
                 "description": "Tool execution and management",
-                "tool_count": 11,
+                "tool_count": 17,
                 "supports_introspection": True,
             },
         ),

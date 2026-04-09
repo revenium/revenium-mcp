@@ -17,6 +17,7 @@ from loguru import logger
 
 from ..client import ReveniumAPIError, ReveniumClient
 from ..common.error_handling import ErrorCodes, ToolError
+from ..endpoint_registry import resolve_analytics_request
 
 
 @dataclass
@@ -75,17 +76,6 @@ class ProfitabilityAnalyticsProcessor:
 
     def __init__(self):
         """Initialize the profitability analytics processor."""
-        self.revenue_endpoints = {
-            "revenue_metric_by_organization": "/profitstream/v2/api/sources/metrics/ai/revenue-metric-by-organization",
-            "percentage_revenue_metric_by_organization": "/profitstream/v2/api/sources/metrics/ai/percentage-revenue-metric-by-organization",
-            "revenue_metric_by_product": "/profitstream/v2/api/sources/metrics/ai/revenue-metric-by-product",
-            "percentage_revenue_metric_by_product": "/profitstream/v2/api/sources/metrics/ai/percentage-revenue-metric-by-product",
-        }
-
-        self.cost_endpoints = {
-            "cost_metric_by_organization": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-organization",
-            "cost_metric_by_product": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-product",
-        }
 
     async def analyze_profitability(
         self,
@@ -139,26 +129,6 @@ class ProfitabilityAnalyticsProcessor:
                 f"Profitability analysis complete. Net profit: ${profitability_data.net_profit:.2f}"
             )
             return profitability_data
-
-        except ToolError:
-            # Re-raise ToolError exceptions without modification
-            # This preserves helpful error messages with specific suggestions
-            raise
-        except ToolError:
-
-            # Re-raise ToolError exceptions without modification
-
-            # This preserves helpful error messages with specific suggestions
-
-            raise
-
-        except ToolError:
-
-            # Re-raise ToolError exceptions without modification
-
-            # This preserves helpful error messages with specific suggestions
-
-            raise
 
         except ToolError:
             # Re-raise ToolError exceptions without modification
@@ -307,22 +277,6 @@ class ProfitabilityAnalyticsProcessor:
             return comparison_result
 
         except ToolError:
-
-            # Re-raise ToolError exceptions without modification
-
-            # This preserves helpful error messages with specific suggestions
-
-            raise
-
-        except ToolError:
-
-            # Re-raise ToolError exceptions without modification
-
-            # This preserves helpful error messages with specific suggestions
-
-            raise
-
-        except ToolError:
             # Re-raise ToolError exceptions without modification
             # This preserves helpful error messages with specific suggestions
             raise
@@ -344,29 +298,26 @@ class ProfitabilityAnalyticsProcessor:
         self, client: ReveniumClient, team_id: str, period: str, group: str, entity_type: str
     ) -> Dict[str, Any]:
         """Fetch revenue data from multiple endpoints concurrently."""
-        params = {"teamId": team_id, "period": period}
-        if group != "TOTAL":
-            params["group"] = group
+        extra_old_params = {"group": group} if group != "TOTAL" else None
 
         tasks = {}
 
         # Add revenue endpoints based on entity type
+        # percentage_revenue endpoints are client_side_only — fetched from base revenue data
         if entity_type in ["customers", "both"]:
-            tasks["revenue_by_organization"] = client._request_with_retry(
-                "GET", self.revenue_endpoints["revenue_metric_by_organization"], params=params
+            path, params, call_kwargs = resolve_analytics_request(
+                "revenue_metric_by_organization", team_id, period, extra_old_params=extra_old_params
             )
-            tasks["percentage_revenue_by_organization"] = client._request_with_retry(
-                "GET",
-                self.revenue_endpoints["percentage_revenue_metric_by_organization"],
-                params=params,
+            tasks["revenue_by_organization"] = client._request_with_retry(
+                "GET", path, params=params, **call_kwargs
             )
 
         if entity_type in ["products", "both"]:
-            tasks["revenue_by_product"] = client._request_with_retry(
-                "GET", self.revenue_endpoints["revenue_metric_by_product"], params=params
+            path, params, call_kwargs = resolve_analytics_request(
+                "revenue_metric_by_product", team_id, period, extra_old_params=extra_old_params
             )
-            tasks["percentage_revenue_by_product"] = client._request_with_retry(
-                "GET", self.revenue_endpoints["percentage_revenue_metric_by_product"], params=params
+            tasks["revenue_by_product"] = client._request_with_retry(
+                "GET", path, params=params, **call_kwargs
             )
 
         # Execute all API calls concurrently
@@ -387,21 +338,25 @@ class ProfitabilityAnalyticsProcessor:
         self, client: ReveniumClient, team_id: str, period: str, group: str, entity_type: str
     ) -> Dict[str, Any]:
         """Fetch cost data from multiple endpoints concurrently."""
-        params = {"teamId": team_id, "period": period}
-        if group != "TOTAL":
-            params["group"] = group
+        extra_old_params = {"group": group} if group != "TOTAL" else None
 
         tasks = {}
 
         # Add cost endpoints based on entity type
         if entity_type in ["customers", "both"]:
+            path, params, call_kwargs = resolve_analytics_request(
+                "cost_metric_by_organization", team_id, period, extra_old_params=extra_old_params
+            )
             tasks["cost_by_organization"] = client._request_with_retry(
-                "GET", self.cost_endpoints["cost_metric_by_organization"], params=params
+                "GET", path, params=params, **call_kwargs
             )
 
         if entity_type in ["products", "both"]:
+            path, params, call_kwargs = resolve_analytics_request(
+                "cost_metric_by_product", team_id, period, extra_old_params=extra_old_params
+            )
             tasks["cost_by_product"] = client._request_with_retry(
-                "GET", self.cost_endpoints["cost_metric_by_product"], params=params
+                "GET", path, params=params, **call_kwargs
             )
 
         # Execute all API calls concurrently
@@ -591,12 +546,11 @@ class ProfitabilityAnalyticsProcessor:
         self, client: ReveniumClient, team_id: str, period: str
     ) -> Dict[str, Any]:
         """Fetch customer-specific revenue data."""
-        params = {"teamId": team_id, "period": period}
-
+        path, params, call_kwargs = resolve_analytics_request(
+            "revenue_metric_by_organization", team_id, period
+        )
         try:
-            response = await client._request_with_retry(
-                "GET", self.revenue_endpoints["revenue_metric_by_organization"], params=params
-            )
+            response = await client._request_with_retry("GET", path, params=params, **call_kwargs)
             return response
         except ReveniumAPIError as e:
             logger.warning(f"Failed to fetch customer revenue: {e}")
@@ -606,12 +560,11 @@ class ProfitabilityAnalyticsProcessor:
         self, client: ReveniumClient, team_id: str, period: str
     ) -> Dict[str, Any]:
         """Fetch customer-specific cost data."""
-        params = {"teamId": team_id, "period": period}
-
+        path, params, call_kwargs = resolve_analytics_request(
+            "cost_metric_by_organization", team_id, period
+        )
         try:
-            response = await client._request_with_retry(
-                "GET", self.cost_endpoints["cost_metric_by_organization"], params=params
-            )
+            response = await client._request_with_retry("GET", path, params=params, **call_kwargs)
             return response
         except ReveniumAPIError as e:
             logger.warning(f"Failed to fetch customer costs: {e}")
@@ -621,12 +574,11 @@ class ProfitabilityAnalyticsProcessor:
         self, client: ReveniumClient, team_id: str, period: str
     ) -> Dict[str, Any]:
         """Fetch product-specific revenue data."""
-        params = {"teamId": team_id, "period": period}
-
+        path, params, call_kwargs = resolve_analytics_request(
+            "revenue_metric_by_product", team_id, period
+        )
         try:
-            response = await client._request_with_retry(
-                "GET", self.revenue_endpoints["revenue_metric_by_product"], params=params
-            )
+            response = await client._request_with_retry("GET", path, params=params, **call_kwargs)
             return response
         except ReveniumAPIError as e:
             logger.warning(f"Failed to fetch product revenue: {e}")
@@ -636,12 +588,11 @@ class ProfitabilityAnalyticsProcessor:
         self, client: ReveniumClient, team_id: str, period: str
     ) -> Dict[str, Any]:
         """Fetch product-specific cost data."""
-        params = {"teamId": team_id, "period": period}
-
+        path, params, call_kwargs = resolve_analytics_request(
+            "cost_metric_by_product", team_id, period
+        )
         try:
-            response = await client._request_with_retry(
-                "GET", self.cost_endpoints["cost_metric_by_product"], params=params
-            )
+            response = await client._request_with_retry("GET", path, params=params, **call_kwargs)
             return response
         except ReveniumAPIError as e:
             logger.warning(f"Failed to fetch product costs: {e}")
@@ -855,6 +806,47 @@ class ProfitabilityAnalyticsProcessor:
             },
             "analyzed_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    def _compute_percentage_revenue(self, revenue_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Compute percentage revenue from base revenue data client-side.
+
+        Used for percentage-revenue-metric-by-organization and
+        percentage-revenue-metric-by-product, which are client_side_only in the
+        new ClickHouse-backed analytics API.
+
+        Args:
+            revenue_data: Revenue response with 'groups' list
+
+        Returns:
+            Dict with 'groups' containing percentage values (each entity's share of total)
+        """
+        groups = revenue_data.get("groups", []) if isinstance(revenue_data, dict) else []
+
+        # Compute per-entity revenue totals and overall total
+        total_revenue = 0.0
+        entity_revenues: Dict[str, float] = {}
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            entity = group.get("groupName", "Unknown")
+            for metric in group.get("metrics", []):
+                if not isinstance(metric, dict):
+                    continue
+                value = float(metric.get("metricResult", metric.get("revenue", 0)))
+                total_revenue += value
+                entity_revenues[entity] = entity_revenues.get(entity, 0.0) + value
+
+        if total_revenue == 0:
+            return {"groups": []}
+
+        percentage_groups = [
+            {
+                "groupName": entity,
+                "metrics": [{"metricResult": (revenue / total_revenue) * 100}],
+            }
+            for entity, revenue in entity_revenues.items()
+        ]
+        return {"groups": percentage_groups}
 
     def _calculate_percentage_change(self, old_value: float, new_value: float) -> float:
         """Calculate percentage change between two values."""

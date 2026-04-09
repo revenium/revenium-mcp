@@ -5,7 +5,7 @@ _format_analysis_response, and error handling paths.
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 from mcp.types import TextContent
 
 from src.revenium_mcp_server.tools_decomposed.revenium_log_analysis import (

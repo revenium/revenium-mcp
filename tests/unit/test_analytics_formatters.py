@@ -16,7 +16,6 @@ Tests the behavioral correctness of all analytics formatters:
 import pytest
 
 from src.revenium_mcp_server.analytics.formatters.base_formatter import (
-    AnalyticsResponseFormatter,
     BaseFormattingUtilities,
 )
 from src.revenium_mcp_server.analytics.formatters.error_formatter import ErrorFormatter

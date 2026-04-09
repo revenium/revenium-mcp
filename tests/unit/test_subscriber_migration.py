@@ -1,6 +1,5 @@
 """Tests for common/subscriber_migration.py — format migration, deprecation, and analytics."""
 
-import pytest
 
 from src.revenium_mcp_server.common.subscriber_migration import (
     SubscriberMigrationValidator,

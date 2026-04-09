@@ -6,9 +6,8 @@ All ReveniumClient calls are mocked.
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, patch
 
-from mcp.types import TextContent
 
 from src.revenium_mcp_server.tools_decomposed.slack_setup_assistant import SlackSetupAssistant
 
@@ -75,7 +74,7 @@ class TestGuidedSetup:
     async def test_configs_with_default_shows_ready(self, setup_tool):
         """When configs exist and default is set, show ready status."""
         configs = [
-            {"id": "cfg-1", "name": "Prod Config", "workspaceName": "ProdWS"}
+            {"id": "cfg-1", "name": "Prod Config", "teamName": "ProdWS"}
         ]
         mock_client = _mock_client_with_configs(configs, total=1)
         with patch(
@@ -94,7 +93,7 @@ class TestGuidedSetup:
     async def test_configs_without_default_triggers_detect(self, setup_tool):
         """When configs exist but no default, delegate to detect_and_recommend."""
         configs = [
-            {"id": "cfg-1", "name": "Config A", "workspaceName": "WS-A"}
+            {"id": "cfg-1", "name": "Config A", "teamName": "WS-A"}
         ]
         mock_client = _mock_client_with_configs(configs, total=1)
         with patch(
@@ -140,7 +139,7 @@ class TestSelectDefaultConfiguration:
 
     @pytest.mark.asyncio
     async def test_successful_set_default(self, setup_tool):
-        configs = [{"id": "cfg-1", "name": "My Config", "workspaceName": "WS", "channel": "#ch"}]
+        configs = [{"id": "cfg-1", "name": "My Config", "teamName": "WS", "channelName": "#ch"}]
         mock_client = _mock_client_with_configs(configs)
         with patch(
             "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
@@ -178,7 +177,7 @@ class TestSetupStatus:
     async def test_complete_status(self, setup_tool):
         """With configs and default set, status should say COMPLETE."""
         mock_client = _mock_client_with_configs(
-            [{"id": "cfg-1", "name": "C1", "workspaceName": "WS"}], total=1
+            [{"id": "cfg-1", "name": "C1", "teamName": "WS"}], total=1
         )
         with patch(
             "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
@@ -252,3 +251,98 @@ class TestHandleActionErrorHandling:
             result = await setup_tool.handle_action("guided_setup", {})
         text = result[0].text.lower()
         assert "failed" in text or "error" in text
+
+
+class TestWorkspaceAndChannelFieldExtraction:
+    """Regression tests for BACK-925: guided_setup and detect_and_recommend
+    must extract workspace from teamName/team.label and channel from channelName,
+    matching the pattern used by list_configurations."""
+
+    @pytest.mark.asyncio
+    async def test_guided_setup_uses_teamName(self, setup_tool):
+        """guided_setup should display workspace from teamName field."""
+        configs = [{"id": "cfg-1", "name": "Alerts", "teamName": "Acme Corp"}]
+        mock_client = _mock_client_with_configs(configs, total=1)
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
+            return_value=mock_client,
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
+            return_value="cfg-1",
+        ):
+            result = await setup_tool.handle_action("guided_setup", {})
+        assert "Acme Corp" in result[0].text
+        assert "Unknown Workspace" not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_guided_setup_falls_back_to_team_label(self, setup_tool):
+        """When teamName is absent, guided_setup should use team.label."""
+        configs = [{"id": "cfg-1", "name": "Alerts", "team": {"label": "Fallback Team"}}]
+        mock_client = _mock_client_with_configs(configs, total=1)
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
+            return_value=mock_client,
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
+            return_value="cfg-1",
+        ):
+            result = await setup_tool.handle_action("guided_setup", {})
+        assert "Fallback Team" in result[0].text
+        assert "Unknown Workspace" not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_detect_and_recommend_uses_teamName_and_channelName(self, setup_tool):
+        """detect_and_recommend should display workspace and channel from correct fields."""
+        configs = [
+            {"id": "cfg-1", "name": "Prod", "teamName": "Revenium", "channelName": "alerts"},
+            {"id": "cfg-2", "name": "Dev", "teamName": "Revenium Dev", "channelName": "dev-alerts"},
+        ]
+        mock_client = _mock_client_with_configs(configs, total=2)
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
+            return_value=mock_client,
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
+            return_value=None,
+        ):
+            result = await setup_tool.handle_action("detect_and_recommend", {})
+        text = result[0].text
+        assert "Revenium" in text
+        assert "Revenium Dev" in text
+        assert "Unknown Workspace" not in text
+        assert "alerts" in text
+
+    @pytest.mark.asyncio
+    async def test_detect_and_recommend_falls_back_to_team_label(self, setup_tool):
+        """detect_and_recommend should fall back to team.label when teamName is absent."""
+        configs = [
+            {"id": "cfg-1", "name": "Prod", "team": {"label": "Nested WS"}, "channelName": "ch1"},
+        ]
+        mock_client = _mock_client_with_configs(configs, total=1)
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
+            return_value=mock_client,
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
+            return_value=None,
+        ):
+            result = await setup_tool.handle_action("detect_and_recommend", {})
+        assert "Nested WS" in result[0].text
+        assert "Unknown Workspace" not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_select_default_uses_correct_fields(self, setup_tool):
+        """select_default_configuration should show teamName and channelName."""
+        configs = [{"id": "cfg-1", "name": "My Config", "teamName": "WS1", "channelName": "general"}]
+        mock_client = _mock_client_with_configs(configs)
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
+            return_value=mock_client,
+        ), patch.dict("os.environ", {}, clear=False):
+            result = await setup_tool.handle_action(
+                "select_default_configuration", {"config_id": "cfg-1"}
+            )
+        text = result[0].text
+        assert "WS1" in text
+        assert "Unknown Workspace" not in text
+        assert "general" in text

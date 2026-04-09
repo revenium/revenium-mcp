@@ -6,10 +6,8 @@ diagnostic insights, and temporal analysis.
 """
 
 import pytest
-from unittest.mock import patch
 
 from src.revenium_mcp_server.tools_decomposed.log_formatters import LogResponseFormatter
-from src.revenium_mcp_server.common.error_handling import ToolError
 from mcp.types import TextContent
 
 

@@ -7,7 +7,6 @@ Every test asserts specific behavioural outcomes that FAIL if the production
 logic under test is removed or broken.
 """
 
-import pytest
 from unittest.mock import MagicMock, patch
 
 from src.revenium_mcp_server.product_schema_enhanced import (

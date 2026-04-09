@@ -115,3 +115,32 @@ class SourceRequest:
     connection_string: Optional[str] = None
     example_type: Optional[str] = None
     dry_run: Optional[bool] = None
+
+
+@dataclass
+class ToolRequest:
+    """Parameter object for manage_tools function following Phase 1 pattern."""
+
+    action: str
+    tool_id: Optional[str] = None
+    tool_name: Optional[str] = None
+    tool_data: Optional[dict] = None
+    page: int = 0
+    size: int = 20
+    filters: Optional[dict] = None
+    text: Optional[str] = None
+    name: Optional[str] = None
+    type: Optional[str] = None
+    description: Optional[str] = None
+    version: Optional[str] = None
+    provider: Optional[str] = None
+    event_data: Optional[dict] = None
+    event_type: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    granularity: Optional[str] = None
+    query: Optional[str] = None
+    example_type: Optional[str] = None
+    dry_run: Optional[bool] = None
+    pricing_model: Optional[str] = None
+    per_unit_price: Optional[float] = None

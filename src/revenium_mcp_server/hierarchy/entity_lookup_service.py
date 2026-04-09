@@ -468,7 +468,7 @@ class EntityLookupService:
                     matches=[],
                     confidence_scores=[],
                     metadata={},
-                    error_message=f"Invalid identifier: must be a non-empty string",
+                    error_message="Invalid identifier: must be a non-empty string",
                 )
 
             identifier = identifier.strip()

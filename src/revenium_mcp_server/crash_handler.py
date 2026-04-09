@@ -105,16 +105,16 @@ class CrashHandler:
     def _process_exception(self, exc_type: type, exc_value: Exception, exc_traceback) -> None:
         """Handle unhandled exceptions with comprehensive crash logging."""
         crash_info = self._generate_crash_dump(exc_type, exc_value, exc_traceback)
-        
+
         # Log to file if available
         if self.crash_log_file:
             logger.error(f"CRASH DETECTED: {crash_info}")
-        
+
         # Always log to stderr for immediate visibility
-        print(f"\n🚨 CRITICAL: MCP Server Crash Detected", file=sys.stderr)
+        print("\n🚨 CRITICAL: MCP Server Crash Detected", file=sys.stderr)
         print(f"Crash ID: {crash_info.get('crash_id', 'unknown')}", file=sys.stderr)
         print(f"Error: {exc_value}", file=sys.stderr)
-        
+
         if self.crash_log_file:
             print(f"Full crash report saved to: {self.crash_log_file}", file=sys.stderr)
         else:
@@ -140,7 +140,7 @@ class CrashHandler:
             if self.crash_log_file:
                 logger.error(f"ASYNCIO CRASH: {crash_info}")
 
-            print(f"\n🚨 CRITICAL: MCP Server Asyncio Crash", file=sys.stderr)
+            print("\n🚨 CRITICAL: MCP Server Asyncio Crash", file=sys.stderr)
             print(f"Error: {exception}", file=sys.stderr)
             if self.crash_log_file:
                 print(f"Crash report: {self.crash_log_file}", file=sys.stderr)
@@ -208,7 +208,7 @@ class CrashHandler:
             "MCP_STARTUP_VERBOSE", "UCM_WARNINGS_ENABLED", "REVENIUM_BASE_URL",
             "PATH", "PYTHONPATH", "HOME", "USER", "PWD", "SHELL"
         ]
-        
+
         env_info = {}
         for var in relevant_vars:
             value = os.environ.get(var)
@@ -218,7 +218,7 @@ class CrashHandler:
                     env_info[var] = "***MASKED***"
                 else:
                     env_info[var] = value
-                    
+
         return env_info
 
     def _get_process_info(self) -> Dict[str, Any]:

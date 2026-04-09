@@ -26,19 +26,15 @@ Targets missed lines:
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from typing import Any, Dict, List, Optional
 
 from src.revenium_mcp_server.hierarchy.multi_entity_nlp_processor import (
     ActionType,
     EntityMention,
     EntityType,
-    ExecutionPlan,
     MultiEntityNLPProcessor,
-    NLPResult,
     ParsedAction,
     ParsedQuery,
     QueryType,
-    WorkflowStep,
     get_multi_entity_nlp_processor,
     multi_entity_nlp_processor,
 )
@@ -741,7 +737,6 @@ class TestGlobalHelpers:
     def test_get_multi_entity_nlp_processor_returns_instance(self, monkeypatch):
         """get_multi_entity_nlp_processor returns a MultiEntityNLPProcessor."""
         import sys
-        import src.revenium_mcp_server.hierarchy.multi_entity_nlp_processor  # ensure loaded
         mod = sys.modules["src.revenium_mcp_server.hierarchy.multi_entity_nlp_processor"]
         monkeypatch.setattr(mod, "_multi_entity_nlp_processor", None)
 
@@ -756,7 +751,6 @@ class TestGlobalHelpers:
     def test_get_multi_entity_nlp_processor_returns_same_instance_on_second_call(self, monkeypatch):
         """get_multi_entity_nlp_processor is idempotent (lazy singleton)."""
         import sys
-        import src.revenium_mcp_server.hierarchy.multi_entity_nlp_processor  # ensure loaded
         mod = sys.modules["src.revenium_mcp_server.hierarchy.multi_entity_nlp_processor"]
         monkeypatch.setattr(mod, "_multi_entity_nlp_processor", None)
 
@@ -771,7 +765,6 @@ class TestGlobalHelpers:
     def test_multi_entity_nlp_processor_backward_compat_returns_same_as_getter(self, monkeypatch):
         """multi_entity_nlp_processor() returns same instance as get_multi_entity_nlp_processor()."""
         import sys
-        import src.revenium_mcp_server.hierarchy.multi_entity_nlp_processor  # ensure loaded
         mod = sys.modules["src.revenium_mcp_server.hierarchy.multi_entity_nlp_processor"]
         monkeypatch.setattr(mod, "_multi_entity_nlp_processor", None)
 

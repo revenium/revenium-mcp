@@ -6,8 +6,6 @@ Covers:
   get_recovery_actions_mapping, get_default_recovery_actions
 """
 
-import pytest
-from unittest.mock import MagicMock
 from types import SimpleNamespace
 
 from src.revenium_mcp_server.mcp_compliance.error_formatting_helpers import (

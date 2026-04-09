@@ -357,8 +357,10 @@ class CapabilityDiscovery:
                 "LESS_THAN_OR_EQUAL_TO",
                 "EQUAL_TO",
                 "NOT_EQUAL_TO",
+                "INCREASES_BY",
+                "DECREASES_BY",
             ],
-            "period_durations": ["ONE_MINUTE", "DAILY", "WEEKLY", "MONTHLY"],
+            "period_durations": ["ONE_MINUTE", "DAILY", "WEEKLY", "MONTHLY", "QUARTERLY"],
             "schema": {
                 "threshold_alert": {
                     "required": ["name", "metricType", "operatorType", "threshold"],
@@ -757,6 +759,8 @@ class CapabilityDiscovery:
                     "EQUALS",
                     "NOT_EQUALS",
                     "BETWEEN",
+                    "INCREASES_BY",
+                    "DECREASES_BY",
                 }
                 logger.info("No operators discovered from API, using standard comparison operators")
             else:
@@ -766,7 +770,7 @@ class CapabilityDiscovery:
 
         except Exception as e:
             logger.warning(f"Operators discovery failed: {e}")
-            return ["GREATER_THAN", "LESS_THAN", "EQUALS"]
+            return ["DECREASES_BY", "EQUALS", "GREATER_THAN", "INCREASES_BY", "LESS_THAN"]
 
     async def _get_models_summary(self) -> Dict[str, Any]:
         """Get lightweight summary of AI models and providers without loading all 3000 models."""

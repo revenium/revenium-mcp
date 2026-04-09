@@ -503,7 +503,7 @@ class TestRequest:
 
     @pytest.mark.asyncio
     async def test_hashed_id_error_raises_enhanced_error(self):
-        """Responses containing 'failed to decode hashed id' trigger the anomaly ID error."""
+        """Responses containing 'failed to decode hashed id' use the correct resource label."""
         resp = MagicMock()
         resp.status_code = 400
         resp.reason_phrase = "Bad Request"
@@ -511,11 +511,51 @@ class TestRequest:
         resp.text = "failed to decode hashed id: XYZ"
         resp.content = b"failed to decode hashed id: XYZ"
         resp.json.return_value = {"message": "failed to decode hashed id: XYZ"}
+
+        # Anomaly endpoint should say "Invalid Anomaly ID"
         with self._patch_httpx(resp):
             with pytest.raises(ReveniumAPIError) as exc_info:
-                await self.client._request("PUT", "/endpoint")
-        # The enhanced message specifically contains the anomaly ID diagnostic header
+                await self.client._request("PUT", "/profitstream/v2/api/sources/ai/anomaly")
         assert "Invalid Anomaly ID" in exc_info.value.message
+
+        # Product endpoint should say "Invalid Product ID"
+        with self._patch_httpx(resp):
+            with pytest.raises(ReveniumAPIError) as exc_info:
+                await self.client._request("GET", "/profitstream/v2/api/products/abc")
+        assert "Invalid Product ID" in exc_info.value.message
+
+        # Unknown endpoint should say "Invalid Resource ID"
+        with self._patch_httpx(resp):
+            with pytest.raises(ReveniumAPIError) as exc_info:
+                await self.client._request("PUT", "/unknown")
+        assert "Invalid Resource ID" in exc_info.value.message
+
+    @pytest.mark.parametrize(
+        "endpoint, expected_label",
+        [
+            ("/profitstream/v2/api/products/abc", "Product"),
+            ("/profitstream/v2/api/sources/123", "Source"),
+            ("/profitstream/v2/api/subscriptions/abc", "Subscription"),
+            ("/profitstream/v2/api/users/abc", "User"),
+            ("/profitstream/v2/api/subscribers/abc", "Subscriber"),
+            ("/profitstream/v2/api/subscribers/abc/credentials/xyz", "Credential"),
+            ("/profitstream/v2/api/organizations/abc", "Organization"),
+            ("/profitstream/v2/api/teams/abc", "Team"),
+            ("/profitstream/v2/api/sources/ai/anomaly/abc", "Anomaly"),
+            ("/profitstream/v2/api/sources/ai/anomalies", "Anomaly"),
+            ("/profitstream/v2/api/sources/ai/alert/abc", "Alert"),
+            ("/profitstream/v2/api/sources/ai/alerts", "Alert"),
+            ("/profitstream/v2/api/metering-element-definitions/abc", "Metering Element"),
+            ("/profitstream/v2/api/metering/abc", "Metering"),
+            ("/profitstream/v2/api/configurations/abc", "Configuration"),
+            ("/profitstream/v2/api/slack/abc", "Slack Configuration"),
+            ("/unknown/path", "Resource"),
+        ],
+    )
+    def test_resource_label_from_endpoint(self, endpoint, expected_label):
+        """_resource_label_from_endpoint returns the correct singular label for every mapped segment."""
+        singular, _plural = ReveniumClient._resource_label_from_endpoint(endpoint)
+        assert singular == expected_label
 
     @pytest.mark.asyncio
     async def test_httpx_request_error_raises_api_error(self):
@@ -747,14 +787,18 @@ class TestHttpMethodDelegates:
     async def test_get_with_retry(self):
         self.client._request_with_retry = AsyncMock(return_value={"a": 1})
         result = await self.client.get("/ep", params={"p": 1})
-        self.client._request_with_retry.assert_called_once_with("GET", "/ep", params={"p": 1})
+        self.client._request_with_retry.assert_called_once_with(
+            "GET", "/ep", params={"p": 1}, base_url=None, use_bearer=False
+        )
         assert result == {"a": 1}
 
     @pytest.mark.asyncio
     async def test_get_without_retry(self):
         self.client._request = AsyncMock(return_value={"b": 2})
         result = await self.client.get("/ep", use_retry=False)
-        self.client._request.assert_called_once_with("GET", "/ep", params=None)
+        self.client._request.assert_called_once_with(
+            "GET", "/ep", params=None, base_url=None, use_bearer=False
+        )
         assert result == {"b": 2}
 
     @pytest.mark.asyncio
@@ -762,7 +806,7 @@ class TestHttpMethodDelegates:
         self.client._request_with_retry = AsyncMock(return_value={"created": True})
         result = await self.client.post("/ep", data={"x": 1})
         self.client._request_with_retry.assert_called_once_with(
-            "POST", "/ep", params=None, json_data={"x": 1}
+            "POST", "/ep", params=None, json_data={"x": 1}, base_url=None, use_bearer=False
         )
         assert result == {"created": True}
 
@@ -770,7 +814,9 @@ class TestHttpMethodDelegates:
     async def test_post_without_retry(self):
         self.client._request = AsyncMock(return_value={"c": 3})
         result = await self.client.post("/ep", data={"y": 2}, use_retry=False)
-        self.client._request.assert_called_once_with("POST", "/ep", params=None, json_data={"y": 2})
+        self.client._request.assert_called_once_with(
+            "POST", "/ep", params=None, json_data={"y": 2}, base_url=None, use_bearer=False
+        )
         assert result == {"c": 3}
 
     @pytest.mark.asyncio
@@ -778,7 +824,7 @@ class TestHttpMethodDelegates:
         self.client._request_with_retry = AsyncMock(return_value={"updated": True})
         result = await self.client.put("/ep", data={"z": 3})
         self.client._request_with_retry.assert_called_once_with(
-            "PUT", "/ep", params=None, json_data={"z": 3}
+            "PUT", "/ep", params=None, json_data={"z": 3}, base_url=None, use_bearer=False
         )
         assert result == {"updated": True}
 
@@ -792,7 +838,9 @@ class TestHttpMethodDelegates:
     async def test_delete_with_retry(self):
         self.client._request_with_retry = AsyncMock(return_value={})
         result = await self.client.delete("/ep")
-        self.client._request_with_retry.assert_called_once_with("DELETE", "/ep", params=None)
+        self.client._request_with_retry.assert_called_once_with(
+            "DELETE", "/ep", params=None, base_url=None, use_bearer=False
+        )
         assert result == {}
 
     @pytest.mark.asyncio
@@ -1506,7 +1554,7 @@ class TestAIModelsAPI:
     async def test_search_ai_models(self):
         await self.client.search_ai_models("gpt", page=0, size=10)
         call_url = self.client.get.call_args[0][0]
-        assert "search" in call_url
+        assert call_url == "/profitstream/v2/api/sources/ai/models"
         params = self.client.get.call_args[1]["params"]
         assert params["query"] == "gpt"
 

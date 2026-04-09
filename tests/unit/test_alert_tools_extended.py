@@ -5,7 +5,6 @@ bulk operations, and specialized alert creation actions.
 Mocks self.get_client() to avoid real API calls.
 """
 
-import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 

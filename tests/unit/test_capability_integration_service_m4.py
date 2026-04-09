@@ -245,7 +245,7 @@ class TestIntegrateWithMCPServer:
         )
         await svc.integrate_with_mcp_server(MagicMock())
         assert len(captured_handlers) == 1
-        import asyncio, inspect
+        import inspect
         assert inspect.iscoroutinefunction(captured_handlers[0])
 
     @pytest.mark.asyncio

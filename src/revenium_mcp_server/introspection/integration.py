@@ -168,6 +168,22 @@ class IntrospectionIntegration:
                 SourceManagement, "Source Management", "manage_sources"
             )
 
+            from ..tools_decomposed.tool_management import ToolManagement
+
+            await self._register_tool_with_ucm(
+                ToolManagement, "Tool Registry Management", "manage_tools"
+            )
+
+            try:
+                from ..tools_decomposed.job_management import JobManagement
+
+                await self._register_tool_with_ucm(
+                    JobManagement, "Job Management", "manage_jobs"
+                )
+                logger.info("Registered manage_jobs for introspection")
+            except Exception as e:
+                logger.warning(f"Could not register manage_jobs for introspection: {e}")
+
             from ..tools_decomposed.business_analytics_management import BusinessAnalyticsManagement
 
             await self._register_tool_with_ucm(
@@ -310,7 +326,7 @@ class IntrospectionIntegration:
 
             # Only wrap non-ToolError exceptions
             execution_error = ToolExecutionError(
-                f"Tool execution failed", tool_name=tool_name, action=action
+                "Tool execution failed", tool_name=tool_name, action=action
             )
             return format_error_response(execution_error, f"executing {tool_name}.{action}")
         finally:
@@ -430,7 +446,7 @@ class IntrospectionIntegration:
         # Use individual tool discovery instead of removed get_all_metadata
         tool_names = await self.engine.list_tools()
         all_metadata = {}
-        
+
         # Collect metadata using individual tool discovery
         for tool_name in tool_names:
             metadata = await self.engine.get_tool_metadata(tool_name)

@@ -16,7 +16,7 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 # Local imports
 from .models import RoutingResult
 from .parameter_mapper import ParameterMapper, ParameterMappingError
-from .tool_executor import ToolExecutionError, ToolExecutor
+from .tool_executor import ToolExecutor
 from .tool_registry import tool_registry
 
 
@@ -149,13 +149,13 @@ class EnhancedToolIntegration:
         # Use individual tool discovery instead of get_all_metadata aggregation
         available_tools = tool_registry.list_tools()
         tool_metadata = {}
-        
+
         # Get individual tool metadata using standard MCP patterns
         for tool_name in available_tools:
             individual_metadata = tool_registry.get_tool_metadata(tool_name)
             if individual_metadata:
                 tool_metadata[tool_name] = individual_metadata
-        
+
         return {
             "available_tools": available_tools,
             "tool_metadata": tool_metadata,

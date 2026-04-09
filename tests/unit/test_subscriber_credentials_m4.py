@@ -334,6 +334,82 @@ class TestHandleActionFullRouting:
         assert "cred_1" in result[0].text
 
     @pytest.mark.asyncio
+    async def test_resolve_subscriber_email_to_id_found(self, cred_tool):
+        """resolve_subscriber_email_to_id returns subscriber ID when email is found."""
+        cred_tool.client.resolve_subscriber_email_to_id = AsyncMock(return_value="sub_123")
+        result = await cred_tool.handle_action(
+            "resolve_subscriber_email_to_id", {"email": "user@company.com"}
+        )
+        assert isinstance(result[0], TextContent)
+        assert "sub_123" in result[0].text
+        assert "user@company.com" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_resolve_subscriber_email_to_id_not_found(self, cred_tool):
+        """resolve_subscriber_email_to_id returns not-found message when email doesn't match."""
+        cred_tool.client.resolve_subscriber_email_to_id = AsyncMock(return_value=None)
+        result = await cred_tool.handle_action(
+            "resolve_subscriber_email_to_id", {"email": "nobody@example.com"}
+        )
+        assert isinstance(result[0], TextContent)
+        assert "Not Found" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_resolve_subscriber_email_to_id_missing_email(self, cred_tool):
+        """resolve_subscriber_email_to_id raises ToolError when email param is missing."""
+        with pytest.raises(ToolError, match="email"):
+            await cred_tool.handle_action("resolve_subscriber_email_to_id", {})
+
+    @pytest.mark.asyncio
+    async def test_resolve_subscriber_email_to_id_api_error(self, cred_tool):
+        """resolve_subscriber_email_to_id raises ToolError on API failure."""
+        cred_tool.client.resolve_subscriber_email_to_id = AsyncMock(
+            side_effect=Exception("Connection refused")
+        )
+        with pytest.raises(ToolError, match="Failed to resolve subscriber email"):
+            await cred_tool.handle_action(
+                "resolve_subscriber_email_to_id", {"email": "user@company.com"}
+            )
+
+    @pytest.mark.asyncio
+    async def test_resolve_organization_name_to_id_found(self, cred_tool):
+        """resolve_organization_name_to_id returns org ID when name is found."""
+        cred_tool.client.resolve_organization_name_to_id = AsyncMock(return_value="org_456")
+        result = await cred_tool.handle_action(
+            "resolve_organization_name_to_id", {"name": "Acme Corp"}
+        )
+        assert isinstance(result[0], TextContent)
+        assert "org_456" in result[0].text
+        assert "Acme Corp" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_resolve_organization_name_to_id_not_found(self, cred_tool):
+        """resolve_organization_name_to_id returns not-found message when name doesn't match."""
+        cred_tool.client.resolve_organization_name_to_id = AsyncMock(return_value=None)
+        result = await cred_tool.handle_action(
+            "resolve_organization_name_to_id", {"name": "NoSuchOrg"}
+        )
+        assert isinstance(result[0], TextContent)
+        assert "Not Found" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_resolve_organization_name_to_id_missing_name(self, cred_tool):
+        """resolve_organization_name_to_id raises ToolError when name param is missing."""
+        with pytest.raises(ToolError, match="name"):
+            await cred_tool.handle_action("resolve_organization_name_to_id", {})
+
+    @pytest.mark.asyncio
+    async def test_resolve_organization_name_to_id_api_error(self, cred_tool):
+        """resolve_organization_name_to_id raises ToolError on API failure."""
+        cred_tool.client.resolve_organization_name_to_id = AsyncMock(
+            side_effect=Exception("Timeout")
+        )
+        with pytest.raises(ToolError, match="Failed to resolve organization name"):
+            await cred_tool.handle_action(
+                "resolve_organization_name_to_id", {"name": "Acme Corp"}
+            )
+
+    @pytest.mark.asyncio
     async def test_dict_result_wrapped_in_text_content(self, cred_tool):
         """Dict results for non-standard actions are wrapped in TextContent (lines 383-389)."""
         cred_tool.documentation_handler.validate_credential_data = AsyncMock(
@@ -932,7 +1008,8 @@ class TestIntrospectionMethods:
         actions = await cred_tool._get_supported_actions()
         assert isinstance(actions, list)
         for action in ["list", "get", "create", "update", "delete", "get_capabilities",
-                        "validate", "get_subscription_details", "get_product_details"]:
+                        "validate", "get_subscription_details", "get_product_details",
+                        "resolve_subscriber_email_to_id", "resolve_organization_name_to_id"]:
             assert action in actions
 
     @pytest.mark.asyncio

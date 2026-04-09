@@ -7,7 +7,7 @@ relationships in the Revenium billing automation system.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 class BusinessScenario(Enum):

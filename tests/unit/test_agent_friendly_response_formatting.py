@@ -1,7 +1,5 @@
 """Tests for agent_friendly/response_formatting.py — standardized response builders."""
 
-import json
-import pytest
 from mcp.types import TextContent
 
 from src.revenium_mcp_server.agent_friendly.response_formatting import (

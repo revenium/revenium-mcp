@@ -256,7 +256,7 @@ class ProductValidationEngine:
                             ValidationError(
                                 field=f"plan.{field}",
                                 value=None,
-                                error=f"SUBSCRIPTION plans require a 'period' field",
+                                error="SUBSCRIPTION plans require a 'period' field",
                                 suggestion="Add 'period' to your plan configuration. Use UCM get_capabilities to see valid periods",
                                 example={"plan": {"period": "MONTHLY"}},
                             )

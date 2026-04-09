@@ -11,7 +11,6 @@ Tests the behavioral correctness of:
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.analytics.comparative_analytics_processor import (
     ComparativeAnalyticsProcessor,

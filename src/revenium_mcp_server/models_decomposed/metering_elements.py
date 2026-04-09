@@ -9,7 +9,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from .base import BaseReveniumModel, validate_non_empty_string, validate_positive_number
+from .base import BaseReveniumModel, validate_non_empty_string
 
 
 class MeteringElementType(str, Enum):

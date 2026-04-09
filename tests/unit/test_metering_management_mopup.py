@@ -18,7 +18,7 @@ Targets the ~600 uncovered lines remaining after existing test suites:
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.tools_decomposed.metering_management import (
     MeteringTransactionManager,
@@ -381,19 +381,19 @@ class TestHandleLookupRecentTransactions:
             )
 
     async def test_invalid_page_size_raises(self):
-        """Line 2680: invalid page_size parameter."""
+        """Line 2680: invalid recent_page_size parameter."""
         client = make_client()
         with pytest.raises(ToolError):
             await self.mm._handle_lookup_recent_transactions(
-                client, {"page_size": 0}
+                client, {"recent_page_size": 0}
             )
 
     async def test_page_size_too_large_raises(self):
-        """Line 2680: page_size > 50."""
+        """recent_page_size > 100 raises ToolError."""
         client = make_client()
         with pytest.raises(ToolError):
             await self.mm._handle_lookup_recent_transactions(
-                client, {"page_size": 100}
+                client, {"recent_page_size": 101}
             )
 
     async def test_successful_response_with_embedded(self):
@@ -418,7 +418,7 @@ class TestHandleLookupRecentTransactions:
             },
         })
         result = await self.mm._handle_lookup_recent_transactions(
-            client, {"page": 0, "page_size": 20}
+            client, {"page": 0, "recent_page_size": 20}
         )
         assert "tx_001" in result
         assert "Recent Transactions" in result
@@ -430,7 +430,7 @@ class TestHandleLookupRecentTransactions:
             "_embedded": {"aICompletionMetricResourceList": []},
         })
         result = await self.mm._handle_lookup_recent_transactions(
-            client, {"page": 0, "page_size": 20}
+            client, {"page": 0, "recent_page_size": 20}
         )
         assert "No transactions found" in result
 
@@ -483,7 +483,7 @@ class TestHandleLookupRecentTransactions:
             "_embedded": {"aICompletionMetricResourceList": txs},
         })
         result = await self.mm._handle_lookup_recent_transactions(
-            client, {"page": 0, "page_size": 5}
+            client, {"page": 0, "recent_page_size": 5}
         )
         assert "More Available" in result
 
@@ -514,11 +514,11 @@ class TestHandleAnalyzeRecentTransactions:
         self.mm = make_mm()
 
     async def test_no_data_returned(self):
-        """Line 3150: response with neither _embedded nor content."""
+        """Response with neither _embedded nor content yields empty transaction list."""
         client = make_client()
         client.get = AsyncMock(return_value={})
         result = await self.mm._handle_analyze_recent_transactions(client, {})
-        assert result[0].text and "No Transaction Data" in result[0].text
+        assert result[0].text and "No Recent Transactions" in result[0].text
 
     async def test_empty_transactions(self):
         """Line 3158: zero transactions in response."""
@@ -556,16 +556,16 @@ class TestHandleAnalyzeRecentTransactions:
         assert "Field Presence Summary" in text
         assert "Subscriber Object Analysis" in text
 
-    async def test_limit_capped_at_50(self):
-        """Line 3118: limit > 50 is capped."""
+    async def test_limit_capped_at_100(self):
+        """limit > 100 is capped to 100."""
         client = make_client()
         client.get = AsyncMock(return_value={
             "_embedded": {"aICompletionMetricResourceList": [{"transactionId": "tx_1", "model": "m"}]},
         })
-        await self.mm._handle_analyze_recent_transactions(client, {"limit": 100})
+        await self.mm._handle_analyze_recent_transactions(client, {"limit": 200})
         # Verify the call used capped limit
         call_kwargs = client.get.call_args
-        assert call_kwargs[1]["params"]["size"] == 50
+        assert call_kwargs[1]["params"]["size"] == 100
 
     async def test_exception_returns_error(self):
         """Line 3349-3351: exception handling."""
@@ -693,9 +693,9 @@ class TestAIModelHandlers:
 
     @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
     async def test_search_ai_models_success(self, MockClient):
-        """Lines 4147-4217: successful search."""
+        """Server-side search returns matching models."""
         mock_client = MockClient.return_value
-        mock_client.get_ai_models = AsyncMock(return_value={
+        mock_client.search_ai_models = AsyncMock(return_value={
             "_embedded": {
                 "aIModelResourceList": [
                     {"name": "gpt-4o", "provider": "OPENAI", "id": "m1",
@@ -703,30 +703,30 @@ class TestAIModelHandlers:
                      "supportFunctionCalling": True, "supportsVision": True,
                      "supportsPromptCaching": False},
                 ]
-            }
+            },
+            "page": {"totalElements": 1, "totalPages": 1},
         })
         result = await self.mm._handle_search_ai_models({"query": "gpt"})
         assert "gpt-4o" in result[0].text
 
     @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
     async def test_search_ai_models_no_results(self, MockClient):
-        """Line 4171: no matching models."""
+        """Server-side search returns empty list."""
         mock_client = MockClient.return_value
-        mock_client.get_ai_models = AsyncMock(return_value={
-            "_embedded": {"aIModelResourceList": [
-                {"name": "claude-3", "provider": "ANTHROPIC"},
-            ]}
+        mock_client.search_ai_models = AsyncMock(return_value={
+            "_embedded": {"aIModelResourceList": []},
+            "page": {"totalElements": 0, "totalPages": 0},
         })
         result = await self.mm._handle_search_ai_models({"query": "nonexistent"})
         assert "No models found" in result[0].text
 
     @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
     async def test_search_ai_models_empty_response(self, MockClient):
-        """Line 4218: empty API response."""
+        """Empty API response without _embedded key."""
         mock_client = MockClient.return_value
-        mock_client.get_ai_models = AsyncMock(return_value={})
+        mock_client.search_ai_models = AsyncMock(return_value={})
         result = await self.mm._handle_search_ai_models({"query": "test"})
-        assert "Search failed" in result[0].text
+        assert "No results found" in result[0].text
 
     @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
     async def test_get_supported_providers_success(self, MockClient):
@@ -764,7 +764,7 @@ class TestAIModelHandlers:
     async def test_validate_model_provider_exact_match(self, MockClient):
         """Lines 4361-4371: exact match found."""
         mock_client = MockClient.return_value
-        mock_client.get_ai_models = AsyncMock(return_value={
+        mock_client.search_ai_models = AsyncMock(return_value={
             "_embedded": {
                 "aIModelResourceList": [
                     {"name": "gpt-4o", "provider": "OPENAI", "id": "m1",
@@ -781,7 +781,7 @@ class TestAIModelHandlers:
     async def test_validate_model_provider_partial_match(self, MockClient):
         """Lines 4373-4383: partial match suggestions."""
         mock_client = MockClient.return_value
-        mock_client.get_ai_models = AsyncMock(return_value={
+        mock_client.search_ai_models = AsyncMock(return_value={
             "_embedded": {
                 "aIModelResourceList": [
                     {"name": "gpt-4o", "provider": "OPENAI"},
@@ -798,7 +798,7 @@ class TestAIModelHandlers:
     async def test_validate_model_provider_no_match(self, MockClient):
         """Lines 4385-4393: no match at all."""
         mock_client = MockClient.return_value
-        mock_client.get_ai_models = AsyncMock(return_value={
+        mock_client.search_ai_models = AsyncMock(return_value={
             "_embedded": {
                 "aIModelResourceList": [
                     {"name": "claude-3", "provider": "ANTHROPIC"},
@@ -814,7 +814,7 @@ class TestAIModelHandlers:
     async def test_validate_model_provider_empty_response(self, MockClient):
         """Line 4395: empty API response."""
         mock_client = MockClient.return_value
-        mock_client.get_ai_models = AsyncMock(return_value={})
+        mock_client.search_ai_models = AsyncMock(return_value={})
         result = await self.mm._handle_validate_model_provider(
             {"model": "gpt-4o", "provider": "openai"}
         )
@@ -838,7 +838,7 @@ class TestAIModelHandlers:
     async def test_estimate_cost_success(self, MockClient):
         """Lines 4477-4507: successful cost estimation."""
         mock_client = MockClient.return_value
-        mock_client.get_ai_models = AsyncMock(return_value={
+        mock_client.search_ai_models = AsyncMock(return_value={
             "_embedded": {
                 "aIModelResourceList": [
                     {"name": "gpt-4o", "provider": "OPENAI",
@@ -856,7 +856,7 @@ class TestAIModelHandlers:
     async def test_estimate_cost_model_not_found(self, MockClient):
         """Line 4509: model not found for cost estimation."""
         mock_client = MockClient.return_value
-        mock_client.get_ai_models = AsyncMock(return_value={
+        mock_client.search_ai_models = AsyncMock(return_value={
             "_embedded": {"aIModelResourceList": [
                 {"name": "claude-3", "provider": "ANTHROPIC"},
             ]}
@@ -870,7 +870,7 @@ class TestAIModelHandlers:
     async def test_estimate_cost_empty_response(self, MockClient):
         """Line 4518: empty API response."""
         mock_client = MockClient.return_value
-        mock_client.get_ai_models = AsyncMock(return_value={})
+        mock_client.search_ai_models = AsyncMock(return_value={})
         result = await self.mm._handle_estimate_transaction_cost(
             {"model": "gpt-4o", "provider": "openai", "input_tokens": 100, "output_tokens": 50}
         )

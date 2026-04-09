@@ -5,14 +5,13 @@ summary generation and recommendation logic without making real routing calls.
 """
 
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
 from src.revenium_mcp_server.ai_routing.ab_testing_framework import (
     ABTestingFramework,
     ABTestResult,
-    ABTestSummary,
     PerformanceComparator,
     TestScenario,
     TestScenarioManager,

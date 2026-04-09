@@ -6,7 +6,6 @@ analysis for credential operations.
 """
 
 import pytest
-from unittest.mock import patch, MagicMock
 
 from src.revenium_mcp_server.tools_decomposed.credential_business_handler import (
     CredentialBusinessHandler,

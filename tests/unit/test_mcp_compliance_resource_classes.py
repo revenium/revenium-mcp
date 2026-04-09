@@ -9,7 +9,6 @@ Covers:
 
 import pytest
 from datetime import datetime
-from types import SimpleNamespace
 
 from src.revenium_mcp_server.mcp_compliance.resource_classes import (
     MCPResource,

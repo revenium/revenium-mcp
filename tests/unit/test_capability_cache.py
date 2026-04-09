@@ -6,7 +6,7 @@ TTL-based caching, cache warming, eviction, and automatic cleanup.
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 

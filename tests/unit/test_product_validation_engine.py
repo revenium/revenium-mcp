@@ -1,6 +1,5 @@
 """Unit tests for product_validation_engine module."""
 
-import pytest
 
 from src.revenium_mcp_server.product_validation_engine import (
     ValidationError,

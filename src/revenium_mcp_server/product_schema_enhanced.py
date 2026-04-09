@@ -151,7 +151,7 @@ class EnhancedProductSchemaDiscovery:
                         template_name, requirements
                     ),
                 }
-        except (ImportError, KeyError) as e:
+        except (ImportError, KeyError):
             # Fallback if import fails or template structure is wrong
             pass
 

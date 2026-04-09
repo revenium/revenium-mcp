@@ -10,7 +10,7 @@ the dual-layer delegation pattern.
 
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 
 from loguru import logger
@@ -77,7 +77,7 @@ class ProductManager:
                 "has_previous": page > 0,
             },
             "metadata": {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         }
 
@@ -103,7 +103,7 @@ class ProductManager:
             "product_id": product_id,
             "data": product,
             "metadata": {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         }
 
@@ -328,7 +328,7 @@ class ProductManager:
             "action": "create",
             "data": result,
             "metadata": {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         }
 
@@ -389,7 +389,7 @@ class ProductManager:
             "product_id": product_id,
             "data": result,
             "metadata": {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "partial_update": True,
                 "validation_engine": "ProductValidationEngine integrated",
             },
@@ -417,7 +417,7 @@ class ProductManager:
             "product_id": product_id,
             "data": result,
             "metadata": {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         }
 
@@ -1300,7 +1300,7 @@ class ProductEnhancementProcessor:
             ] = "Fee charged for each subscription"
 
         # Add validation metadata
-        validation_result["enhanced_data"]["validation_timestamp"] = datetime.now().isoformat()
+        validation_result["enhanced_data"]["validation_timestamp"] = datetime.now(timezone.utc).isoformat()
         validation_result["enhanced_data"]["validation_status"] = (
             "valid" if validation_result["valid"] else "invalid"
         )
@@ -1569,7 +1569,7 @@ class ProductHierarchyManager:
             "data": navigation_result.related_entities,
             "navigation_path": navigation_result.navigation_path,
             "metadata": {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "hierarchy_level": "products → subscriptions",
                 "total_subscriptions": len(navigation_result.related_entities),
             },
@@ -1618,7 +1618,7 @@ class ProductHierarchyManager:
             "data": credentials,
             "navigation_path": navigation_result.navigation_path,
             "metadata": {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "hierarchy_level": "products → subscriptions → credentials",
                 "total_credentials": len(credentials),
                 "total_subscriptions": len(hierarchy_data.get("subscriptions", [])),
