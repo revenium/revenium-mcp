@@ -4,7 +4,6 @@ Covers handle_action routing for create, update, delete, search, get_supporting_
 and various discovery/validation actions. Mocks client API calls.
 """
 
-import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,7 +16,6 @@ from src.revenium_mcp_server.tools_decomposed.product_management import (
     ProductEnhancementProcessor,
     ProductHierarchyManager,
 )
-from src.revenium_mcp_server.common.error_handling import ToolError
 
 
 # ---------------------------------------------------------------------------

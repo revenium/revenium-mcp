@@ -7,7 +7,7 @@ that all specialized formatters can inherit and use.
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 
 class BaseFormattingUtilities:

@@ -6,17 +6,14 @@ integrity, and analyzes deletion impact.
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.hierarchy.cross_tier_validator import (
     CrossTierValidator,
-    ImpactAnalysis,
     OperationType,
     ValidationIssue,
     ValidationResult,
     ValidationSeverity,
-    get_cross_tier_validator,
-    cross_tier_validator,
 )
 
 

@@ -6,6 +6,7 @@ extensive business context for product managers managing billing automation.
 """
 
 import time
+from datetime import datetime, timezone
 from typing import Any, ClassVar, Dict, List, Union
 
 from loguru import logger
@@ -87,7 +88,7 @@ class CredentialsHierarchyManager:
             ),
             "navigation_path": navigation_result.navigation_path,
             "metadata": {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "response_time_ms": timing_ms,
                 "hierarchy_level": "credentials → subscriptions",
                 "subscription_found": len(navigation_result.related_entities) > 0,
@@ -144,7 +145,7 @@ class CredentialsHierarchyManager:
             "data": product,
             "navigation_path": navigation_result.navigation_path,
             "metadata": {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "response_time_ms": timing_ms,
                 "hierarchy_level": "credentials → subscriptions → products",
                 "product_found": bool(product),
@@ -213,7 +214,7 @@ class SubscriberCredentialsManagement(ToolBase):
                 # Optional credential fields
                 "name": {
                     "type": "string",
-                    "description": "Internal name (defaults to label if not provided)",
+                    "description": "Internal name (defaults to label if not provided). Also used as organization name for resolve_organization_name_to_id action.",
                 },
                 "tags": {"type": "array", "description": "List of tags for categorization"},
                 "subscriptionIds": {
@@ -228,6 +229,11 @@ class SubscriberCredentialsManagement(ToolBase):
                 "credential_data": {
                     "type": "object",
                     "description": "Credential data object for create/update operations",
+                },
+                # Resolver fields
+                "email": {
+                    "type": "string",
+                    "description": "Email address for resolve_subscriber_email_to_id action",
                 },
                 # Note: Full field list available in get_capabilities() and get_examples()
             },
@@ -313,6 +319,56 @@ class SubscriberCredentialsManagement(ToolBase):
                         text=f"**Product Details for Credential {result['credential_id']}**\n\n{json.dumps(result, indent=2)}",
                     )
                 ]
+            elif action == "resolve_subscriber_email_to_id":
+                email = arguments.get("email")
+                if not email:
+                    raise ToolError(
+                        message="Missing required 'email' parameter for resolve_subscriber_email_to_id",
+                        error_code=ErrorCodes.MISSING_PARAMETER,
+                        field="email",
+                        value=None,
+                        suggestions=["Provide an email address: resolve_subscriber_email_to_id(email='user@company.com')"],
+                    )
+                from mcp.types import TextContent
+                try:
+                    subscriber_id = await self.client.resolve_subscriber_email_to_id(email)
+                except Exception as e:
+                    raise ToolError(
+                        message=f"Failed to resolve subscriber email: {e}",
+                        error_code=ErrorCodes.API_ERROR,
+                        field="email",
+                        value=email,
+                        suggestions=["Check your API connection and try again"],
+                    )
+                if subscriber_id:
+                    return [TextContent(type="text", text=f"**Resolved Subscriber**\n\n- **Email:** {email}\n- **Subscriber ID:** {subscriber_id}")]
+                else:
+                    return [TextContent(type="text", text=f"**Subscriber Not Found**\n\nNo subscriber found with email: {email}")]
+            elif action == "resolve_organization_name_to_id":
+                org_name = arguments.get("name")
+                if not org_name:
+                    raise ToolError(
+                        message="Missing required 'name' parameter for resolve_organization_name_to_id",
+                        error_code=ErrorCodes.MISSING_PARAMETER,
+                        field="name",
+                        value=None,
+                        suggestions=["Provide an organization name: resolve_organization_name_to_id(name='Company Name')"],
+                    )
+                from mcp.types import TextContent
+                try:
+                    org_id = await self.client.resolve_organization_name_to_id(org_name)
+                except Exception as e:
+                    raise ToolError(
+                        message=f"Failed to resolve organization name: {e}",
+                        error_code=ErrorCodes.API_ERROR,
+                        field="name",
+                        value=org_name,
+                        suggestions=["Check your API connection and try again"],
+                    )
+                if org_id:
+                    return [TextContent(type="text", text=f"**Resolved Organization**\n\n- **Name:** {org_name}\n- **Organization ID:** {org_id}")]
+                else:
+                    return [TextContent(type="text", text=f"**Organization Not Found**\n\nNo organization found with name: {org_name}")]
             else:
                 raise ToolError(
                     message=f"Unknown action '{action}' is not supported",
@@ -337,6 +393,8 @@ class SubscriberCredentialsManagement(ToolBase):
                             "validate",
                             "get_subscription_details",
                             "get_product_details",
+                            "resolve_subscriber_email_to_id",
+                            "resolve_organization_name_to_id",
                         ],
                         "example_usage": {
                             "list": "list(page=0, size=20)",
@@ -346,6 +404,8 @@ class SubscriberCredentialsManagement(ToolBase):
                             "delete": "delete(credential_id='cred_123')",
                             "get_subscription_details": "get_subscription_details(credential_id='cred_123')",
                             "get_product_details": "get_product_details(credential_id='cred_123')",
+                            "resolve_subscriber_email_to_id": "resolve_subscriber_email_to_id(email='user@company.com')",
+                            "resolve_organization_name_to_id": "resolve_organization_name_to_id(name='Company Name')",
                         },
                     },
                 )
@@ -400,7 +460,7 @@ class SubscriberCredentialsManagement(ToolBase):
 
             # Map specific API errors to appropriate error codes
             if e.status_code == 400:
-                if "Failed to decode hashed Id" in str(e.message) or "Invalid Anomaly ID" in str(e.message):
+                if "Failed to decode hashed Id" in str(e.message) or "Invalid Credential ID" in str(e.message):
                     # Extract the invalid ID from the arguments
                     invalid_id = arguments.get("credential_id", "INVALID_ID")
                     raise ToolError(
@@ -1000,6 +1060,8 @@ class SubscriberCredentialsManagement(ToolBase):
             "analyze_billing_impact",
             "get_subscription_details",
             "get_product_details",
+            "resolve_subscriber_email_to_id",
+            "resolve_organization_name_to_id",
         ]
 
     async def _get_tool_capabilities(self) -> List[ToolCapability]:

@@ -13,16 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from .statistical_anomaly_detector import SENSITIVITY_THRESHOLDS, StatisticalAnomalyDetector
-
-# API endpoint mappings as specified in PRD
-TEMPORAL_ANALYSIS_ENDPOINTS = {
-    "providers": "/profitstream/v2/api/sources/metrics/ai/total-cost-by-provider-over-time",
-    "models": "/profitstream/v2/api/sources/metrics/ai/total-cost-by-model",
-    "api_keys": "/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-subscriber-credential",
-    "agents": "/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-agents-over-time",
-    "customers": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-organization",
-    "tokens": "/profitstream/v2/api/sources/metrics/ai/tokens-per-minute-by-provider",
-}
+from ..endpoint_registry import resolve_analytics_request
 
 # Dimensions that support time-series data for new entity detection
 NEW_ENTITY_DETECTION_SUPPORTED_DIMENSIONS = {
@@ -65,6 +56,17 @@ class EnhancedSpikeAnalyzer:
         self.client = client
         self.detector = StatisticalAnomalyDetector()
         self.logger = logger
+
+        # Maps dimension name → endpoint registry key for resolve_analytics_request
+        # (BACK-718 migration — paths resolved per-call so feature flag toggles are handled)
+        self.temporal_analysis_endpoint_keys = {
+            "providers": "total_cost_by_provider_over_time",
+            "models": "total_cost_by_model",
+            "api_keys": "cost_metrics_by_subscriber_credential",
+            "agents": "cost_metrics_by_agents_over_time",
+            "customers": "cost_metric_by_organization",
+            "tokens": "tokens_per_minute_by_provider",
+        }
 
         # Period validation mapping
         self.supported_periods = {
@@ -167,16 +169,16 @@ class EnhancedSpikeAnalyzer:
 
         # Collect data for each specified dimension
         for dimension in include_dimensions:
-            if dimension not in TEMPORAL_ANALYSIS_ENDPOINTS:
+            if dimension not in self.temporal_analysis_endpoint_keys:
                 self.logger.warning(f"Unknown dimension: {dimension}")
                 continue
 
-            endpoint = TEMPORAL_ANALYSIS_ENDPOINTS[dimension]
-            params = {"teamId": team_id, "period": period}
+            registry_key = self.temporal_analysis_endpoint_keys[dimension]
+            path, params, call_kwargs = resolve_analytics_request(registry_key, team_id, period)
 
             try:
-                self.logger.info(f"Collecting {dimension} data from {endpoint}")
-                response = await self.client.get(endpoint, params=params)
+                self.logger.info(f"Collecting {dimension} data from {path}")
+                response = await self.client.get(path, params=params, **call_kwargs)
                 collected_data[dimension] = response
                 self.logger.info(f"Successfully collected {dimension} data")
 

@@ -158,6 +158,7 @@ revenium-platformapi-mcp.code-workspace
 *CLAUDE*.md
 .augment/
 .claude_code_config.json
+.claude/settings.json
 
 #others
 local_docs
@@ -168,3 +169,6 @@ tool_config.json
 
 # Publication staging directories (generated, not tracked)
 *-public-staging/
+
+# Development credentials (never commit real credentials)
+docs/dev-credentials.md

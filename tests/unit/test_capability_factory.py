@@ -47,8 +47,11 @@ class TestUCMFactory:
     async def test_create_ucm_raises_without_client_or_env(self, monkeypatch):
         """create_ucm raises ValueError when no client and no API key env var."""
         monkeypatch.delenv("REVENIUM_API_KEY", raising=False)
-        with pytest.raises(ValueError, match="Failed to create"):
-            await UCMFactory.create_ucm()
+        with patch(
+            "src.revenium_mcp_server.capability_manager.factory.load_dotenv"
+        ):
+            with pytest.raises(ValueError, match="Failed to create"):
+                await UCMFactory.create_ucm()
 
     @pytest.mark.asyncio
     async def test_create_ucm_uses_env_defaults(self, mock_client, monkeypatch):
@@ -72,8 +75,11 @@ class TestUCMFactoryCreateDefaultClient:
     async def test_returns_none_without_api_key(self, monkeypatch):
         """Returns None when REVENIUM_API_KEY is not set."""
         monkeypatch.delenv("REVENIUM_API_KEY", raising=False)
-        result = await UCMFactory._create_default_client()
-        assert result is None
+        with patch(
+            "src.revenium_mcp_server.capability_manager.factory.load_dotenv"
+        ):
+            result = await UCMFactory._create_default_client()
+            assert result is None
 
     @pytest.mark.asyncio
     async def test_returns_none_without_team_id(self, monkeypatch):

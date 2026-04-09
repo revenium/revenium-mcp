@@ -1,13 +1,10 @@
 """Unit tests for Pydantic models."""
 
 import pytest
-from datetime import datetime
 from pydantic import ValidationError
 
 from src.revenium_mcp_server.models import (
-    Product, ProductStatus, Plan, PlanType, Tier, Element, SetupFee, RatingAggregation,
-    Currency, BillingPeriod, TrialPeriod, AggregationType, RatingAggregationType,
-    Subscription, SubscriptionStatus,
+    Product, Plan, PlanType, Tier, Currency, BillingPeriod, TrialPeriod, Subscription, SubscriptionStatus,
     Source, SourceType,
     APIResponse, ListResponse
 )
@@ -179,11 +176,19 @@ class TestSubscription:
         # id should be None when not provided (not auto-generated)
         assert subscription.id is None
 
+    def test_subscription_creation_full(self, sample_subscription_data):
+        """Test creating a subscription with all fields."""
+        subscription = Subscription(**sample_subscription_data)
+        assert subscription.id == "sub_123"
+        assert subscription.product_id == "prod_123"
+        assert subscription.name == "Test Subscription"
+        assert subscription.status == SubscriptionStatus.ACTIVE
+
     def test_subscription_required_fields(self):
         """Test that required fields are validated."""
         with pytest.raises(ValidationError):
             Subscription(name="Test")  # Missing product_id
-        
+
         with pytest.raises(ValidationError):
             Subscription(product_id="prod_123")  # Missing name
 
@@ -217,7 +222,7 @@ class TestSource:
 
 class TestAPIResponse:
     """Test APIResponse model."""
-    
+
     def test_api_response_defaults(self):
         """Test APIResponse with default values."""
         response = APIResponse()
@@ -225,7 +230,7 @@ class TestAPIResponse:
         assert response.data is None
         assert response.message is None
         assert response.error is None
-    
+
     def test_api_response_with_data(self, sample_api_response):
         """Test APIResponse with data."""
         response = APIResponse(**sample_api_response)
@@ -237,7 +242,7 @@ class TestAPIResponse:
 
 class TestListResponse:
     """Test ListResponse model."""
-    
+
     def test_list_response_defaults(self):
         """Test ListResponse with default values."""
         response = ListResponse()
@@ -246,7 +251,7 @@ class TestListResponse:
         assert response.page == 1
         assert response.per_page == 20
         assert response.has_more is False
-    
+
     def test_list_response_with_data(self):
         """Test ListResponse with data."""
         response = ListResponse(

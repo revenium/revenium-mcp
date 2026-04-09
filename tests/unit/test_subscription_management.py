@@ -4,7 +4,6 @@ Tests the SubscriptionManager and SubscriptionManagement classes from the decomp
 Focuses on CRUD operations, product discovery/validation, search filtering, and error handling.
 """
 
-import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 

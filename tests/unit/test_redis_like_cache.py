@@ -1,9 +1,6 @@
 """Tests for core/redis_like_cache.py — LRU/LFU/TTL cache with eviction and pipelines."""
 
-import asyncio
-import time
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
 
 import pytest
 

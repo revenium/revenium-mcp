@@ -6,7 +6,6 @@ and the _handle_debug diagnostic report generation.
 
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
-from mcp.types import TextContent
 
 from src.revenium_mcp_server.tools_decomposed.debug_auto_discovery import (
     DebugAutoDiscovery,

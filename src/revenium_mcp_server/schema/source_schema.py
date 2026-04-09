@@ -12,7 +12,6 @@ Following development best practices:
 
 from typing import Any, Dict, List, Optional
 
-from loguru import logger
 
 from .discovery_engine import BaseSchemaDiscovery
 

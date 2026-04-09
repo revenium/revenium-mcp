@@ -12,7 +12,6 @@ Covers:
 - _format_subscriber_details
 """
 
-import pytest
 
 from src.revenium_mcp_server.tools_decomposed.metering_management import (
     MeteringManagement,

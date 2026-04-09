@@ -62,7 +62,7 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
     """
 
     tool_name = "manage_alerts"
-    tool_description = "AI spending alerts and anomaly monitoring with two approaches: (1) Convenience methods for easy setup - create_threshold_alert, create_cumulative_usage_alert (recommended for most use cases), (2) Advanced method - create with anomaly_data for complex configurations. Supports persistence-based triggering with triggerAfterPersistsDuration. Use get_examples() for comprehensive usage guidance."
+    tool_description = "AI spending alerts and anomaly monitoring with three alert types: (1) Spike Detection - create_threshold_alert for real-time monitoring, (2) Budget Threshold - create_cumulative_usage_alert for period tracking, (3) Relative Change - create with alertType RELATIVE_CHANGE and INCREASES_BY/DECREASES_BY operators for trend detection. Supports persistence-based triggering with triggerAfterPersistsDuration. Use get_examples() for comprehensive usage guidance."
     business_category = "Revenium Cost Alert Functionality"
     tool_type = ToolType.ANALYTICS
     tool_version = "2.0.0"
@@ -437,8 +437,8 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
         """Get quick start guide."""
         return [
             "**ALWAYS START HERE**: get_capabilities() - Understand alert types and required fields",
-            "**See Examples**: get_examples(alert_type='budget_threshold') or get_examples(alert_type='spike_detection')",
-            "**Quick Creation**: create_cumulative_usage_alert() for budget threshold tracking, create_threshold_alert() for spike detection monitoring",
+            "**See Examples**: get_examples(alert_type='budget_threshold'), get_examples(alert_type='spike_detection'), or get_examples(alert_type='relative_change')",
+            "**Quick Creation**: create_cumulative_usage_alert() for budget tracking, create_threshold_alert() for spike detection, or create with alertType RELATIVE_CHANGE for trend detection",
             "**Investigation**: query(text='show alerts from last week') for natural language search",
             "**Analytics**: get_metrics() to analyze alert patterns and frequency",
         ]
@@ -1278,7 +1278,12 @@ create_threshold_alert(...)                     # Real-time monitoring rule
 ### **Need Real-time Monitoring?** → Spike Detection
 - Cost spike alerts: `create_threshold_alert(...)`
 - Error rate monitoring: `create_threshold_alert(...)`
-- Performance alerts: `create_threshold_alert(...)`"""
+- Performance alerts: `create_threshold_alert(...)`
+
+### **Need Trend/Change Detection?** → Relative Change
+- Cost increase alerts: `create` with `alertType: RELATIVE_CHANGE`, `operatorType: INCREASES_BY`
+- Cost decrease alerts: `create` with `alertType: RELATIVE_CHANGE`, `operatorType: DECREASES_BY`
+- Percentage-based monitoring over daily, weekly, or monthly periods"""
 
         # Get metrics using single source of truth with UCM integration
         try:
@@ -1828,6 +1833,103 @@ create(
                     )
                 ]
 
+            elif alert_type in ["relative_change"]:
+                return [
+                    TextContent(
+                        type="text",
+                        text="""**Relative Change Alert Examples**
+
+These alerts detect percentage-based changes over time periods.
+Use INCREASES_BY or DECREASES_BY operators with daily, weekly, or monthly periods.
+
+## **Daily Cost Increase Detection**
+```json
+{
+  "action": "create",
+  "anomaly_data": {
+    "name": "Daily Cost Increase Alert",
+    "alertType": "RELATIVE_CHANGE",
+    "metricType": "TOTAL_COST",
+    "operatorType": "INCREASES_BY",
+    "threshold": 20,
+    "isPercentage": true,
+    "periodDuration": "DAILY",
+    "notificationAddresses": ["finance@company.com"]
+  }
+}
+```
+
+## **Weekly Cost Decrease Detection**
+```json
+{
+  "action": "create",
+  "anomaly_data": {
+    "name": "Weekly Cost Drop Alert",
+    "alertType": "RELATIVE_CHANGE",
+    "metricType": "TOTAL_COST",
+    "operatorType": "DECREASES_BY",
+    "threshold": 30,
+    "isPercentage": true,
+    "periodDuration": "WEEKLY",
+    "notificationAddresses": ["ops@company.com"]
+  }
+}
+```
+
+## **Monthly Token Usage Change**
+```json
+{
+  "action": "create",
+  "anomaly_data": {
+    "name": "Monthly Token Increase Alert",
+    "alertType": "RELATIVE_CHANGE",
+    "metricType": "INPUT_TOKENS",
+    "operatorType": "INCREASES_BY",
+    "threshold": 50,
+    "isPercentage": true,
+    "periodDuration": "MONTHLY",
+    "notificationAddresses": ["engineering@company.com"]
+  }
+}
+```
+
+## **Using Detection Rules Format**
+```json
+{
+  "action": "create",
+  "anomaly_data": {
+    "name": "Cost Trend Alert",
+    "detection_rules": [
+      {
+        "rule_type": "RELATIVE_CHANGE",
+        "metric": "total_cost",
+        "operator": "INCREASES_BY",
+        "value": 25,
+        "time_window": "weekly"
+      }
+    ],
+    "notification_addresses": ["alerts@company.com"],
+    "is_percentage": true
+  }
+}
+```
+
+## **Using Natural Language**
+```json
+{
+  "action": "create_from_text",
+  "text": "alert me when costs increase by 20% daily"
+}
+```
+
+**Key Points**:
+- Valid operators: INCREASES_BY, DECREASES_BY
+- Valid periods: DAILY, WEEKLY, MONTHLY, QUARTERLY
+- Sub-daily periods (e.g., 5 minutes) are automatically clamped to DAILY
+- Use `isPercentage: true` for percentage-based thresholds""",
+                    )
+                ]
+
             elif alert_type == "update":
                 return [
                     TextContent(
@@ -2094,7 +2196,7 @@ update(
 ## **Available Fields for Updates**
 - `name` - Alert name
 - `threshold` - Alert threshold value
-- `alertType` - Type of alert (THRESHOLD, CUMULATIVE_USAGE)
+- `alertType` - Type of alert (THRESHOLD, CUMULATIVE_USAGE, RELATIVE_CHANGE)
 - `enabled` - Enable/disable status
 - `slackConfigurations` - Array of Slack config IDs
 - `notificationAddresses` - Array of email addresses
@@ -2112,6 +2214,7 @@ update(
 ## **Quick Start**
 - `get_examples(alert_type="budget_threshold")` - Budget/quota examples with filtering
 - `get_examples(alert_type="spike_detection")` - Real-time monitoring examples with filtering
+- `get_examples(alert_type="relative_change")` - Trend detection with INCREASES_BY/DECREASES_BY
 - `get_examples(alert_type="update")` - How to update existing alerts (including Slack setup)
 
 ## **Alert Type Decision**
@@ -2131,9 +2234,15 @@ update(
 - **Supports persistence-based triggering** with triggerAfterPersistsDuration
 - Example: "Alert when GPT-4 cost per 15 minutes exceeds $200"
 
+### **Relative Change** (RELATIVE_CHANGE)
+- Detects percentage-based changes over time
+- Uses INCREASES_BY or DECREASES_BY operators
+- Supports daily, weekly, monthly, and quarterly periods
+- Example: "Alert when costs increase by 20% daily"
+
 ## **Persistence-Based Alerting**
 
-Both alert types support the `triggerAfterPersistsDuration` parameter for sophisticated alert behavior:
+All alert types support the `triggerAfterPersistsDuration` parameter for sophisticated alert behavior:
 
 ### **How It Works**
 - **periodDuration**: Evaluation frequency (e.g., every 5 minutes)
@@ -2285,6 +2394,7 @@ create(resource_type="anomalies", anomaly_data={
 
 ### **Method Selection Guide**
 - **Simple alerts**: Use convenience methods (`create_threshold_alert`, `create_cumulative_usage_alert`)
+- **Relative change detection**: Use `create` with `alertType: RELATIVE_CHANGE` and `INCREASES_BY`/`DECREASES_BY` operators
 - **Complex filtering**: Use standard method with `anomaly_data`
 - **Custom operators**: Use standard method with `anomaly_data`
 - **Multiple conditions**: Use standard method with `anomaly_data`
@@ -2311,12 +2421,14 @@ create(resource_type="anomalies", anomaly_data={
                     "Try calling get_examples() without parameters for general examples",
                     "Use alert_type='budget_threshold' for budget tracking examples",
                     "Use alert_type='spike_detection' for real-time monitoring examples",
+                    "Use alert_type='relative_change' for trend detection examples",
                     "Check if the alert_type parameter is spelled correctly",
                 ],
                 examples={
                     "general_examples": "get_examples()",
                     "budget_examples": "get_examples(alert_type='budget_threshold')",
                     "monitoring_examples": "get_examples(alert_type='spike_detection')",
+                    "relative_change_examples": "get_examples(alert_type='relative_change')",
                 },
             )
 
@@ -2333,7 +2445,7 @@ create(resource_type="anomalies", anomaly_data={
 
 **Key Capabilities**:
 • **Smart Alert Creation**: Natural language processing for intuitive alert setup
-• **Dual Alert Types**: Budget Threshold tracking and Spike Detection monitoring
+• **Three Alert Types**: Budget Threshold tracking, Spike Detection monitoring, and Relative Change trend detection
 • **Rich Analytics**: Pattern analysis, frequency tracking, and performance metrics
 • **Bulk Operations**: Enable/disable multiple alerts efficiently
 • **Investigation Tools**: Natural language querying of alert history

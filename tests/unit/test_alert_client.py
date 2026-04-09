@@ -1,8 +1,6 @@
 """Unit tests for AI Anomaly and Alert client methods."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime
 
 from src.revenium_mcp_server.alerts.anomaly_manager import AnomalyManager
 from src.revenium_mcp_server.alerts.alert_manager import AlertManager

@@ -11,7 +11,7 @@ Following development best practices:
 """
 
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 from loguru import logger
 

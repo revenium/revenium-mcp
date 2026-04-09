@@ -24,7 +24,6 @@ from ..introspection.metadata import (
     ToolCapability,
     ToolDependency,
     ToolType,
-    UsagePattern,
 )
 from .unified_tool_base import ToolBase
 

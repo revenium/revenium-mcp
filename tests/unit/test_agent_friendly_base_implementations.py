@@ -1,7 +1,7 @@
 """Tests for agent_friendly/base_implementations.py — base tool, NLP, schema, validation."""
 
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from src.revenium_mcp_server.agent_friendly.base_implementations import (
     BaseAgentFriendlyTool,

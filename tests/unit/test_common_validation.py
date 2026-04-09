@@ -1,6 +1,5 @@
 """Tests for common/validation.py — parameter validation and preprocessing."""
 
-import json
 import pytest
 
 from src.revenium_mcp_server.common.validation import (

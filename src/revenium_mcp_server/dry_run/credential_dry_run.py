@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from ..client import ReveniumClient
-from ..common.security_utils import obfuscate_sensitive_string
+from ..common.security_utils import obfuscate_credential_data, obfuscate_sensitive_string
 
 
 class ValidationSeverity(Enum):
@@ -123,6 +123,9 @@ class CredentialDryRunValidator:
         # Generate next steps
         next_steps = self._generate_next_steps("create", validation_issues, billing_impact)
 
+        # SECURITY: Mask sensitive fields in preview_data before returning
+        preview_data = obfuscate_credential_data(preview_data)
+
         return DryRunResult(
             operation="create",
             valid=not any(
@@ -182,6 +185,9 @@ class CredentialDryRunValidator:
 
         # Generate next steps
         next_steps = self._generate_next_steps("update", validation_issues, billing_impact)
+
+        # SECURITY: Mask sensitive fields in preview_data before returning
+        preview_data = obfuscate_credential_data(preview_data)
 
         return DryRunResult(
             operation="update",

@@ -363,7 +363,7 @@ You can now use all the powerful features of the Revenium MCP server:
 Try these commands to explore your capabilities:
 - `manage_alerts(action='create')` - Set up AI spending alerts to avoid surprise costs
 - `verify_email_setup(action='update_email')` - Configure default email address to receive AI spending alerts
-- `slack_setup_assistant(action='setup_status')` - Configure default Slack channel to receive AI spending alerts
+- `slack_management(action='setup_status')` - Configure default Slack channel to receive AI spending alerts
 
 **Welcome to Revenium!**
 
@@ -535,7 +535,7 @@ Auto-discovery found all your required configuration:
                     next_steps_section = """## **Choose Your Path**
 
 **Option 1: Add Slack Notifications (Recommended)**
-- `slack_setup_assistant(action='quick_setup')` - Set up real-time alerts
+- `slack_management(action='quick_setup')` - Set up real-time alerts
 
 **Option 2: Skip Slack and Finish Setup**
 - `complete_setup()` - Start using Revenium immediately
@@ -605,7 +605,7 @@ Some configuration items need your attention to ensure optimal functionality.
 - `tool_introspection()` - Discover all available tools and capabilities
 - `setup_checklist()` - See detailed setup status
 - `environment_status()` - View all environment variables
-- `slack_setup_assistant(action='quick_setup')` - Set up Slack notifications
+- `slack_management(action='quick_setup')` - Set up Slack notifications
 - `next_steps()` - Get personalized recommendations
 
 **Ready to get started?** Use any of the commands above!
@@ -640,7 +640,7 @@ Some configuration items need your attention to ensure optimal functionality.
         slack_set = bool(get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID"))
 
         checklist += f"{'[OK]' if email_set else '[ ]'} **Email Notifications**: {'Configured' if email_set else 'Use verify_email_setup() to configure'}\n"
-        slack_action = 'slack_setup_assistant(action="quick_setup") to configure'
+        slack_action = 'slack_management(action="quick_setup") to configure'
         checklist += f"{'[OK]' if slack_set else '[ ]'} **Slack Integration**: {'Configured' if slack_set else f'Use {slack_action}'}\n\n"
 
         # System status
@@ -767,7 +767,7 @@ Auto-discovery has configured all required settings automatically.
 
 **Option 1: Add Slack Notifications (Recommended)**
 ```
-slack_setup_assistant(action='quick_setup')
+slack_management(action='quick_setup')
 ```
 - Get real-time alerts delivered to your team
 - Perfect for mobile monitoring and team collaboration
@@ -836,7 +836,7 @@ Slack notifications provide instant alerts when:
                     "priority": 2,
                     "title": "Configure Slack Integration",
                     "description": "Set up Slack for real-time notifications",
-                    "action": "Use slack_setup_assistant(action='quick_setup')",
+                    "action": "Use slack_management(action='quick_setup')",
                     "urgency": " Recommended",
                 }
             )

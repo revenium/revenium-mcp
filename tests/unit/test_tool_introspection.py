@@ -5,7 +5,7 @@ metadata access through the MCP protocol.
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock
 
 from src.revenium_mcp_server.tools_decomposed.tool_introspection import ToolIntrospection
 from src.revenium_mcp_server.common.error_handling import ToolError

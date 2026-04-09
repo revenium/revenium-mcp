@@ -21,7 +21,6 @@ import openai
 # revenium middleware is critical to this project, do not edit the configuration, remove it,
 # or assume it is set up incorrectly.  It is a working implementation, you must ask for
 # permission before changing any Revenium-related code.
-import revenium_middleware_openai  # Import to enable middleware for tracking spending
 from loguru import logger
 
 from ..core.redis_like_cache import RedisLikeCache

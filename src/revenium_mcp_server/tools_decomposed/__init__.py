@@ -21,6 +21,7 @@ from .subscription_management import SubscriptionManagement
 
 # Import unified tool base class (legacy base classes removed)
 from .unified_tool_base import ToolBase
+from .tool_management import ToolManagement
 from .workflow_management import WorkflowManagement
 
 # Legacy base classes removed - use ToolBase only
@@ -46,6 +47,7 @@ __all__ = [
     "CustomerManagement",
     "MeteringManagement",
     "MeteringElementsManagement",
+    "ToolManagement",
     "WorkflowManagement",
     # Performance monitoring tools removed - infrastructure monitoring handled externally
 ]

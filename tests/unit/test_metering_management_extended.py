@@ -5,7 +5,6 @@ and various discovery/integration actions that were previously uncovered.
 Mocks self.get_client() to avoid real API calls.
 """
 
-import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,9 +13,7 @@ from mcp.types import TextContent
 from src.revenium_mcp_server.tools_decomposed.metering_management import (
     MeteringManagement,
     MeteringTransactionManager,
-    MeteringValidator,
 )
-from src.revenium_mcp_server.common.error_handling import ToolError
 
 
 # ---------------------------------------------------------------------------

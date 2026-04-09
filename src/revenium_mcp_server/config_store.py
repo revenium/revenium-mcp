@@ -138,7 +138,6 @@ class ConfigurationStore:
             # CRITICAL FIX: Manual configuration extraction as fallback
             # Since we know the API works, try to extract values manually
             try:
-                import asyncio
 
                 import httpx
 
@@ -180,6 +179,7 @@ class ConfigurationStore:
                                 default_email=email,
                                 api_key=api_key,
                                 base_url=base_url,
+                                app_base_url=os.environ.get("REVENIUM_APP_BASE_URL"),
                             )
 
                             logger.info(

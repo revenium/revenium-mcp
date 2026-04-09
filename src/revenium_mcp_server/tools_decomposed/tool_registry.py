@@ -143,6 +143,13 @@ def _get_tool_registry() -> Dict[str, Type[ToolBase]]:
         pass
 
     try:
+        from .tool_management import ToolManagement
+
+        registry["manage_tools"] = ToolManagement
+    except ImportError:
+        pass
+
+    try:
         from .metering_elements_management import MeteringElementsManagement
 
         registry["manage_metering_elements"] = MeteringElementsManagement
@@ -184,6 +191,13 @@ def _get_tool_registry() -> Dict[str, Type[ToolBase]]:
         from .manage_capabilities import ManageCapabilities
 
         registry["manage_capabilities"] = ManageCapabilities
+    except ImportError:
+        pass
+
+    try:
+        from .job_management import JobManagement
+
+        registry["manage_jobs"] = JobManagement
     except ImportError:
         pass
 

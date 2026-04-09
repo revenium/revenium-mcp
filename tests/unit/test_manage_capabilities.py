@@ -5,7 +5,7 @@ actions including get_capabilities, verify_capability, and health status.
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, patch
 
 from src.revenium_mcp_server.tools_decomposed.manage_capabilities import (
     ManageCapabilities,

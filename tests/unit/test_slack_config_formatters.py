@@ -4,20 +4,16 @@ Tests the pure formatting functions that transform API response data
 into user-facing TextContent output.
 """
 
-import pytest
 from unittest.mock import patch
 
 from mcp.types import TextContent
 
 from src.revenium_mcp_server.tools_decomposed.slack_config_formatters import (
     format_configurations_list,
-    format_single_config_summary,
     format_pagination_info,
-    format_usage_instructions,
     format_configuration_details,
     format_default_set_success,
     format_no_default_message,
-    format_default_configuration,
     format_oauth_url_response,
     get_examples_text,
     get_capabilities_text,

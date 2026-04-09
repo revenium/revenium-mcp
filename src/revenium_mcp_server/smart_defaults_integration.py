@@ -240,16 +240,16 @@ class SmartDefaultsIntegration:
             result_text += f"**Name**: {name}\n"
 
             if applied_defaults:
-                result_text += f"\n**🔧 Smart Defaults Applied**:\n"
+                result_text += "\n**🔧 Smart Defaults Applied**:\n"
                 for key, value in applied_defaults.items():
                     if isinstance(value, dict):
                         result_text += f"• **{key}**: Complex configuration applied\n"
                     else:
                         result_text += f"• **{key}**: {value}\n"
 
-                result_text += f"\n💡 **Tip**: You can override any of these defaults by providing your own values.\n"
+                result_text += "\n💡 **Tip**: You can override any of these defaults by providing your own values.\n"
 
-            result_text += f"\n**✅ Ready to Create**: Use the standard create action with this enhanced configuration."
+            result_text += "\n**✅ Ready to Create**: Use the standard create action with this enhanced configuration."
 
             return [TextContent(type="text", text=result_text)]
 
@@ -289,7 +289,7 @@ class SmartDefaultsReporter:
         elif tool_name == "manage_sources":
             guide += self._generate_source_defaults_guide()
         else:
-            guide += f"## **General Defaults**\n\n"
+            guide += "## **General Defaults**\n\n"
             guide += "• **Pagination**: page=0, size=20\n"
             guide += "• **Timestamps**: Current ISO timestamp\n"
             guide += "• **Status**: 'active' for most resources\n"

@@ -4,7 +4,7 @@ This module defines the configuration objects used by PartialUpdateHandler
 for each resource type in the Revenium Platform API.
 """
 
-from typing import Dict
+from typing import Any, Dict
 
 from ..client import ReveniumClient
 from .partial_update_handler import FieldTransformers, UpdateConfig
@@ -131,7 +131,10 @@ class UpdateConfigs:
             ],
             field_transformations={
                 "owner": {"ownerId": FieldTransformers.extract_owner_id},
-                "client": {"subscriberId": FieldTransformers.object_to_id},
+                "client": {
+                    "subscriberId": FieldTransformers.object_to_id,
+                    "clientEmailAddress": FieldTransformers.extract_label,
+                },
                 "organization": {"organizationId": FieldTransformers.object_to_id},
                 "product": {"productId": FieldTransformers.object_to_id},
             },
@@ -278,15 +281,21 @@ class UpdateConfigs:
                 ["organization_id", "parent_team_id", "owner_id", "members", "permissions"]
             )
 
+        default_fields: Dict[str, Any] = {}
+        if resource_type in ["user", "subscriber"]:
+            default_fields["teamId"] = client.team_id
+        elif resource_type in ["organization", "team"]:
+            default_fields["tenantId"] = (
+                client.auth_config.tenant_id or client.auth_config.team_id
+            )
+
         return UpdateConfig(
             resource_type=resource_type,
             get_method=mapping["get_method"],
             update_method=mapping["update_method"],
             id_field="id",
             required_fields=mapping["required_fields"],
-            default_fields={
-                "teamId": client.team_id if resource_type in ["user", "subscriber"] else None
-            },
+            default_fields=default_fields,
             preserve_fields=preserve_fields,
             field_transformations=field_transformations,
         )

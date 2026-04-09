@@ -10,12 +10,9 @@ Tests the behavioral correctness of:
 import pytest
 
 from src.revenium_mcp_server.analytics.validation import (
-    AnalyticsParams,
     AnalyticsValidator,
     ConfigurationError,
     DataProcessingError,
-    SupportedAggregation,
-    SupportedPeriod,
     ValidationError,
 )
 

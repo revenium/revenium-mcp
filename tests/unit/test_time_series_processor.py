@@ -11,10 +11,8 @@ from datetime import datetime, timedelta, timezone
 from src.revenium_mcp_server.analytics.time_series_processor import (
     TimeSeriesProcessor,
     TimeSeriesPoint,
-    TrendAnalysis,
     TrendDirection,
     AggregationType,
-    PeriodComparison,
 )
 
 

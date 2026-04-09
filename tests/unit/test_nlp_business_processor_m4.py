@@ -8,7 +8,6 @@ numerical quantity extraction.
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timezone, timedelta
 
 from src.revenium_mcp_server.analytics.nlp_business_processor import (
@@ -16,7 +15,6 @@ from src.revenium_mcp_server.analytics.nlp_business_processor import (
     QueryIntent,
     TimeFrame,
     ExtractedEntity,
-    QueryDimension,
     ContextReference,
     QuerySession,
     NLPQueryResult,
@@ -402,7 +400,6 @@ class TestNormalizeQueryText:
 
 class TestBuildStructuredQuery:
     def test_returns_analytics_query(self):
-        from src.revenium_mcp_server.analytics.business_analytics_engine import AnalyticsQuery
         p = _processor()
         entities = [
             ExtractedEntity(

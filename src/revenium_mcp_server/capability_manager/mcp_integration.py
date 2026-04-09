@@ -4,7 +4,7 @@ This module provides integration with the Model Context Protocol for capability
 declarations and change notifications.
 """
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 from loguru import logger
 

@@ -126,11 +126,11 @@ class BaseAgentFriendlyTool(AgentFriendlyTool):
     def _get_quick_start_steps(self) -> List[str]:
         """Get quick start steps for agent summary."""
         return [
-            f"Call get_capabilities() to understand available actions",
-            f"Call get_examples() to see working examples",
-            f"Use validate() to check your configuration",
-            f"Call the appropriate action with your data",
-            f"Check the response for results and next steps",
+            "Call get_capabilities() to understand available actions",
+            "Call get_examples() to see working examples",
+            "Use validate() to check your configuration",
+            "Call the appropriate action with your data",
+            "Check the response for results and next steps",
         ]
 
     def _get_next_actions(self) -> List[str]:

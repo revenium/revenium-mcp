@@ -9,8 +9,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.hierarchy.navigation_service import (
     HierarchyNavigationService,
-    HierarchyPath,
-    NavigationResult,
 )
 
 

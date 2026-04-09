@@ -10,7 +10,6 @@ from src.revenium_mcp_server.tools_decomposed.log_analysis_constants import (
     EXAMPLES_TEXT,
     UNSUPPORTED_ACTION_TEMPLATE,
     ERROR_MESSAGES,
-    SUGGESTIONS,
     DEFAULT_VALUES,
     LOG_ENDPOINTS,
     VALID_VALUES,

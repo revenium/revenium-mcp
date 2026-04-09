@@ -21,7 +21,7 @@ from .error_handling import (
     create_internal_error,
     create_resource_not_found_error,
 )
-from .resource_classes import MCPResource, ResourceSubscription, ResourceType, ResourceMimeType
+from .resource_classes import MCPResource, ResourceSubscription, ResourceType
 from .resource_helpers import generate_mock_content_by_type, get_builtin_resource_definitions
 from .resource_management_helpers import (
     add_subscription_to_list,

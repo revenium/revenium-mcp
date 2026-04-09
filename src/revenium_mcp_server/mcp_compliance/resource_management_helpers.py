@@ -8,6 +8,8 @@ from typing import Any, Dict, List
 
 from loguru import logger
 
+from .resource_classes import ResourceMimeType, ResourceSubscription, ResourceType
+
 
 def create_resource_metadata(resource) -> Dict[str, Any]:
     """Create metadata dictionary for a resource."""
@@ -87,25 +89,16 @@ def build_subscription_stats(resources: Dict, subscriptions: Dict) -> Dict[str, 
 
 def get_resource_types_list() -> List[str]:
     """Get list of available resource types."""
-    # Import here to avoid circular imports
-    from .resources import ResourceType
-
     return [rt.value for rt in ResourceType]
 
 
 def get_mime_types_list() -> List[str]:
     """Get list of supported MIME types."""
-    # Import here to avoid circular imports
-    from .resources import ResourceMimeType
-
     return [mt.value for mt in ResourceMimeType]
 
 
 def add_subscription_to_list(subscriptions: Dict, uri: str, subscriber_id: str) -> bool:
     """Add a subscription to the subscriptions list."""
-    # Import here to avoid circular imports
-    from .resources import ResourceSubscription
-
     subscription = ResourceSubscription(uri, subscriber_id)
 
     if uri not in subscriptions:

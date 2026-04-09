@@ -1,7 +1,6 @@
 """Unit tests for AI Anomaly and Alert models."""
 
 import pytest
-from datetime import datetime
 from pydantic import ValidationError
 
 from src.revenium_mcp_server.models_decomposed.alerts import (
@@ -13,7 +12,6 @@ from src.revenium_mcp_server.models_decomposed.alerts import (
     OperatorType,
     PeriodDuration,
     GroupByDimension,
-    TriggerDuration,
     FilterOperator,
     AlertFilter,
     SlackConfiguration,

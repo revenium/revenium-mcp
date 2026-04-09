@@ -16,6 +16,7 @@ from mcp.types import TextContent, ImageContent, EmbeddedResource
 
 from ..client import ReveniumClient
 from ..agent_friendly import UnifiedResponseFormatter
+from ..endpoint_registry import get_endpoint_path
 from .unified_tool_base import ToolBase
 from ..common.error_handling import (
     ErrorCodes,
@@ -27,12 +28,84 @@ from ..common.error_handling import (
 # Performance monitoring removed - infrastructure monitoring handled externally
 from ..core.response_cache import response_cache, cache_response
 from ..introspection.metadata import ToolType, ToolCapability, ToolDependency, DependencyType
-from ..trace_fields import extract_trace_fields, TRACE_FIELD_NAMES
+from ..trace_fields import extract_trace_fields
 
 
 # Import Prometheus metrics if available
 # Prometheus metrics removed - infrastructure monitoring handled externally
 PROMETHEUS_METRICS_AVAILABLE = False
+
+# Mapping from MCP argument names (snake_case) to completions API filter param names (camelCase).
+# Used to build API query params for all three completions call sites.
+_COMPLETIONS_FILTER_PARAM_MAP: Dict[str, str] = {
+    # Date range (biggest performance win — avoids full-table scans)
+    "start_date": "startDate",
+    "end_date": "endDate",
+    # Identity / tracing
+    "transaction_id": "transactionId",
+    "trace_id": "traceId",
+    "trace_type": "traceType",
+    "trace_name": "traceName",
+    "agent": "agent",
+    # Cost / performance ranges
+    "total_cost_min": "totalCostMin",
+    "total_cost_max": "totalCostMax",
+    "request_duration_min": "requestDurationMin",
+    "request_duration_max": "requestDurationMax",
+    # Entity filters
+    "organization_name": "organizationName",
+    "subscriber_id": "subscriberId",
+    "subscriber_email": "subscriberEmail",
+    "subscription_id": "subscriptionId",
+    "product_id": "productId",
+    "credential_name": "credentialName",
+    # Model / provider
+    "provider": "provider",
+    "model": "model",
+    "model_source": "modelSource",
+    # Token count ranges
+    "input_token_count_min": "inputTokenCountMin",
+    "input_token_count_max": "inputTokenCountMax",
+    "output_token_count_min": "outputTokenCountMin",
+    "output_token_count_max": "outputTokenCountMax",
+    "reasoning_token_count_min": "reasoningTokenCountMin",
+    "reasoning_token_count_max": "reasoningTokenCountMax",
+    "cached_token_count_min": "cachedTokenCountMin",
+    "cached_token_count_max": "cachedTokenCountMax",
+    "total_token_count_min": "totalTokenCountMin",
+    "total_token_count_max": "totalTokenCountMax",
+    # Token cost ranges
+    "input_token_cost_min": "inputTokenCostMin",
+    "input_token_cost_max": "inputTokenCostMax",
+    "output_token_cost_min": "outputTokenCostMin",
+    "output_token_cost_max": "outputTokenCostMax",
+    # Streaming performance
+    "time_to_first_token_min": "timeToFirstTokenMin",
+    "time_to_first_token_max": "timeToFirstTokenMax",
+    "mediation_latency_min": "mediationLatencyMin",
+    "mediation_latency_max": "mediationLatencyMax",
+    # Quality / config
+    "temperature_min": "temperatureMin",
+    "temperature_max": "temperatureMax",
+    "response_quality_score_min": "responseQualityScoreMin",
+    "response_quality_score_max": "responseQualityScoreMax",
+    "stop_reason": "stopReason",
+    "task_type": "taskType",
+    "system_fingerprint": "systemFingerprint",
+    # Operational
+    "operation_type": "operationType",
+    "environment": "environment",
+    "error_reason": "errorReason",
+}
+
+
+def _extract_completions_filters(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Build completions API filter params from MCP arguments, omitting absent/None/empty values."""
+    return {
+        api_key: arguments[arg_key]
+        for arg_key, api_key in _COMPLETIONS_FILTER_PARAM_MAP.items()
+        if arguments.get(arg_key) is not None and arguments.get(arg_key) != ""
+    }
 
 
 class MeteringTransactionManager:
@@ -589,7 +662,6 @@ The subscriber data structure has been updated. The old individual fields are no
         Returns:
             Error message if validation fails, None if passes
         """
-        import time
 
         # Check 1: Old subscriber format (most common error)
         old_format_error = self._check_for_old_subscriber_format(arguments)
@@ -2001,6 +2073,7 @@ The subscriber data structure has been updated. The old individual fields are no
             "page_size": arguments.get("page_size", 1000),
             "early_termination": arguments.get("early_termination", True),
             "return_transaction_data": self._normalize_return_data_parameter(arguments),
+            "filters": _extract_completions_filters(arguments),
         }
 
         # Validate parameters using extracted validation logic
@@ -2098,6 +2171,7 @@ The subscriber data structure has been updated. The old individual fields are no
                     params["search_page_range"],
                     params["page_size"],
                     params["early_termination"],
+                    filters=params.get("filters"),
                 )
 
             success, transaction_data, search_metadata, error = await self._execute_with_retry(
@@ -2145,11 +2219,14 @@ The subscriber data structure has been updated. The old individual fields are no
         search_page_range: Union[int, Tuple[int, int]] = 50,
         page_size: int = 1000,
         early_termination: bool = True,
+        filters: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         """Search across multiple pages for a specific transaction with comprehensive auto-pagination.
 
         This method implements efficient transaction search with maximum API efficiency,
         searching up to 5,000 transactions by default using 1,000 transactions per API call.
+        When filters are provided (especially startDate/endDate or transactionId), the API
+        narrows results server-side, dramatically reducing pages needed.
 
         Args:
             client: Revenium API client
@@ -2157,13 +2234,20 @@ The subscriber data structure has been updated. The old individual fields are no
             search_page_range: Pages to search - int for 0 to N-1, tuple for (start, end) range
             page_size: Transactions per API call (default: 1000 - maximum supported)
             early_termination: Stop searching when transaction is found (default: True)
+            filters: Optional dict of camelCase API filter params (e.g. startDate, provider).
+                     Passing transactionId here enables direct API lookup instead of page scanning.
 
         Returns:
             Tuple of (transaction_data, search_metadata) where:
             - transaction_data: Dict with transaction info if found, None if not found
             - search_metadata: Dict with search statistics and results
         """
-        endpoint = "/profitstream/v2/api/sources/metrics/ai/completions"
+        endpoint = get_endpoint_path("completions")
+
+        # Short-circuit: if transactionId or traceId is in filters, the API can
+        # resolve the lookup directly — no need to scan multiple pages.
+        if filters and ("transactionId" in filters or "traceId" in filters):
+            search_page_range = 1  # only page 0
 
         # Parse search range
         if isinstance(search_page_range, int):
@@ -2191,6 +2275,12 @@ The subscriber data structure has been updated. The old individual fields are no
                     "size": page_size,
                     "sort": "timestamp,desc",
                 }
+                # Apply any caller-supplied filters (date range, provider, model, etc.)
+                if filters:
+                    params.update(filters)
+                # Always scope to the specific transaction — lets the API do the filtering
+                # instead of scanning every record on the page.
+                params["transactionId"] = transaction_id
 
                 logger.debug(f"🔍 Searching page {page} (size: {page_size})")
                 response = await client.get(endpoint, params=params)
@@ -2652,7 +2742,7 @@ class MeteringManagement(ToolBase):
         """
         # Extract and validate parameters
         page = arguments.get("page", 0)
-        page_size = arguments.get("page_size", 20)
+        page_size = arguments.get("recent_page_size") if "recent_page_size" in arguments else arguments.get("page_size", 20)
         # Set default to "summary" for recent transactions lookup
         if "return_transaction_data" not in arguments:
             arguments = arguments.copy()
@@ -2677,26 +2767,29 @@ class MeteringManagement(ToolBase):
                 }
             )
 
-        if not isinstance(page_size, int) or page_size < 1 or page_size > 50:
+        if not isinstance(page_size, int) or page_size < 1 or page_size > 100:
             raise create_structured_validation_error(
-                message=f"Invalid page_size parameter: {page_size}. Must be an integer between 1 and 50.",
-                field="page_size",
+                message=f"Invalid recent_page_size parameter: {page_size}. Must be an integer between 1 and 100.",
+                field="recent_page_size",
                 value=page_size,
                 suggestions=[
-                    "Use page_size=20 for default pagination",
-                    "Use page_size=10 for smaller pages",
-                    "Maximum page_size is 50 due to API limits"
+                    "Use recent_page_size=20 for default pagination",
+                    "Use recent_page_size=10 for smaller pages",
+                    "Maximum recent_page_size is 100"
                 ],
                 examples={
-                    "default": "lookup_recent_transactions(page_size=20)",
-                    "small_pages": "lookup_recent_transactions(page_size=10)",
-                    "valid_range": "1-50"
+                    "default": "lookup_recent_transactions(recent_page_size=20)",
+                    "small_pages": "lookup_recent_transactions(recent_page_size=10)",
+                    "valid_range": "1-100"
                 }
             )
 
+        # Extract completions API filter params from arguments
+        filters = _extract_completions_filters(arguments)
+
         # Fetch recent transactions with pagination
         transactions, pagination_info = await self._fetch_recent_transactions_paginated(
-            client, page, page_size
+            client, page, page_size, filters=filters
         )
 
         # Format response
@@ -2721,32 +2814,39 @@ class MeteringManagement(ToolBase):
                     if return_transaction_data == "full":
                         response_text += self._format_full_transaction_details(transaction)
                 elif return_transaction_data == "no":
-                    response_text += f"- **Status**: Found\n"
+                    response_text += "- **Status**: Found\n"
 
                 response_text += "\n"
 
         return response_text
 
     async def _fetch_recent_transactions_paginated(
-        self, client: ReveniumClient, page: int = 0, page_size: int = 20
+        self,
+        client: ReveniumClient,
+        page: int = 0,
+        page_size: int = 20,
+        filters: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Fetch recent transactions with pagination support.
 
         Args:
             client: Revenium API client
             page: Page number (0-based)
-            page_size: Number of transactions per page (max 50)
+            page_size: Number of transactions per page (max 100)
+            filters: Optional camelCase API filter params (startDate, endDate, provider, etc.)
 
         Returns:
             Tuple of (transactions_list, pagination_metadata)
         """
-        endpoint = "/profitstream/v2/api/sources/metrics/ai/completions"
+        endpoint = get_endpoint_path("completions")
         params = {
             "teamId": client.team_id,
             "page": page,
             "size": page_size,
             "sort": "timestamp,desc",
         }
+        if filters:
+            params.update(filters)
 
         logger.info(f"🔍 Fetching recent transactions: page {page}, size {page_size}")
         response = await client.get(endpoint, params=params)
@@ -3115,44 +3215,21 @@ class MeteringManagement(ToolBase):
             limit = arguments.get("limit", 20)
 
             # ✅ PAGINATION VALIDATION: Enforce API limits with helpful guidance
-            if limit > 50:
+            if limit > 100:
                 logger.warning(
-                    f"Requested limit {limit} exceeds API maximum of 50, automatically capping to 50"
+                    f"Requested limit {limit} exceeds maximum of 100, automatically capping to 100"
                 )
-                limit = 50
+                limit = 100
 
             # include_test_transactions = arguments.get("include_test_transactions", True)  # Reserved for future use
 
-            # Query the reporting API for recent transactions
-            endpoint = "/profitstream/v2/api/sources/metrics/ai/completions"
-            params = {
-                "teamId": client.team_id,
-                "page": 0,
-                "size": limit,  # Already validated to be ≤ 50
-                "sort": "timestamp,desc",  # Get most recent first
-            }
-
-            logger.info(f"🔍 Querying recent transactions from {endpoint}")
-            response = await client.get(endpoint, params=params)
-
-            # Handle both possible response structures
-            transactions = []
-            if (
-                "_embedded" in response
-                and "aICompletionMetricResourceList" in response["_embedded"]
-            ):
-                # New API structure with _embedded
-                transactions = response["_embedded"]["aICompletionMetricResourceList"]
-            elif "content" in response:
-                # Legacy API structure with content
-                transactions = response["content"]
-            else:
-                return [
-                    TextContent(
-                        type="text",
-                        text="❌ **No Transaction Data Found**\n\nThe reporting API returned no transaction data. This could indicate:\n• No transactions have been processed yet\n• API permissions issue\n• Different endpoint structure",
-                    )
-                ]
+            # Delegate to the shared paginated fetch helper to avoid duplicating
+            # request construction, filter application, and response-structure parsing.
+            endpoint = get_endpoint_path("completions")  # Retained for report output below
+            filters = _extract_completions_filters(arguments)
+            transactions, _ = await self._fetch_recent_transactions_paginated(
+                client, page=0, page_size=limit, filters=filters or None
+            )
             total_found = len(transactions)
 
             if total_found == 0:
@@ -4141,38 +4218,19 @@ Use `validate()` before submission."""
             page = arguments.get("page", 0)
             size = arguments.get("size", 20)
 
-            # Get all models and filter locally since API doesn't have search endpoint
-            response = await client.get_ai_models(page=0, size=1000)  # Get larger set for filtering
+            response = await client.search_ai_models(query=query, page=page, size=size)
 
             if "_embedded" in response and "aIModelResourceList" in response["_embedded"]:
-                all_models = response["_embedded"]["aIModelResourceList"]
+                models = response["_embedded"]["aIModelResourceList"]
+                page_info = response.get("page", {})
+                total_elements = page_info.get("totalElements", len(models))
+                total_pages = page_info.get("totalPages", 1)
 
-                # Filter models based on query (case-insensitive search in name and provider)
-                query_lower = query.lower()
-                filtered_models = []
-
-                for model in all_models:
-                    model_name = model.get("name", "").lower()
-                    provider = model.get("provider", "").lower()
-
-                    if (
-                        query_lower in model_name
-                        or query_lower in provider
-                        or model_name.startswith(query_lower)
-                        or provider.startswith(query_lower)
-                    ):
-                        filtered_models.append(model)
-
-                # Apply pagination to filtered results
-                start_idx = page * size
-                end_idx = start_idx + size
-                models = filtered_models[start_idx:end_idx]
-
-                if not filtered_models:
+                if not models:
                     return [
                         TextContent(
                             type="text",
-                            text=f'🔍 **No models found for query**: "{query}"\n\n'
+                            text=f'No models found for query: "{query}"\n\n'
                             "**Suggestions**:\n"
                             "- Try a broader search term\n"
                             '- Search by provider name (e.g., "openai", "anthropic")\n'
@@ -4180,10 +4238,9 @@ Use `validate()` before submission."""
                         )
                     ]
 
-                # Build response text
-                text = "# 🔍 **AI Models Search Results**\n\n"
+                text = "# **AI Models Search Results**\n\n"
                 text += f'**Query**: "{query}"\n'
-                text += f"**Results Found**: {len(filtered_models)} total ({len(models)} on page {page + 1})\n\n"
+                text += f"**Results Found**: {total_elements} total ({len(models)} on page {page + 1} of {total_pages})\n\n"
 
                 for model in models:
                     name = model.get("name", "Unknown")
@@ -4197,7 +4254,6 @@ Use `validate()` before submission."""
                     text += f"- **Input Cost**: ${input_cost}/token\n"
                     text += f"- **Output Cost**: ${output_cost}/token\n"
 
-                    # Add feature flags if available
                     features = []
                     if model.get("supportFunctionCalling"):
                         features.append("Function Calling")
@@ -4211,7 +4267,7 @@ Use `validate()` before submission."""
                     text += "\n"
 
                 text += (
-                    '**💡 Tip**: Use `get_ai_model(model_id="<id>")` for complete model details'
+                    '**Tip**: Use `get_ai_model(model_id="<id>")` for complete model details'
                 )
 
                 return [TextContent(type="text", text=text)]
@@ -4219,7 +4275,7 @@ Use `validate()` before submission."""
                 return [
                     TextContent(
                         type="text",
-                        text=f'❌ **Search failed**\n\nNo results found for query: "{query}"',
+                        text=f'No results found for query: "{query}"',
                     )
                 ]
 
@@ -4338,13 +4394,11 @@ Use `validate()` before submission."""
 
             client = ReveniumClient()
 
-            # Get all models and filter for the specific model/provider combination
-            response = await client.get_ai_models(page=0, size=1000)
+            response = await client.search_ai_models(query=model, page=0, size=100)
 
             if "_embedded" in response and "aIModelResourceList" in response["_embedded"]:
                 models = response["_embedded"]["aIModelResourceList"]
 
-                # Look for exact match
                 exact_match = None
                 partial_matches = []
 
@@ -4458,13 +4512,11 @@ Use `validate()` before submission."""
 
             client = ReveniumClient()
 
-            # Get all models and filter for the specific model
-            response = await client.get_ai_models(page=0, size=1000)
+            response = await client.search_ai_models(query=model, page=0, size=100)
 
             if "_embedded" in response and "aIModelResourceList" in response["_embedded"]:
                 models = response["_embedded"]["aIModelResourceList"]
 
-                # Find exact match
                 target_model = None
                 for api_model in models:
                     if (
@@ -5805,11 +5857,11 @@ Use `validate()` before submission."""
                 # Core Transaction Fields (required for submit_ai_transaction)
                 "model": {
                     "type": "string",
-                    "description": "AI model name (e.g., 'gpt-4o', 'claude-3-5-sonnet-20241022') - required for submit_ai_transaction",
+                    "description": "AI model name (e.g., 'gpt-4o', 'claude-3-5-sonnet-20241022') - required for submit_ai_transaction. Also used as a search filter for lookup_recent_transactions and analyze_recent_transactions.",
                 },
                 "provider": {
                     "type": "string",
-                    "description": "AI provider (e.g., 'openai', 'anthropic') - required for submit_ai_transaction",
+                    "description": "AI provider (e.g., 'openai', 'anthropic') - required for submit_ai_transaction. Also used as a search filter for lookup_recent_transactions and analyze_recent_transactions.",
                 },
                 "input_tokens": {
                     "type": "integer",
@@ -5834,11 +5886,11 @@ Use `validate()` before submission."""
                 },
                 "trace_id": {
                     "type": "string",
-                    "description": "Unique identifier for conversation/session tracking",
+                    "description": "Unique identifier for conversation/session tracking. Also used as a search filter for lookup_recent_transactions (finds all spans in a trace).",
                 },
                 "task_type": {
                     "type": "string",
-                    "description": "Classification of AI operation for reporting and analytics",
+                    "description": "Classification of AI operation for reporting and analytics. Also used as a search filter for lookup_recent_transactions.",
                 },
                 # Pagination and Search Control Parameters
                 "search_page_range": {
@@ -5911,16 +5963,188 @@ Use `validate()` before submission."""
                     "minimum": 0,
                     "description": "Page number for pagination (0-based, default: 0) - used with lookup_recent_transactions",
                 },
-                "page_size": {
+                "recent_page_size": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 50,
-                    "description": "Number of transactions per page (1-50, default: 20) - used with lookup_recent_transactions",
+                    "maximum": 100,
+                    "description": "Number of transactions per page (1-100, default: 20) - used with lookup_recent_transactions",
+                },
+                # Search Filters for lookup_recent_transactions and analyze_recent_transactions.
+                # All filters are sent directly to the completions API; only non-None values are included.
+                # Date range (biggest performance win — narrows result set server-side)
+                "start_date": {
+                    "type": "string",
+                    "description": "Filter transactions on or after this ISO 8601 timestamp (e.g. '2026-03-10T00:00:00-06:00'). Used with lookup_recent_transactions and analyze_recent_transactions.",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "Filter transactions on or before this ISO 8601 timestamp. Used with lookup_recent_transactions and analyze_recent_transactions.",
+                },
+                # Cost / performance ranges
+                "total_cost_min": {
+                    "type": "number",
+                    "description": "Minimum total transaction cost (inclusive). e.g. 0.5 for ≥$0.50.",
+                },
+                "total_cost_max": {
+                    "type": "number",
+                    "description": "Maximum total transaction cost (inclusive).",
+                },
+                "request_duration_min": {
+                    "type": "number",
+                    "description": "Minimum request duration in milliseconds (inclusive).",
+                },
+                "request_duration_max": {
+                    "type": "number",
+                    "description": "Maximum request duration in milliseconds (inclusive).",
+                },
+                # Entity filters
+                "organization_name": {
+                    "type": "string",
+                    "description": "Filter by customer organization name.",
+                },
+                "subscriber_id": {
+                    "type": "string",
+                    "description": "Filter by subscriber ID.",
+                },
+                "subscriber_email": {
+                    "type": "string",
+                    "description": "Filter by subscriber email address.",
+                },
+                "subscription_id": {
+                    "type": "string",
+                    "description": "Filter by subscription ID.",
+                },
+                "product_id": {
+                    "type": "string",
+                    "description": "Filter by product ID.",
+                },
+                "credential_name": {
+                    "type": "string",
+                    "description": "Filter by credential name.",
+                },
+                # Model / provider (see also "provider" above — dual-use for submission and filtering)
+                "model_source": {
+                    "type": "string",
+                    "description": "Filter by model source.",
+                },
+                # Token count ranges
+                "input_token_count_min": {
+                    "type": "integer",
+                    "description": "Minimum input token count (inclusive).",
+                },
+                "input_token_count_max": {
+                    "type": "integer",
+                    "description": "Maximum input token count (inclusive).",
+                },
+                "output_token_count_min": {
+                    "type": "integer",
+                    "description": "Minimum output token count (inclusive).",
+                },
+                "output_token_count_max": {
+                    "type": "integer",
+                    "description": "Maximum output token count (inclusive).",
+                },
+                "reasoning_token_count_min": {
+                    "type": "integer",
+                    "description": "Minimum reasoning token count (inclusive).",
+                },
+                "reasoning_token_count_max": {
+                    "type": "integer",
+                    "description": "Maximum reasoning token count (inclusive).",
+                },
+                "cached_token_count_min": {
+                    "type": "integer",
+                    "description": "Minimum cached token count (inclusive).",
+                },
+                "cached_token_count_max": {
+                    "type": "integer",
+                    "description": "Maximum cached token count (inclusive).",
+                },
+                "total_token_count_min": {
+                    "type": "integer",
+                    "description": "Minimum total token count across all token types (inclusive).",
+                },
+                "total_token_count_max": {
+                    "type": "integer",
+                    "description": "Maximum total token count across all token types (inclusive).",
+                },
+                # Token cost ranges
+                "input_token_cost_min": {
+                    "type": "number",
+                    "description": "Minimum input token cost (inclusive).",
+                },
+                "input_token_cost_max": {
+                    "type": "number",
+                    "description": "Maximum input token cost (inclusive).",
+                },
+                "output_token_cost_min": {
+                    "type": "number",
+                    "description": "Minimum output token cost (inclusive).",
+                },
+                "output_token_cost_max": {
+                    "type": "number",
+                    "description": "Maximum output token cost (inclusive).",
+                },
+                # Streaming performance
+                "time_to_first_token_min": {
+                    "type": "number",
+                    "description": "Minimum time-to-first-token in milliseconds (inclusive).",
+                },
+                "time_to_first_token_max": {
+                    "type": "number",
+                    "description": "Maximum time-to-first-token in milliseconds (inclusive).",
+                },
+                "mediation_latency_min": {
+                    "type": "number",
+                    "description": "Minimum mediation latency in milliseconds (inclusive).",
+                },
+                "mediation_latency_max": {
+                    "type": "number",
+                    "description": "Maximum mediation latency in milliseconds (inclusive).",
+                },
+                # Quality / config ranges
+                "temperature_min": {
+                    "type": "number",
+                    "description": "Minimum temperature value (inclusive).",
+                },
+                "temperature_max": {
+                    "type": "number",
+                    "description": "Maximum temperature value (inclusive).",
+                },
+                "response_quality_score_min": {
+                    "type": "number",
+                    "description": "Minimum response quality score (inclusive).",
+                },
+                "response_quality_score_max": {
+                    "type": "number",
+                    "description": "Maximum response quality score (inclusive).",
+                },
+                # Quality / operational text filters (also used for submission)
+                "stop_reason": {
+                    "type": "string",
+                    "description": "Stop reason value (e.g. 'END', 'stop'). Used as filter for lookup_recent_transactions and as a submission field.",
+                },
+                "operation_type": {
+                    "type": "string",
+                    "description": "Operation type (e.g. 'CHAT', 'COMPLETION'). Used as filter for lookup_recent_transactions and as a submission field.",
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Agent name/identifier. Used as filter for lookup_recent_transactions and as a submission field.",
+                },
+                "system_fingerprint": {
+                    "type": "string",
+                    "description": "System fingerprint value. Used as filter for lookup_recent_transactions and as a submission field.",
+                },
+                # Operational filters
+                "error_reason": {
+                    "type": "string",
+                    "description": "Filter by error reason string to find failed transactions.",
                 },
                 # Distributed Tracing Fields (optional, for observability)
                 "environment": {
                     "type": "string",
-                    "description": "Deployment environment (e.g., 'production', 'staging', 'development'). Falls back to REVENIUM_ENVIRONMENT, ENVIRONMENT, or DEPLOYMENT_ENV env vars.",
+                    "description": "Deployment environment (e.g., 'production', 'staging', 'development'). Falls back to REVENIUM_ENVIRONMENT, ENVIRONMENT, or DEPLOYMENT_ENV env vars. Also used as a search filter for lookup_recent_transactions.",
                 },
                 "region": {
                     "type": "string",
@@ -5932,11 +6156,11 @@ Use `validate()` before submission."""
                 },
                 "trace_type": {
                     "type": "string",
-                    "description": "Categorical identifier for grouping similar workflows (e.g., 'customer-support', 'document-analysis'). Max 128 chars, alphanumeric/hyphens/underscores only.",
+                    "description": "Categorical identifier for grouping similar workflows (e.g., 'customer-support', 'document-analysis'). Max 128 chars, alphanumeric/hyphens/underscores only. Also used as a search filter for lookup_recent_transactions.",
                 },
                 "trace_name": {
                     "type": "string",
-                    "description": "Human-readable label for trace instances (e.g., 'Support Chat Session'). Max 256 chars, auto-truncates if longer.",
+                    "description": "Human-readable label for trace instances (e.g., 'Support Chat Session'). Max 256 chars, auto-truncates if longer. Also used as a search filter for lookup_recent_transactions.",
                 },
                 "parent_transaction_id": {
                     "type": "string",
@@ -6022,6 +6246,7 @@ Use `validate()` before submission."""
                 "**Rate Limit**: 1,000 requests/minute\n\n"
                 "### **2. Verify Transactions**\n"
                 "```http\n"
+                # completions new_path is TBD in endpoint_registry; currently routes to legacy path
                 "GET {base_url}/profitstream/v2/api/sources/metrics/ai/completions\n"
                 "Authorization: Bearer {REVENIUM_API_KEY}\n"
                 "x-api-key: {REVENIUM_API_KEY}\n"
@@ -6036,6 +6261,7 @@ Use `validate()` before submission."""
                 "**Rate Limit**: 100 requests/minute\n\n"
                 "### **3. Get Transaction Status**\n"
                 "```http\n"
+                # completions new_path is TBD in endpoint_registry; currently routes to legacy path
                 "GET {base_url}/profitstream/v2/api/sources/metrics/ai/completions/{transaction_id}\n"
                 "Authorization: Bearer {REVENIUM_API_KEY}\n"
                 "x-api-key: {REVENIUM_API_KEY}\n"
@@ -6344,6 +6570,7 @@ Use `validate()` before submission."""
                 "- `estimated_cost`: Estimated cost in USD (optional)\n"
                 "- `processing_time_ms`: Server processing time in milliseconds\n\n"
                 "### **200 OK - Transaction Verification**\n"
+                # completions new_path is TBD; currently routes to legacy path regardless of REVENIUM_USE_NEW_ANALYTICS_API flag
                 "**Endpoint**: `GET /profitstream/v2/api/sources/metrics/ai/completions`\n\n"
                 "```json\n"
                 "{\n"

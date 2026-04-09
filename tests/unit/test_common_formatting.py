@@ -2,7 +2,6 @@
 
 import json
 import re
-import pytest
 from mcp.types import TextContent
 
 from src.revenium_mcp_server.common.formatting import (

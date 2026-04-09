@@ -1,7 +1,5 @@
 """Unit tests for onboarding detection service."""
 
-import pytest
-from unittest.mock import AsyncMock, patch
 
 from src.revenium_mcp_server.config_store import (
     ConfigurationStore,

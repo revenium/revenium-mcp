@@ -527,7 +527,7 @@ class AIRoutingConfig:
     def reset_to_defaults(self) -> None:
         """Reset configuration to default values (useful for testing)."""
         self.global_enabled = False
-        self.tool_overrides = {tool: False for tool in self.supported_tools}
+        self.tool_overrides = dict.fromkeys(self.supported_tools, False)
         self.testing_mode = TestingMode.DISABLED
         self.ai_percentage = 0
         self.version = 1

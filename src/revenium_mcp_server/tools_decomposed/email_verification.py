@@ -176,7 +176,7 @@ Your notification email has been updated and will be used for:
 
 1. **Test Configuration**: Use `test_configuration()` to verify email setup
 2. **Set Up Alerts**: Use `manage_alerts()` to create notification rules
-3. **Configure Slack**: Use `slack_setup_assistant()` for additional notifications
+3. **Configure Slack**: Use `slack_management(action='quick_setup')` for additional notifications
 
 **Tip**: You can check your email status anytime with `check_status()`
 """
@@ -453,7 +453,7 @@ This email address is ready to use! You can:
         guidance += "## 🔗 **Integration with Other Tools**\n\n"
         guidance += "Once email is configured, you can:\n"
         guidance += "- **Set up alerts**: Use `manage_alerts()` to create notification rules\n"
-        guidance += "- **Configure Slack**: Use `slack_setup_assistant()` for additional channels\n"
+        guidance += "- **Configure Slack**: Use `slack_management(action='quick_setup')` for additional channels\n"
         guidance += (
             "- **Check setup**: Use `setup_checklist()` to verify complete configuration\n\n"
         )
@@ -513,7 +513,7 @@ This email address is ready to use! You can:
             test += "## 📬 **Next Steps**\n\n"
             test += "Your email configuration is ready! You can now:\n"
             test += "1. Set up alerts with `manage_alerts()`\n"
-            test += "2. Configure Slack with `slack_setup_assistant()`\n"
+            test += "2. Configure Slack with `slack_management(action='quick_setup')`\n"
             test += "3. Check overall setup with `setup_checklist()`\n"
 
         else:

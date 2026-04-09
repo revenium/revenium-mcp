@@ -1,7 +1,6 @@
 """Unit tests for onboarding tools."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.tools_decomposed.welcome_setup import WelcomeSetup
 from src.revenium_mcp_server.tools_decomposed.configuration_status import ConfigurationStatus

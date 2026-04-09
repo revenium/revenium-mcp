@@ -329,7 +329,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
 
             if not slack_configured:
                 status["recommendations"] = [
-                    "Use slack_setup_assistant(action='quick_setup') to configure Slack",
+                    "Use slack_management(action='quick_setup') to configure Slack",
                     "Set up Slack for real-time alert notifications",
                     "Enable team collaboration through Slack integration",
                 ]
@@ -401,7 +401,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             checklist += f"   - Status: Configured ({config_id})\n"
         else:
             checklist += "   - Status: Not configured\n"
-            checklist += "   - Action: Use slack_setup_assistant(action='quick_setup')\n"
+            checklist += "   - Action: Use slack_management(action='quick_setup')\n"
         checklist += "\n"
 
         # System status
@@ -539,7 +539,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
         if slack_configured:
             optional += "**Benefit**: [OK] Real-time Slack notifications enabled\n"
         else:
-            optional += "**Action**: Use slack_setup_assistant(action='quick_setup')\n"
+            optional += "**Action**: Use slack_management(action='quick_setup')\n"
             optional += "**Benefit**: Get instant notifications and enable team collaboration\n"
         optional += "\n"
 
@@ -735,7 +735,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
                 {
                     "title": "Configure Slack Integration",
                     "description": "Set up Slack for real-time notifications",
-                    "action": "Use slack_setup_assistant(action='quick_setup')",
+                    "action": "Use slack_management(action='quick_setup')",
                     "impact": "High - Enables team collaboration",
                 }
             )

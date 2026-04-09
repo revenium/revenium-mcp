@@ -7,7 +7,6 @@ standards and Builder Pattern support.
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import asdict
 from typing import Any, ClassVar, Dict, List, Optional, Union
 
 from mcp.types import EmbeddedResource, ImageContent, TextContent

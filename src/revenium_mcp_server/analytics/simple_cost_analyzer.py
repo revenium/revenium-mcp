@@ -8,7 +8,9 @@ Focus on 95%+ success rate with simple, robust implementations.
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+
+from ..endpoint_registry import resolve_analytics_request
 
 logger = logging.getLogger(__name__)
 
@@ -97,9 +99,6 @@ class SimpleCostAnalyzer:
                 f"Getting provider costs for period={period}, aggregation={aggregation}"
             )
 
-            # Use the correct endpoint for total costs (not time-series breakdown)
-            endpoint = "/profitstream/v2/api/sources/metrics/ai/total-cost-by-provider-over-time"
-
             # Get team_id from client (required for all analytics endpoints)
             team_id = getattr(self.client, "team_id", None)
             if not team_id:
@@ -110,13 +109,13 @@ class SimpleCostAnalyzer:
                 if not team_id:
                     raise Exception("Team ID not available from client or environment")
 
-            params = {
-                "teamId": team_id,
-                "period": period,
-                # Note: total-cost endpoint returns aggregated totals, no group parameter needed
-            }
+            extra_old = {"group": aggregation} if aggregation else {}
+            path, params, call_kwargs = resolve_analytics_request(
+                "cost_metric_by_provider_over_time", team_id, period,
+                extra_old_params=extra_old,
+            )
 
-            response = await self.client.get(endpoint, params=params)
+            response = await self.client.get(path, params=params, **call_kwargs)
 
             if not response:
                 self.logger.warning("Empty response from provider costs API")
@@ -161,9 +160,6 @@ class SimpleCostAnalyzer:
         try:
             self.logger.info(f"Getting model costs for period={period}, aggregation={aggregation}")
 
-            # Use the correct endpoint for total model costs (not time-series breakdown)
-            endpoint = "/profitstream/v2/api/sources/metrics/ai/total-cost-by-model"
-
             # Get team_id from client (required for all analytics endpoints)
             team_id = getattr(self.client, "team_id", None)
             if not team_id:
@@ -174,15 +170,15 @@ class SimpleCostAnalyzer:
                 if not team_id:
                     raise Exception("Team ID not available from client or environment")
 
-            params = {
-                "teamId": team_id,
-                "period": period,
-                # Note: total-cost endpoint returns aggregated totals, no group parameter needed
-            }
+            extra_old = {"group": aggregation} if aggregation else {}
+            path, params, call_kwargs = resolve_analytics_request(
+                "cost_metric_by_model", team_id, period,
+                extra_old_params=extra_old,
+            )
 
-            self.logger.info(f"DEBUG: Making API call to {endpoint} with params: {params}")
+            self.logger.info(f"DEBUG: Making API call to {path} with params: {params}")
 
-            response = await self.client.get(endpoint, params=params)
+            response = await self.client.get(path, params=params, **call_kwargs)
 
             self.logger.info(f"DEBUG: Raw API response type: {type(response)}")
             if isinstance(response, (list, dict)):
@@ -368,9 +364,6 @@ class SimpleCostAnalyzer:
                 f"Getting customer costs for period={period}, aggregation={aggregation}"
             )
 
-            # Use the correct endpoint for customer costs (from working codebase examples)
-            endpoint = "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-organization"
-
             # Get team_id from client (required for all analytics endpoints)
             team_id = getattr(self.client, "team_id", None)
             if not team_id:
@@ -381,15 +374,15 @@ class SimpleCostAnalyzer:
                 if not team_id:
                     raise Exception("Team ID not available from client or environment")
 
-            params = {
-                "teamId": team_id,
-                "period": period,
-                # Note: customer costs endpoint uses simplified params (no group parameter needed)
-            }
+            extra_old = {"group": aggregation} if aggregation else {}
+            path, params, call_kwargs = resolve_analytics_request(
+                "cost_metric_by_organization", team_id, period,
+                extra_old_params=extra_old,
+            )
 
-            self.logger.info(f"DEBUG: Making API call to {endpoint} with params: {params}")
+            self.logger.info(f"DEBUG: Making API call to {path} with params: {params}")
 
-            response = await self.client.get(endpoint, params=params)
+            response = await self.client.get(path, params=params, **call_kwargs)
 
             self.logger.info(f"DEBUG: Raw API response type: {type(response)}")
             # Handle the actual API response format
@@ -631,11 +624,6 @@ class SimpleCostAnalyzer:
                 f"Getting API key costs for period={period}, aggregation={aggregation}"
             )
 
-            # Use the API key costs endpoint (from PRD specifications)
-            endpoint = (
-                "/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-subscriber-credential"
-            )
-
             # Get team_id from client (required for all analytics endpoints)
             team_id = getattr(self.client, "team_id", None)
             if not team_id:
@@ -646,15 +634,15 @@ class SimpleCostAnalyzer:
                 if not team_id:
                     raise Exception("Team ID not available from client or environment")
 
-            params = {
-                "teamId": team_id,
-                "period": period,
-                # Note: API key costs endpoint uses simplified params (no group parameter needed)
-            }
+            extra_old = {"group": aggregation} if aggregation else {}
+            path, params, call_kwargs = resolve_analytics_request(
+                "cost_metrics_by_subscriber_credential", team_id, period,
+                extra_old_params=extra_old,
+            )
 
-            self.logger.info(f"DEBUG: Making API call to {endpoint} with params: {params}")
+            self.logger.info(f"DEBUG: Making API call to {path} with params: {params}")
 
-            response = await self.client.get(endpoint, params=params)
+            response = await self.client.get(path, params=params, **call_kwargs)
 
             self.logger.info(f"DEBUG: Raw API response type: {type(response)}")
             if isinstance(response, (list, dict)):
@@ -705,9 +693,6 @@ class SimpleCostAnalyzer:
         try:
             self.logger.info(f"Getting agent costs for period={period}, aggregation={aggregation}")
 
-            # Use the agent costs endpoint (from PRD specifications)
-            endpoint = "/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-agents-over-time"
-
             # Get team_id from client (required for all analytics endpoints)
             team_id = getattr(self.client, "team_id", None)
             if not team_id:
@@ -718,15 +703,15 @@ class SimpleCostAnalyzer:
                 if not team_id:
                     raise Exception("Team ID not available from client or environment")
 
-            params = {
-                "teamId": team_id,
-                "period": period,
-                # Note: agent costs endpoint uses simplified params (no group parameter needed)
-            }
+            extra_old = {"group": aggregation} if aggregation else {}
+            path, params, call_kwargs = resolve_analytics_request(
+                "cost_metrics_by_agents_over_time", team_id, period,
+                extra_old_params=extra_old,
+            )
 
-            self.logger.info(f"DEBUG: Making API call to {endpoint} with params: {params}")
+            self.logger.info(f"DEBUG: Making API call to {path} with params: {params}")
 
-            response = await self.client.get(endpoint, params=params)
+            response = await self.client.get(path, params=params, **call_kwargs)
 
             self.logger.info(f"DEBUG: Raw API response type: {type(response)}")
             if isinstance(response, (list, dict)):

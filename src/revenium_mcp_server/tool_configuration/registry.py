@@ -53,6 +53,8 @@ TOOL_REGISTRATION_PRIORITY_ORDER = [
     "manage_subscriptions",            # Subscription management
     "manage_subscriber_credentials",   # Billing identity management
     "manage_workflows",                # Automation and workflows
+    "manage_jobs",                     # Jobs & Outcomes management
+    "manage_tools",                    # Tool Registry management
 
     # Group 5: System Diagnostics (Troubleshooting - last)
     "system_diagnostics"               # System health and troubleshooting
@@ -157,8 +159,12 @@ class ToolConfigurationRegistry:
                 await self._register_manage_metering_elements(mcp)
             elif tool_name == "manage_capabilities":
                 await self._register_manage_capabilities(mcp)
+            elif tool_name == "manage_jobs":
+                await self._register_manage_jobs(mcp)
             elif tool_name == "tool_introspection":
                 await self._register_tool_introspection(mcp)
+            elif tool_name == "manage_tools":
+                await self._register_manage_tools(mcp)
             else:
                 logger.warning(f"Unknown tool for registration: {tool_name}")
                 return
@@ -557,7 +563,10 @@ class ToolConfigurationRegistry:
             subscriber: Optional[dict] = None,
             trace_id: Optional[str] = None,
             task_type: Optional[str] = None,
-            agent: Optional[str] = None
+            agent: Optional[str] = None,
+            is_streamed: Optional[Union[bool, str]] = None,
+            response_quality_score: Optional[Union[float, str]] = None,
+            stop_reason: Optional[str] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
             # Map arguments
             arguments = {
@@ -594,7 +603,11 @@ class ToolConfigurationRegistry:
                 "subscriber": subscriber,
                 "trace_id": trace_id,
                 "task_type": task_type,
-                "agent": agent
+                "agent": agent,
+                # Quality and performance parameters
+                "is_streamed": is_streamed,
+                "response_quality_score": response_quality_score,
+                "stop_reason": stop_reason
             }
 
             # NUMERIC PREPROCESSING: Convert string numeric parameters to appropriate types
@@ -607,12 +620,13 @@ class ToolConfigurationRegistry:
                 'wait_seconds': int,
                 'max_retries': int,
                 'retry_interval': int,
-                'page_size': int
+                'page_size': int,
+                'response_quality_score': float
             }
             arguments = preprocess_numeric_parameters(arguments, numeric_params)
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
-            boolean_params = ["dry_run", "return_transaction_data", "early_termination"]
+            boolean_params = ["dry_run", "return_transaction_data", "early_termination", "is_streamed"]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
 
             # ARRAY PREPROCESSING: Convert string array parameters to actual Python lists
@@ -838,7 +852,9 @@ class ToolConfigurationRegistry:
             organizationId: Optional[str] = None,
             page: int = 0,
             size: int = 20,
-            dry_run: Optional[Union[bool, str]] = None
+            dry_run: Optional[Union[bool, str]] = None,
+            email: Optional[str] = None,
+            name: Optional[str] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
             # Map arguments
             arguments = {
@@ -849,7 +865,9 @@ class ToolConfigurationRegistry:
                 "organizationId": organizationId,
                 "page": page,
                 "size": size,
-                "dry_run": dry_run
+                "dry_run": dry_run,
+                "email": email,
+                "name": name
             }
 
             # SMART INPUT PREPROCESSING: Handle agent interface serialization issues for credential_data
@@ -1336,6 +1354,152 @@ class ToolConfigurationRegistry:
             )
             return result
 
+    async def _register_manage_jobs(self, mcp: FastMCP) -> None:
+        """Register manage jobs tool."""
+        @mcp.tool()
+        @dynamic_mcp_tool("manage_jobs")
+        async def manage_jobs(
+            action: str = "get_capabilities",
+            job_id: Optional[str] = None,
+            outcome_data: Optional[Union[dict, str]] = None,
+            page: Union[int, str] = 0,
+            size: Union[int, str] = 20,
+            filters: Optional[Union[dict, str]] = None,
+        ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+            # Map arguments
+            arguments = {
+                "action": action,
+                "job_id": job_id,
+                "outcome_data": outcome_data,
+                "page": page,
+                "size": size,
+                "filters": filters or {},
+            }
+
+            # SMART INPUT PREPROCESSING: Handle agent interface serialization
+            if isinstance(outcome_data, str):
+                try:
+                    import json
+                    arguments["outcome_data"] = json.loads(outcome_data)
+                except json.JSONDecodeError:
+                    from mcp.types import TextContent as TC
+                    return [TC(
+                        type="text",
+                        text=f"Invalid JSON for outcome_data: `{outcome_data}`. "
+                             f"Send as a proper JSON object with outcome, revenue, etc."
+                    )]
+
+            if isinstance(filters, str):
+                try:
+                    import json
+                    arguments["filters"] = json.loads(filters)
+                except json.JSONDecodeError:
+                    from mcp.types import TextContent as TC
+                    return [TC(
+                        type="text",
+                        text=f"Invalid JSON for filters: `{filters}`. "
+                             f"Send as a proper JSON object, e.g. {{\"type\": \"loan_processing\"}}."
+                    )]
+
+            # NUMERIC PREPROCESSING
+            numeric_params = {'page': int, 'size': int}
+            arguments = preprocess_numeric_parameters(arguments, numeric_params)
+
+            # Remove None values
+            arguments = {k: v for k, v in arguments.items() if v is not None}
+
+            # Import tool class and execution helper
+            from ..tools_decomposed.job_management import JobManagement
+            from ..common.tool_execution import standardized_tool_execution
+
+            result = await standardized_tool_execution(
+                tool_name="manage_jobs",
+                action=action,
+                arguments=arguments,
+                tool_class=JobManagement
+            )
+            return result
+
+    async def _register_manage_tools(self, mcp: FastMCP) -> None:
+        """Register manage tools tool."""
+        @mcp.tool()
+        @dynamic_mcp_tool("manage_tools")
+        async def manage_tools(
+            action: str = "get_capabilities",
+            tool_id: Optional[str] = None,
+            tool_name: Optional[str] = None,
+            tool_data: Optional[Union[dict, str]] = None,
+            event_data: Optional[Union[dict, str]] = None,
+            event_type: Optional[str] = None,
+            query: Optional[str] = None,
+            page: Union[int, str] = 0,
+            size: Union[int, str] = 20,
+            filters: Optional[Union[dict, str]] = None,
+            start_date: Optional[str] = None,
+            end_date: Optional[str] = None,
+            granularity: Optional[str] = None,
+            pricing_model: Optional[str] = None,
+            per_unit_price: Optional[float] = None,
+            tool_type: Optional[str] = None,
+            tool_description: Optional[str] = None,
+            tool_version: Optional[str] = None,
+            tool_provider: Optional[str] = None,
+        ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+            arguments = {
+                "action": action,
+                "tool_id": tool_id,
+                "tool_name": tool_name,
+                "tool_data": tool_data,
+                "event_data": event_data,
+                "event_type": event_type,
+                "query": query,
+                "page": page,
+                "size": size,
+                "filters": filters or {},
+                "start_date": start_date,
+                "end_date": end_date,
+                "granularity": granularity,
+                "pricing_model": pricing_model,
+                "per_unit_price": per_unit_price,
+                "tool_type": tool_type,
+                "tool_description": tool_description,
+                "tool_version": tool_version,
+                "tool_provider": tool_provider,
+            }
+
+            # SMART INPUT PREPROCESSING: Handle agent interface serialization
+            for dict_param in ("tool_data", "event_data", "filters"):
+                val = arguments.get(dict_param)
+                if isinstance(val, str):
+                    try:
+                        import json
+                        arguments[dict_param] = json.loads(val)
+                    except json.JSONDecodeError:
+                        from mcp.types import TextContent as TC
+                        return [TC(
+                            type="text",
+                            text=f"Invalid JSON for {dict_param}: `{val}`. "
+                                 f"Send as a proper JSON object."
+                        )]
+
+            # NUMERIC PREPROCESSING
+            numeric_params = {'page': int, 'size': int}
+            arguments = preprocess_numeric_parameters(arguments, numeric_params)
+
+            # Remove None values
+            arguments = {k: v for k, v in arguments.items() if v is not None}
+
+            from ..tools_decomposed.tool_management import ToolManagement
+            from ..common.tool_execution import standardized_tool_execution
+
+            result = await standardized_tool_execution(
+                tool_name="manage_tools",
+                action=action,
+                arguments=arguments,
+                tool_class=ToolManagement
+            )
+            return result
+
     async def _register_tool_metadata(self, tool_name: str) -> None:
         """Register tool metadata with introspection engine.
 
@@ -1358,6 +1522,8 @@ class ToolConfigurationRegistry:
             "manage_subscriptions": ("subscription_management", "SubscriptionManagement"),
             "manage_metering_elements": ("metering_elements_management", "MeteringElementsManagement"),
             "manage_capabilities": ("manage_capabilities", "ManageCapabilities"),
+            "manage_jobs": ("job_management", "JobManagement"),
+            "manage_tools": ("tool_management", "ToolManagement"),
             "tool_introspection": None  # Registered separately
         }
 

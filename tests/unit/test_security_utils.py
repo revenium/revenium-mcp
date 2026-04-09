@@ -1,6 +1,5 @@
 """Tests for common/security_utils.py — sensitive data obfuscation and sanitization."""
 
-import pytest
 
 from src.revenium_mcp_server.common.security_utils import (
     get_sensitive_field_patterns,
@@ -10,7 +9,6 @@ from src.revenium_mcp_server.common.security_utils import (
     obfuscate_credentials_list,
     sanitize_text_for_logging,
     sanitize_for_logging,
-    _sanitize_recursive,
     _get_default_sensitive_fields,
 )
 

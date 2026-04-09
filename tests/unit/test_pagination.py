@@ -1,8 +1,7 @@
 """Unit tests for pagination and filtering functionality."""
 
 import pytest
-from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import datetime, timedelta
 
 from src.revenium_mcp_server.pagination import (
     QueryCache,
@@ -10,9 +9,7 @@ from src.revenium_mcp_server.pagination import (
 )
 from src.revenium_mcp_server.models import (
     PaginationParams,
-    FilterParams,
     FilterOperator,
-    FilterCondition,
     SortField,
     SortOrder,
 )

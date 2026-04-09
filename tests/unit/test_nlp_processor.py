@@ -1,7 +1,6 @@
 """Unit tests for Natural Language Processing functionality."""
 
 import pytest
-from datetime import datetime, timedelta
 
 from src.revenium_mcp_server.nlp_processor import (
     NLPProcessor,

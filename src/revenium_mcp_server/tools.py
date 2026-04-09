@@ -74,6 +74,16 @@ class ReveniumTools:
         action = arguments.get("action", "")
         return await source_management.handle_action(action, arguments)
 
+    async def handle_manage_tools(
+        self, arguments: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle the manage_tools tool."""
+        from .tools_decomposed.tool_management import ToolManagement
+
+        tool_management = ToolManagement()
+        action = arguments.get("action", "")
+        return await tool_management.handle_action(action, arguments)
+
     async def handle_manage_customers(
         self, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
@@ -376,7 +386,7 @@ class ReveniumTools:
                 if "error" in guidance:
                     return [TextContent(type="text", text=f"❌ **Error**: {guidance['error']}")]
 
-                result_text = f"# 📋 **Current Step Guidance**\n\n"
+                result_text = "# 📋 **Current Step Guidance**\n\n"
                 result_text += f"**Step**: {guidance['title']}\n"
                 result_text += f"**Description**: {guidance['description']}\n"
                 result_text += f"**Tool**: `{guidance['tool']}`\n"
@@ -386,22 +396,22 @@ class ReveniumTools:
                 for instruction in guidance.get("instructions", []):
                     result_text += f"- {instruction}\n"
 
-                result_text += f"\n## **Required Data**\n"
+                result_text += "\n## **Required Data**\n"
                 for data_field in guidance["required_data"]:
                     result_text += f"- `{data_field}`\n"
 
                 if guidance.get("optional_data"):
-                    result_text += f"\n## **Optional Data**\n"
+                    result_text += "\n## **Optional Data**\n"
                     for data_field in guidance["optional_data"]:
                         result_text += f"- `{data_field}`\n"
 
                 if guidance.get("validation_rules"):
-                    result_text += f"\n## **Validation Rules**\n"
+                    result_text += "\n## **Validation Rules**\n"
                     for rule, value in guidance["validation_rules"].items():
                         result_text += f"- **{rule}**: {value}\n"
 
                 if guidance.get("context_available"):
-                    result_text += f"\n## **Available Context**\n"
+                    result_text += "\n## **Available Context**\n"
                     for context_key in guidance["context_available"]:
                         result_text += f"- `{context_key}`\n"
 
@@ -708,7 +718,7 @@ action="create_simple", workflow_type="customer_onboarding", customer_email="use
         has_errors = any(result.startswith("❌") for result in validation_results)
         status = "❌ **INVALID**" if has_errors else "✅ **VALID**"
 
-        result_text = f"# 🔍 **Workflow Validation Results**\n\n"
+        result_text = "# 🔍 **Workflow Validation Results**\n\n"
         result_text += f"**Workflow**: {workflow_id}\n"
         result_text += f"**Status**: {status}\n\n"
 
@@ -717,17 +727,17 @@ action="create_simple", workflow_type="customer_onboarding", customer_email="use
             result_text += f"{result}\n"
 
         if not has_errors:
-            result_text += f"\n## **✅ Ready to Execute**\n"
-            result_text += f"This workflow configuration is valid and ready to start.\n\n"
+            result_text += "\n## **✅ Ready to Execute**\n"
+            result_text += "This workflow configuration is valid and ready to start.\n\n"
             result_text += (
-                f'**Next Step**: Use `action="start"` with the same parameters to begin execution.'
+                '**Next Step**: Use `action="start"` with the same parameters to begin execution.'
             )
         else:
-            result_text += f"\n## **🔧 Required Fixes**\n"
+            result_text += "\n## **🔧 Required Fixes**\n"
             result_text += (
-                f"Please address the validation errors above before starting the workflow.\n\n"
+                "Please address the validation errors above before starting the workflow.\n\n"
             )
-            result_text += f"**Help**: Use `get_examples` to see valid workflow configurations."
+            result_text += "**Help**: Use `get_examples` to see valid workflow configurations."
 
         return [TextContent(type="text", text=result_text)]
 
@@ -831,24 +841,24 @@ action="create_simple", workflow_type="customer_onboarding", customer_email="use
             ],
         }
 
-        result_text = f"🚀 **Simple Customer Onboarding Workflow**\n\n"
+        result_text = "🚀 **Simple Customer Onboarding Workflow**\n\n"
         result_text += f"**Customer Email**: {customer_email}\n"
         result_text += f"**Organization**: {organization_name}\n\n"
 
-        result_text += f"**📋 Complete Workflow Configuration**:\n"
+        result_text += "**📋 Complete Workflow Configuration**:\n"
         result_text += f"```json\n{json.dumps(workflow_config, indent=2)}\n```\n\n"
 
-        result_text += f"**✅ Next Steps**:\n"
-        result_text += f"1. Review the workflow configuration above\n"
-        result_text += f"2. Use `validate` action to verify the configuration\n"
-        result_text += f"3. Use `start` action with this configuration to begin the workflow\n\n"
+        result_text += "**✅ Next Steps**:\n"
+        result_text += "1. Review the workflow configuration above\n"
+        result_text += "2. Use `validate` action to verify the configuration\n"
+        result_text += "3. Use `start` action with this configuration to begin the workflow\n\n"
 
-        result_text += f"**💡 Workflow Tips**:\n"
-        result_text += f"• Each step will be executed in sequence\n"
-        result_text += f"• Use `next_step` to get guidance during execution\n"
-        result_text += f"• Customize the context data for your specific needs\n\n"
+        result_text += "**💡 Workflow Tips**:\n"
+        result_text += "• Each step will be executed in sequence\n"
+        result_text += "• Use `next_step` to get guidance during execution\n"
+        result_text += "• Customize the context data for your specific needs\n\n"
 
-        result_text += f"**🔧 Pro Tip**: Copy the JSON configuration above and use it directly with the `start` action!"
+        result_text += "**🔧 Pro Tip**: Copy the JSON configuration above and use it directly with the `start` action!"
 
         return [TextContent(type="text", text=result_text)]
 
@@ -891,14 +901,14 @@ action="create_simple", workflow_type="customer_onboarding", customer_email="use
             ],
         }
 
-        result_text = f"**Simple Product Launch Workflow**\n\n"
+        result_text = "**Simple Product Launch Workflow**\n\n"
         result_text += f"**Product Name**: {product_name}\n"
         result_text += f"**Pricing Model**: {pricing_model}\n\n"
 
-        result_text += f"**Complete Workflow Configuration**:\n"
+        result_text += "**Complete Workflow Configuration**:\n"
         result_text += f"```json\n{json.dumps(workflow_config, indent=2)}\n```\n\n"
 
-        result_text += f"**Ready to Launch**: Use `start` action with this configuration!"
+        result_text += "**Ready to Launch**: Use `start` action with this configuration!"
 
         return [TextContent(type="text", text=result_text)]
 
@@ -940,14 +950,14 @@ action="create_simple", workflow_type="customer_onboarding", customer_email="use
             ],
         }
 
-        result_text = f"**Simple Alert Setup Workflow**\n\n"
+        result_text = "**Simple Alert Setup Workflow**\n\n"
         result_text += f"**Notification Email**: {notification_email}\n"
         result_text += f"**Cost Threshold**: ${cost_threshold}\n\n"
 
-        result_text += f"**Complete Workflow Configuration**:\n"
+        result_text += "**Complete Workflow Configuration**:\n"
         result_text += f"```json\n{json.dumps(workflow_config, indent=2)}\n```\n\n"
 
-        result_text += f"**Ready to Configure**: Use `start` action with this configuration!"
+        result_text += "**Ready to Configure**: Use `start` action with this configuration!"
 
         return [TextContent(type="text", text=result_text)]
 
@@ -985,14 +995,14 @@ action="create_simple", workflow_type="customer_onboarding", customer_email="use
             ],
         }
 
-        result_text = f"**Simple Data Pipeline Workflow**\n\n"
+        result_text = "**Simple Data Pipeline Workflow**\n\n"
         result_text += f"**Source Name**: {source_name}\n"
         result_text += f"**Source Type**: {source_type}\n\n"
 
-        result_text += f"**Complete Workflow Configuration**:\n"
+        result_text += "**Complete Workflow Configuration**:\n"
         result_text += f"```json\n{json.dumps(workflow_config, indent=2)}\n```\n\n"
 
-        result_text += f"**Ready to Deploy**: Use `start` action with this configuration!"
+        result_text += "**Ready to Deploy**: Use `start` action with this configuration!"
 
         return [TextContent(type="text", text=result_text)]
 

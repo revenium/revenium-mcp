@@ -7,6 +7,8 @@ to maintain compliance with the 300-line limit per module.
 from datetime import datetime
 from typing import Any, Dict, List
 
+from .resource_classes import MCPResource, ResourceMimeType, ResourceType
+
 
 def get_builtin_resource_definitions() -> List:
     """Get built-in resource definitions.
@@ -14,8 +16,6 @@ def get_builtin_resource_definitions() -> List:
     Returns:
         List of built-in MCPResource instances
     """
-    # Import here to avoid circular imports
-    from .resources import MCPResource, ResourceMimeType, ResourceType
 
     return [
         # Analytics Resources
@@ -155,9 +155,6 @@ def generate_mock_content_by_type(resource) -> Dict[str, Any]:
     Returns:
         Mock content dictionary
     """
-    # Import here to avoid circular imports
-    from .resources import ResourceType
-
     if resource.resource_type == ResourceType.ANALYTICS:
         return _generate_analytics_content()
     elif resource.resource_type == ResourceType.TRANSACTIONS:

@@ -7,7 +7,7 @@ MCP format conversion, server info updates, change listeners, and stats.
 import pytest
 from unittest.mock import MagicMock
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Dict
 
 from src.revenium_mcp_server.mcp_compliance.capability_operations_helpers import (
     add_change_listener_to_list,

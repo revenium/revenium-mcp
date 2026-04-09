@@ -4,7 +4,6 @@ This module provides a service interface for tool introspection that can be
 integrated into the MCP server to provide comprehensive tool metadata access.
 """
 
-import json
 from typing import Any, Dict, List, Union
 
 from loguru import logger
@@ -97,6 +96,8 @@ class ToolIntrospectionService:
             "manage_subscriptions",  # Subscription management
             "manage_subscriber_credentials",  # Billing identity management
             "manage_workflows",  # Automation and workflows
+            "manage_jobs",  # Jobs & Outcomes management
+            "manage_tools",  # Tool Registry management
             # Group 5: System Diagnostics (Troubleshooting - last)
             "system_diagnostics",  # System health and troubleshooting
         ]
@@ -475,7 +476,7 @@ Provides essential introspection and metadata access for all MCP tools using sta
             text += "3. **Detailed Capabilities**: Call individual tools with `get_capabilities` action\n"
             text += "4. **Usage Examples**: Call individual tools with `get_examples` action\n\n"
 
-            text += f'**Tip**: Use `get_tool_metadata(tool_name="<tool_name>")` for detailed examples of any specific tool.'
+            text += '**Tip**: Use `get_tool_metadata(tool_name="<tool_name>")` for detailed examples of any specific tool.'
 
             return [TextContent(type="text", text=text)]
 

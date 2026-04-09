@@ -1,9 +1,8 @@
 """Extended unit tests for Revenium API client — covers convenience methods, retry logic, error formatting."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, patch
 
-import httpx
 
 from src.revenium_mcp_server.client import (
     ConnectionPoolConfig,
@@ -68,7 +67,6 @@ class TestConnectionPoolConfig:
 
     def test_http2_auto_detect_missing(self, monkeypatch):
         """When h2 is not installed, HTTP/2 is disabled."""
-        import importlib
         with patch.dict("sys.modules", {"h2": None}):
             with patch("builtins.__import__", side_effect=ImportError):
                 cfg = ConnectionPoolConfig(enable_http2=None)
@@ -216,7 +214,7 @@ class TestHTTPConvenienceMethods:
         self.client._request_with_retry = AsyncMock(return_value={"data": []})
         result = await self.client.get("/endpoint", params={"page": 0})
         assert result == {"data": []}
-        self.client._request_with_retry.assert_awaited_once_with("GET", "/endpoint", params={"page": 0})
+        self.client._request_with_retry.assert_awaited_once_with("GET", "/endpoint", params={"page": 0}, base_url=None, use_bearer=False)
 
     @pytest.mark.asyncio
     async def test_get_without_retry(self):

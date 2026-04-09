@@ -6,7 +6,6 @@ unsupported action handling, error formatting, and chart generation logic.
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from mcp.types import TextContent, ImageContent
 
 from src.revenium_mcp_server.tools_decomposed.business_analytics_management import (
     BusinessAnalyticsManagement,

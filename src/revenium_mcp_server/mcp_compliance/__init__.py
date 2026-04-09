@@ -39,10 +39,10 @@ from .notifications import (
 )
 from .protocol_handler import MCPProtocolHandler, protocol_handler, with_mcp_protocol_validation
 from .resource_discovery import MCPResourceDiscoveryEngine, resource_discovery_engine
+from .resource_classes import ResourceMimeType
 from .resources import (
     MCPResource,
     MCPResourceManager,
-    ResourceMimeType,
     ResourceSubscription,
     ResourceType,
     resource_manager,

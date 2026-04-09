@@ -10,7 +10,7 @@ from src.revenium_mcp_server.auth import AuthConfig
 
 class TestReveniumClient:
     """Test ReveniumClient class."""
-    
+
     def test_client_initialization_with_auth_config(self):
         """Test client initialization with explicit auth config."""
         auth_config = AuthConfig(
@@ -24,7 +24,7 @@ class TestReveniumClient:
         assert client.base_url == "https://test.api.com"
         assert client.timeout == 60.0
         assert client.team_id == "test_team_123"
-    
+
     def test_client_initialization_from_env(self, mock_env_vars):
         """Test client initialization from environment variables."""
         client = ReveniumClient()
@@ -32,7 +32,7 @@ class TestReveniumClient:
         assert client.team_id == "test_team_id_456"
         assert client.base_url == "https://api.test.revenium.ai"
         assert client.timeout == 30.0
-    
+
     def test_client_initialization_missing_api_key(self, monkeypatch):
         """Test client initialization fails without API key."""
         # Clear the ConfigManager cache first
@@ -47,11 +47,11 @@ class TestReveniumClient:
         client = ReveniumClient()
         assert client is not None
         assert client._auth_config_loaded is False
-    
+
     def test_build_url(self, mock_env_vars):
         """Test URL building."""
         client = ReveniumClient()
-        
+
         # Test with leading slash
         url = client._build_url("/profitstream/v2/api/products")
         assert url == "https://api.test.revenium.ai/profitstream/v2/api/products"
@@ -59,7 +59,7 @@ class TestReveniumClient:
         # Test without leading slash
         url = client._build_url("profitstream/v2/api/products")
         assert url == "https://api.test.revenium.ai/profitstream/v2/api/products"
-    
+
     @pytest.mark.asyncio
     async def test_request_success(self, mock_env_vars):
         """Test successful API request."""
@@ -74,7 +74,7 @@ class TestReveniumClient:
         with patch.object(client.client, 'request', new_callable=AsyncMock, return_value=mock_response):
             result = await client._request("GET", "/profitstream/v2/api/products")
             assert result == {"success": True, "data": []}
-    
+
     @pytest.mark.asyncio
     async def test_request_http_error(self, mock_env_vars):
         """Test API request with HTTP error."""
@@ -93,7 +93,7 @@ class TestReveniumClient:
             assert exc_info.value.status_code == 404
             # Error message format is now "HTTP 404: ..."
             assert "404" in str(exc_info.value)
-    
+
     @pytest.mark.asyncio
     async def test_request_network_error(self, mock_env_vars):
         """Test API request with network error."""
@@ -102,7 +102,7 @@ class TestReveniumClient:
         with patch.object(client.client, 'request', new_callable=AsyncMock, side_effect=httpx.RequestError("Connection failed")):
             with pytest.raises(ReveniumAPIError, match="Request failed"):
                 await client._request("GET", "/profitstream/v2/api/products")
-    
+
     @pytest.mark.asyncio
     async def test_request_empty_response(self, mock_env_vars):
         """Test API request with empty response."""
@@ -116,7 +116,7 @@ class TestReveniumClient:
         with patch.object(client.client, 'request', new_callable=AsyncMock, return_value=mock_response):
             result = await client._request("DELETE", "/profitstream/v2/api/products/123")
             assert result == {}
-    
+
     @pytest.mark.asyncio
     async def test_context_manager(self, mock_env_vars):
         """Test client as async context manager."""
@@ -126,7 +126,7 @@ class TestReveniumClient:
 
         # Client should be closed after context exit
         # Note: In real implementation, we'd check if client.client is closed
-    
+
     @pytest.mark.asyncio
     async def test_close(self, mock_env_vars):
         """Test client close method."""
@@ -140,7 +140,7 @@ class TestReveniumClient:
 
 class TestReveniumAPIError:
     """Test ReveniumAPIError exception."""
-    
+
     def test_error_creation_minimal(self):
         """Test creating error with minimal parameters."""
         error = ReveniumAPIError("Test error")
@@ -148,7 +148,7 @@ class TestReveniumAPIError:
         assert error.message == "Test error"
         assert error.status_code is None
         assert error.response_data is None
-    
+
     def test_error_creation_full(self):
         """Test creating error with all parameters."""
         response_data = {"error": "Invalid request"}

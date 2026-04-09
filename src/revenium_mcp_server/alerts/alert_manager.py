@@ -336,7 +336,7 @@ class AlertManager:
         slack_configs = alert.get("slackConfigurations", [])
         webhook_configs = alert.get("webhookConfigurations", [])
         if slack_configs or webhook_configs:
-            result_text += f"\n\n**Integrations:**"
+            result_text += "\n\n**Integrations:**"
             if slack_configs:
                 result_text += f"\n  • Slack: {len(slack_configs)} configured"
             if webhook_configs:
@@ -345,7 +345,7 @@ class AlertManager:
         # Add percentage flag if relevant
         is_percentage = alert.get("isPercentage", False)
         if is_percentage:
-            result_text += f"\n\n**Note:** Threshold is configured as a percentage value"
+            result_text += "\n\n**Note:** Threshold is configured as a percentage value"
 
         # Add trigger persistence duration if available
         trigger_duration = alert.get("triggerAfterPersistsDuration")

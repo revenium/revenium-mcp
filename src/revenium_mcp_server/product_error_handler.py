@@ -7,7 +7,7 @@ examples, and step-by-step guidance for fixing product creation issues.
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
 

@@ -5,9 +5,8 @@ email update flow, status checking, and error handling.
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import patch
 
-from mcp.types import TextContent
 
 from src.revenium_mcp_server.tools_decomposed.email_verification import EmailVerification
 

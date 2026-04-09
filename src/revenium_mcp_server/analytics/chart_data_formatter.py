@@ -124,7 +124,7 @@ class ChartDataFormatter:
 
         if not data:
             # Graceful handling for empty data scenarios
-            logger.warning(f"No data available for cost trend chart generation")
+            logger.warning("No data available for cost trend chart generation")
 
             # Create empty chart with helpful message
             config = ChartConfig(
@@ -282,7 +282,7 @@ class ChartDataFormatter:
 
         if not data:
             # Graceful handling for empty breakdown data
-            logger.warning(f"No data available for breakdown chart generation")
+            logger.warning("No data available for breakdown chart generation")
 
             # Create empty chart with helpful message
             config = ChartConfig(
@@ -592,7 +592,7 @@ class ChartDataFormatter:
 
         if not data:
             # Graceful handling for empty agent cost trends data
-            logger.warning(f"No data available for agent cost trends chart generation")
+            logger.warning("No data available for agent cost trends chart generation")
 
             # Create empty chart with helpful message
             config = ChartConfig(

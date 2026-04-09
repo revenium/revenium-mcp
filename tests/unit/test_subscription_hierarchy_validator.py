@@ -10,12 +10,10 @@ Covers:
   _handle_discovery_actions
 """
 
-import json
-import time
 import pytest
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.tools_decomposed.subscription_management import (
     SubscriptionHierarchyManager,

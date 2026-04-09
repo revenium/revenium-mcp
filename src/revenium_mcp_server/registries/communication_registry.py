@@ -7,7 +7,7 @@ workflow management with enterprise compliance and security patterns.
 import logging
 from typing import Any, Dict, List, Optional, Union
 
-from mcp.server import FastMCP
+from fastmcp import FastMCP
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..tools_decomposed.email_verification import EmailVerification

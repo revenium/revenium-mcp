@@ -13,6 +13,7 @@ from loguru import logger
 
 # Import existing configuration infrastructure - REUSE EXISTING
 from ..config_store import get_config_value
+from ..endpoint_registry import _resolved_app_base_url, _use_new_api, get_endpoint_path
 
 
 @dataclass
@@ -189,20 +190,31 @@ class EnvironmentVariableValidator:
 
             api_key = os.getenv("REVENIUM_API_KEY")
             from ..constants import DEFAULT_BASE_URL
-            base_url = os.getenv("REVENIUM_BASE_URL", DEFAULT_BASE_URL)
+            base_url = (
+                _resolved_app_base_url()
+                if _use_new_api()
+                else os.getenv("REVENIUM_BASE_URL", DEFAULT_BASE_URL)
+            )
 
             api_result = {"status": "not_attempted", "error": None, "response": None}
 
             if api_key:
                 # Use a simple business endpoint that should work with basic API key authentication
                 # This is more reliable than health endpoints which may not exist
-                endpoint = "/profitstream/v2/api/sources/metrics/ai/data-connected"
+                endpoint = get_endpoint_path("data_connected")
 
-                headers = {
-                    "x-api-key": api_key,
-                    "accept": "application/json",
-                    "Content-Type": "application/json",
-                }
+                if _use_new_api():
+                    headers = {
+                        "Authorization": f"Bearer {api_key}",
+                        "accept": "application/json",
+                        "Content-Type": "application/json",
+                    }
+                else:
+                    headers = {
+                        "x-api-key": api_key,
+                        "accept": "application/json",
+                        "Content-Type": "application/json",
+                    }
 
                 try:
                     url = f"{base_url}{endpoint}"

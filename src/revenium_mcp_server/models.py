@@ -691,6 +691,8 @@ class OperatorType(str, Enum):
     NOT_EQUAL = "NOT_EQUAL"
     CONTAINS = "CONTAINS"
     NOT_CONTAINS = "NOT_CONTAINS"
+    INCREASES_BY = "INCREASES_BY"
+    DECREASES_BY = "DECREASES_BY"
 
 
 class PeriodDuration(str, Enum):

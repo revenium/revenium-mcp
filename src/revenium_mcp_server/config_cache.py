@@ -5,7 +5,6 @@ This module provides caching functionality for discovered configuration
 to reduce API calls and improve startup performance.
 """
 
-import asyncio
 import json
 import os
 import time

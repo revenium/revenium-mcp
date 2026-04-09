@@ -17,8 +17,6 @@ from src.revenium_mcp_server.analytics.transaction_level_analytics_processor imp
     TransactionLevelData,
     CustomerTransactionData,
     ProductTransactionData,
-    AgentAnalyticsData,
-    TaskAnalyticsData,
 )
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 
@@ -616,40 +614,6 @@ class TestAnalyzeTaskPerformanceErrors:
 
 class TestTransactionProcessorInit:
     """Tests for processor initialization and endpoint configuration."""
-
-    def test_has_all_endpoint_categories(self):
-        """Processor initializes with all 5 non-empty endpoint categories."""
-        processor = TransactionLevelAnalyticsProcessor()
-        assert len(processor.summary_endpoints) > 0
-        assert len(processor.customer_endpoints) > 0
-        assert len(processor.product_endpoints) > 0
-        assert len(processor.agent_endpoints) > 0
-        assert len(processor.task_endpoints) > 0
-
-    def test_summary_endpoints_count(self):
-        """Summary endpoints should have 5 entries."""
-        processor = TransactionLevelAnalyticsProcessor()
-        assert len(processor.summary_endpoints) == 5
-
-    def test_customer_endpoints_count(self):
-        """Customer endpoints should have 3 entries."""
-        processor = TransactionLevelAnalyticsProcessor()
-        assert len(processor.customer_endpoints) == 3
-
-    def test_product_endpoints_count(self):
-        """Product endpoints should have 3 entries."""
-        processor = TransactionLevelAnalyticsProcessor()
-        assert len(processor.product_endpoints) == 3
-
-    def test_agent_endpoints_count(self):
-        """Agent endpoints should have 3 entries."""
-        processor = TransactionLevelAnalyticsProcessor()
-        assert len(processor.agent_endpoints) == 3
-
-    def test_task_endpoints_count(self):
-        """Task endpoints should have 4 entries."""
-        processor = TransactionLevelAnalyticsProcessor()
-        assert len(processor.task_endpoints) == 4
 
     def test_validator_initialized(self):
         """Processor initializes with a functional parameter validator."""

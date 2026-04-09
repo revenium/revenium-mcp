@@ -17,7 +17,6 @@ from src.revenium_mcp_server.introspection.metadata import (
     PerformanceMetrics,
     ToolCapability,
     ToolMetadata,
-    ToolType,
 )
 
 os.environ.setdefault("LOG_LEVEL", "ERROR")

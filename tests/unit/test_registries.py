@@ -5,21 +5,15 @@ business_shared_parameters, business_management_registry, integration_helper.
 """
 
 import pytest
-from dataclasses import asdict
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 from src.revenium_mcp_server.registries.shared_parameters import (
-    AnalyticsTimeRange,
-    AnalyticsGrouping,
     AnalyticsFilters,
     MeteringTransaction,
-    MeteringElementDefinition,
     MeteringTransactionBuilder,
     AnalyticsQueryBuilder,
-    OAuthWorkflowParameters,
     IntegrationSetupParameters,
     EmailVerificationParameters,
-    WorkflowManagementParameters,
     InfrastructureConfigParameters,
     DebugParameters,
     SourceManagementParameters,

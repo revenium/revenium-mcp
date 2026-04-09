@@ -11,7 +11,6 @@ Based on MCP specification and JSON-RPC 2.0 standard:
 - Structured error data for debugging
 """
 
-import json
 from dataclasses import asdict, dataclass
 from dataclasses import field as dataclass_field
 from enum import IntEnum

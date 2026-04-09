@@ -1097,7 +1097,7 @@ class BusinessAnalyticsEngine:
         elif query.query_type == "transaction_level":
             insights.append("🔍 Transaction-level analysis insights will be generated here")
             if data.get("results"):
-                insights.append(f"📊 Transaction-level analysis processed successfully")
+                insights.append("📊 Transaction-level analysis processed successfully")
 
         return insights
 
@@ -1886,10 +1886,10 @@ class BusinessAnalyticsEngine:
 
             # General recommendations
             recommendations.append(
-                f"📈 Monitor transaction-level metrics regularly to identify cost optimization opportunities"
+                "📈 Monitor transaction-level metrics regularly to identify cost optimization opportunities"
             )
             recommendations.append(
-                f"🔍 Use transaction-level analytics to correlate costs with business outcomes"
+                "🔍 Use transaction-level analytics to correlate costs with business outcomes"
             )
 
         except Exception as e:
@@ -2031,10 +2031,10 @@ class BusinessAnalyticsEngine:
 
             # General recommendations
             recommendations.append(
-                f"📈 Monitor customer-level profitability regularly to identify trends and opportunities"
+                "📈 Monitor customer-level profitability regularly to identify trends and opportunities"
             )
             recommendations.append(
-                f"🔍 Use customer analytics to optimize pricing and service delivery strategies"
+                "🔍 Use customer analytics to optimize pricing and service delivery strategies"
             )
 
         except Exception as e:
@@ -2176,10 +2176,10 @@ class BusinessAnalyticsEngine:
 
             # General recommendations
             recommendations.append(
-                f"📈 Monitor product-level profitability regularly to identify trends and opportunities"
+                "📈 Monitor product-level profitability regularly to identify trends and opportunities"
             )
             recommendations.append(
-                f"🔍 Use product analytics to optimize product mix and pricing strategies"
+                "🔍 Use product analytics to optimize product mix and pricing strategies"
             )
 
         except Exception as e:
@@ -2318,10 +2318,10 @@ class BusinessAnalyticsEngine:
 
             # General recommendations
             recommendations.append(
-                f"📈 Monitor agent performance regularly to identify optimization opportunities"
+                "📈 Monitor agent performance regularly to identify optimization opportunities"
             )
             recommendations.append(
-                f"🔍 Use agent analytics to optimize resource allocation and performance"
+                "🔍 Use agent analytics to optimize resource allocation and performance"
             )
 
         except Exception as e:
@@ -2531,10 +2531,10 @@ class BusinessAnalyticsEngine:
 
             # General task analytics recommendations
             recommendations.append(
-                f"📊 Monitor task-level metrics regularly to optimize provider and model selection"
+                "📊 Monitor task-level metrics regularly to optimize provider and model selection"
             )
             recommendations.append(
-                f"🔧 Use task analytics to identify patterns and improve task allocation strategies"
+                "🔧 Use task analytics to identify patterns and improve task allocation strategies"
             )
 
         except Exception as e:

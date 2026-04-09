@@ -6,7 +6,6 @@ and CRUD operations with mocked API client.
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
-from mcp.types import TextContent
 
 from src.revenium_mcp_server.alerts.anomaly_manager import AnomalyManager
 from src.revenium_mcp_server.exceptions import ValidationError
@@ -215,6 +214,61 @@ class TestValidateDirectApiFormat:
         }
         with pytest.raises(ValidationError):
             manager._validate_direct_api_format(data)
+
+    def test_increases_by_with_non_relative_change_raises(self, manager):
+        data = {
+            "alertType": "THRESHOLD",
+            "metricType": "TOTAL_COST",
+            "operatorType": "INCREASES_BY",
+            "threshold": 10,
+        }
+        with pytest.raises(ValidationError) as exc_info:
+            manager._validate_direct_api_format(data)
+        assert "RELATIVE_CHANGE" in exc_info.value.message
+
+    def test_decreases_by_with_non_relative_change_raises(self, manager):
+        data = {
+            "alertType": "CUMULATIVE_USAGE",
+            "metricType": "TOTAL_COST",
+            "operatorType": "DECREASES_BY",
+            "threshold": 10,
+        }
+        with pytest.raises(ValidationError) as exc_info:
+            manager._validate_direct_api_format(data)
+        assert "RELATIVE_CHANGE" in exc_info.value.message
+
+    def test_relative_change_with_threshold_operator_raises(self, manager):
+        data = {
+            "alertType": "RELATIVE_CHANGE",
+            "metricType": "TOTAL_COST",
+            "operatorType": "GREATER_THAN",
+            "threshold": 10,
+        }
+        with pytest.raises(ValidationError) as exc_info:
+            manager._validate_direct_api_format(data)
+        assert "relative operator" in exc_info.value.message
+
+    def test_relative_change_with_increases_by_valid(self, manager):
+        data = {
+            "alertType": "RELATIVE_CHANGE",
+            "metricType": "TOTAL_COST",
+            "operatorType": "INCREASES_BY",
+            "threshold": 10,
+        }
+        result = manager._validate_direct_api_format(data)
+        assert result["alertType"] == "RELATIVE_CHANGE"
+        assert result["operatorType"] == "INCREASES_BY"
+
+    def test_relative_change_with_decreases_by_valid(self, manager):
+        data = {
+            "alertType": "RELATIVE_CHANGE",
+            "metricType": "TOTAL_COST",
+            "operatorType": "DECREASES_BY",
+            "threshold": 10,
+        }
+        result = manager._validate_direct_api_format(data)
+        assert result["alertType"] == "RELATIVE_CHANGE"
+        assert result["operatorType"] == "DECREASES_BY"
 
 
 # ---------------------------------------------------------------------------

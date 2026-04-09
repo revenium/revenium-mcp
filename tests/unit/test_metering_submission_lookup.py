@@ -12,11 +12,7 @@ Covers:
 - _search_transaction_pages: pagination, page iteration, early termination, caching
 """
 
-import asyncio
-import json
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 

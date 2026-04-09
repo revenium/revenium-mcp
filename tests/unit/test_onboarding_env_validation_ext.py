@@ -1,13 +1,10 @@
 """Unit tests for EnvironmentVariableValidator (onboarding/env_validation.py)."""
 
-import os
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import patch
 
 from src.revenium_mcp_server.onboarding.env_validation import (
     EnvironmentVariableValidator,
-    EnvironmentVariableStatus,
-    ValidationResult,
     get_debug_auto_discovery_env_vars,
     get_all_env_vars_dict,
 )

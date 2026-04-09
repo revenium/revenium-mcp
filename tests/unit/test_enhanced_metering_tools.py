@@ -1,11 +1,8 @@
 """Unit tests for MeteringManagement tools."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime, timezone
 
 from src.revenium_mcp_server.tools_decomposed.metering_management import MeteringManagement
-from mcp.types import TextContent
 
 
 @pytest.fixture

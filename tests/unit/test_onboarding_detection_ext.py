@@ -3,15 +3,12 @@
 import json
 import time
 import pytest
-from datetime import datetime, timezone
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.onboarding.detection_service import (
     OnboardingDetectionService,
     OnboardingState,
     detect_first_time_user,
-    get_onboarding_state,
     get_detection_service,
 )
 

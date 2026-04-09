@@ -7,6 +7,7 @@ tool with internal composition, following the proven alert/source/customer manag
 import json
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 
 from loguru import logger
@@ -1551,7 +1552,7 @@ class SubscriptionHierarchyManager:
             ),
             "navigation_path": navigation_result.navigation_path,
             "metadata": {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "hierarchy_level": "subscriptions → products",
                 "product_found": len(navigation_result.related_entities) > 0,
             },
@@ -1596,7 +1597,7 @@ class SubscriptionHierarchyManager:
             "data": navigation_result.related_entities,
             "navigation_path": navigation_result.navigation_path,
             "metadata": {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "hierarchy_level": "subscriptions → credentials",
                 "total_credentials": len(navigation_result.related_entities),
             },
@@ -1753,7 +1754,7 @@ class SubscriptionHierarchyManager:
                 },
             },
             "metadata": {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "hierarchy_level": "subscriptions + credentials",
                 "operation_type": "coordinated_creation",
             },

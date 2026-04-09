@@ -5,7 +5,7 @@ validation, and natural language processing for credential operations.
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.tools_decomposed.credential_documentation_handler import (
     CredentialDocumentationHandler,

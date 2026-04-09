@@ -12,9 +12,6 @@ from src.revenium_mcp_server.analytics.nlp_business_processor import (
     TimeFrame,
     ExtractedEntity,
     QuerySession,
-    NLPQueryResult,
-    QueryDimension,
-    ContextReference,
 )
 from src.revenium_mcp_server.common.error_handling import ToolError
 

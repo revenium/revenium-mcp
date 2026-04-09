@@ -124,8 +124,8 @@ class ValidationIntegration:
         # Add helpful actions
         error_text += "**Next Steps:**\n"
         error_text += f"• Use `get_capabilities` to see valid parameters for {tool_name}\n"
-        error_text += f"• Use `get_examples` to see working parameter examples\n"
-        error_text += f"• Use `validate` action to test your parameters before submitting\n"
+        error_text += "• Use `get_examples` to see working parameter examples\n"
+        error_text += "• Use `validate` action to test your parameters before submitting\n"
 
         return error_text
 
@@ -243,9 +243,9 @@ class ValidationReporter:
         # Usage examples
         report += "## 💡 **Usage Tips**\n\n"
         report += f"• Use `get_examples` to see working examples for {tool_name}\n"
-        report += f"• Use `validate` action to test parameters before submitting\n"
-        report += f"• All parameter names must use snake_case format\n"
-        report += f"• Required parameters must be provided for the tool to work\n"
+        report += "• Use `validate` action to test parameters before submitting\n"
+        report += "• All parameter names must use snake_case format\n"
+        report += "• Required parameters must be provided for the tool to work\n"
 
         return report
 

@@ -235,12 +235,11 @@ class TestFetchProductData:
 
     @pytest.mark.asyncio
     async def test_fetch_product_data_success(self, processor, mock_client):
-        """All three product endpoints return successfully."""
+        """Cost and revenue endpoints fetched; percentage_revenue computed client-side."""
         mock_client._request_with_retry = AsyncMock(
             side_effect=[
                 [_api_entry("Product A", 100.0)],
                 [_api_entry("Product A", 500.0)],
-                [_api_entry("Product A", 60.0)],
             ]
         )
 
@@ -249,7 +248,8 @@ class TestFetchProductData:
         assert "cost_metric_by_product" in result
         assert "revenue_metric_by_product" in result
         assert "percentage_revenue_metric_by_product" in result
-        assert mock_client._request_with_retry.call_count == 3
+        # percentage_revenue is computed client-side from revenue data, not a separate API call
+        assert mock_client._request_with_retry.call_count == 2
 
     @pytest.mark.asyncio
     async def test_fetch_product_data_with_group(self, processor, mock_client):

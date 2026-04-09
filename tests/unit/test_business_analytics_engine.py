@@ -13,9 +13,8 @@ Tests behavioral correctness of:
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime, timezone
+from datetime import datetime
 from dataclasses import dataclass
-from typing import Any, Dict, List
 
 from src.revenium_mcp_server.analytics.business_analytics_engine import (
     AnalyticsQuery,

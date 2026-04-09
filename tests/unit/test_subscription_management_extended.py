@@ -10,11 +10,10 @@ Covers:
   _handle_get_agent_summary, metadata provider methods
 """
 
-import json
 import pytest
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.tools_decomposed.subscription_management import (
     SubscriptionAnalytics,
@@ -991,8 +990,8 @@ class TestHandleAction:
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
     async def test_handle_action_validation_error(self, mock_get_client, sub_management, mock_client):
         mock_get_client.return_value = mock_client
-        # Missing subscription_id should raise a validation/tool error
-        with pytest.raises((ToolError, Exception)):
+        # Missing subscription_id should raise a ToolError
+        with pytest.raises(ToolError):
             await sub_management.handle_action("get", {})
 
 

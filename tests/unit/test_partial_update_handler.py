@@ -2,7 +2,7 @@
 
 import asyncio
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from src.revenium_mcp_server.common.partial_update_handler import (
     FieldTransformers,
@@ -43,6 +43,15 @@ class TestFieldTransformers:
     def test_extract_team_ids_delegates(self):
         teams = [{"id": "t1"}, {"id": "t2"}]
         assert FieldTransformers.extract_team_ids(teams) == ["t1", "t2"]
+
+    def test_extract_label_with_dict(self):
+        assert FieldTransformers.extract_label({"label": "test@email.com"}) == "test@email.com"
+
+    def test_extract_label_none(self):
+        assert FieldTransformers.extract_label(None) is None
+
+    def test_extract_label_no_label_key(self):
+        assert FieldTransformers.extract_label({"id": "abc"}) is None
 
     def test_extract_owner_id_delegates(self):
         owner = {"id": "o1"}
@@ -116,6 +125,27 @@ class TestPartialUpdateHandlerHelpers:
         assert result["ownerId"] == "o123"
         assert "owner" not in result  # Source field removed
 
+    def test_apply_field_transformations_multiple_targets_from_same_source(self):
+        config = UpdateConfig(
+            resource_type="test",
+            get_method=AsyncMock(),
+            update_method=AsyncMock(),
+            field_transformations={
+                "client": {
+                    "subscriberId": FieldTransformers.object_to_id,
+                    "clientEmailAddress": FieldTransformers.extract_label,
+                },
+            },
+        )
+        data = {
+            "client": {"id": "sub_123", "label": "user@example.com"},
+            "name": "test",
+        }
+        result = self.handler._apply_field_transformations(data, config)
+        assert result["subscriberId"] == "sub_123"
+        assert result["clientEmailAddress"] == "user@example.com"
+        assert "client" not in result
+
     def test_apply_field_transformations_error_continues(self):
         """If a transformer raises, the field is skipped gracefully."""
         def bad_transformer(val):
@@ -130,6 +160,7 @@ class TestPartialUpdateHandlerHelpers:
         data = {"x": "something", "name": "test"}
         result = self.handler._apply_field_transformations(data, config)
         assert result["name"] == "test"
+        assert result["x"] == "something"
 
     def test_apply_defaults_fills_missing(self):
         config = UpdateConfig(
@@ -296,3 +327,62 @@ class TestUpdateWithMerge:
 
         with pytest.raises(ToolError, match="db connection lost"):
             await handler.update_with_merge("123", {"name": "x"}, config)
+
+    @pytest.mark.asyncio
+    async def test_subscription_update_extracts_client_email_and_product_id(self):
+        get_response = {
+            "id": "sub_001",
+            "name": "Test Subscription",
+            "owner": {"id": "owner_1", "resourceType": "user", "label": "admin@test.com"},
+            "client": {"id": "client_1", "resourceType": "user", "label": "customer@test.com"},
+            "organization": {"id": "org_1", "resourceType": "organization", "label": "Acme"},
+            "product": {"id": "prod_1", "resourceType": "product", "label": "Premium Plan"},
+            "resourceType": "subscription",
+            "created": "2025-01-01",
+        }
+
+        captured_payload = {}
+
+        async def mock_update(resource_id, data):
+            captured_payload.update(data)
+            return {"id": resource_id, **data}
+
+        handler = PartialUpdateHandler()
+        config = UpdateConfig(
+            resource_type="subscription",
+            get_method=AsyncMock(return_value=get_response),
+            update_method=mock_update,
+            id_field="id",
+            required_fields=["name"],
+            default_fields={"teamId": "team_1"},
+            preserve_fields=[
+                "id", "createdAt", "updatedAt",
+                "productId", "ownerId", "teamId",
+                "subscriberId", "organizationId",
+            ],
+            field_transformations={
+                "owner": {"ownerId": FieldTransformers.extract_owner_id},
+                "client": {
+                    "subscriberId": FieldTransformers.object_to_id,
+                    "clientEmailAddress": FieldTransformers.extract_label,
+                },
+                "organization": {"organizationId": FieldTransformers.object_to_id},
+                "product": {"productId": FieldTransformers.object_to_id},
+            },
+        )
+
+        await handler.update_with_merge("sub_001", {"description": "Updated"}, config)
+
+        assert captured_payload["clientEmailAddress"] == "customer@test.com"
+        assert captured_payload["productId"] == "prod_1"
+        assert captured_payload["subscriberId"] == "client_1"
+        assert captured_payload["ownerId"] == "owner_1"
+        assert captured_payload["organizationId"] == "org_1"
+        assert captured_payload["teamId"] == "team_1"
+        assert captured_payload["name"] == "Test Subscription"
+        assert captured_payload["description"] == "Updated"
+        assert "id" not in captured_payload
+        assert "client" not in captured_payload
+        assert "product" not in captured_payload
+        assert "owner" not in captured_payload
+        assert "resourceType" not in captured_payload

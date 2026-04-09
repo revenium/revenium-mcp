@@ -21,8 +21,6 @@ from unittest.mock import MagicMock
 from src.revenium_mcp_server.analytics.enhanced_spike_analyzer import (
     EnhancedSpikeAnalyzer,
     TemporalAnomaly,
-    TEMPORAL_ANALYSIS_ENDPOINTS,
-    NEW_ENTITY_DETECTION_SUPPORTED_DIMENSIONS,
 )
 
 

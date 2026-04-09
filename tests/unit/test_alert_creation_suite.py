@@ -11,7 +11,7 @@ Covers:
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from typing import Dict, Any
 
 from mcp.types import TextContent

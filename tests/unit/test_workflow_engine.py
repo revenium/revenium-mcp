@@ -1,6 +1,5 @@
 """Unit tests for workflow_engine module."""
 
-import pytest
 
 from src.revenium_mcp_server.workflow_engine import (
     WorkflowStatus,

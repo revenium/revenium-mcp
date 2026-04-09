@@ -7,7 +7,6 @@ in __post_init__ and behavioral methods.
 
 from datetime import datetime
 
-import pytest
 
 from src.revenium_mcp_server.ai_routing.models import (
     AIClientConfig,

@@ -1,6 +1,5 @@
 """Unit tests for naming_standards and naming_audit modules."""
 
-import pytest
 
 from src.revenium_mcp_server.naming_standards import (
     NamingStandards,
@@ -8,9 +7,6 @@ from src.revenium_mcp_server.naming_standards import (
     BackwardCompatibilityManager,
     validate_new_parameter,
     get_naming_guidelines,
-    naming_standards,
-    parameter_validator,
-    compatibility_manager,
 )
 from src.revenium_mcp_server.naming_audit import (
     NamingAudit,

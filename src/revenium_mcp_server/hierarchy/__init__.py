@@ -105,5 +105,6 @@ __all__ = [
     "EntityMention",
     "ParsedAction",
     "WorkflowStep",
+    "get_multi_entity_nlp_processor",
     "multi_entity_nlp_processor",
 ]

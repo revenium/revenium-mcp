@@ -17,6 +17,7 @@ from loguru import logger
 
 from ..client import ReveniumClient
 from ..common.error_handling import ErrorCodes, ToolError
+from ..endpoint_registry import get_unit_multiplier, resolve_analytics_request
 from .transaction_level_validation import TransactionLevelParameterValidator
 
 
@@ -122,44 +123,6 @@ class TransactionLevelAnalyticsProcessor:
 
         # UCM integration for capability discovery
         self.ucm_helper = ucm_helper
-
-        # Summary Analytics endpoints (5 endpoints)
-        self.summary_endpoints = {
-            "total_cost_by_provider_over_time": "/profitstream/v2/api/sources/metrics/ai/total-cost-by-provider-over-time",
-            "cost_metric_by_provider_over_time": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-provider-over-time",
-            "total_cost_by_model": "/profitstream/v2/api/sources/metrics/ai/total-cost-by-model",
-            "cost_metrics_by_subscriber_credential": "/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-subscriber-credential",
-            "tokens_per_minute_by_provider": "/profitstream/v2/api/sources/metrics/ai/tokens-per-minute-by-provider",
-        }
-
-        # Customer Analytics endpoints (3 endpoints)
-        self.customer_endpoints = {
-            "cost_metric_by_organization": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-organization",
-            "revenue_metric_by_organization": "/profitstream/v2/api/sources/metrics/ai/revenue-metric-by-organization",
-            "percentage_revenue_metric_by_organization": "/profitstream/v2/api/sources/metrics/ai/percentage-revenue-metric-by-organization",
-        }
-
-        # Product Analytics endpoints (3 endpoints)
-        self.product_endpoints = {
-            "cost_metric_by_product": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-product",
-            "revenue_metric_by_product": "/profitstream/v2/api/sources/metrics/ai/revenue-metric-by-product",
-            "percentage_revenue_metric_by_product": "/profitstream/v2/api/sources/metrics/ai/percentage-revenue-metric-by-product",
-        }
-
-        # Agent Analytics endpoints (3 endpoints)
-        self.agent_endpoints = {
-            "cost_metrics_by_agents_over_time": "/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-agents-over-time",
-            "call_count_metrics_by_agents": "/profitstream/v2/api/sources/metrics/ai/call-count-metrics-by-agents",
-            "performance_metrics_by_agents": "/profitstream/v2/api/sources/metrics/ai/performance-metrics-by-agents",
-        }
-
-        # Task Analytics endpoints (4 endpoints)
-        self.task_endpoints = {
-            "cost_metric_by_provider": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-provider",
-            "cost_metric_by_model": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-model",
-            "performance_metric_by_provider": "/profitstream/v2/api/sources/metrics/ai/performance-metric-by-provider",
-            "performance_metric_by_model": "/profitstream/v2/api/sources/metrics/ai/performance-metric-by-model",
-        }
 
     # Summary Analytics Methods (5 endpoints)
     async def analyze_summary_metrics(
@@ -635,40 +598,32 @@ class TransactionLevelAnalyticsProcessor:
         self, client: ReveniumClient, team_id: str, period: str, group: str
     ) -> Dict[str, Any]:
         """Fetch summary data from multiple endpoints concurrently following CostAnalyticsProcessor patterns."""
-        # Base parameters following existing patterns
-        params = {"teamId": team_id, "period": period}
-        if group != "TOTAL":
-            params["group"] = group
+        extra_old_params = {"group": group} if group != "TOTAL" else None
 
-        # Create concurrent API calls using verified endpoints following existing patterns
+        def _make_call(key, extra=None, extra_new=None):
+            path, params, call_kwargs = resolve_analytics_request(
+                key, team_id, period, extra_old_params=extra, extra_new_params=extra_new
+            )
+            return client._request_with_retry("GET", path, params=params, **call_kwargs)
+
+        # Create concurrent API calls using resolve_analytics_request for correct host/auth routing
         tasks = {
-            "total_cost_by_provider_over_time": client._request_with_retry(
-                "GET",
-                self.summary_endpoints["total_cost_by_provider_over_time"],
-                params=params,  # Use consistent params with group parameter
+            "total_cost_by_provider_over_time": _make_call(
+                "total_cost_by_provider_over_time", extra=extra_old_params
             ),
-            "cost_metric_by_provider_over_time": client._request_with_retry(
-                "GET",
-                self.summary_endpoints["cost_metric_by_provider_over_time"],
-                params=params,  # Use consistent params with group parameter
+            "cost_metric_by_provider_over_time": _make_call(
+                "cost_metric_by_provider_over_time", extra=extra_old_params
             ),
-            "total_cost_by_model": client._request_with_retry(
-                "GET",
-                self.summary_endpoints["total_cost_by_model"],
-                params=params,  # Use consistent params with group parameter
+            "total_cost_by_model": _make_call(
+                "total_cost_by_model", extra=extra_old_params
             ),
-            "cost_metrics_by_subscriber_credential": client._request_with_retry(
-                "GET",
-                self.summary_endpoints["cost_metrics_by_subscriber_credential"],
-                params=params,  # Use consistent params with group parameter
+            "cost_metrics_by_subscriber_credential": _make_call(
+                "cost_metrics_by_subscriber_credential", extra=extra_old_params
             ),
-            "tokens_per_minute_by_provider": client._request_with_retry(
-                "GET",
-                self.summary_endpoints["tokens_per_minute_by_provider"],
-                params={
-                    **params,
-                    "tokenType": "TOTAL",
-                },  # Add required tokenType parameter to base params
+            "tokens_per_minute_by_provider": _make_call(
+                "tokens_per_minute_by_provider",
+                extra={**(extra_old_params or {}), "tokenType": "TOTAL"},
+                extra_new={"tokenType": "TOTAL"},
             ),
         }
 
@@ -951,24 +906,19 @@ class TransactionLevelAnalyticsProcessor:
         """Fetch customer data from all 3 Customer Analytics endpoints following existing patterns."""
         logger.info(f"Fetching customer data for team {team_id}, period {period}, group {group}")
 
-        # Base parameters following existing patterns
-        params = {"teamId": team_id, "period": period}
-        if group != "TOTAL":
-            params["group"] = group
+        extra_old_params = {"group": group} if group != "TOTAL" else None
 
-        # Create concurrent API calls for all 3 Customer Analytics endpoints
+        def _make_call(key):
+            path, params, call_kwargs = resolve_analytics_request(
+                key, team_id, period, extra_old_params=extra_old_params
+            )
+            return client._request_with_retry("GET", path, params=params, **call_kwargs)
+
+        # Create concurrent API calls for Customer Analytics endpoints
+        # percentage_revenue_metric_by_organization is client_side_only — computed from revenue data
         tasks = {
-            "cost_metric_by_organization": client._request_with_retry(
-                "GET", self.customer_endpoints["cost_metric_by_organization"], params=params
-            ),
-            "revenue_metric_by_organization": client._request_with_retry(
-                "GET", self.customer_endpoints["revenue_metric_by_organization"], params=params
-            ),
-            "percentage_revenue_metric_by_organization": client._request_with_retry(
-                "GET",
-                self.customer_endpoints["percentage_revenue_metric_by_organization"],
-                params=params,
-            ),
+            "cost_metric_by_organization": _make_call("cost_metric_by_organization"),
+            "revenue_metric_by_organization": _make_call("revenue_metric_by_organization"),
         }
 
         # Execute all API calls concurrently following existing patterns
@@ -982,6 +932,12 @@ class TransactionLevelAnalyticsProcessor:
                 customer_data[task_name] = {"error": str(result), "data": []}
             else:
                 customer_data[task_name] = result
+
+        # Compute percentage revenue client-side from revenue-per-customer data
+        if "revenue_metric_by_organization" in customer_data:
+            customer_data["percentage_revenue_metric_by_organization"] = (
+                self._compute_percentage_revenue(customer_data["revenue_metric_by_organization"])
+            )
 
         return customer_data
 
@@ -1396,22 +1352,19 @@ class TransactionLevelAnalyticsProcessor:
         """Fetch product data from all 3 Product Analytics endpoints following existing patterns."""
         logger.info(f"Fetching product data for team {team_id}, period {period}, group {group}")
 
-        # Base parameters following existing patterns
-        params = {"teamId": team_id, "period": period}
-        if group != "TOTAL":
-            params["group"] = group
+        extra_old_params = {"group": group} if group != "TOTAL" else None
 
-        # Create concurrent API calls for all 3 Product Analytics endpoints
+        def _make_call(key):
+            path, params, call_kwargs = resolve_analytics_request(
+                key, team_id, period, extra_old_params=extra_old_params
+            )
+            return client._request_with_retry("GET", path, params=params, **call_kwargs)
+
+        # Create concurrent API calls for Product Analytics endpoints
+        # percentage_revenue_metric_by_product is client_side_only — computed from revenue data
         tasks = {
-            "cost_metric_by_product": client._request_with_retry(
-                "GET", self.product_endpoints["cost_metric_by_product"], params=params
-            ),
-            "revenue_metric_by_product": client._request_with_retry(
-                "GET", self.product_endpoints["revenue_metric_by_product"], params=params
-            ),
-            "percentage_revenue_metric_by_product": client._request_with_retry(
-                "GET", self.product_endpoints["percentage_revenue_metric_by_product"], params=params
-            ),
+            "cost_metric_by_product": _make_call("cost_metric_by_product"),
+            "revenue_metric_by_product": _make_call("revenue_metric_by_product"),
         }
 
         # Execute all API calls concurrently following existing patterns
@@ -1425,6 +1378,12 @@ class TransactionLevelAnalyticsProcessor:
                 product_data[task_name] = {"error": str(result), "data": []}
             else:
                 product_data[task_name] = result
+
+        # Compute percentage revenue client-side from revenue-per-product data
+        if "revenue_metric_by_product" in product_data:
+            product_data["percentage_revenue_metric_by_product"] = (
+                self._compute_percentage_revenue(product_data["revenue_metric_by_product"])
+            )
 
         return product_data
 
@@ -1587,22 +1546,19 @@ class TransactionLevelAnalyticsProcessor:
         """Fetch agent data from all 3 Agent Analytics endpoints following existing patterns."""
         logger.info(f"Fetching agent data for team {team_id}, period {period}, group {group}")
 
-        # Base parameters following existing patterns
-        params = {"teamId": team_id, "period": period}
-        if group != "TOTAL":
-            params["group"] = group
+        extra_old_params = {"group": group} if group != "TOTAL" else None
+
+        def _make_call(key):
+            path, params, call_kwargs = resolve_analytics_request(
+                key, team_id, period, extra_old_params=extra_old_params
+            )
+            return client._request_with_retry("GET", path, params=params, **call_kwargs)
 
         # Create concurrent API calls for all 3 Agent Analytics endpoints
         tasks = {
-            "cost_metrics_by_agents_over_time": client._request_with_retry(
-                "GET", self.agent_endpoints["cost_metrics_by_agents_over_time"], params=params
-            ),
-            "call_count_metrics_by_agents": client._request_with_retry(
-                "GET", self.agent_endpoints["call_count_metrics_by_agents"], params=params
-            ),
-            "performance_metrics_by_agents": client._request_with_retry(
-                "GET", self.agent_endpoints["performance_metrics_by_agents"], params=params
-            ),
+            "cost_metrics_by_agents_over_time": _make_call("cost_metrics_by_agents_over_time"),
+            "call_count_metrics_by_agents": _make_call("call_count_metrics_by_agents"),
+            "performance_metrics_by_agents": _make_call("performance_metrics_by_agents"),
         }
 
         # Execute all API calls concurrently following existing patterns
@@ -1695,6 +1651,7 @@ class TransactionLevelAnalyticsProcessor:
 
         # Process performance metrics by agents
         try:
+            perf_multiplier = get_unit_multiplier("performance_metrics_by_agents")
             performance_data = agent_data.get("performance_metrics_by_agents", {})
             if isinstance(performance_data, list) and performance_data:
                 for time_period in performance_data:
@@ -1714,7 +1671,7 @@ class TransactionLevelAnalyticsProcessor:
                             if isinstance(metric, dict):
                                 metric_result = metric.get("metricResult", 0)
                                 if isinstance(metric_result, (int, float)):
-                                    agent_performance_score += metric_result
+                                    agent_performance_score += metric_result * perf_multiplier
 
                         if agent_performance_score > 0:
                             if agent_name not in agents:
@@ -1815,6 +1772,7 @@ class TransactionLevelAnalyticsProcessor:
                     agent_data_dict[agent_name]["calls"] += agent_calls
 
         # Process performance metrics by agents
+        perf_agents_multiplier = get_unit_multiplier("performance_metrics_by_agents")
         performance_data = agent_data.get("performance_metrics_by_agents", {})
         if isinstance(performance_data, list):
             for time_period in performance_data:
@@ -1832,7 +1790,7 @@ class TransactionLevelAnalyticsProcessor:
                         if isinstance(metric, dict):
                             metric_result = metric.get("metricResult", 0)
                             if isinstance(metric_result, (int, float)):
-                                agent_performance += metric_result
+                                agent_performance += metric_result * perf_agents_multiplier
 
                     if agent_name not in agent_data_dict:
                         agent_data_dict[agent_name] = {"cost": 0, "calls": 0, "performance": 0}
@@ -1876,25 +1834,20 @@ class TransactionLevelAnalyticsProcessor:
         """Fetch task data from all 4 Task Analytics endpoints following existing patterns."""
         logger.info(f"Fetching task data for team {team_id}, period {period}, group {group}")
 
-        # Base parameters following existing patterns
-        params = {"teamId": team_id, "period": period}
-        if group != "TOTAL":
-            params["group"] = group
+        extra_old_params = {"group": group} if group != "TOTAL" else None
+
+        def _make_call(key):
+            path, params, call_kwargs = resolve_analytics_request(
+                key, team_id, period, extra_old_params=extra_old_params
+            )
+            return client._request_with_retry("GET", path, params=params, **call_kwargs)
 
         # Create concurrent API calls for all 4 Task Analytics endpoints
         tasks = {
-            "cost_metric_by_provider": client._request_with_retry(
-                "GET", self.task_endpoints["cost_metric_by_provider"], params=params
-            ),
-            "cost_metric_by_model": client._request_with_retry(
-                "GET", self.task_endpoints["cost_metric_by_model"], params=params
-            ),
-            "performance_metric_by_provider": client._request_with_retry(
-                "GET", self.task_endpoints["performance_metric_by_provider"], params=params
-            ),
-            "performance_metric_by_model": client._request_with_retry(
-                "GET", self.task_endpoints["performance_metric_by_model"], params=params
-            ),
+            "cost_metric_by_provider": _make_call("cost_metric_by_provider"),
+            "cost_metric_by_model": _make_call("cost_metric_by_model"),
+            "performance_metric_by_provider": _make_call("performance_metric_by_provider"),
+            "performance_metric_by_model": _make_call("performance_metric_by_model"),
         }
 
         # Execute all API calls concurrently following existing patterns
@@ -1988,6 +1941,7 @@ class TransactionLevelAnalyticsProcessor:
 
         # Process performance metrics by provider
         try:
+            perf_provider_multiplier = get_unit_multiplier("performance_metric_by_provider")
             perf_provider_data = task_data.get("performance_metric_by_provider", {})
             if isinstance(perf_provider_data, list) and perf_provider_data:
                 for time_period in perf_provider_data:
@@ -2007,7 +1961,7 @@ class TransactionLevelAnalyticsProcessor:
                             if isinstance(metric, dict):
                                 metric_result = metric.get("metricResult", 0)
                                 if isinstance(metric_result, (int, float)):
-                                    provider_perf_value += metric_result
+                                    provider_perf_value += metric_result * perf_provider_multiplier
 
                         if provider_perf_value > 0:
                             if provider_name not in providers:
@@ -2019,6 +1973,7 @@ class TransactionLevelAnalyticsProcessor:
 
         # Process performance metrics by model
         try:
+            perf_model_multiplier = get_unit_multiplier("performance_metric_by_model")
             perf_model_data = task_data.get("performance_metric_by_model", {})
             if isinstance(perf_model_data, list) and perf_model_data:
                 for time_period in perf_model_data:
@@ -2038,7 +1993,7 @@ class TransactionLevelAnalyticsProcessor:
                             if isinstance(metric, dict):
                                 metric_result = metric.get("metricResult", 0)
                                 if isinstance(metric_result, (int, float)):
-                                    model_perf_value += metric_result
+                                    model_perf_value += metric_result * perf_model_multiplier
 
                         if model_perf_value > 0:
                             if model_name not in models:
@@ -2127,6 +2082,7 @@ class TransactionLevelAnalyticsProcessor:
                     provider_data_dict[provider_name]["cost"] += provider_cost
 
         # Process performance metrics by provider
+        perf_prov_multiplier = get_unit_multiplier("performance_metric_by_provider")
         perf_provider_data = task_data.get("performance_metric_by_provider", {})
         if isinstance(perf_provider_data, list):
             for time_period in perf_provider_data:
@@ -2144,7 +2100,7 @@ class TransactionLevelAnalyticsProcessor:
                         if isinstance(metric, dict):
                             metric_result = metric.get("metricResult", 0)
                             if isinstance(metric_result, (int, float)):
-                                provider_performance += metric_result
+                                provider_performance += metric_result * perf_prov_multiplier
 
                     if provider_name not in provider_data_dict:
                         provider_data_dict[provider_name] = {"cost": 0, "performance": 0}
@@ -2175,6 +2131,7 @@ class TransactionLevelAnalyticsProcessor:
                     model_data_dict[model_name]["cost"] += model_cost
 
         # Process performance metrics by model
+        perf_mdl_multiplier = get_unit_multiplier("performance_metric_by_model")
         perf_model_data = task_data.get("performance_metric_by_model", {})
         if isinstance(perf_model_data, list):
             for time_period in perf_model_data:
@@ -2192,7 +2149,7 @@ class TransactionLevelAnalyticsProcessor:
                         if isinstance(metric, dict):
                             metric_result = metric.get("metricResult", 0)
                             if isinstance(metric_result, (int, float)):
-                                model_performance += metric_result
+                                model_performance += metric_result * perf_mdl_multiplier
 
                     if model_name not in model_data_dict:
                         model_data_dict[model_name] = {"cost": 0, "performance": 0}
@@ -2242,3 +2199,83 @@ class TransactionLevelAnalyticsProcessor:
         )
 
         return task_analytics[:top_n]
+
+    def _compute_percentage_revenue(self, revenue_data: Any) -> Any:
+        """Compute percentage revenue client-side from base revenue data.
+
+        Used for percentage-revenue-metric-by-organization (revenue-per-customer)
+        and percentage-revenue-metric-by-product (revenue-per-product), which are
+        client_side_only in the new ClickHouse-backed analytics API.
+
+        Args:
+            revenue_data: Revenue response — either a list of time periods or a dict with 'groups'
+
+        Returns:
+            Percentage data in the same format as the input, with metricResult as percentages
+        """
+        if isinstance(revenue_data, list):
+            # Handle list-of-time-periods format used by transaction-level endpoints
+            percentage_periods = []
+            for time_period in revenue_data:
+                if not isinstance(time_period, dict):
+                    percentage_periods.append(time_period)
+                    continue
+                groups = time_period.get("groups", [])
+                total_revenue = 0.0
+                entity_revenues: Dict[str, float] = {}
+                for group in groups:
+                    if not isinstance(group, dict):
+                        continue
+                    entity = group.get("groupName", "Unknown")
+                    for metric in group.get("metrics", []):
+                        if not isinstance(metric, dict):
+                            continue
+                        value = float(metric.get("metricResult", metric.get("revenue", 0)))
+                        total_revenue += value
+                        entity_revenues[entity] = entity_revenues.get(entity, 0.0) + value
+
+                if total_revenue == 0:
+                    percentage_periods.append({"groups": []})
+                    continue
+
+                pct_groups = [
+                    {
+                        "groupName": entity,
+                        "metrics": [{"metricResult": (rev / total_revenue) * 100}],
+                    }
+                    for entity, rev in entity_revenues.items()
+                ]
+                period_copy = {k: v for k, v in time_period.items() if k != "groups"}
+                period_copy["groups"] = pct_groups
+                percentage_periods.append(period_copy)
+            return percentage_periods
+
+        # Handle dict format with 'groups' key
+        if isinstance(revenue_data, dict):
+            groups = revenue_data.get("groups", [])
+            total_revenue = 0.0
+            entity_revenues: Dict[str, float] = {}
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                entity = group.get("groupName", "Unknown")
+                for metric in group.get("metrics", []):
+                    if not isinstance(metric, dict):
+                        continue
+                    value = float(metric.get("metricResult", metric.get("revenue", 0)))
+                    total_revenue += value
+                    entity_revenues[entity] = entity_revenues.get(entity, 0.0) + value
+
+            if total_revenue == 0:
+                return {"groups": []}
+
+            pct_groups = [
+                {
+                    "groupName": entity,
+                    "metrics": [{"metricResult": (rev / total_revenue) * 100}],
+                }
+                for entity, rev in entity_revenues.items()
+            ]
+            return {"groups": pct_groups}
+
+        return revenue_data

@@ -7,7 +7,6 @@ for ensuring data integrity and security across all alert and anomaly operations
 import html
 import logging
 import re
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
@@ -460,14 +459,14 @@ class InputValidator:
             "STATISTICAL",
             "PATTERN",
             "ANOMALY",
-            "TREND",
             "CUMULATIVE_USAGE",
+            "RELATIVE_CHANGE",
         ]:
             raise ValidationError(
                 message="Invalid detection rule type",
                 field="rule_type",
                 value=rule_type,
-                expected="One of: THRESHOLD, STATISTICAL, PATTERN, ANOMALY, TREND, CUMULATIVE_USAGE",
+                expected="One of: THRESHOLD, STATISTICAL, PATTERN, ANOMALY, CUMULATIVE_USAGE, RELATIVE_CHANGE",
             )
         validated_rule["rule_type"] = rule_type_upper
 
@@ -480,7 +479,7 @@ class InputValidator:
         validated_rule["metric"] = metric
 
         # Validate operator (special handling - no HTML escaping for operators)
-        valid_operators = [">", "<", ">=", "<=", "==", "!=", "contains", "not_contains"]
+        valid_operators = [">", "<", ">=", "<=", "==", "!=", "contains", "not_contains", "INCREASES_BY", "DECREASES_BY"]
         operator = str(rule["operator"]).strip()  # Simple string conversion without HTML escaping
         if operator not in valid_operators:
             raise ValidationError(
@@ -491,9 +490,26 @@ class InputValidator:
             )
         validated_rule["operator"] = operator
 
+        # Cross-field validation: operator must match rule_type
+        relative_change_operators = {"INCREASES_BY", "DECREASES_BY"}
+        if operator in relative_change_operators and rule_type_upper != "RELATIVE_CHANGE":
+            raise ValidationError(
+                message=f"Operator '{operator}' is only valid for RELATIVE_CHANGE rules",
+                field="operator",
+                value=operator,
+                expected="INCREASES_BY/DECREASES_BY require rule_type: RELATIVE_CHANGE",
+            )
+        if rule_type_upper == "RELATIVE_CHANGE" and operator not in relative_change_operators:
+            raise ValidationError(
+                message="RELATIVE_CHANGE rules require a relative operator",
+                field="operator",
+                value=operator,
+                expected="One of: INCREASES_BY, DECREASES_BY",
+            )
+
         # Validate value (can be numeric or string depending on operator)
-        if operator in [">", "<", ">=", "<=", "==", "!="]:
-            # Numeric operators
+        if operator in [">", "<", ">=", "<=", "==", "!=", "INCREASES_BY", "DECREASES_BY"]:
+            # Numeric operators (including relative change operators)
             validated_rule["value"] = InputValidator.validate_numeric_range(
                 rule["value"], "value", allow_zero=True
             )
@@ -505,12 +521,12 @@ class InputValidator:
         if "time_window" in rule:
             time_window = InputValidator.sanitize_string(rule["time_window"], 20)
             if time_window:
-                # For CUMULATIVE_USAGE alerts, allow calendar periods
-                if rule_type_upper == "CUMULATIVE_USAGE":
+                # For CUMULATIVE_USAGE and RELATIVE_CHANGE alerts, allow calendar periods
+                if rule_type_upper in ("CUMULATIVE_USAGE", "RELATIVE_CHANGE"):
                     calendar_periods = ["daily", "weekly", "monthly", "quarterly"]
                     if time_window.lower() not in calendar_periods:
                         raise ValidationError(
-                            message="Invalid time window for CUMULATIVE_USAGE alert",
+                            message=f"Invalid time window for {rule_type_upper} alert",
                             field="time_window",
                             value=time_window,
                             expected="One of: daily, weekly, monthly, quarterly",
@@ -685,6 +701,9 @@ class InputValidator:
             "<": "LESS_THAN",
             ">=": "GREATER_THAN_OR_EQUAL_TO",
             "<=": "LESS_THAN_OR_EQUAL_TO",
+            # Relative change operators — API accepts these directly
+            "INCREASES_BY": "INCREASES_BY",
+            "DECREASES_BY": "DECREASES_BY",
         }
 
         metric_mapping = {
@@ -808,10 +827,11 @@ class InputValidator:
                 },
             )
 
-        # Convert period duration - handle CUMULATIVE_USAGE differently
+        # Convert period duration - handle CUMULATIVE_USAGE and RELATIVE_CHANGE differently
         # Use appropriate defaults based on alert type
-        if alert_type == "CUMULATIVE_USAGE":
-            period = rule.get("time_window", "daily")  # Default to daily for CUMULATIVE_USAGE
+        _calendar_alert_types = ("CUMULATIVE_USAGE", "RELATIVE_CHANGE")
+        if alert_type in _calendar_alert_types:
+            period = rule.get("time_window", "daily")  # Default to daily for calendar-period alerts
         else:
             period = rule.get("time_window", "5m")  # Default to 5m for THRESHOLD alerts
 
@@ -820,11 +840,11 @@ class InputValidator:
             f"Converting period for {alert_type}: rule.time_window='{period}', user_data keys: {list(user_data.keys())}"
         )
 
-        if alert_type == "CUMULATIVE_USAGE":
+        if alert_type in _calendar_alert_types:
             # For CUMULATIVE_USAGE, if time_window is missing, check user_data for period
             if "time_window" not in rule:
                 logger.info(
-                    f"CUMULATIVE_USAGE alert missing time_window, checking user_data for period"
+                    "CUMULATIVE_USAGE alert missing time_window, checking user_data for period"
                 )
                 period = (
                     user_data.get("period")

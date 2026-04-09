@@ -11,18 +11,17 @@ import asyncio
 import json
 import os
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urljoin
 
 import httpx
 from loguru import logger
 
 from .api_field_mapper import APIFieldMapper
-from .auth import AuthConfig, get_auth_config
+from .auth import AuthConfig, get_auth_config, get_bearer_auth_headers
 from .config_store import get_config_value
-from .error_handlers import translate_http_error
 from .exceptions import AlertToolsError
-from .logging_config import async_operation_context, performance_monitor
+from .logging_config import async_operation_context
 
 
 class ConnectionPoolConfig:
@@ -143,6 +142,25 @@ class ReveniumAPIError(Exception):
 
 class ReveniumClient:
     """Async HTTP client for Revenium Platform API."""
+
+    _SEGMENT_RESOURCE_MAP: Dict[str, Tuple[str, str]] = {
+        "products": ("Product", "Products"),
+        "sources": ("Source", "Sources"),
+        "subscriptions": ("Subscription", "Subscriptions"),
+        "users": ("User", "Users"),
+        "subscribers": ("Subscriber", "Subscribers"),
+        "credentials": ("Credential", "Credentials"),
+        "organizations": ("Organization", "Organizations"),
+        "teams": ("Team", "Teams"),
+        "anomaly": ("Anomaly", "Anomalies"),
+        "anomalies": ("Anomaly", "Anomalies"),
+        "alert": ("Alert", "Alerts"),
+        "alerts": ("Alert", "Alerts"),
+        "metering-element-definitions": ("Metering Element", "Metering Elements"),
+        "metering": ("Metering", "Metering"),
+        "configurations": ("Configuration", "Configurations"),
+        "slack": ("Slack Configuration", "Slack Configurations"),
+    }
 
     def __init__(self, auth_config: Optional[AuthConfig] = None):
         """Initialize the Revenium API client.
@@ -281,7 +299,7 @@ class ReveniumClient:
                 "base_url": self.base_url
             }
 
-        except httpx.ConnectError as e:
+        except httpx.ConnectError:
             # Connection error - base URL is likely wrong
             return {
                 "valid": False,
@@ -351,6 +369,25 @@ class ReveniumClient:
         # Fallback to string representation
         return str(error_data)
 
+    @classmethod
+    def _resource_label_from_endpoint(cls, endpoint: str) -> Tuple[str, str]:
+        """Derive a human-readable resource label from an API endpoint path.
+
+        Maps endpoint path segments to friendly names so error messages say
+        "Invalid Product ID" instead of a generic "Invalid Anomaly ID".
+
+        Returns:
+            A tuple of (singular, plural) label strings.
+        """
+        # Split the endpoint into path segments and walk backwards so the most
+        # specific segment wins (e.g. ".../sources/ai/anomaly" → "Anomaly").
+        segments = [s.lower() for s in endpoint.strip("/").split("/") if s]
+        for segment in reversed(segments):
+            if segment in cls._SEGMENT_RESOURCE_MAP:
+                return cls._SEGMENT_RESOURCE_MAP[segment]
+
+        return ("Resource", "Resources")
+
     def _should_retry(self, status_code: int, _error_data: Optional[Dict[str, Any]] = None) -> bool:
         """Determine if a request should be retried based on the error.
 
@@ -383,7 +420,9 @@ class ReveniumClient:
         params: Optional[Dict[str, Any]] = None,
         json_data: Optional[Dict[str, Any]] = None,
         max_retries: Optional[int] = None,
-    ) -> Dict[str, Any]:
+        base_url: Optional[str] = None,
+        use_bearer: bool = False,
+    ) -> Union[Dict[str, Any], List[Any]]:
         """Make HTTP request with retry logic for transient failures.
 
         Args:
@@ -392,6 +431,8 @@ class ReveniumClient:
             params: Query parameters
             json_data: JSON request body
             max_retries: Maximum number of retries (uses config default if None)
+            base_url: Optional base URL override for this single call
+            use_bearer: If True, use Authorization: Bearer header instead of x-api-key
 
         Returns:
             Response data as dictionary
@@ -406,7 +447,7 @@ class ReveniumClient:
 
         for attempt in range(max_retries + 1):
             try:
-                return await self._request(method, endpoint, params, json_data)
+                return await self._request(method, endpoint, params, json_data, base_url=base_url, use_bearer=use_bearer)
 
             except ReveniumAPIError as e:
                 last_error = e
@@ -465,14 +506,15 @@ class ReveniumClient:
         params.update(self.auth_config.get_team_and_tenant_query_params())
         return params
 
-    @performance_monitor("api_call")
     async def _request(
         self,
         method: str,
         endpoint: str,
         params: Optional[Dict[str, Any]] = None,
         json_data: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        base_url: Optional[str] = None,
+        use_bearer: bool = False,
+    ) -> Union[Dict[str, Any], List[Any]]:
         """Make HTTP request to Revenium API.
 
         Args:
@@ -480,14 +522,29 @@ class ReveniumClient:
             endpoint: API endpoint path
             params: Query parameters
             json_data: JSON request body
+            base_url: Optional base URL override for this single call (e.g. new analytics host)
+            use_bearer: If True, use Authorization: Bearer header instead of x-api-key
 
         Returns:
             Response data as dictionary
 
         Raises:
+            ValueError: If use_bearer=True but base_url is not provided (the legacy
+                host expects x-api-key, not Bearer auth; mixing them causes a silent
+                401 with no clear error message).
             ReveniumAPIError: If the API request fails
         """
-        url = self._build_url(endpoint)
+        if use_bearer and base_url is None:
+            raise ValueError(
+                "use_bearer=True requires base_url — the legacy profitstream host "
+                "expects x-api-key, not Bearer auth. Pass the analytics base URL "
+                "explicitly."
+            )
+
+        if base_url is not None:
+            url = urljoin(base_url.rstrip("/") + "/", endpoint.lstrip("/"))
+        else:
+            url = self._build_url(endpoint)
 
         async with async_operation_context(
             f"api_request_{method}_{endpoint.replace('/', '_')}",
@@ -502,7 +559,10 @@ class ReveniumClient:
                 logger.info(f"Making {method} request to {url}", operation_id=operation_id)
 
                 # Merge auth headers with any existing headers for this request
-                request_headers = self.auth_config.get_auth_headers()
+                if use_bearer:
+                    request_headers = get_bearer_auth_headers(self.auth_config.api_key)
+                else:
+                    request_headers = self.auth_config.get_auth_headers()
 
                 response = await self.client.request(
                     method=method, url=url, params=params, json=json_data, headers=request_headers
@@ -586,22 +646,25 @@ class ReveniumClient:
                             },
                         )
                     elif "failed to decode hashed id" in error_text.lower():
-                        # Provide more helpful error message for invalid ID issues
+                        # Infer resource type from the endpoint path
+                        resource_label, resource_label_plural = self._resource_label_from_endpoint(endpoint)
+                        resource_label_lower = resource_label.lower()
+                        resource_label_plural_lower = resource_label_plural.lower()
                         enhanced_message = (
-                            f"Invalid Anomaly ID\n\n"
-                            f"The provided anomaly ID is not valid or does not exist.\n\n"
-                            f"**What are valid anomaly IDs?**\n"
-                            f"• Short alphanumeric codes like 'X5oon5', 'mvMYRv', 'GlkRbv'\n"
-                            f"• Generated automatically when alerts are created\n"
-                            f"• Case-sensitive and must be used exactly as provided\n\n"
-                            f"**How to get valid IDs:**\n"
-                            f"• Use list(resource_type='anomalies') to see all your alerts\n"
-                            f"• Copy the ID from the list results\n"
-                            f"• Check that you're using the correct ID for the alert you want to modify\n\n"
-                            f"**Common mistakes:**\n"
-                            f"• Using alert names instead of IDs\n"
-                            f"• Typing IDs manually (always copy from list results)\n"
-                            f"• Using old IDs from deleted alerts"
+                            f"Invalid {resource_label} ID\n\n"
+                            f"The provided {resource_label_lower} ID is not valid or does not exist.\n\n"
+                            f"**What are valid {resource_label_lower} IDs?**\n"
+                            "• Short alphanumeric codes like 'X5oon5', 'mvMYRv', 'GlkRbv'\n"
+                            "• Generated automatically when the resource is created\n"
+                            "• Case-sensitive and must be used exactly as provided\n\n"
+                            "**How to get valid IDs:**\n"
+                            f"• Use the appropriate list action to see all your {resource_label_plural_lower}\n"
+                            "• Copy the ID from the list results\n"
+                            f"• Check that you're using the correct ID for the {resource_label_lower} you want to modify\n\n"
+                            "**Common mistakes:**\n"
+                            f"• Using {resource_label_lower} names instead of IDs\n"
+                            "• Typing IDs manually (always copy from list results)\n"
+                            f"• Using old IDs from deleted {resource_label_plural_lower}"
                         )
 
                         comprehensive_error = ReveniumAPIError(
@@ -628,13 +691,16 @@ class ReveniumClient:
                 if response.content:
                     result = response.json()
                     logger.debug(
-                        f"Response parsed successfully",
+                        "Response parsed successfully",
                         operation_id=operation_id,
                         response_size=len(response.content),
                     )
+                    # Auto-unwrap HAL+JSON _embedded when using new analytics API host
+                    if use_bearer and isinstance(result, dict):
+                        result = self._extract_embedded_data(result)
                     return result
                 else:
-                    logger.debug(f"Empty response", operation_id=operation_id)
+                    logger.debug("Empty response", operation_id=operation_id)
                     return {}
 
             except ReveniumAPIError:
@@ -656,14 +722,36 @@ class ReveniumClient:
                 logger.error("Unexpected error: {}", str(e), operation_id=operation_id)
                 raise ReveniumAPIError(f"Unexpected error: {str(e)}")
 
-    def _extract_embedded_data(self, response: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Extract data from _embedded response structure."""
-        if isinstance(response, dict) and "_embedded" in response:
-            # Find the first key in _embedded that contains a list
-            embedded = response["_embedded"]
-            for _key, value in embedded.items():
-                if isinstance(value, list):
-                    return value
+    def _extract_embedded_data(self, data: Any) -> Any:
+        """Extract data from HAL+JSON _embedded response structure.
+
+        For bearer-mode (new analytics API) responses that contain an ``_embedded``
+        envelope, returns the first list found inside it.  If ``data`` is already a
+        list it is returned unchanged.  In all other cases — including responses that
+        lack ``_embedded`` entirely — an empty list is returned so that every call
+        site can safely iterate the result without a type-guard.
+
+        Args:
+            data: Response data — may be a HAL+JSON dict with _embedded, a plain
+                  list, or any other value.
+
+        Returns:
+            The first list found inside ``_embedded``, ``data`` if it is already a
+            list, or ``[]`` for all other shapes (preserving the legacy contract).
+        """
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and "_embedded" in data:
+            embedded = data["_embedded"]
+            if isinstance(embedded, dict):
+                for _, value in embedded.items():
+                    if isinstance(value, list):
+                        return value
+            # _embedded present but no list found — warn and fall through to []
+            logger.warning(
+                "_extract_embedded_data: _embedded present but no list value found;"
+                " returning []"
+            )
         return []
 
     def _extract_pagination_info(self, response: Dict[str, Any]) -> Dict[str, Any]:
@@ -673,12 +761,17 @@ class ReveniumClient:
         return {}
 
     async def get(
-        self, endpoint: str, params: Optional[Dict[str, Any]] = None, use_retry: bool = True
-    ) -> Dict[str, Any]:
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        use_retry: bool = True,
+        base_url: Optional[str] = None,
+        use_bearer: bool = False,
+    ) -> Union[Dict[str, Any], List[Any]]:
         """Make a GET request to the API."""
         if use_retry:
-            return await self._request_with_retry("GET", endpoint, params=params)
-        return await self._request("GET", endpoint, params=params)
+            return await self._request_with_retry("GET", endpoint, params=params, base_url=base_url, use_bearer=use_bearer)
+        return await self._request("GET", endpoint, params=params, base_url=base_url, use_bearer=use_bearer)
 
     async def post(
         self,
@@ -686,11 +779,13 @@ class ReveniumClient:
         data: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         use_retry: bool = True,
-    ) -> Dict[str, Any]:
+        base_url: Optional[str] = None,
+        use_bearer: bool = False,
+    ) -> Union[Dict[str, Any], List[Any]]:
         """Make a POST request to the API."""
         if use_retry:
-            return await self._request_with_retry("POST", endpoint, params=params, json_data=data)
-        return await self._request("POST", endpoint, params=params, json_data=data)
+            return await self._request_with_retry("POST", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
+        return await self._request("POST", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
 
     async def put(
         self,
@@ -698,19 +793,40 @@ class ReveniumClient:
         data: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         use_retry: bool = True,
-    ) -> Dict[str, Any]:
+        base_url: Optional[str] = None,
+        use_bearer: bool = False,
+    ) -> Union[Dict[str, Any], List[Any]]:
         """Make a PUT request to the API."""
         if use_retry:
-            return await self._request_with_retry("PUT", endpoint, params=params, json_data=data)
-        return await self._request("PUT", endpoint, params=params, json_data=data)
+            return await self._request_with_retry("PUT", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
+        return await self._request("PUT", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
 
     async def delete(
-        self, endpoint: str, params: Optional[Dict[str, Any]] = None, use_retry: bool = True
-    ) -> Dict[str, Any]:
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        use_retry: bool = True,
+        base_url: Optional[str] = None,
+        use_bearer: bool = False,
+    ) -> Union[Dict[str, Any], List[Any]]:
         """Make a DELETE request to the API."""
         if use_retry:
-            return await self._request_with_retry("DELETE", endpoint, params=params)
-        return await self._request("DELETE", endpoint, params=params)
+            return await self._request_with_retry("DELETE", endpoint, params=params, base_url=base_url, use_bearer=use_bearer)
+        return await self._request("DELETE", endpoint, params=params, base_url=base_url, use_bearer=use_bearer)
+
+    async def patch(
+        self,
+        endpoint: str,
+        data: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        use_retry: bool = True,
+        base_url: Optional[str] = None,
+        use_bearer: bool = False,
+    ) -> Union[Dict[str, Any], List[Any]]:
+        """Make a PATCH request to the API."""
+        if use_retry:
+            return await self._request_with_retry("PATCH", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
+        return await self._request("PATCH", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
 
     # Products API methods
     async def get_products(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
@@ -1693,7 +1809,7 @@ class ReveniumClient:
     async def search_ai_models(
         self, query: str, page: int = 0, size: int = 20, **filters
     ) -> Dict[str, Any]:
-        """Search AI models by query.
+        """Search AI models by query using server-side filtering.
 
         Args:
             query: Search query (provider, name, etc.)
@@ -1707,7 +1823,7 @@ class ReveniumClient:
         params = {"query": query, "page": page, "size": size}
         params.update(filters)
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/sources/ai/models/search", params=params)
+        return await self.get("/profitstream/v2/api/sources/ai/models", params=params)
 
     # Note: Individual AI model endpoint has ID format issues
     # Use search_ai_models() or get_ai_models() to find specific models by ID
@@ -1877,6 +1993,412 @@ class ReveniumClient:
             Slack configuration data
         """
         return await self.get(f"/profitstream/v2/api/configurations/slack/{config_id}")
+
+    # Jobs & Outcomes API methods (/profitstream/v2/api/jobs)
+
+    async def get_jobs(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
+        """Get list of jobs with pagination.
+
+        Args:
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Optional filter parameters
+
+        Returns:
+            Response containing jobs data and pagination info
+        """
+        params: Dict[str, Any] = {"page": page, "size": size, **filters}
+        params = self._add_team_id_to_params(params)
+        return await self.get("/profitstream/v2/api/jobs", params=params)
+
+    async def get_job_by_id(self, job_id: str) -> Dict[str, Any]:
+        """Get a specific job by ID.
+
+        Args:
+            job_id: The job identifier
+
+        Returns:
+            Job data
+        """
+        params = self._add_team_id_to_params({})
+        return await self.get(f"/profitstream/v2/api/jobs/{job_id}", params=params)
+
+    async def get_job_transactions(self, job_id: str, page: int = 0, size: int = 20) -> Dict[str, Any]:
+        """Get transactions for a specific job.
+
+        Args:
+            job_id: The job identifier
+            page: Page number (0-based)
+            size: Number of items per page
+
+        Returns:
+            Response containing transactions data and pagination info
+        """
+        params: Dict[str, Any] = {"page": page, "size": size}
+        params = self._add_team_id_to_params(params)
+        return await self.get(f"/profitstream/v2/api/jobs/{job_id}/transactions", params=params)
+
+    async def get_job_roi(self, job_id: str) -> Dict[str, Any]:
+        """Get ROI metrics for a specific job.
+
+        Args:
+            job_id: The job identifier
+
+        Returns:
+            ROI metrics data
+        """
+        params = self._add_team_id_to_params({})
+        return await self.get(f"/profitstream/v2/api/jobs/{job_id}/roi", params=params)
+
+    async def get_job_types(self) -> Dict[str, Any]:
+        """Get available job types.
+
+        Returns:
+            Response containing available job types
+        """
+        params = self._add_team_id_to_params({})
+        return await self.get("/profitstream/v2/api/jobs/types", params=params)
+
+    async def get_job_conversion_funnel(self, **filters: Any) -> Dict[str, Any]:
+        """Get conversion funnel analytics (total/successful/converted).
+
+        Args:
+            **filters: Optional filter parameters (startDate, endDate, jobType)
+
+        Returns:
+            Conversion funnel data
+        """
+        params: Dict[str, Any] = {**filters}
+        params = self._add_team_id_to_params(params)
+        return await self.get("/profitstream/v2/api/jobs/conversion-funnel", params=params)
+
+    async def report_job_outcome(self, job_id: str, outcome_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Report an outcome for a specific job.
+
+        Args:
+            job_id: The job identifier
+            outcome_data: Outcome data to report
+
+        Returns:
+            Response from the API
+
+        Raises:
+            ReveniumAPIError: With status_code 409 if outcome already reported
+        """
+        params = self._add_team_id_to_params({})
+        return await self.post(f"/profitstream/v2/api/jobs/{job_id}/outcomes", data=outcome_data, params=params)
+
+    # Tool Registry API methods
+    async def list_tools(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
+        """Get list of tools with pagination.
+
+        Args:
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Additional filter parameters
+
+        Returns:
+            Response containing tools data and pagination info
+        """
+        params = {"page": page, "size": size}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return await self.get("/profitstream/v2/api/tools", params=params)
+
+    async def get_tool(self, tool_id: str) -> Dict[str, Any]:
+        """Get a specific tool by ID.
+
+        Args:
+            tool_id: The tool ID
+
+        Returns:
+            Tool data
+        """
+        params = self._add_team_id_to_params()
+        return await self.get(f"/profitstream/v2/api/tools/{tool_id}", params=params)
+
+    async def get_tool_by_tool_id(self, tool_id: str) -> Dict[str, Any]:
+        """Get a specific tool by its toolId (team-scoped).
+
+        Args:
+            tool_id: The team-scoped toolId
+
+        Returns:
+            Tool data
+        """
+        params = self._add_team_id_to_params()
+        return await self.get(f"/profitstream/v2/api/tools/by-tool-id/{tool_id}", params=params)
+
+    async def create_tool(self, tool_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a new tool.
+
+        Args:
+            tool_data: Tool data to create
+
+        Returns:
+            Created tool data
+        """
+        params = self._add_team_id_to_params()
+        return await self.post("/profitstream/v2/api/tools", data=tool_data, params=params)
+
+    async def update_tool(self, tool_id: str, tool_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Update an existing tool using PUT.
+
+        Args:
+            tool_id: The tool ID
+            tool_data: Updated tool fields
+
+        Returns:
+            Updated tool data
+        """
+        params = self._add_team_id_to_params()
+        return await self.put(f"/profitstream/v2/api/tools/{tool_id}", data=tool_data, params=params)
+
+    async def replace_tool(self, tool_id: str, tool_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Fully replace an existing tool using PUT.
+
+        Args:
+            tool_id: The tool ID
+            tool_data: Complete replacement tool data
+
+        Returns:
+            Replaced tool data
+        """
+        params = self._add_team_id_to_params()
+        return await self.put(f"/profitstream/v2/api/tools/{tool_id}", data=tool_data, params=params)
+
+    async def delete_tool(self, tool_id: str) -> Dict[str, Any]:
+        """Delete a tool.
+
+        Args:
+            tool_id: The tool ID
+
+        Returns:
+            Deletion response
+        """
+        params = self._add_team_id_to_params()
+        return await self.delete(f"/profitstream/v2/api/tools/{tool_id}", params=params)
+
+    async def restore_tool(self, tool_id: str) -> Dict[str, Any]:
+        """Restore a previously deleted tool.
+
+        Args:
+            tool_id: The tool ID
+
+        Returns:
+            Restored tool data
+        """
+        params = self._add_team_id_to_params()
+        return await self.post(f"/profitstream/v2/api/tools/{tool_id}/restore", params=params)
+
+    async def search_tools(self, query: str, page: int = 0, size: int = 20) -> Dict[str, Any]:
+        """Search tools by text query.
+
+        Args:
+            query: Text search query
+            page: Page number (0-based)
+            size: Number of items per page
+
+        Returns:
+            Response containing matching tools
+        """
+        params = {"query": query, "page": page, "size": size}
+        params = self._add_team_id_to_params(params)
+        return await self.get("/profitstream/v2/api/tools/search", params=params)
+
+    async def record_tool_event(self, tool_id: str, event_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Record an event for a tool (invocation, error, etc.) via per-tool endpoint.
+
+        Args:
+            tool_id: The tool ID
+            event_data: Event data to record
+
+        Returns:
+            Recorded event data
+        """
+        params = self._add_team_id_to_params()
+        return await self.post(f"/profitstream/v2/api/tools/{tool_id}/events", data=event_data, params=params)
+
+    async def meter_tool_event(self, event_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Submit a tool/function call for metering via global endpoint.
+
+        Args:
+            event_data: Event data to meter
+
+        Returns:
+            Metered event data
+        """
+        params = self._add_team_id_to_params()
+        return await self.post("/profitstream/v2/api/metering/tool-events", data=event_data, params=params)
+
+    async def get_tool_events(self, tool_id: str, page: int = 0, size: int = 20) -> Dict[str, Any]:
+        """Get events for a specific tool via per-tool endpoint.
+
+        Args:
+            tool_id: The tool ID
+            page: Page number (0-based)
+            size: Number of items per page
+
+        Returns:
+            Response containing tool events
+        """
+        params = {"page": page, "size": size}
+        params = self._add_team_id_to_params(params)
+        return await self.get(f"/profitstream/v2/api/tools/{tool_id}/events", params=params)
+
+    async def list_tool_events(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
+        """List tool event logs via global filterable endpoint.
+
+        Args:
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Filter params (tool_id, tool_name, tool_type, operation,
+                       transaction_id, product, charge_amount, start_date, end_date)
+
+        Returns:
+            Response containing tool event logs
+        """
+        params = {"page": page, "size": size}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return await self.get("/profitstream/v2/api/tool-events", params=params)
+
+    # Global Tool Analytics endpoints (ticket-specified paths)
+
+    async def get_cost_by_tool(self, **filters) -> Dict[str, Any]:
+        """Cost breakdown by tool over time.
+
+        Args:
+            **filters: Date range and other filter parameters
+
+        Returns:
+            Cost breakdown data by tool
+        """
+        params = {}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return await self.get("/profitstream/v2/api/analytics/cost-by-tool", params=params)
+
+    async def get_cost_by_tool_aggregated(self, **filters) -> Dict[str, Any]:
+        """Aggregated cost per tool.
+
+        Args:
+            **filters: Date range and other filter parameters
+
+        Returns:
+            Aggregated cost data per tool
+        """
+        params = {}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return await self.get("/profitstream/v2/api/analytics/cost-by-tool-aggregated", params=params)
+
+    async def get_cost_by_tool_agent(self, **filters) -> Dict[str, Any]:
+        """Tool cost grouped by agent.
+
+        Args:
+            **filters: Date range and other filter parameters
+
+        Returns:
+            Cost data grouped by agent
+        """
+        params = {}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return await self.get("/profitstream/v2/api/analytics/cost-by-tool-agent", params=params)
+
+    async def get_agent_tool_breakdown(self, **filters) -> Dict[str, Any]:
+        """Cost per (agent, tool) pair.
+
+        Args:
+            **filters: Date range and other filter parameters
+
+        Returns:
+            Cost breakdown by agent-tool pair
+        """
+        params = {}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return await self.get("/profitstream/v2/api/analytics/agent-tool-breakdown", params=params)
+
+    async def get_cost_by_tool_provider(self, **filters) -> Dict[str, Any]:
+        """Cost by tool provider over time.
+
+        Args:
+            **filters: Date range and other filter parameters
+
+        Returns:
+            Cost data by tool provider
+        """
+        params = {}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return await self.get("/profitstream/v2/api/analytics/cost-by-tool-provider", params=params)
+
+    async def get_cost_by_tool_provider_aggregated(self, **filters) -> Dict[str, Any]:
+        """Aggregated cost by provider.
+
+        Args:
+            **filters: Date range and other filter parameters
+
+        Returns:
+            Aggregated cost data by provider
+        """
+        params = {}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return await self.get("/profitstream/v2/api/analytics/cost-by-tool-provider-aggregated", params=params)
+
+    async def get_top_tools_by_call_count(self, **filters) -> Dict[str, Any]:
+        """Top 20 tools by call count.
+
+        Args:
+            **filters: Date range and other filter parameters
+
+        Returns:
+            Top tools ranked by call count
+        """
+        params = {}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return await self.get("/profitstream/v2/api/analytics/top-tools-by-call-count", params=params)
+
+    async def get_tool_success_rate(self, **filters) -> Dict[str, Any]:
+        """Success rate per tool.
+
+        Args:
+            **filters: Date range and other filter parameters
+
+        Returns:
+            Success rate data per tool
+        """
+        params = {}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return await self.get("/profitstream/v2/api/analytics/tool-success-rate", params=params)
+
+    async def get_tool_latency(self, **filters) -> Dict[str, Any]:
+        """Average execution duration per tool.
+
+        Args:
+            **filters: Date range and other filter parameters
+
+        Returns:
+            Latency data per tool
+        """
+        params = {}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return await self.get("/profitstream/v2/api/analytics/tool-latency", params=params)
+
+    async def get_tool_filter_options(self) -> Dict[str, Any]:
+        """Available tool IDs for filter dropdowns.
+
+        Returns:
+            Filter options for tools
+        """
+        params = self._add_team_id_to_params()
+        return await self.get("/profitstream/v2/api/analytics/filter-options/tools", params=params)
 
 
 # Global client instance for connection pooling optimization

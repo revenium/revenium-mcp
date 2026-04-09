@@ -10,6 +10,7 @@ from loguru import logger
 
 from ..capability_manager.core import UnifiedCapabilityManager
 from ..client import ReveniumClient
+from ..endpoint_registry import get_endpoint_path
 
 
 class AnalyticsCapabilityDiscovery:
@@ -22,33 +23,36 @@ class AnalyticsCapabilityDiscovery:
             client: Revenium API client for discovery
         """
         self.client = client
+        # Paths are resolved once at __init__ time via get_endpoint_path().
+        # If the new-API feature flag changes later, these cached paths will be
+        # stale until a new instance is created. (_test_* methods resolve freshly.)
         self.analytics_endpoints = {
             # Cost analytics endpoints
-            "total_cost_by_provider_over_time": "/profitstream/v2/api/sources/metrics/ai/total-cost-by-provider-over-time",
-            "cost_metric_by_provider_over_time": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-provider-over-time",
-            "total_cost_by_model": "/profitstream/v2/api/sources/metrics/ai/total-cost-by-model",
-            "cost_metrics_by_subscriber_credential": "/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-subscriber-credential",
+            "total_cost_by_provider_over_time": get_endpoint_path("total_cost_by_provider_over_time"),
+            "cost_metric_by_provider_over_time": get_endpoint_path("cost_metric_by_provider_over_time"),
+            "total_cost_by_model": get_endpoint_path("total_cost_by_model"),
+            "cost_metrics_by_subscriber_credential": get_endpoint_path("cost_metrics_by_subscriber_credential"),
             # Customer analytics endpoints
-            "cost_metric_by_organization": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-organization",
-            "revenue_metric_by_organization": "/profitstream/v2/api/sources/metrics/ai/revenue-metric-by-organization",
-            "percentage_revenue_metric_by_organization": "/profitstream/v2/api/sources/metrics/ai/percentage-revenue-metric-by-organization",
+            "cost_metric_by_organization": get_endpoint_path("cost_metric_by_organization"),
+            "revenue_metric_by_organization": get_endpoint_path("revenue_metric_by_organization"),
+            "percentage_revenue_metric_by_organization": get_endpoint_path("percentage_revenue_metric_by_organization"),
             # Product analytics endpoints
-            "cost_metric_by_product": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-product",
-            "revenue_metric_by_product": "/profitstream/v2/api/sources/metrics/ai/revenue-metric-by-product",
-            "percentage_revenue_metric_by_product": "/profitstream/v2/api/sources/metrics/ai/percentage-revenue-metric-by-product",
+            "cost_metric_by_product": get_endpoint_path("cost_metric_by_product"),
+            "revenue_metric_by_product": get_endpoint_path("revenue_metric_by_product"),
+            "percentage_revenue_metric_by_product": get_endpoint_path("percentage_revenue_metric_by_product"),
             # Agent analytics endpoints
-            "cost_metrics_by_agents_over_time": "/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-agents-over-time",
-            "call_count_metrics_by_agents": "/profitstream/v2/api/sources/metrics/ai/call-count-metrics-by-agents",
-            "performance_metrics_by_agents": "/profitstream/v2/api/sources/metrics/ai/performance-metrics-by-agents",
+            "cost_metrics_by_agents_over_time": get_endpoint_path("cost_metrics_by_agents_over_time"),
+            "call_count_metrics_by_agents": get_endpoint_path("call_count_metrics_by_agents"),
+            "performance_metrics_by_agents": get_endpoint_path("performance_metrics_by_agents"),
             # Task analytics endpoints
-            "cost_metric_by_provider": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-provider",
-            "cost_metric_by_model": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-model",
-            "performance_metric_by_provider": "/profitstream/v2/api/sources/metrics/ai/performance-metric-by-provider",
-            "performance_metric_by_model": "/profitstream/v2/api/sources/metrics/ai/performance-metric-by-model",
+            "cost_metric_by_provider": get_endpoint_path("cost_metric_by_provider"),
+            "cost_metric_by_model": get_endpoint_path("cost_metric_by_model"),
+            "performance_metric_by_provider": get_endpoint_path("performance_metric_by_provider"),
+            "performance_metric_by_model": get_endpoint_path("performance_metric_by_model"),
             # Usage analytics endpoints
-            "tokens_per_minute_by_provider": "/profitstream/v2/api/sources/metrics/ai/tokens-per-minute-by-provider",
+            "tokens_per_minute_by_provider": get_endpoint_path("tokens_per_minute_by_provider"),
             # Data connectivity endpoints
-            "data_connected": "/profitstream/v2/api/sources/metrics/ai/data-connected",
+            "data_connected": get_endpoint_path("data_connected"),
         }
 
     async def discover_analytics_capabilities(self) -> Dict[str, Any]:
@@ -178,7 +182,7 @@ class AnalyticsCapabilityDiscovery:
         team_id = self.client.team_id
 
         # Use a simple endpoint for testing
-        test_endpoint = "/profitstream/v2/api/sources/metrics/ai/data-connected"
+        test_endpoint = get_endpoint_path("data_connected")
 
         for period in test_periods:
             try:
@@ -200,7 +204,7 @@ class AnalyticsCapabilityDiscovery:
         team_id = self.client.team_id
 
         # Use an endpoint that supports aggregation
-        test_endpoint = "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-provider-over-time"
+        test_endpoint = get_endpoint_path("cost_metric_by_provider_over_time")
 
         for aggregation in test_aggregations:
             try:
@@ -222,7 +226,7 @@ class AnalyticsCapabilityDiscovery:
         team_id = self.client.team_id
 
         # Use the token usage endpoint
-        test_endpoint = "/profitstream/v2/api/sources/metrics/ai/tokens-per-minute-by-provider"
+        test_endpoint = get_endpoint_path("tokens_per_minute_by_provider")
 
         for token_type in test_token_types:
             try:

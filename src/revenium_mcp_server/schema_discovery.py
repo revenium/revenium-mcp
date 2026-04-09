@@ -16,7 +16,6 @@ from .models import (  # REMOVED: SourceStatus - API doesn't support status fiel
     PlanType,
     RatingAggregationType,
     SourceType,
-    SubscriptionStatus,
     TrialPeriod,
     UserRole,
 )
@@ -1270,16 +1269,16 @@ class SubscriptionSchemaDiscovery(SchemaDiscoveryEngine):
                     # We're in an async context, but this is a sync method
                     # Add a warning instead of trying to make async call
                     validation_result["warnings"].append(
-                        f"Product existence validation skipped - use async validation for complete checking"
+                        "Product existence validation skipped - use async validation for complete checking"
                     )
                 except RuntimeError:
                     # Not in async context, can't validate product existence
                     validation_result["warnings"].append(
-                        f"Product existence validation requires async context"
+                        "Product existence validation requires async context"
                     )
             except Exception as e:
                 logger.debug(f"Could not validate product existence: {e}")
-                validation_result["warnings"].append(f"Product existence validation unavailable")
+                validation_result["warnings"].append("Product existence validation unavailable")
 
         # REMOVED: Subscription status validation - status field NOT FOUND in actual Revenium API responses
         # The API does not return or accept a status field for subscription objects

@@ -17,6 +17,7 @@ from loguru import logger
 
 from ..client import ReveniumAPIError, ReveniumClient
 from ..common.error_handling import ErrorCodes, ToolError, create_structured_validation_error
+from ..endpoint_registry import get_endpoint_path, get_unit_multiplier, resolve_analytics_request
 
 
 @dataclass
@@ -83,19 +84,19 @@ class ComparativeAnalyticsProcessor:
         """Initialize the comparative analytics processor."""
         self.analytics_endpoints = {
             # Cost analytics endpoints
-            "cost_metric_by_provider_over_time": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-provider-over-time",
-            "total_cost_by_model": "/profitstream/v2/api/sources/metrics/ai/total-cost-by-model",
-            "cost_metric_by_organization": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-organization",
-            "cost_metric_by_product": "/profitstream/v2/api/sources/metrics/ai/cost-metric-by-product",
+            "cost_metric_by_provider_over_time": get_endpoint_path("cost_metric_by_provider_over_time"),
+            "total_cost_by_model": get_endpoint_path("total_cost_by_model"),
+            "cost_metric_by_organization": get_endpoint_path("cost_metric_by_organization"),
+            "cost_metric_by_product": get_endpoint_path("cost_metric_by_product"),
             # Revenue analytics endpoints
-            "revenue_metric_by_organization": "/profitstream/v2/api/sources/metrics/ai/revenue-metric-by-organization",
-            "revenue_metric_by_product": "/profitstream/v2/api/sources/metrics/ai/revenue-metric-by-product",
+            "revenue_metric_by_organization": get_endpoint_path("revenue_metric_by_organization"),
+            "revenue_metric_by_product": get_endpoint_path("revenue_metric_by_product"),
             # Performance analytics endpoints
-            "performance_metric_by_provider": "/profitstream/v2/api/sources/metrics/ai/performance-metric-by-provider",
-            "performance_metric_by_model": "/profitstream/v2/api/sources/metrics/ai/performance-metric-by-model",
+            "performance_metric_by_provider": get_endpoint_path("performance_metric_by_provider"),
+            "performance_metric_by_model": get_endpoint_path("performance_metric_by_model"),
             # Agent analytics endpoints
-            "cost_metrics_by_agents_over_time": "/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-agents-over-time",
-            "performance_metrics_by_agents": "/profitstream/v2/api/sources/metrics/ai/performance-metrics-by-agents",
+            "cost_metrics_by_agents_over_time": get_endpoint_path("cost_metrics_by_agents_over_time"),
+            "performance_metrics_by_agents": get_endpoint_path("performance_metrics_by_agents"),
         }
 
     def _normalize_entity_name(self, entity_name: str, entity_type: str = "provider") -> str:
@@ -659,21 +660,20 @@ class ComparativeAnalyticsProcessor:
             # Fallback to cost metrics
             endpoint_key = "cost_metric_by_provider_over_time"
 
-        endpoint = self.analytics_endpoints[endpoint_key]
-        params = {"teamId": team_id, "period": period}
+        # Add group parameter for endpoints that require it (old API only — new API uses date range)
+        group_keys = {"cost_metric_by_provider_over_time", "performance_metric_by_provider"}
+        extra_old_params = {"group": group} if endpoint_key in group_keys else None
 
-        # Add required group parameter for certain endpoints
-        if (
-            "cost-metric-by-provider-over-time" in endpoint
-            or "performance-metric-by-provider" in endpoint
-        ):
-            params["group"] = group  # Use provided aggregation type
+        path, params, call_kwargs = resolve_analytics_request(
+            endpoint_key, team_id, period, extra_old_params=extra_old_params
+        )
+        multiplier = get_unit_multiplier(endpoint_key)
 
         try:
-            response = await client.get(endpoint, params=params)
+            response = await client.get(path, params=params, **call_kwargs)
 
             # Process the API response to extract data in expected format
-            processed_data = self._process_api_response(response, breakdown_by)
+            processed_data = self._process_api_response(response, breakdown_by, unit_multiplier=multiplier)
 
             return {"data": processed_data}
         except ReveniumAPIError as e:
@@ -879,7 +879,7 @@ class ComparativeAnalyticsProcessor:
                 f"🚨 **Immediate Action Required**: {len(significant_increases)} entities show significant cost increases (avg: {avg_increase:.1f}%, max: {max_increase:.1f}%)"
             )
             recommendations.append(
-                f"🔍 **Investigation Priority**: Focus on entities with >50% increases - review usage patterns and implement cost controls within 48 hours"
+                "🔍 **Investigation Priority**: Focus on entities with >50% increases - review usage patterns and implement cost controls within 48 hours"
             )
 
             if major_increases:
@@ -905,7 +905,7 @@ class ComparativeAnalyticsProcessor:
                 f"💰 **Estimated Savings**: ${abs(total_savings):,.2f} - document and replicate successful optimization strategies"
             )
             recommendations.append(
-                f"📊 **Best Practice**: Analyze top-performing cost reductions to create optimization playbook for other entities"
+                "📊 **Best Practice**: Analyze top-performing cost reductions to create optimization playbook for other entities"
             )
 
         if significant_increases and metric_type == "revenue":
@@ -941,21 +941,21 @@ class ComparativeAnalyticsProcessor:
         logger.info(f"Fetching {metric_type} data for models: {models}")
 
         if metric_type == "cost":
-            endpoint = self.analytics_endpoints["total_cost_by_model"]
+            endpoint_key = "total_cost_by_model"
         else:
-            endpoint = self.analytics_endpoints["performance_metric_by_model"]
+            endpoint_key = "performance_metric_by_model"
 
-        params = {"teamId": team_id, "period": time_period}
-
-        # Add group parameter for performance metrics
-        if metric_type == "performance":
-            params["group"] = group
+        extra_old_params = {"group": group} if metric_type == "performance" else None
+        path, params, call_kwargs = resolve_analytics_request(
+            endpoint_key, team_id, time_period, extra_old_params=extra_old_params
+        )
+        multiplier = get_unit_multiplier(endpoint_key)
 
         try:
-            response = await client.get(endpoint, params=params)
+            response = await client.get(path, params=params, **call_kwargs)
 
             # Process the API response to extract data in expected format
-            processed_data = self._process_api_response(response, "model")
+            processed_data = self._process_api_response(response, "model", unit_multiplier=multiplier)
 
             return {"data": processed_data}
         except ReveniumAPIError as e:
@@ -1057,7 +1057,7 @@ class ComparativeAnalyticsProcessor:
             insights.append(f"{model_a} and {model_b} have similar {metric_type} performance")
 
         if change.significance == "significant":
-            insights.append(f"The difference is significant and may warrant investigation")
+            insights.append("The difference is significant and may warrant investigation")
 
         return insights
 
@@ -1091,7 +1091,7 @@ class ComparativeAnalyticsProcessor:
                         f"⚡ **Immediate Action**: Migrate 80% of non-critical workloads to {model_b} within 2 weeks to reduce costs"
                     )
                     recommendations.append(
-                        f"📋 **Implementation Plan**: Start with batch processing, then move real-time inference if quality metrics remain acceptable"
+                        "📋 **Implementation Plan**: Start with batch processing, then move real-time inference if quality metrics remain acceptable"
                     )
                 else:
                     recommendations.append(
@@ -1115,7 +1115,7 @@ class ComparativeAnalyticsProcessor:
             )
 
         recommendations.append(
-            f"🔄 **Regular Review**: Schedule monthly model cost analysis to identify optimization opportunities"
+            "🔄 **Regular Review**: Schedule monthly model cost analysis to identify optimization opportunities"
         )
 
         return recommendations
@@ -1135,24 +1135,21 @@ class ComparativeAnalyticsProcessor:
         logger.info(f"Fetching {metric_type} data for providers: {providers}")
 
         if metric_type == "cost":
-            endpoint = self.analytics_endpoints["cost_metric_by_provider_over_time"]
+            endpoint_key = "cost_metric_by_provider_over_time"
         else:
-            endpoint = self.analytics_endpoints["performance_metric_by_provider"]
+            endpoint_key = "performance_metric_by_provider"
 
-        params = {"teamId": team_id, "period": time_period}
-
-        # Add required group parameter for provider endpoints
-        if (
-            "cost-metric-by-provider-over-time" in endpoint
-            or "performance-metric-by-provider" in endpoint
-        ):
-            params["group"] = group  # Use provided aggregation type
+        # Both provider endpoint keys require a group param for the old API
+        path, params, call_kwargs = resolve_analytics_request(
+            endpoint_key, team_id, time_period, extra_old_params={"group": group}
+        )
+        multiplier = get_unit_multiplier(endpoint_key)
 
         try:
-            response = await client.get(endpoint, params=params)
+            response = await client.get(path, params=params, **call_kwargs)
 
             # Process the API response to extract data in expected format
-            processed_data = self._process_api_response(response, "provider")
+            processed_data = self._process_api_response(response, "provider", unit_multiplier=multiplier)
 
             return {"data": processed_data}
         except ReveniumAPIError as e:
@@ -1258,7 +1255,7 @@ class ComparativeAnalyticsProcessor:
             insights.append(f"{provider_a} and {provider_b} have similar {metric_type} performance")
 
         if change.significance == "significant":
-            insights.append(f"The difference is significant and may warrant investigation")
+            insights.append("The difference is significant and may warrant investigation")
 
         return insights
 
@@ -1313,7 +1310,7 @@ class ComparativeAnalyticsProcessor:
         # Risk management and monitoring
         if monthly_impact > 1000:  # Significant monthly cost difference
             recommendations.append(
-                f"⚠️ **Risk Management**: Maintain 20-30% workload on secondary provider to avoid vendor lock-in"
+                "⚠️ **Risk Management**: Maintain 20-30% workload on secondary provider to avoid vendor lock-in"
             )
             recommendations.append(
                 f"📊 **Cost Monitoring**: Set up weekly alerts when provider cost difference exceeds ${cost_diff * 0.2:.2f}/day"
@@ -1321,10 +1318,10 @@ class ComparativeAnalyticsProcessor:
 
         # Performance and quality considerations
         recommendations.append(
-            f"🔄 **Quality Assurance**: Monitor output quality metrics during any provider shifts - maintain >95% quality threshold"
+            "🔄 **Quality Assurance**: Monitor output quality metrics during any provider shifts - maintain >95% quality threshold"
         )
         recommendations.append(
-            f"📈 **Performance Tracking**: Track latency, throughput, and error rates across providers for comprehensive optimization"
+            "📈 **Performance Tracking**: Track latency, throughput, and error rates across providers for comprehensive optimization"
         )
 
         return recommendations
@@ -1338,15 +1335,17 @@ class ComparativeAnalyticsProcessor:
         logger.info(f"Fetching customer metrics for {customer_id}")
 
         # Fetch cost and revenue data for the customer
-        cost_endpoint = self.analytics_endpoints["cost_metric_by_organization"]
-        revenue_endpoint = self.analytics_endpoints["revenue_metric_by_organization"]
-
-        params = {"teamId": team_id, "period": time_period}
+        cost_path, cost_params, cost_kwargs = resolve_analytics_request(
+            "cost_metric_by_organization", team_id, time_period
+        )
+        rev_path, rev_params, rev_kwargs = resolve_analytics_request(
+            "revenue_metric_by_organization", team_id, time_period
+        )
 
         try:
             results = await asyncio.gather(
-                client.get(cost_endpoint, params=params),
-                client.get(revenue_endpoint, params=params),
+                client.get(cost_path, params=cost_params, **cost_kwargs),
+                client.get(rev_path, params=rev_params, **rev_kwargs),
                 return_exceptions=True,
             )
 
@@ -1410,15 +1409,17 @@ class ComparativeAnalyticsProcessor:
         logger.info(f"Fetching benchmark metrics for {benchmark_type}")
 
         # For now, calculate industry averages from all customers
-        cost_endpoint = self.analytics_endpoints["cost_metric_by_organization"]
-        revenue_endpoint = self.analytics_endpoints["revenue_metric_by_organization"]
-
-        params = {"teamId": team_id, "period": time_period}
+        cost_path, cost_params, cost_kwargs = resolve_analytics_request(
+            "cost_metric_by_organization", team_id, time_period
+        )
+        rev_path, rev_params, rev_kwargs = resolve_analytics_request(
+            "revenue_metric_by_organization", team_id, time_period
+        )
 
         try:
             results = await asyncio.gather(
-                client.get(cost_endpoint, params=params),
-                client.get(revenue_endpoint, params=params),
+                client.get(cost_path, params=cost_params, **cost_kwargs),
+                client.get(rev_path, params=rev_params, **rev_kwargs),
                 return_exceptions=True,
             )
 
@@ -1546,12 +1547,17 @@ class ComparativeAnalyticsProcessor:
 
         return ranking, percentile
 
-    def _process_api_response(self, response: Any, breakdown_by: str) -> List[Dict[str, Any]]:
+    def _process_api_response(
+        self, response: Any, breakdown_by: str, unit_multiplier: float = 1.0
+    ) -> List[Dict[str, Any]]:
         """Process API response to extract data in expected format.
 
         Args:
             response: Raw API response (dict with groups → metrics → metricResult structure)
             breakdown_by: Dimension to break down by (provider, model, customer, product)
+            unit_multiplier: Multiplier applied to each metricResult value (default 1.0).
+                Set to 1000.0 for new-API performance/latency endpoints that return seconds
+                instead of milliseconds.
 
         Returns:
             List of processed data items in expected format
@@ -1592,7 +1598,7 @@ class ComparativeAnalyticsProcessor:
 
                         metric_result = metric.get("metricResult", 0)
                         if isinstance(metric_result, (int, float)):
-                            group_cost += metric_result
+                            group_cost += metric_result * unit_multiplier
 
                     if group_cost > 0:
                         # Create data item in expected format for comparison calculations
@@ -1651,7 +1657,7 @@ class ComparativeAnalyticsProcessor:
 
                             metric_result = metric.get("metricResult", 0)
                             if isinstance(metric_result, (int, float)):
-                                group_cost += metric_result
+                                group_cost += metric_result * unit_multiplier
 
                         if group_cost > 0:
                             # Create data item in expected format for comparison calculations

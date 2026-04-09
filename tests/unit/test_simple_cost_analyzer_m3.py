@@ -14,7 +14,6 @@ test_simple_cost_analyzer.py:
 - _process_agent_data edge cases
 """
 
-import os
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 

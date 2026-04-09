@@ -4,7 +4,7 @@ Defines the tool sets for each profile tier optimized for AI analytics and usage
 
 Profile Structure:
 - Starter (7 tools): Essential cost monitoring and alerting
-- Business (15 tools): Complete AI analytics and usage-based billing capabilities (default)
+- Business (17 tools): Complete AI analytics and usage-based billing capabilities (default)
 
 Note: Enterprise profile removed as it was redundant after infrastructure monitoring tools removal.
 """
@@ -31,7 +31,7 @@ PROFILE_DEFINITIONS: Dict[str, Set[str]] = {
         "system_setup",
         "system_diagnostics",
         "tool_introspection",
-        # Additional business tools (8)
+        # Additional business tools (10)
         "manage_sources",
         "manage_workflows",
         "manage_subscriber_credentials",
@@ -40,11 +40,13 @@ PROFILE_DEFINITIONS: Dict[str, Set[str]] = {
         "manage_subscriptions",
         "manage_metering_elements",
         "manage_capabilities",
+        "manage_jobs",
+        "manage_tools",
     },
 }
 
 # Profile tool counts for validation
-PROFILE_TOOL_COUNTS = {"starter": 7, "business": 15}
+PROFILE_TOOL_COUNTS = {"starter": 7, "business": 17}
 
 
 def validate_profile_definitions() -> bool:

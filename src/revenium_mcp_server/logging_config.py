@@ -4,7 +4,6 @@ This module provides sophisticated logging capabilities for the Alerts & Anomali
 MCP server, including structured logging, performance tracking, and monitoring.
 """
 
-import asyncio
 import functools
 import inspect
 import sys

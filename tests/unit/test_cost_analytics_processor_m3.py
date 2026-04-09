@@ -32,8 +32,7 @@ Focused areas:
 """
 
 import pytest
-import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.analytics.cost_analytics_processor import (

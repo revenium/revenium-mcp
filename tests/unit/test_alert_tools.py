@@ -4,7 +4,7 @@ Tests the AlertManagement class from the decomposed tools module.
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock
 
 from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
 from mcp.types import TextContent

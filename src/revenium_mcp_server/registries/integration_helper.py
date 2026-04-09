@@ -5,7 +5,6 @@ registry with the enhanced_server.py, enabling seamless transition from
 individual functions to registry-based management.
 """
 
-from dataclasses import asdict
 from typing import List, Union
 
 from mcp.types import EmbeddedResource, ImageContent, TextContent

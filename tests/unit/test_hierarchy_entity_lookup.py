@@ -9,9 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.hierarchy.entity_lookup_service import (
     EntityLookupService,
-    EntityReference,
     IDValidator,
-    LookupResult,
 )
 
 

@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Union
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
-from .parameter_mapper import ParameterMapper, ParameterMappingError
+from .parameter_mapper import ParameterMapper
 
 # Local imports
 from .tool_registry import tool_registry
