@@ -84,7 +84,7 @@ See [Installation](#installation) for Cursor, Augment, and other integrations.
 
 Implements [Model Context Protocol](https://modelcontextprotocol.io/specification/2025-06-18) version **2025-06-18**.
 
-- **Framework:** FastMCP 2.10+
+- **Framework:** FastMCP 3.2+
 - **Transport:** stdio
 - **Protocol:** JSON-RPC 2.0
 

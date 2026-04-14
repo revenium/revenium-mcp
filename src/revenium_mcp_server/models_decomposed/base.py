@@ -120,12 +120,6 @@ class ListResponse(BaseReveniumModel):
 # Note: Explicit allow-list validation for BillingPeriod and PlanType is performed in product_validation_engine.py
 # These enums are preserved here for model definitions; validation logic uses them directly.
 
-# Note: These enums are preserved as comments for reference but should not be used for validation
-# Currency options: USD, EUR, GBP, CAD, AUD, JPY
-# BillingPeriod options: MONTH, YEAR, QUARTER, WEEK, DAY, TEST_MINUTE, TEST_MINUTE_WITH_SYNTHETIC_METERING, NONE
-# TrialPeriod options: DAY, WEEK, MONTH
-# AggregationType options: SUM, COUNT, MAX, MIN, AVERAGE, LAST
-
 
 class RatingAggregationType(str, Enum):
     """Rating aggregation type enumeration."""

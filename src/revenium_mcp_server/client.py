@@ -2269,7 +2269,12 @@ class ReveniumClient:
 
     def _get_app_base_url(self) -> str:
         """Return the analytics base URL (app.revenium.ai), falling back to default."""
-        return get_config_value("REVENIUM_APP_BASE_URL", "https://app.revenium.ai") or "https://app.revenium.ai"
+        url = get_config_value("REVENIUM_APP_BASE_URL", "https://app.revenium.ai") or "https://app.revenium.ai"
+        if not url.startswith("https://"):
+            raise ValueError(
+                f"REVENIUM_APP_BASE_URL must use HTTPS to prevent Bearer token leakage, got: {url!r}"
+            )
+        return url
 
     async def get_cost_by_tool(self, **filters) -> Dict[str, Any]:
         """Cost breakdown by tool over time.

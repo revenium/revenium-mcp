@@ -360,16 +360,7 @@ class ProductValidationEngine:
             _allowed_periods_str = ", ".join(_allowed_periods)
             period = plan_data.get("period")
             if plan_type == "SUBSCRIPTION":
-                if not period:
-                    errors.append(
-                        ValidationError(
-                            field="plan.period",
-                            value=period,
-                            error="Period is required for SUBSCRIPTION plans",
-                            suggestion=f"Use one of the allowed periods: {_allowed_periods_str}",
-                        )
-                    )
-                elif period not in _allowed_periods:
+                if period and period not in _allowed_periods:
                     errors.append(
                         ValidationError(
                             field="plan.period",
