@@ -172,3 +172,10 @@ tool_config.json
 
 # Development credentials (never commit real credentials)
 docs/dev-credentials.md
+
+# Revvie agent files (auto-added, do not commit)
+.revvie-handoff.md
+.revvie-followup-instructions.md
+.revvie-task-instructions.md
+.revvie-ci-fix-*.md
+.revvie/

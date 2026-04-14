@@ -2191,7 +2191,7 @@ class ReveniumClient:
         params = self._add_team_id_to_params()
         return await self.post(f"/profitstream/v2/api/tools/{tool_id}/restore", params=params)
 
-    async def search_tools(self, query: str, page: int = 0, size: int = 20) -> Dict[str, Any]:
+    async def search_tools(self, query: str, page: int = 0, size: int = 20) -> Dict[str, Any]:  # noqa: E501
         """Search tools by text query.
 
         Args:
@@ -2202,22 +2202,23 @@ class ReveniumClient:
         Returns:
             Response containing matching tools
         """
-        params = {"query": query, "page": page, "size": size}
+        params = {"name": query, "page": page, "size": size}
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/tools/search", params=params)
+        return await self.get("/profitstream/v2/api/tools", params=params)
 
     async def record_tool_event(self, tool_id: str, event_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Record an event for a tool (invocation, error, etc.) via per-tool endpoint.
+        """Record an event for a tool by merging tool_id into payload and submitting to metering.
 
         Args:
-            tool_id: The tool ID
+            tool_id: The tool ID (merged into event_data as toolId)
             event_data: Event data to record
 
         Returns:
-            Recorded event data
+            Metered event data
         """
+        payload = {**event_data, "toolId": tool_id}
         params = self._add_team_id_to_params()
-        return await self.post(f"/profitstream/v2/api/tools/{tool_id}/events", data=event_data, params=params)
+        return await self.post("/meter/v2/tool/events", data=payload, params=params)
 
     async def meter_tool_event(self, event_data: Dict[str, Any]) -> Dict[str, Any]:
         """Submit a tool/function call for metering via global endpoint.
@@ -2229,22 +2230,22 @@ class ReveniumClient:
             Metered event data
         """
         params = self._add_team_id_to_params()
-        return await self.post("/profitstream/v2/api/metering/tool-events", data=event_data, params=params)
+        return await self.post("/meter/v2/tool/events", data=event_data, params=params)
 
     async def get_tool_events(self, tool_id: str, page: int = 0, size: int = 20) -> Dict[str, Any]:
-        """Get events for a specific tool via per-tool endpoint.
+        """Get events for a specific tool via the global tool events log endpoint.
 
         Args:
-            tool_id: The tool ID
+            tool_id: The tool ID to filter by
             page: Page number (0-based)
             size: Number of items per page
 
         Returns:
             Response containing tool events
         """
-        params = {"page": page, "size": size}
+        params = {"toolId": tool_id, "page": page, "size": size}
         params = self._add_team_id_to_params(params)
-        return await self.get(f"/profitstream/v2/api/tools/{tool_id}/events", params=params)
+        return await self.get("/profitstream/v2/api/sources/metrics/tool/events", params=params)
 
     async def list_tool_events(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
         """List tool event logs via global filterable endpoint.
@@ -2261,9 +2262,19 @@ class ReveniumClient:
         params = {"page": page, "size": size}
         params.update(filters)
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/tool-events", params=params)
+        return await self.get("/profitstream/v2/api/sources/metrics/tool/events", params=params)
 
-    # Global Tool Analytics endpoints (ticket-specified paths)
+    # Tool Analytics endpoints — hosted on app.revenium.ai, Bearer auth
+    # Base: https://app.revenium.ai, path prefix: /api/v2/analytics/
+
+    def _get_app_base_url(self) -> str:
+        """Return the analytics base URL (app.revenium.ai), falling back to default."""
+        url = get_config_value("REVENIUM_APP_BASE_URL", "https://app.revenium.ai") or "https://app.revenium.ai"
+        if not url.startswith("https://"):
+            raise ValueError(
+                f"REVENIUM_APP_BASE_URL must use HTTPS to prevent Bearer token leakage, got: {url!r}"
+            )
+        return url
 
     async def get_cost_by_tool(self, **filters) -> Dict[str, Any]:
         """Cost breakdown by tool over time.
@@ -2276,8 +2287,12 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/analytics/cost-by-tool", params=params)
+        return await self.get(
+            "/api/v2/analytics/cost-by-tool",
+            params=params,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+        )
 
     async def get_cost_by_tool_aggregated(self, **filters) -> Dict[str, Any]:
         """Aggregated cost per tool.
@@ -2290,8 +2305,12 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/analytics/cost-by-tool-aggregated", params=params)
+        return await self.get(
+            "/api/v2/analytics/cost-by-tool-aggregated",
+            params=params,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+        )
 
     async def get_cost_by_tool_agent(self, **filters) -> Dict[str, Any]:
         """Tool cost grouped by agent.
@@ -2304,8 +2323,12 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/analytics/cost-by-tool-agent", params=params)
+        return await self.get(
+            "/api/v2/analytics/cost-by-tool-agent",
+            params=params,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+        )
 
     async def get_agent_tool_breakdown(self, **filters) -> Dict[str, Any]:
         """Cost per (agent, tool) pair.
@@ -2318,8 +2341,12 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/analytics/agent-tool-breakdown", params=params)
+        return await self.get(
+            "/api/v2/analytics/agent-tool-breakdown",
+            params=params,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+        )
 
     async def get_cost_by_tool_provider(self, **filters) -> Dict[str, Any]:
         """Cost by tool provider over time.
@@ -2332,8 +2359,12 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/analytics/cost-by-tool-provider", params=params)
+        return await self.get(
+            "/api/v2/analytics/cost-by-tool-provider",
+            params=params,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+        )
 
     async def get_cost_by_tool_provider_aggregated(self, **filters) -> Dict[str, Any]:
         """Aggregated cost by provider.
@@ -2346,8 +2377,12 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/analytics/cost-by-tool-provider-aggregated", params=params)
+        return await self.get(
+            "/api/v2/analytics/cost-by-tool-provider-aggregated",
+            params=params,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+        )
 
     async def get_top_tools_by_call_count(self, **filters) -> Dict[str, Any]:
         """Top 20 tools by call count.
@@ -2360,8 +2395,12 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/analytics/top-tools-by-call-count", params=params)
+        return await self.get(
+            "/api/v2/analytics/top-tools-by-call-count",
+            params=params,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+        )
 
     async def get_tool_success_rate(self, **filters) -> Dict[str, Any]:
         """Success rate per tool.
@@ -2374,8 +2413,12 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/analytics/tool-success-rate", params=params)
+        return await self.get(
+            "/api/v2/analytics/tool-success-rate",
+            params=params,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+        )
 
     async def get_tool_latency(self, **filters) -> Dict[str, Any]:
         """Average execution duration per tool.
@@ -2388,8 +2431,12 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/analytics/tool-latency", params=params)
+        return await self.get(
+            "/api/v2/analytics/tool-latency",
+            params=params,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+        )
 
     async def get_tool_filter_options(self) -> Dict[str, Any]:
         """Available tool IDs for filter dropdowns.
@@ -2397,8 +2444,11 @@ class ReveniumClient:
         Returns:
             Filter options for tools
         """
-        params = self._add_team_id_to_params()
-        return await self.get("/profitstream/v2/api/analytics/filter-options/tools", params=params)
+        return await self.get(
+            "/api/v2/analytics/filter-options/tools",
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+        )
 
 
 # Global client instance for connection pooling optimization

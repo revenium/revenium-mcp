@@ -240,3 +240,198 @@ class TestProductValidationEngine:
         assert isinstance(scenario, dict)
         # Should contain before/after or similar comparison data
         assert len(scenario) > 0
+
+    def test_invalid_plan_type_graduated(self):
+        """plan.type='GRADUATED' should be rejected with an error referencing both GRADUATED and SUBSCRIPTION."""
+        product_data = {
+            "name": "Test Product",
+            "description": "A test",
+            "version": "1.0.0",
+            "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
+            "plan": {
+                "type": "GRADUATED",
+                "name": "Graduated Plan",
+                "currency": "USD",
+                "period": "MONTH",
+                "tiers": [{"name": "T1", "up_to": None}],
+            },
+        }
+        result = ProductValidationEngine.validate_product_data(product_data)
+        plan_type_errors = [e for e in result.errors if e.field == "plan.type"]
+        assert len(plan_type_errors) >= 1
+        error_text = " ".join(e.error + " " + e.suggestion for e in plan_type_errors)
+        assert "GRADUATED" in error_text
+        assert "SUBSCRIPTION" in error_text
+
+    def test_invalid_plan_period_monthly(self):
+        """plan.period='MONTHLY' should be rejected and the error should list valid period values."""
+        product_data = {
+            "name": "Test Product",
+            "description": "A test",
+            "version": "1.0.0",
+            "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
+            "plan": {
+                "type": "SUBSCRIPTION",
+                "name": "Monthly Plan",
+                "currency": "USD",
+                "period": "MONTHLY",
+                "tiers": [{"name": "T1", "up_to": None}],
+            },
+        }
+        result = ProductValidationEngine.validate_product_data(product_data)
+        period_errors = [e for e in result.errors if e.field == "plan.period"]
+        assert len(period_errors) >= 1
+        error_text = " ".join(e.error + " " + e.suggestion for e in period_errors)
+        assert "MONTHLY" in error_text
+        # The error should list valid period values. Exclude "MONTH" from the
+        # match count because it is a substring of the invalid input "MONTHLY"
+        # and would trivially match even if valid values are not listed.
+        valid_periods = ["MONTH", "YEAR", "QUARTER", "WEEK", "DAY", "TEST_MINUTE"]
+        listed_valid = [p for p in valid_periods if p in error_text and p != "MONTH"]
+        assert len(listed_valid) >= 2, (
+            f"Error should list valid period values, but only found: {listed_valid}. "
+            f"Full error text: {error_text}"
+        )
+
+    def test_valid_plan_subscription_month(self):
+        """plan.type='SUBSCRIPTION' with plan.period='MONTH' should produce no plan.type or plan.period errors."""
+        product_data = {
+            "name": "Test Product",
+            "description": "A test product",
+            "version": "1.0.0",
+            "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
+            "plan": {
+                "type": "SUBSCRIPTION",
+                "name": "Monthly Plan",
+                "currency": "USD",
+                "period": "MONTH",
+                "tiers": [{"name": "Basic", "up_to": None, "unit_amount": "9.99"}],
+            },
+        }
+        result = ProductValidationEngine.validate_product_data(product_data)
+        all_issues = result.errors + result.warnings
+        plan_field_issues = [
+            i for i in all_issues if i.field in ("plan.type", "plan.period")
+        ]
+        assert len(plan_field_issues) == 0
+
+    def test_valid_plan_period_test_minute(self):
+        """plan.period='TEST_MINUTE' should produce no plan.period error."""
+        product_data = {
+            "name": "Test Product",
+            "description": "A test product",
+            "version": "1.0.0",
+            "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
+            "plan": {
+                "type": "SUBSCRIPTION",
+                "name": "Test Minute Plan",
+                "currency": "USD",
+                "period": "TEST_MINUTE",
+                "tiers": [{"name": "Basic", "up_to": None, "unit_amount": "0.01"}],
+            },
+        }
+        result = ProductValidationEngine.validate_product_data(product_data)
+        all_issues = result.errors + result.warnings
+        period_issues = [i for i in all_issues if i.field == "plan.period"]
+        assert len(period_issues) == 0
+
+    def test_simultaneous_invalid_type_and_period(self):
+        """Both plan.type and plan.period errors should surface in a single validation call."""
+        product_data = {
+            "name": "Test Product",
+            "description": "A test",
+            "version": "1.0.0",
+            "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
+            "plan": {
+                "type": "GRADUATED",
+                "name": "Graduated Plan",
+                "currency": "USD",
+                "period": "MONTHLY",
+                "tiers": [{"name": "T1", "up_to": None}],
+            },
+        }
+        result = ProductValidationEngine.validate_product_data(product_data)
+        plan_type_errors = [e for e in result.errors if e.field == "plan.type"]
+        period_errors = [e for e in result.errors if e.field == "plan.period"]
+        assert len(plan_type_errors) >= 1, "Expected plan.type error for GRADUATED"
+        assert len(period_errors) >= 1, "Expected plan.period error for MONTHLY"
+
+
+class TestVersionFormatValidation:
+    """Tests for semantic version format validation in _validate_field_values."""
+
+    # Base valid product data used across version tests.
+    BASE_PRODUCT = {
+        "name": "Test Product",
+        "description": "A test product",
+        "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
+        "plan": {
+            "type": "SUBSCRIPTION",
+            "name": "Monthly Plan",
+            "currency": "USD",
+            "period": "MONTH",
+            "tiers": [{"name": "Basic", "up_to": None, "unit_amount": "9.99"}],
+        },
+    }
+
+    def _product_with_version(self, version):
+        data = dict(self.BASE_PRODUCT)
+        data["version"] = version
+        return data
+
+    def _version_errors(self, result):
+        return [e for e in result.errors if e.field == "version"]
+
+    # --- Invalid version formats ---
+
+    def test_version_empty_string_produces_error(self):
+        """'' (empty string) should produce a ValidationError with field='version'."""
+        result = ProductValidationEngine.validate_product_data(
+            self._product_with_version("")
+        )
+        version_errs = self._version_errors(result)
+        assert len(version_errs) >= 1
+        assert "version" in version_errs[0].error.lower()
+
+    def test_version_missing_patch_produces_error(self):
+        """'1.0' (missing PATCH) should produce a ValidationError with field='version'."""
+        result = ProductValidationEngine.validate_product_data(
+            self._product_with_version("1.0")
+        )
+        version_errs = self._version_errors(result)
+        assert len(version_errs) >= 1
+        assert "version" in version_errs[0].error.lower()
+
+    def test_version_with_v_prefix_produces_error(self):
+        """'v1.0.0' (v-prefix) should produce a ValidationError with field='version'."""
+        result = ProductValidationEngine.validate_product_data(
+            self._product_with_version("v1.0.0")
+        )
+        version_errs = self._version_errors(result)
+        assert len(version_errs) >= 1
+        assert "version" in version_errs[0].error.lower()
+
+    def test_version_non_numeric_produces_error(self):
+        """'abc' (non-numeric) should produce a ValidationError with field='version'."""
+        result = ProductValidationEngine.validate_product_data(
+            self._product_with_version("abc")
+        )
+        version_errs = self._version_errors(result)
+        assert len(version_errs) >= 1
+        assert "version" in version_errs[0].error.lower()
+
+    # --- Valid version formats ---
+
+    def test_version_semver_passes(self):
+        """'1.0.0' (MAJOR.MINOR.PATCH) should produce no version ValidationError."""
+        result = ProductValidationEngine.validate_product_data(
+            self._product_with_version("1.0.0")
+        )
+        assert self._version_errors(result) == []
+
+    def test_version_semver_with_prerelease_passes(self):
+        """'1.0.0-beta' (semver with pre-release) should produce no version ValidationError."""
+        result = ProductValidationEngine.validate_product_data(
+            self._product_with_version("1.0.0-beta")
+        )
+        assert self._version_errors(result) == []

@@ -11,6 +11,10 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from revenium_mcp_server.models import BillingPeriod, PlanType
+
+from .product_validators import ProductValidator
+
 
 @dataclass
 class ValidationError:
@@ -115,8 +119,7 @@ class ProductValidationEngine:
     Prevents API errors before they reach the Revenium API, improving agent success rates.
     """
 
-    # REMOVED: Hardcoded validation arrays - now using UCM-only validation
-    # All validation now relies on UCM capabilities and API verification
+    # Validation uses allow-lists derived from PlanType and BillingPeriod enums in models.py
 
     # Deprecated values with specific migration guidance
     DEPRECATED_VALUES = {
@@ -169,8 +172,7 @@ class ProductValidationEngine:
         "tier": ["name", "up_to"],  # CORRECTED: starting_from is auto-generated, not user input
     }
 
-    # REMOVED: Hardcoded VALID_PERIODS array - now using UCM-only validation
-    # All period validation now relies on UCM capabilities and API verification
+    # Period validation uses allow-list derived from BillingPeriod enum in models.py
 
     @classmethod
     def validate_for_mcp(cls, product_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -257,8 +259,8 @@ class ProductValidationEngine:
                                 field=f"plan.{field}",
                                 value=None,
                                 error="SUBSCRIPTION plans require a 'period' field",
-                                suggestion="Add 'period' to your plan configuration. Use UCM get_capabilities to see valid periods",
-                                example={"plan": {"period": "MONTHLY"}},
+                                suggestion=f"Add 'period' to your plan configuration. Allowed values: {', '.join(p.value for p in BillingPeriod)}",
+                                example={"plan": {"period": "MONTH"}},
                             )
                         )
                     else:
@@ -320,15 +322,25 @@ class ProductValidationEngine:
         if "plan" in data and isinstance(data["plan"], dict):
             plan_data = data["plan"]
 
-            # UCM-only validation - let the API handle plan type validation
             plan_type = plan_data.get("type")
+            _allowed_plan_types = [t.value for t in PlanType]
+            _allowed_plan_types_str = ", ".join(_allowed_plan_types)
             if not plan_type:
                 errors.append(
                     ValidationError(
                         field="plan.type",
                         value=plan_type,
                         error="Plan type is required",
-                        suggestion="Use UCM get_capabilities to see valid types",
+                        suggestion=f"Use one of the allowed plan types: {_allowed_plan_types_str}",
+                    )
+                )
+            elif plan_type not in _allowed_plan_types and plan_type not in cls.DEPRECATED_VALUES.get("plan.type", {}):
+                errors.append(
+                    ValidationError(
+                        field="plan.type",
+                        value=plan_type,
+                        error=f"Invalid Plan type: {plan_type}; only these values are allowed: {_allowed_plan_types_str}",
+                        suggestion=f"Use one of the allowed plan types: {_allowed_plan_types_str}",
                     )
                 )
 
@@ -344,18 +356,28 @@ class ProductValidationEngine:
                     )
                 )
 
-            # UCM-only validation - let the API handle period validation
+            _allowed_periods = [p.value for p in BillingPeriod]
+            _allowed_periods_str = ", ".join(_allowed_periods)
+            period = plan_data.get("period")
             if plan_type == "SUBSCRIPTION":
-                period = plan_data.get("period")
-                if not period:
+                if period and period not in _allowed_periods:
                     errors.append(
                         ValidationError(
                             field="plan.period",
                             value=period,
-                            error="Period is required for SUBSCRIPTION plans",
-                            suggestion="Use UCM get_capabilities to see valid periods for SUBSCRIPTION plans",
+                            error=f"Invalid Plan period: {period}; only these values are allowed: {_allowed_periods_str}",
+                            suggestion=f"Use one of the allowed periods: {_allowed_periods_str}",
                         )
                     )
+            elif period and period not in _allowed_periods:
+                errors.append(
+                    ValidationError(
+                        field="plan.period",
+                        value=period,
+                        error=f"Invalid Plan period: {period}; only these values are allowed: {_allowed_periods_str}",
+                        suggestion=f"Use one of the allowed periods: {_allowed_periods_str}",
+                    )
+                )
 
         # Payment source validation with supported values
         payment_source = data.get("paymentSource")  # FIXED: Use correct API field name
@@ -387,6 +409,20 @@ class ProductValidationEngine:
                         value=payment_source,
                         error=f"Payment source '{payment_source}' is not supported",
                         suggestion="Use 'INVOICE_ONLY_NO_PAYMENT' or 'EXTERNAL_PAYMENT_NOTIFICATION'",
+                        severity="error",
+                    )
+                )
+
+        # Version format validation - must be MAJOR.MINOR.PATCH (semver)
+        version = data.get("version")
+        if isinstance(version, str):
+            if not ProductValidator.VERSION_PATTERN.match(version):
+                errors.append(
+                    ValidationError(
+                        field="version",
+                        value=version,
+                        error="Version must be semantic (MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-prerelease)",
+                        suggestion='Use format like "1.0.0" or "1.0.0-beta"',
                         severity="error",
                     )
                 )

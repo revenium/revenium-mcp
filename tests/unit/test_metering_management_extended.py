@@ -6,6 +6,7 @@ Mocks self.get_client() to avoid real API calls.
 """
 
 import pytest
+import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from mcp.types import TextContent
@@ -994,3 +995,48 @@ class TestNormalizeReturnDataEdgeCases:
     def test_integer_maps_to_no(self):
         mgmt = MeteringManagement()
         assert mgmt._normalize_return_data_parameter({"return_transaction_data": 42}) == "no"
+
+
+# ===========================================================================
+# _build_integration_capabilities_content — regression for BACK-949
+# ===========================================================================
+
+
+class TestBuildIntegrationCapabilitiesContent:
+    """Regression tests ensuring the integration guide content uses the correct
+    endpoint, auth headers, and camelCase field names (BACK-949)."""
+
+    @pytest_asyncio.fixture
+    async def integration_content(self):
+        return await MeteringManagement()._build_integration_capabilities_content(None)
+
+    @pytest.mark.asyncio
+    async def test_build_integration_capabilities_content_uses_correct_endpoint(self, integration_content):
+        """The integration guide must reference the real metering endpoint."""
+        # Correct endpoint must be present
+        assert "/meter/v2/ai/completions" in integration_content, (
+            "Integration guide should use /meter/v2/ai/completions"
+        )
+
+        # Legacy non-existent endpoint must NOT appear
+        assert "/v1/ai-transactions" not in integration_content, (
+            "Integration guide must not reference the non-existent /v1/ai-transactions endpoint"
+        )
+
+    @pytest.mark.asyncio
+    async def test_build_integration_capabilities_content_includes_api_key_header(self, integration_content):
+        """x-api-key header must appear in the guide (api.revenium.ai auth scheme)."""
+        assert "x-api-key" in integration_content, "Integration guide should document x-api-key header"
+
+    @pytest.mark.asyncio
+    async def test_build_integration_capabilities_content_uses_camel_case_fields(self, integration_content):
+        """Field names in the code examples must use camelCase, not snake_case."""
+        assert "inputTokenCount" in integration_content, (
+            "Integration guide should use camelCase field 'inputTokenCount'"
+        )
+        assert "outputTokenCount" in integration_content, (
+            "Integration guide should use camelCase field 'outputTokenCount'"
+        )
+        assert "requestDuration" in integration_content, (
+            "Integration guide should use camelCase field 'requestDuration'"
+        )

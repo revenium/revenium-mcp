@@ -10,7 +10,7 @@
 
 Once you've connected your AI applications to Revenium using any of the supported middleware libraries or via direct API integration, this MCP server allows agents to directly interact with your Revenium account. Connect Claude, OpenAI, or any MCP-compatible AI assistant to Revenium to configure AI cost alerts & tracking as well as usage-based billing for AI products.
 
-## Features
+##  Features
 
 ### AI Cost Tracking & Alerting - Never Be Surprised by Unexpected AI Costs Again
 - Ask AI agents to **set up AI cost alerts to avoid unexpected costs**
@@ -26,7 +26,7 @@ Once you've connected your AI applications to Revenium using any of the supporte
 
 ### Tool Registry - Register & Price Your AI Tools
 - **Register, manage, and analyze AI tools** with built-in pricing tiers
-- Support for multiple pricing models: per_request, tiered, and flat
+- Support for multiple pricing models: per-call, per-token, tiered, flat, and subscription
 - Track tool usage events and analyze cost, latency, and success rates
 
 ### Usage-based Billing & Chargebacks (Optional)
@@ -680,9 +680,10 @@ python -c "import os; from dotenv import load_dotenv; load_dotenv(); print(f'API
 pytest
 
 # Run linters
-ruff check .
-ruff format .
+black .
+isort .
 mypy .
+flake8
 ```
 
 **Important:** Never commit your `.env` file. The repository includes `.env.example` as a template.
