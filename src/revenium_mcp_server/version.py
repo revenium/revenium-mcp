@@ -21,10 +21,10 @@ def get_package_version() -> str:
     except importlib.metadata.PackageNotFoundError:
         # Fallback for development/testing environments
         logger.debug("Package metadata not found, using fallback version")
-        return "0.2.5-dev"
+        return "0.2.6-dev"
     except Exception as e:
         logger.warning(f"Error getting package version: {e}, using fallback")
-        return "0.2.5-dev"
+        return "0.2.6-dev"
 
 
 def get_mcp_protocol_version() -> str:
