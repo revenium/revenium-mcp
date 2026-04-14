@@ -64,6 +64,9 @@ class BillingPeriod(str, Enum):
     QUARTER = "QUARTER"
     WEEK = "WEEK"
     DAY = "DAY"
+    TEST_MINUTE = "TEST_MINUTE"
+    TEST_MINUTE_WITH_SYNTHETIC_METERING = "TEST_MINUTE_WITH_SYNTHETIC_METERING"
+    NONE = "NONE"
 
 
 class TrialPeriod(str, Enum):

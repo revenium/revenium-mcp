@@ -20,7 +20,7 @@ def get_default_capabilities() -> Dict[str, Any]:
             sub_capabilities={"listChanged": True},
             metadata={
                 "description": "Tool execution and management",
-                "tool_count": 17,
+                "tool_count": 11,
                 "supports_introspection": True,
             },
         ),
