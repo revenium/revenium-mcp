@@ -117,14 +117,9 @@ class ListResponse(BaseReveniumModel):
     has_more: bool = Field(False, description="Whether there are more pages")
 
 
-# REMOVED: Hardcoded validation enums - now using UCM-only validation
-# These enums were used for validation but are now replaced with dynamic UCM capabilities
+# Note: Explicit allow-list validation for BillingPeriod and PlanType is performed in product_validation_engine.py
+# These enums are preserved here for model definitions; validation logic uses them directly.
 
-# Note: These enums are preserved as comments for reference but should not be used for validation
-# Currency options: USD, EUR, GBP, CAD, AUD, JPY
-# BillingPeriod options: MONTH, YEAR, QUARTER, WEEK, DAY
-# TrialPeriod options: DAY, WEEK, MONTH
-# AggregationType options: SUM, COUNT, MAX, MIN, AVERAGE, LAST
 
 
 class RatingAggregationType(str, Enum):
