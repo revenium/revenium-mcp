@@ -8,8 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.5] - 2026-04-09
 
 ### Added
-- OAuth and multi-tenancy support for MCP server
-- MCP analytics migration: infrastructure & foundation, processors, full search filters
+- MCP analytics migration to high-performance endpoints
 - RELATIVE_CHANGE detection rule support with NLP mappings and operator validation
 - Jobs & Outcomes management tool — manage_jobs with ROI analytics
 - Tool Registry management tool — manage_tools with pricing tiers
@@ -23,10 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - search_ai_models to use server-side filtering instead of local pagination
 - Same pagination bug in validate_model_provider and estimate_transaction_cost
 - guided_setup and detect_and_recommend showing Unknown Workspace and #N/A
-- Mask externalSecret in dry_run preview_data
-- Replace stale pre-consolidation tool names in Slack response strings
 - Subscription update: extract clientEmailAddress from client.label
-- Preserve source field when all transformers fail
 - Organization/team update: inject tenantId in default_fields
 - Parameterize "Invalid Anomaly ID" error with correct resource type
 - Update 3 stale slack_setup_assistant references in email_verification.py
