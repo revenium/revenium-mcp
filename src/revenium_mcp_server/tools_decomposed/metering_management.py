@@ -3838,14 +3838,15 @@ class ReveniumMeteringClient:
         self.base_url = os.getenv("REVENIUM_BASE_URL", DEFAULT_BASE_URL)
 
     async def submit_transaction(self, transaction_data: Dict[str, Any]) -> Dict[str, Any]:
+        # api.revenium.ai uses x-api-key; Bearer is for app.revenium.ai/api/v2
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "x-api-key": self.api_key,
             "Content-Type": "application/json"
         }
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"{self.base_url}/v1/ai-transactions",
+                f"{self.base_url}/meter/v2/ai/completions",
                 json=transaction_data,
                 headers=headers
             ) as response:
@@ -3858,11 +3859,15 @@ async def main():
     transaction = {
         "model": "gpt-4o",
         "provider": "openai",
-        "input_tokens": 1500,
-        "output_tokens": 800,
-        "duration_ms": 2500,
-        "organization_id": "your-org-id",
-        "task_type": "text_generation"
+        "inputTokenCount": 1500,
+        "outputTokenCount": 800,
+        "requestDuration": 2500,
+        "requestTime": "2024-01-01T00:00:00Z",
+        "completionStartTime": "2024-01-01T00:00:01Z",
+        "responseTime": "2024-01-01T00:00:02Z",
+        "stopReason": "stop",
+        "organizationId": "your-org-id",
+        "taskType": "text_generation"
     }
 
     result = await client.submit_transaction(transaction)
@@ -3883,14 +3888,15 @@ class ReveniumMeteringClient {
     }
 
     async submitTransaction(transactionData) {
+        // api.revenium.ai uses x-api-key; Bearer is for app.revenium.ai/api/v2
         const headers = {
-            'Authorization': `Bearer ${this.apiKey}`,
+            'x-api-key': this.apiKey,
             'Content-Type': 'application/json'
         };
 
         try {
             const response = await axios.post(
-                `${this.baseUrl}/v1/ai-transactions`,
+                `${this.baseUrl}/meter/v2/ai/completions`,
                 transactionData,
                 { headers }
             );
@@ -3909,11 +3915,15 @@ async function main() {
     const transaction = {
         model: 'gpt-4o',
         provider: 'openai',
-        input_tokens: 1500,
-        output_tokens: 800,
-        duration_ms: 2500,
-        organization_id: 'your-org-id',
-        task_type: 'text_generation'
+        inputTokenCount: 1500,
+        outputTokenCount: 800,
+        requestDuration: 2500,
+        requestTime: '2024-01-01T00:00:00Z',
+        completionStartTime: '2024-01-01T00:00:01Z',
+        responseTime: '2024-01-01T00:00:02Z',
+        stopReason: 'stop',
+        organizationId: 'your-org-id',
+        taskType: 'text_generation'
     };
 
     try {
@@ -5156,11 +5166,15 @@ Use `validate()` before submission."""
                 "    transaction = {\n"
                 "        'model': 'gpt-4o',\n"
                 "        'provider': 'openai',\n"
-                "        'input_tokens': 1500,\n"
-                "        'output_tokens': 800,\n"
-                "        'duration_ms': 2500,\n"
-                "        'organization_id': 'my-org',\n"
-                "        'task_type': 'text_generation'\n"
+                "        'inputTokenCount': 1500,\n"
+                "        'outputTokenCount': 800,\n"
+                "        'requestDuration': 2500,\n"
+                "        'requestTime': '2024-01-01T00:00:00Z',\n"
+                "        'completionStartTime': '2024-01-01T00:00:01Z',\n"
+                "        'responseTime': '2024-01-01T00:00:02Z',\n"
+                "        'stopReason': 'stop',\n"
+                "        'organizationId': 'my-org',\n"
+                "        'taskType': 'text_generation'\n"
                 "    }\n"
                 "    \n"
                 "    try:\n"
@@ -5358,11 +5372,15 @@ Use `validate()` before submission."""
                 "        const transaction = {\n"
                 "            model: 'gpt-4o',\n"
                 "            provider: 'openai',\n"
-                "            input_tokens: 1500,\n"
-                "            output_tokens: 800,\n"
-                "            duration_ms: 2500,\n"
-                "            organization_id: 'my-org',\n"
-                "            task_type: 'text_generation'\n"
+                "            inputTokenCount: 1500,\n"
+                "            outputTokenCount: 800,\n"
+                "            requestDuration: 2500,\n"
+                "            requestTime: '2024-01-01T00:00:00Z',\n"
+                "            completionStartTime: '2024-01-01T00:00:01Z',\n"
+                "            responseTime: '2024-01-01T00:00:02Z',\n"
+                "            stopReason: 'stop',\n"
+                "            organizationId: 'my-org',\n"
+                "            taskType: 'text_generation'\n"
                 "        };\n"
                 "        \n"
                 "        const result = await client.submitTransaction(transaction);\n"
@@ -7131,11 +7149,15 @@ Use `validate()` before submission."""
                 "    transaction = {\n"
                 "        'model': 'gpt-4o',\n"
                 "        'provider': 'openai',\n"
-                "        'input_tokens': 1500,\n"
-                "        'output_tokens': 800,\n"
-                "        'duration_ms': 2500,\n"
-                "        'organization_id': 'my-org',\n"
-                "        'task_type': 'text_generation'\n"
+                "        'inputTokenCount': 1500,\n"
+                "        'outputTokenCount': 800,\n"
+                "        'requestDuration': 2500,\n"
+                "        'requestTime': '2024-01-01T00:00:00Z',\n"
+                "        'completionStartTime': '2024-01-01T00:00:01Z',\n"
+                "        'responseTime': '2024-01-01T00:00:02Z',\n"
+                "        'stopReason': 'stop',\n"
+                "        'organizationId': 'my-org',\n"
+                "        'taskType': 'text_generation'\n"
                 "    }\n"
                 "    \n"
                 "    try:\n"
