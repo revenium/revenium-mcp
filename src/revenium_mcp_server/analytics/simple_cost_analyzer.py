@@ -8,7 +8,7 @@ Focus on 95%+ success rate with simple, robust implementations.
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..endpoint_registry import resolve_analytics_request
 
@@ -745,6 +745,81 @@ class SimpleCostAnalyzer:
             # Re-raise original exception to preserve API error details (status codes, response data, etc.)
             raise
 
+    async def get_user_costs(
+        self, period: str, aggregation: str, filters: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get user costs using the new ClickHouse-backed analytics API.
+
+        Returns cost, request count, and token usage broken down by subscriber
+        email from AiMetricsCosted. Requires the new analytics API (FRONT-931).
+
+        Args:
+            period: Time period (API-verified values only)
+            aggregation: Aggregation type (API-verified values only)
+            filters: Optional dict with array params: agents, providers, models, users
+
+        Returns:
+            List of user cost data with cost, requests, and tokens per user
+
+        Raises:
+            Exception: If API call fails
+        """
+        try:
+            self.logger.info("Getting user costs for period=%s, aggregation=%s", period, aggregation)
+
+            team_id = self._get_team_id()
+
+            extra_old = {"group": aggregation} if aggregation else {}
+            extra_new = dict(filters) if filters else {}
+            # Default costSources to coding_assistant (subscriber email only populated there)
+            if "costSources" not in extra_new:
+                extra_new["costSources"] = ["coding_assistant"]
+            if aggregation and "aggregation" not in extra_new:
+                extra_new["aggregation"] = aggregation
+            path, params, call_kwargs = resolve_analytics_request(
+                "cost_metric_by_user_aggregated", team_id, period,
+                extra_old_params=extra_old,
+                extra_new_params=extra_new,
+            )
+
+            self.logger.debug("User costs API call to %s", path)
+
+            response = await self.client.get(path, params=params, **call_kwargs)
+
+            if not response:
+                self.logger.warning("Empty response from user costs API")
+                return []
+
+            # The new API returns HAL+JSON with _embedded.items
+            if isinstance(response, dict):
+                embedded = response.get("_embedded", {})
+                items = embedded.get("items", [])
+                if items:
+                    data = items
+                elif "groups" in response:
+                    # Fallback: legacy groups format
+                    data = [response]
+                else:
+                    data = response.get("data", [])
+            elif isinstance(response, list):
+                data = response
+            else:
+                data = []
+
+            if not data:
+                self.logger.warning("No user cost data found")
+                return []
+
+            processed_data = self._process_user_data(data)
+
+            self.logger.info("Successfully retrieved %d user cost records", len(processed_data))
+            return processed_data
+
+        except Exception as e:
+            self.logger.error("Failed to get user costs: %s", e)
+            raise
+
     async def get_cost_summary(self, period: str, aggregation: str) -> Dict[str, Any]:
         """
         Get enhanced cost summary combining all 5 data sources.
@@ -1127,3 +1202,231 @@ class SimpleCostAnalyzer:
         # Sort by cost descending
         processed_data.sort(key=lambda x: x.get("cost", 0), reverse=True)
         return processed_data
+
+    def _process_user_data(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Process user cost data from the cost-by-user-aggregated endpoint.
+
+        Handles the multi-metric response where each group (user email) has
+        COST_METRIC_BY_USER, REQUEST_METRIC_BY_USER, and TOKEN_METRIC_BY_USER.
+        """
+        processed_data = []
+        total_cost = 0.0
+
+        items = data if isinstance(data, list) else [data]
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            # Handle _embedded.items format (HAL+JSON from new API)
+            if "groupName" in item:
+                user_entry = self._extract_user_metrics(item)
+                if user_entry:
+                    processed_data.append(user_entry)
+                    total_cost += user_entry["cost"]
+            elif "groups" in item:
+                # Fallback: time-series format with nested groups
+                for group in item.get("groups", []):
+                    if isinstance(group, dict):
+                        user_entry = self._extract_user_metrics(group)
+                        if user_entry:
+                            processed_data.append(user_entry)
+                            total_cost += user_entry["cost"]
+
+        # Calculate percentages
+        for item in processed_data:
+            item["percentage"] = (item["cost"] / total_cost * 100) if total_cost > 0 else 0
+
+        # Sort by cost descending
+        processed_data.sort(key=lambda x: x.get("cost", 0), reverse=True)
+        return processed_data
+
+    def _extract_user_metrics(self, group: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Extract cost, requests, and tokens from a multi-metric user group."""
+        user_email = group.get("groupName", "")
+        if not user_email:
+            return None
+
+        metrics = group.get("metrics", [])
+        if not isinstance(metrics, list):
+            return None
+
+        cost = 0.0
+        requests = 0
+        tokens = 0
+
+        for metric in metrics:
+            if not isinstance(metric, dict):
+                continue
+            metric_type = metric.get("metricType", "")
+            value = metric.get("metricResult", 0)
+            if not isinstance(value, (int, float)):
+                continue
+
+            if metric_type == "COST_METRIC_BY_USER":
+                cost = float(value)
+            elif metric_type == "REQUEST_METRIC_BY_USER":
+                requests = int(value)
+            elif metric_type == "TOKEN_METRIC_BY_USER":
+                tokens = int(value)
+            elif not metric_type:
+                # Single-metric fallback (no metricType field) — treat as cost
+                cost += float(value)
+
+        if cost > 0 or requests > 0 or tokens > 0:
+            return {
+                "user_email": user_email,
+                "cost": cost,
+                "requests": requests,
+                "tokens": tokens,
+            }
+        return None
+
+    # ── Tool cost methods (use direct client calls, not endpoint_registry) ──
+
+    def _get_team_id(self) -> str:
+        """Get team_id from client or environment. Raises if unavailable."""
+        team_id = getattr(self.client, "team_id", None)
+        if not team_id:
+            team_id = os.getenv("REVENIUM_TEAM_ID")
+            if not team_id:
+                raise Exception("Team ID not available from client or environment")
+        return team_id
+
+    async def get_tool_costs(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
+        """Get tool costs using aggregated cost-by-tool endpoint."""
+        try:
+            self.logger.info(f"Getting tool costs for period={period}, aggregation={aggregation}")
+            team_id = self._get_team_id()
+            # aggregation is not passed: this endpoint doesn't support it as a query param;
+            # it's accepted here for pipeline consistency with other analytics actions.
+            response = await self.client.get_cost_by_tool_aggregated(teamId=team_id, period=period)
+            if not response:
+                return []
+            items = self._extract_embedded_items(response)
+            return self._process_tool_cost_items(items)
+        except Exception as e:
+            self.logger.error(f"Failed to get tool costs: {e}")
+            raise
+
+    async def get_top_tools(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
+        """Get top tools by call count."""
+        try:
+            self.logger.info(f"Getting top tools for period={period}, aggregation={aggregation}")
+            team_id = self._get_team_id()
+            # aggregation is not passed: this endpoint doesn't support it as a query param;
+            # it's accepted here for pipeline consistency with other analytics actions.
+            response = await self.client.get_top_tools_by_call_count(teamId=team_id, period=period)
+            if not response:
+                return []
+            return self._process_grouped_metrics(response, entity_key="tool", metric_key="call_count")
+        except Exception as e:
+            self.logger.error(f"Failed to get top tools: {e}")
+            raise
+
+    async def get_tool_costs_by_agent(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
+        """Get tool costs grouped by agent."""
+        try:
+            self.logger.info(f"Getting tool costs by agent for period={period}, aggregation={aggregation}")
+            team_id = self._get_team_id()
+            # aggregation is not passed: this endpoint doesn't support it as a query param;
+            # it's accepted here for pipeline consistency with other analytics actions.
+            response = await self.client.get_cost_by_tool_agent(teamId=team_id, period=period)
+            if not response:
+                return []
+            return self._process_grouped_metrics(response, entity_key="agent", metric_key="cost")
+        except Exception as e:
+            self.logger.error(f"Failed to get tool costs by agent: {e}")
+            raise
+
+    async def get_tool_costs_by_provider(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
+        """Get tool costs grouped by provider."""
+        try:
+            self.logger.info(f"Getting tool costs by provider for period={period}, aggregation={aggregation}")
+            team_id = self._get_team_id()
+            # aggregation is not passed: this endpoint doesn't support it as a query param;
+            # it's accepted here for pipeline consistency with other analytics actions.
+            response = await self.client.get_cost_by_tool_provider(teamId=team_id, period=period)
+            if not response:
+                return []
+            return self._process_grouped_metrics(response, entity_key="provider", metric_key="cost")
+        except Exception as e:
+            self.logger.error(f"Failed to get tool costs by provider: {e}")
+            raise
+
+    def _extract_embedded_items(self, response: Any) -> List[Dict[str, Any]]:
+        """Extract items from _embedded HAL response format."""
+        if isinstance(response, dict):
+            embedded = response.get("_embedded", {})
+            if isinstance(embedded, dict):
+                items = embedded.get("items", [])
+                if isinstance(items, list):
+                    return items
+            data = response.get("data", [])
+            if isinstance(data, list):
+                return data
+        if isinstance(response, list):
+            return response
+        return []
+
+    def _process_tool_cost_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Process tool cost items from aggregated endpoint."""
+        processed = []
+        total_cost = sum(
+            v for item in items
+            if isinstance(item, dict)
+            for v in [item.get("totalCost", 0)]
+            if isinstance(v, (int, float))
+        )
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            tool_id = item.get("toolId", item.get("toolName", "Unknown Tool"))
+            raw_cost = item.get("totalCost", 0)
+            cost = raw_cost if isinstance(raw_cost, (int, float)) else 0
+            entry = {"tool": tool_id, "cost": cost}
+            call_count = item.get("callCount")
+            if call_count is not None and isinstance(call_count, (int, float)):
+                entry["call_count"] = call_count
+            if total_cost > 0:
+                entry["percentage"] = (cost / total_cost) * 100
+            processed.append(entry)
+        processed.sort(key=lambda x: x.get("cost", 0), reverse=True)
+        return processed
+
+    def _process_grouped_metrics(self, response: Any, entity_key: str, metric_key: str) -> List[Dict[str, Any]]:
+        """Process grouped metrics response (groupName + metrics[].metricResult)."""
+        processed = []
+        responses = response if isinstance(response, list) else [response]
+        for item in responses:
+            if not isinstance(item, dict):
+                continue
+            if "groups" in item:
+                for group in item.get("groups", []):
+                    if not isinstance(group, dict):
+                        continue
+                    entry = self._extract_group_entry(group, entity_key, metric_key)
+                    if entry:
+                        processed.append(entry)
+            else:
+                entry = self._extract_group_entry(item, entity_key, metric_key)
+                if entry:
+                    processed.append(entry)
+        processed.sort(key=lambda x: x.get(metric_key, 0), reverse=True)
+        return processed
+
+    def _extract_group_entry(self, group: Dict[str, Any], entity_key: str, metric_key: str):
+        """Extract a single entry from a group dict with groupName + metrics."""
+        name = group.get("groupName", f"Unknown {entity_key.title()}")
+        metrics = group.get("metrics", [])
+        if not isinstance(metrics, list):
+            return None
+        total = 0.0
+        for metric in metrics:
+            if isinstance(metric, dict):
+                val = metric.get("metricResult", 0)
+                if isinstance(val, (int, float)):
+                    total += val
+        if total > 0:
+            return {entity_key: name, metric_key: total}
+        return None

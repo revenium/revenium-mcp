@@ -834,3 +834,314 @@ class TestHandleGetAnomalyStatus:
         result = await alert_mgmt._handle_get_anomaly_status(mock_client, {})
         text = _text(result)
         assert "Alert 42" in text
+
+
+# ===========================================================================
+# BACK-1136 — periodDuration accepted as flat kwarg on create/update
+# ===========================================================================
+
+class TestPeriodDurationFlatKwarg:
+    """Regression for BACK-1136 — periodDuration is documented in get_examples
+    but the MCP signature previously omitted it, so the FastMCP-generated
+    schema rejected callers that passed it as a top-level kwarg with
+    extra_forbidden. The fix exposes it as a signature parameter and threads
+    it into anomaly_data on create + the updatable_fields list on update."""
+
+    @pytest.mark.asyncio
+    async def test_create_injects_flat_period_duration_into_empty_anomaly_data(
+        self, alert_mgmt, mock_client
+    ):
+        """A flat periodDuration with no anomaly_data wraps into a dict and
+        reaches anomaly_manager.create_anomaly."""
+        alert_mgmt.anomaly_manager.create_anomaly = AsyncMock(
+            return_value=[TextContent(type="text", text="created")]
+        )
+        await alert_mgmt._handle_anomaly_operations(
+            mock_client, "create", {"periodDuration": "FIVE_MINUTES"}
+        )
+        called_data = alert_mgmt.anomaly_manager.create_anomaly.call_args[0][1]
+        assert called_data == {"periodDuration": "FIVE_MINUTES"}
+
+    @pytest.mark.asyncio
+    async def test_create_merges_flat_period_duration_when_anomaly_data_lacks_it(
+        self, alert_mgmt, mock_client
+    ):
+        """A flat periodDuration is added to anomaly_data when not nested."""
+        alert_mgmt.anomaly_manager.create_anomaly = AsyncMock(
+            return_value=[TextContent(type="text", text="created")]
+        )
+        await alert_mgmt._handle_anomaly_operations(
+            mock_client,
+            "create",
+            {
+                "anomaly_data": {"name": "Spike", "alertType": "THRESHOLD"},
+                "periodDuration": "FIFTEEN_MINUTES",
+            },
+        )
+        called_data = alert_mgmt.anomaly_manager.create_anomaly.call_args[0][1]
+        assert called_data["periodDuration"] == "FIFTEEN_MINUTES"
+        assert called_data["name"] == "Spike"
+
+    @pytest.mark.asyncio
+    async def test_create_does_not_overwrite_nested_period_duration(
+        self, alert_mgmt, mock_client
+    ):
+        """Nested periodDuration wins over flat kwarg (explicit > implicit)."""
+        alert_mgmt.anomaly_manager.create_anomaly = AsyncMock(
+            return_value=[TextContent(type="text", text="created")]
+        )
+        await alert_mgmt._handle_anomaly_operations(
+            mock_client,
+            "create",
+            {
+                "anomaly_data": {"name": "Spike", "periodDuration": "ONE_HOUR"},
+                "periodDuration": "FIVE_MINUTES",
+            },
+        )
+        called_data = alert_mgmt.anomaly_manager.create_anomaly.call_args[0][1]
+        assert called_data["periodDuration"] == "ONE_HOUR"
+
+    @pytest.mark.asyncio
+    async def test_update_threads_flat_period_duration_through_direct_params(
+        self, alert_mgmt, mock_client
+    ):
+        """periodDuration is part of updatable_fields and reaches update_anomaly."""
+        alert_mgmt.anomaly_manager.update_anomaly = AsyncMock(
+            return_value=[TextContent(type="text", text="updated")]
+        )
+        await alert_mgmt._handle_anomaly_operations(
+            mock_client,
+            "update",
+            {"anomaly_id": "anom_42", "periodDuration": "MONTHLY"},
+        )
+        called_id = alert_mgmt.anomaly_manager.update_anomaly.call_args[0][1]
+        called_data = alert_mgmt.anomaly_manager.update_anomaly.call_args[0][2]
+        assert called_id == "anom_42"
+        assert called_data["periodDuration"] == "MONTHLY"
+
+
+class TestTriggerAfterPersistsDurationFlatKwarg:
+    """Parallel regression to TestPeriodDurationFlatKwarg: triggerAfterPersistsDuration
+    is exposed as a top-level kwarg and documented in get_examples payloads, so a
+    caller who passes it flat on create must have it threaded into anomaly_data
+    rather than silently dropped."""
+
+    @pytest.mark.asyncio
+    async def test_create_injects_flat_trigger_into_empty_anomaly_data(
+        self, alert_mgmt, mock_client
+    ):
+        """A flat triggerAfterPersistsDuration with no anomaly_data wraps into a dict."""
+        alert_mgmt.anomaly_manager.create_anomaly = AsyncMock(
+            return_value=[TextContent(type="text", text="created")]
+        )
+        await alert_mgmt._handle_anomaly_operations(
+            mock_client, "create", {"triggerAfterPersistsDuration": "FIFTEEN_MINUTES"}
+        )
+        called_data = alert_mgmt.anomaly_manager.create_anomaly.call_args[0][1]
+        assert called_data == {"triggerAfterPersistsDuration": "FIFTEEN_MINUTES"}
+
+    @pytest.mark.asyncio
+    async def test_create_merges_flat_trigger_when_anomaly_data_lacks_it(
+        self, alert_mgmt, mock_client
+    ):
+        """A flat triggerAfterPersistsDuration is added to anomaly_data when not nested."""
+        alert_mgmt.anomaly_manager.create_anomaly = AsyncMock(
+            return_value=[TextContent(type="text", text="created")]
+        )
+        await alert_mgmt._handle_anomaly_operations(
+            mock_client,
+            "create",
+            {
+                "anomaly_data": {"name": "Spike", "alertType": "THRESHOLD"},
+                "triggerAfterPersistsDuration": "FIFTEEN_MINUTES",
+            },
+        )
+        called_data = alert_mgmt.anomaly_manager.create_anomaly.call_args[0][1]
+        assert called_data["triggerAfterPersistsDuration"] == "FIFTEEN_MINUTES"
+        assert called_data["name"] == "Spike"
+
+    @pytest.mark.asyncio
+    async def test_create_does_not_overwrite_nested_trigger(
+        self, alert_mgmt, mock_client
+    ):
+        """Nested triggerAfterPersistsDuration wins over flat kwarg (explicit > implicit)."""
+        alert_mgmt.anomaly_manager.create_anomaly = AsyncMock(
+            return_value=[TextContent(type="text", text="created")]
+        )
+        await alert_mgmt._handle_anomaly_operations(
+            mock_client,
+            "create",
+            {
+                "anomaly_data": {
+                    "name": "Spike",
+                    "triggerAfterPersistsDuration": "ONE_HOUR",
+                },
+                "triggerAfterPersistsDuration": "FIVE_MINUTES",
+            },
+        )
+        called_data = alert_mgmt.anomaly_manager.create_anomaly.call_args[0][1]
+        assert called_data["triggerAfterPersistsDuration"] == "ONE_HOUR"
+
+
+class TestFlatKwargInjectionPreservesFalsyValues:
+    """Regression for code-review feedback (PR #150): the injection guard must
+    use `is not None` (not truthiness) so falsy-but-explicitly-passed values
+    like "" reach the backend rather than being silently dropped at the MCP
+    layer. The backend is the correct place to reject semantically invalid
+    durations — silently dropping them masks the caller's intent."""
+
+    @pytest.mark.asyncio
+    async def test_create_forwards_explicit_empty_string_period_duration(
+        self, alert_mgmt, mock_client
+    ):
+        """An explicit periodDuration='' is forwarded, not dropped."""
+        alert_mgmt.anomaly_manager.create_anomaly = AsyncMock(
+            return_value=[TextContent(type="text", text="created")]
+        )
+        await alert_mgmt._handle_anomaly_operations(
+            mock_client,
+            "create",
+            {
+                "anomaly_data": {"name": "Spike"},
+                "periodDuration": "",
+            },
+        )
+        called_data = alert_mgmt.anomaly_manager.create_anomaly.call_args[0][1]
+        assert "periodDuration" in called_data
+        assert called_data["periodDuration"] == ""
+
+    @pytest.mark.asyncio
+    async def test_create_forwards_explicit_empty_string_trigger(
+        self, alert_mgmt, mock_client
+    ):
+        """An explicit triggerAfterPersistsDuration='' is forwarded, not dropped."""
+        alert_mgmt.anomaly_manager.create_anomaly = AsyncMock(
+            return_value=[TextContent(type="text", text="created")]
+        )
+        await alert_mgmt._handle_anomaly_operations(
+            mock_client,
+            "create",
+            {
+                "anomaly_data": {"name": "Spike"},
+                "triggerAfterPersistsDuration": "",
+            },
+        )
+        called_data = alert_mgmt.anomaly_manager.create_anomaly.call_args[0][1]
+        assert "triggerAfterPersistsDuration" in called_data
+        assert called_data["triggerAfterPersistsDuration"] == ""
+
+    @pytest.mark.asyncio
+    async def test_create_skips_truly_absent_fields(self, alert_mgmt, mock_client):
+        """When neither flat kwarg is passed (key absent or None), neither
+        is injected — the loop must distinguish absent from explicitly empty."""
+        alert_mgmt.anomaly_manager.create_anomaly = AsyncMock(
+            return_value=[TextContent(type="text", text="created")]
+        )
+        await alert_mgmt._handle_anomaly_operations(
+            mock_client,
+            "create",
+            {
+                "anomaly_data": {"name": "Spike"},
+                "periodDuration": None,
+                # triggerAfterPersistsDuration not in dict at all
+            },
+        )
+        called_data = alert_mgmt.anomaly_manager.create_anomaly.call_args[0][1]
+        assert "periodDuration" not in called_data
+        assert "triggerAfterPersistsDuration" not in called_data
+        assert called_data == {"name": "Spike"}
+
+
+# ===========================================================================
+# BACK-1137 — alert_id accepted as alias for anomaly_id
+# ===========================================================================
+
+class TestAlertIdAlias:
+    """Regression for BACK-1137 — capabilities text references alert_id while
+    anomaly handlers require anomaly_id, so callers following the docs hit a
+    'missing anomaly_id' error. handle_action now coerces alert_id into
+    anomaly_id when anomaly_id is absent, leaving alerts-resource paths
+    untouched (they read alert_id directly)."""
+
+    @pytest.mark.asyncio
+    async def test_get_anomaly_accepts_alert_id_alias(self, alert_mgmt, mock_client):
+        """get with alert_id (no anomaly_id) reaches the anomaly handler."""
+        alert_mgmt.anomaly_manager.get_anomaly = AsyncMock(
+            return_value=[TextContent(type="text", text="anomaly")]
+        )
+        await alert_mgmt.handle_action("get", {"alert_id": "anom_42"})
+        called_id = alert_mgmt.anomaly_manager.get_anomaly.call_args[0][1]
+        assert called_id == "anom_42"
+
+    @pytest.mark.asyncio
+    async def test_anomaly_id_wins_when_both_provided(self, alert_mgmt, mock_client):
+        """Explicit anomaly_id is preserved when alert_id is also passed."""
+        alert_mgmt.anomaly_manager.get_anomaly = AsyncMock(
+            return_value=[TextContent(type="text", text="anomaly")]
+        )
+        await alert_mgmt.handle_action(
+            "get", {"anomaly_id": "anom_real", "alert_id": "anom_alias"}
+        )
+        called_id = alert_mgmt.anomaly_manager.get_anomaly.call_args[0][1]
+        assert called_id == "anom_real"
+
+    @pytest.mark.asyncio
+    async def test_explicit_falsy_anomaly_id_is_not_overwritten_by_alias(
+        self, alert_mgmt, mock_client
+    ):
+        """anomaly_id="" must still win over alert_id (PR #151 review): the
+        alias guard now uses key-presence, not truthiness, so an explicitly-
+        passed falsy value reaches the handler unchanged rather than being
+        silently overwritten by alert_id. The downstream handler may still
+        reject the empty value — the contract enforced here is only that
+        the dispatch-level coercion does not mutate arguments when
+        anomaly_id is present (even if falsy).
+        """
+        captured_args: dict = {}
+
+        async def capture_args(client, arguments):  # noqa: ARG001
+            captured_args.update(arguments)
+            return [TextContent(type="text", text="captured")]
+
+        with patch.object(
+            alert_mgmt, "_handle_get", new=AsyncMock(side_effect=capture_args),
+        ):
+            await alert_mgmt.handle_action(
+                "get", {"anomaly_id": "", "alert_id": "anom_alias"}
+            )
+
+        # The dispatch must not have copied alert_id over the explicit
+        # (falsy) anomaly_id — the empty value is preserved.
+        assert captured_args["anomaly_id"] == ""
+        assert captured_args["alert_id"] == "anom_alias"
+
+    @pytest.mark.asyncio
+    async def test_alerts_resource_get_still_uses_alert_id(self, alert_mgmt, mock_client):
+        """resource_type=alerts paths read alert_id directly; the alias does
+        not break them or shadow alert_id with a stale anomaly_id."""
+        alert_mgmt.alert_manager.get_alert = AsyncMock(
+            return_value=[TextContent(type="text", text="alert event")]
+        )
+        await alert_mgmt.handle_action(
+            "get", {"resource_type": "alerts", "alert_id": "evt_123"}
+        )
+        called_id = alert_mgmt.alert_manager.get_alert.call_args[0][1]
+        assert called_id == "evt_123"
+
+    @pytest.mark.asyncio
+    async def test_disable_anomaly_accepts_alert_id_alias(self, alert_mgmt, mock_client):
+        """The standalone disable handler also benefits from the alias since
+        the coercion happens at handle_action dispatch."""
+        mock_client.get_anomaly_by_id.return_value = {
+            "id": "anom_99",
+            "name": "X",
+            "enabled": True,
+        }
+        mock_client.update_anomaly.return_value = {
+            "id": "anom_99",
+            "name": "X",
+            "enabled": False,
+        }
+        result = await alert_mgmt.handle_action("disable", {"alert_id": "anom_99"})
+        text = _text(result)
+        assert "anom_99" in text

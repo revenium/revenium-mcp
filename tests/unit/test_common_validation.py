@@ -8,7 +8,10 @@ from src.revenium_mcp_server.common.validation import (
     preprocess_numeric_parameters,
     preprocess_boolean_parameters,
     preprocess_array_parameters,
+    validate_pagination_params,
+    validate_string_params,
 )
+from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.exceptions import ValidationError
 
 
@@ -208,3 +211,136 @@ class TestPreprocessArrayParameters:
     def test_missing_param_ignored(self):
         result = preprocess_array_parameters({"x": 1}, ["dims"])
         assert "dims" not in result
+
+
+# ---------------------------------------------------------------------------
+# validate_pagination_params (BACK-1097)
+# ---------------------------------------------------------------------------
+
+class TestValidatePaginationParams:
+    def test_int_values_pass_through(self):
+        result = validate_pagination_params({"page": 0, "size": 20}, action="list")
+        assert result["page"] == 0
+        assert result["size"] == 20
+
+    def test_string_digits_coerced_to_int(self):
+        result = validate_pagination_params({"page": "3", "size": "10"}, action="list")
+        assert result["page"] == 3
+        assert result["size"] == 10
+
+    def test_string_with_whitespace_coerced(self):
+        result = validate_pagination_params({"page": " 2 "}, action="list")
+        assert result["page"] == 2
+
+    def test_missing_keys_pass_through(self):
+        result = validate_pagination_params({"other": "x"}, action="list")
+        assert result == {"other": "x"}
+
+    def test_none_values_skipped(self):
+        result = validate_pagination_params({"page": None, "size": None}, action="list")
+        assert result["page"] is None
+        assert result["size"] is None
+
+    def test_non_numeric_string_raises_tool_error(self):
+        with pytest.raises(ToolError) as exc:
+            validate_pagination_params({"page": "not_a_number"}, action="list tools")
+        assert exc.value.field == "page"
+        assert "not_a_number" in str(exc.value.message)
+        # Every suggestion should mention the action name so the user can tell
+        # which call failed (BACK-1097 review follow-up).
+        assert exc.value.suggestions, "expected at least one suggestion"
+        for suggestion in exc.value.suggestions:
+            assert "list tools" in suggestion
+
+    def test_negative_page_raises(self):
+        with pytest.raises(ToolError) as exc:
+            validate_pagination_params({"page": -1}, action="list")
+        assert exc.value.field == "page"
+
+    def test_size_below_minimum_raises(self):
+        with pytest.raises(ToolError) as exc:
+            validate_pagination_params({"size": 0}, action="list")
+        assert exc.value.field == "size"
+
+    def test_size_above_maximum_raises(self):
+        with pytest.raises(ToolError) as exc:
+            validate_pagination_params({"size": 101}, action="list")
+        assert exc.value.field == "size"
+
+    def test_bool_rejected(self):
+        """True/False are int subclasses in Python — should be rejected, not coerced."""
+        with pytest.raises(ToolError) as exc:
+            validate_pagination_params({"page": True}, action="list")
+        assert exc.value.field == "page"
+
+    def test_float_rejected(self):
+        with pytest.raises(ToolError) as exc:
+            validate_pagination_params({"page": 1.5}, action="list")
+        assert exc.value.field == "page"
+
+    def test_does_not_mutate_input(self):
+        original = {"page": "5"}
+        validate_pagination_params(original, action="list")
+        assert original == {"page": "5"}
+
+    def test_overlong_digit_string_rejected_without_int_overflow_attempt(self):
+        """Very long digit strings must be rejected via the length guard, not
+        passed to int(). On Python < 3.11.4, int("9" * 1_000_000) would saturate
+        CPU (CVE-2020-10735); the guard short-circuits to a ToolError instead.
+        """
+        huge_digits = "9" * 1000
+        with pytest.raises(ToolError) as exc:
+            validate_pagination_params({"page": huge_digits}, action="list")
+        assert exc.value.field == "page"
+
+
+class TestValidateStringParams:
+    """Reject non-string values on string-typed fields so callers see a
+    structured ToolError instead of a raw Pydantic `string_type` leak."""
+
+    def test_all_strings_pass_through_unchanged(self):
+        args = {"tool_id": "abc123", "tool_name": "MyTool", "action": "get"}
+        result = validate_string_params(args, ["tool_id", "tool_name"], action="get")
+        assert result == args
+
+    def test_missing_fields_are_ignored(self):
+        result = validate_string_params({"action": "list"}, ["tool_id"], action="list")
+        assert result == {"action": "list"}
+
+    def test_none_values_are_ignored(self):
+        result = validate_string_params({"tool_id": None}, ["tool_id"], action="get")
+        assert result == {"tool_id": None}
+
+    def test_int_raises_tool_error_with_field_context(self):
+        with pytest.raises(ToolError) as exc:
+            validate_string_params({"tool_id": 12345}, ["tool_id"], action="get")
+        assert exc.value.field == "tool_id"
+        assert "string" in exc.value.message.lower()
+        assert "12345" in exc.value.message
+
+    def test_float_raises(self):
+        with pytest.raises(ToolError) as exc:
+            validate_string_params({"tool_id": 1.5}, ["tool_id"], action="get")
+        assert exc.value.field == "tool_id"
+
+    def test_bool_raises(self):
+        """Python booleans are int subclasses; must reject explicitly to avoid
+        silent coercion into 'True'/'False'."""
+        with pytest.raises(ToolError) as exc:
+            validate_string_params({"tool_id": True}, ["tool_id"], action="get")
+        assert exc.value.field == "tool_id"
+
+    def test_error_message_mentions_action(self):
+        with pytest.raises(ToolError) as exc:
+            validate_string_params({"tool_id": 42}, ["tool_id"], action="get tool")
+        assert "get tool" in " ".join(exc.value.suggestions or []).lower() or "get tool" in exc.value.message.lower()
+
+    def test_original_dict_not_mutated(self):
+        original = {"tool_id": "abc"}
+        validate_string_params(original, ["tool_id"], action="get")
+        assert original == {"tool_id": "abc"}
+
+    def test_empty_string_still_passes(self):
+        """Semantic validity (empty not allowed) is enforced downstream, not here."""
+        result = validate_string_params({"tool_id": ""}, ["tool_id"], action="get")
+        assert result["tool_id"] == ""

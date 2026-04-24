@@ -12,10 +12,12 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..client import ReveniumAPIError, ReveniumClient
 from ..common.error_handling import (
+    ErrorCodes,
     ToolError,
     create_structured_missing_parameter_error,
     create_structured_validation_error,
 )
+from ..common.validation import validate_pagination_params
 from ..introspection.metadata import (
     ToolCapability,
     ToolType,
@@ -32,6 +34,7 @@ class ToolManager:
 
     async def list_tools(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """List tools with pagination."""
+        arguments = validate_pagination_params(arguments, action="list tools")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
         filters = arguments.get("filters", {})
@@ -45,7 +48,28 @@ class ToolManager:
             "tools": tools,
             "pagination": page_info,
             "total_found": len(tools),
+            "page": page,
         }
+
+    @staticmethod
+    def _raise_tool_not_found(tool_id: str, lookup: str) -> None:
+        """Raise a structured RESOURCE_NOT_FOUND ToolError for a missing tool.
+
+        Mirrors the pattern manage_customers uses for team/user lookups so the
+        caller sees "Tool not found" instead of a passthrough HTTP 500
+        (BACK-1098, same class as BACK-910).
+        """
+        raise ToolError(
+            message=f"Tool not found for {lookup}: {tool_id!r}",
+            error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+            field="tool_id",
+            value=tool_id,
+            suggestions=[
+                "Verify the tool ID exists using list(action='list')",
+                "Use search(query='...') to look up tools by name",
+                "Check that the ID was copied verbatim — IDs are case-sensitive",
+            ],
+        )
 
     async def get_tool(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get specific tool by ID."""
@@ -59,7 +83,15 @@ class ToolManager:
                     "valid_format": "Tool ID should be a string identifier",
                 },
             )
-        return await self.client.get_tool(tool_id)
+        try:
+            return await self.client.get_tool(tool_id)
+        except ReveniumAPIError as e:
+            # Tool Registry returns 500 for missing IDs and 403 for deleted
+            # IDs; both fold into "Tool not found" so callers see consistent
+            # semantics and no cross-tenant existence can be inferred.
+            if e.status_code in (403, 404, 500):
+                self._raise_tool_not_found(tool_id, lookup="id")
+            raise
 
     async def get_by_tool_id(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get specific tool by team-scoped toolId."""
@@ -73,7 +105,12 @@ class ToolManager:
                     "valid_format": "Team-scoped tool identifier",
                 },
             )
-        return await self.client.get_tool_by_tool_id(tool_id)
+        try:
+            return await self.client.get_tool_by_tool_id(tool_id)
+        except ReveniumAPIError as e:
+            if e.status_code in (403, 404, 500):
+                self._raise_tool_not_found(tool_id, lookup="toolId")
+            raise
 
     async def create_tool(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new tool."""
@@ -99,6 +136,11 @@ class ToolManager:
                         "Use create_simple action for convenience pricing setup",
                     ],
                 )
+        # Inject teamId from auth context — server requires it and rejects with HTTP 400
+        # otherwise. Mirrors the pattern used by create_simple and customer_management
+        # subscriber/team creation. See BACK-1095 (and BACK-911 for the broader pattern).
+        if "teamId" not in tool_data:
+            tool_data["teamId"] = self.client.team_id
         return await self.client.create_tool(tool_data)
 
     async def update_tool(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -182,11 +224,72 @@ class ToolManager:
         return await self.client.restore_tool(tool_id)
 
     async def search_tools(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Search tools by query."""
-        query = arguments.get("query", "")
+        """Search tools by query.
+
+        The Tool Registry GET endpoint accepts a ``name`` query parameter but
+        the live server currently ignores it and returns the unfiltered list,
+        so callers got every tool back regardless of ``query`` (BACK-1138 —
+        same shape as BACK-927 for ``search_ai_models``). Until the server
+        implements proper filtering, fall back to a client-side substring
+        match on the returned page and surface a ``filter_warning`` so the
+        caller knows the search is limited to the requested page of the
+        unfiltered list.
+        """
+        arguments = validate_pagination_params(arguments, action="search tools")
+        query = (arguments.get("query") or "").strip()
+        if not query:
+            raise create_structured_missing_parameter_error(
+                parameter_name="query",
+                action="search tools",
+                examples={
+                    "usage": "search(query='billing')",
+                    "valid_format": "non-empty substring matched against tool name and description",
+                    "examples": [
+                        "search(query='billing')",
+                        "search(query='openai')",
+                    ],
+                },
+            )
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        return await self.client.search_tools(query=query, page=page, size=size)
+        response = await self.client.search_tools(query=query, page=page, size=size)
+        tools = self.client._extract_embedded_data(response)
+        page_info = self.client._extract_pagination_info(response)
+
+        needle = query.lower()
+        matched = [
+            t
+            for t in tools
+            if needle in str(t.get("name", "")).lower()
+            or needle in str(t.get("description", "")).lower()
+        ]
+        result: Dict[str, Any] = {
+            "action": "search",
+            "query": query,
+            # Raw server page metadata (totalElements/totalPages reflect the
+            # unfiltered tenant list, not the client-filtered match set —
+            # use total_found below for the actual match count on this page).
+            "pagination": page_info,
+            "tools": matched,
+            "total_found": len(matched),
+        }
+        # Emit filter_warning whenever there is a possibility the caller is
+        # missing matches: either we found some on this page (more may exist
+        # on other pages) OR this page returned zero matches but the server
+        # reports more pages to scan. Suppressing the warning on a true dead
+        # end (zero matches AND only one page) avoids the misleading "phantom
+        # matches elsewhere" hint Tessie iter-1 flagged, while still keeping
+        # callers from prematurely concluding "no such tool exists" when the
+        # server actually has more pages to look at (Greptile iter-1 P1).
+        more_pages = page_info.get("totalPages", 1) > 1
+        if matched or more_pages:
+            result["filter_warning"] = (
+                "Search is applied client-side on the requested page only. The "
+                "Tool Registry server does not yet filter by query, so matches "
+                "beyond this page are not returned. Increase 'size' or paginate "
+                "via list_tools for a wider sweep."
+            )
+        return result
 
     async def meter_event(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Submit a tool/function call for metering via global endpoint."""
@@ -201,6 +304,7 @@ class ToolManager:
 
     async def list_events(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """List tool event logs via global filterable endpoint."""
+        arguments = validate_pagination_params(arguments, action="list tool events")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
         filters = arguments.get("filters", {})
@@ -208,8 +312,21 @@ class ToolManager:
         filters = {k: v for k, v in filters.items() if k not in ("page", "size")}
         return await self.client.list_tool_events(page=page, size=size, **filters)
 
-    # Analytics-relevant params — only these are forwarded to analytics client methods
-    _ANALYTICS_PARAMS = {"start_date", "end_date", "granularity", "tool_id", "tool_name", "agent", "provider"}
+    # Analytics-relevant params — only these are forwarded to analytics client methods.
+    # `period` and `group` mirror the analytics contract used by business_analytics_management
+    # (see BACK-1096): without them in this set the MCP layer silently dropped the params
+    # before they reached the server.
+    _ANALYTICS_PARAMS = {
+        "start_date",
+        "end_date",
+        "granularity",
+        "tool_id",
+        "tool_name",
+        "agent",
+        "provider",
+        "period",
+        "group",
+    }
 
     def _extract_analytics_filters(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Extract only analytics-relevant params from arguments."""
@@ -264,6 +381,7 @@ class ToolManager:
                 action="get tool events",
                 examples={"usage": "get_events(tool_id='tool_123', page=0, size=20)"},
             )
+        arguments = validate_pagination_params(arguments, action="get tool events")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
         return await self.client.get_tool_events(tool_id, page=page, size=size)
@@ -664,6 +782,22 @@ class ToolManagement(ToolBase):
                     "type": "string",
                     "description": "Provider identifier for provider-scoped analytics (get_cost_by_provider, get_cost_by_provider_aggregated)",
                 },
+                "period": {
+                    "type": "string",
+                    "enum": [
+                        "HOUR",
+                        "EIGHT_HOURS",
+                        "TWENTY_FOUR_HOURS",
+                        "SEVEN_DAYS",
+                        "THIRTY_DAYS",
+                        "TWELVE_MONTHS",
+                    ],
+                    "description": "Time window for analytics actions (e.g. SEVEN_DAYS). Mirrors the period parameter used by business_analytics_management.",
+                },
+                "group": {
+                    "type": "string",
+                    "description": "Grouping/aggregation key for analytics actions (e.g. TOTAL, MEAN, MAXIMUM, MINIMUM, or a dimension name like 'cost'). Forwarded as-is to the server.",
+                },
             },
             "required": ["action"],
             "additionalProperties": False,
@@ -852,6 +986,9 @@ class ToolManagement(ToolBase):
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle tool registry management actions."""
         try:
+            # Deferred import: module-level import would trigger a circular
+            # import chain through analytics/__init__.py.
+            from ..analytics.cost_enrichment import enrich_cost_response  # noqa: PLC0415
             if action == "get_tool_metadata":
                 metadata = await self.get_tool_metadata()
                 return [TextContent(type="text", text=json.dumps(metadata.to_dict(), indent=2))]
@@ -924,7 +1061,7 @@ class ToolManagement(ToolBase):
                 return [
                     TextContent(
                         type="text",
-                        text=f"Found {result['total_found']} tools (page {arguments.get('page', 0) + 1}):\n\n"
+                        text=f"Found {result['total_found']} tools (page {result.get('page', 0) + 1}):\n\n"
                         + json.dumps(result, indent=2),
                     )
                 ]
@@ -983,6 +1120,7 @@ class ToolManagement(ToolBase):
 
             elif action == "get_cost_breakdown":
                 result = await manager.get_cost_breakdown(arguments)
+                result = enrich_cost_response(result)
                 return [TextContent(type="text", text=f"Cost breakdown:\n{json.dumps(result, indent=2)}")]
 
             elif action == "get_top_tools":
@@ -999,22 +1137,27 @@ class ToolManagement(ToolBase):
 
             elif action == "get_cost_aggregated":
                 result = await manager.get_cost_aggregated(arguments)
+                result = enrich_cost_response(result)
                 return [TextContent(type="text", text=f"Aggregated cost per tool:\n{json.dumps(result, indent=2)}")]
 
             elif action == "get_cost_by_agent":
                 result = await manager.get_cost_by_agent(arguments)
+                result = enrich_cost_response(result)
                 return [TextContent(type="text", text=f"Cost by agent:\n{json.dumps(result, indent=2)}")]
 
             elif action == "get_agent_breakdown":
                 result = await manager.get_agent_breakdown(arguments)
+                result = enrich_cost_response(result)
                 return [TextContent(type="text", text=f"Agent-tool breakdown:\n{json.dumps(result, indent=2)}")]
 
             elif action == "get_cost_by_provider":
                 result = await manager.get_cost_by_provider(arguments)
+                result = enrich_cost_response(result)
                 return [TextContent(type="text", text=f"Cost by provider:\n{json.dumps(result, indent=2)}")]
 
             elif action == "get_cost_by_provider_aggregated":
                 result = await manager.get_cost_by_provider_aggregated(arguments)
+                result = enrich_cost_response(result)
                 return [TextContent(type="text", text=f"Aggregated cost by provider:\n{json.dumps(result, indent=2)}")]
 
             elif action == "get_filter_options":

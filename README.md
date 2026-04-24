@@ -548,7 +548,7 @@ These values are loaded from your account and can be overridden if needed:
 | Variable | Required | Description | Example |
 |----------|----------|-------------|---------|
 | `REVENIUM_BASE_URL` |  | API endpoint URL (defaults to main Revenium instance) | `https://api.revenium.ai` |
-| `REVENIUM_APP_BASE_URL` |  | Defines which Revenium web application instance to use for Slack channel configurations (defaults to main Revenium instance) | `https://ai.revenium.io` |
+| `REVENIUM_APP_BASE_URL` |  | Revenium application/analytics host used by tool-cost analytics (`/api/v2/analytics/*`) and Slack integrations. When `REVENIUM_BASE_URL` points at a non-production environment, set this too — otherwise analytics calls default to production and fail with 401 for non-prod API keys. | `https://ai.revenium.io` |
 | `LOG_LEVEL` |  | Logging verbosity level | `DEBUG` |
 | `REQUEST_TIMEOUT` |  | API request timeout in seconds | `30` |
 

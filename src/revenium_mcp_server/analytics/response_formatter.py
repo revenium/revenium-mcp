@@ -18,6 +18,8 @@ from .formatters import (
     ErrorFormatter,
     ModelCostsFormatter,
     ProviderCostsFormatter,
+    ToolCostsFormatter,
+    UserCostsFormatter,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,8 +49,10 @@ class ResponseFormatter:
         self.provider_costs_formatter = ProviderCostsFormatter(production_mode)
         self.api_key_costs_formatter = ApiKeyCostsFormatter(production_mode)
         self.agent_costs_formatter = AgentCostsFormatter(production_mode)
+        self.tool_costs_formatter = ToolCostsFormatter(production_mode)
         self.cost_spike_formatter = CostSpikeFormatter(production_mode)
         self.cost_summary_formatter = CostSummaryFormatter(production_mode)
+        self.user_costs_formatter = UserCostsFormatter(production_mode)
         self.error_formatter = ErrorFormatter(production_mode)
 
     def format_provider_costs_response(
@@ -135,6 +139,39 @@ class ResponseFormatter:
         """
         params = {"period": period, "aggregation": aggregation}
         return self.agent_costs_formatter.format(data, params)
+
+    def format_user_costs_response(
+        self, data: List[Dict[str, Any]], period: str, aggregation: str
+    ) -> str:
+        """
+        Format user costs response using dedicated formatter.
+
+        Args:
+            data: User cost data from API
+            period: Time period used
+            aggregation: Aggregation type used
+
+        Returns:
+            Formatted response string
+        """
+        params = {"period": period, "aggregation": aggregation}
+        return self.user_costs_formatter.format(data, params)
+
+    def format_tool_costs_response(
+        self, data: List[Dict[str, Any]], period: str, aggregation: str
+    ) -> str:
+        """Format tool costs response using dedicated formatter.
+
+        Args:
+            data: Tool cost data from API
+            period: Time period used
+            aggregation: Aggregation type used
+
+        Returns:
+            Formatted response string
+        """
+        params = {"period": period, "aggregation": aggregation}
+        return self.tool_costs_formatter.format(data, params)
 
     def format_cost_spike_response(
         self, data: Dict[str, Any], threshold: float, period: str

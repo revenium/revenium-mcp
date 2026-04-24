@@ -33,6 +33,23 @@ from ..trace_fields import extract_trace_fields
 
 # Import Prometheus metrics if available
 # Prometheus metrics removed - infrastructure monitoring handled externally
+
+
+# BACK-1139: Canonical provider enum enforced on the submit_ai_transaction
+# write path. Mirrors the list used by analytics_registry.validate_request,
+# so a transaction that satisfies the metering enum will also satisfy the
+# read-side analytics filters. Compared case-insensitively (the API persists
+# upper-case but several examples in the docs use lower-case).
+_VALID_PROVIDERS = (
+    "OPENAI",
+    "ANTHROPIC",
+    "GOOGLE",
+    "AZURE",
+    "COHERE",
+    "MISTRAL",
+    "TOGETHER",
+    "GROQ",
+)
 PROMETHEUS_METRICS_AVAILABLE = False
 
 # Mapping from MCP argument names (snake_case) to completions API filter param names (camelCase).
@@ -395,6 +412,21 @@ class MeteringTransactionManager:
                     if len(value) > 200 or any(char in value for char in ["<", ">", '"', "'", "&"]):
                         logger.warning(f"Potentially malicious {field}: {value}")
                         return False
+
+            # BACK-1139: mirror the provider enum check performed in the async
+            # pipeline's _validate_string_fields (see lines ~802-811). The two
+            # validation paths exist in parallel today (async pipeline for the
+            # real submit path, sync method for the fast/test path), and must
+            # stay in lock-step — lifting the _VALID_PROVIDERS tuple to module
+            # scope is the cheap part; mirroring the check here is the rest.
+            provider_value = arguments.get("provider")
+            if isinstance(provider_value, str) and provider_value.strip():
+                if provider_value.strip().upper() not in _VALID_PROVIDERS:
+                    logger.warning(
+                        f"Invalid provider '{provider_value}'. Must be one of: "
+                        f"{', '.join(_VALID_PROVIDERS)}"
+                    )
+                    return False
 
             # Validate optional fields
             optional_string_fields = [
@@ -781,6 +813,17 @@ The subscriber data structure has been updated. The old individual fields are no
                 if any(char in value for char in ["<", ">", '"', "'", "&"]):
                     errors.append(f"• {field}: Contains invalid characters")
                     continue
+
+        # BACK-1139: enforce the documented provider enum on the write path.
+        # Without this, arbitrary strings (including typos) were persisted
+        # silently and corrupted downstream analytics aggregation.
+        provider_value = arguments.get("provider")
+        if isinstance(provider_value, str) and provider_value.strip():
+            if provider_value.strip().upper() not in _VALID_PROVIDERS:
+                errors.append(
+                    f"• provider: Invalid provider '{provider_value}'. Must be one of: "
+                    f"{', '.join(_VALID_PROVIDERS)}"
+                )
 
         return errors
 

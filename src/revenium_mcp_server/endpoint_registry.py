@@ -42,7 +42,7 @@ class EndpointConfig:
     """
 
     mapping_status: str = "READY"
-    """Migration status: 'READY' means the new path is confirmed; 'TBD' means not yet verified."""
+    """Migration status: 'READY' means the new path is confirmed; 'TBD' means not yet verified; 'NEW_API_ONLY' means the endpoint exists only on the new API and has no legacy equivalent."""
 
     unit_multiplier: float = 1.0
     """Multiplier applied to new-API metric values to convert to the same unit as the old API.
@@ -192,6 +192,13 @@ _ENDPOINT_REGISTRY: Dict[str, EndpointConfig] = {
         old_path="/profitstream/v2/api/sources/metrics/ai/performance-metrics-by-agents",
         new_path="/api/v2/analytics/avg-time-by-agent",
         unit_multiplier=1000.0,
+    ),
+    # ── User cost endpoint (new-API only — no legacy equivalent) ────────
+    # New: /api/v2/analytics/cost-by-user-aggregated  (FRONT-931 — aggregated)
+    "cost_metric_by_user_aggregated": EndpointConfig(
+        old_path="/api/v2/analytics/cost-by-user-aggregated",  # placeholder; guarded by mapping_status="NEW_API_ONLY"
+        new_path="/api/v2/analytics/cost-by-user-aggregated",
+        mapping_status="NEW_API_ONLY",
     ),
     # ── Status / connectivity endpoint ────────────────────────────────────
     # Old: /profitstream/v2/api/sources/metrics/ai/data-connected
@@ -353,6 +360,11 @@ def resolve_analytics_request(
         ``await client.get(path, params=params, **call_kwargs)``
     """
     config = get_endpoint_config(key)
+
+    if config.mapping_status == "NEW_API_ONLY" and not _use_new_api():
+        raise RuntimeError(
+            f"Endpoint {key!r} is new-API only; set REVENIUM_USE_NEW_ANALYTICS_API=true to use it."
+        )
 
     if _use_new_api() and config.new_path is not None:
         from .analytics_parameters import TimePeriod

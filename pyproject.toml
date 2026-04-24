@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "revenium-mcp"
-version = "0.2.6"
+version = "0.2.7"
 description = "Model Context Protocol (MCP) server for Revenium API monitoring, analytics, and AI spending management"
 readme = "README.md"
 license = "MIT"

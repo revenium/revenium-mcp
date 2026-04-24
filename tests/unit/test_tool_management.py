@@ -13,7 +13,8 @@ from src.revenium_mcp_server.tools_decomposed.tool_management import (
     ToolManager,
     ToolManagement,
 )
-from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.client import ReveniumAPIError
+from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from mcp.types import TextContent
 
 
@@ -100,6 +101,22 @@ class TestToolManagerList:
 
         mock_client.list_tools.assert_called_once_with(page=0, size=20)
 
+    @pytest.mark.asyncio
+    async def test_list_tools_rejects_non_numeric_page(self, tool_manager, mock_client):
+        """Wrong-type page raises a structured ToolError, not a raw TypeError (BACK-1097)."""
+        with pytest.raises(ToolError) as exc:
+            await tool_manager.list_tools({"page": "not_a_number"})
+        assert exc.value.field == "page"
+        mock_client.list_tools.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_tools_coerces_string_page(self, tool_manager, mock_client):
+        """A digit-only string for page is coerced rather than rejected."""
+        mock_client._extract_embedded_data.return_value = []
+        mock_client._extract_pagination_info.return_value = {}
+        await tool_manager.list_tools({"page": "2", "size": "5"})
+        mock_client.list_tools.assert_called_once_with(page=2, size=5)
+
 
 class TestToolManagerGet:
     """Test ToolManager.get_tool behavior."""
@@ -115,6 +132,51 @@ class TestToolManagerGet:
     async def test_get_tool_missing_id_raises(self, tool_manager):
         with pytest.raises(ToolError):
             await tool_manager.get_tool({})
+
+    @pytest.mark.asyncio
+    async def test_get_tool_500_translates_to_not_found(self, tool_manager, mock_client):
+        """HTTP 500 from the registry on a bogus tool_id surfaces as a structured
+        RESOURCE_NOT_FOUND ToolError mentioning Tool (BACK-1098)."""
+        mock_client.get_tool.side_effect = ReveniumAPIError("boom", status_code=500)
+        with pytest.raises(ToolError) as exc:
+            await tool_manager.get_tool({"tool_id": "NONEXISTENT"})
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert exc.value.field == "tool_id"
+        assert "Tool" in exc.value.message
+        assert "NONEXISTENT" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_get_tool_404_translates_to_not_found(self, tool_manager, mock_client):
+        """HTTP 404 also maps to the same structured error envelope."""
+        mock_client.get_tool.side_effect = ReveniumAPIError("missing", status_code=404)
+        with pytest.raises(ToolError) as exc:
+            await tool_manager.get_tool({"tool_id": "X"})
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_get_tool_403_translates_to_not_found(self, tool_manager, mock_client):
+        """HTTP 403 from the Tool Registry surfaces as 'Tool not found'.
+
+        The server returns 403 (not 404) when a caller GETs a previously-
+        deleted tool_id; from the client's POV this is semantically
+        equivalent to "not found" (no cross-tenant ID leak).
+        """
+        mock_client.get_tool.side_effect = ReveniumAPIError("forbidden", status_code=403)
+        with pytest.raises(ToolError) as exc:
+            await tool_manager.get_tool({"tool_id": "DELETED"})
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert exc.value.field == "tool_id"
+        assert "DELETED" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_get_tool_other_api_errors_propagate(self, tool_manager, mock_client):
+        """API errors outside the {403, 404, 500} not-found set still
+        propagate unchanged so callers can distinguish genuine failures."""
+        original = ReveniumAPIError("rate limited", status_code=429)
+        mock_client.get_tool.side_effect = original
+        with pytest.raises(ReveniumAPIError) as exc:
+            await tool_manager.get_tool({"tool_id": "X"})
+        assert exc.value is original
 
 
 class TestToolManagerGetByToolId:
@@ -132,6 +194,24 @@ class TestToolManagerGetByToolId:
         with pytest.raises(ToolError):
             await tool_manager.get_by_tool_id({})
 
+    @pytest.mark.asyncio
+    async def test_get_by_tool_id_500_translates_to_not_found(self, tool_manager, mock_client):
+        """get_by_tool_id gets the same translation contract as get_tool."""
+        mock_client.get_tool_by_tool_id.side_effect = ReveniumAPIError("boom", status_code=500)
+        with pytest.raises(ToolError) as exc:
+            await tool_manager.get_by_tool_id({"tool_id": "missing-team-scoped-id"})
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert "toolId" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_get_by_tool_id_403_translates_to_not_found(self, tool_manager, mock_client):
+        """get_by_tool_id mirrors get_tool's 403 handling."""
+        mock_client.get_tool_by_tool_id.side_effect = ReveniumAPIError("forbidden", status_code=403)
+        with pytest.raises(ToolError) as exc:
+            await tool_manager.get_by_tool_id({"tool_id": "deleted-team-scoped"})
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert "toolId" in exc.value.message
+
 
 class TestToolManagerCreate:
     """Test ToolManager.create_tool behavior."""
@@ -142,12 +222,33 @@ class TestToolManagerCreate:
         mock_client.create_tool.return_value = {"id": "t3", **tool_data}
         result = await tool_manager.create_tool({"tool_data": tool_data})
         assert result["name"] == "New Tool"
-        mock_client.create_tool.assert_called_once_with(tool_data)
+        # teamId is auto-injected from the client's auth context (see BACK-1095)
+        mock_client.create_tool.assert_called_once_with(
+            {"name": "New Tool", "type": "api", "teamId": "test_team_id_456"}
+        )
 
     @pytest.mark.asyncio
     async def test_create_tool_missing_data_raises(self, tool_manager):
         with pytest.raises(ToolError):
             await tool_manager.create_tool({})
+
+    @pytest.mark.asyncio
+    async def test_create_tool_injects_team_id(self, tool_manager, mock_client):
+        """create injects teamId from the client's auth context (BACK-1095)."""
+        mock_client.create_tool.return_value = {"id": "t1"}
+        await tool_manager.create_tool({"tool_data": {"name": "X", "toolType": "MCP_SERVER"}})
+        sent = mock_client.create_tool.call_args[0][0]
+        assert sent["teamId"] == "test_team_id_456"
+
+    @pytest.mark.asyncio
+    async def test_create_tool_preserves_explicit_team_id(self, tool_manager, mock_client):
+        """An explicit teamId in the payload is not overwritten by the auto-injection."""
+        mock_client.create_tool.return_value = {"id": "t1"}
+        await tool_manager.create_tool(
+            {"tool_data": {"name": "X", "toolType": "MCP_SERVER", "teamId": "custom_team"}}
+        )
+        sent = mock_client.create_tool.call_args[0][0]
+        assert sent["teamId"] == "custom_team"
 
 
 class TestToolManagerUpdate:
@@ -239,16 +340,15 @@ class TestToolManagerSearch:
 
     @pytest.mark.asyncio
     async def test_search_tools_calls_client(self, tool_manager, mock_client):
-        mock_client.search_tools.return_value = {"results": [{"id": "t1", "name": "Match"}]}
+        mock_client._extract_embedded_data.return_value = [{"id": "t1", "name": "Match"}]
+        mock_client._extract_pagination_info.return_value = {"totalPages": 1, "totalElements": 1}
         result = await tool_manager.search_tools({"query": "Match", "page": 0, "size": 10})
-        assert "results" in result
+        assert result["action"] == "search"
+        assert result["tools"] == [{"id": "t1", "name": "Match"}]
+        # filter_warning must be present when there is at least one match —
+        # the page-bounded scope caveat applies to non-empty results.
+        assert "filter_warning" in result
         mock_client.search_tools.assert_called_once_with(query="Match", page=0, size=10)
-
-    @pytest.mark.asyncio
-    async def test_search_tools_defaults(self, tool_manager, mock_client):
-        mock_client.search_tools.return_value = {"results": []}
-        await tool_manager.search_tools({})
-        mock_client.search_tools.assert_called_once_with(query="", page=0, size=20)
 
 
 # ===========================================================================
@@ -469,6 +569,27 @@ class TestToolManagerAnalyticsFilterForwarding:
         })
         assert filters == {"agent": "a1", "provider": "p1", "start_date": "2025-01-01", "tool_id": "t1"}
 
+    @pytest.mark.asyncio
+    async def test_period_param_forwarded(self, tool_manager, mock_client):
+        """period reaches the analytics client method (BACK-1096)."""
+        mock_client.get_top_tools_by_call_count.return_value = {}
+        await tool_manager.get_top_tools({"period": "SEVEN_DAYS", "junk": "dropped"})
+        mock_client.get_top_tools_by_call_count.assert_called_once_with(period="SEVEN_DAYS")
+
+    @pytest.mark.asyncio
+    async def test_group_param_forwarded(self, tool_manager, mock_client):
+        """group reaches the analytics client method (BACK-1096)."""
+        mock_client.get_cost_by_tool.return_value = {}
+        await tool_manager.get_cost_breakdown({"group": "TOTAL", "period": "THIRTY_DAYS"})
+        mock_client.get_cost_by_tool.assert_called_once_with(group="TOTAL", period="THIRTY_DAYS")
+
+    def test_extract_analytics_filters_includes_period_and_group(self, tool_manager):
+        """period and group are recognised analytics params (BACK-1096)."""
+        filters = tool_manager._extract_analytics_filters({
+            "period": "SEVEN_DAYS", "group": "TOTAL", "tool_id": "t1",
+        })
+        assert filters == {"period": "SEVEN_DAYS", "group": "TOTAL", "tool_id": "t1"}
+
 
 # ===========================================================================
 # ToolManagement (top-level) Tests
@@ -504,6 +625,17 @@ class TestToolManagementMetadata:
         schema = await tool_mgmt._get_input_schema()
         assert "action" in schema["required"]
         assert "action" in schema["properties"]
+
+    @pytest.mark.asyncio
+    async def test_input_schema_exposes_period_and_group(self, tool_mgmt):
+        """Schema declares period/group so analytics callers don't trigger Pydantic
+        rejection (BACK-1096). additionalProperties stays False, so unknown params
+        still fail loudly — only these two were the legitimate gap."""
+        schema = await tool_mgmt._get_input_schema()
+        assert "period" in schema["properties"]
+        assert "group" in schema["properties"]
+        assert schema["additionalProperties"] is False
+        assert "SEVEN_DAYS" in schema["properties"]["period"]["enum"]
 
 
 # ===========================================================================
@@ -731,3 +863,273 @@ class TestToolManagementHandleAction:
         assert len(result) == 1
         assert "Tool Pricing Guide" in result[0].text
         assert "pricing_structure" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_list_dispatch_with_digit_string_page_no_typeerror(self, tool_mgmt, mock_client):
+        """Digit-string page flows end-to-end to display text without TypeError (BACK-1097).
+
+        Regression guard for the Greptile P1: list_tools coerces page internally,
+        but the outer handle_action display text previously read the un-coerced
+        arguments dict and raised `TypeError: can only concatenate str (not "int")`.
+        """
+        mock_client._extract_embedded_data.return_value = [{"id": "t1", "name": "Equifax"}]
+        mock_client._extract_pagination_info.return_value = {"totalPages": 3, "totalElements": 21}
+        tool_mgmt.client = mock_client
+
+        result = await tool_mgmt.handle_action("list", {"page": "2", "size": "10"})
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContent)
+        assert "page 3" in result[0].text
+        assert "Found 1 tools" in result[0].text
+        mock_client.list_tools.assert_called_once_with(page=2, size=10)
+
+
+
+# ===========================================================================
+# Unit Cost Enrichment (BACK-1055)
+# ===========================================================================
+
+
+class TestCostActionEnrichment:
+    """Each of the six cost actions must emit ``currency`` and formatted fields."""
+
+    @pytest.mark.asyncio
+    async def test_get_cost_aggregated_emits_currency_and_formatted_field(
+        self, tool_mgmt, mock_client
+    ):
+        mock_client.get_cost_by_tool_aggregated.return_value = {
+            "_embedded": {"items": [{"toolId": "t1", "totalCost": 106344}]}
+        }
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+        result = await tool_mgmt.handle_action(
+            "get_cost_aggregated", {"period": "THIRTY_DAYS"}
+        )
+        text = result[0].text
+        assert '"currency": "USD"' in text
+        assert '"totalCost_formatted": "$106,344.00"' in text
+
+    @pytest.mark.asyncio
+    async def test_get_cost_by_agent_emits_currency_and_formatted_field(
+        self, tool_mgmt, mock_client
+    ):
+        mock_client.get_cost_by_tool_agent.return_value = {
+            "groups": [
+                {
+                    "groupName": "agent-x",
+                    "metrics": [
+                        {"metricResult": 480.369, "metricType": "COST_METRIC_BY_TOOL_AGENT"}
+                    ],
+                }
+            ]
+        }
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+        result = await tool_mgmt.handle_action(
+            "get_cost_by_agent", {"period": "SEVEN_DAYS"}
+        )
+        text = result[0].text
+        assert '"currency": "USD"' in text
+        assert '"metricResult_formatted": "$480.37"' in text
+
+    @pytest.mark.asyncio
+    async def test_get_cost_breakdown_emits_currency(
+        self, tool_mgmt, mock_client
+    ):
+        mock_client.get_cost_by_tool.return_value = {
+            "groups": [{"metrics": [{"metricResult": 75774}]}]
+        }
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+        result = await tool_mgmt.handle_action("get_cost_breakdown", {})
+        text = result[0].text
+        assert '"currency": "USD"' in text
+        assert '"metricResult_formatted": "$75,774.00"' in text
+
+    @pytest.mark.asyncio
+    async def test_get_agent_breakdown_emits_currency(
+        self, tool_mgmt, mock_client
+    ):
+        mock_client.get_agent_tool_breakdown.return_value = {
+            "groups": [{"metrics": [{"metricResult": 12.5}]}]
+        }
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+        result = await tool_mgmt.handle_action("get_agent_breakdown", {})
+        text = result[0].text
+        assert '"currency": "USD"' in text
+        assert '"metricResult_formatted": "$12.50"' in text
+
+    @pytest.mark.asyncio
+    async def test_get_cost_by_provider_emits_currency(
+        self, tool_mgmt, mock_client
+    ):
+        mock_client.get_cost_by_tool_provider.return_value = {
+            "groups": [{"metrics": [{"metricResult": 1}]}]
+        }
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+        result = await tool_mgmt.handle_action("get_cost_by_provider", {})
+        text = result[0].text
+        assert '"currency": "USD"' in text
+        assert '"metricResult_formatted": "$1.00"' in text
+
+    @pytest.mark.asyncio
+    async def test_get_cost_by_provider_aggregated_emits_currency(
+        self, tool_mgmt, mock_client
+    ):
+        mock_client.get_cost_by_tool_provider_aggregated.return_value = {
+            "groups": [{"metrics": [{"metricResult": 2}]}]
+        }
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+        result = await tool_mgmt.handle_action(
+            "get_cost_by_provider_aggregated", {}
+        )
+        text = result[0].text
+        assert '"currency": "USD"' in text
+        assert '"metricResult_formatted": "$2.00"' in text
+
+
+class TestNonCostActionsNotEnriched:
+    """Actions that are not cost-related must not have currency labels injected."""
+
+    @pytest.mark.asyncio
+    async def test_get_top_tools_has_no_currency(
+        self, tool_mgmt, mock_client
+    ):
+        mock_client.get_top_tools_by_call_count.return_value = {
+            "groups": [{"metrics": [{"metricResult": 42}]}]
+        }
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+        result = await tool_mgmt.handle_action("get_top_tools", {})
+        text = result[0].text
+        assert '"currency": "USD"' not in text
+        assert "metricResult_formatted" not in text
+
+    @pytest.mark.asyncio
+    async def test_get_success_rate_has_no_currency(
+        self, tool_mgmt, mock_client
+    ):
+        mock_client.get_tool_success_rate.return_value = {
+            "groups": [{"metrics": [{"metricResult": 0.95}]}]
+        }
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+        result = await tool_mgmt.handle_action("get_success_rate", {})
+        text = result[0].text
+        assert '"currency": "USD"' not in text
+        assert "metricResult_formatted" not in text
+
+    @pytest.mark.asyncio
+    async def test_get_latency_has_no_currency(
+        self, tool_mgmt, mock_client
+    ):
+        mock_client.get_tool_latency.return_value = {
+            "groups": [{"metrics": [{"metricResult": 123}]}]
+        }
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+        result = await tool_mgmt.handle_action("get_latency", {})
+        text = result[0].text
+        assert '"currency": "USD"' not in text
+        assert "metricResult_formatted" not in text
+
+
+# ===========================================================================
+# BACK-1138 — search applies a client-side filter and warns about page-1 scope
+# ===========================================================================
+
+
+class TestToolManagerSearchClientSideFilter:
+    """Regression for BACK-1138 — search previously forwarded the query as
+    ``name=...`` and returned the server's response verbatim. The Tool
+    Registry endpoint ignores the filter today and returns every tool, so
+    callers got the full list back. Follow the BACK-927 pattern: substring-
+    filter the returned page client-side and surface a warning that beyond
+    the requested page no other matches are evaluated."""
+
+    @pytest.mark.asyncio
+    async def test_search_requires_query(self, tool_manager):
+        """An empty query is no longer silently treated as 'list everything'."""
+        with pytest.raises(ToolError):
+            await tool_manager.search_tools({})
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_query_raises_structured_error(self, tool_manager, mock_client):
+        """A whitespace-only query must be rejected before any client call.
+
+        Non-empty but whitespace-only strings are truthy in Python, so an
+        unguarded ``if not query`` check would let them through and the
+        stripped needle would match every tool (names/descriptions commonly
+        contain spaces). Strip before the empty check and raise the structured
+        missing-parameter error.
+        """
+        with pytest.raises(ToolError):
+            await tool_manager.search_tools({"query": "   "})
+        mock_client.search_tools.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_search_filters_returned_page_by_name(self, tool_manager, mock_client):
+        """Only tools whose name contains the query (case-insensitive) survive."""
+        mock_client._extract_embedded_data.return_value = [
+            {"id": "t1", "name": "Billing Sync", "description": ""},
+            {"id": "t2", "name": "Plaid", "description": ""},
+            {"id": "t3", "name": "Equifax", "description": "billing connector"},
+        ]
+        mock_client._extract_pagination_info.return_value = {"totalPages": 1, "totalElements": 3}
+
+        result = await tool_manager.search_tools({"query": "billing"})
+
+        assert result["action"] == "search"
+        assert result["query"] == "billing"
+        assert {t["id"] for t in result["tools"]} == {"t1", "t3"}
+        assert result["total_found"] == 2
+        assert "filter_warning" in result
+        mock_client.search_tools.assert_called_once_with(query="billing", page=0, size=20)
+
+    @pytest.mark.asyncio
+    async def test_search_returns_empty_without_warning_on_single_page(
+        self, tool_manager, mock_client
+    ):
+        """Zero matches AND only one page → no warning (true dead end).
+
+        Suppressing the warning here avoids the misleading "phantom matches
+        elsewhere" hint Tessie iter-1 flagged: the server reported a single
+        page, the caller scanned all of it client-side, and nothing matched.
+        """
+        mock_client._extract_embedded_data.return_value = [
+            {"id": "t1", "name": "Plaid", "description": ""},
+        ]
+        mock_client._extract_pagination_info.return_value = {"totalPages": 1, "totalElements": 1}
+
+        result = await tool_manager.search_tools({"query": "billing"})
+
+        assert result["tools"] == []
+        assert result["total_found"] == 0
+        assert "filter_warning" not in result
+
+    @pytest.mark.asyncio
+    async def test_search_returns_empty_with_warning_when_more_pages(
+        self, tool_manager, mock_client
+    ):
+        """Zero matches BUT server reports more pages → warning is present.
+
+        Greptile iter-1 escalated the previous "always drop on empty" change
+        to P1: a caller (especially an LLM agent) seeing tools=[] with no
+        warning concludes "no such tool exists anywhere" and stops paginating.
+        When totalPages > 1 the call only scanned one page of the unfiltered
+        list, so the warning must stay to nudge the caller to keep going.
+        """
+        mock_client._extract_embedded_data.return_value = [
+            {"id": "t1", "name": "Plaid", "description": ""},
+        ]
+        mock_client._extract_pagination_info.return_value = {"totalPages": 5, "totalElements": 100}
+
+        result = await tool_manager.search_tools({"query": "billing"})
+
+        assert result["tools"] == []
+        assert result["total_found"] == 0
+        assert "filter_warning" in result
+
+    @pytest.mark.asyncio
+    async def test_search_passes_pagination_to_client(self, tool_manager, mock_client):
+        mock_client._extract_embedded_data.return_value = []
+        mock_client._extract_pagination_info.return_value = {}
+
+        await tool_manager.search_tools({"query": "x", "page": 2, "size": 50})
+
+        mock_client.search_tools.assert_called_once_with(query="x", page=2, size=50)

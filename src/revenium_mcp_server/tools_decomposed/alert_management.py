@@ -103,6 +103,23 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
             # Get client
             client = await self.get_client()
 
+            # Compatibility alias for the anomaly_id parameter. The capabilities
+            # text and several example payloads still call the resource
+            # identifier "alert_id" in places where the underlying handler
+            # expects anomaly_id (e.g. get/update/delete/disable on anomaly
+            # resources). Treat alert_id as a synonym when anomaly_id is
+            # missing so callers following the docs do not hit a 400 for the
+            # parameter name alone. Alerts-resource paths are unaffected: the
+            # alert_operations branch reads alert_id directly and never
+            # consults anomaly_id.
+            #
+            # Use key-presence (not truthiness) so an explicitly-passed
+            # falsy anomaly_id (None, "", 0) still wins over alert_id —
+            # silently overwriting an explicit value would violate the
+            # "anomaly_id wins when both are passed" invariant.
+            if "anomaly_id" not in arguments and arguments.get("alert_id"):
+                arguments = {**arguments, "anomaly_id": arguments["alert_id"]}
+
             # Route to appropriate handler based on action
             if action == "list":
                 return await self._handle_list(client, arguments)
@@ -882,6 +899,26 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
 
         elif action == "create":
             anomaly_data = arguments.get("anomaly_data")
+            # Honor flat periodDuration / triggerAfterPersistsDuration kwargs by
+            # injecting them into anomaly_data when provided alongside (or
+            # instead of) the nested payload. Both fields are top-level
+            # arguments in the MCP signature and both appear in the example
+            # payloads from get_examples, so callers frequently pass them flat.
+            # Without this, the values are silently dropped unless nested.
+            # Nested values win over flat kwargs (explicit > implicit).
+            #
+            # Use `is not None` (not truthiness) so falsy-but-meaningful
+            # values like "" are forwarded to the backend rather than
+            # silently dropped at the MCP layer — let the API surface the
+            # error instead of pretending the caller never sent the field.
+            for field in ("periodDuration", "triggerAfterPersistsDuration"):
+                flat_value = arguments.get(field)
+                if flat_value is None:
+                    continue
+                if isinstance(anomaly_data, dict):
+                    anomaly_data.setdefault(field, flat_value)
+                elif anomaly_data is None:
+                    anomaly_data = {field: flat_value}
             if not anomaly_data:
                 error = create_structured_missing_parameter_error(
                     parameter_name="anomaly_data",
@@ -941,6 +978,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                 "tags",
                 "metricType",
                 "period",
+                "periodDuration",
                 "triggerAfterPersistsDuration",
             ]
 

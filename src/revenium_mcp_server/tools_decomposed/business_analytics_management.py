@@ -36,6 +36,7 @@ from ..common.error_handling import (
     create_structured_missing_parameter_error,
     create_structured_validation_error,
 )
+from ..common.validation import validate_pagination_params
 from ..introspection.metadata import ToolType
 
 
@@ -48,7 +49,7 @@ class BusinessAnalyticsManagement(ToolBase):
 
     tool_name: ClassVar[str] = "business_analytics_management"
     tool_description: ClassVar[str] = (
-        "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_examples() for parameter guidance and get_capabilities() for status."
+        "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_user_costs, get_tool_costs, get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_examples() for parameter guidance and get_capabilities() for status."
     )
     business_category: ClassVar[str] = "Metering and Analytics Tools"
     tool_type: ClassVar[ToolType] = ToolType.ANALYTICS
@@ -156,6 +157,12 @@ class BusinessAnalyticsManagement(ToolBase):
             Tool response
         """
         try:
+            # Reject wrong-type page/size up front so callers get a structured
+            # error instead of a silent accept (BACK-1097). The actions below do
+            # not paginate today, but enforcing the shared contract keeps the
+            # error envelope consistent with manage_tools.
+            arguments = validate_pagination_params(arguments, action=action)
+
             # Route to appropriate handler
             if action == "get_capabilities":
                 return await self._handle_get_capabilities()
@@ -173,6 +180,16 @@ class BusinessAnalyticsManagement(ToolBase):
                 return await self._handle_get_api_key_costs(arguments)
             elif action == "get_agent_costs":
                 return await self._handle_get_agent_costs(arguments)
+            elif action == "get_user_costs":
+                return await self._handle_get_user_costs(arguments)
+            elif action == "get_tool_costs":
+                return await self._handle_get_tool_costs(arguments)
+            elif action == "get_top_tools":
+                return await self._handle_get_top_tools(arguments)
+            elif action == "get_tool_costs_by_agent":
+                return await self._handle_get_tool_costs_by_agent(arguments)
+            elif action == "get_tool_costs_by_provider":
+                return await self._handle_get_tool_costs_by_provider(arguments)
 
             elif action == "get_cost_summary":
                 return await self._handle_get_cost_summary(arguments)
@@ -292,16 +309,21 @@ If you're seeing this error, please report it as it indicates a reliability issu
 5. **get_agent_costs**
    - Analyze costs by agent/application
 
-6. **get_cost_summary**
-   - Generate a summary report of recent AI spending (includes all 5 dimensions)
+6. **get_user_costs**
+   - Analyze costs by user email (subscriber)
+   - Returns cost, request count, and token usage per user
+   - Data from coding assistant traces (Cursor, Claude Code, Gemini CLI)
 
-7. **analyze_cost_anomalies** (Phase 1)
+7. **get_cost_summary**
+   - Generate a summary report of recent AI spending (includes all dimensions)
+
+8. **analyze_cost_anomalies** (Phase 1)
    - Enhanced statistical anomaly detection using z-score analysis
 
-8. **get_capabilities**
+9. **get_capabilities**
    - Shows current implementation status
 
-9. **get_examples**
+10. **get_examples**
    - Shows examples for available features
 
 ## 🔧 Parameter Usage
@@ -885,6 +907,253 @@ If you're seeing this error, please report it as it indicates a reliability issu
 """
             return [TextContent(type="text", text=error_response)]
 
+    async def _handle_get_user_costs(
+        self, arguments: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_user_costs request — cost attribution by subscriber email."""
+        try:
+            logger.info("Processing get_user_costs request")
+
+            if self.simple_analytics_engine is None:
+                client = await self.get_client()
+                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
+
+            response = await self.simple_analytics_engine.get_user_costs(**arguments)
+
+            logger.info("User costs analysis completed successfully")
+            return [TextContent(type="text", text=response)]
+
+        except ValidationError as e:
+            logger.warning(f"Validation error in get_user_costs: {e.message}")
+            error_response = f"""❌ **User Costs Validation Error**
+
+**Error**: {e.message}
+
+**Suggestions:**
+"""
+            for suggestion in e.suggestions:
+                error_response += f"- {suggestion}\n"
+
+            error_response += """
+**For Help:**
+- Use `get_capabilities()` to see supported parameters
+- Use `get_examples()` to see working examples
+- Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
+"""
+            return [TextContent(type="text", text=error_response)]
+
+        except Exception as e:
+            logger.error(f"Error in get_user_costs: {e}")
+            error_details = self._format_api_error_details(e)
+            error_response = f"""❌ **User Costs Analysis Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- Verify your parameters: period (required), aggregation (optional, defaults to TOTAL)
+- This endpoint requires the cost-by-user API (FRONT-931)
+- User cost data is only available for coding assistant traces (Cursor, Claude Code, Gemini CLI)
+
+**Supported Parameters:**
+- **period**: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- **aggregation**: TOTAL, MEAN, MAXIMUM, MINIMUM (optional, defaults to TOTAL)
+- **filters**: Optional dict with array keys `agents`, `providers`, `models`, `users`, `costSources`
+- **costSources**: Defaults to `["coding_assistant"]` (only coding-assistant traces populate subscriber email)
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+- Use `get_examples()` to see working examples
+"""
+            return [TextContent(type="text", text=error_response)]
+
+    async def _handle_get_tool_costs(
+        self, arguments: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_tool_costs request using the simplified engine."""
+        try:
+            logger.info("Processing get_tool_costs request")
+            if self.simple_analytics_engine is None:
+                client = await self.get_client()
+                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
+            response = await self.simple_analytics_engine.get_tool_costs(**arguments)
+            logger.info("Tool costs analysis completed successfully")
+            return [TextContent(type="text", text=response)]
+        except ValidationError as e:
+            logger.warning(f"Validation error in get_tool_costs: {e.message}")
+            error_response = f"""❌ **Tool Costs Validation Error**
+
+**Error**: {e.message}
+
+**Suggestions:**
+"""
+            for suggestion in e.suggestions:
+                error_response += f"- {suggestion}\n"
+            error_response += """
+**For Help:**
+- Use `get_capabilities()` to see supported parameters
+- Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
+"""
+            return [TextContent(type="text", text=error_response)]
+        except Exception as e:
+            logger.error(f"Error in get_tool_costs: {e}")
+            error_details = self._format_api_error_details(e)
+            error_response = f"""❌ **Tool Costs Analysis Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- Verify your parameters: period (required), aggregation (optional, defaults to TOTAL)
+- Check that you have tool data for the specified time period
+- Note: tool cost data requires the backend cost aggregation pipeline to be working
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+- Use `get_examples()` to see working examples
+"""
+            return [TextContent(type="text", text=error_response)]
+
+    async def _handle_get_top_tools(
+        self, arguments: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_top_tools request using the simplified engine."""
+        try:
+            logger.info("Processing get_top_tools request")
+            if self.simple_analytics_engine is None:
+                client = await self.get_client()
+                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
+            response = await self.simple_analytics_engine.get_top_tools(**arguments)
+            logger.info("Top tools analysis completed successfully")
+            return [TextContent(type="text", text=response)]
+        except ValidationError as e:
+            logger.warning(f"Validation error in get_top_tools: {e.message}")
+            error_response = f"""❌ **Top Tools Validation Error**
+
+**Error**: {e.message}
+
+**Suggestions:**
+"""
+            for suggestion in e.suggestions:
+                error_response += f"- {suggestion}\n"
+            error_response += """
+**For Help:**
+- Use `get_capabilities()` to see supported parameters
+- Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
+"""
+            return [TextContent(type="text", text=error_response)]
+        except Exception as e:
+            logger.error(f"Error in get_top_tools: {e}")
+            error_details = self._format_api_error_details(e)
+            error_response = f"""❌ **Top Tools Analysis Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- Verify your parameters: period (required), aggregation (optional, defaults to TOTAL)
+- Check that you have tool data for the specified time period
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+- Use `get_examples()` to see working examples
+"""
+            return [TextContent(type="text", text=error_response)]
+
+    async def _handle_get_tool_costs_by_agent(
+        self, arguments: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_tool_costs_by_agent request using the simplified engine."""
+        try:
+            logger.info("Processing get_tool_costs_by_agent request")
+            if self.simple_analytics_engine is None:
+                client = await self.get_client()
+                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
+            response = await self.simple_analytics_engine.get_tool_costs_by_agent(**arguments)
+            logger.info("Tool costs by agent analysis completed successfully")
+            return [TextContent(type="text", text=response)]
+        except ValidationError as e:
+            logger.warning(f"Validation error in get_tool_costs_by_agent: {e.message}")
+            error_response = f"""❌ **Tool Costs by Agent Validation Error**
+
+**Error**: {e.message}
+
+**Suggestions:**
+"""
+            for suggestion in e.suggestions:
+                error_response += f"- {suggestion}\n"
+            error_response += """
+**For Help:**
+- Use `get_capabilities()` to see supported parameters
+- Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
+"""
+            return [TextContent(type="text", text=error_response)]
+        except Exception as e:
+            logger.error(f"Error in get_tool_costs_by_agent: {e}")
+            error_details = self._format_api_error_details(e)
+            error_response = f"""❌ **Tool Costs by Agent Analysis Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- Verify your parameters: period (required), aggregation (optional, defaults to TOTAL)
+- Check that you have tool data for the specified time period
+- Note: tool cost data requires the backend cost aggregation pipeline to be working
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+- Use `get_examples()` to see working examples
+"""
+            return [TextContent(type="text", text=error_response)]
+
+    async def _handle_get_tool_costs_by_provider(
+        self, arguments: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_tool_costs_by_provider request using the simplified engine."""
+        try:
+            logger.info("Processing get_tool_costs_by_provider request")
+            if self.simple_analytics_engine is None:
+                client = await self.get_client()
+                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
+            response = await self.simple_analytics_engine.get_tool_costs_by_provider(**arguments)
+            logger.info("Tool costs by provider analysis completed successfully")
+            return [TextContent(type="text", text=response)]
+        except ValidationError as e:
+            logger.warning(f"Validation error in get_tool_costs_by_provider: {e.message}")
+            error_response = f"""❌ **Tool Costs by Provider Validation Error**
+
+**Error**: {e.message}
+
+**Suggestions:**
+"""
+            for suggestion in e.suggestions:
+                error_response += f"- {suggestion}\n"
+            error_response += """
+**For Help:**
+- Use `get_capabilities()` to see supported parameters
+- Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
+"""
+            return [TextContent(type="text", text=error_response)]
+        except Exception as e:
+            logger.error(f"Error in get_tool_costs_by_provider: {e}")
+            error_details = self._format_api_error_details(e)
+            error_response = f"""❌ **Tool Costs by Provider Analysis Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- Verify your parameters: period (required), aggregation (optional, defaults to TOTAL)
+- Check that you have tool data for the specified time period
+- Note: tool cost data requires the backend cost aggregation pipeline to be working
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+- Use `get_examples()` to see working examples
+"""
+            return [TextContent(type="text", text=error_response)]
+
     async def _handle_analyze_cost_anomalies(
         self, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
@@ -1055,6 +1324,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
             "get_customer_costs",
             "get_api_key_costs",
             "get_agent_costs",
+            "get_tool_costs",
+            "get_top_tools",
+            "get_tool_costs_by_agent",
+            "get_tool_costs_by_provider",
             "get_cost_summary",
             "analyze_cost_anomalies",
         ]
@@ -1078,6 +1351,22 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "get_model_costs(period='SEVEN_DAYS', group='TOTAL')",
                     "get_customer_costs(period='THIRTY_DAYS', group='TOTAL')",
                     "get_cost_summary(period='THIRTY_DAYS', group='TOTAL')",
+                ],
+            ),
+            ToolCapability(
+                name="Tool Cost Analysis",
+                description="Tool invocation cost analysis by tool, agent, and provider",
+                parameters={
+                    "get_tool_costs": {"period": "str", "aggregation": "str"},
+                    "get_top_tools": {"period": "str", "aggregation": "str"},
+                    "get_tool_costs_by_agent": {"period": "str", "aggregation": "str"},
+                    "get_tool_costs_by_provider": {"period": "str", "aggregation": "str"},
+                },
+                examples=[
+                    "get_tool_costs(period='HOUR')",
+                    "get_top_tools(period='TWENTY_FOUR_HOURS')",
+                    "get_tool_costs_by_agent(period='SEVEN_DAYS')",
+                    "get_tool_costs_by_provider(period='THIRTY_DAYS')",
                 ],
             ),
             ToolCapability(

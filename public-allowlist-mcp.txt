@@ -12,4 +12,8 @@ SECURITY.md
 CODE_OF_CONDUCT.md
 DEVELOPMENT.md
 .claude/commands/
+!.claude/commands/mcp-functional-audit.md
+!.claude/commands/mcp-functional-audit/
+!.claude/commands/mcp-functional-testing*
+!.claude/commands/mcp-test-coverage-matrix.yaml
 public-allowlist-mcp.txt

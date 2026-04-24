@@ -276,6 +276,53 @@ class TestValidateStringFields:
 
 
 # ===========================================================================
+# BACK-1139 — provider enum enforced on the submit write path
+# ===========================================================================
+
+
+class TestValidateStringFieldsProviderEnum:
+    """Regression for BACK-1139 — submit_ai_transaction previously accepted
+    any string as ``provider`` and persisted it (e.g. ``INVALID_PROVIDER_XYZ``).
+    The MCP layer now rejects values outside the documented enum so the
+    write path matches the analytics-side contract (BACK-1025 concerns the
+    READ path)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "provider",
+        ["OPENAI", "ANTHROPIC", "GOOGLE", "AZURE", "COHERE", "MISTRAL", "TOGETHER", "GROQ"],
+    )
+    async def test_documented_providers_pass(self, provider):
+        mgr = _mgr()
+        errors = await mgr._validate_string_fields({**VALID_TX, "provider": provider})
+        assert not any("Invalid provider" in e for e in errors)
+
+    @pytest.mark.asyncio
+    async def test_lowercase_provider_passes(self):
+        """Documentation examples mix casings (e.g. provider='openai'); accept
+        them and let the API persist the canonical upper-case form."""
+        mgr = _mgr()
+        errors = await mgr._validate_string_fields({**VALID_TX, "provider": "openai"})
+        assert not any("Invalid provider" in e for e in errors)
+
+    @pytest.mark.asyncio
+    async def test_arbitrary_provider_rejected(self):
+        mgr = _mgr()
+        errors = await mgr._validate_string_fields(
+            {**VALID_TX, "provider": "INVALID_PROVIDER_XYZ"}
+        )
+        assert any("Invalid provider" in e for e in errors)
+        assert any("OPENAI" in e for e in errors)
+
+    @pytest.mark.asyncio
+    async def test_typo_provider_rejected(self):
+        """Common typos slip through string-only validation; the enum catches them."""
+        mgr = _mgr()
+        errors = await mgr._validate_string_fields({**VALID_TX, "provider": "OPENAII"})
+        assert any("Invalid provider" in e for e in errors)
+
+
+# ===========================================================================
 # _validate_optional_fields
 # ===========================================================================
 

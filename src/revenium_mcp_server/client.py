@@ -20,6 +20,7 @@ from loguru import logger
 from .api_field_mapper import APIFieldMapper
 from .auth import AuthConfig, get_auth_config, get_bearer_auth_headers
 from .config_store import get_config_value
+from .endpoint_registry import DEFAULT_APP_BASE_URL
 from .exceptions import AlertToolsError
 from .logging_config import async_operation_context
 
@@ -152,6 +153,7 @@ class ReveniumClient:
         "credentials": ("Credential", "Credentials"),
         "organizations": ("Organization", "Organizations"),
         "teams": ("Team", "Teams"),
+        "tools": ("Tool", "Tools"),
         "anomaly": ("Anomaly", "Anomalies"),
         "anomalies": ("Anomaly", "Anomalies"),
         "alert": ("Alert", "Alerts"),
@@ -556,7 +558,13 @@ class ReveniumClient:
             has_json_data=json_data is not None,
         ) as operation_id:
             try:
-                logger.info(f"Making {method} request to {url}", operation_id=operation_id)
+                logger.info(
+                    "Making API request",
+                    method=method,
+                    url=url,
+                    endpoint=endpoint,
+                    operation_id=operation_id,
+                )
 
                 # Merge auth headers with any existing headers for this request
                 if use_bearer:
@@ -568,7 +576,13 @@ class ReveniumClient:
                     method=method, url=url, params=params, json=json_data, headers=request_headers
                 )
 
-                logger.debug(f"Response status: {response.status_code}", operation_id=operation_id)
+                logger.debug(
+                    "Received API response",
+                    method=method,
+                    url=url,
+                    status_code=response.status_code,
+                    operation_id=operation_id,
+                )
 
                 # Check for HTTP errors
                 if response.status_code >= 400:
@@ -605,18 +619,23 @@ class ReveniumClient:
 
                     # Enhanced logging for debugging
                     logger.error(
-                        "API error {}: {}",
-                        response.status_code,
-                        error_text,
-                        operation_id=operation_id,
-                        error_data=error_data,
+                        "API error response",
+                        method=method,
+                        url=url,
                         endpoint=endpoint,
+                        status_code=response.status_code,
+                        error_text=error_text,
+                        error_data=error_data,
+                        operation_id=operation_id,
                     )
 
                     # Log comprehensive debug information
                     logger.error(
-                        "=== RAW HTTP RESPONSE DEBUG ===\n{}",
-                        json.dumps(raw_response_debug, indent=2, default=str),
+                        "Raw HTTP response debug",
+                        method=method,
+                        url=url,
+                        status_code=response.status_code,
+                        raw_response_debug=raw_response_debug,
                         operation_id=operation_id,
                     )
 
@@ -675,6 +694,41 @@ class ReveniumClient:
                                 "raw_response_debug": raw_response_debug,
                             },
                         )
+                    elif (
+                        use_bearer
+                        and response.status_code in (401, 403, 404)
+                        and base_url == DEFAULT_APP_BASE_URL
+                        and not get_config_value("REVENIUM_APP_BASE_URL", None)
+                    ):
+                        # Bearer call to the default prod app host failing with an auth/not-found
+                        # status, while REVENIUM_APP_BASE_URL was never configured. Most common
+                        # cause is a non-prod REVENIUM_API_KEY used against the prod analytics
+                        # host because the operator forgot to point REVENIUM_APP_BASE_URL at
+                        # their analytics host. The raw response typically reads
+                        # "Invalid or inactive API key" which hides the real cause.
+                        enhanced_message = (
+                            f"HTTP {response.status_code} from analytics host "
+                            f"{DEFAULT_APP_BASE_URL} (default).\n\n"
+                            f"Original response: {error_text}\n\n"
+                            "**Likely cause:** REVENIUM_APP_BASE_URL is not set, so the client "
+                            "defaulted to the production analytics host. If your "
+                            "REVENIUM_API_KEY belongs to a dev/staging environment, it will "
+                            "be rejected there.\n\n"
+                            "**To fix:**\n"
+                            "• Set REVENIUM_APP_BASE_URL to the analytics host that matches "
+                            "your REVENIUM_API_KEY (e.g. https://app.<your-environment>.revenium.ai).\n"
+                            "• Or, if you intend to use the production analytics host, verify "
+                            "that your API key is a production key.\n"
+                            "• See README.md for the full env var reference."
+                        )
+                        comprehensive_error = ReveniumAPIError(
+                            message=enhanced_message,
+                            status_code=response.status_code,
+                            response_data={
+                                "error_data": error_data,
+                                "raw_response_debug": raw_response_debug,
+                            },
+                        )
                     else:
                         # Create ReveniumAPIError with comprehensive debug data
                         comprehensive_error = ReveniumAPIError(
@@ -709,17 +763,31 @@ class ReveniumClient:
             except AlertToolsError as e:
                 # Re-raise custom AlertToolsError exceptions as-is to preserve detailed error information
                 logger.error(
-                    "Alert tools error: {}",
-                    str(e),
-                    operation_id=operation_id,
+                    "Alert tools error",
+                    method=method,
+                    url=url,
+                    error=str(e),
                     error_code=e.error_code,
+                    operation_id=operation_id,
                 )
                 raise
             except httpx.RequestError as e:
-                logger.error("Request error: {}", str(e), operation_id=operation_id)
+                logger.error(
+                    "Request error",
+                    method=method,
+                    url=url,
+                    error=str(e),
+                    operation_id=operation_id,
+                )
                 raise ReveniumAPIError(f"Request failed: {str(e)}")
             except Exception as e:
-                logger.error("Unexpected error: {}", str(e), operation_id=operation_id)
+                logger.error(
+                    "Unexpected error",
+                    method=method,
+                    url=url,
+                    error=str(e),
+                    operation_id=operation_id,
+                )
                 raise ReveniumAPIError(f"Unexpected error: {str(e)}")
 
     def _extract_embedded_data(self, data: Any) -> Any:
@@ -2269,7 +2337,7 @@ class ReveniumClient:
 
     def _get_app_base_url(self) -> str:
         """Return the analytics base URL (app.revenium.ai), falling back to default."""
-        url = get_config_value("REVENIUM_APP_BASE_URL", "https://app.revenium.ai") or "https://app.revenium.ai"
+        url = get_config_value("REVENIUM_APP_BASE_URL", DEFAULT_APP_BASE_URL) or DEFAULT_APP_BASE_URL
         if not url.startswith("https://"):
             raise ValueError(
                 f"REVENIUM_APP_BASE_URL must use HTTPS to prevent Bearer token leakage, got: {url!r}"
