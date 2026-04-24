@@ -179,6 +179,13 @@ class TestValidateTransactionInputsSync:
         args["model"] = "   "
         assert self.mgr._validate_transaction_inputs(args) is False
 
+    def test_invalid_provider_enum_value_returns_false(self):
+        # BACK-1139: sync path must reject providers outside the canonical
+        # enum, matching the async pipeline's _validate_string_fields.
+        args = VALID_TRANSACTION.copy()
+        args["provider"] = "INVALID_PROVIDER_XYZ"
+        assert self.mgr._validate_transaction_inputs(args) is False
+
     def test_invalid_subscriber_type_returns_false(self):
         args = VALID_TRANSACTION.copy()
         args["subscriber"] = "not_a_dict"

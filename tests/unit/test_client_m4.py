@@ -22,6 +22,7 @@ import httpx
 
 from src.revenium_mcp_server.client import (
     ConnectionPoolConfig,
+    DEFAULT_APP_BASE_URL,
     ReveniumAPIError,
     ReveniumClient,
     close_global_client,
@@ -541,6 +542,7 @@ class TestRequest:
             ("/profitstream/v2/api/subscribers/abc/credentials/xyz", "Credential"),
             ("/profitstream/v2/api/organizations/abc", "Organization"),
             ("/profitstream/v2/api/teams/abc", "Team"),
+            ("/profitstream/v2/api/tools/abc", "Tool"),
             ("/profitstream/v2/api/sources/ai/anomaly/abc", "Anomaly"),
             ("/profitstream/v2/api/sources/ai/anomalies", "Anomaly"),
             ("/profitstream/v2/api/sources/ai/alert/abc", "Alert"),
@@ -604,6 +606,130 @@ class TestRequest:
             with pytest.raises(ReveniumAPIError) as exc_info:
                 await self.client._request("POST", "/endpoint")
         assert exc_info.value is original
+
+
+# ===========================================================================
+# Structured logging — BACK-1088
+# ===========================================================================
+
+class TestRequestStructuredLogging:
+    """Request/response/error log calls in _request must use structured fields,
+    not f-string or positional-format interpolation. This is a prerequisite for
+    BACK-1086 Phase 6 endpoint-mirror audit which parses outgoing URLs from
+    MCP server log output.
+    """
+
+    def setup_method(self):
+        self.client = _client()
+
+    def _patch_httpx(self, response: MagicMock):
+        return patch.object(
+            self.client.client, "request", new_callable=AsyncMock, return_value=response
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_request_logs_structured_fields(self):
+        """The outgoing-request info log must carry method, url, endpoint, and
+        operation_id as structured fields — not baked into an f-string message."""
+        resp = _mock_httpx_response(200, json_data={"ok": True}, content=b'{"ok":true}')
+        with patch("src.revenium_mcp_server.client.logger") as mock_logger:
+            with self._patch_httpx(resp):
+                await self.client._request("GET", "/some/endpoint")
+
+        # Find the "Making API request" info call
+        request_calls = [
+            c for c in mock_logger.info.call_args_list
+            if c.args and c.args[0] == "Making API request"
+        ]
+        assert len(request_calls) == 1, (
+            f"Expected exactly one 'Making API request' log; got {mock_logger.info.call_args_list}"
+        )
+        call = request_calls[0]
+        # Message must be a plain string (no interpolation)
+        assert call.args == ("Making API request",)
+        # Structured fields must be kwargs, not embedded in the message
+        assert call.kwargs["method"] == "GET"
+        assert "/some/endpoint" in call.kwargs["url"]
+        assert call.kwargs["endpoint"] == "/some/endpoint"
+        assert "operation_id" in call.kwargs
+
+    @pytest.mark.asyncio
+    async def test_response_debug_log_carries_status_code_field(self):
+        """The response debug log must carry status_code as a structured field."""
+        resp = _mock_httpx_response(200, json_data={"ok": True}, content=b'{"ok":true}')
+        with patch("src.revenium_mcp_server.client.logger") as mock_logger:
+            with self._patch_httpx(resp):
+                await self.client._request("GET", "/ep")
+
+        debug_calls = [
+            c for c in mock_logger.debug.call_args_list
+            if c.args and c.args[0] == "Received API response"
+        ]
+        assert len(debug_calls) == 1
+        call = debug_calls[0]
+        assert call.args == ("Received API response",)
+        assert call.kwargs["status_code"] == 200
+        assert call.kwargs["method"] == "GET"
+        assert "url" in call.kwargs
+        assert "operation_id" in call.kwargs
+
+    @pytest.mark.asyncio
+    async def test_httpx_request_error_logs_structured_fields(self):
+        """The httpx.RequestError branch must log structured fields, not use
+        positional-format interpolation."""
+        with patch("src.revenium_mcp_server.client.logger") as mock_logger:
+            with patch.object(
+                self.client.client,
+                "request",
+                new_callable=AsyncMock,
+                side_effect=httpx.RequestError("connection refused"),
+            ):
+                with pytest.raises(ReveniumAPIError):
+                    await self.client._request("GET", "/ep")
+
+        error_calls = [
+            c for c in mock_logger.error.call_args_list
+            if c.args and c.args[0] == "Request error"
+        ]
+        assert len(error_calls) == 1
+        call = error_calls[0]
+        # Message must be a plain string — no "{}" placeholders, no positional args
+        assert call.args == ("Request error",)
+        assert call.kwargs["method"] == "GET"
+        assert "url" in call.kwargs
+        assert call.kwargs["error"] == "connection refused"
+        assert "operation_id" in call.kwargs
+
+    @pytest.mark.asyncio
+    async def test_api_error_log_has_no_interpolation_placeholders(self):
+        """The API-error branch must log structured fields (method, url,
+        status_code, error_text) — the message must not contain "{}" format
+        placeholders that were used in the old positional-format style."""
+        resp = _mock_httpx_response(
+            500,
+            json_data={"message": "server exploded"},
+            content=b'{"message":"server exploded"}',
+            reason_phrase="Server Error",
+        )
+        resp.text = '{"message":"server exploded"}'
+        with patch("src.revenium_mcp_server.client.logger") as mock_logger:
+            with self._patch_httpx(resp):
+                with pytest.raises(ReveniumAPIError):
+                    await self.client._request("POST", "/ep")
+
+        error_calls = [
+            c for c in mock_logger.error.call_args_list
+            if c.args and c.args[0] == "API error response"
+        ]
+        assert len(error_calls) == 1
+        call = error_calls[0]
+        assert call.args == ("API error response",)
+        assert "{}" not in call.args[0]
+        assert call.kwargs["method"] == "POST"
+        assert call.kwargs["status_code"] == 500
+        assert "url" in call.kwargs
+        assert "error_text" in call.kwargs
+        assert "operation_id" in call.kwargs
 
 
 # ===========================================================================
@@ -1770,3 +1896,166 @@ class TestOptimizedClient:
         import src.revenium_mcp_server.client as client_module
         client_module._global_client = None
         await close_global_client()  # Should not raise
+
+
+# ===========================================================================
+# _get_app_base_url — BACK-1094: REVENIUM_APP_BASE_URL resolution
+# ===========================================================================
+
+class TestGetAppBaseUrl:
+    """_get_app_base_url reads REVENIUM_APP_BASE_URL with a prod default and rejects
+    non-HTTPS values to prevent Bearer token leakage.
+    """
+
+    def setup_method(self):
+        self.client = _client()
+
+    def test_defaults_to_prod_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
+        assert self.client._get_app_base_url() == DEFAULT_APP_BASE_URL
+
+    def test_reads_env_var_override(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_APP_BASE_URL", "https://app.dev.revenium.ai")
+        assert self.client._get_app_base_url() == "https://app.dev.revenium.ai"
+
+    def test_rejects_non_https(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_APP_BASE_URL", "http://app.dev.revenium.ai")
+        with pytest.raises(ValueError, match="must use HTTPS"):
+            self.client._get_app_base_url()
+
+
+# ===========================================================================
+# _request — BACK-1094: enhance Bearer 401/403/404 when app host defaulted to prod
+# ===========================================================================
+
+def _mock_get_config_value(values):
+    """Return a fake get_config_value that reads per-test values from `values`.
+
+    Mirrors the real signature `get_config_value(key, default=None)` and falls
+    back to `default` for any key not in the dict. Used to make tests that
+    assert on env-driven config behavior deterministic regardless of the
+    developer's on-disk `.revenium_cache` state — production code reads config
+    via `get_config_value`, so patching it bypasses the cache lookup.
+    """
+    def _fn(key, default=None):
+        return values.get(key, default)
+    return _fn
+
+
+class TestAppBaseUrlDriftError:
+    """When a Bearer analytics call hits the default prod app host and returns
+    401/403/404 while REVENIUM_APP_BASE_URL was never configured, the error
+    message must surface the host misconfiguration instead of echoing the raw
+    "Invalid or inactive API key" body from the server.
+    """
+
+    def setup_method(self):
+        self.client = _client()
+
+    def _patch_httpx(self, response: MagicMock):
+        return patch.object(
+            self.client.client, "request", new_callable=AsyncMock, return_value=response
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [401, 403, 404])
+    async def test_enhances_bearer_error_on_default_app_host(self, status_code, monkeypatch):
+        monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
+        resp = _mock_httpx_response(
+            status_code,
+            json_data={"message": "Invalid or inactive API key"},
+            content=b'{"message":"Invalid or inactive API key"}',
+            reason_phrase="Unauthorized",
+        )
+        resp.json.return_value = {"message": "Invalid or inactive API key"}
+        resp.text = '{"message":"Invalid or inactive API key"}'
+        with patch(
+            "src.revenium_mcp_server.client.get_config_value",
+            side_effect=_mock_get_config_value({"REVENIUM_APP_BASE_URL": None}),
+        ):
+            with self._patch_httpx(resp):
+                with pytest.raises(ReveniumAPIError) as exc_info:
+                    await self.client._request(
+                        "GET",
+                        "/api/v2/analytics/cost-by-tool",
+                        base_url="https://app.revenium.ai",
+                        use_bearer=True,
+                    )
+        message = exc_info.value.message
+        assert "REVENIUM_APP_BASE_URL is not set" in message
+        assert f"HTTP {status_code}" in message
+
+    @pytest.mark.asyncio
+    async def test_no_enhancement_when_app_base_url_explicitly_set(self, monkeypatch):
+        """Operator explicitly opted into a host — respect their choice, don't hint at config."""
+        monkeypatch.setenv("REVENIUM_APP_BASE_URL", "https://app.revenium.ai")
+        resp = _mock_httpx_response(
+            401,
+            json_data={"message": "Invalid or inactive API key"},
+            content=b'{"message":"Invalid or inactive API key"}',
+            reason_phrase="Unauthorized",
+        )
+        resp.json.return_value = {"message": "Invalid or inactive API key"}
+        resp.text = '{"message":"Invalid or inactive API key"}'
+        with patch(
+            "src.revenium_mcp_server.client.get_config_value",
+            side_effect=_mock_get_config_value(
+                {"REVENIUM_APP_BASE_URL": "https://app.revenium.ai"}
+            ),
+        ):
+            with self._patch_httpx(resp):
+                with pytest.raises(ReveniumAPIError) as exc_info:
+                    await self.client._request(
+                        "GET",
+                        "/api/v2/analytics/cost-by-tool",
+                        base_url="https://app.revenium.ai",
+                        use_bearer=True,
+                    )
+        assert "REVENIUM_APP_BASE_URL is not set" not in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_no_enhancement_when_use_bearer_false(self, monkeypatch):
+        """Non-Bearer calls (x-api-key path) are unrelated to the app host — don't mis-hint."""
+        monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
+        resp = _mock_httpx_response(
+            401,
+            json_data={"message": "Invalid or inactive API key"},
+            content=b'{"message":"Invalid or inactive API key"}',
+            reason_phrase="Unauthorized",
+        )
+        resp.json.return_value = {"message": "Invalid or inactive API key"}
+        resp.text = '{"message":"Invalid or inactive API key"}'
+        with patch(
+            "src.revenium_mcp_server.client.get_config_value",
+            side_effect=_mock_get_config_value({"REVENIUM_APP_BASE_URL": None}),
+        ):
+            with self._patch_httpx(resp):
+                with pytest.raises(ReveniumAPIError) as exc_info:
+                    await self.client._request("GET", "/profitstream/v2/api/sources")
+        assert "REVENIUM_APP_BASE_URL is not set" not in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_no_enhancement_on_500(self, monkeypatch):
+        """Only 401/403/404 point at host drift — server errors stay generic."""
+        monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
+        resp = _mock_httpx_response(
+            500,
+            json_data={"message": "internal error"},
+            content=b'{"message":"internal error"}',
+            reason_phrase="Internal Server Error",
+        )
+        resp.json.return_value = {"message": "internal error"}
+        resp.text = '{"message":"internal error"}'
+        with patch(
+            "src.revenium_mcp_server.client.get_config_value",
+            side_effect=_mock_get_config_value({"REVENIUM_APP_BASE_URL": None}),
+        ):
+            with self._patch_httpx(resp):
+                with pytest.raises(ReveniumAPIError) as exc_info:
+                    await self.client._request(
+                        "GET",
+                        "/api/v2/analytics/cost-by-tool",
+                        base_url="https://app.revenium.ai",
+                        use_bearer=True,
+                    )
+        assert "REVENIUM_APP_BASE_URL is not set" not in exc_info.value.message

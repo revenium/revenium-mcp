@@ -613,3 +613,106 @@ class TestJobManagementBusinessActions:
         assert isinstance(result[0], TextContent)
         text_lower = result[0].text.lower()
         assert "conflict" in text_lower or "duplicate" in text_lower or "already reported" in text_lower
+
+
+# ===========================================================================
+# BACK-1140 — page boundary translates into a structured 400, not HTTP 500
+# ===========================================================================
+
+
+class TestJobManagerPaginationBoundary:
+    """Regression for BACK-1140 — list_jobs with page=2147483647 (32-bit
+    MAX_INT) used to forward the value to the backend, which returned a
+    generic HTTP 500 ('An unexpected error occurred'). Client-determinable
+    boundary inputs now raise a structured ToolError naming the field and
+    the bound, so callers can fix the input without inspecting a server
+    traceback."""
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_max_int_page_raises_structured_400(
+        self, job_manager, mock_client
+    ):
+        """page=2^31-1 is rejected before the request ever reaches the API."""
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.list_jobs({"page": 2_147_483_647, "size": 10})
+        err = exc_info.value
+        assert getattr(err, "field", None) == "page"
+        assert "page" in err.message.lower()
+        assert "exceeds maximum" in err.message
+        mock_client.get_jobs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_negative_page_raises(self, job_manager, mock_client):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.list_jobs({"page": -1, "size": 10})
+        assert getattr(exc_info.value, "field", None) == "page"
+        mock_client.get_jobs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_non_integer_page_raises(self, job_manager, mock_client):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.list_jobs({"page": "1", "size": 10})
+        assert getattr(exc_info.value, "field", None) == "page"
+        mock_client.get_jobs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_zero_size_raises(self, job_manager, mock_client):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.list_jobs({"page": 0, "size": 0})
+        assert getattr(exc_info.value, "field", None) == "size"
+        mock_client.get_jobs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_max_int_size_raises_structured_400(
+        self, job_manager, mock_client
+    ):
+        """size=2^31-1 is rejected before the request ever reaches the API."""
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.list_jobs({"page": 0, "size": 2_147_483_647})
+        err = exc_info.value
+        assert getattr(err, "field", None) == "size"
+        assert "exceeds maximum" in err.message
+        mock_client.get_jobs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_within_bounds_still_works(
+        self, job_manager, mock_client
+    ):
+        """The fix does not regress legitimate pagination."""
+        mock_client._extract_embedded_data.return_value = []
+        mock_client._extract_pagination_info.return_value = {
+            "totalPages": 1,
+            "totalElements": 0,
+        }
+        result = await job_manager.list_jobs({"page": 999_999, "size": 20})
+        assert result["action"] == "list_jobs"
+        assert result["pagination"]["page"] == 999_999
+        assert result["pagination"]["size"] == 20
+        mock_client.get_jobs.assert_called_once_with(page=999_999, size=20)
+
+    @pytest.mark.asyncio
+    async def test_get_job_transactions_max_int_page_raises_structured_400(
+        self, job_manager, mock_client
+    ):
+        """The same guard applies to get_job_transactions, the other paginated
+        action on this tool."""
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.get_job_transactions(
+                {"job_id": "j1", "page": 2_147_483_647, "size": 10}
+            )
+        assert getattr(exc_info.value, "field", None) == "page"
+        mock_client.get_job_transactions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_job_transactions_max_int_size_raises_structured_400(
+        self, job_manager, mock_client
+    ):
+        """The size upper-bound guard also applies to get_job_transactions."""
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.get_job_transactions(
+                {"job_id": "j1", "page": 0, "size": 2_147_483_647}
+            )
+        err = exc_info.value
+        assert getattr(err, "field", None) == "size"
+        assert "exceeds maximum" in err.message
+        mock_client.get_job_transactions.assert_not_called()

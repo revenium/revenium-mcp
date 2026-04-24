@@ -15,7 +15,12 @@ from mcp.types import TextContent, ImageContent, EmbeddedResource
 from .config import ToolConfig
 # Note: PROFILE_DEFINITIONS is used indirectly through ToolConfig.is_tool_enabled()
 # which queries profiles.PROFILE_DEFINITIONS as the single source of truth
-from ..common.validation import preprocess_numeric_parameters, preprocess_boolean_parameters, preprocess_array_parameters
+from ..common.validation import (
+    preprocess_numeric_parameters,
+    preprocess_boolean_parameters,
+    preprocess_array_parameters,
+    validate_string_params,
+)
 from ..tools_decomposed.dynamic_decorators import dynamic_mcp_tool
 
 
@@ -267,6 +272,7 @@ class ToolConfigurationRegistry:
             email: Optional[str] = None,
             slack_config_id: Optional[str] = None,
             triggerAfterPersistsDuration: Optional[str] = None,
+            periodDuration: Optional[str] = None,
             filters: Optional[dict] = None,
             page: int = 0,
             size: int = 20,
@@ -329,6 +335,7 @@ class ToolConfigurationRegistry:
                 "email": email,
                 "slack_config_id": slack_config_id,
                 "triggerAfterPersistsDuration": triggerAfterPersistsDuration,
+                "periodDuration": periodDuration,
                 "filters": filters,
                 "page": page,
                 "size": size,
@@ -1421,29 +1428,40 @@ class ToolConfigurationRegistry:
             return result
 
     async def _register_manage_tools(self, mcp: FastMCP) -> None:
-        """Register manage tools tool."""
+        """Register manage tools tool.
+
+        FastMCP derives its Pydantic input model from this function's
+        signature, not from get_schema(). Every kwarg callers may send must
+        appear here, and string-typed params are widened to JSON scalars so
+        we can validate them in-body (returning a structured ToolError
+        instead of leaking a raw framework error).
+        """
+        _JSONScalar = Union[str, int, float, bool]
+
         @mcp.tool()
         @dynamic_mcp_tool("manage_tools")
         async def manage_tools(
-            action: str = "get_capabilities",
-            tool_id: Optional[str] = None,
-            tool_name: Optional[str] = None,
+            action: _JSONScalar = "get_capabilities",
+            tool_id: Optional[_JSONScalar] = None,
+            tool_name: Optional[_JSONScalar] = None,
             tool_data: Optional[Union[dict, str]] = None,
             event_data: Optional[Union[dict, str]] = None,
-            event_type: Optional[str] = None,
-            query: Optional[str] = None,
+            event_type: Optional[_JSONScalar] = None,
+            query: Optional[_JSONScalar] = None,
             page: Union[int, str] = 0,
             size: Union[int, str] = 20,
             filters: Optional[Union[dict, str]] = None,
-            start_date: Optional[str] = None,
-            end_date: Optional[str] = None,
-            granularity: Optional[str] = None,
-            pricing_model: Optional[str] = None,
+            start_date: Optional[_JSONScalar] = None,
+            end_date: Optional[_JSONScalar] = None,
+            granularity: Optional[_JSONScalar] = None,
+            pricing_model: Optional[_JSONScalar] = None,
             per_unit_price: Optional[float] = None,
-            tool_type: Optional[str] = None,
-            tool_description: Optional[str] = None,
-            tool_version: Optional[str] = None,
-            tool_provider: Optional[str] = None,
+            tool_type: Optional[_JSONScalar] = None,
+            tool_description: Optional[_JSONScalar] = None,
+            tool_version: Optional[_JSONScalar] = None,
+            tool_provider: Optional[_JSONScalar] = None,
+            period: Optional[_JSONScalar] = None,
+            group: Optional[_JSONScalar] = None,
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
             arguments = {
                 "action": action,
@@ -1465,7 +1483,31 @@ class ToolConfigurationRegistry:
                 "tool_description": tool_description,
                 "tool_version": tool_version,
                 "tool_provider": tool_provider,
+                "period": period,
+                "group": group,
             }
+
+            arguments = validate_string_params(
+                arguments,
+                string_fields=[
+                    "action",
+                    "tool_id",
+                    "tool_name",
+                    "event_type",
+                    "query",
+                    "start_date",
+                    "end_date",
+                    "granularity",
+                    "pricing_model",
+                    "tool_type",
+                    "tool_description",
+                    "tool_version",
+                    "tool_provider",
+                    "period",
+                    "group",
+                ],
+                action=action if isinstance(action, str) else str(action),
+            )
 
             # SMART INPUT PREPROCESSING: Handle agent interface serialization
             for dict_param in ("tool_data", "event_data", "filters"):

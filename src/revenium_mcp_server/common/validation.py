@@ -15,6 +15,8 @@ __all__ = [
     "validate_id_format",
     "preprocess_numeric_parameters",
     "preprocess_boolean_parameters",
+    "validate_pagination_params",
+    "validate_string_params",
 ]
 
 
@@ -147,6 +149,125 @@ def preprocess_boolean_parameters(
                 # Keep as string if not a recognized boolean value - let tool handle the error
 
     return processed_args
+
+
+def validate_pagination_params(arguments: Dict[str, Any], action: str) -> Dict[str, Any]:
+    """Validate page/size pagination parameters and return a copy with coerced ints.
+
+    Strings that parse cleanly as non-negative ints are coerced (e.g. "0" → 0).
+    Booleans are rejected (True/False are technically int subclasses in Python).
+    Anything else raises a structured ToolError so callers see a usable message
+    instead of a raw Python TypeError downstream (BACK-1097).
+
+    Args:
+        arguments: Tool arguments dict (not mutated)
+        action: Action name used in the error suggestion text
+
+    Returns:
+        A shallow copy of arguments with `page` and `size` coerced to int when present
+
+    Raises:
+        ToolError: when page or size is present but not a non-negative int
+    """
+    # Local import to avoid circular dependency: common.error_handling imports
+    # from common.validation in some places.
+    from .error_handling import ToolError, ErrorCodes
+
+    out = arguments.copy()
+    bounds = {"page": (0, None), "size": (1, 100)}
+
+    for name, (min_value, max_value) in bounds.items():
+        if name not in out or out[name] is None:
+            continue
+
+        raw = out[name]
+        if isinstance(raw, bool):
+            coerced = None
+        elif isinstance(raw, int):
+            coerced = raw
+        elif isinstance(raw, str):
+            stripped = raw.strip()
+            # Guard against DoS on int() with very large digit strings
+            # (CVE-2020-10735). Python >= 3.11.4 enforces a built-in 4300-digit
+            # cap, but we may run on older interpreters; bound the input length
+            # defensively before calling int(). 20 chars is well above any
+            # legitimate page/size value (max legitimate size is 100).
+            if len(stripped) > 20:
+                coerced = None
+            else:
+                try:
+                    coerced = int(stripped)
+                except (ValueError, AttributeError):
+                    coerced = None
+        else:
+            coerced = None
+
+        if coerced is None or coerced < min_value or (max_value is not None and coerced > max_value):
+            range_hint = (
+                f"a non-negative integer (>= {min_value})"
+                if max_value is None
+                else f"an integer in [{min_value}, {max_value}]"
+            )
+            raise ToolError(
+                message=f"{name} must be {range_hint}, got {raw!r}",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=name,
+                value=raw,
+                suggestions=[
+                    f"When calling '{action}', pass {name} as an integer (e.g. {name}={min_value if name == 'page' else 20})",
+                    f"When calling '{action}' over string transports, send a digit-only string for {name} (e.g. {name}=\"{min_value if name == 'page' else 20}\")",
+                ],
+            )
+
+        out[name] = coerced
+
+    return out
+
+
+def validate_string_params(
+    arguments: Dict[str, Any],
+    string_fields: List[str],
+    action: str,
+) -> Dict[str, Any]:
+    """Reject non-string values on fields the server expects as strings.
+
+    Rejects rather than coerces so caller bugs (dropped quotes, int math)
+    surface clearly instead of being string-concatenated into URLs downstream.
+
+    Args:
+        arguments: Tool arguments dict (not mutated)
+        string_fields: Field names expected to be strings
+        action: Action name used for the suggestion text
+
+    Returns:
+        Shallow copy of arguments, unchanged if validation passes.
+
+    Raises:
+        ToolError: when a listed field is present with a non-string, non-None value.
+    """
+    # Local import to avoid circular dependency: common.error_handling imports
+    # from common.validation in some places.
+    from .error_handling import ToolError, ErrorCodes
+
+    for name in string_fields:
+        if name not in arguments:
+            continue
+        value = arguments[name]
+        if value is None or isinstance(value, str):
+            continue
+        observed = type(value).__name__
+        raise ToolError(
+            message=f"{name} must be a string, got {observed} ({value!r})",
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field=name,
+            value=value,
+            suggestions=[
+                f"When calling '{action}', pass {name} as a string (e.g. {name}=\"{value}\")",
+                f"Check whether the caller dropped quotes or did string math on {name}",
+            ],
+        )
+
+    return arguments.copy()
 
 
 def preprocess_array_parameters(

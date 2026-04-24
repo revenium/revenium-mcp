@@ -1,13 +1,18 @@
 """Unit tests for logging and monitoring functionality."""
 
+import json
 import pytest
 import asyncio
 import time
+from pathlib import Path
 from unittest.mock import patch, MagicMock
+
+from loguru import logger
 
 from src.revenium_mcp_server.logging_config import (
     PerformanceTracker, LoggingConfig, performance_monitor,
-    async_operation_context, operation_context, get_performance_summary
+    async_operation_context, operation_context, get_performance_summary,
+    _console_format,
 )
 from src.revenium_mcp_server.monitoring import (
     HealthMonitor, HealthCheck, HealthStatus, SystemMetrics
@@ -112,6 +117,94 @@ class TestLoggingConfig:
         logger = config.get_logger("test_logger")
         assert logger is not None
         assert callable(logger.info)
+
+    def test_log_file_defaults_from_env_var(self, monkeypatch, tmp_path):
+        """When no explicit log_file is passed, REVENIUM_LOG_FILE env var is used
+        AND the JSON file sink is actually registered with loguru.
+
+        This asserts the full Phase 6 contract: setting REVENIUM_LOG_FILE before
+        launching the server must (a) set the attribute AND (b) cause loguru
+        to write structured records to that file. A regression in the
+        ``logger.add(...)`` branch of ``_setup_logging`` that silently swallows
+        an exception would leave the attribute correct but the sink inactive —
+        Phase 6 capture would then produce an empty file.
+        """
+        env_path = str(tmp_path / "mcp-test.jsonl")
+        monkeypatch.setenv("REVENIUM_LOG_FILE", env_path)
+        config = LoggingConfig()
+        assert config.log_file == env_path
+        # Sink-activation check: emit a record and confirm it landed in the
+        # serialized JSON file with the expected shape.
+        logger.info("sink_probe", probe_tag="test_log_file_defaults_from_env_var")
+        log_path = Path(env_path)
+        assert log_path.exists(), "File sink not registered — no log file created"
+        # loguru's serialize=True writes one JSON object per line
+        first_line = log_path.read_text().splitlines()[0]
+        record = json.loads(first_line)  # raises if not valid JSON
+        assert "record" in record, "Serialized record missing 'record' root"
+
+    def test_explicit_log_file_wins_over_env_var(self, monkeypatch, tmp_path):
+        """Explicit log_file argument takes precedence over REVENIUM_LOG_FILE."""
+        monkeypatch.setenv("REVENIUM_LOG_FILE", str(tmp_path / "env.jsonl"))
+        explicit = str(tmp_path / "explicit.jsonl")
+        config = LoggingConfig(log_file=explicit)
+        assert config.log_file == explicit
+
+    def test_log_file_defaults_to_conventional_path(self, monkeypatch, tmp_path):
+        """With no argument and no env var, log_file falls back to the
+        conventional default at ``{crash_log_directory}/server.jsonl``.
+
+        This default is always-on so Phase 6 Endpoint Mirror Audit can
+        capture outgoing-request records without any operator setup.
+        """
+        monkeypatch.delenv("REVENIUM_LOG_FILE", raising=False)
+        config = LoggingConfig(crash_log_directory=tmp_path)
+        assert config.log_file == str(tmp_path / "server.jsonl")
+
+    def test_empty_env_var_falls_through_to_default(self, monkeypatch, tmp_path):
+        """An empty REVENIUM_LOG_FILE is treated as unset and falls
+        through to the conventional default path — not to None."""
+        monkeypatch.setenv("REVENIUM_LOG_FILE", "")
+        config = LoggingConfig(crash_log_directory=tmp_path)
+        assert config.log_file == str(tmp_path / "server.jsonl")
+
+    def test_env_var_overrides_default(self, monkeypatch, tmp_path):
+        """An explicit REVENIUM_LOG_FILE value overrides the conventional default."""
+        override = str(tmp_path / "custom.jsonl")
+        monkeypatch.setenv("REVENIUM_LOG_FILE", override)
+        config = LoggingConfig(crash_log_directory=tmp_path)
+        assert config.log_file == override
+
+    def test_devnull_opts_out_of_file_logging(self, monkeypatch, tmp_path):
+        """Operators can opt out of file logging by pointing at /dev/null."""
+        monkeypatch.setenv("REVENIUM_LOG_FILE", "/dev/null")
+        config = LoggingConfig(crash_log_directory=tmp_path)
+        assert config.log_file == "/dev/null"
+
+
+class TestConsoleFormat:
+    """Test the stderr console format callable that renders structured extras."""
+
+    def test_renders_extras_inline_when_present(self):
+        fmt = _console_format({"extra": {"method": "GET", "url": "/x", "operation_id": "op1"}})
+        assert "method='GET'" in fmt
+        assert "url='/x'" in fmt
+        assert "operation_id='op1'" in fmt
+        assert "{message}" in fmt  # base template preserved
+
+    def test_omits_extras_segment_when_empty(self):
+        fmt = _console_format({"extra": {}})
+        assert "{message}" in fmt
+        # No trailing " | " separator added for empty extras
+        assert not fmt.rstrip().endswith("|")
+
+    def test_escapes_curly_braces_in_values(self):
+        """Values containing '{' or '}' must be escaped so loguru doesn't try
+        to interpret them as format placeholders."""
+        fmt = _console_format({"extra": {"error_data": '{"code": 404}'}})
+        # Raw quotes around dict braces must be doubled for loguru escape
+        assert '{{' in fmt
+        assert '}}' in fmt
 
 
 class TestPerformanceDecorator:

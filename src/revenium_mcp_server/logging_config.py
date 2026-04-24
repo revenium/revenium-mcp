@@ -6,6 +6,7 @@ MCP server, including structured logging, performance tracking, and monitoring.
 
 import functools
 import inspect
+import os
 import sys
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -149,6 +150,38 @@ class PerformanceTracker:
         return summary
 
 
+# Loguru record keys that appear in `extra` but are framework-internal or
+# already rendered elsewhere in the format string. Skip them when formatting
+# extras for console output so we surface only caller-supplied kwargs.
+_CONSOLE_EXTRA_SKIP = frozenset({"level", "message", "time", "name", "function", "line"})
+
+
+def _console_format(record: Dict[str, Any]) -> str:
+    """Loguru format callable that renders `extra` kwargs inline on stderr.
+
+    Returns a loguru format template; the extras segment is pre-rendered with
+    curly braces escaped so values containing '{' or '}' don't collide with
+    loguru's own placeholder substitution.
+    """
+    extras = {
+        k: v for k, v in record["extra"].items()
+        if k not in _CONSOLE_EXTRA_SKIP
+    }
+    if extras:
+        rendered = " ".join(f"{k}={v!r}" for k, v in extras.items())
+        extras_segment = " | " + rendered.replace("{", "{{").replace("}", "}}")
+    else:
+        extras_segment = ""
+    return (
+        "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
+        "<level>{message}</level>"
+        + extras_segment
+        + "\n"
+    )
+
+
 class LoggingConfig:
     """Centralized logging configuration and management."""
 
@@ -163,14 +196,32 @@ class LoggingConfig:
 
         Args:
             log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-            log_file: Optional log file path for general logging
+            log_file: Log file path for JSON-serialized logging.
+                Precedence: explicit argument > ``REVENIUM_LOG_FILE`` env var
+                > conventional default at
+                ``{crash_log_directory}/server.jsonl``.
+                The conventional default is always-on so the
+                mcp-functional-testing Phase 6 "Endpoint Mirror Audit" can
+                capture outgoing-request records without any operator
+                configuration. To opt out of file logging explicitly, pass
+                ``log_file=os.devnull`` or set ``REVENIUM_LOG_FILE=/dev/null``.
             enable_crash_logging: Enable automatic crash file logging (default: True)
             crash_log_directory: Custom crash log directory (default: ~/.revenium-mcp/logs/)
         """
         self.log_level = log_level
-        self.log_file = log_file
         self.enable_crash_logging = enable_crash_logging
         self.crash_log_directory = crash_log_directory or Path.home() / ".revenium-mcp" / "logs"
+        # Resolve log_file precedence: explicit arg > env var > conventional
+        # default (reuses the already-writable crash-log directory with a
+        # .jsonl extension to signal the serialized-JSON format). Empty
+        # strings in the env var fall through to the default.
+        env_override = os.environ.get("REVENIUM_LOG_FILE") or None
+        if log_file is not None:
+            self.log_file = log_file
+        elif env_override is not None:
+            self.log_file = env_override
+        else:
+            self.log_file = str(self.crash_log_directory / "server.jsonl")
         self.performance_tracker = PerformanceTracker()
         self._setup_logging()
 
@@ -179,14 +230,15 @@ class LoggingConfig:
         # Remove default loguru handler
         logger.remove()
 
-        # Add console handler with structured format
+        # Add console handler with structured format.
+        # Renders loguru `extra` fields (structured kwargs) when present so stderr
+        # readers see key=value context; required after BACK-1088 moved request
+        # metadata (method, url, operation_id, ...) from the message string into
+        # structured kwargs.
         logger.add(
             sys.stderr,
             level=self.log_level,
-            format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-            "<level>{level: <8}</level> | "
-            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
-            "<level>{message}</level>",
+            format=_console_format,
             colorize=True,
             serialize=False,
         )

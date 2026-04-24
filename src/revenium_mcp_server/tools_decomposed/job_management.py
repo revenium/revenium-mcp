@@ -23,6 +23,90 @@ from ..introspection.metadata import (
 from .unified_tool_base import ToolBase
 
 
+# BACK-1140: client-determinable upper bound on the page parameter.
+# Without this, page=2147483647 (32-bit MAX_INT) and similar boundary
+# inputs were forwarded straight to the backend, which returned a
+# generic HTTP 500 ("An unexpected error occurred, please contact
+# Revenium support") instead of a 400 naming the offending field. The
+# bound is intentionally generous — even at the smallest documented
+# size=1 it covers a million-row job dataset, far beyond what the
+# Jobs & Outcomes API surfaces today — so it stays a guard against
+# pathological inputs rather than a real cap on legitimate paging.
+_MAX_JOBS_PAGE = 1_000_000
+
+# BACK-1140: upper bound on the size parameter. Matches
+# PaginationPerformanceManager.MAXIMUM_LIMIT (50), the Revenium API
+# absolute maximum. Without this, size=2147483647 (32-bit MAX_INT)
+# passed the `size <= 0` guard and was forwarded to the backend, which
+# returned the same generic HTTP 500 this PR closed for page.
+_MAX_JOBS_SIZE = 50
+
+
+def _validate_jobs_pagination(page: Any, size: Any) -> None:
+    """Reject client-determinable boundary inputs with a structured 400.
+
+    Raises:
+        ToolError: when page or size is non-integer, negative, or exceeds
+            the bound; carries field/value/expected so the caller can fix
+            their input without inspecting a server-side traceback.
+    """
+    for label, value in (("page", page), ("size", size)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ToolError(
+                message=f"{label} must be an integer (got {type(value).__name__})",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=label,
+                value=value,
+                suggestions=[
+                    f"Pass an integer for {label} (no quotes, no booleans)",
+                ],
+            )
+    if page < 0:
+        raise ToolError(
+            message=f"page must be >= 0 (got {page})",
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="page",
+            value=page,
+            suggestions=["Use page=0 for the first page; pages are zero-indexed"],
+        )
+    if page > _MAX_JOBS_PAGE:
+        raise ToolError(
+            message=(
+                f"page exceeds maximum (expected 0 <= page <= {_MAX_JOBS_PAGE}, got {page})"
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="page",
+            value=page,
+            suggestions=[
+                "Pick a smaller page; very large indices indicate an off-by-one or "
+                "misuse — the underlying dataset never reaches this depth.",
+                "If you are looking for a specific job, use get_job(job_id=...) "
+                "instead of paginating to find it.",
+            ],
+        )
+    if size <= 0:
+        raise ToolError(
+            message=f"size must be > 0 (got {size})",
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="size",
+            value=size,
+            suggestions=["Use size between 1 and 50 (default 20)"],
+        )
+    if size > _MAX_JOBS_SIZE:
+        raise ToolError(
+            message=(
+                f"size exceeds maximum (expected 1 <= size <= {_MAX_JOBS_SIZE}, got {size})"
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="size",
+            value=size,
+            suggestions=[
+                f"Use size between 1 and {_MAX_JOBS_SIZE} (default 20)",
+                "Paginate with larger page numbers instead of oversized page sizes.",
+            ],
+        )
+
+
 class JobManager:
     """Internal manager wrapping async client calls for Jobs & Outcomes API."""
 
@@ -34,6 +118,7 @@ class JobManager:
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
         filters = arguments.get("filters", {})
+        _validate_jobs_pagination(page, size)
         response = await self.client.get_jobs(page=page, size=size, **filters)
         jobs = self.client._extract_embedded_data(response)
         page_info = self.client._extract_pagination_info(response)
@@ -76,6 +161,7 @@ class JobManager:
             )
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
+        _validate_jobs_pagination(page, size)
         response = await self.client.get_job_transactions(job_id, page=page, size=size)
         transactions = self.client._extract_embedded_data(response)
         page_info = self.client._extract_pagination_info(response)

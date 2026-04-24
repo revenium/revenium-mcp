@@ -5,6 +5,28 @@ All notable changes to the Revenium MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.7] - 2026-04-23
+
+### Added
+- Cost-by-user analytics via the new `get_user_costs` action on `manage_tools_analytics`, with optional filters for agents, providers, models, users, and cost sources
+- Tool cost analytics actions on `manage_tools_analytics` for per-tool spend breakdowns
+- USD currency labels on numeric `metricResult` values returned by analytics responses, including values nested in lists and dictionaries
+- `REVENIUM_LOG_FILE` environment variable for routing server logs to a file
+- Structured request and error logging in the HTTP client for easier downstream parsing
+
+### Fixed
+- `manage_tools` analytics now surface a clear configuration error when `REVENIUM_APP_BASE_URL` drifts from the API URL, instead of returning a misleading "Invalid API key" message
+- `manage_tools.create` now correctly injects `teamId` into the request payload
+- `manage_tools` analytics actions now expose `period` and `group` as first-class parameters and no longer leak raw Pydantic validation errors
+- `manage_tools` returns a structured error when `page` or `size` are passed with the wrong type, instead of surfacing an uncaught Python `TypeError`
+- `manage_tools.get` with a non-existent id now returns a structured "Tool not found" error rather than HTTP 500
+- `manage_tools.search` now honors the `query` parameter and filters results accordingly, instead of returning every tool regardless of query
+- `manage_alerts` exposes `periodDuration` and `triggerAfterPersistsDuration` as documented flat parameters
+- `manage_alerts` accepts `alert_id` as an alias for `anomaly_id`, resolving the parameter naming inconsistency across actions
+- `manage_metering.submit` rejects unknown provider values with a structured error instead of silently accepting them
+- `manage_jobs` translates out-of-range `page` values (including `MAX_INT`) into a structured 400 response instead of an unhandled HTTP 500
+- Pagination validation messages now reference the calling action name, making errors easier to trace
+
 ## [0.2.6] - 2026-04-14
 
 ### Fixed
@@ -90,6 +112,7 @@ No functional changes. Changelog formatting update only.
 - Configuration via environment variables
 - System diagnostics and transaction verification tools
 
+[0.2.7]: https://github.com/revenium/revenium-mcp/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/revenium/revenium-mcp/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/revenium/revenium-mcp/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/revenium/revenium-mcp/compare/v0.2.3...v0.2.4

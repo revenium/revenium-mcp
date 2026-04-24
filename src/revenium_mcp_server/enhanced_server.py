@@ -11,7 +11,7 @@ Licensed under the MIT License. See LICENSE file for details.
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, List, Union
+from typing import AsyncGenerator, List, Optional, Union
 
 from dotenv import load_dotenv
 
@@ -28,6 +28,9 @@ from .crash_handler import install_crash_logging
 # Import UCM integration
 from .capability_manager.integration_service import ucm_integration_service
 
+# Import config store for layered config resolution (env -> disk cache -> auto-discovery)
+from .config_store import get_config_value
+
 # Import enhanced introspection
 from .introspection.integration import introspection_integration
 
@@ -36,6 +39,27 @@ from .tools_decomposed.tool_registry import get_tool_description
 
 # Import version information
 from .version import get_package_version
+
+
+def _check_app_base_url_drift() -> Optional[str]:
+    """Return a warning message when REVENIUM_BASE_URL is configured but
+    REVENIUM_APP_BASE_URL is not.
+
+    Analytics (cost-by-tool, cost-by-user) and Slack OAuth endpoints default to
+    the production app host when REVENIUM_APP_BASE_URL is unset. If the operator
+    has pointed REVENIUM_BASE_URL at a non-production API host, those endpoints
+    will silently cross-environment and fail with a misleading 401.
+    """
+    base_url = get_config_value("REVENIUM_BASE_URL", None)
+    if base_url and not get_config_value("REVENIUM_APP_BASE_URL", None):
+        return (
+            f"REVENIUM_BASE_URL is configured ({base_url}) but REVENIUM_APP_BASE_URL is not. "
+            "Analytics endpoints (cost-by-tool, cost-by-user, Slack OAuth) will default to "
+            "https://app.revenium.ai (production). If your REVENIUM_API_KEY belongs to a "
+            "non-production environment, those endpoints will return 401. "
+            "Set REVENIUM_APP_BASE_URL to the app host matching your API key."
+        )
+    return None
 
 
 def dynamic_mcp_tool(tool_name: str):
@@ -354,6 +378,16 @@ async def main() -> None:
             logger.error("The server will start but API calls may fail.")
             logger.error("Please check your REVENIUM_API_KEY and REVENIUM_BASE_URL configuration.")
             logger.error("=" * 60)
+
+    # Warn when REVENIUM_BASE_URL is set but REVENIUM_APP_BASE_URL is not — the
+    # latter silently falls back to production and breaks non-prod analytics calls.
+    app_base_url_warning = _check_app_base_url_drift()
+    if app_base_url_warning:
+        logger.warning("=" * 60)
+        logger.warning("REVENIUM_APP_BASE_URL is not set")
+        logger.warning("=" * 60)
+        logger.warning(app_base_url_warning)
+        logger.warning("=" * 60)
 
     # Initialize UCM integration FIRST
     try:

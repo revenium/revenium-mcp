@@ -14,6 +14,8 @@ from .customer_costs_formatter import CustomerCostsFormatter
 from .error_formatter import ErrorFormatter
 from .model_costs_formatter import ModelCostsFormatter
 from .provider_costs_formatter import ProviderCostsFormatter
+from .tool_costs_formatter import ToolCostsFormatter
+from .user_costs_formatter import UserCostsFormatter
 
 __all__ = [
     "AnalyticsResponseFormatter",
@@ -23,7 +25,9 @@ __all__ = [
     "ProviderCostsFormatter",
     "ApiKeyCostsFormatter",
     "AgentCostsFormatter",
+    "UserCostsFormatter",
     "CostSpikeFormatter",
     "CostSummaryFormatter",
     "ErrorFormatter",
+    "ToolCostsFormatter",
 ]

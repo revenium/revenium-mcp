@@ -1363,3 +1363,119 @@ class TestManageProductsResourceDataParsing:
 
         assert isinstance(captured_args.get("resource_data"), dict)
         assert captured_args["resource_data"]["name"] == "ResX"
+
+
+class TestManageToolsFastMCPSignature:
+    """FastMCP builds its Pydantic model from the registered function's
+    signature, not from get_schema(). Undeclared kwargs raise a raw
+    `unexpected_keyword_argument` error, and plain-string params reject
+    other JSON scalars with a `string_type` Pydantic leak — these tests
+    guard both surfaces.
+    """
+
+    @pytest.mark.asyncio
+    async def test_signature_accepts_period_and_group(self):
+        """period and group must be declared so the analytics contract
+        (SEVEN_DAYS etc.) doesn't trip FastMCP validation."""
+        import inspect
+
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_tools")
+        sig = inspect.signature(fn)
+        assert "period" in sig.parameters, (
+            "period missing from manage_tools signature — callers passing "
+            "period='SEVEN_DAYS' will hit a raw Pydantic framework error"
+        )
+        assert "group" in sig.parameters, (
+            "group missing from manage_tools signature — callers passing "
+            "group='TOTAL' will hit a raw Pydantic framework error"
+        )
+
+    @pytest.mark.asyncio
+    async def test_period_string_reaches_downstream_execution(self):
+        """period='SEVEN_DAYS' must be forwarded to standardized_tool_execution
+        (the inner closure's single call-out), proving the kwarg survives
+        Python dispatch end-to-end."""
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_tools")
+
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await fn(action="get_cost_breakdown", period="SEVEN_DAYS", group="TOTAL")
+
+        assert captured.get("period") == "SEVEN_DAYS"
+        assert captured.get("group") == "TOTAL"
+
+    @pytest.mark.asyncio
+    async def test_int_tool_id_raises_structured_tool_error(self):
+        """tool_id=<int> must surface a structured ToolError (field='tool_id'),
+        not a raw Pydantic string_type leak."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_tools")
+
+        with pytest.raises(ToolError) as exc:
+            await fn(action="get", tool_id=12345)
+
+        assert exc.value.field == "tool_id"
+        assert "string" in exc.value.message.lower()
+        assert "12345" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_int_tool_name_raises_structured_tool_error(self):
+        """Same contract for tool_name — the fix must cover the full set of
+        ID/name string fields, not just tool_id."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_tools")
+
+        with pytest.raises(ToolError) as exc:
+            await fn(action="search", tool_name=999)
+
+        assert exc.value.field == "tool_name"
+
+    @pytest.mark.asyncio
+    async def test_int_action_raises_structured_tool_error(self):
+        """action is widened to JSON scalar at the framework boundary;
+        non-string values must still surface a structured ToolError rather
+        than leaking a Pydantic string_type error."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_tools")
+
+        with pytest.raises(ToolError) as exc:
+            await fn(action=123)
+
+        assert exc.value.field == "action"
+        assert "string" in exc.value.message.lower()
+
+    @pytest.mark.asyncio
+    async def test_string_tool_id_passes_through_unchanged(self):
+        """Happy path — a properly-typed tool_id reaches downstream execution."""
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_tools")
+
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await fn(action="get", tool_id="valid-tool-id")
+
+        assert captured.get("tool_id") == "valid-tool-id"

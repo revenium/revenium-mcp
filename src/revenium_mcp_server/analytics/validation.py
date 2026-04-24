@@ -309,6 +309,82 @@ class AnalyticsValidator:
         logger.info(f"Validated agent costs params: {validated}")
         return validated
 
+    # Filter keys accepted by the cost-by-user endpoints (FRONT-931).
+    _USER_COSTS_FILTER_KEYS = {"agents", "providers", "models", "users", "costSources"}
+    _VALID_COST_SOURCES = {"coding_assistant", "revenium_metered"}
+
+    def validate_user_costs_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate parameters for get_user_costs.
+
+        Args:
+            params: Parameters dictionary
+
+        Returns:
+            Validated parameters
+
+        Raises:
+            ValidationError: If parameters are invalid
+        """
+        # Extract filters before base validation (which has a different allowlist)
+        raw_filters = params.get("filters") or {}
+        base_params = {k: v for k, v in params.items() if k != "filters"}
+        analytics_params = self.validate_analytics_params(base_params)
+
+        validated = {"period": analytics_params.period, "aggregation": analytics_params.aggregation}
+
+        # Validate user-costs-specific filters (agents, providers, models, users)
+        if raw_filters:
+            user_filters = {}
+            for key, value in raw_filters.items():
+                if key not in self._USER_COSTS_FILTER_KEYS:
+                    raise ValidationError(
+                        f"Unsupported filter key for user costs: {key}",
+                        field="filters",
+                        suggestions=[
+                            f"Allowed keys: {', '.join(sorted(self._USER_COSTS_FILTER_KEYS))}"
+                        ],
+                    )
+                # Normalise to list for array query params
+                if isinstance(value, str):
+                    user_filters[key] = [value]
+                elif isinstance(value, list):
+                    if len(value) > 100:
+                        raise ValidationError(
+                            f"Filter '{key}' exceeds maximum of 100 items",
+                            field=f"filters.{key}",
+                            suggestions=[f"Provide at most 100 values for '{key}'"],
+                        )
+                    user_filters[key] = [str(v) for v in value]
+                else:
+                    user_filters[key] = [str(value)]
+
+                # Defense-in-depth: cap per-value string length
+                oversized = [v for v in user_filters[key] if len(v) > 255]
+                if oversized:
+                    raise ValidationError(
+                        f"Filter '{key}' contains value(s) longer than 255 characters",
+                        field=f"filters.{key}",
+                        suggestions=[f"Each value for '{key}' must be at most 255 characters"],
+                    )
+
+                # Validate costSources enum values
+                if key == "costSources":
+                    invalid = [v for v in user_filters[key] if v not in self._VALID_COST_SOURCES]
+                    if invalid:
+                        raise ValidationError(
+                            f"Invalid costSources value(s): {', '.join(invalid)}",
+                            field="filters.costSources",
+                            suggestions=[
+                                f"Valid values: {', '.join(sorted(self._VALID_COST_SOURCES))}"
+                            ],
+                        )
+
+            validated["filters"] = user_filters
+
+        logger.debug("Validated user costs params: period=%s", validated["period"])
+        return validated
+
     def validate_cost_summary_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """
         Validate parameters for get_cost_summary.
@@ -327,6 +403,27 @@ class AnalyticsValidator:
         validated = {"period": analytics_params.period, "aggregation": analytics_params.aggregation}
 
         logger.info(f"Validated cost summary params: {validated}")
+        return validated
+
+    def validate_tool_costs_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate parameters for tool cost actions (get_tool_costs,
+        get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider).
+
+        Args:
+            params: Parameters dictionary
+
+        Returns:
+            Validated parameters
+
+        Raises:
+            ValidationError: If parameters are invalid
+        """
+        analytics_params = self.validate_analytics_params(params)
+
+        validated = {"period": analytics_params.period, "aggregation": analytics_params.aggregation}
+
+        logger.info(f"Validated tool costs params: {validated}")
         return validated
 
     def validate_period(self, period: str) -> str:

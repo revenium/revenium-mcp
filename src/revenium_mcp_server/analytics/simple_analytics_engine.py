@@ -317,6 +317,40 @@ class AgentCostsProcessor(AnalyticsProcessor):
         )
 
 
+class UserCostsProcessor(AnalyticsProcessor):
+    """Processor for user costs analytics."""
+
+    def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate user costs parameters."""
+        return self.validator.validate_user_costs_params(kwargs)
+
+    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Fetch user costs data."""
+        return await self.analyzer.get_user_costs(
+            period=params["period"],
+            aggregation=params["aggregation"],
+            filters=params.get("filters"),
+        )
+
+    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+        """Format user costs response."""
+        return self.formatter.format_user_costs_response(
+            data=data, period=params["period"], aggregation=params["aggregation"]
+        )
+
+    def _handle_general_error(self, error: Exception, operation_type: str) -> str:
+        """Handle user costs errors."""
+        return self.formatter.format_error_response(
+            f"User costs analysis failed: {str(error)}",
+            [
+                "Check that the time period is valid (HOUR, SEVEN_DAYS, THIRTY_DAYS, etc.)",
+                "Verify that aggregation is valid (TOTAL, MEAN, MAXIMUM, MINIMUM)",
+                "Ensure there is data available for the specified period",
+                "This endpoint requires the new analytics API (cost-by-user)",
+            ],
+        )
+
+
 class CostSummaryProcessor(AnalyticsProcessor):
     """Processor for cost summary analytics."""
 
@@ -345,6 +379,112 @@ class CostSummaryProcessor(AnalyticsProcessor):
                 "Verify that aggregation is valid (TOTAL, MEAN, MAXIMUM, MINIMUM)",
                 "Ensure there is data available for the specified period",
                 "Try a different time period if no data is found",
+            ],
+        )
+
+
+class ToolCostsProcessor(AnalyticsProcessor):
+    """Processor for tool costs analytics."""
+
+    def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        return self.validator.validate_tool_costs_params(kwargs)
+
+    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return await self.analyzer.get_tool_costs(
+            period=params["period"], aggregation=params["aggregation"]
+        )
+
+    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+        return self.formatter.format_tool_costs_response(
+            data=data, period=params["period"], aggregation=params["aggregation"]
+        )
+
+    def _handle_general_error(self, error: Exception, operation_type: str) -> str:
+        return self.formatter.format_error_response(
+            f"Tool costs analysis failed: {str(error)}",
+            [
+                "Check that the time period is valid (HOUR, SEVEN_DAYS, THIRTY_DAYS, etc.)",
+                "Verify that aggregation is valid (TOTAL, MEAN, MAXIMUM, MINIMUM)",
+                "Ensure there is tool data available for the specified period",
+                "Note: tool cost data requires backend cost aggregation to be working",
+            ],
+        )
+
+
+class TopToolsProcessor(AnalyticsProcessor):
+    """Processor for top tools by call count."""
+
+    def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        return self.validator.validate_tool_costs_params(kwargs)
+
+    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return await self.analyzer.get_top_tools(
+            period=params["period"], aggregation=params["aggregation"]
+        )
+
+    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+        return self.formatter.format_tool_costs_response(
+            data=data, period=params["period"], aggregation=params["aggregation"]
+        )
+
+    def _handle_general_error(self, error: Exception, operation_type: str) -> str:
+        return self.formatter.format_error_response(
+            f"Top tools analysis failed: {str(error)}",
+            [
+                "Check that the time period is valid (HOUR, SEVEN_DAYS, THIRTY_DAYS, etc.)",
+                "Ensure there is tool usage data available for the specified period",
+            ],
+        )
+
+
+class ToolCostsByAgentProcessor(AnalyticsProcessor):
+    """Processor for tool costs grouped by agent."""
+
+    def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        return self.validator.validate_tool_costs_params(kwargs)
+
+    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return await self.analyzer.get_tool_costs_by_agent(
+            period=params["period"], aggregation=params["aggregation"]
+        )
+
+    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+        return self.formatter.format_tool_costs_response(
+            data=data, period=params["period"], aggregation=params["aggregation"]
+        )
+
+    def _handle_general_error(self, error: Exception, operation_type: str) -> str:
+        return self.formatter.format_error_response(
+            f"Tool costs by agent analysis failed: {str(error)}",
+            [
+                "Check that the time period is valid (HOUR, SEVEN_DAYS, THIRTY_DAYS, etc.)",
+                "Ensure there are agents with tool usage data for the specified period",
+            ],
+        )
+
+
+class ToolCostsByProviderProcessor(AnalyticsProcessor):
+    """Processor for tool costs grouped by provider."""
+
+    def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        return self.validator.validate_tool_costs_params(kwargs)
+
+    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return await self.analyzer.get_tool_costs_by_provider(
+            period=params["period"], aggregation=params["aggregation"]
+        )
+
+    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+        return self.formatter.format_tool_costs_response(
+            data=data, period=params["period"], aggregation=params["aggregation"]
+        )
+
+    def _handle_general_error(self, error: Exception, operation_type: str) -> str:
+        return self.formatter.format_error_response(
+            f"Tool costs by provider analysis failed: {str(error)}",
+            [
+                "Check that the time period is valid (HOUR, SEVEN_DAYS, THIRTY_DAYS, etc.)",
+                "Ensure there are tool providers with data for the specified period",
             ],
         )
 
@@ -389,8 +529,13 @@ class SimpleAnalyticsEngine:
         self.customer_processor = CustomerCostsProcessor(self.dependencies, self.logger)
         self.api_key_processor = ApiKeyCostsProcessor(self.dependencies, self.logger)
         self.agent_processor = AgentCostsProcessor(self.dependencies, self.logger)
+        self.user_processor = UserCostsProcessor(self.dependencies, self.logger)
         self.spike_processor = CostSpikeProcessor(self.dependencies, self.logger)
         self.summary_processor = CostSummaryProcessor(self.dependencies, self.logger)
+        self.tool_costs_processor = ToolCostsProcessor(self.dependencies, self.logger)
+        self.top_tools_processor = TopToolsProcessor(self.dependencies, self.logger)
+        self.tool_costs_by_agent_processor = ToolCostsByAgentProcessor(self.dependencies, self.logger)
+        self.tool_costs_by_provider_processor = ToolCostsByProviderProcessor(self.dependencies, self.logger)
 
     async def get_provider_costs(self, **kwargs) -> str:
         """
@@ -457,6 +602,19 @@ class SimpleAnalyticsEngine:
         params = AnalyticsParams(operation_type="agent costs", kwargs=kwargs)
         return await self.agent_processor.process_analytics_request(params)
 
+    async def get_user_costs(self, **kwargs) -> str:
+        """
+        Get user cost ranking with validation and formatting.
+
+        Args:
+            **kwargs: Parameters including period and aggregation
+
+        Returns:
+            Formatted user costs response
+        """
+        params = AnalyticsParams(operation_type="user costs", kwargs=kwargs)
+        return await self.user_processor.process_analytics_request(params)
+
     async def investigate_cost_spike(self, **kwargs) -> str:
         """
         Investigate cost spikes above threshold.
@@ -483,6 +641,26 @@ class SimpleAnalyticsEngine:
         params = AnalyticsParams(operation_type="cost summary", kwargs=kwargs)
         return await self.summary_processor.process_analytics_request(params)
 
+    async def get_tool_costs(self, **kwargs) -> str:
+        """Get tool cost ranking with validation and formatting."""
+        params = AnalyticsParams(operation_type="tool costs", kwargs=kwargs)
+        return await self.tool_costs_processor.process_analytics_request(params)
+
+    async def get_top_tools(self, **kwargs) -> str:
+        """Get top tools by call count with validation and formatting."""
+        params = AnalyticsParams(operation_type="top tools", kwargs=kwargs)
+        return await self.top_tools_processor.process_analytics_request(params)
+
+    async def get_tool_costs_by_agent(self, **kwargs) -> str:
+        """Get tool costs grouped by agent with validation and formatting."""
+        params = AnalyticsParams(operation_type="tool costs by agent", kwargs=kwargs)
+        return await self.tool_costs_by_agent_processor.process_analytics_request(params)
+
+    async def get_tool_costs_by_provider(self, **kwargs) -> str:
+        """Get tool costs grouped by provider with validation and formatting."""
+        params = AnalyticsParams(operation_type="tool costs by provider", kwargs=kwargs)
+        return await self.tool_costs_by_provider_processor.process_analytics_request(params)
+
     def get_supported_actions(self) -> List[str]:
         """
         Get list of supported actions.
@@ -496,8 +674,13 @@ class SimpleAnalyticsEngine:
             "get_customer_costs",
             "get_api_key_costs",
             "get_agent_costs",
+            "get_user_costs",
             "investigate_cost_spike",
             "get_cost_summary",
+            "get_tool_costs",
+            "get_top_tools",
+            "get_tool_costs_by_agent",
+            "get_tool_costs_by_provider",
         ]
 
     def get_capabilities_summary(self) -> Dict[str, Any]:

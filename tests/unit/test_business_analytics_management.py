@@ -87,6 +87,26 @@ class TestHandleActionRouting:
         with pytest.raises(ToolError, match="unexpected boom"):
             await analytics_tool.handle_action("get_capabilities", {})
 
+    @pytest.mark.asyncio
+    async def test_wrong_type_page_returns_structured_error(self, analytics_tool):
+        """Non-numeric page is rejected up front with a structured ToolError so it
+        no longer silently slides through as it did before BACK-1097."""
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action(
+                "get_provider_costs", {"page": "not_a_number"}
+            )
+        assert exc.value.field == "page"
+
+    @pytest.mark.asyncio
+    async def test_valid_page_passes_validation(self, analytics_tool):
+        """A correctly-typed page does not trip validation; the action proceeds
+        normally and any downstream behaviour is unchanged."""
+        analytics_tool._handle_get_provider_costs = AsyncMock(return_value=[])
+        await analytics_tool.handle_action(
+            "get_provider_costs", {"page": 0, "size": 20}
+        )
+        analytics_tool._handle_get_provider_costs.assert_awaited_once()
+
 
 class TestFormatApiErrorDetails:
     """Test _format_api_error_details with different error types."""
