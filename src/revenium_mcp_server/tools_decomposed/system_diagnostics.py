@@ -179,56 +179,56 @@ Use `get_examples()` for detailed usage examples and parameter guidance.
 
 ### Check Environment Variables
 ```json
-{{"action": "environment_variables"}}
+{"action": "environment_variables"}
 ```
 
 ### Check Auto-Discovery Status
 ```json
-{{"action": "auto_discovery"}}
+{"action": "auto_discovery"}
 ```
 
 ### System Health Overview
 ```json
-{{"action": "system_health"}}
+{"action": "system_health"}
 ```
 
 ## **Auto-Discovery Debugging Examples**
 
 ### Debug Auto-Discovery Issues
 ```json
-{{"action": "debug"}}
+{"action": "debug"}
 ```
 
 ## **Log Analysis Examples**
 
 ### Get Internal System Logs
 ```json
-{{"action": "get_internal_logs"}}
+{"action": "get_internal_logs"}
 ```
 
 ### Get Integration Logs
 ```json
-{{"action": "get_integration_logs"}}
+{"action": "get_integration_logs"}
 ```
 
 ### Get Recent Logs (Last 200 entries)
 ```json
-{{"action": "get_recent_logs"}}
+{"action": "get_recent_logs"}
 ```
 
 ### Search Logs for Specific Terms
 ```json
-{{"action": "search_logs", "search_term": "error"}}
+{"action": "search_logs", "search_term": "error"}
 ```
 
 ### Search with Pagination
 ```json
-{{"action": "search_logs", "search_term": "API", "page": 0, "size": 100}}
+{"action": "search_logs", "search_term": "API", "page": 0, "size": 100}
 ```
 
 ### Analyze Operation Patterns
 ```json
-{{"action": "analyze_operations"}}
+{"action": "analyze_operations"}
 ```
 
 ## **Troubleshooting Workflows**

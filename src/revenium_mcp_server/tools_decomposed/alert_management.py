@@ -33,6 +33,7 @@ from ..common.error_handling import (
     format_structured_error,
 )
 from ..common.pagination_performance import validate_pagination_with_performance
+from ..common.validation import validate_pagination_params
 from ..common.ucm_config import log_ucm_status
 from ..exceptions import ValidationError
 from ..introspection.metadata import (
@@ -44,9 +45,17 @@ from ..introspection.metadata import (
     UsagePattern,
 )
 from ..mixins.slack_prompting_mixin import SlackPromptingMixin
-from ..models import MetricType
+from ..models import AlertType, MetricType, OperatorType
 from ..schema.alert_schema import get_alert_metrics_capabilities
 from .unified_tool_base import ToolBase
+
+
+# Module-level — must stay in sync with AlertType enum members.
+_ALERT_TYPE_DESCRIPTIONS = {
+    AlertType.THRESHOLD.value: "real-time spike detection on a metric crossing a threshold",
+    AlertType.CUMULATIVE_USAGE.value: "budget / quota tracking across a billing period",
+    AlertType.RELATIVE_CHANGE.value: "trend detection — alert when a metric increases or decreases by a percentage",
+}
 
 
 class AlertManagement(ToolBase, SlackPromptingMixin):
@@ -575,6 +584,9 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
             return await self._handle_anomaly_operations(client, "list", arguments)
         elif resource_type == "alerts":
             logger.info("Routing to alert operations for list")
+            # BACK-1270 (item #5): reject malformed page/size at the tool boundary
+            # before the underlying client receives a non-int (Pydantic-leak guard).
+            arguments = validate_pagination_params(arguments, action="list_alerts")
             try:
                 # Extract and validate pagination parameters with performance guidance
                 page = arguments.get("page", 0)
@@ -873,6 +885,9 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle anomaly-related operations."""
         if action == "list":
+            # BACK-1270 (item #5): reject malformed page/size at the tool boundary
+            # before the underlying client receives a non-int (Pydantic-leak guard).
+            arguments = validate_pagination_params(arguments, action="list_anomalies")
             page = arguments.get("page", 0)
             size = arguments.get("size", 20)
             filters = arguments.get("filters", {})
@@ -1176,14 +1191,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
         self, client: ReveniumClient, action: str, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle alert-related operations."""
-        if action == "list":
-            page = arguments.get("page", 0)
-            size = arguments.get("size", 20)
-            filters = arguments.get("filters", {})
-            query = arguments.get("query")
-            return await self.alert_manager.list_alerts(client, page, size, filters, query)
-
-        elif action == "get":
+        if action == "get":
             alert_id = arguments.get("alert_id")
             if not alert_id:
                 error = create_structured_missing_parameter_error(
@@ -1218,7 +1226,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                     "For creating alerts, use anomaly management instead",
                 ],
                 examples={
-                    "alert_actions": ["list", "get", "query"],
+                    "alert_actions": ["get", "query"],
                     "anomaly_actions": ["create", "update", "delete"],
                     "example_usage": {
                         "list_alerts": "list() to see existing alerts",
@@ -1351,16 +1359,28 @@ create_threshold_alert(...)                     # Real-time monitoring rule
             for metric in MetricType:
                 text += f"- **{metric.value}**\n"
 
-        # Add UCM-enhanced operators if available
-        if ucm_capabilities and "operators" in ucm_capabilities:
-            text += "\n\n## **Available Operators**\n"
-            for operator in ucm_capabilities["operators"]:
-                text += f"- **{operator}**\n"
+        # Available Operators — prefer UCM, fall back to OperatorType enum so
+        # the section is never rendered with an empty body. Empty UCM lists
+        # also fall through to the enum.
+        operators = list(ucm_capabilities.get("operators") or []) if ucm_capabilities else []
+        if not operators:
+            operators = [op.value for op in OperatorType]
+        text += "\n\n## **Available Operators**\n"
+        for operator in operators:
+            text += f"- **{operator}**\n"
 
-        # Add UCM-enhanced alert types if available
-        if ucm_capabilities and "alert_types" in ucm_capabilities:
-            text += "\n\n## **Alert Types**\n"
-            for alert_type in ucm_capabilities["alert_types"]:
+        # Alert Types — same fallback chain. Each enum value carries a short
+        # description so the rendered section is informative even when UCM
+        # is unavailable.
+        alert_types = list(ucm_capabilities.get("alert_types") or []) if ucm_capabilities else []
+        if not alert_types:
+            alert_types = [t.value for t in AlertType]
+        text += "\n\n## **Alert Types**\n"
+        for alert_type in alert_types:
+            description = _ALERT_TYPE_DESCRIPTIONS.get(alert_type)
+            if description:
+                text += f"- **{alert_type}** — {description}\n"
+            else:
                 text += f"- **{alert_type}**\n"
 
         text += """

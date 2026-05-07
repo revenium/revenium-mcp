@@ -103,7 +103,7 @@ def test_customer_tools_import():
 
 def test_models_import():
     """Test that customer models can be imported successfully."""
-    from revenium_mcp_server.models import User, Subscriber, Organization, Team
+    from src.revenium_mcp_server.models import User, Subscriber, Organization, Team
     assert User is not None
     assert Subscriber is not None
     assert Organization is not None

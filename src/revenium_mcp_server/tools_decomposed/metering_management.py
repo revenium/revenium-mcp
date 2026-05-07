@@ -7,6 +7,7 @@ following the proven alert/source/customer/product/workflow management template.
 import asyncio
 import hashlib
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union, Tuple, Callable, Awaitable
@@ -16,6 +17,7 @@ from mcp.types import TextContent, ImageContent, EmbeddedResource
 
 from ..client import ReveniumClient
 from ..agent_friendly import UnifiedResponseFormatter
+from ..common.validation import validate_pagination_params
 from ..endpoint_registry import get_endpoint_path
 from .unified_tool_base import ToolBase
 from ..common.error_handling import (
@@ -51,6 +53,21 @@ _VALID_PROVIDERS = (
     "GROQ",
 )
 PROMETHEUS_METRICS_AVAILABLE = False
+
+# Accepted transaction_id formats. The backend silently drops ids it does not
+# recognize, so anything outside this whitelist must be rejected at the MCP
+# boundary — otherwise submit returns "submitted" while the row never lands
+# in the analytics pipeline.
+#   - Internal: emitted by _generate_transaction_id (`tx_` + 12 lowercase hex)
+#   - UUID:     standard 8-4-4-4-12 dashed form, case-insensitive
+#   - UUID:     bare 32-char hex form, case-insensitive
+# NOTE: intentionally case-sensitive — _generate_transaction_id always produces lowercase hex; uppercase tx_ ids are rejected by design.
+_TX_ID_INTERNAL_RE = re.compile(r"^tx_[0-9a-f]{12}$")
+_TX_ID_UUID_DASHED_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_TX_ID_UUID_BARE_RE = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
 
 # Mapping from MCP argument names (snake_case) to completions API filter param names (camelCase).
 # Used to build API query params for all three completions call sites.
@@ -150,6 +167,50 @@ class MeteringTransactionManager:
     def _generate_transaction_id(self) -> str:
         """Generate a unique transaction ID."""
         return f"tx_{uuid.uuid4().hex[:12]}"
+
+    def _validate_transaction_id_format(self, transaction_id: Any) -> None:
+        """Reject transaction_ids the backend will silently drop.
+
+        Auto-generated ids always satisfy this — only ids the caller supplied
+        are checked. The error envelope carries field/value/examples so the
+        caller can fix their input without inspecting a server-side traceback.
+        """
+        if not isinstance(transaction_id, str) or not transaction_id:
+            raise ToolError(
+                message="transaction_id must be a non-empty string (UUID or 'tx_' + 12 hex chars)",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="transaction_id",
+                value=transaction_id,
+                suggestions=[
+                    "Pass a UUID (e.g. '550e8400-e29b-41d4-a716-446655440000')",
+                    "Or omit transaction_id entirely so submit_ai_transaction auto-generates one",
+                ],
+            )
+        if (
+            _TX_ID_INTERNAL_RE.match(transaction_id)
+            or _TX_ID_UUID_DASHED_RE.match(transaction_id)
+            or _TX_ID_UUID_BARE_RE.match(transaction_id)
+        ):
+            return
+        raise ToolError(
+            message=(
+                f"transaction_id '{transaction_id}' is not a recognized format; "
+                "the backend silently drops unrecognized ids, so the row would "
+                "not be persisted."
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="transaction_id",
+            value=transaction_id,
+            suggestions=[
+                "Pass a UUID (8-4-4-4-12 dashed or 32-char bare hex)",
+                "Or omit transaction_id and let submit_ai_transaction auto-generate one",
+            ],
+            examples={
+                "valid_uuid_dashed": "550e8400-e29b-41d4-a716-446655440000",
+                "valid_uuid_bare": "550e8400e29b41d4a716446655440000",
+                "valid_internal": "tx_a1b2c3d4e5f6",
+            },
+        )
 
     def _transaction_ids_match(self, stored_id: Optional[str], search_id: str) -> bool:
         """Universal transaction ID matching that supports any format.
@@ -1618,8 +1679,12 @@ The subscriber data structure has been updated. The old individual fields are no
                 },
             )
 
-        # Generate transaction ID if not provided
-        transaction_id = arguments.get("transaction_id") or self._generate_transaction_id()
+        # Generate transaction ID if not provided; reject malformed user-supplied
+        # ids before the payload reaches the backend, which silently drops them.
+        user_supplied_id = arguments.get("transaction_id")
+        if user_supplied_id:
+            self._validate_transaction_id_format(user_supplied_id)
+        transaction_id = user_supplied_id or self._generate_transaction_id()
 
         # Build payload with required fields matching the API format
         now_time = self._iso_utc()
@@ -3623,9 +3688,9 @@ get_field_documentation()
 - `trace_id` (optional) - Session/conversation tracking ID
 - `product_id` (optional) - Product using the AI service
 - `subscription_id` (optional) - Subscription reference
-- `task_id` (optional) - Task identifier
 - `response_quality_score` (optional) - Quality score 0.0-1.0
 - `stop_reason` (optional) - Completion stop reason
+- `error_reason` (optional) - Error description if request failed
 - `is_streamed` (optional) - Whether response was streamed
 - `subscriber` (object) - Subscriber information with nested structure
 
@@ -4085,7 +4150,7 @@ list_ai_models()                       # List all models
 - `duration_ms` (integer) - Duration in milliseconds (> 0, ≤ 10,000,000)
 
 ## **Optional Fields**
-- `organization_id`, `task_type`, `agent`, `trace_id`, `product_id`, `subscription_id`, `stop_reason` (string, 1-500 chars)
+- `organization_id`, `task_type`, `agent`, `trace_id`, `product_id`, `subscription_id`, `stop_reason`, `error_reason` (string, 1-500 chars, no `< > " ' &`)
 - `response_quality_score` (float, 0.0-1.0)
 - `is_streamed` (boolean)
 - `time_to_first_token` (integer, ≤ 60,000ms)
@@ -4114,7 +4179,7 @@ list_ai_models()                       # List all models
 ## **Field Groups**
 - **Basic**: `model`, `provider`, `input_tokens`, `output_tokens`, `duration_ms`
 - **Attribution**: + `organization_id`, `task_type`, `agent`
-- **Quality**: + `response_quality_score`, `is_streamed`, `stop_reason`
+- **Quality**: + `response_quality_score`, `is_streamed`, `stop_reason`, `error_reason`
 - **Session**: + `trace_id`
 - **Billing**: + `product_id`, `subscription_id`, `subscriber`
 - **Timestamps**: + `request_time`, `response_time`, `completion_start_time`
@@ -4183,6 +4248,10 @@ Use `validate()` before submission."""
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle list AI models action."""
         try:
+            # BACK-1313: coerce page/size before they reach arithmetic; raises
+            # structured ToolError on bad input instead of letting a Python
+            # TypeError leak through (audit finding C.4).
+            arguments = validate_pagination_params(arguments, action="list_ai_models")
             client = ReveniumClient()
             page = arguments.get("page", 0)
             size = arguments.get("size", 20)
@@ -4192,7 +4261,8 @@ Use `validate()` before submission."""
 
             if "_embedded" in response and "aIModelResourceList" in response["_embedded"]:
                 models = response["_embedded"]["aIModelResourceList"]
-                total_models = len(models)
+                page_info = response.get("page", {})
+                total_models = page_info.get("totalElements", len(models))
 
                 # Group models by provider
                 providers = {}
@@ -4245,6 +4315,8 @@ Use `validate()` before submission."""
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle search AI models action using list and filter approach."""
         try:
+            # BACK-1313: coerce page/size at the action boundary (audit C.4).
+            arguments = validate_pagination_params(arguments, action="search_ai_models")
             query = arguments.get("query")
             if not query:
                 raise create_structured_missing_parameter_error(

@@ -1145,3 +1145,32 @@ class TestAlertIdAlias:
         result = await alert_mgmt.handle_action("disable", {"alert_id": "anom_99"})
         text = _text(result)
         assert "anom_99" in text
+
+
+from tests.unit._helpers_no_framework_leak import assert_no_framework_leak
+
+
+class TestAlertListPaginationValidation:
+    """BACK-1270 / item #5 — Pydantic leak guard on manage_alerts list."""
+
+    @pytest.mark.asyncio
+    async def test_list_alerts_rejects_float_size_with_structured_error(
+        self, alert_mgmt, mock_client
+    ):
+        with pytest.raises(ToolError) as exc:
+            await alert_mgmt._handle_list(
+                mock_client, {"resource_type": "alerts", "page": 0, "size": 3.7}
+            )
+        assert exc.value.field == "size"
+        assert_no_framework_leak(exc.value.message)
+
+    @pytest.mark.asyncio
+    async def test_list_anomalies_rejects_float_size_with_structured_error(
+        self, alert_mgmt, mock_client
+    ):
+        with pytest.raises(ToolError) as exc:
+            await alert_mgmt._handle_anomaly_operations(
+                mock_client, "list", {"page": 0, "size": 3.7}
+            )
+        assert exc.value.field == "size"
+        assert_no_framework_leak(exc.value.message)

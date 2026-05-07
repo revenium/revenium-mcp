@@ -253,16 +253,15 @@ class EnhancedSpikeAnalyzer:
                 if not isinstance(group, dict):
                     continue
 
-                entity_name = group.get("groupName", "Unknown")
+                raw_name = group.get("groupName")
+                entity_name = str(raw_name).upper() if raw_name else "UNKNOWN"
                 total_cost = self._calculate_group_cost(group.get("metrics", []))
 
-                # Track entity to dimension mapping
                 self.entity_dimension_map[entity_name] = dimension
 
                 if entity_name not in entity_time_matrix:
                     entity_time_matrix[entity_name] = []
 
-                # Store both timestamp and cost
                 entity_time_matrix[entity_name].append((timestamp, total_cost))
 
     def _process_single_period_data(
@@ -290,14 +289,15 @@ class EnhancedSpikeAnalyzer:
             if not isinstance(group, dict):
                 continue
 
-            entity_name = group.get("groupName", "Unknown")
+            raw_name = group.get("groupName")
+            entity_name = str(raw_name).upper() if raw_name else "UNKNOWN"
             total_cost = self._calculate_group_cost(group.get("metrics", []))
 
-            # Track entity to dimension mapping
             self.entity_dimension_map[entity_name] = dimension
 
-            # For single period, create single-item time series with timestamp
-            entity_time_matrix[entity_name] = [(timestamp, total_cost)]
+            if entity_name not in entity_time_matrix:
+                entity_time_matrix[entity_name] = []
+            entity_time_matrix[entity_name].append((timestamp, total_cost))
 
     def _calculate_group_cost(self, metrics: List[Dict]) -> float:
         """Calculate total cost for a group from metrics."""

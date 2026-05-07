@@ -32,7 +32,6 @@ def mock_client():
     client.get_tool_by_tool_id = AsyncMock()
     client.create_tool = AsyncMock()
     client.update_tool = AsyncMock()
-    client.replace_tool = AsyncMock()
     client.delete_tool = AsyncMock()
     client.restore_tool = AsyncMock()
     client.search_tools = AsyncMock()
@@ -259,7 +258,19 @@ class TestToolManagerUpdate:
         mock_client.update_tool.return_value = {"id": "t1", "name": "Updated"}
         result = await tool_manager.update_tool({"tool_id": "t1", "tool_data": {"name": "Updated"}})
         assert result["name"] == "Updated"
-        mock_client.update_tool.assert_called_once_with("t1", {"name": "Updated"})
+        mock_client.update_tool.assert_called_once_with(
+            "t1", {"name": "Updated", "teamId": "test_team_id_456"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_tool_preserves_explicit_team_id(self, tool_manager, mock_client):
+        mock_client.update_tool.return_value = {"id": "t1"}
+        await tool_manager.update_tool({
+            "tool_id": "t1",
+            "tool_data": {"name": "X", "teamId": "explicit_team"},
+        })
+        call_data = mock_client.update_tool.call_args[0][1]
+        assert call_data["teamId"] == "explicit_team"
 
     @pytest.mark.asyncio
     async def test_update_tool_missing_id_raises(self, tool_manager):
@@ -274,30 +285,31 @@ class TestToolManagerUpdate:
 
 
 class TestToolManagerReplace:
-    """Test ToolManager.replace_tool behavior."""
+    """replace is an alias for update_tool (BACK-1316/F.2)."""
 
     @pytest.mark.asyncio
-    async def test_replace_tool_sends_put(self, tool_manager, mock_client):
-        mock_client.replace_tool.return_value = {"id": "t1", "name": "Replaced"}
-        result = await tool_manager.replace_tool({"tool_id": "t1", "tool_data": {"name": "Replaced"}})
+    async def test_replace_routes_through_update_tool(self, tool_manager, mock_client):
+        mock_client.update_tool.return_value = {"id": "t1", "name": "Replaced"}
+        result = await tool_manager.update_tool({"tool_id": "t1", "tool_data": {"name": "Replaced"}})
         assert result["name"] == "Replaced"
-        mock_client.replace_tool.assert_called_once_with("t1", {"name": "Replaced"})
+        mock_client.update_tool.assert_called_once_with(
+            "t1", {"name": "Replaced", "teamId": "test_team_id_456"},
+        )
 
     @pytest.mark.asyncio
-    async def test_replace_tool_missing_id_raises(self, tool_manager):
+    async def test_replace_missing_id_raises(self, tool_manager):
         with pytest.raises(ToolError):
-            await tool_manager.replace_tool({"tool_data": {"name": "X"}})
+            await tool_manager.update_tool({"tool_data": {"name": "X"}})
 
     @pytest.mark.asyncio
-    async def test_replace_tool_missing_data_raises(self, tool_manager):
+    async def test_replace_missing_data_raises(self, tool_manager):
         with pytest.raises(ToolError):
-            await tool_manager.replace_tool({"tool_id": "t1"})
+            await tool_manager.update_tool({"tool_id": "t1"})
 
     @pytest.mark.asyncio
-    async def test_replace_tool_with_invalid_pricing_raises(self, tool_manager):
-        """replace_tool validates pricing the same as create_tool."""
+    async def test_replace_with_invalid_pricing_raises(self, tool_manager):
         with pytest.raises(ToolError):
-            await tool_manager.replace_tool({
+            await tool_manager.update_tool({
                 "tool_id": "t1",
                 "tool_data": {"name": "X", "pricing": {"elements": [{"unitPrice": -1}]}},
             })
@@ -637,6 +649,22 @@ class TestToolManagementMetadata:
         assert schema["additionalProperties"] is False
         assert "SEVEN_DAYS" in schema["properties"]["period"]["enum"]
 
+    @pytest.mark.asyncio
+    async def test_event_data_redirects_subscriber_credential_attribution(self, tool_mgmt):
+        """meter_event silently drops subscriberCredential — schema description and
+        Event Metering capability point callers at manage_metering for attribution
+        instead of advertising a field whose persistence is not verified end-to-end."""
+        schema = await tool_mgmt._get_input_schema()
+        event_data_desc = schema["properties"]["event_data"]["description"]
+        assert "manage_metering" in event_data_desc
+        assert "subscriber-credential attribution" in event_data_desc.lower()
+
+        capabilities = await tool_mgmt._get_tool_capabilities()
+        event_metering = next(c for c in capabilities if c.name == "Event Metering")
+        joined_limitations = " ".join(event_metering.limitations)
+        assert "manage_metering" in joined_limitations
+        assert "subscriber-credential attribution" in joined_limitations.lower()
+
 
 # ===========================================================================
 # ToolManager Pricing Tests
@@ -884,6 +912,22 @@ class TestToolManagementHandleAction:
         assert "Found 1 tools" in result[0].text
         mock_client.list_tools.assert_called_once_with(page=2, size=10)
 
+    @pytest.mark.asyncio
+    async def test_replace_dispatches_to_update_tool(self, tool_mgmt, mock_client):
+        mock_client.update_tool.return_value = {"id": "t1", "name": "replaced"}
+        tool_mgmt.client = mock_client
+
+        result = await tool_mgmt.handle_action("replace", {
+            "tool_id": "t1",
+            "tool_data": {"name": "replaced", "toolType": "MCP_SERVER"},
+        })
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContent)
+        assert "Tool updated" in result[0].text
+        mock_client.update_tool.assert_called_once()
+        call_data = mock_client.update_tool.call_args[0][1]
+        assert "teamId" in call_data
 
 
 # ===========================================================================

@@ -31,9 +31,85 @@ class ApiKeyCostsFormatter(AnalyticsResponseFormatter):
                 "API key costs", period, f"aggregation: {aggregation}"
             )
 
+        # BACK-1270 / item #8: distinct upstream API keys can mask to the same
+        # label (e.g. two ANONYMOUS rows -> ANON****MOUS), producing rows the
+        # caller cannot disambiguate. Collapse colliding masked labels into a
+        # single row before formatting.
+        aggregated = self._aggregate_by_masked_label(data)
+
         return self._format_api_key_costs_content(
-            data, {"period": period, "aggregation": aggregation}
+            aggregated, {"period": period, "aggregation": aggregation}
         )
+
+    def _aggregate_by_masked_label(
+        self, rows: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Merge rows whose masked label collides; sum cost + percentage.
+
+        BACK-1270 / item #8: two distinct upstream api keys can produce the
+        same masked label (e.g. both ``ANONYMOUS`` -> ``ANON****MOUS``), and
+        indistinguishable rows confuse callers. Group by what
+        :meth:`_mask_api_key_name` produces; one emitted row per masked label.
+        Groups with more than one source row get a ``note`` field documenting
+        the source count so callers know the row is an aggregation.
+
+        Debug rows (``api_key == "DEBUG_INFO"``) and rows with no ``api_key``
+        are passed through unchanged so existing debug / unknown-key handling
+        is preserved.
+
+        Args:
+            rows: Raw API key cost rows from upstream.
+
+        Returns:
+            Aggregated row list, preserving first-seen order, with summed
+            ``cost`` and ``percentage`` and an optional ``note`` field on
+            collapsed groups.
+        """
+        groups: Dict[str, Dict[str, Any]] = {}
+        order: List[str] = []
+        sources_per_group: Dict[str, int] = {}
+        passthrough: List[Dict[str, Any]] = []
+
+        for row in rows:
+            api_key_name = row.get("api_key")
+            # Pass-through: debug rows and rows missing the api_key field
+            # bypass aggregation entirely (preserves existing behavior).
+            if api_key_name is None or api_key_name == "DEBUG_INFO":
+                passthrough.append(row)
+                continue
+
+            masked = self._mask_api_key_name(api_key_name)
+            if masked not in groups:
+                # Seed with a copy of the row, then overwrite the cost /
+                # percentage fields so the running sum starts at zero.
+                seed = dict(row)
+                seed["cost"] = 0.0
+                if "percentage" in row:
+                    seed["percentage"] = 0.0
+                groups[masked] = seed
+                sources_per_group[masked] = 0
+                order.append(masked)
+
+            sources_per_group[masked] += 1
+            groups[masked]["cost"] = float(groups[masked].get("cost", 0.0)) + float(
+                row.get("cost", 0.0) or 0.0
+            )
+            if "percentage" in row:
+                current = float(groups[masked].get("percentage", 0.0) or 0.0)
+                groups[masked]["percentage"] = current + float(row.get("percentage", 0.0) or 0.0)
+
+        out: List[Dict[str, Any]] = []
+        for masked in order:
+            row = groups[masked]
+            count = sources_per_group[masked]
+            if count > 1:
+                row["note"] = f"aggregated {count} sources with the same masked label"
+            out.append(row)
+
+        # Append any pass-through rows after aggregated rows so debug / unknown
+        # entries continue to render in their existing position-independent way.
+        out.extend(passthrough)
+        return out
 
     def _format_api_key_costs_content(
         self, data: List[Dict[str, Any]], params: Dict[str, Any]
@@ -149,6 +225,12 @@ class ApiKeyCostsFormatter(AnalyticsResponseFormatter):
 
         if "percentage" in api_key:
             entry += f"   - Share: {api_key['percentage']:.1f}%\n"
+
+        # BACK-1270 / item #8: surface aggregation note when multiple upstream
+        # rows collapsed into this one (e.g. two ANONYMOUS sources merged).
+        note = api_key.get("note")
+        if note:
+            entry += f"   - Note: {note}\n"
 
         # Add debug information if available - only in debug mode
         if not self.production_mode and "debug_metrics_count" in api_key:

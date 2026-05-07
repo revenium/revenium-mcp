@@ -242,6 +242,48 @@ class TestSourceManagerUpdate:
         assert result["name"] == "Updated"
         source_manager.update_handler.update_with_merge.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_update_source_uppercases_type(self, source_manager):
+        """Update normalizes lowercase 'type' to uppercase before dispatching to
+        PartialUpdateHandler — same contract as create (BACK-1141)."""
+        source_manager.update_handler.update_with_merge = AsyncMock(
+            return_value={"id": "s1", "type": "API"}
+        )
+        source_manager.update_config_factory.get_config = MagicMock(return_value={})
+
+        await source_manager.update_source(
+            {"source_id": "s1", "source_data": {"type": "api"}}
+        )
+
+        call_kwargs = source_manager.update_handler.update_with_merge.call_args.kwargs
+        assert call_kwargs["partial_data"]["type"] == "API"
+
+
+class TestSourceManagerNormalizeType:
+    """Test SourceManager._normalize_source_type helper (BACK-1141)."""
+
+    def test_normalize_uppercases_lowercase_string(self):
+        data = {"type": "api"}
+        SourceManager._normalize_source_type(data)
+        assert data["type"] == "API"
+
+    def test_normalize_leaves_already_uppercase_unchanged(self):
+        data = {"type": "STREAM"}
+        SourceManager._normalize_source_type(data)
+        assert data["type"] == "STREAM"
+
+    def test_normalize_returns_unchanged_when_type_missing(self):
+        data = {"name": "no type field"}
+        SourceManager._normalize_source_type(data)
+        assert "type" not in data
+
+    def test_normalize_skips_non_string_type(self):
+        """A non-string type is left untouched so caller sees the original
+        validation error from the backend, not a coerced one."""
+        data = {"type": 42}
+        SourceManager._normalize_source_type(data)
+        assert data["type"] == 42
+
 
 class TestSourceManagerDelete:
     """Test SourceManager.delete_source behavior."""
@@ -406,5 +448,19 @@ class TestSourceManagementHandleAction:
 # ===========================================================================
 # SourceValidator tests
 # ===========================================================================
+
+
+from tests.unit._helpers_no_framework_leak import assert_no_framework_leak
+
+
+class TestSourceListPaginationValidation:
+    """BACK-1270 / item #5 — Pydantic leak guard on manage_sources list."""
+
+    @pytest.mark.asyncio
+    async def test_list_rejects_float_size_with_structured_error(self, source_manager):
+        with pytest.raises(ToolError) as exc:
+            await source_manager.list_sources({"page": 0, "size": 3.7})
+        assert exc.value.field == "size"
+        assert_no_framework_leak(exc.value.message)
 
 

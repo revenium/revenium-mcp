@@ -281,16 +281,38 @@ class TestLazyAuthLoading:
         assert client.api_key == key
 
     def test_lazy_load_raises_value_error_when_env_missing(self, monkeypatch):
-        """If env vars are missing, accessing auth_config raises ValueError."""
-        from src.revenium_mcp_server.auth import ConfigManager
+        """If env vars are missing, accessing auth_config raises an auth-shape error.
+
+        BACK-1270 #9: client.auth_config now wraps the underlying
+        AuthenticationError in a 401-equivalent ToolError envelope (an
+        UnauthorizedToolError that subclasses both ToolError and
+        AuthenticationError). The wrapper preserves the AuthenticationError
+        type so existing ``except AuthenticationError`` paths in tool
+        handlers continue to escape, while user-facing message no longer
+        leaks the env-var name.
+        """
+        from src.revenium_mcp_server.auth import AuthenticationError, ConfigManager
+        from src.revenium_mcp_server.common.error_handling import (
+            ErrorCodes,
+            ToolError,
+        )
         monkeypatch.setattr(ConfigManager(), "_config", None)
 
         monkeypatch.delenv("REVENIUM_API_KEY", raising=False)
         monkeypatch.delenv("REVENIUM_TEAM_ID", raising=False)
 
         client = ReveniumClient()
-        with pytest.raises(ValueError, match="Authentication configuration required"):
+        with pytest.raises(AuthenticationError) as exc_info:
             _ = client.auth_config
+
+        raised = exc_info.value
+        # Must also be a ToolError so dispatch surfaces auth-shape envelope.
+        assert isinstance(raised, ToolError)
+        assert raised.error_code == ErrorCodes.UNAUTHORIZED
+        # Must NOT leak the raw env-var name to users.
+        assert "REVENIUM_API_KEY environment variable" not in raised.message
+        # Must keep the original AuthenticationError as the cause for logs.
+        assert isinstance(raised.__cause__, AuthenticationError)
 
 
 # ===========================================================================
@@ -2059,3 +2081,59 @@ class TestAppBaseUrlDriftError:
                         use_bearer=True,
                     )
         assert "REVENIUM_APP_BASE_URL is not set" not in exc_info.value.message
+
+class TestRequestSanitizesDictReprLeak:
+    """BACK-1313: HTTP error sanitizers strip dict-repr suffix and Error ID
+    from error_text before raising ReveniumAPIError."""
+
+    def setup_method(self):
+        self.client = _client()
+
+    def _patch_httpx(self, response: MagicMock):
+        return patch.object(self.client.client, "request", new_callable=AsyncMock, return_value=response)
+
+    @pytest.mark.asyncio
+    async def test_strips_dict_repr_from_response_text_fallback(self):
+        """Backend returns plain-text body with Python dict-repr suffix.
+
+        Reproduces the manage_products get-after-delete shape from the audit:
+        the body is not valid JSON (single-quoted dict), so json() fails and
+        the fallback uses response.text, which carries the leak.
+        """
+        leak = ("Could not find Product with id: 3ByY1L2 "
+                "- {'error': 'Could not find Product with id: 3ByY1L2'}")
+        resp = MagicMock()
+        resp.status_code = 404
+        resp.reason_phrase = "Not Found"
+        resp.headers = {}
+        resp.text = leak
+        resp.content = leak.encode()
+        resp.json.side_effect = Exception("not json (single quotes)")
+        with self._patch_httpx(resp):
+            with pytest.raises(ReveniumAPIError) as exc_info:
+                await self.client._request("GET", "/some/endpoint")
+        msg = exc_info.value.message
+        assert "Could not find Product" in msg
+        assert " - {'error':" not in msg
+        assert ' - {"error":' not in msg
+
+    @pytest.mark.asyncio
+    async def test_strips_internal_error_id_alerts_shape(self):
+        """manage_alerts get-after-delete leaks an internal Error ID token."""
+        leak = "Error ID: get_anomaly_0974\nHTTP 403: Access Denied - {'error': 'Access Denied'}"
+        resp = MagicMock()
+        resp.status_code = 403
+        resp.reason_phrase = "Forbidden"
+        resp.headers = {}
+        resp.text = leak
+        resp.content = leak.encode()
+        resp.json.side_effect = Exception("not json")
+        with self._patch_httpx(resp):
+            with pytest.raises(ReveniumAPIError) as exc_info:
+                await self.client._request("GET", "/some/endpoint")
+        msg = exc_info.value.message
+        assert "Error ID:" not in msg
+        assert " - {'error':" not in msg
+        # Real content (HTTP 403 prefix added by client + Access Denied) is preserved.
+        assert "Access Denied" in msg
+

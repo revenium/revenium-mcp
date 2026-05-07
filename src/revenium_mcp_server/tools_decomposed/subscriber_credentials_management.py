@@ -22,6 +22,7 @@ from ..common.error_handling import (
     create_structured_missing_parameter_error,
     create_structured_validation_error,
 )
+from ..common.validation import validate_pagination_params
 from ..dry_run.credential_dry_run import CredentialDryRunValidator
 from ..hierarchy import cross_tier_validator, entity_lookup_service, hierarchy_navigation_service
 from ..introspection.metadata import ToolCapability, ToolType
@@ -526,6 +527,10 @@ class SubscriberCredentialsManagement(ToolBase):
 
     async def _list_credentials(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """List subscriber credentials with pagination."""
+        # BACK-1270 (items #4 + #5): reject malformed / out-of-range page|size
+        # at the tool boundary before they reach the API client. Closes the
+        # Pydantic leak (#5) and the size=0/MAX_INT silent-accept (#4).
+        arguments = validate_pagination_params(arguments, action="list_credentials")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
         filters = arguments.get("filters", {})

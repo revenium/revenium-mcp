@@ -42,12 +42,23 @@ class TestSystemDiagnosticsRouting:
 
     @pytest.mark.asyncio
     async def test_get_examples_returns_examples(self, diagnostics_tool):
-        """get_examples returns usage examples for all action groups."""
         result = await diagnostics_tool.handle_action("get_examples", {})
         text = result[0].text
         assert "Examples" in text
         assert "environment_variables" in text
         assert "search_logs" in text
+
+    @pytest.mark.asyncio
+    async def test_get_examples_json_blocks_are_parseable(self, diagnostics_tool):
+        import json
+        import re
+        result = await diagnostics_tool.handle_action("get_examples", {})
+        text = result[0].text
+        json_blocks = re.findall(r"```json\n(.*?)\n```", text, re.DOTALL)
+        assert len(json_blocks) > 0
+        for block in json_blocks:
+            parsed = json.loads(block)
+            assert isinstance(parsed, dict)
 
     @pytest.mark.asyncio
     async def test_config_action_delegates_to_config_tool(self, diagnostics_tool):

@@ -488,6 +488,50 @@ class TestApiKeyCostsFormatter:
         result = debug_formatter.format(data, {"period": "SEVEN_DAYS", "aggregation": "TOTAL"})
         assert "15 metrics" in result
 
+    # ─────────────────────────────────────────────────────────────────────
+    # BACK-1270 / item #8 — masked-label collision aggregation
+    # ─────────────────────────────────────────────────────────────────────
+
+    def test_anonymous_rows_with_same_masked_label_aggregate_into_one(self, formatter):
+        """Two rows whose masked labels collide are merged into a single row.
+
+        BACK-1270 / item #8: business_analytics get_api_key_costs previously
+        returned multiple indistinguishable rows with the same masked label
+        (e.g. two ANON****MOUS rows). Group by masked label, sum cost + share.
+        """
+        data = [
+            {"api_key": "ANONYMOUS", "cost": 10.0, "percentage": 40.0},
+            {"api_key": "ANONYMOUS", "cost": 5.0, "percentage": 20.0},
+            {"api_key": "real-key-abcdefgh", "cost": 7.5, "percentage": 40.0},
+        ]
+        result = formatter.format(data, {"period": "SEVEN_DAYS", "aggregation": "TOTAL"})
+        # Exactly one ANONYMOUS-derived row should appear.
+        assert result.count("ANON****MOUS") == 1
+        # Cost was summed: 10 + 5 = 15.
+        assert "$15.00" in result
+        # Share was summed: 40 + 20 = 60.
+        assert "60.0%" in result
+        # And only ONE entry total survives the collapse for ANONYMOUS plus
+        # the unrelated row, so "API Keys Found: 2" appears in the header.
+        assert "API Keys Found**: 2" in result
+
+    def test_aggregation_emits_note_when_multiple_sources_collapse(self, formatter):
+        """Aggregated rows get a 'note' line documenting the source count."""
+        data = [
+            {"api_key": "ANONYMOUS", "cost": 10.0, "percentage": 40.0},
+            {"api_key": "ANONYMOUS", "cost": 5.0, "percentage": 20.0},
+        ]
+        result = formatter.format(data, {"period": "SEVEN_DAYS", "aggregation": "TOTAL"})
+        assert "aggregated 2" in result.lower()
+
+    def test_unique_masked_label_passes_through_without_note(self, formatter):
+        """A row with a unique masked label has no aggregation note."""
+        data = [
+            {"api_key": "sk-abcdefgh1234", "cost": 25.0, "percentage": 100.0},
+        ]
+        result = formatter.format(data, {"period": "SEVEN_DAYS", "aggregation": "TOTAL"})
+        assert "aggregated" not in result.lower()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ProviderCostsFormatter

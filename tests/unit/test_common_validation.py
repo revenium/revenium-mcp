@@ -293,6 +293,41 @@ class TestValidatePaginationParams:
             validate_pagination_params({"page": huge_digits}, action="list")
         assert exc.value.field == "page"
 
+    def test_page_upper_bound_rejects_max_int(self):
+        with pytest.raises(ToolError) as exc:
+            validate_pagination_params({"page": 2147483647}, action="list")
+        assert exc.value.field == "page"
+        assert "[0, 10000]" in exc.value.message
+
+    def test_page_at_upper_bound_accepted(self):
+        result = validate_pagination_params({"page": 10000}, action="list")
+        assert result["page"] == 10000
+
+    def test_page_above_upper_bound_rejected(self):
+        with pytest.raises(ToolError) as exc:
+            validate_pagination_params({"page": 10001}, action="list")
+        assert exc.value.field == "page"
+
+    def test_safe_integer_overflow_does_not_echo_corrupted_value(self):
+        over_safe = 2**53 + 1
+        with pytest.raises(ToolError) as exc:
+            validate_pagination_params({"page": over_safe}, action="list")
+        assert "safe integer range" in exc.value.message
+        assert str(over_safe) not in exc.value.message
+
+    def test_safe_integer_overflow_on_size(self):
+        over_safe = 2**53 + 1
+        with pytest.raises(ToolError) as exc:
+            validate_pagination_params({"size": over_safe}, action="list")
+        assert "safe integer range" in exc.value.message
+        assert str(over_safe) not in exc.value.message
+
+    def test_safe_integer_value_stored_for_debug(self):
+        over_safe = 2**53 + 1
+        with pytest.raises(ToolError) as exc:
+            validate_pagination_params({"page": over_safe}, action="list")
+        assert exc.value.value == str(over_safe)
+
 
 class TestValidateStringParams:
     """Reject non-string values on string-typed fields so callers see a

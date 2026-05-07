@@ -827,13 +827,16 @@ class TestAlertOperations:
     """Cover _handle_alert_operations internal routing."""
 
     @pytest.mark.asyncio
-    async def test_alert_list(self):
+    async def test_alert_list_routes_through_handle_list_not_alert_operations(self):
+        """`_handle_alert_operations` is only ever invoked with action='get' or
+        'query' (callers at lines 657 and 853). The list path is owned by
+        `_handle_list`, which has its own pagination guard. Passing 'list' here
+        falls through to the unsupported-action error — verifying the dead
+        branch removal in the BACK-1270 follow-up bundle."""
         tools, client = _make_alert_with_client()
-        tools.alert_manager.list_alerts = AsyncMock(
-            return_value=[TextContent(type="text", text="Alert list")]
-        )
         result = await tools._handle_alert_operations(client, "list", {})
-        assert result[0].text == "Alert list"
+        text_lower = result[0].text.lower()
+        assert "unknown" in text_lower or "not supported" in text_lower
 
     @pytest.mark.asyncio
     async def test_alert_get_missing_id(self):

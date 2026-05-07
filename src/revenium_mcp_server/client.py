@@ -10,6 +10,7 @@ Licensed under the MIT License. See LICENSE file for details.
 import asyncio
 import json
 import os
+import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urljoin
@@ -18,7 +19,7 @@ import httpx
 from loguru import logger
 
 from .api_field_mapper import APIFieldMapper
-from .auth import AuthConfig, get_auth_config, get_bearer_auth_headers
+from .auth import AuthConfig, AuthenticationError, get_auth_config, get_bearer_auth_headers
 from .config_store import get_config_value
 from .endpoint_registry import DEFAULT_APP_BASE_URL
 from .exceptions import AlertToolsError
@@ -141,6 +142,48 @@ class ReveniumAPIError(Exception):
         super().__init__(self.message)
 
 
+# BACK-1313: HTTP error sanitizers. The dev backend sometimes returns plain-text
+# error bodies with a Python dict-repr suffix (`<msg> - {'error': '<msg>'}`)
+# and an internal `Error ID: <name>_<digits>` token. Both leak framework
+# internals to the caller. The sanitizers strip the leak shapes before the
+# message reaches ReveniumAPIError.
+_DICT_REPR_SUFFIX = re.compile(
+    r"\s*-\s*\{['\"]error['\"]\s*:\s*['\"][^'\"\n]*['\"]\s*\}\s*$",
+)
+_INTERNAL_ERROR_ID = re.compile(r"\s*Error ID:\s*\w+_\d+\s*\n?")
+
+
+def _strip_dict_repr_suffix(text: str) -> str:
+    """Drop a trailing `- {'error': '<...>'}` Python dict-repr from `text`.
+
+    Conservative: only strips when the trailing brace block is a single-key
+    `'error'` dict (single- or double-quoted). Set/tuple reprs and dicts with
+    other keys are not stripped — the audit-observed leak shape is the
+    duplicated-error shape.
+    """
+    return _DICT_REPR_SUFFIX.sub("", text)
+
+
+def _strip_internal_error_id(text: str) -> str:
+    """Drop an `Error ID: <name>_<digits>` token from anywhere in `text`.
+
+    If stripping the Error ID would leave an empty string (i.e. the body was
+    nothing but the Error ID token), preserve the original text so callers
+    don't receive a completely opaque error envelope.
+    """
+    stripped = _INTERNAL_ERROR_ID.sub(" ", text).strip()
+    return stripped if stripped else text.strip()
+
+
+def _sanitize_error_text(text: str) -> str:
+    """Apply the HTTP-error sanitizers in the right order.
+
+    Internal Error ID first (it can appear as a leading line), then the
+    dict-repr suffix (anchored at end). Both helpers are idempotent.
+    """
+    return _strip_dict_repr_suffix(_strip_internal_error_id(text))
+
+
 class ReveniumClient:
     """Async HTTP client for Revenium Platform API."""
 
@@ -197,6 +240,14 @@ class ReveniumClient:
                 logger.info(
                     f"Loaded auth configuration with base URL: {self._auth_config.base_url}"
                 )
+            except AuthenticationError as exc:
+                # BACK-1270 #9: wrap the infrastructure-shaped AuthenticationError
+                # in a 401-equivalent ToolError envelope so callers see auth-shape
+                # (matches Phase-10c probe contract; does not leak env-var names).
+                from .common.auth_response_envelope import auth_error_to_tool_error
+
+                logger.error("Failed to load auth configuration: missing required auth env vars")
+                raise auth_error_to_tool_error("missing credential") from exc
             except Exception as e:
                 logger.error(f"Failed to load auth configuration: {e}")
                 raise ValueError(f"Authentication configuration required but not available: {e}")
@@ -598,6 +649,10 @@ class ReveniumClient:
                         error_text = (
                             response.text or f"HTTP {response.status_code} {response.reason_phrase}"
                         )
+
+                    # BACK-1313: strip backend leak shapes (Python dict-repr suffix
+                    # and internal `Error ID:` token) before they reach the caller.
+                    error_text = _sanitize_error_text(error_text)
 
                     # COMPREHENSIVE ERROR DEBUGGING - Capture everything before error translation
                     raw_response_debug = {
@@ -2218,19 +2273,6 @@ class ReveniumClient:
 
         Returns:
             Updated tool data
-        """
-        params = self._add_team_id_to_params()
-        return await self.put(f"/profitstream/v2/api/tools/{tool_id}", data=tool_data, params=params)
-
-    async def replace_tool(self, tool_id: str, tool_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Fully replace an existing tool using PUT.
-
-        Args:
-            tool_id: The tool ID
-            tool_data: Complete replacement tool data
-
-        Returns:
-            Replaced tool data
         """
         params = self._add_team_id_to_params()
         return await self.put(f"/profitstream/v2/api/tools/{tool_id}", data=tool_data, params=params)

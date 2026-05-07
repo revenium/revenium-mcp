@@ -19,6 +19,7 @@ from ..common.error_handling import (
     create_structured_validation_error,
 )
 from ..common.pagination_performance import validate_pagination_with_performance
+from ..common.validation import validate_pagination_params
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.ucm_config import log_ucm_status, should_suppress_ucm_warnings
 from ..common.update_configs import UpdateConfigFactory
@@ -45,8 +46,26 @@ class SourceManager:
         self.update_handler = PartialUpdateHandler()
         self.update_config_factory = UpdateConfigFactory(self.client)
 
+    @staticmethod
+    def _normalize_source_type(source_data: Dict[str, Any]) -> None:
+        """Upper-case the `type` field in `source_data` if present and string-typed (mutates in place).
+
+        Ensures create and update accept the same lowercase enum casing
+        client-side; without this both code paths must independently call
+        .upper(), and the asymmetry surfaced as create-success / update-400
+        on identical lowercase input.
+        """
+        if not isinstance(source_data, dict):
+            return
+        raw_type = source_data.get("type")
+        if isinstance(raw_type, str):
+            source_data["type"] = raw_type.upper()
+
     async def list_sources(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """List sources with pagination and performance monitoring."""
+        # BACK-1270 (item #5): reject malformed page/size at the tool boundary
+        # before the underlying client receives a non-int (Pydantic-leak guard).
+        arguments = validate_pagination_params(arguments, action="list_sources")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
         filters = arguments.get("filters", {})
@@ -124,8 +143,7 @@ class SourceManager:
         # Ensure type is provided and uppercase (API expects uppercase)
         if "type" not in source_data:
             source_data["type"] = "API"  # Default type
-        else:
-            source_data["type"] = source_data["type"].upper()
+        self._normalize_source_type(source_data)
 
         # Handle URL and authentication parameters - move to configuration
         configuration = source_data.get("configuration", {})
@@ -180,6 +198,11 @@ class SourceManager:
                     "integration_context": "INTEGRATION: Partial updates preserve existing source configuration while changing specific fields",
                 },
             )
+
+        # Normalize enum casing client-side so update accepts the same
+        # lowercase input that create silently accepts (the backend rejects
+        # lowercase on update with a 400; create masks it via .upper()).
+        self._normalize_source_type(source_data)
 
         # Get update configuration for sources
         config = self.update_config_factory.get_config("sources")

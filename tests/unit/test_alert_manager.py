@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 from datetime import datetime, timezone
 
 from src.revenium_mcp_server.alerts.alert_manager import AlertManager
+from src.revenium_mcp_server.client import ReveniumAPIError
 
 
 @pytest.fixture
@@ -629,6 +630,48 @@ class TestGetAlert:
 
         result = await manager.get_alert(client, "alert-3")
         assert "https://api.revenium.io/alerts/3" in result[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [403, 404, 500])
+    async def test_get_alert_translates_not_found_status_codes(self, manager, status_code):
+        """get_alert folds 403/404/500 from the alerts service into the
+        AlertNotFoundError envelope so the @handle_alert_tool_errors
+        decorator renders a rich 'alert not found' message — callers
+        no longer see the catch-all 'Unexpected Error' prose surfaced
+        by the decorator's last-resort handler (BACK-1142; same shape
+        as BACK-1098 on manage_tools)."""
+        client = MagicMock()
+        client.get_alert_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("not found", status_code=status_code)
+        )
+
+        result = await manager.get_alert(client, "NONEXISTENT_12345")
+
+        assert len(result) == 1
+        text = result[0].text
+        assert "Unexpected Error" not in text
+        assert "NONEXISTENT_12345" in text
+        # AlertNotFoundError.format_user_message() renders 'not found' prose
+        assert "not found" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_get_alert_other_status_codes_propagate_through_decorator(self, manager):
+        """A 502 (or any non-403/404/500) is not folded into AlertNotFoundError;
+        the decorator's catch-all renders 'Unexpected Error' for genuinely
+        unexpected upstream failures, keeping them distinguishable from a
+        clean 'not found' case."""
+        client = MagicMock()
+        client.get_alert_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("bad gateway", status_code=502)
+        )
+
+        result = await manager.get_alert(client, "alert-id")
+
+        assert len(result) == 1
+        # The decorator's catch-all branch renders "Unexpected Error" for
+        # uncategorized failures — explicitly opposite of the 403/404/500
+        # case above so the two paths don't accidentally collapse.
+        assert "Unexpected Error" in result[0].text
 
 
 class TestUpdateAlert:

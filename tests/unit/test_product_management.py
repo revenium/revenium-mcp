@@ -102,6 +102,92 @@ class TestProductManagerList:
 
         assert result["pagination"]["has_next"] is False
 
+    @pytest.mark.asyncio
+    async def test_list_products_rejects_string_page_with_structured_error(
+        self, product_manager, mock_client
+    ):
+        """Wrong-type page must raise a structured ToolError before reaching the client.
+
+        BACK-1112 audit shape — page='not_a_number' previously crashed inside
+        validate_pagination_with_performance with a Python TypeError ("'<' not
+        supported between instances of 'str' and 'int'") that leaked to the caller.
+        """
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        with pytest.raises(ToolError) as exc_info:
+            await product_manager.list_products({"page": "not_a_number"})
+
+        err = exc_info.value
+        assert getattr(err, "field", None) == "page"
+        # No raw Python TypeError leak
+        assert "not supported between instances" not in str(err)
+        # Must not have reached the client
+        mock_client.get_products.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_products_rejects_negative_page(self, product_manager, mock_client):
+        """Negative page surfaces as a structured 400."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        with pytest.raises(ToolError) as exc_info:
+            await product_manager.list_products({"page": -1})
+
+        assert getattr(exc_info.value, "field", None) == "page"
+        mock_client.get_products.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_products_rejects_string_size_with_structured_error(
+        self, product_manager, mock_client
+    ):
+        """Wrong-type size must raise a structured ToolError before reaching the client.
+
+        Mirrors the page wrong-type guard: size='big' must not crash inside
+        validate_pagination_with_performance and must surface as a structured 400.
+        """
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        with pytest.raises(ToolError) as exc_info:
+            await product_manager.list_products({"page": 0, "size": "big"})
+
+        err = exc_info.value
+        assert getattr(err, "field", None) == "size"
+        # No raw Python TypeError leak
+        assert "not supported between instances" not in str(err)
+        mock_client.get_products.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_products_rejects_oversized_size(self, product_manager, mock_client):
+        """size above the configured maximum surfaces as a structured 400."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        with pytest.raises(ToolError) as exc_info:
+            await product_manager.list_products({"page": 0, "size": 99999})
+
+        assert getattr(exc_info.value, "field", None) == "size"
+        mock_client.get_products.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_products_rejects_bool_page(self, product_manager, mock_client):
+        """Boolean page (True/False) must be rejected as wrong-type, not silently coerced.
+
+        Python's bool is a subclass of int, so `isinstance(True, int)` is True. The
+        guard must explicitly reject booleans to avoid passing True/False to the API.
+        """
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        with pytest.raises(ToolError) as exc_info:
+            await product_manager.list_products({"page": True})
+
+        assert getattr(exc_info.value, "field", None) == "page"
+        mock_client.get_products.assert_not_called()
+
+        with pytest.raises(ToolError) as exc_info:
+            await product_manager.list_products({"page": False, "size": 10})
+
+        # False is also an int subclass; should be rejected just like True.
+        assert getattr(exc_info.value, "field", None) == "page"
+        mock_client.get_products.assert_not_called()
+
 
 class TestProductManagerGet:
     """Test ProductManager.get_product behavior."""
@@ -454,3 +540,63 @@ class TestProductValidator:
             await validator.get_capabilities()
 
         assert "ucm" in str(exc_info.value).lower()
+
+
+class TestListProductsRejectsFloatSizeNoLeak:
+    """BACK-1270 / item #5 — float size must reject without Pydantic URL."""
+
+    @pytest.mark.asyncio
+    async def test_float_size_returns_clean_error(self, product_manager):
+        from src.revenium_mcp_server.common.error_handling import ToolError
+        from tests.unit._helpers_no_framework_leak import assert_no_framework_leak
+        with pytest.raises(ToolError) as exc:
+            await product_manager.list_products({"page": 0, "size": 3.7})
+        assert exc.value.field == "size"
+        assert_no_framework_leak(exc.value.message)
+
+
+class TestUpdateProductPreservesFlatAmount:
+    """BACK-1270 / item #3 — name-only update on a flat_amount-tier product preserves tier.
+
+    The audit caught that update was rejecting `flat_amount` even though create
+    accepts it; the symptom was a 404 from the tier validator. Behaviour must be
+    truly partial: a name-only patch must NOT invalidate the existing tier
+    structure, and the merged payload must keep `flat_amount` intact.
+    """
+
+    @pytest.mark.asyncio
+    async def test_name_only_update_does_not_invalidate_flat_amount_tier(
+        self, product_manager, mock_client
+    ):
+        existing = {
+            "id": "prod_123",
+            "name": "old",
+            "version": "1.0",
+            "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
+            "plan": {
+                "tiers": [
+                    {"id": None, "name": "flat", "up_to": None, "flat_amount": "1.00"}
+                ]
+            },
+        }
+        mock_client.get_product_by_id = AsyncMock(return_value=existing)
+        mock_client.update_product = AsyncMock(
+            side_effect=lambda _id, payload: {**existing, **payload}
+        )
+
+        # Should not raise / not 404 from validator; should preserve tier.
+        result = await product_manager.update_product({
+            "product_id": "prod_123",
+            "product_data": {"name": "new"},
+        })
+        assert "data" in result
+        sent = mock_client.update_product.await_args.args[1]
+        # The merged payload must still describe a flat_amount tier (the field
+        # the API accepts on create must also be acceptable on update).
+        assert "plan" in sent and sent["plan"].get("tiers"), (
+            f"BACK-1270 #3: tier configuration dropped on partial update. payload={sent!r}"
+        )
+        assert sent["plan"]["tiers"][0].get("flat_amount") == "1.00", (
+            f"BACK-1270 #3: flat_amount stripped or rewritten on partial update. "
+            f"payload={sent!r}"
+        )

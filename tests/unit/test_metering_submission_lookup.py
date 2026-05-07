@@ -145,7 +145,7 @@ class TestSubmitTransaction:
     @pytest.mark.asyncio
     async def test_custom_transaction_id_is_used(self):
         client = _make_client()
-        args = {**VALID_ARGS, "transaction_id": "custom_tx_999"}
+        args = {**VALID_ARGS, "transaction_id": "tx_a1b2c3d4e5f6"}
         cache_patch, _ = _patch_cache()
         with cache_patch:
             with patch.object(
@@ -156,7 +156,44 @@ class TestSubmitTransaction:
             ):
                 result = await self.mgr.submit_transaction(client, args)
 
-        assert result["transaction_id"] == "custom_tx_999"
+        assert result["transaction_id"] == "tx_a1b2c3d4e5f6"
+
+    @pytest.mark.asyncio
+    async def test_custom_transaction_id_uuid_dashed_is_used(self):
+        client = _make_client()
+        args = {**VALID_ARGS, "transaction_id": "550e8400-e29b-41d4-a716-446655440000"}
+        cache_patch, _ = _patch_cache()
+        with cache_patch:
+            with patch.object(
+                self.mgr,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                result = await self.mgr.submit_transaction(client, args)
+
+        assert result["transaction_id"] == "550e8400-e29b-41d4-a716-446655440000"
+
+    @pytest.mark.asyncio
+    async def test_malformed_transaction_id_is_rejected(self):
+        client = _make_client()
+        args = {**VALID_ARGS, "transaction_id": "mcp-test-p3-tx-NOT_A_GUID"}
+        cache_patch, _ = _patch_cache()
+        with cache_patch:
+            with patch.object(
+                self.mgr,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                with pytest.raises(ToolError) as excinfo:
+                    await self.mgr.submit_transaction(client, args)
+
+        err = excinfo.value
+        assert getattr(err, "field", None) == "transaction_id"
+        assert getattr(err, "value", None) == "mcp-test-p3-tx-NOT_A_GUID"
+        # Must not have reached the backend
+        client.post.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_transaction_stored_in_session_store(self):

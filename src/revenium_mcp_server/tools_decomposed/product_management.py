@@ -40,6 +40,76 @@ from ..introspection.metadata import (
 from .unified_tool_base import ToolBase
 
 
+# Sanity cap on integer page values. Large indices (e.g. 2**31) are almost certainly caller errors; reject them before they reach the API.
+_MAX_PRODUCTS_PAGE = 1_000_000
+
+# Upper bound on the size parameter (matches PaginationPerformanceManager.MAXIMUM_LIMIT).
+_MAX_PRODUCTS_SIZE = 100
+
+
+def _validate_products_pagination(page: Any, size: Any) -> None:
+    """Reject malformed page / size before they reach the API client.
+
+    Mirrors the structured-400 contract used by manage_jobs / manage_subscriptions:
+    any non-integer, negative, or out-of-range value raises a ToolError carrying
+    field/value/suggestions so the caller never sees a raw Python TypeError or
+    Pydantic leak.
+    """
+    for label, value in (("page", page), ("size", size)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ToolError(
+                message=f"{label} must be an integer (got {type(value).__name__})",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=label,
+                value=value,
+                suggestions=[
+                    f"Pass an integer for {label} (no quotes, no booleans)",
+                ],
+            )
+    if page < 0:
+        raise ToolError(
+            message=f"page must be >= 0 (got {page})",
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="page",
+            value=page,
+            suggestions=["Use page=0 for the first page; pages are zero-indexed"],
+        )
+    if page > _MAX_PRODUCTS_PAGE:
+        raise ToolError(
+            message=(
+                f"page exceeds maximum (expected 0 <= page <= {_MAX_PRODUCTS_PAGE}, got {page})"
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="page",
+            value=page,
+            suggestions=[
+                "Pick a smaller page; very large indices indicate an off-by-one or misuse",
+                "If you are looking for a specific product, use get(product_id=...) instead of paginating to find it.",
+            ],
+        )
+    if size <= 0:
+        raise ToolError(
+            message=f"size must be > 0 (got {size})",
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="size",
+            value=size,
+            suggestions=[f"Use size between 1 and {_MAX_PRODUCTS_SIZE} (default 20)"],
+        )
+    if size > _MAX_PRODUCTS_SIZE:
+        raise ToolError(
+            message=(
+                f"size exceeds maximum (expected 1 <= size <= {_MAX_PRODUCTS_SIZE}, got {size})"
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="size",
+            value=size,
+            suggestions=[
+                f"Use size between 1 and {_MAX_PRODUCTS_SIZE} (default 20)",
+                "Paginate with larger page numbers instead of oversized page sizes.",
+            ],
+        )
+
+
 class ProductManager:
     """Internal manager for product CRUD operations."""
 
@@ -57,6 +127,10 @@ class ProductManager:
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
         filters = arguments.get("filters", {})
+
+        # Validate type/sign/upper-bound first so wrong-type values surface as a
+        # structured ToolError instead of crashing inside the perf-tier helper.
+        _validate_products_pagination(page, size)
 
         # Validate pagination with performance guidance
         validate_pagination_with_performance(page, size, "Product Management")
@@ -355,7 +429,11 @@ class ProductManager:
                 action="update product",
                 examples={
                     "usage": "update(product_id='prod_123', product_data={'description': 'Updated description'})",
-                    "partial_update": "Only provide the fields you want to update",
+                    "partial_update": (
+                        "Partial update — provide only the fields you want to change. "
+                        "Other fields (including the plan's tier configuration) are "
+                        "preserved from the current state."
+                    ),
                     "updatable_fields": [
                         "name",
                         "description",

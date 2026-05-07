@@ -10,6 +10,20 @@ from pydantic import BaseModel, Field, field_validator
 
 from .constants import DEFAULT_BASE_URL
 
+
+class AuthenticationError(ValueError):
+    """Raised when required Revenium auth configuration is missing.
+
+    Subclasses ValueError so callers and tests that catch ValueError keep
+    working. The MCP dispatch layer, in turn, treats this class as a
+    structured error so the MCP envelope carries isError=true on every
+    auth-enforcing tool — without each tool having to wrap auth errors
+    into a ToolError of its own.
+    """
+
+    pass
+
+
 # Shared headers sent on every request regardless of auth scheme.
 # Centralised here so version bumps and header changes only need to happen once.
 _COMMON_HEADERS: Dict[str, str] = {
@@ -123,11 +137,11 @@ class ConfigManager:
         # Override pattern: explicit env vars → discovered values → error
         api_key = get_config_value("REVENIUM_API_KEY")
         if not api_key:
-            raise ValueError("REVENIUM_API_KEY environment variable is required")
+            raise AuthenticationError("REVENIUM_API_KEY environment variable is required")
 
         team_id = get_config_value("REVENIUM_TEAM_ID")
         if not team_id:
-            raise ValueError(
+            raise AuthenticationError(
                 "REVENIUM_TEAM_ID environment variable is required or could not be auto-discovered"
             )
 

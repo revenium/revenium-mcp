@@ -219,6 +219,25 @@ class TestUserManagerList:
         result = await user_manager.list_users({})
         mock_client.get_users.assert_called_once_with(page=0, size=20)
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_args, bad_field",
+        [
+            ({"page": -1}, "page"),
+            ({"size": 0}, "size"),
+            ({"size": 101}, "size"),
+        ],
+    )
+    async def test_list_users_rejects_out_of_range_pagination(
+        self, user_manager, mock_client, bad_args, bad_field
+    ):
+        """Out-of-range page/size are rejected with a structured ToolError before
+        the client is called (BACK-1146; sister to BACK-1111/1112/1145)."""
+        with pytest.raises(ToolError) as exc:
+            await user_manager.list_users(bad_args)
+        assert exc.value.field == bad_field
+        mock_client.get_users.assert_not_called()
+
 
 class TestUserManagerGet:
     """Test UserManager.get_user behavior."""
@@ -361,6 +380,27 @@ class TestUserManagerDelete:
 # ===========================================================================
 # SubscriberManager Tests
 # ===========================================================================
+
+
+class TestSubscriberManagerListPagination:
+    """Pagination boundary validation for SubscriberManager.list_subscribers (BACK-1146)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_args, bad_field",
+        [
+            ({"page": -1}, "page"),
+            ({"size": 0}, "size"),
+            ({"size": 101}, "size"),
+        ],
+    )
+    async def test_list_subscribers_rejects_out_of_range_pagination(
+        self, subscriber_manager, mock_client, bad_args, bad_field
+    ):
+        with pytest.raises(ToolError) as exc:
+            await subscriber_manager.list_subscribers(bad_args)
+        assert exc.value.field == bad_field
+        mock_client.get_subscribers.assert_not_called()
 
 
 class TestSubscriberManagerList:
@@ -600,6 +640,27 @@ class TestSubscriberEnhanceResponse:
 # ===========================================================================
 
 
+class TestOrganizationManagerListPagination:
+    """Pagination boundary validation for OrganizationManager.list_organizations (BACK-1146)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_args, bad_field",
+        [
+            ({"page": -1}, "page"),
+            ({"size": 0}, "size"),
+            ({"size": 101}, "size"),
+        ],
+    )
+    async def test_list_organizations_rejects_out_of_range_pagination(
+        self, org_manager, mock_client, bad_args, bad_field
+    ):
+        with pytest.raises(ToolError) as exc:
+            await org_manager.list_organizations(bad_args)
+        assert exc.value.field == bad_field
+        mock_client.get_organizations.assert_not_called()
+
+
 class TestOrganizationManagerList:
 
     @pytest.mark.asyncio
@@ -709,6 +770,27 @@ class TestOrganizationManagerDelete:
 # ===========================================================================
 # TeamManager Tests
 # ===========================================================================
+
+
+class TestTeamManagerListPagination:
+    """Pagination boundary validation for TeamManager.list_teams (BACK-1146)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_args, bad_field",
+        [
+            ({"page": -1}, "page"),
+            ({"size": 0}, "size"),
+            ({"size": 101}, "size"),
+        ],
+    )
+    async def test_list_teams_rejects_out_of_range_pagination(
+        self, team_manager, mock_client, bad_args, bad_field
+    ):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.list_teams(bad_args)
+        assert exc.value.field == bad_field
+        mock_client.get_teams.assert_not_called()
 
 
 class TestTeamManagerList:
@@ -1242,3 +1324,67 @@ class TestCreateCustomersConfigDefaultFields:
         mock_client.team_id = "team_456"
         config = UpdateConfigs.create_customers_config(mock_client, "subscriber")
         assert config.default_fields == {"teamId": "team_456"}
+
+
+from tests.unit._helpers_no_framework_leak import assert_no_framework_leak
+
+
+class TestCustomerListPaginationValidation:
+    """BACK-1270 / item #5 — Pydantic leak guard on manage_customers list."""
+
+    @pytest.mark.asyncio
+    async def test_list_orgs_rejects_float_size_with_structured_error(self, org_manager):
+        with pytest.raises(ToolError) as exc:
+            await org_manager.list_organizations({"page": 0, "size": 3.7})
+        assert exc.value.field == "size"
+        assert_no_framework_leak(exc.value.message)
+
+
+class TestUpdateOrganizationPreservesParent:
+    """BACK-1270 / item #1 — name-only update must NOT drop parent (BACK-911 regression).
+
+    The Revenium organizations API persists the parent relationship via the scalar
+    ``parentId`` field. GETs return the populated nested ``parent`` object, but PUT
+    only writes the relationship if ``parentId`` is present in the payload. The
+    PartialUpdateHandler must therefore project the current ``parent.id`` into
+    ``parentId`` on update, otherwise a name-only patch silently nulls the parent
+    server-side (the BACK-911 regression).
+    """
+
+    @pytest.mark.asyncio
+    async def test_name_only_update_preserves_parent(self, org_manager, mock_client):
+        existing = {
+            "id": "org_123",
+            "name": "old-name",
+            "parent": {"id": "team_xyz", "label": "Engineering"},
+            "tenantId": "tenant_a",
+        }
+        # The handler reads current state, merges patch, writes the merged view.
+        mock_client.get_organization_by_id = AsyncMock(return_value=existing)
+        mock_client.update_organization = AsyncMock(
+            side_effect=lambda _id, payload: {**existing, **payload}
+        )
+
+        await org_manager.update_organization({
+            "organization_id": "org_123",
+            "organization_data": {"name": "new-name"},
+        })
+
+        # The payload sent upstream must carry the parent relationship in a form
+        # the API persists. Either parentId (scalar id, what the server writes on
+        # PUT) or a parent dict containing an id is acceptable; both must NOT be
+        # absent / None.
+        call_args = mock_client.update_organization.await_args
+        sent_payload = (
+            call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs["payload"]
+        )
+        parent_obj = sent_payload.get("parent")
+        parent_id_scalar = sent_payload.get("parentId")
+        assert parent_obj is not None or parent_id_scalar is not None, (
+            f"BACK-911 regression: parent dropped on partial update. payload={sent_payload!r}"
+        )
+        # The ID the API uses to persist the relationship must be present on PUT.
+        assert sent_payload.get("parentId") == "team_xyz", (
+            "BACK-911 regression: API persists parent via parentId on PUT, but the "
+            f"merged payload is missing parentId. payload={sent_payload!r}"
+        )
