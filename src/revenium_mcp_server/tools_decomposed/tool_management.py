@@ -170,36 +170,9 @@ class ToolManager:
                         "Use get_pricing_help action for pricing structure reference",
                     ],
                 )
+        if "teamId" not in tool_data:
+            tool_data["teamId"] = self.client.team_id
         return await self.client.update_tool(tool_id, tool_data)
-
-    async def replace_tool(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Fully replace a tool (PUT)."""
-        tool_id = arguments.get("tool_id")
-        if not tool_id:
-            raise create_structured_missing_parameter_error(
-                parameter_name="tool_id",
-                action="replace tool",
-                examples={"usage": "replace(tool_id='tool_123', tool_data={...})"},
-            )
-        tool_data = arguments.get("tool_data")
-        if not tool_data:
-            raise create_structured_missing_parameter_error(
-                parameter_name="tool_data",
-                action="replace tool",
-                examples={"usage": "replace(tool_id='tool_123', tool_data={'name': 'My Tool'})"},
-            )
-        if "pricing" in tool_data:
-            errors = self._validate_tool_pricing(tool_data["pricing"])
-            if errors:
-                raise create_structured_validation_error(
-                    message=f"Tool pricing validation failed: {'; '.join(errors)}",
-                    field="pricing",
-                    value=tool_data["pricing"],
-                    suggestions=[
-                        "Use get_pricing_help action for pricing structure reference",
-                    ],
-                )
-        return await self.client.replace_tool(tool_id, tool_data)
 
     async def delete_tool(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Delete a tool by ID."""
@@ -702,7 +675,12 @@ class ToolManagement(ToolBase):
                 },
                 "event_data": {
                     "type": "object",
-                    "description": "Event data payload for meter_event and record_event actions",
+                    "description": (
+                        "Event data payload for meter_event and record_event actions. "
+                        "Note: subscriber-credential attribution is not supported on this path — "
+                        "use manage_metering (e.g. submit_ai_transaction) when attribution to a "
+                        "specific subscriber credential is required."
+                    ),
                     "properties": {
                         "toolId": {"type": "string", "description": "Tool identifier (required for meter_event; not needed for record_event since tool_id is provided separately)"},
                         "durationMs": {"type": "integer", "description": "Execution duration in milliseconds (required)"},
@@ -852,7 +830,7 @@ class ToolManagement(ToolBase):
                     "create": {"tool_data": "dict (required: name, toolType, pricing)"},
                     "create_simple": {"tool_name": "str", "pricing_model": "str", "per_unit_price": "float"},
                     "update": {"tool_id": "str", "tool_data": "dict (partial update)"},
-                    "replace": {"tool_id": "str", "tool_data": "dict (full replacement)"},
+                    "replace": {"tool_id": "str", "tool_data": "dict (alias for update; partial update)"},
                     "delete": {"tool_id": "str (soft delete)"},
                     "restore": {"tool_id": "str"},
                     "search": {"query": "str", "page": "int (optional)", "size": "int (optional)"},
@@ -871,7 +849,7 @@ class ToolManagement(ToolBase):
                     "Tool names must be unique within the organization",
                     "Some fields (toolType, id) are immutable after creation",
                     "get uses system UUID; get_by_tool_id uses team-scoped toolId",
-                    "update performs partial updates; replace overwrites the entire object",
+                    "replace is an alias for update; both perform partial updates via the upstream PUT endpoint",
                 ],
             ),
             ToolCapability(
@@ -888,6 +866,9 @@ class ToolManagement(ToolBase):
                 limitations=[
                     "Events are append-only and cannot be modified after creation",
                     "Timestamp defaults to server time if not provided",
+                    "Subscriber-credential attribution is not supported on meter_event — "
+                    "use manage_metering (e.g. submit_ai_transaction) when attribution to a "
+                    "specific subscriber credential is required",
                 ],
             ),
             ToolCapability(
@@ -978,7 +959,7 @@ class ToolManagement(ToolBase):
             "If delete returns success but the tool still appears, it was soft-deleted; use restore to recover",
             "Analytics return empty results when no events have been metered for the tool",
             "Ensure tool_data includes 'name' and 'toolType' when using create",
-            "update performs a partial patch; use replace to overwrite the entire tool object",
+            "replace is an alias for update; both perform partial updates via the upstream PUT endpoint",
         ]
 
     async def handle_action(
@@ -1087,8 +1068,8 @@ class ToolManagement(ToolBase):
                 return [TextContent(type="text", text=f"Tool updated:\n{json.dumps(result, indent=2)}")]
 
             elif action == "replace":
-                result = await manager.replace_tool(arguments)
-                return [TextContent(type="text", text=f"Tool replaced:\n{json.dumps(result, indent=2)}")]
+                result = await manager.update_tool(arguments)
+                return [TextContent(type="text", text=f"Tool updated:\n{json.dumps(result, indent=2)}")]
 
             elif action == "delete":
                 result = await manager.delete_tool(arguments)

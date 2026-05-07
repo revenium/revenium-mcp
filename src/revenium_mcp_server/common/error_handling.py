@@ -43,6 +43,12 @@ class ErrorCodes:
     API_AUTHENTICATION = "API_AUTHENTICATION"
     API_AUTHORIZATION = "API_AUTHORIZATION"
 
+    # Auth-shape envelope (401-equivalent) — BACK-1270 #9
+    # Used by common/auth_response_envelope.py to wrap AuthenticationError at
+    # the client boundary so callers see a structured 401-shape error instead
+    # of the raw "REVENIUM_API_KEY environment variable is required" message.
+    UNAUTHORIZED = "UNAUTHORIZED"
+
     # UCM errors
     UCM_ERROR = "UCM_ERROR"
     UCM_UNAVAILABLE = "UCM_UNAVAILABLE"

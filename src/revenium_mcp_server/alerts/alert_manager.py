@@ -16,9 +16,9 @@ except ImportError:
 
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
-from ..client import ReveniumClient
+from ..client import ReveniumAPIError, ReveniumClient
 from ..date_parser import DateRangeParser
-from ..exceptions import ValidationError
+from ..exceptions import AlertNotFoundError, ValidationError
 from ..models import MetricType
 
 
@@ -57,6 +57,7 @@ class AlertManager:
         """
         self.config = config or {}
         self.date_parser = DateRangeParser()
+
 
     def _get_severity_emoji(self, severity: str) -> str:
         """Get emoji for alert severity."""
@@ -280,8 +281,21 @@ class AlertManager:
 
         logger.info(f"Getting alert: {alert_id}")
 
-        # Call the API client method
-        alert = await client.get_alert_by_id(alert_id)
+        # Call the API client method. The Revenium alerts service returns
+        # 404 for never-existed ids, 403 for ids the caller cannot access,
+        # and 500 in some legacy edge cases — all three mean "this id has
+        # no actionable alert" from the caller's POV. Fold them into a
+        # single AlertNotFoundError so the @handle_alert_tool_errors
+        # decorator renders the rich "alert not found" envelope instead
+        # of the catch-all "Unexpected Error" fallback at the bottom of
+        # error_handlers.py (BACK-1142; same shape as BACK-1098 on
+        # manage_tools).
+        try:
+            alert = await client.get_alert_by_id(alert_id)
+        except ReveniumAPIError as e:
+            if e.status_code in (403, 404, 500):
+                raise AlertNotFoundError(alert_id) from e
+            raise
 
         # Enhanced field extraction for alert history
         alert_name = self._extract_alert_name(alert)

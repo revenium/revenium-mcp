@@ -7,6 +7,7 @@ import pytest
 from unittest.mock import AsyncMock
 
 from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
+from src.revenium_mcp_server.models import AlertType, OperatorType
 from mcp.types import TextContent
 
 
@@ -46,6 +47,39 @@ class TestAlertManagement:
         # Check for key content (flexible matching)
         text = result[0].text.lower()
         assert "capabilities" in text or "alert" in text
+
+    @pytest.mark.asyncio
+    async def test_get_capabilities_renders_operators_and_alert_types(self, alert_tools):
+        """get_capabilities must populate Available Operators and Alert Types from
+        the OperatorType / AlertType enums when UCM does not supply them.
+
+        BACK-1113 audit shape — both section headers were rendered with no items
+        underneath, leaving callers unable to discover the supported set.
+        """
+        result = await alert_tools.handle_action("get_capabilities", {})
+        text = result[0].text
+
+        assert "## **Available Operators**" in text
+        # Drive assertions from the enums directly so new members are covered automatically.
+        for op in OperatorType:
+            assert f"**{op.value}**" in text, f"Available Operators section missing {op.value}"
+
+        assert "## **Alert Types**" in text
+        for at in AlertType:
+            assert f"**{at.value}**" in text, f"Alert Types section missing {at.value}"
+
+    @pytest.mark.asyncio
+    async def test_build_capabilities_text_falls_back_when_ucm_lists_are_empty(
+        self, alert_tools
+    ):
+        """Empty UCM lists must trigger the enum fallback, not render empty headers."""
+        text = await alert_tools._build_enhanced_capabilities_text(
+            {"operators": [], "alert_types": []}
+        )
+        assert "## **Available Operators**" in text
+        assert "**GREATER_THAN**" in text
+        assert "## **Alert Types**" in text
+        assert "**THRESHOLD**" in text
 
     @pytest.mark.asyncio
     async def test_get_examples(self, alert_tools):

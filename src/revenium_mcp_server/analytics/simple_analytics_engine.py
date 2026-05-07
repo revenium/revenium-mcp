@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 
+from ..auth import AuthenticationError
 from .response_formatter import ResponseFormatter
 from .simple_cost_analyzer import SimpleCostAnalyzer
 from .validation import AnalyticsValidator, ValidationError
@@ -77,6 +78,10 @@ class AnalyticsProcessor(ABC):
             return await self._execute_analytics_workflow(params)
         except ValidationError as e:
             return self._handle_validation_error_with_logging(e, params.operation_type)
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            # Each tool handler that catches Exception below must also re-raise this.
+            raise
         except Exception as e:
             return self._handle_general_error_with_logging(e, params.operation_type)
 

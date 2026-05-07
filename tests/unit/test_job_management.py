@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from src.revenium_mcp_server.tools_decomposed.job_management import (
     JobManager,
     JobManagement,
+    _strip_links,
 )
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ToolError
@@ -716,3 +717,228 @@ class TestJobManagerPaginationBoundary:
         assert getattr(err, "field", None) == "size"
         assert "exceeds maximum" in err.message
         mock_client.get_job_transactions.assert_not_called()
+
+
+# ===========================================================================
+# _links sanitisation
+# ===========================================================================
+
+
+class TestStripLinks:
+    """``_strip_links`` removes HAL ``_links`` keys from any nested shape."""
+
+    def test_strips_top_level_links(self):
+        sanitised = _strip_links(
+            {
+                "id": "j1",
+                "_links": {"self": {"href": "http://api-lb.dev.hcapp.io/jobs/j1"}},
+            }
+        )
+        assert "_links" not in sanitised
+        assert sanitised == {"id": "j1"}
+
+    def test_strips_nested_links_in_list_items(self):
+        items = [
+            {"id": "a", "_links": {"self": {"href": "http://api-lb.dev.hcapp.io/jobs/a"}}},
+            {"id": "b", "_links": {"self": {"href": "http://api-lb.dev.hcapp.io/jobs/b"}}},
+        ]
+        sanitised = _strip_links(items)
+        assert all("_links" not in item for item in sanitised)
+        assert [item["id"] for item in sanitised] == ["a", "b"]
+
+    def test_strips_links_inside_embedded_collections(self):
+        sanitised = _strip_links(
+            {
+                "id": "j1",
+                "_links": {"collection": {"href": "http://api-lb.dev.hcapp.io/jobs"}},
+                "outcomes": [
+                    {"id": "o1", "_links": {"self": {"href": "http://api-lb.dev.hcapp.io/o/1"}}},
+                ],
+            }
+        )
+        assert "_links" not in sanitised
+        assert "_links" not in sanitised["outcomes"][0]
+        assert sanitised["outcomes"][0]["id"] == "o1"
+
+    def test_does_not_mutate_input(self):
+        original = {"id": "j1", "_links": {"self": {"href": "x"}}}
+        _strip_links(original)
+        assert "_links" in original
+
+    def test_passes_through_scalars(self):
+        assert _strip_links("string") == "string"
+        assert _strip_links(42) == 42
+        assert _strip_links(None) is None
+
+
+class TestListJobsStripsLinks:
+    """list_jobs must not surface HAL _links from the upstream HAL+JSON."""
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_strips_internal_lb_links(self, job_manager, mock_client):
+        """Each job item arrives from the API with _links pointing at api-lb.* — strip them."""
+        mock_client.get_jobs.return_value = {"_embedded": {"jobs": []}}
+        mock_client._extract_embedded_data.return_value = [
+            {
+                "id": "j1",
+                "name": "Job A",
+                "_links": {
+                    "self": {"href": "http://api-lb.dev.hcapp.io/profitstream/v2/api/jobs/j1"},
+                    "collection": {"href": "http://api-lb.dev.hcapp.io/profitstream/v2/api/jobs"},
+                },
+            }
+        ]
+        mock_client._extract_pagination_info.return_value = {"totalPages": 1, "totalElements": 1}
+
+        result = await job_manager.list_jobs({"page": 0, "size": 10})
+
+        for job in result["data"]:
+            assert "_links" not in job, "manage_jobs list response must not expose HAL _links"
+        # serialised payload must not mention the internal LB hostname
+        assert "api-lb.dev.hcapp.io" not in json.dumps(result)
+
+
+class TestGetJobStripsLinks:
+    """get_job must also strip _links from the single-resource response."""
+
+    @pytest.mark.asyncio
+    async def test_get_job_strips_links(self, job_manager, mock_client):
+        mock_client.get_job_by_id.return_value = {
+            "id": "j1",
+            "name": "Job A",
+            "_links": {"self": {"href": "http://api-lb.dev.hcapp.io/jobs/j1"}},
+        }
+
+        result = await job_manager.get_job({"job_id": "j1"})
+
+        assert "_links" not in result["data"]
+        assert "api-lb.dev.hcapp.io" not in json.dumps(result)
+
+
+class TestGetJobTransactionsStripsLinks:
+    """get_job_transactions must strip _links from each transaction item."""
+
+    @pytest.mark.asyncio
+    async def test_get_job_transactions_strips_links(self, job_manager, mock_client):
+        mock_client.get_job_transactions.return_value = {"_embedded": {"transactions": []}}
+        mock_client._extract_embedded_data.return_value = [
+            {
+                "id": "t1",
+                "_links": {"self": {"href": "https://api-lb.dev.hcapp.io/profitstream/v2/api/transactions/t1"}},
+            }
+        ]
+        mock_client._extract_pagination_info.return_value = {"totalPages": 1, "totalElements": 1}
+
+        result = await job_manager.get_job_transactions({"job_id": "j1", "page": 0, "size": 10})
+
+        for tx in result["data"]:
+            assert "_links" not in tx
+        assert "api-lb.dev.hcapp.io" not in json.dumps(result)
+
+
+class TestGetJobRoiStripsLinks:
+    """get_job_roi must strip _links from the ROI payload."""
+
+    @pytest.mark.asyncio
+    async def test_get_job_roi_strips_links(self, job_manager, mock_client):
+        mock_client.get_job_roi.return_value = {
+            "jobId": "j1",
+            "roi": 1.42,
+            "_links": {"self": {"href": "https://api-lb.dev.hcapp.io/profitstream/v2/api/jobs/j1/roi"}},
+        }
+
+        result = await job_manager.get_job_roi({"job_id": "j1"})
+
+        assert "_links" not in result["data"]
+        assert "api-lb.dev.hcapp.io" not in json.dumps(result)
+
+
+class TestGetJobTypesStripsLinks:
+    """get_job_types must strip _links from the types payload."""
+
+    @pytest.mark.asyncio
+    async def test_get_job_types_strips_links(self, job_manager, mock_client):
+        mock_client.get_job_types.return_value = {"_embedded": {"jobTypes": []}}
+        mock_client._extract_embedded_data.return_value = [
+            {
+                "name": "TYPE_A",
+                "_links": {"self": {"href": "https://api-lb.dev.hcapp.io/profitstream/v2/api/jobs/types/TYPE_A"}},
+            }
+        ]
+
+        result = await job_manager.get_job_types({})
+
+        for item in result["data"]:
+            assert "_links" not in item
+        assert "api-lb.dev.hcapp.io" not in json.dumps(result)
+
+
+class TestGetConversionFunnelStripsLinks:
+    """get_conversion_funnel must strip _links from the funnel payload."""
+
+    @pytest.mark.asyncio
+    async def test_get_conversion_funnel_strips_links(self, job_manager, mock_client):
+        mock_client.get_job_conversion_funnel = AsyncMock(return_value={
+            "totalJobs": 10,
+            "successfulJobs": 7,
+            "convertedJobs": 5,
+            "_links": {"self": {"href": "https://api-lb.dev.hcapp.io/profitstream/v2/api/jobs/conversion-funnel"}},
+        })
+
+        result = await job_manager.get_conversion_funnel({"filters": {}})
+
+        assert "_links" not in result["data"]
+        assert "api-lb.dev.hcapp.io" not in json.dumps(result)
+
+
+class TestGetRoiSummaryStripsLinks:
+    """get_roi_summary must strip _links from each per-type funnel breakdown item."""
+
+    @pytest.mark.asyncio
+    async def test_get_roi_summary_strips_links(self, job_manager, mock_client):
+        mock_client.get_job_types.return_value = {"_embedded": {"jobTypes": []}}
+        mock_client._extract_embedded_data.return_value = ["TYPE_A"]
+        mock_client.get_job_conversion_funnel = AsyncMock(return_value={
+            "totalJobs": 10,
+            "successfulJobs": 7,
+            "convertedJobs": 5,
+            "_links": {"self": {"href": "https://api-lb.dev.hcapp.io/profitstream/v2/api/jobs/conversion-funnel?jobType=TYPE_A"}},
+        })
+
+        result = await job_manager.get_roi_summary({"filters": {}})
+
+        for entry in result["per_type_breakdown"]:
+            assert entry["data"] is None or "_links" not in entry["data"]
+        assert "api-lb.dev.hcapp.io" not in json.dumps(result)
+
+
+class TestReportOutcomeStripsLinks:
+    """report_outcome must strip _links from the upstream confirmation payload."""
+
+    @pytest.mark.asyncio
+    async def test_report_outcome_strips_links(self, job_manager, mock_client):
+        mock_client.report_job_outcome.return_value = {
+            "id": "o1",
+            "outcome": "CONVERTED",
+            "_links": {"self": {"href": "https://api-lb.dev.hcapp.io/profitstream/v2/api/jobs/j1/outcomes/o1"}},
+        }
+
+        result = await job_manager.report_outcome(
+            {"job_id": "j1", "outcome_data": {"outcome": "CONVERTED", "revenue": 99.99}}
+        )
+
+        assert "_links" not in result["data"]
+        assert "api-lb.dev.hcapp.io" not in json.dumps(result)
+
+
+class TestListJobsRejectsFloatPageNoLeak:
+    """BACK-1270 / item #6 — float page must reject without Pydantic URL."""
+
+    @pytest.mark.asyncio
+    async def test_float_page_returns_clean_error(self, job_manager):
+        from src.revenium_mcp_server.common.error_handling import ToolError
+        from tests.unit._helpers_no_framework_leak import assert_no_framework_leak
+        with pytest.raises(ToolError) as exc:
+            await job_manager.list_jobs({"page": 3.7, "size": 20})
+        assert exc.value.field == "page"
+        assert_no_framework_leak(exc.value.message)

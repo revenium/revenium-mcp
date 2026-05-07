@@ -276,6 +276,15 @@ class UpdateConfigs:
             }
         elif resource_type == "organization":
             preserve_fields.extend(["parent_organization_id", "contact_info", "address"])
+            # BACK-1270 / BACK-911 regression — the organizations API GET returns
+            # the parent as a populated nested ``parent`` object, but the PUT
+            # endpoint only persists the relationship when the scalar ``parentId``
+            # field is present. Project ``parent.id`` into ``parentId`` so a
+            # partial update (e.g. name-only) does not silently null the parent
+            # link server-side.
+            field_transformations = {
+                "parent": {"parentId": FieldTransformers.object_to_id},
+            }
         elif resource_type == "team":
             preserve_fields.extend(
                 ["organization_id", "parent_team_id", "owner_id", "members", "permissions"]

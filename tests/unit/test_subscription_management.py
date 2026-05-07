@@ -205,6 +205,97 @@ class TestSubscriptionManagerList:
 
         mock_client.get_subscriptions.assert_called_once_with(page=0, size=20)
 
+    @pytest.mark.asyncio
+    async def test_list_subscriptions_rejects_string_page_with_structured_error(
+        self, sub_manager, mock_client
+    ):
+        """Wrong-type page must raise a structured ToolError before reaching the client.
+
+        This is the BACK-1111 audit shape — page='not_a_number' previously bubbled up
+        as a raw Pydantic error with errors.pydantic.dev URL leakage.
+        """
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager.list_subscriptions({"page": "not_a_number"})
+
+        err = exc_info.value
+        assert getattr(err, "field", None) == "page"
+        # Structured envelope, no Pydantic URL leak
+        assert "pydantic.dev" not in str(err)
+        # Must not have reached the client
+        mock_client.get_subscriptions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_subscriptions_rejects_negative_page(self, sub_manager, mock_client):
+        """Negative page surfaces as a structured 400 (not Pydantic / not 5xx)."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager.list_subscriptions({"page": -1})
+
+        assert getattr(exc_info.value, "field", None) == "page"
+        mock_client.get_subscriptions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_discover_products_rejects_string_page_with_structured_error(
+        self, sub_manager, mock_client
+    ):
+        """discover_products: wrong-type page must raise structured ToolError before client call."""
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager.discover_products({"page": "not_a_number"})
+
+        err = exc_info.value
+        assert getattr(err, "field", None) == "page"
+        assert "pydantic.dev" not in str(err)
+        mock_client.get_products.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_supporting_data_rejects_string_page_with_structured_error(
+        self, sub_manager, mock_client
+    ):
+        """get_supporting_data: wrong-type page must raise structured ToolError before client call."""
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager.get_supporting_data({"page": "not_a_number"})
+
+        err = exc_info.value
+        assert getattr(err, "field", None) == "page"
+        assert "pydantic.dev" not in str(err)
+        mock_client.get_organizations.assert_not_called()
+        mock_client.get_products.assert_not_called()
+        mock_client.get_subscribers.assert_not_called()
+        mock_client.get_credentials.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_search_subscriptions_rejects_string_page_with_structured_error(
+        self, sub_manager, mock_client
+    ):
+        """search_subscriptions: wrong-type page must raise structured ToolError before client call."""
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager.search_subscriptions({"page": "not_a_number"})
+
+        err = exc_info.value
+        assert getattr(err, "field", None) == "page"
+        assert "pydantic.dev" not in str(err)
+        mock_client.get_subscriptions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_metrics_rejects_string_page_with_structured_error(self, mock_client):
+        """SubscriptionAnalytics.get_metrics: wrong-type page must raise structured ToolError before client call."""
+        from src.revenium_mcp_server.tools_decomposed.subscription_management import (
+            SubscriptionAnalytics,
+        )
+
+        analytics = SubscriptionAnalytics(mock_client)
+
+        with pytest.raises(ToolError) as exc_info:
+            await analytics.get_metrics({"page": "not_a_number"})
+
+        err = exc_info.value
+        assert getattr(err, "field", None) == "page"
+        assert "pydantic.dev" not in str(err)
+        mock_client.get_subscriptions.assert_not_called()
+
 
 class TestSubscriptionManagerGet:
     """Test SubscriptionManager.get_subscription behavior."""
@@ -608,3 +699,135 @@ class TestSubscriptionManagementHandleAction:
 # ===========================================================================
 
 
+class TestListSubscriptionsRejectsFloatPageNoLeak:
+    """BACK-1270 / item #5 — float page must reject without leaking Pydantic."""
+
+    @pytest.mark.asyncio
+    async def test_float_page_returns_clean_error(self, sub_manager):
+        from tests.unit._helpers_no_framework_leak import assert_no_framework_leak
+        with pytest.raises(ToolError) as exc:
+            await sub_manager.list_subscriptions({"page": 3.7, "size": 20})
+        assert exc.value.field == "page"
+        assert_no_framework_leak(exc.value.message)
+        assert_no_framework_leak(str(exc.value.suggestions))
+
+
+
+
+# ===========================================================================
+# BACK-1311 — Sanitizer integration through SubscriptionManager methods
+# ===========================================================================
+
+
+class TestListSubscriptionsSanitizesNestedProductSentinels:
+    """Audit finding A.2 — backend-returned nested product placeholders must
+    be normalized by the time the manager returns."""
+
+    @pytest.mark.asyncio
+    async def test_list_sanitizes_nested_product_undefined(self, sub_manager, mock_client):
+        leaky_subscription = {
+            "id": "3ByYBQK",
+            "resourceType": "subscription",
+            "label": "valid@example.com",
+            "product": {
+                "id": "jM7Bz8P",
+                "resourceType": "undefined",
+                "label": "undefined",
+                "created": "4/2/26, 1:29 PM",
+                "updated": "4/2/26, 1:29 PM",
+                "_links": {"self": {"href": "/profitstream/v2/api/products/jM7Bz8P"}},
+            },
+        }
+        mock_client._extract_embedded_data.return_value = [leaky_subscription]
+        mock_client._extract_pagination_info.return_value = {}
+
+        result = await sub_manager.list_subscriptions({})
+
+        product = result["subscriptions"][0]["product"]
+        assert product["resourceType"] == "product"  # inferred from path
+        assert product["label"] is None
+        assert product["created"] is None
+        assert product["updated"] is None
+        # Identity preserved
+        assert product["id"] == "jM7Bz8P"
+        assert product["_links"]["self"]["href"] == "/profitstream/v2/api/products/jM7Bz8P"
+
+
+class TestGetSubscriptionSanitizesNestedProductSentinels:
+    @pytest.mark.asyncio
+    async def test_get_sanitizes_nested_product(self, sub_manager, mock_client):
+        leaky = {
+            "id": "3ByYBQK",
+            "resourceType": "subscription",
+            "product": {
+                "id": "jM7Bz8P",
+                "resourceType": "undefined",
+                "label": "undefined",
+                "created": "4/2/26, 1:29 PM",
+                "_links": {"self": {"href": "/profitstream/v2/api/products/jM7Bz8P"}},
+            },
+        }
+        mock_client.get_subscription_by_id = AsyncMock(return_value=leaky)
+
+        result = await sub_manager.get_subscription({"subscription_id": "3ByYBQK"})
+
+        product = result["product"]
+        assert product["resourceType"] == "product"
+        assert product["label"] is None
+        assert product["created"] is None
+
+
+class TestSearchSubscriptionsSanitizesNestedProductSentinels:
+    @pytest.mark.asyncio
+    async def test_search_sanitizes_nested_product(self, sub_manager, mock_client):
+        leaky = {
+            "id": "3ByYBQK",
+            "name": "match-on-name",
+            "resourceType": "subscription",
+            "product": {
+                "id": "jM7Bz8P",
+                "resourceType": "undefined",
+                "label": "undefined",
+                "created": "4/2/26, 1:29 PM",
+                "_links": {"self": {"href": "/profitstream/v2/api/products/jM7Bz8P"}},
+            },
+        }
+        mock_client._extract_embedded_data.return_value = [leaky]
+        mock_client._extract_pagination_info.return_value = {}
+
+        result = await sub_manager.search_subscriptions({"search_query": "match"})
+
+        assert len(result["subscriptions"]) == 1
+        product = result["subscriptions"][0]["product"]
+        assert product["resourceType"] == "product"
+        assert product["label"] is None
+        assert product["created"] is None
+
+
+class TestCreateSubscriptionSanitizesNestedProductSentinels:
+    @pytest.mark.asyncio
+    async def test_create_sanitizes_nested_product(self, sub_manager, mock_client):
+        leaky = {
+            "id": "3ByYBQK",
+            "resourceType": "subscription",
+            "product": {
+                "id": "jM7Bz8P",
+                "resourceType": "undefined",
+                "label": "undefined",
+                "created": "4/2/26, 1:29 PM",
+                "_links": {"self": {"href": "/profitstream/v2/api/products/jM7Bz8P"}},
+            },
+        }
+        mock_client.create_subscription = AsyncMock(return_value=leaky)
+        # Bypass discover_products / context7 paths — pass subscription_data directly
+        result = await sub_manager.create_subscription({
+            "subscription_data": {
+                "name": "test-sub",
+                "product_id": "jM7Bz8P",
+                "clientEmailAddress": "test@example.com",
+            },
+        })
+        product = result["product"]
+        assert product["resourceType"] == "product"
+        assert product["label"] is None
+        assert product["created"] is None

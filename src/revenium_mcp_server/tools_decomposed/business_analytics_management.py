@@ -17,6 +17,7 @@ from ..agent_friendly import UnifiedResponseFormatter
 from ..analytics.enhanced_spike_analyzer import EnhancedSpikeAnalyzer
 from ..analytics.simple_analytics_engine import SimpleAnalyticsEngine
 from ..analytics.validation import ValidationError
+from ..auth import AuthenticationError
 from ..client import ReveniumAPIError
 from ..introspection.metadata import ToolCapability
 from .unified_tool_base import ToolBase
@@ -36,6 +37,7 @@ from ..common.error_handling import (
     create_structured_missing_parameter_error,
     create_structured_validation_error,
 )
+from ..common.numeric_param_validator import coerce_numeric_param
 from ..common.validation import validate_pagination_params
 from ..introspection.metadata import ToolType
 
@@ -264,6 +266,10 @@ class BusinessAnalyticsManagement(ToolBase):
 """
             return [TextContent(type="text", text=error_response)]
 
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
+            raise
         except Exception as e:
             logger.error(f"Error in get_cost_summary: {e}")
             error_details = self._format_api_error_details(e)
@@ -635,6 +641,10 @@ Use `get_capabilities()` for current status.
 """
             return [TextContent(type="text", text=error_response)]
 
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
+            raise
         except Exception as e:
             logger.error(f"Error in get_provider_costs: {e}")
             error_details = self._format_api_error_details(e)
@@ -697,6 +707,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
 """
             return [TextContent(type="text", text=error_response)]
 
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
+            raise
         except Exception as e:
             logger.error(f"Error in get_model_costs: {e}")
             error_details = self._format_api_error_details(e)
@@ -759,6 +773,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
 """
             return [TextContent(type="text", text=error_response)]
 
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
+            raise
         except Exception as e:
             logger.error(f"Error in get_customer_costs: {e}")
             error_details = self._format_api_error_details(e)
@@ -821,6 +839,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
 """
             return [TextContent(type="text", text=error_response)]
 
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
+            raise
         except Exception as e:
             logger.error(f"Error in get_api_key_costs: {e}")
             error_details = self._format_api_error_details(e)
@@ -883,6 +905,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
 """
             return [TextContent(type="text", text=error_response)]
 
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
+            raise
         except Exception as e:
             logger.error(f"Error in get_agent_costs: {e}")
             error_details = self._format_api_error_details(e)
@@ -943,6 +969,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
 """
             return [TextContent(type="text", text=error_response)]
 
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
+            raise
         except Exception as e:
             logger.error(f"Error in get_user_costs: {e}")
             error_details = self._format_api_error_details(e)
@@ -996,6 +1026,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
             return [TextContent(type="text", text=error_response)]
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
+            raise
         except Exception as e:
             logger.error(f"Error in get_tool_costs: {e}")
             error_details = self._format_api_error_details(e)
@@ -1043,6 +1077,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
             return [TextContent(type="text", text=error_response)]
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
+            raise
         except Exception as e:
             logger.error(f"Error in get_top_tools: {e}")
             error_details = self._format_api_error_details(e)
@@ -1089,6 +1127,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
             return [TextContent(type="text", text=error_response)]
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
+            raise
         except Exception as e:
             logger.error(f"Error in get_tool_costs_by_agent: {e}")
             error_details = self._format_api_error_details(e)
@@ -1136,6 +1178,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
             return [TextContent(type="text", text=error_response)]
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
+            raise
         except Exception as e:
             logger.error(f"Error in get_tool_costs_by_provider: {e}")
             error_details = self._format_api_error_details(e)
@@ -1158,6 +1204,23 @@ If you're seeing this error, please report it as it indicates a reliability issu
         self, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle analyze_cost_anomalies request using Enhanced Spike Analyzer v2.0."""
+        # BACK-1270 (item #7): coerce min_impact_threshold to float at the
+        # action boundary so a string (or other non-numeric) yields a
+        # structured ToolError instead of a downstream Python TypeError leak.
+        # This MUST run outside the try/except below: the bare `except Exception`
+        # clause formats failures as TextContent guidance pages, but Class-K
+        # leak fixes require the ToolError envelope to escape unmodified.
+        # No `default=` here — the existing `arguments.get("min_impact_threshold",
+        # 10.0)` below preserves the default-when-absent semantics, AND lets the
+        # `"threshold" in arguments and "min_impact_threshold" not in arguments`
+        # guidance check below still trigger when the user passes the wrong key.
+        arguments = coerce_numeric_param(
+            arguments,
+            "min_impact_threshold",
+            action="analyze_cost_anomalies",
+            minimum=0.0,
+        )
+
         try:
             logger.info("Processing analyze_cost_anomalies request")
 
@@ -1293,6 +1356,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
 """
             return [TextContent(type="text", text=error_response)]
 
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
+            raise
         except Exception as e:
             logger.error(f"Error in analyze_cost_anomalies: {e}")
             error_details = self._format_api_error_details(e)

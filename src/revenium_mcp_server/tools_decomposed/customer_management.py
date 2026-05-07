@@ -20,6 +20,7 @@ from ..common.error_handling import (
 )
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.update_configs import UpdateConfigFactory
+from ..common.validation import validate_pagination_params
 from ..config_store import get_config_value
 from ..introspection.metadata import (
     DependencyType,
@@ -82,6 +83,7 @@ class UserManager(BaseManager):
 
     async def list_users(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """List users with pagination."""
+        arguments = validate_pagination_params(arguments, action="list users")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
         filters = arguments.get("filters", {})
@@ -288,6 +290,7 @@ class SubscriberManager(BaseManager):
 
     async def list_subscribers(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """List subscribers with pagination."""
+        arguments = validate_pagination_params(arguments, action="list subscribers")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
         filters = arguments.get("filters", {})
@@ -622,6 +625,7 @@ class OrganizationManager(BaseManager):
 
     async def list_organizations(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """List organizations with pagination."""
+        arguments = validate_pagination_params(arguments, action="list organizations")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
         filters = arguments.get("filters", {})
@@ -800,6 +804,7 @@ class TeamManager(BaseManager):
 
     async def list_teams(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """List teams with pagination."""
+        arguments = validate_pagination_params(arguments, action="list teams")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
         filters = arguments.get("filters", {})

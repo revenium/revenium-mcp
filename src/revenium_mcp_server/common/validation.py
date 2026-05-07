@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Union, Type
 from ..validators import InputValidator
 from ..exceptions import ValidationError
 
+_SAFE_INT_MAX = 2**53
+
 # Re-export common validation functions
 __all__ = [
     "InputValidator",
@@ -174,7 +176,7 @@ def validate_pagination_params(arguments: Dict[str, Any], action: str) -> Dict[s
     from .error_handling import ToolError, ErrorCodes
 
     out = arguments.copy()
-    bounds = {"page": (0, None), "size": (1, 100)}
+    bounds = {"page": (0, 10_000), "size": (1, 100)}
 
     for name, (min_value, max_value) in bounds.items():
         if name not in out or out[name] is None:
@@ -187,11 +189,7 @@ def validate_pagination_params(arguments: Dict[str, Any], action: str) -> Dict[s
             coerced = raw
         elif isinstance(raw, str):
             stripped = raw.strip()
-            # Guard against DoS on int() with very large digit strings
-            # (CVE-2020-10735). Python >= 3.11.4 enforces a built-in 4300-digit
-            # cap, but we may run on older interpreters; bound the input length
-            # defensively before calling int(). 20 chars is well above any
-            # legitimate page/size value (max legitimate size is 100).
+            # CVE-2020-10735: int() on very large digit strings can saturate CPU.
             if len(stripped) > 20:
                 coerced = None
             else:
@@ -201,6 +199,17 @@ def validate_pagination_params(arguments: Dict[str, Any], action: str) -> Dict[s
                     coerced = None
         else:
             coerced = None
+
+        if coerced is not None and abs(coerced) > _SAFE_INT_MAX:
+            raise ToolError(
+                message=f"{name} exceeds safe integer range (max 2^53)",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=name,
+                value=str(raw),
+                suggestions=[
+                    f"When calling '{action}', pass {name} as a reasonable integer (e.g. {name}={min_value if name == 'page' else 20})",
+                ],
+            )
 
         if coerced is None or coerced < min_value or (max_value is not None and coerced > max_value):
             range_hint = (

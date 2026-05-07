@@ -161,3 +161,92 @@ class TestChartGeneration:
         mock_chart_data.config.height = 600
         result = await analytics_tool._generate_visual_chart(mock_chart_data)
         assert result is None
+
+
+class TestAnalyzeCostAnomaliesRejectsStringThreshold:
+    """BACK-1270 / item #7 — non-numeric min_impact_threshold must reject cleanly."""
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_threshold_returns_clean_error(self, analytics_tool):
+        from tests.unit._helpers_no_framework_leak import assert_no_framework_leak
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action(
+                "analyze_cost_anomalies",
+                {"period": "LAST_24_HOURS", "min_impact_threshold": "high"},
+            )
+        assert exc.value.field == "min_impact_threshold"
+        assert "number" in exc.value.message.lower() or "float" in exc.value.message.lower()
+        assert_no_framework_leak(exc.value.message)
+
+
+class TestCoerceNumericParam:
+    """BACK-1270 / item #7 — numeric_param_validator helper coverage."""
+
+    def test_numeric_string_is_coerced_to_float(self):
+        from src.revenium_mcp_server.common.numeric_param_validator import coerce_numeric_param
+        out = coerce_numeric_param(
+            {"min_impact_threshold": "0.5"},
+            "min_impact_threshold",
+            action="analyze_cost_anomalies",
+            minimum=0.0,
+        )
+        assert out["min_impact_threshold"] == 0.5
+        assert isinstance(out["min_impact_threshold"], float)
+
+    def test_int_is_coerced_to_float(self):
+        from src.revenium_mcp_server.common.numeric_param_validator import coerce_numeric_param
+        out = coerce_numeric_param(
+            {"x": 42}, "x", action="test", minimum=0.0
+        )
+        assert out["x"] == 42.0
+        assert isinstance(out["x"], float)
+
+    def test_default_used_when_param_absent(self):
+        from src.revenium_mcp_server.common.numeric_param_validator import coerce_numeric_param
+        out = coerce_numeric_param({}, "x", action="test", default=10.0)
+        assert out["x"] == 10.0
+
+    def test_bool_is_rejected(self):
+        from src.revenium_mcp_server.common.numeric_param_validator import coerce_numeric_param
+        with pytest.raises(ToolError) as exc:
+            coerce_numeric_param({"x": True}, "x", action="test")
+        assert exc.value.field == "x"
+
+    def test_below_minimum_is_rejected(self):
+        from src.revenium_mcp_server.common.numeric_param_validator import coerce_numeric_param
+        with pytest.raises(ToolError) as exc:
+            coerce_numeric_param({"x": -1.0}, "x", action="test", minimum=0.0)
+        assert exc.value.field == "x"
+        assert ">=" in exc.value.message
+
+    def test_above_maximum_is_rejected(self):
+        from src.revenium_mcp_server.common.numeric_param_validator import coerce_numeric_param
+        with pytest.raises(ToolError) as exc:
+            coerce_numeric_param({"x": 999.0}, "x", action="test", maximum=100.0)
+        assert exc.value.field == "x"
+        assert "<=" in exc.value.message
+
+    def test_nan_string_is_rejected(self):
+        from src.revenium_mcp_server.common.numeric_param_validator import coerce_numeric_param
+        with pytest.raises(ToolError) as exc:
+            coerce_numeric_param({"x": "nan"}, "x", action="t", minimum=0.0)
+        assert exc.value.field == "x"
+        assert "finite" in exc.value.message.lower()  # finiteness branch, not parse-failure branch
+
+    def test_inf_string_is_rejected(self):
+        from src.revenium_mcp_server.common.numeric_param_validator import coerce_numeric_param
+        with pytest.raises(ToolError) as exc:
+            coerce_numeric_param({"x": "inf"}, "x", action="t", minimum=0.0)
+        assert exc.value.field == "x"
+
+    def test_nan_float_is_rejected(self):
+        from src.revenium_mcp_server.common.numeric_param_validator import coerce_numeric_param
+        with pytest.raises(ToolError) as exc:
+            coerce_numeric_param({"x": float("nan")}, "x", action="t", minimum=0.0)
+        assert exc.value.field == "x"
+
+    def test_explicit_none_is_rejected(self):
+        from src.revenium_mcp_server.common.numeric_param_validator import coerce_numeric_param
+        with pytest.raises(ToolError) as exc:
+            coerce_numeric_param({"x": None}, "x", action="t")
+        assert exc.value.field == "x"

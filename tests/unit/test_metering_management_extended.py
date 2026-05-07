@@ -397,6 +397,7 @@ class TestHandleActionDiscovery:
         assert result[0].text
         assert "Valid" in result[0].text
 
+
     @pytest.mark.asyncio
     async def test_estimate_transaction_cost(self):
         mgmt, _ = _make_mgmt_with_client()
@@ -432,6 +433,40 @@ class TestHandleActionDiscovery:
         assert isinstance(result[0], TextContent)
         assert result[0].text
         assert "Parsed" in result[0].text
+
+
+class TestListAiModelsTotalCount:
+    """list_ai_models must report totalElements from the API, not page size."""
+
+    @pytest.mark.asyncio
+    async def test_total_models_uses_total_elements_not_page_length(self):
+        mgmt = MeteringManagement()
+        page_size = 10
+        catalog_total = 437
+
+        models = [
+            {"name": f"model-{i}", "provider": "OPENAI",
+             "inputCostPerToken": 0.0, "outputCostPerToken": 0.0}
+            for i in range(page_size)
+        ]
+        api_response = {
+            "_embedded": {"aIModelResourceList": models},
+            "page": {"totalElements": catalog_total, "totalPages": 44, "size": page_size, "number": 0},
+        }
+        fake_client = MagicMock()
+        fake_client.get_ai_models = AsyncMock(return_value=api_response)
+
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient",
+            return_value=fake_client,
+        ):
+            result = await mgmt._handle_list_ai_models({"page": 0, "size": page_size})
+
+        text = result[0].text
+        assert f"**Total Models Found**: {catalog_total}" in text, (
+            f"Expected '**Total Models Found**: {catalog_total}' (totalElements), "
+            f"got text:\n{text}"
+        )
 
 
 # ===========================================================================

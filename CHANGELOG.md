@@ -5,6 +5,44 @@ All notable changes to the Revenium MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.8] - 2026-05-07
+
+### Added
+- "Did you mean?" suggestions when a tool argument name is mistyped (e.g. `id` → `product_id`)
+- `error_reason` field exposed on `manage_metering.get_submission_capabilities` and `get_field_documentation` Optional Fields
+
+### Fixed
+- `manage_metering.list_ai_models` and `search_ai_models` now reject non-numeric `page`/`size` with a structured error instead of an uncaught Python `TypeError`
+- `manage_subscriptions`, `manage_products`, `manage_customers`, `manage_metering_elements`, and `manage_subscriber_credentials` now validate `page`/`size` at the tool boundary, including `size=0` and `MAX_INT` edge cases
+- `manage_jobs` translates float, out-of-range, and non-numeric `page` values into a structured 400 response
+- HTTP error responses no longer surface Python dict-repr trailers (e.g. `<msg> - {'error': '<msg>'}`) or internal `Error ID: <name>_<digits>` tokens
+- Tool argument errors raised at the framework signature-binding layer are translated to a clean `ToolError` envelope, eliminating `errors.pydantic.dev` URLs and `call[<tool>]` framing on common typos
+- `analyze_cost_anomalies` now accepts string `min_impact_threshold` and rejects invalid values with a structured error
+- `manage_alerts.get` returns a structured "Alert not found" instead of an unhandled HTTP failure
+- `business_analytics.get_api_key_costs` and `get_cost_summary` now aggregate rows whose masked label collides into one row per label with summed cost, share, and a `note: aggregated N untracked sources`
+- `manage_customers` organization update now preserves the `parent` field
+- `manage_products.update` partial-update semantics now match the create/update validators
+- `manage_sources` type normalization now consistent across `create` and `update`
+- `manage_subscriptions` list/get/update/search responses now normalize backend `"undefined"` placeholders in nested resource blocks (resource type inferred from the self link, label cleared, locale-formatted dates dropped)
+- `manage_subscriptions` key-actions list now matches the dispatcher (no orphan or missing actions)
+- `manage_metering.submit` rejects malformed `transaction_id` values at the boundary and rejects unknown provider values with a structured error
+- `manage_alerts` capabilities are backfilled with Operators and Alert Types from canonical enums (no `Unknown` values surfaced)
+- `manage_metering_elements` capabilities are backfilled with Element Types from the canonical set
+- `manage_tools` JSON precision and action-validation hardening across the surface
+- `list_ai_models` prose summary now reports the catalog `totalElements` rather than just the current page length
+
+### Changed
+- Auth-failure responses now use a consistent 401-shape `ToolError` envelope (`error_code=UNAUTHORIZED`) across all tools, replacing tool-specific failure shapes
+- `manage_jobs` responses no longer include HAL `_links` envelopes
+- `manage_tools` `meter_event` capability now points at `manage_metering` for subscriber-credential attribution
+
+### Removed
+- `requestDuration` metering element template (collided with the system element)
+- Contradictory `task_id` entry from `get_submission_capabilities`
+
+### Security
+- Auth-failure messages no longer reference the `REVENIUM_API_KEY` environment variable literal
+
 ## [0.2.7] - 2026-04-23
 
 ### Added
@@ -112,6 +150,7 @@ No functional changes. Changelog formatting update only.
 - Configuration via environment variables
 - System diagnostics and transaction verification tools
 
+[0.2.8]: https://github.com/revenium/revenium-mcp/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/revenium/revenium-mcp/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/revenium/revenium-mcp/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/revenium/revenium-mcp/compare/v0.2.4...v0.2.5

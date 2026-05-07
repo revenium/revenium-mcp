@@ -12,6 +12,7 @@ from src.revenium_mcp_server.tools_decomposed.metering_elements_management impor
     MeteringElementsValidator,
     MeteringElementsManagement,
 )
+from src.revenium_mcp_server.common.error_handling import ToolError
 from mcp.types import TextContent
 
 
@@ -71,8 +72,9 @@ class TestBuildElementTemplates:
     def test_shipping_cost_is_number_type(self, manager):
         assert manager.element_templates["shippingCost"]["type"] == "NUMBER"
 
-    def test_request_duration_template_exists(self, manager):
-        assert "requestDuration" in manager.element_templates
+    def test_request_duration_template_absent(self, manager):
+        # requestDuration is a system element — removed from templates to avoid collision (SE-75 d2)
+        assert "requestDuration" not in manager.element_templates
 
 
 # ===========================================================================
@@ -213,6 +215,44 @@ class TestListElements:
         result = await manager.list_elements(mock_client, {})
         # Labels should be populated
         assert result["_embedded"]["elements"][0]["label"] == "calls"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_args, bad_field",
+        [
+            ({"page": -1}, "page"),
+            ({"size": 0}, "size"),
+            ({"size": 101}, "size"),
+        ],
+    )
+    async def test_list_rejects_out_of_range_pagination(
+        self, manager, mock_client, bad_args, bad_field
+    ):
+        """Out-of-range page/size are rejected with a structured ToolError before
+        the client is called (BACK-1146; sister to BACK-1111/1112/1145)."""
+        with pytest.raises(ToolError) as exc:
+            await manager.list_elements(mock_client, bad_args)
+        assert exc.value.field == bad_field
+        mock_client.get_metering_element_definitions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_forwards_name_filter(self, manager, mock_client):
+        mock_client.get_metering_element_definitions.return_value = {"data": []}
+        await manager.list_elements(mock_client, {"name": "shipping"})
+        mock_client.get_metering_element_definitions.assert_called_once_with(
+            page=0, size=20, name="shipping",
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_name_does_not_override_explicit_filters(self, manager, mock_client):
+        mock_client.get_metering_element_definitions.return_value = {"data": []}
+        await manager.list_elements(mock_client, {
+            "name": "top-level",
+            "filters": {"name": "from-filters"},
+        })
+        mock_client.get_metering_element_definitions.assert_called_once_with(
+            page=0, size=20, name="from-filters",
+        )
 
 
 # ===========================================================================
@@ -617,3 +657,60 @@ class TestMeteringElementsManagementHandleAction:
             )
         assert isinstance(result[0], TextContent)
         assert len(result[0].text) > 0
+
+
+class TestMeteringElementsCapabilitiesElementTypesFallback:
+    """Element Types section in get_capabilities must always render concrete items.
+
+    BACK-1114 audit shape — pre-fix the section header rendered with a
+    self-referential "Use `get_capabilities` action to see current valid
+    element types" body when UCM did not supply element_types. Post-fix
+    every code path emits a real list.
+    """
+
+    @pytest.fixture
+    def mgmt(self):
+        return MeteringElementsManagement()
+
+    @pytest.mark.asyncio
+    async def test_element_types_falls_back_when_ucm_absent(self, mgmt):
+        text = await mgmt._build_enhanced_capabilities_text(None)
+        assert "## **Element Types**" in text
+        assert "**NUMBER**" in text
+        assert "**STRING**" in text
+        # Self-referential prompt removed
+        assert "Use `get_capabilities` action to see current valid element types" not in text
+
+    @pytest.mark.asyncio
+    async def test_element_types_falls_back_when_ucm_list_is_empty(self, mgmt):
+        text = await mgmt._build_enhanced_capabilities_text({"element_types": []})
+        assert "## **Element Types**" in text
+        assert "**NUMBER**" in text
+        assert "**STRING**" in text
+
+    @pytest.mark.asyncio
+    async def test_element_types_uses_ucm_list_when_present(self, mgmt):
+        text = await mgmt._build_enhanced_capabilities_text(
+            {"element_types": ["NUMBER", "STRING", "BOOLEAN"]}
+        )
+        assert "**NUMBER**" in text
+        assert "**STRING**" in text
+        assert "**BOOLEAN**" in text
+
+
+from tests.unit._helpers_no_framework_leak import assert_no_framework_leak
+
+
+class TestMeteringElementsListPaginationValidation:
+    """BACK-1270 / item #5 — Pydantic leak guard on manage_metering_elements list."""
+
+    @pytest.mark.asyncio
+    async def test_list_rejects_float_size_with_structured_error(
+        self, manager_with_client, mock_client
+    ):
+        with pytest.raises(ToolError) as exc:
+            await manager_with_client.list_elements(
+                mock_client, {"page": 0, "size": 3.7}
+            )
+        assert exc.value.field == "size"
+        assert_no_framework_leak(exc.value.message)

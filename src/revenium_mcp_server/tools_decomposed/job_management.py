@@ -42,6 +42,23 @@ _MAX_JOBS_PAGE = 1_000_000
 _MAX_JOBS_SIZE = 50
 
 
+def _strip_links(value: Any) -> Any:
+    """Return a copy of ``value`` with all HAL ``_links`` keys removed.
+
+    Upstream HAL+JSON responses embed ``_links.*.href`` URLs that point at
+    the internal load-balancer hostname (e.g. ``api-lb.dev.hcapp.io``).
+    Forwarding those leaks internal infrastructure topology to MCP callers.
+    Strip ``_links`` recursively at the tool boundary so the response carries
+    only public-shape fields. Operates on a fresh structure — input is not
+    mutated.
+    """
+    if isinstance(value, dict):
+        return {k: _strip_links(v) for k, v in value.items() if k != "_links"}
+    if isinstance(value, list):
+        return [_strip_links(item) for item in value]
+    return value
+
+
 def _validate_jobs_pagination(page: Any, size: Any) -> None:
     """Reject client-determinable boundary inputs with a structured 400.
 
@@ -124,7 +141,7 @@ class JobManager:
         page_info = self.client._extract_pagination_info(response)
         return {
             "action": "list_jobs",
-            "data": jobs,
+            "data": _strip_links(jobs),
             "pagination": {
                 "page": page,
                 "size": size,
@@ -147,7 +164,7 @@ class JobManager:
                 suggestions=["Use list_jobs to find valid job IDs"],
             )
         result = await self.client.get_job_by_id(job_id)
-        return {"action": "get_job", "job_id": job_id, "data": result}
+        return {"action": "get_job", "job_id": job_id, "data": _strip_links(result)}
 
     async def get_job_transactions(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get transactions for a job."""
@@ -168,7 +185,7 @@ class JobManager:
         return {
             "action": "get_job_transactions",
             "job_id": job_id,
-            "data": transactions,
+            "data": _strip_links(transactions),
             "pagination": {
                 "page": page,
                 "size": size,
@@ -190,19 +207,19 @@ class JobManager:
                 suggestions=["Use list_jobs to find valid job IDs"],
             )
         result = await self.client.get_job_roi(job_id)
-        return {"action": "get_job_roi", "job_id": job_id, "data": result}
+        return {"action": "get_job_roi", "job_id": job_id, "data": _strip_links(result)}
 
     async def get_job_types(self, arguments: Dict[str, Any]) -> Dict[str, Any]:  # noqa: ARG002
         """Get available job types."""
         result = await self.client.get_job_types()
         types = self.client._extract_embedded_data(result) if isinstance(result, dict) else result
-        return {"action": "get_job_types", "data": types}
+        return {"action": "get_job_types", "data": _strip_links(types)}
 
     async def get_conversion_funnel(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get global conversion funnel analytics with optional filters."""
         filters = arguments.get("filters", {})
         result = await self.client.get_job_conversion_funnel(**filters)
-        return {"action": "get_conversion_funnel", "data": result}
+        return {"action": "get_conversion_funnel", "data": _strip_links(result)}
 
     async def get_roi_summary(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get ROI summary across all job types with per-type conversion funnels.
@@ -238,7 +255,7 @@ class JobManager:
             try:
                 funnel_filters = {"jobType": job_type, **date_filters}
                 result = await self.client.get_job_conversion_funnel(**funnel_filters)
-                return {"jobType": job_type, "data": result, "status": "success"}
+                return {"jobType": job_type, "data": _strip_links(result), "status": "success"}
             except Exception as e:
                 logger.warning(f"Failed to fetch funnel for job type '{job_type}': {e}")
                 status_code = getattr(e, "status_code", "unknown")
@@ -309,7 +326,7 @@ class JobManager:
             )
         try:
             result = await self.client.report_job_outcome(job_id, outcome_data)
-            return {"action": "report_outcome", "job_id": job_id, "data": result}
+            return {"action": "report_outcome", "job_id": job_id, "data": _strip_links(result)}
         except ReveniumAPIError as e:
             if e.status_code == 409:
                 return {

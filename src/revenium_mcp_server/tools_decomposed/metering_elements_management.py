@@ -20,6 +20,7 @@ from ..common.error_handling import (
 )
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.update_configs import UpdateConfigFactory
+from ..common.validation import validate_pagination_params
 from ..introspection.metadata import (
     DependencyType,
     ToolCapability,
@@ -27,6 +28,12 @@ from ..introspection.metadata import (
     ToolType,
 )
 from .unified_tool_base import ToolBase
+
+# Module-level — must stay in sync with the canonical Revenium element-type set.
+_ELEMENT_TYPE_DESCRIPTIONS = {
+    "NUMBER": "numeric metric (cost, weight, duration, count)",
+    "STRING": "string identifier or category",
+}
 
 
 class MeteringElementsManager:
@@ -60,23 +67,20 @@ class MeteringElementsManager:
                 "description": "Shipping container identifier",
                 "type": "STRING",
             },
-            "requestDuration": {
-                "name": "requestDuration",
-                "description": "Duration of API requests",
-                "type": "NUMBER",
-            },
-
         }
 
     async def list_elements(
         self, client: ReveniumClient, arguments: Dict[str, Any]
     ) -> Dict[str, Any]:
         """List metering elements."""
+        arguments = validate_pagination_params(arguments, action="list metering elements")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = arguments.get("filters", {})
+        filters = arguments.get("filters", {}).copy()
+        name = arguments.get("name")
+        if name is not None and "name" not in filters:
+            filters["name"] = name
 
-        # Use the client's dedicated method for metering element definitions
         response = await client.get_metering_element_definitions(page=page, size=size, **filters)
 
         # Fix empty label fields by populating from name or description
@@ -840,17 +844,22 @@ delete(element_id="elem_123")                     # Remove element
 assign_to_source(source_id="src_123", element_ids=["elem_456"]) # Connect to sources
 ```"""
 
-        # Add UCM-enhanced element types if available
-        if ucm_capabilities and "element_types" in ucm_capabilities:
-            text += "\n\n## **Element Types**\n"
-            for element_type in ucm_capabilities["element_types"]:
+        # Element Types — prefer UCM, fall back to the canonical Revenium element-type
+        # set so the section is never an orphan header. Empty UCM lists also fall
+        # through to the static set; the previous fallback pointed back at
+        # `get_capabilities` itself, which is the very output the caller is reading.
+        element_types = (
+            list(ucm_capabilities.get("element_types") or []) if ucm_capabilities else []
+        )
+        if not element_types:
+            element_types = list(_ELEMENT_TYPE_DESCRIPTIONS.keys())
+        text += "\n\n## **Element Types**\n"
+        for element_type in element_types:
+            description = _ELEMENT_TYPE_DESCRIPTIONS.get(element_type)
+            if description:
+                text += f"- **{element_type}** — {description}\n"
+            else:
                 text += f"- **{element_type}**\n"
-        else:
-            # UCM-only mode - no hardcoded fallbacks
-            text += "\n\n## **Element Types**\n"
-            text += (
-                "Use `get_capabilities` action to see current valid element types from the API.\n"
-            )
 
         # Add UCM-enhanced templates if available
         if ucm_capabilities and "templates" in ucm_capabilities:

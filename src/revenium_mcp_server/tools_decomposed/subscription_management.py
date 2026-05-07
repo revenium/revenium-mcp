@@ -6,6 +6,7 @@ tool with internal composition, following the proven alert/source/customer manag
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
@@ -41,6 +42,143 @@ from ..introspection.metadata import (
 from .unified_tool_base import ToolBase
 
 
+# Upper bound on the page parameter. Without this, page=2147483647 (32-bit
+# MAX_INT) and similar boundary inputs were forwarded to the backend, which
+# Pydantic-rejected with a public errors.pydantic.dev URL leaking framework
+# internals to the caller. Generous so it stays a sanity guard rather than
+# a real cap on legitimate paging.
+# BACK-1311: backend returns subscription nested objects with placeholder
+# strings — `resourceType: "undefined"`, `label: "undefined"`, locale-formatted
+# date strings — instead of resolved values. Audit finding A.2. The sanitizer
+# below normalizes the three known sentinel patterns before responses leave
+# the manager. Backend ticket pending; this is defensive on the MCP side.
+_PATH_TO_RESOURCE_TYPE = {
+    "products": "product",
+    "subscriptions": "subscription",
+    "users": "user",
+    "organizations": "organization",
+    "credentials": "credential",
+    "sources": "source",
+}
+
+_LOCALE_DATE = re.compile(
+    r"^\d{1,2}/\d{1,2}/\d{2},\s*\d{1,2}:\d{2}[\s ][AP]M$"
+)
+
+# Keys that the audit shows carry locale-formatted timestamps in nested resource
+# blocks. Only these keys are checked against _LOCALE_DATE; other string fields
+# pass through even if their value happens to match the regex.
+_DATE_KEYS = frozenset({"created", "updated"})
+
+_RESOURCE_PATH = re.compile(r"/profitstream/v2/api/(\w+)/[^/]+/?$")
+
+
+def _sanitize_undefined_sentinels(data):
+    """Recursively replace backend-returned `"undefined"` literals and
+    locale-formatted date strings with sensible nulls (BACK-1311).
+
+    Mutates dicts and lists in place; returns the same object so call sites
+    can `return _sanitize_undefined_sentinels(response)` cleanly.
+
+    Three transformations:
+      1. `resourceType == "undefined"` and `_links.self.href` matches a
+         known resource path → infer canonical type from path. Unknown
+         paths or missing `_links` → `None`.
+      2. `label == "undefined"` (exact string match) → `None`.
+      3. Date-shaped strings matching the locale-format regex → `None`.
+
+    Strings that legitimately contain "undefined" as a substring are
+    preserved (equality match, not substring).
+    """
+    if isinstance(data, dict):
+        if data.get("resourceType") == "undefined":
+            href = ((data.get("_links") or {}).get("self") or {}).get("href", "")
+            match = _RESOURCE_PATH.search(href) if href else None
+            data["resourceType"] = (
+                _PATH_TO_RESOURCE_TYPE.get(match.group(1)) if match else None
+            )
+        if data.get("label") == "undefined":
+            data["label"] = None
+        for key, value in list(data.items()):
+            if isinstance(value, str):
+                if key in _DATE_KEYS and _LOCALE_DATE.match(value):
+                    data[key] = None
+            elif isinstance(value, (dict, list)):
+                _sanitize_undefined_sentinels(value)
+    elif isinstance(data, list):
+        for item in data:
+            _sanitize_undefined_sentinels(item)
+    return data
+
+
+_MAX_SUBSCRIPTIONS_PAGE = 1_000_000
+
+# Upper bound on the size parameter (matches PaginationPerformanceManager.MAXIMUM_LIMIT).
+_MAX_SUBSCRIPTIONS_SIZE = 100
+
+
+def _validate_subscriptions_pagination(page: Any, size: Any) -> None:
+    """Reject malformed page / size before they reach the API client.
+
+    Mirrors the structured-400 contract used by manage_jobs: any non-integer,
+    negative, or out-of-range value raises a ToolError carrying field/value/
+    suggestions so the caller never sees a raw Pydantic / framework error.
+    """
+    for label, value in (("page", page), ("size", size)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ToolError(
+                message=f"{label} must be an integer (got {type(value).__name__})",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=label,
+                value=value,
+                suggestions=[
+                    f"Pass an integer for {label} (no quotes, no booleans)",
+                ],
+            )
+    if page < 0:
+        raise ToolError(
+            message=f"page must be >= 0 (got {page})",
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="page",
+            value=page,
+            suggestions=["Use page=0 for the first page; pages are zero-indexed"],
+        )
+    if page > _MAX_SUBSCRIPTIONS_PAGE:
+        raise ToolError(
+            message=(
+                f"page exceeds maximum (expected 0 <= page <= {_MAX_SUBSCRIPTIONS_PAGE}, got {page})"
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="page",
+            value=page,
+            suggestions=[
+                "Pick a smaller page; very large indices indicate an off-by-one or misuse",
+                "If you are looking for a specific subscription, use get(subscription_id=...) instead of paginating to find it.",
+            ],
+        )
+    if size <= 0:
+        raise ToolError(
+            message=f"size must be > 0 (got {size})",
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="size",
+            value=size,
+            suggestions=[f"Use size between 1 and {_MAX_SUBSCRIPTIONS_SIZE}"],
+        )
+    if size > _MAX_SUBSCRIPTIONS_SIZE:
+        raise ToolError(
+            message=(
+                f"size exceeds maximum (expected 1 <= size <= {_MAX_SUBSCRIPTIONS_SIZE}, got {size})"
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="size",
+            value=size,
+            suggestions=[
+                f"Use size between 1 and {_MAX_SUBSCRIPTIONS_SIZE}",
+                "Paginate with larger page numbers instead of oversized page sizes.",
+            ],
+        )
+
+
 class SubscriptionManager:
     """Internal manager for subscription CRUD operations."""
 
@@ -57,6 +195,7 @@ class SubscriptionManager:
         search_query = arguments.get("search_query", "")
         page = arguments.get("page", 0)
         size = arguments.get("size", 10)
+        _validate_subscriptions_pagination(page, size)
 
         try:
             # Get products from the manage_products tool
@@ -199,10 +338,15 @@ class SubscriptionManager:
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
         filters = arguments.get("filters", {})
+        _validate_subscriptions_pagination(page, size)
 
         response = await self.client.get_subscriptions(page=page, size=size, **filters)
         subscriptions = self.client._extract_embedded_data(response)
         page_info = self.client._extract_pagination_info(response)
+
+        # BACK-1311: normalize backend-returned `"undefined"` placeholders and
+        # locale dates in nested resource blocks (audit finding A.2).
+        _sanitize_undefined_sentinels(subscriptions)
 
         return {
             "action": "list",
@@ -228,6 +372,8 @@ class SubscriptionManager:
 
         try:
             subscription = await self.client.get_subscription_by_id(subscription_id)
+            # BACK-1311: normalize nested `"undefined"` placeholders + locale dates.
+            _sanitize_undefined_sentinels(subscription)
             return subscription
         except ReveniumAPIError as e:
             if e.status_code == 404:
@@ -359,6 +505,8 @@ class SubscriptionManager:
                 )
 
         result = await self.client.create_subscription(subscription_data)
+        # BACK-1311: normalize nested `"undefined"` placeholders + locale dates.
+        _sanitize_undefined_sentinels(result)
         return result
 
     async def update_subscription(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -401,6 +549,8 @@ class SubscriptionManager:
             action_context="update subscription",
         )
 
+        # BACK-1311: normalize nested `"undefined"` placeholders + locale dates.
+        _sanitize_undefined_sentinels(result)
         return result
 
     async def cancel_subscription(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -446,6 +596,7 @@ class SubscriptionManager:
         page = arguments.get("page", 0)
         size = arguments.get("size", 100)
         search_query = arguments.get("search_query", "")
+        _validate_subscriptions_pagination(page, size)
 
         result = {
             "action": "get_supporting_data",
@@ -535,6 +686,7 @@ class SubscriptionManager:
         subscriber_email = arguments.get("subscriber_email", "")
         page = arguments.get("page", 0)
         size = arguments.get("size", 50)  # Get more for filtering
+        _validate_subscriptions_pagination(page, size)
 
         # Get all subscriptions first
         response = await self.client.get_subscriptions(page=page, size=size)
@@ -584,6 +736,9 @@ class SubscriptionManager:
 
             if matches:
                 filtered_subscriptions.append(subscription)
+
+        # BACK-1311: normalize nested `"undefined"` placeholders + locale dates.
+        _sanitize_undefined_sentinels(filtered_subscriptions)
 
         return {
             "action": "search_subscriptions",
@@ -1452,6 +1607,7 @@ class SubscriptionAnalytics:
         page = arguments.get("page", 0)
         size = arguments.get("size", 100)  # Get more for analysis
         filters = arguments.get("filters", {})
+        _validate_subscriptions_pagination(page, size)
 
         response = await self.client.get_subscriptions(page=page, size=size, **filters)
         subscriptions = self.client._extract_embedded_data(response)
@@ -1765,7 +1921,7 @@ class SubscriptionManagement(ToolBase):
     """Consolidated subscription management tool with internal composition."""
 
     tool_name = "manage_subscriptions"
-    tool_description = "Subscription management connecting customers to products. Key actions: list, create, update, delete, search. Use get_capabilities() for complete action list."
+    tool_description = "Subscription management connecting customers to products. Key actions: list, create, update, delete, search_subscriptions. Use get_capabilities() for complete action list."
     business_category = "Core Business Management Tools"
     tool_type = ToolType.CRUD
     tool_version = "2.0.0"

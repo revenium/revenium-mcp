@@ -231,6 +231,12 @@ Set REVENIUM_API_KEY environment variable with your Revenium API key.
 """,
     )
 
+    # BACK-1312: translate Pydantic ValidationError raised by FastMCP's
+    # signature-binding layer into clean ToolError envelopes (no
+    # `errors.pydantic.dev` URLs, no `call[<tool>]` framing).
+    from .middleware.framework_leak_guard import FrameworkLeakGuardMiddleware
+    mcp.add_middleware(FrameworkLeakGuardMiddleware())
+
     return mcp
 
 

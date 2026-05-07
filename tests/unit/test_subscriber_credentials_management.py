@@ -201,3 +201,33 @@ class TestCredentialsHierarchyManager:
 
         with pytest.raises(ToolError, match="Failed to get subscription"):
             await manager.get_subscription_details({"credential_id": "cred_abc"})
+
+
+from tests.unit._helpers_no_framework_leak import assert_no_framework_leak
+
+
+class TestListCredentialsPaginationValidation:
+    """BACK-1270 / items #4 and #5 — list size validation + Pydantic leak guard."""
+
+    @pytest.mark.asyncio
+    async def test_list_rejects_float_size_with_structured_error(self, cred_tool):
+        with pytest.raises(ToolError) as exc:
+            await cred_tool._list_credentials({"page": 0, "size": 3.7})
+        assert exc.value.field == "size"
+        assert "integer" in exc.value.message.lower()
+        assert_no_framework_leak(exc.value.message)
+        assert_no_framework_leak(str(exc.value.suggestions))
+
+    @pytest.mark.asyncio
+    async def test_list_rejects_size_zero(self, cred_tool):
+        with pytest.raises(ToolError) as exc:
+            await cred_tool._list_credentials({"page": 0, "size": 0})
+        assert exc.value.field == "size"
+        assert "[1, 100]" in exc.value.message or "1" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_list_rejects_size_max_int(self, cred_tool):
+        with pytest.raises(ToolError) as exc:
+            await cred_tool._list_credentials({"page": 0, "size": 2147483647})
+        assert exc.value.field == "size"
+        assert "[1, 100]" in exc.value.message or "100" in exc.value.message

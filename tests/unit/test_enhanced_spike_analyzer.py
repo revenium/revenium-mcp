@@ -108,11 +108,10 @@ class TestBuildEntityTimeMatrix:
             ]
         }
         matrix = self.analyzer._build_entity_time_matrix(data)
-        assert "OpenAI" in matrix
-        assert len(matrix["OpenAI"]) == 2
-        # Each entry is (timestamp, cost)
-        assert matrix["OpenAI"][0] == (1705276800000, 100.0)
-        assert matrix["OpenAI"][1] == (1705363200000, 200.0)
+        assert "OPENAI" in matrix
+        assert len(matrix["OPENAI"]) == 2
+        assert matrix["OPENAI"][0] == (1705276800000, 100.0)
+        assert matrix["OPENAI"][1] == (1705363200000, 200.0)
 
     def test_single_period_format(self):
         """Dict with groups (single period) produces single-item time series."""
@@ -125,9 +124,45 @@ class TestBuildEntityTimeMatrix:
             }
         }
         matrix = self.analyzer._build_entity_time_matrix(data)
-        assert "gpt-4" in matrix
-        assert len(matrix["gpt-4"]) == 1
-        assert matrix["gpt-4"][0][1] == 500.0
+        assert "GPT-4" in matrix
+        assert len(matrix["GPT-4"]) == 1
+        assert matrix["GPT-4"][0][1] == 500.0
+
+    def test_mixed_case_time_series_aggregate_as_one(self):
+        data = {
+            "providers": [
+                {
+                    "startTimestamp": 1000,
+                    "groups": [
+                        {"groupName": "OPENAI", "metrics": [{"metricResult": 100}]},
+                        {"groupName": "openai", "metrics": [{"metricResult": 50}]},
+                        {"groupName": "OpenAI", "metrics": [{"metricResult": 25}]},
+                    ],
+                }
+            ]
+        }
+        matrix = self.analyzer._build_entity_time_matrix(data)
+        assert len(matrix) == 1
+        assert "OPENAI" in matrix
+        costs = [c for _, c in matrix["OPENAI"]]
+        assert sum(costs) == 175.0
+
+    def test_mixed_case_single_period_aggregate_as_one(self):
+        data = {
+            "providers": {
+                "startTimestamp": "2024-01-15T00:00:00Z",
+                "groups": [
+                    {"groupName": "OPENAI", "metrics": [{"metricResult": 100}]},
+                    {"groupName": "openai", "metrics": [{"metricResult": 50}]},
+                ],
+            }
+        }
+        matrix = self.analyzer._build_entity_time_matrix(data)
+        assert len(matrix) == 1
+        assert "OPENAI" in matrix
+        assert len(matrix["OPENAI"]) == 2
+        costs = [c for _, c in matrix["OPENAI"]]
+        assert sum(costs) == 150.0
 
     def test_empty_data_produces_empty_matrix(self):
         matrix = self.analyzer._build_entity_time_matrix({})
