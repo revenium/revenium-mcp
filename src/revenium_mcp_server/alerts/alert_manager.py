@@ -5,7 +5,7 @@ in the Revenium platform.
 """
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from loguru import logger
 
@@ -31,18 +31,20 @@ try:
     )
 except ImportError:
     # Fallback decorators and validators
-    def handle_alert_tool_errors(operation_name: str):
-        def decorator(func):
+    def handle_alert_tool_errors(
+        operation_name: str,
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             # Use operation_name to satisfy linter
             _ = operation_name
             return func
 
         return decorator
 
-    def validate_alert_id(alert_id):
+    def validate_alert_id(alert_id: Any) -> str:
         if not alert_id or not isinstance(alert_id, str):
             raise ValidationError("Invalid alert ID", field="alert_id", value=alert_id)
-        return alert_id.strip()
+        return str(alert_id.strip())
 
 
 
@@ -511,13 +513,13 @@ class AlertManager:
             for field in ["name", "label"]:
                 value = anomaly.get(field)
                 if value and isinstance(value, str) and value.strip():
-                    return value.strip()
+                    return str(value.strip())
 
         # Fallback to alert event fields
         for field in ["name", "label", "description", "title"]:
             value = alert.get(field)
             if value and isinstance(value, str) and value.strip():
-                return value.strip()
+                return str(value.strip())
 
         # If no name found, construct from alert event ID
         alert_id = alert.get("id")
@@ -534,7 +536,7 @@ class AlertManager:
             if isinstance(triggered_timestamp, str):
                 return triggered_timestamp
             elif hasattr(triggered_timestamp, "isoformat"):
-                return triggered_timestamp.isoformat()
+                return str(triggered_timestamp.isoformat())
             else:
                 return str(triggered_timestamp)
 
@@ -545,7 +547,7 @@ class AlertManager:
                 if isinstance(value, str):
                     return value
                 elif hasattr(value, "isoformat"):
-                    return value.isoformat()
+                    return str(value.isoformat())
                 else:
                     return str(value)
         return None
@@ -558,7 +560,7 @@ class AlertManager:
             if isinstance(resolved_timestamp, str):
                 return resolved_timestamp
             elif hasattr(resolved_timestamp, "isoformat"):
-                return resolved_timestamp.isoformat()
+                return str(resolved_timestamp.isoformat())
             else:
                 return str(resolved_timestamp)
 
@@ -569,7 +571,7 @@ class AlertManager:
                 if isinstance(value, str):
                     return value
                 elif hasattr(value, "isoformat"):
-                    return value.isoformat()
+                    return str(value.isoformat())
                 else:
                     return str(value)
         return None
@@ -739,18 +741,18 @@ class AlertManager:
         if isinstance(anomaly, dict):
             metric_type = anomaly.get("metricType")
             if metric_type and isinstance(metric_type, str):
-                return metric_type.strip()
+                return str(metric_type.strip())
 
         # Fallback to direct alert fields
         metric_type = alert.get("metricType")
         if metric_type and isinstance(metric_type, str):
-            return metric_type.strip()
+            return str(metric_type.strip())
 
         # Try other field names as fallback
         for field in ["metric_type", "metric", "metric_name"]:
             value = alert.get(field)
             if value and isinstance(value, str) and value.strip():
-                return value.strip()
+                return str(value.strip())
 
         return "N/A"
 
@@ -764,13 +766,13 @@ class AlertManager:
         for field in ["name", "label"]:
             value = alert.get(field)
             if value and isinstance(value, str) and value.strip():
-                return value.strip()
+                return str(value.strip())
 
         # Try other anomaly-specific field names as fallback
         for field in ["anomaly_name", "anomalyName", "anomaly_title"]:
             value = alert.get(field)
             if value and isinstance(value, str) and value.strip():
-                return value.strip()
+                return str(value.strip())
 
         # Fall back to anomaly ID if name not available
         anomaly_id = alert.get("id") or alert.get("anomaly_id") or alert.get("anomalyId")
@@ -809,7 +811,7 @@ class AlertManager:
                     "THRESHOLD": "Threshold",
                     "RELATIVE_CHANGE": "Relative Change",
                 }
-                return type_mapping.get(alert_type, alert_type.replace("_", " ").title())
+                return str(type_mapping.get(alert_type, alert_type.replace("_", " ").title()))
 
         # Fallback to direct alert fields
         alert_type = alert.get("alertType")
@@ -819,7 +821,7 @@ class AlertManager:
                 "THRESHOLD": "Threshold",
                 "RELATIVE_CHANGE": "Relative Change",
             }
-            return type_mapping.get(alert_type, alert_type.replace("_", " ").title())
+            return str(type_mapping.get(alert_type, alert_type.replace("_", " ").title()))
         return "N/A"
 
     def _extract_period_duration(self, alert: Dict[str, Any]) -> str:
@@ -840,7 +842,7 @@ class AlertManager:
                     "WEEKLY": "Weekly",
                     "MONTHLY": "Monthly",
                 }
-                return period_mapping.get(period, period.replace("_", " ").title())
+                return str(period_mapping.get(period, period.replace("_", " ").title()))
 
         # Fallback to direct alert fields
         period = alert.get("periodDuration")
@@ -855,7 +857,7 @@ class AlertManager:
                 "WEEKLY": "Weekly",
                 "MONTHLY": "Monthly",
             }
-            return period_mapping.get(period, period.replace("_", " ").title())
+            return str(period_mapping.get(period, period.replace("_", " ").title()))
         return "N/A"
 
     def _extract_notification_addresses(self, alert: Dict[str, Any]) -> str:
@@ -878,7 +880,7 @@ class AlertManager:
             if team_label:
                 return f"{team_label} ({team_id})" if team_id else team_label
             elif team_id:
-                return team_id
+                return str(team_id)
         return "N/A"
 
     def _extract_severity(self, alert: Dict[str, Any]) -> str:
@@ -887,14 +889,14 @@ class AlertManager:
         for field in ["severity", "priority", "level"]:
             value = alert.get(field)
             if value and isinstance(value, str) and value.strip():
-                return value.strip().title()
+                return str(value.strip().title())
 
         # Try to get from threshold violation
         threshold_violation = alert.get("threshold_violation")
         if threshold_violation and isinstance(threshold_violation, dict):
             severity = threshold_violation.get("severity")
             if severity and isinstance(severity, str):
-                return severity.strip().title()
+                return str(severity.strip().title())
 
         # Default severity
         return "Medium"
@@ -911,7 +913,7 @@ class AlertManager:
 
             dt = dateutil.parser.parse(timestamp)
             # Format as readable datetime
-            return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+            return str(dt.strftime("%Y-%m-%d %H:%M:%S UTC"))
         except Exception as e:
             logger.debug(f"Error formatting timestamp {timestamp}: {e}")
             # Return first 19 characters (YYYY-MM-DD HH:MM:SS) if parsing fails

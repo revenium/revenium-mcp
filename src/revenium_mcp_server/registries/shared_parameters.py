@@ -63,9 +63,9 @@ class MeteringTransaction:
 
     # Transaction metadata
     transaction_id: Optional[str] = None
-    organization_id: Optional[str] = None
+    organization_name: Optional[str] = None
     subscription_id: Optional[str] = None
-    product_id: Optional[str] = None
+    product_name: Optional[str] = None
 
     # Subscriber information
     subscriber: Optional[Dict[str, Any]] = None
@@ -174,17 +174,17 @@ class MeteringTransactionBuilder:
 
     def with_business_context(
         self,
-        organization_id: Optional[str] = None,
+        organization_name: Optional[str] = None,
         subscription_id: Optional[str] = None,
-        product_id: Optional[str] = None,
+        product_name: Optional[str] = None,
     ) -> "MeteringTransactionBuilder":
         """Set business and billing context."""
-        if organization_id:
-            self._transaction.organization_id = organization_id
+        if organization_name:
+            self._transaction.organization_name = organization_name
         if subscription_id:
             self._transaction.subscription_id = subscription_id
-        if product_id:
-            self._transaction.product_id = product_id
+        if product_name:
+            self._transaction.product_name = product_name
         return self
 
     def with_quality_metrics(

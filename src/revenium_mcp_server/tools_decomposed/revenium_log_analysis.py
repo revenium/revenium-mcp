@@ -8,7 +8,10 @@ This tool provides log analysis capabilities including:
 - Diagnostic insights and troubleshooting
 """
 
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -58,11 +61,15 @@ class ReveniumLogAnalysis(ToolBase):
         self.default_sort = DEFAULT_VALUES["sort"]
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle log analysis actions."""
         try:
-            return await self._route_action(action, arguments)
+            return await self._route_action(action, arguments, ctx=ctx)
         except ToolError:
             # Re-raise ToolError exceptions without modification
             raise
@@ -99,11 +106,17 @@ class ReveniumLogAnalysis(ToolBase):
                 suggestions=["Use size <= 1000", "Use pagination for larger datasets"],
             )
 
-    async def _make_api_call(self, endpoint: str, page: int, size: int) -> Dict[str, Any]:
+    async def _make_api_call(
+        self,
+        endpoint: str,
+        page: int,
+        size: int,
+        ctx: Optional["TenantContext"] = None,
+    ) -> Dict[str, Any]:
         """Make API call with standard parameters."""
         params = {"page": page, "size": size, "sort": self.default_sort}
 
-        client = await self.get_client()
+        client = await self.get_client(ctx=ctx)
         params = client._add_team_id_to_params(params)
         return await client.get(endpoint, params)
 
@@ -115,13 +128,14 @@ class ReveniumLogAnalysis(ToolBase):
         operation_filter: Optional[str],
         status_filter: Optional[str],
         search_term: Optional[str],
+        ctx: Optional["TenantContext"] = None,
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
         """Get logs and apply client-side filtering."""
         # Determine endpoint
         endpoint = self.log_endpoints.get(log_type, self.log_endpoints["internal"])
 
         # Get raw data
-        response = await self._make_api_call(endpoint, page, size)
+        response = await self._make_api_call(endpoint, page, size, ctx=ctx)
 
         # Extract and filter entries
         embedded = response.get("_embedded", {})
@@ -138,7 +152,12 @@ class ReveniumLogAnalysis(ToolBase):
 
         return response, applied_filters
 
-    async def _get_multi_page_logs(self, log_type: str, pages: int) -> List[Dict[str, Any]]:
+    async def _get_multi_page_logs(
+        self,
+        log_type: str,
+        pages: int,
+        ctx: Optional["TenantContext"] = None,
+    ) -> List[Dict[str, Any]]:
         """Retrieve logs from multiple pages and aggregate."""
         all_entries = []
 
@@ -148,6 +167,7 @@ class ReveniumLogAnalysis(ToolBase):
                     self.log_endpoints.get(log_type, self.log_endpoints["internal"]),
                     page,
                     self.default_size,
+                    ctx=ctx,
                 )
 
                 embedded = response.get("_embedded", {})
@@ -172,6 +192,7 @@ class ReveniumLogAnalysis(ToolBase):
         status_filter: Optional[str],
         search_term: Optional[str],
         max_pages: int = 50,
+        ctx: Optional["TenantContext"] = None,
     ) -> tuple[List[Dict[str, Any]], Dict[str, Any], int]:
         """Search across all pages for comprehensive results."""
         all_matches = []
@@ -184,7 +205,7 @@ class ReveniumLogAnalysis(ToolBase):
             try:
                 # Get data from this page with maximum size for efficiency
                 endpoint = self.log_endpoints.get(log_type, self.log_endpoints["internal"])
-                response = await self._make_api_call(endpoint, page, 1000)
+                response = await self._make_api_call(endpoint, page, 1000, ctx=ctx)
 
                 # Extract entries
                 embedded = response.get("_embedded", {})
@@ -344,7 +365,11 @@ No log entries found for analysis. This may be expected for integration logs.
         )
 
     async def _route_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Route action to appropriate handler."""
         if action == "get_capabilities":
@@ -352,20 +377,20 @@ No log entries found for analysis. This may be expected for integration logs.
         elif action == "get_examples":
             return await self._handle_get_examples(arguments)
         elif action == "get_internal_logs":
-            return await self._handle_get_internal_logs(arguments)
+            return await self._handle_get_internal_logs(arguments, ctx=ctx)
         elif action == "get_integration_logs":
-            return await self._handle_get_integration_logs(arguments)
+            return await self._handle_get_integration_logs(arguments, ctx=ctx)
         elif action == "get_recent_logs":
-            return await self._handle_get_recent_logs(arguments)
+            return await self._handle_get_recent_logs(arguments, ctx=ctx)
         elif action == "search_logs":
-            return await self._handle_search_logs(arguments)
+            return await self._handle_search_logs(arguments, ctx=ctx)
         elif action == "analyze_operations":
-            return await self._handle_analyze_operations(arguments)
+            return await self._handle_analyze_operations(arguments, ctx=ctx)
         else:
             return await self._handle_unsupported_action(action)
 
     async def _handle_get_internal_logs(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Retrieve internal system logs."""
         page = arguments.get("page", 0)
@@ -373,7 +398,7 @@ No log entries found for analysis. This may be expected for integration logs.
 
         try:
             self._validate_page_size(size)
-            response = await self._make_api_call(self.log_endpoints["internal"], page, size)
+            response = await self._make_api_call(self.log_endpoints["internal"], page, size, ctx=ctx)
             return self.response_formatter.format_log_response(response, "internal", page, size)
 
         except ToolError:
@@ -388,7 +413,7 @@ No log entries found for analysis. This may be expected for integration logs.
             )
 
     async def _handle_get_integration_logs(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Retrieve integration logs."""
         page = arguments.get("page", 0)
@@ -396,7 +421,7 @@ No log entries found for analysis. This may be expected for integration logs.
 
         try:
             self._validate_page_size(size)
-            response = await self._make_api_call(self.log_endpoints["integration"], page, size)
+            response = await self._make_api_call(self.log_endpoints["integration"], page, size, ctx=ctx)
             return self.response_formatter.format_log_response(response, "integration", page, size)
 
         except ToolError:
@@ -411,7 +436,7 @@ No log entries found for analysis. This may be expected for integration logs.
             )
 
     async def _handle_get_recent_logs(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Get recent activity across multiple pages."""
         pages = arguments.get("pages", 1)
@@ -419,7 +444,7 @@ No log entries found for analysis. This may be expected for integration logs.
 
         try:
             # Get entries from multiple pages
-            all_entries = await self._get_multi_page_logs(log_type, pages)
+            all_entries = await self._get_multi_page_logs(log_type, pages, ctx=ctx)
 
             # Use formatter for multi-page response
             return self.response_formatter.format_multi_page_response(all_entries, log_type, pages)
@@ -436,7 +461,7 @@ No log entries found for analysis. This may be expected for integration logs.
             )
 
     async def _handle_search_logs(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Search logs with client-side filtering."""
         page = arguments.get("page", 0)
@@ -452,6 +477,7 @@ No log entries found for analysis. This may be expected for integration logs.
                     arguments.get("operation_filter"),
                     arguments.get("status_filter"),
                     arguments.get("search_term"),
+                    ctx=ctx,
                 )
 
                 # Format comprehensive search response
@@ -468,6 +494,7 @@ No log entries found for analysis. This may be expected for integration logs.
                     arguments.get("operation_filter"),
                     arguments.get("status_filter"),
                     arguments.get("search_term"),
+                    ctx=ctx,
                 )
                 return self.response_formatter.format_log_response(
                     response, f"filtered_{log_type}", page, size, applied_filters
@@ -484,14 +511,14 @@ No log entries found for analysis. This may be expected for integration logs.
             )
 
     async def _handle_analyze_operations(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Analyze operation patterns across multiple pages."""
         log_type = arguments.get("log_type", "internal")
         pages = arguments.get("pages", 3)  # Default to 3 pages for analysis
 
         try:
-            all_entries = await self._get_multi_page_logs(log_type, pages)
+            all_entries = await self._get_multi_page_logs(log_type, pages, ctx=ctx)
             analysis = self._analyze_operation_patterns(all_entries)
             response_text = self._format_analysis_response(analysis, log_type, pages)
             return [TextContent(type="text", text=response_text)]

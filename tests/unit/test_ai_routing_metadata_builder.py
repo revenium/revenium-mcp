@@ -18,7 +18,7 @@ def config():
     return MCPMetadataConfig(
         product="TestMCP",
         agent_type="test-agent",
-        organization_id="test-org",
+        organization_name="test-org",
         subscription_id="test-sub",
         enable_detailed_tracking=True,
         include_query_context=True,
@@ -41,7 +41,7 @@ class TestBuildRoutingMetadata:
         )
         assert meta["product"] == "TestMCP"
         assert meta["agent"] == "test-agent"
-        assert meta["organization_id"] == "test-org"
+        assert meta["organization_name"] == "test-org"
         assert "trace_id" in meta
         assert meta["task_type"] == "query-routing-products"
 
@@ -178,3 +178,38 @@ class TestDefaultConfig:
         )
         assert "product" in meta
         assert "trace_id" in meta
+
+
+class TestResolveOrgNameEnv:
+    """Tests for the REVENIUM_MCP_ORG_NAME / REVENIUM_MCP_ORG_ID env var resolver."""
+
+    def test_returns_default_when_neither_env_set(self, monkeypatch):
+        monkeypatch.delenv("REVENIUM_MCP_ORG_NAME", raising=False)
+        monkeypatch.delenv("REVENIUM_MCP_ORG_ID", raising=False)
+        assert ReveniumMetadataBuilder._resolve_org_name_env() == "revenium-mcp-server"
+
+    def test_returns_new_env_when_set(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_MCP_ORG_NAME", "my-org")
+        monkeypatch.delenv("REVENIUM_MCP_ORG_ID", raising=False)
+        assert ReveniumMetadataBuilder._resolve_org_name_env() == "my-org"
+
+    def test_falls_back_to_legacy_with_warning(self, monkeypatch):
+        from loguru import logger as _logger
+
+        monkeypatch.delenv("REVENIUM_MCP_ORG_NAME", raising=False)
+        monkeypatch.setenv("REVENIUM_MCP_ORG_ID", "legacy-org")
+
+        messages: list[str] = []
+        sink_id = _logger.add(lambda msg: messages.append(str(msg)), level="WARNING")
+        try:
+            result = ReveniumMetadataBuilder._resolve_org_name_env()
+        finally:
+            _logger.remove(sink_id)
+
+        assert result == "legacy-org"
+        assert any("REVENIUM_MCP_ORG_ID is deprecated" in m for m in messages)
+
+    def test_prefers_new_over_legacy(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_MCP_ORG_NAME", "new-org")
+        monkeypatch.setenv("REVENIUM_MCP_ORG_ID", "legacy-org")
+        assert ReveniumMetadataBuilder._resolve_org_name_env() == "new-org"

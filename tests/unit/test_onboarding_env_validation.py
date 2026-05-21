@@ -47,13 +47,12 @@ class TestConfigStoreDiscovery:
     """Test configuration store discovery behavior."""
 
     def test_store_can_clear_cache(self):
-        """Test store cache can be cleared."""
         store = get_config_store()
-        store._discovery_attempted = True
+        store._discovery_attempted.add("_default_")
 
         store.clear_cache()
 
-        assert store._discovery_attempted is False
+        assert len(store._discovery_attempted) == 0
 
     def test_store_has_get_value_with_override(self):
         """Test store has get_value_with_override method."""

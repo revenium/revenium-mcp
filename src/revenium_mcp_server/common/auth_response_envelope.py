@@ -75,3 +75,23 @@ def auth_error_to_tool_error(message_hint: str | None = None) -> UnauthorizedToo
             "Verify the credential has not been revoked or rotated in the Revenium console.",
         ],
     )
+
+
+def auth_scope_unresolved_to_tool_error() -> UnauthorizedToolError:
+    """Envelope for "API key present but active team scope could not be resolved"."""
+    return UnauthorizedToolError(
+        message=(
+            "Authentication is configured but the active team scope could not "
+            "be resolved. Retry the call; if this persists, set "
+            "REVENIUM_TEAM_ID explicitly or verify the API key has access to "
+            "/users/me for auto-discovery."
+        ),
+        error_code=ErrorCodes.AUTH_SCOPE_UNRESOLVED,
+        field="team_scope",
+        value=None,
+        suggestions=[
+            "Retry the request — auto-discovery may complete before the next call.",
+            "Set REVENIUM_TEAM_ID explicitly to bypass auto-discovery.",
+            "Verify the API key has read access to /users/me for scope discovery.",
+        ],
+    )

@@ -10,7 +10,10 @@ import json
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union, Tuple, Callable, Awaitable
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, Tuple, Callable, Awaitable
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 from loguru import logger
 
 from mcp.types import TextContent, ImageContent, EmbeddedResource
@@ -28,6 +31,10 @@ from ..common.error_handling import (
 )
 
 # Performance monitoring removed - infrastructure monitoring handled externally
+from ..coding_assistant_policy import (
+    get_policy_cache,
+    filter_transactions_by_policy,
+)
 from ..core.response_cache import response_cache, cache_response
 from ..introspection.metadata import ToolType, ToolCapability, ToolDependency, DependencyType
 from ..trace_fields import extract_trace_fields
@@ -145,7 +152,7 @@ def _extract_completions_filters(arguments: Dict[str, Any]) -> Dict[str, Any]:
 class MeteringTransactionManager:
     """Internal manager for AI transaction metering operations."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize metering transaction manager."""
         self.transaction_store: Dict[str, Dict[str, Any]] = {}
 
@@ -376,7 +383,7 @@ class MeteringTransactionManager:
             # Validate provided timestamp format - this will raise structured error if invalid
             self._validate_timestamp_format(provided_timestamp, field_name)
             logger.info(f"Using provided {field_name}: {provided_timestamp}")
-            return provided_timestamp
+            return str(provided_timestamp)
         else:
             # Auto-populate with current time
             logger.debug(f"Auto-populating {field_name} with current time")
@@ -491,7 +498,7 @@ class MeteringTransactionManager:
 
             # Validate optional fields
             optional_string_fields = [
-                "organization_id",
+                "organization_name",
                 "task_type",
                 "agent",
                 "stop_reason",
@@ -687,7 +694,7 @@ The subscriber data structure has been updated. The old individual fields are no
         has_subscriber = "subscriber" in arguments and arguments["subscriber"] is not None
         has_attribution = any(
             field in arguments and arguments[field] is not None
-            for field in ["organization_id", "task_type", "agent"]
+            for field in ["organization_name", "task_type", "agent"]
         )
 
         # Provide progressive guidance based on field combinations
@@ -705,7 +712,7 @@ The subscriber data structure has been updated. The old individual fields are no
 
         if has_subscriber and not has_attribution:
             warnings.append(
-                "💡 When using subscriber attribution, consider adding 'organization_id' "
+                "💡 When using subscriber attribution, consider adding 'organization_name' "
                 "and 'task_type' for complete billing context"
             )
 
@@ -729,13 +736,13 @@ The subscriber data structure has been updated. The old individual fields are no
         )
         has_product_billing = any(
             field in arguments and arguments[field] is not None
-            for field in ["product_id", "subscription_id"]
+            for field in ["product_name", "subscription_id"]
         )
 
         if has_task_tracking and not has_attribution:
             warnings.append(
                 "💡 Task tracking fields work best with organization attribution "
-                "(organization_id, task_type)"
+                "(organization_name, task_type)"
             )
 
         if has_product_billing and not has_subscriber:
@@ -823,13 +830,11 @@ The subscriber data structure has been updated. The old individual fields are no
         """Async validation for numeric fields."""
         errors = []
 
-        # Validate required numeric fields with enhanced type conversion
         for field in ["input_tokens", "output_tokens", "duration_ms"]:
             if field in arguments:
                 value = arguments[field]
                 original_value = value
 
-                # Try to convert to integer if it's a string
                 if isinstance(value, str):
                     try:
                         value = int(value)
@@ -837,16 +842,20 @@ The subscriber data structure has been updated. The old individual fields are no
                     except ValueError:
                         errors.append(f"• {field}: Cannot convert '{original_value}' to integer")
                         continue
-                elif not isinstance(value, int):
+                elif isinstance(value, bool) or not isinstance(value, int):
                     errors.append(f"• {field}: Expected integer, got {type(value).__name__}")
                     continue
 
-                # Check for negative values
-                if value < 0:
-                    errors.append(f"• {field}: Must be positive, got {value}")
+                if field == "input_tokens":
+                    if value <= 0:
+                        errors.append(
+                            f"• {field}: Must be a positive integer (> 0), got {value}"
+                        )
+                        continue
+                elif value < 0:
+                    errors.append(f"• {field}: Must be non-negative (>= 0), got {value}")
                     continue
 
-                # Security: Prevent extremely large values
                 if value > 10_000_000:
                     errors.append(f"• {field}: Value too large ({value}), maximum is 10,000,000")
                     continue
@@ -897,12 +906,12 @@ The subscriber data structure has been updated. The old individual fields are no
 
         # Validate optional string fields (non-trace fields - top-level only)
         optional_string_fields = [
-            "organization_id",
+            "organization_name",
             "task_type",
             "agent",
             "stop_reason",
             "trace_id",
-            "product_id",
+            "product_name",
             "subscription_id",
             "error_reason",
         ]
@@ -1139,14 +1148,16 @@ The subscriber data structure has been updated. The old individual fields are no
                 if isinstance(value, str):
                     value = int(value)
                     arguments["time_to_first_token"] = value
-                elif not isinstance(value, int):
+                elif isinstance(value, bool) or not isinstance(value, int):
                     errors.append(
                         f"• time_to_first_token: Expected integer, got {type(value).__name__}"
                     )
                 else:
                     if value < 0:
-                        errors.append(f"• time_to_first_token: Must be positive, got {value}")
-                    elif value > 60000:  # 60 seconds seems like a reasonable upper bound
+                        errors.append(
+                            f"• time_to_first_token: Must be non-negative (>= 0), got {value}"
+                        )
+                    elif value > 60000:
                         errors.append(
                             f"• time_to_first_token: Too large ({value}ms), maximum is 60,000ms"
                         )
@@ -1310,34 +1321,35 @@ The subscriber data structure has been updated. The old individual fields are no
                     "**Quick Fix**: Replace 'task_id' with 'trace_id' for tracking purposes.",
                 }
 
-            # Validate required numeric fields with enhanced type conversion
             for field in ["input_tokens", "output_tokens", "duration_ms"]:
                 if field in arguments:
                     value = arguments[field]
                     original_value = value
 
-                    # Try to convert to integer if it's a string
                     if isinstance(value, str):
                         try:
                             value = int(value)
-                            # Update the arguments with the converted value
                             arguments[field] = value
                         except ValueError:
                             errors.append(
                                 f"• {field}: Cannot convert '{original_value}' to integer"
                             )
                             continue
-                    elif not isinstance(value, int):
+                    elif isinstance(value, bool) or not isinstance(value, int):
                         errors.append(f"• {field}: Expected integer, got {type(value).__name__}")
                         continue
 
-                    # Check for negative values
-                    if value < 0:
-                        errors.append(f"• {field}: Must be positive, got {value}")
+                    if field == "input_tokens":
+                        if value <= 0:
+                            errors.append(
+                                f"• {field}: Must be a positive integer (> 0), got {value}"
+                            )
+                            continue
+                    elif value < 0:
+                        errors.append(f"• {field}: Must be non-negative (>= 0), got {value}")
                         continue
 
-                    # Security: Prevent extremely large values that could cause issues
-                    if value > 10_000_000:  # 10M tokens/ms seems reasonable upper bound
+                    if value > 10_000_000:
                         errors.append(
                             f"• {field}: Value too large ({value}), maximum is 10,000,000"
                         )
@@ -1389,12 +1401,12 @@ The subscriber data structure has been updated. The old individual fields are no
 
             # Validate optional string fields with proper length and character validation
             optional_string_fields = [
-                "organization_id",
+                "organization_name",
                 "task_type",
                 "agent",
                 "stop_reason",
                 "trace_id",
-                "product_id",
+                "product_name",
                 "subscription_id",
                 "error_reason",
             ]
@@ -1475,14 +1487,16 @@ The subscriber data structure has been updated. The old individual fields are no
                     if isinstance(value, str):
                         value = int(value)
                         arguments["time_to_first_token"] = value
-                    elif not isinstance(value, int):
+                    elif isinstance(value, bool) or not isinstance(value, int):
                         errors.append(
                             f"• time_to_first_token: Expected integer, got {type(value).__name__}"
                         )
                     else:
                         if value < 0:
-                            errors.append(f"• time_to_first_token: Must be positive, got {value}")
-                        elif value > 60000:  # 60 seconds seems like a reasonable upper bound
+                            errors.append(
+                                f"• time_to_first_token: Must be non-negative (>= 0), got {value}"
+                            )
+                        elif value > 60000:
                             errors.append(
                                 f"• time_to_first_token: Too large ({value}ms), maximum is 60,000ms"
                             )
@@ -1642,15 +1656,37 @@ The subscriber data structure has been updated. The old individual fields are no
 
     # Performance monitoring decorator removed - infrastructure monitoring handled externally
     async def submit_transaction(
-        self, client: ReveniumClient, arguments: Dict[str, Any]
+        self, client: ReveniumClient, arguments: Dict[str, Any], *, ctx: Optional["TenantContext"] = None
     ) -> Dict[str, Any]:
-        """Submit AI transaction to Revenium metering API."""
         # UCM-only validation - let the API handle required field validation
         # No hardcoded required fields - API will validate based on UCM capabilities
         logger.info("Transaction submission validation delegated to API based on UCM capabilities")
 
+        # Reject the deprecated submission aliases up-front. The metering API
+        # stopped accepting `organizationId` / `productId` on the wire, so
+        # accepting the snake_case aliases silently would lose data — surface
+        # a clear error pointing callers at the new field names.
+        _DEPRECATED_SUBMISSION_ALIASES = {
+            "organization_id": "organization_name",
+            "product_id": "product_name",
+        }
+        for _old_name, _new_name in _DEPRECATED_SUBMISSION_ALIASES.items():
+            if _old_name in arguments:
+                raise create_structured_validation_error(
+                    message=(
+                        f"{_old_name!r} is no longer accepted — the metering API "
+                        f"stopped accepting this field. Use {_new_name!r} instead."
+                    ),
+                    field=_old_name,
+                    value=arguments.get(_old_name),
+                    suggestions=[
+                        f"Rename `{_old_name}` to `{_new_name}` in your tool call.",
+                        "See BACK-1456 for the migration context.",
+                    ],
+                )
+
         # Security validation: Sanitize and validate inputs (async optimized)
-        validation_result = await self._validate_transaction_inputs_async(arguments)
+        validation_result = await self._validate_transaction_inputs_async(arguments, ctx=ctx)
         if not validation_result["valid"]:
             raise create_structured_validation_error(
                 message=f"⚠️ CRITICAL: Transaction validation failed - {validation_result['message']}",
@@ -1679,10 +1715,8 @@ The subscriber data structure has been updated. The old individual fields are no
                 },
             )
 
-        # Generate transaction ID if not provided; reject malformed user-supplied
-        # ids before the payload reaches the backend, which silently drops them.
         user_supplied_id = arguments.get("transaction_id")
-        if user_supplied_id:
+        if user_supplied_id is not None:
             self._validate_transaction_id_format(user_supplied_id)
         transaction_id = user_supplied_id or self._generate_transaction_id()
 
@@ -1703,7 +1737,7 @@ The subscriber data structure has been updated. The old individual fields are no
                 time_to_first_token = int(time_to_first_token)
                 if time_to_first_token < 0:
                     raise create_structured_validation_error(
-                        message="🕒 Invalid time_to_first_token: Must be a positive integer",
+                        message="🕒 Invalid time_to_first_token: Must be non-negative (>= 0)",
                         field="time_to_first_token",
                         value=time_to_first_token,
                         suggestions=[
@@ -1765,8 +1799,8 @@ The subscriber data structure has been updated. The old individual fields are no
 
         # Add optional fields if provided (matching API format)
         optional_fields = {
-            "organizationId": arguments.get("organization_id"),
-            "productId": arguments.get("product_id"),
+            "organizationName": arguments.get("organization_name"),
+            "productName": arguments.get("product_name"),
             "taskType": arguments.get("task_type"),
             "agent": arguments.get("agent"),
             "errorReason": arguments.get("error_reason"),
@@ -1829,7 +1863,7 @@ The subscriber data structure has been updated. The old individual fields are no
 
         # Check cache for identical submissions (rare but possible for retries)
         cache_key = f"submit_{hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]}"
-        cached_response = await response_cache.get_cached_response("api", cache_key)
+        cached_response = await response_cache.get_cached_response("api", cache_key, ctx=ctx)
 
         if cached_response is not None:
             logger.debug("Using cached API response for transaction submission")
@@ -1837,12 +1871,14 @@ The subscriber data structure has been updated. The old individual fields are no
         else:
             try:
                 response = await client.post(endpoint, data=payload)
+                if not isinstance(response, dict):
+                    response = {}
                 logger.info(f"📡 API Response status: {response.get('status', 'unknown')}")
                 logger.debug(f"📡 Full API Response: {response}")
                 # Cache successful responses for 5 minutes (for retry scenarios)
                 if response:
                     await response_cache.set_cached_response(
-                        "api", cache_key, response, ttl_seconds=300
+                        "api", cache_key, response, ttl_seconds=300, ctx=ctx
                     )
             except Exception as api_error:
                 logger.error(f"❌ API submission failed: {api_error}")
@@ -1910,8 +1946,9 @@ The subscriber data structure has been updated. The old individual fields are no
         Raises:
             ToolError: If transaction_ids is empty or invalid
         """
-        # CRITICAL FIX: Explicitly check for empty arrays to prevent 30-second waits
-        if not transaction_ids or len(transaction_ids) == 0:
+        if transaction_ids:
+            transaction_ids[:] = [tid for tid in transaction_ids if isinstance(tid, str) and tid.strip()]
+        if not transaction_ids:
             raise create_structured_missing_parameter_error(
                 parameter_name="transaction_ids",
                 action="lookup_transactions",
@@ -2264,7 +2301,7 @@ The subscriber data structure has been updated. The old individual fields are no
         self, client: ReveniumClient, remaining_ids: List[str], params: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
         """Process API search results for remaining transaction IDs."""
-        results = []
+        results: List[Dict[str, Any]] = []
 
         if not remaining_ids:
             return results
@@ -2272,7 +2309,7 @@ The subscriber data structure has been updated. The old individual fields are no
         # Process each remaining transaction with retry logic
         for tid in remaining_ids:
             # Create operation function for retry logic
-            async def search_operation():
+            async def search_operation() -> Any:
                 return await self._search_transaction_pages(
                     client,
                     tid,
@@ -2392,9 +2429,11 @@ The subscriber data structure has been updated. The old individual fields are no
 
                 logger.debug(f"🔍 Searching page {page} (size: {page_size})")
                 response = await client.get(endpoint, params=params)
+                if not isinstance(response, dict):
+                    response = {}
 
                 # Handle both possible response structures
-                transactions_list = []
+                transactions_list: List[Any] = []
                 if (
                     "_embedded" in response
                     and "aICompletionMetricResourceList" in response["_embedded"]
@@ -2467,7 +2506,7 @@ The subscriber data structure has been updated. The old individual fields are no
 class MeteringValidator:
     """Internal manager for metering validation."""
 
-    def __init__(self, transaction_manager=None):
+    def __init__(self, transaction_manager: Any = None) -> None:
         """Initialize metering validator.
 
         Args:
@@ -2475,15 +2514,15 @@ class MeteringValidator:
         """
         self.transaction_manager = transaction_manager
 
-    async def validate_transaction(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate transaction data."""
-        # Use the shared transaction manager for consistent validation
+    async def validate_transaction(
+        self, arguments: Dict[str, Any], *, ctx: Optional["TenantContext"] = None
+    ) -> Dict[str, Any]:
         if not self.transaction_manager:
             self.transaction_manager = MeteringTransactionManager()
 
         try:
             validation_result = await self.transaction_manager._validate_transaction_inputs_async(
-                arguments
+                arguments, ctx=ctx
             )
 
             if validation_result["valid"]:
@@ -2525,7 +2564,7 @@ class MeteringManagement(ToolBase):
     tool_type = ToolType.UTILITY
     tool_version = "2.0.0"
 
-    def __init__(self, ucm_helper=None):
+    def __init__(self, ucm_helper: Any = None) -> None:
         """Initialize metering management tool.
 
         Args:
@@ -2567,7 +2606,11 @@ class MeteringManagement(ToolBase):
         return "no"
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle metering management actions with response caching."""
         try:
@@ -2575,7 +2618,7 @@ class MeteringManagement(ToolBase):
             response_cache.clear_request_cache()
             self.transaction_manager.clear_request_cache()
 
-            client = await self.get_client()
+            client = await self.get_client(ctx=ctx)
 
             # Route to appropriate handler
             if action == "submit_ai_transaction":
@@ -2583,7 +2626,7 @@ class MeteringManagement(ToolBase):
                 dry_run = arguments.get("dry_run", False)
                 if dry_run:
                     # Validate transaction data without submitting
-                    validation_result = await self.validator.validate_transaction(arguments)
+                    validation_result = await self.validator.validate_transaction(arguments, ctx=ctx)
                     if validation_result["valid"]:
                         # Build comprehensive dry-run output including optional fields
                         dry_run_text = "🧪 **DRY RUN MODE - Transaction Validation**\n\n"
@@ -2605,8 +2648,8 @@ class MeteringManagement(ToolBase):
                         optional_fields_display = [
                             ("subscription_id", "Subscription ID"),
                             ("response_quality_score", "Response Quality Score"),
-                            ("organization_id", "Organization ID"),
-                            ("product_id", "Product ID"),
+                            ("organization_name", "Organization Name"),
+                            ("product_name", "Product Name"),
                             ("task_type", "Task Type"),
                             ("agent", "Agent"),
                             ("trace_id", "Trace ID"),
@@ -2646,7 +2689,7 @@ class MeteringManagement(ToolBase):
                             )
                         ]
 
-                result = await self.transaction_manager.submit_transaction(client, arguments)
+                result = await self.transaction_manager.submit_transaction(client, arguments, ctx=ctx)
                 return [
                     TextContent(
                         type="text",
@@ -2686,7 +2729,7 @@ class MeteringManagement(ToolBase):
                     ]
 
             elif action == "validate":
-                result = await self.validator.validate_transaction(arguments)
+                result = await self.validator.validate_transaction(arguments, ctx=ctx)
                 if result["valid"]:
                     # Enhanced validation response with progressive guidance
                     response_text = "✅ **Validation Successful**\n\n"
@@ -2700,6 +2743,30 @@ class MeteringManagement(ToolBase):
                     ]
             elif action == "lookup_transactions":
                 result = await self.transaction_manager.lookup_transactions(client, arguments)
+
+                allowed = await get_policy_cache().get_allowed_metric_providers(
+                    client, getattr(ctx, "tenant_id", None) if ctx else None
+                )
+                for r in result.get("results", []):
+                    if r.get("found") and "transaction_data" in r:
+                        filtered = filter_transactions_by_policy(
+                            [r["transaction_data"]], allowed
+                        )
+                        if not filtered:
+                            r["found"] = False
+                            r["message"] = "Filtered by tenant provider policy"
+                            r.pop("transaction_data", None)
+
+                found_results = result.get("results", [])
+                found_count = sum(1 for r in found_results if r.get("found"))
+                session_count = sum(
+                    1 for r in found_results if r.get("found") and r.get("source") == "session"
+                )
+                api_count = sum(
+                    1 for r in found_results if r.get("found") and r.get("source") == "api"
+                )
+                result["summary"]["found_count"] = found_count
+                result["summary"]["sources"] = {"session": session_count, "api": api_count}
 
                 # Format unified response for display
                 response_text = "**Transaction Lookup Results**\n\n"
@@ -2743,10 +2810,12 @@ class MeteringManagement(ToolBase):
 
                 return [TextContent(type="text", text=response_text)]
             elif action == "lookup_recent_transactions":
-                result = await self._handle_lookup_recent_transactions(client, arguments)
-                return [TextContent(type="text", text=result)]
+                recent_text = await self._handle_lookup_recent_transactions(
+                    client, arguments, ctx=ctx
+                )
+                return [TextContent(type="text", text=recent_text)]
             elif action == "get_capabilities":
-                return await self._handle_get_capabilities()
+                return await self._handle_get_capabilities(ctx=ctx)
             elif action == "get_examples":
                 return await self._handle_get_examples(arguments)
             elif action == "get_agent_summary":
@@ -2755,15 +2824,15 @@ class MeteringManagement(ToolBase):
                 return await self._handle_parse_natural_language(arguments)
             # AI Models Discovery Actions
             elif action == "list_ai_models":
-                return await self._handle_list_ai_models(arguments)
+                return await self._handle_list_ai_models(arguments, ctx=ctx)
             elif action == "search_ai_models":
-                return await self._handle_search_ai_models(arguments)
+                return await self._handle_search_ai_models(arguments, ctx=ctx)
             elif action == "get_supported_providers":
-                return await self._handle_get_supported_providers(arguments)
+                return await self._handle_get_supported_providers(arguments, ctx=ctx)
             elif action == "validate_model_provider":
-                return await self._handle_validate_model_provider(arguments)
+                return await self._handle_validate_model_provider(arguments, ctx=ctx)
             elif action == "estimate_transaction_cost":
-                return await self._handle_estimate_transaction_cost(arguments)
+                return await self._handle_estimate_transaction_cost(arguments, ctx=ctx)
             # Integration Support Actions
             elif action == "get_api_endpoints":
                 return await self._handle_get_api_endpoints()
@@ -2837,17 +2906,12 @@ class MeteringManagement(ToolBase):
             raise e
 
     async def _handle_lookup_recent_transactions(
-        self, client: ReveniumClient, arguments: Dict[str, Any]
+        self,
+        client: ReveniumClient,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> str:
-        """Handle lookup_recent_transactions action with pagination support.
-
-        Args:
-            client: Revenium API client
-            arguments: Action arguments containing pagination parameters
-
-        Returns:
-            Formatted response text with transaction data and pagination info
-        """
         # Extract and validate parameters
         page = arguments.get("page", 0)
         page_size = arguments.get("recent_page_size") if "recent_page_size" in arguments else arguments.get("page_size", 20)
@@ -2895,12 +2959,19 @@ class MeteringManagement(ToolBase):
         # Extract completions API filter params from arguments
         filters = _extract_completions_filters(arguments)
 
-        # Fetch recent transactions with pagination
         transactions, pagination_info = await self._fetch_recent_transactions_paginated(
             client, page, page_size, filters=filters
         )
 
-        # Format response
+        allowed = await get_policy_cache().get_allowed_metric_providers(
+            client, getattr(ctx, "tenant_id", None) if ctx else None
+        )
+        pre_filter_count = len(transactions)
+        transactions = filter_transactions_by_policy(transactions, allowed)
+        pagination_info["total_found"] = len(transactions)
+        if pre_filter_count > 0 and len(transactions) == 0:
+            pagination_info["has_more"] = False
+
         response_text = "**Recent Transactions**\n\n"
         response_text += f"**Page**: {pagination_info['page']} (size: {pagination_info['page_size']})\n"
         response_text += f"**Found**: {pagination_info['total_found']} transactions\n"
@@ -2958,9 +3029,11 @@ class MeteringManagement(ToolBase):
 
         logger.info(f"🔍 Fetching recent transactions: page {page}, size {page_size}")
         response = await client.get(endpoint, params=params)
+        if not isinstance(response, dict):
+            response = {}
 
         # Handle both possible response structures
-        transactions = []
+        transactions: List[Any] = []
         if (
             "_embedded" in response
             and "aICompletionMetricResourceList" in response["_embedded"]
@@ -3268,8 +3341,8 @@ class MeteringManagement(ToolBase):
 
     async def _handle_get_capabilities(
         self,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Enhanced capabilities with UCM integration and preserved semantic guidance."""
         # Get UCM capabilities if available for API-verified data (with caching)
         ucm_capabilities = None
         if self.ucm_helper:
@@ -3278,7 +3351,7 @@ class MeteringManagement(ToolBase):
 
                 # Check cache for UCM capabilities
                 ucm_cache_key = "ucm_metering_capabilities"
-                cached_ucm = await response_cache.get_cached_response("ucm", ucm_cache_key)
+                cached_ucm = await response_cache.get_cached_response("ucm", ucm_cache_key, ctx=ctx)
 
                 if cached_ucm is not None:
                     logger.debug("Using cached UCM capabilities")
@@ -3288,7 +3361,7 @@ class MeteringManagement(ToolBase):
                     # Cache UCM capabilities for 15 minutes
                     if ucm_capabilities:
                         await response_cache.set_cached_response(
-                            "ucm", ucm_cache_key, ucm_capabilities, ttl_seconds=900
+                            "ucm", ucm_cache_key, ucm_capabilities, ttl_seconds=900, ctx=ctx
                         )
 
                 logger.info(
@@ -3349,7 +3422,7 @@ class MeteringManagement(ToolBase):
                 ]
 
             # Analyze field mapping for each transaction
-            field_analysis = {
+            field_analysis: Dict[str, Any] = {
                 "total_transactions": total_found,
                 "field_presence": {},
                 "field_samples": {},
@@ -3373,12 +3446,12 @@ class MeteringManagement(ToolBase):
                 "inputTokenCount",
                 "outputTokenCount",
                 "durationMs",
-                "organizationId",
+                "organizationName",
                 "taskType",
                 "agent",
                 "traceId",
                 "taskId",
-                "productId",
+                "productName",
                 "subscriptionId",
                 "responseQualityScore",
                 "isStreamed",
@@ -3682,11 +3755,11 @@ get_field_documentation()
 - `duration_ms` (required) - Request duration in milliseconds
 
 ## **Optional Fields**
-- `organization_id` (optional) - Customer organization identifier
+- `organization_name` (optional) - Customer organization name
 - `task_type` (optional) - Type of AI operation
 - `agent` (optional) - AI agent identifier
 - `trace_id` (optional) - Session/conversation tracking ID
-- `product_id` (optional) - Product using the AI service
+- `product_name` (optional) - Product using the AI service
 - `subscription_id` (optional) - Subscription reference
 - `response_quality_score` (optional) - Quality score 0.0-1.0
 - `stop_reason` (optional) - Completion stop reason
@@ -3704,7 +3777,7 @@ get_field_documentation()
 - `duration_ms`
 
 #### **Optional String Fields**
-- `organization_id`, `task_type`, `agent`, `stop_reason`, `trace_id`, `product_id`, `subscription_id`, `error_reason`:
+- `organization_name`, `task_type`, `agent`, `stop_reason`, `trace_id`, `product_name`, `subscription_id`, `error_reason`:
   - Type: String
   - Length: 1-500 characters
   - Invalid chars: `<`, `>`, `"`, `'`, `&`
@@ -3733,7 +3806,7 @@ validate(model="<model>", provider="<provider>", input_tokens=3000, output_token
 {
   "model": "gpt-4o", "provider": "openai",
   "input_tokens": 3247, "output_tokens": 1856, "duration_ms": 4250,
-  "organization_id": "stratton-oakmont-financial",
+  "organization_name": "stratton-oakmont-financial",
   "task_type": "portfolio_risk_analysis",
   "agent": "QuantAnalyst_AI_v2.1",
   "subscriber": {
@@ -3741,7 +3814,7 @@ validate(model="<model>", provider="<provider>", input_tokens=3000, output_token
     "email": "trading.desk@strattonoakmont.com",
     "credential": {"name": "api_key_trading_platform"}
   },
-  "product_id": "trading_platform_v2",
+  "product_name": "trading_platform_v2",
   "subscription_id": "sub_enterprise_trading",
   "response_quality_score": 0.94
 }
@@ -3974,7 +4047,7 @@ async def main():
         "completionStartTime": "2024-01-01T00:00:01Z",
         "responseTime": "2024-01-01T00:00:02Z",
         "stopReason": "stop",
-        "organizationId": "your-org-id",
+        "organizationName": "your-org-name",
         "taskType": "text_generation"
     }
 
@@ -4030,7 +4103,7 @@ async function main() {
         completionStartTime: '2024-01-01T00:00:01Z',
         responseTime: '2024-01-01T00:00:02Z',
         stopReason: 'stop',
-        organizationId: 'your-org-id',
+        organizationName: 'your-org-name',
         taskType: 'text_generation'
     };
 
@@ -4074,7 +4147,7 @@ main();
 - `duration_ms`: Integer (> 0, ≤ 10,000,000)
 
 ### **Optional Fields**
-- **String fields**: `organization_id`, `task_type`, `agent`, `trace_id`, `product_id`, `subscription_id`, `stop_reason`
+- **String fields**: `organization_name`, `task_type`, `agent`, `trace_id`, `product_name`, `subscription_id`, `stop_reason`
   - Length: 1-500 chars, no `<>\"'&`
 - **Numeric fields**: `response_quality_score` (float 0.0-1.0), `time_to_first_token` (integer ≤ 60,000ms)
 - **Boolean fields**: `is_streamed` (true/false, string conversion supported)
@@ -4150,7 +4223,7 @@ list_ai_models()                       # List all models
 - `duration_ms` (integer) - Duration in milliseconds (> 0, ≤ 10,000,000)
 
 ## **Optional Fields**
-- `organization_id`, `task_type`, `agent`, `trace_id`, `product_id`, `subscription_id`, `stop_reason`, `error_reason` (string, 1-500 chars, no `< > " ' &`)
+- `organization_name`, `task_type`, `agent`, `trace_id`, `product_name`, `subscription_id`, `stop_reason`, `error_reason` (string, 1-500 chars, no `< > " ' &`)
 - `response_quality_score` (float, 0.0-1.0)
 - `is_streamed` (boolean)
 - `time_to_first_token` (integer, ≤ 60,000ms)
@@ -4178,10 +4251,10 @@ list_ai_models()                       # List all models
 
 ## **Field Groups**
 - **Basic**: `model`, `provider`, `input_tokens`, `output_tokens`, `duration_ms`
-- **Attribution**: + `organization_id`, `task_type`, `agent`
+- **Attribution**: + `organization_name`, `task_type`, `agent`
 - **Quality**: + `response_quality_score`, `is_streamed`, `stop_reason`, `error_reason`
 - **Session**: + `trace_id`
-- **Billing**: + `product_id`, `subscription_id`, `subscriber`
+- **Billing**: + `product_name`, `subscription_id`, `subscriber`
 - **Timestamps**: + `request_time`, `response_time`, `completion_start_time`
 
 ## **Validation**
@@ -4244,7 +4317,10 @@ Use `validate()` before submission."""
 
     # AI Models Discovery Action Handlers
     async def _handle_list_ai_models(
-        self, arguments: Dict[str, Any]
+        self,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle list AI models action."""
         try:
@@ -4252,7 +4328,7 @@ Use `validate()` before submission."""
             # structured ToolError on bad input instead of letting a Python
             # TypeError leak through (audit finding C.4).
             arguments = validate_pagination_params(arguments, action="list_ai_models")
-            client = ReveniumClient()
+            client = await self.get_client(ctx=ctx)
             page = arguments.get("page", 0)
             size = arguments.get("size", 20)
 
@@ -4265,7 +4341,7 @@ Use `validate()` before submission."""
                 total_models = page_info.get("totalElements", len(models))
 
                 # Group models by provider
-                providers = {}
+                providers: Dict[str, List[Dict[str, Any]]] = {}
                 for model in models:
                     provider = model.get("provider", "Unknown")
                     if provider not in providers:
@@ -4311,7 +4387,10 @@ Use `validate()` before submission."""
             return format_error_response(e, "listing AI models")
 
     async def _handle_search_ai_models(
-        self, arguments: Dict[str, Any]
+        self,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle search AI models action using list and filter approach."""
         try:
@@ -4339,7 +4418,7 @@ Use `validate()` before submission."""
                     },
                 )
 
-            client = ReveniumClient()
+            client = await self.get_client(ctx=ctx)
             page = arguments.get("page", 0)
             size = arguments.get("size", 20)
 
@@ -4411,13 +4490,16 @@ Use `validate()` before submission."""
             return format_error_response(e, "searching AI models")
 
     async def _handle_get_supported_providers(
-        self, arguments: Dict[str, Any]
+        self,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get supported providers action."""
         try:
             # arguments parameter is required by interface but not used in this method
             _ = arguments  # Acknowledge the parameter to avoid linter warnings
-            client = ReveniumClient()
+            client = await self.get_client(ctx=ctx)
 
             # Get all models to extract unique providers
             response = await client.get_ai_models(
@@ -4428,7 +4510,7 @@ Use `validate()` before submission."""
                 models = response["_embedded"]["aIModelResourceList"]
 
                 # Extract unique providers with model counts
-                provider_stats = {}
+                provider_stats: Dict[str, Dict[str, Any]] = {}
                 for model in models:
                     provider = model.get("provider", "Unknown")
                     if provider not in provider_stats:
@@ -4484,7 +4566,10 @@ Use `validate()` before submission."""
             return format_error_response(e, "getting supported providers")
 
     async def _handle_validate_model_provider(
-        self, arguments: Dict[str, Any]
+        self,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle validate model provider action."""
         try:
@@ -4517,7 +4602,7 @@ Use `validate()` before submission."""
                     },
                 )
 
-            client = ReveniumClient()
+            client = await self.get_client(ctx=ctx)
 
             response = await client.search_ai_models(query=model, page=0, size=100)
 
@@ -4586,7 +4671,10 @@ Use `validate()` before submission."""
             return format_error_response(e, "validating model/provider")
 
     async def _handle_estimate_transaction_cost(
-        self, arguments: Dict[str, Any]
+        self,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle estimate transaction cost action."""
         try:
@@ -4635,7 +4723,7 @@ Use `validate()` before submission."""
                     },
                 )
 
-            client = ReveniumClient()
+            client = await self.get_client(ctx=ctx)
 
             response = await client.search_ai_models(query=model, page=0, size=100)
 
@@ -4735,7 +4823,7 @@ Use `validate()` before submission."""
                 '  "input_tokens": 3247,\n'
                 '  "output_tokens": 1856,\n'
                 '  "duration_ms": 4250,\n'
-                '  "organization_id": "stratton-oakmont-financial",\n'
+                '  "organization_name": "stratton-oakmont-financial",\n'
                 '  "task_type": "portfolio_risk_analysis",\n'
                 '  "agent": "QuantAnalyst_AI_v2.1",\n'
                 '  "response_quality_score": 0.94\n'
@@ -4750,7 +4838,7 @@ Use `validate()` before submission."""
                 '  "input_tokens": 4125,\n'
                 '  "output_tokens": 2340,\n'
                 '  "duration_ms": 5800,\n'
-                '  "organization_id": "stratton-oakmont-financial",\n'
+                '  "organization_name": "stratton-oakmont-financial",\n'
                 '  "task_type": "market_sentiment_analysis",\n'
                 '  "agent": "MarketIntel_AI_v3.2",\n'
                 '  "subscriber": {\n'
@@ -4773,7 +4861,7 @@ Use `validate()` before submission."""
                 '  "input_tokens": 5680,\n'
                 '  "output_tokens": 3120,\n'
                 '  "duration_ms": 7200,\n'
-                '  "organization_id": "stratton-oakmont-financial",\n'
+                '  "organization_name": "stratton-oakmont-financial",\n'
                 '  "task_type": "algorithmic_trading_strategy",\n'
                 '  "agent": "AlgoTrader_AI_v4.1",\n'
                 '  "subscriber": {\n'
@@ -4783,7 +4871,7 @@ Use `validate()` before submission."""
                 '      "name": "algo_trading_api_key"\n'
                 "    }\n"
                 "  },\n"
-                '  "product_id": "trading_platform_v2",\n'
+                '  "product_name": "trading_platform_v2",\n'
                 '  "subscription_id": "sub_enterprise_trading",\n'
                 '  "trace_id": "conv_financial_analysis",\n'
                 '  "response_quality_score": 0.96,\n'
@@ -4835,7 +4923,7 @@ Use `validate()` before submission."""
                 '  "input_tokens": 1500,\n'
                 '  "output_tokens": 800,\n'
                 '  "duration_ms": 2500,\n'
-                '  "organization_id": "acme-corp",\n'
+                '  "organization_name": "acme-corp",\n'
                 '  "task_type": "customer_support",\n'
                 '  "agent": "SupportBot_v2.1"\n'
                 "}\n"
@@ -4864,10 +4952,10 @@ Use `validate()` before submission."""
                 '  "input_tokens": 3500,\n'
                 '  "output_tokens": 2000,\n'
                 '  "duration_ms": 6000,\n'
-                '  "organization_id": "enterprise-client",\n'
+                '  "organization_name": "enterprise-client",\n'
                 '  "task_type": "data_analysis",\n'
                 '  "agent": "DataAnalyst_AI_v3.0",\n'
-                '  "product_id": "analytics_platform",\n'
+                '  "product_name": "analytics_platform",\n'
                 '  "subscription_id": "sub_enterprise_pro",\n'
                 '  "trace_id": "conv_enterprise_session",\n'
                 '  "response_quality_score": 0.95,\n'
@@ -5115,7 +5203,7 @@ Use `validate()` before submission."""
                 "  input_tokens=4125, \n"
                 "  output_tokens=2340, \n"
                 "  duration_ms=5800,\n"
-                '  organization_id="stratton-oakmont-financial",\n'
+                '  organization_name="stratton-oakmont-financial",\n'
                 '  task_type="market_sentiment_analysis",\n'
                 '  agent="MarketIntel_AI_v3.2",\n'
                 '  subscriber={"id": "sub_so_trading_001", "email": "trading.desk@strattonoakmont.com"}\n'
@@ -5131,10 +5219,10 @@ Use `validate()` before submission."""
                 "## **Field Compatibility Guidelines**\n\n"
                 "### **Safe Field Combinations (Tested)**\n"
                 "- **Basic Required**: model, provider, input_tokens, output_tokens, duration_ms\n"
-                "- **Organization Attribution**: + organization_id, task_type, agent\n"
+                "- **Organization Attribution**: + organization_name, task_type, agent\n"
                 "- **Quality Tracking**: + response_quality_score, is_streamed, stop_reason\n"
                 "- **Session Tracking**: + trace_id\n"
-                "- **Billing Attribution**: + product_id, subscription_id, subscriber\n"
+                "- **Billing Attribution**: + product_name, subscription_id, subscriber\n"
                 "- **Timestamp Control**: + request_time, response_time, completion_start_time, time_to_first_token\n\n"
                 "### **⚠️ Validation Rules**\n"
                 "- **response_quality_score**: Must be 0.0-1.0\n"
@@ -5288,7 +5376,7 @@ Use `validate()` before submission."""
                 "        'completionStartTime': '2024-01-01T00:00:01Z',\n"
                 "        'responseTime': '2024-01-01T00:00:02Z',\n"
                 "        'stopReason': 'stop',\n"
-                "        'organizationId': 'my-org',\n"
+                "        'organizationName': 'my-org',\n"
                 "        'taskType': 'text_generation'\n"
                 "    }\n"
                 "    \n"
@@ -5494,7 +5582,7 @@ Use `validate()` before submission."""
                 "            completionStartTime: '2024-01-01T00:00:01Z',\n"
                 "            responseTime: '2024-01-01T00:00:02Z',\n"
                 "            stopReason: 'stop',\n"
-                "            organizationId: 'my-org',\n"
+                "            organizationName: 'my-org',\n"
                 "            taskType: 'text_generation'\n"
                 "        };\n"
                 "        \n"
@@ -5901,7 +5989,7 @@ Use `validate()` before submission."""
                 },
                 examples=[
                     "submit_ai_transaction(model='<model>', provider='<provider>', input_tokens=1500, output_tokens=800, duration_ms=2500)",
-                    "submit_ai_transaction(model='<model>', provider='<provider>', input_tokens=3000, output_tokens=1200, duration_ms=5000, organization_id='acme-corp')",
+                    "submit_ai_transaction(model='<model>', provider='<provider>', input_tokens=3000, output_tokens=1200, duration_ms=5000, organization_name='acme-corp')",
                 ],
             ),
             ToolCapability(
@@ -6009,9 +6097,13 @@ Use `validate()` before submission."""
                     "description": "Request duration in milliseconds - required for submit_ai_transaction",
                 },
                 # Enterprise Attribution Fields (optional)
-                "organization_id": {
+                "organization_name": {
                     "type": "string",
-                    "description": "Customer organization identifier for enterprise billing attribution",
+                    "description": "Customer organization name for enterprise billing attribution. Also used as a search filter for lookup_recent_transactions and analyze_recent_transactions.",
+                },
+                "product_name": {
+                    "type": "string",
+                    "description": "Product name for billing attribution on submit_ai_transaction.",
                 },
                 "subscriber": {
                     "type": "object",
@@ -6130,11 +6222,8 @@ Use `validate()` before submission."""
                     "type": "number",
                     "description": "Maximum request duration in milliseconds (inclusive).",
                 },
-                # Entity filters
-                "organization_name": {
-                    "type": "string",
-                    "description": "Filter by customer organization name.",
-                },
+                # Entity filters (organization_name is declared above in the Enterprise
+                # Attribution section — it is dual-use for submission and filtering).
                 "subscriber_id": {
                     "type": "string",
                     "description": "Filter by subscriber ID.",
@@ -6219,6 +6308,10 @@ Use `validate()` before submission."""
                     "description": "Maximum output token cost (inclusive).",
                 },
                 # Streaming performance
+                "time_to_first_token": {
+                    "type": "integer",
+                    "description": "Time to first token in milliseconds (positive integer, <= 60000). Auto-calculated from duration_ms if not provided.",
+                },
                 "time_to_first_token_min": {
                     "type": "number",
                     "description": "Minimum time-to-first-token in milliseconds (inclusive).",
@@ -7271,7 +7364,7 @@ Use `validate()` before submission."""
                 "        'completionStartTime': '2024-01-01T00:00:01Z',\n"
                 "        'responseTime': '2024-01-01T00:00:02Z',\n"
                 "        'stopReason': 'stop',\n"
-                "        'organizationId': 'my-org',\n"
+                "        'organizationName': 'my-org',\n"
                 "        'taskType': 'text_generation'\n"
                 "    }\n"
                 "    \n"

@@ -6,7 +6,10 @@ This tool handles the OAuth workflow for creating new Slack configurations,
 providing a seamless integration with the existing Revenium web application OAuth flow.
 """
 
-from typing import Any, ClassVar, Dict, List, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
@@ -53,11 +56,15 @@ class SlackOAuthWorkflow(ToolBase):
         self.formatter = UnifiedResponseFormatter("slack_oauth_workflow")
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle Slack OAuth workflow actions with structured error handling."""
         try:
-            client = await self.get_client()
+            client = await self.get_client(ctx=ctx)
             return await self._route_oauth_action(action, client, arguments)
 
         except ToolError:

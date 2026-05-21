@@ -10,14 +10,21 @@ Performance targets:
 - Expected latency reduction: 100-150ms
 """
 
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import inspect
 import json
 from functools import wraps
-from typing import Any, Callable, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
+
+from ..common.cache_key_factory import CacheKeyFactory
 
 try:
     import diskcache as dc
@@ -163,52 +170,42 @@ class ResponseCacheManager:
             "total_requests": 0,
         }
 
-    def _generate_cache_key(self, prefix: str, data: Union[str, Dict[str, Any]]) -> str:
-        """Generate a consistent cache key from data.
-
-        Args:
-            prefix: Cache key prefix (e.g., 'api', 'validation', 'ucm')
-            data: Data to hash for the key
-
-        Returns:
-            Consistent cache key string
-        """
+    def _generate_cache_key(
+        self,
+        prefix: str,
+        data: Union[str, Dict[str, Any]],
+        ctx: Optional[TenantContext] = None,
+    ) -> str:
         if isinstance(data, str):
             content = data
         else:
-            # Sort dict keys for consistent hashing
             content = json.dumps(data, sort_keys=True, default=str)
 
         hash_obj = hashlib.sha256(content.encode("utf-8"))
-        return f"{prefix}:{hash_obj.hexdigest()[:16]}"
+        raw_key = f"{prefix}:{hash_obj.hexdigest()[:16]}"
+        return CacheKeyFactory.make_key(ctx, raw_key)
 
     async def get_cached_response(
-        self, cache_type: str, key_data: Union[str, Dict[str, Any]], cache_level: str = "auto"
+        self,
+        cache_type: str,
+        key_data: Union[str, Dict[str, Any]],
+        cache_level: str = "auto",
+        ctx: Optional[TenantContext] = None,
     ) -> Optional[Any]:
-        """Get cached response with multi-level lookup and Redis-like optimization.
-
-        Args:
-            cache_type: Type of cache ('api', 'validation', 'ucm')
-            key_data: Data to generate cache key from
-            cache_level: Cache level preference ('l1', 'l2', 'l3', 'l4', 'auto', 'redis')
-
-        Returns:
-            Cached value if found, None otherwise
-        """
         if not self.enabled:
             return None
 
         self.stats["total_requests"] += 1
-        cache_key = self._generate_cache_key(cache_type, key_data)
-
-        # Try Redis-like cache first for enhanced performance
-        if REDIS_LIKE_CACHE_AVAILABLE and redis_like_cache and cache_level in ("auto", "redis"):
-            redis_result = await redis_like_cache.get(cache_key)
-            if redis_result is not None:
-                logger.debug(f"Redis-like cache hit for {cache_type}: {cache_key[:20]}...")
-                return redis_result
 
         try:
+            cache_key = self._generate_cache_key(cache_type, key_data, ctx)
+
+            # Try Redis-like cache first for enhanced performance
+            if REDIS_LIKE_CACHE_AVAILABLE and redis_like_cache and cache_level in ("auto", "redis"):
+                redis_result = await redis_like_cache.get(cache_key)
+                if redis_result is not None:
+                    logger.debug(f"Redis-like cache hit for {cache_type}: {cache_key[:20]}...")
+                    return redis_result
             # L1 cache check (fastest)
             if cache_level in ("auto", "l1") and cache_key in self.l1_cache:
                 self.stats["l1_hits"] += 1
@@ -279,24 +276,13 @@ class ResponseCacheManager:
         key_data: Union[str, Dict[str, Any]],
         value: Any,
         ttl_seconds: Optional[int] = None,
+        ctx: Optional[TenantContext] = None,
     ) -> bool:
-        """Set cached response in appropriate cache levels.
-
-        Args:
-            cache_type: Type of cache ('api', 'validation', 'ucm')
-            key_data: Data to generate cache key from
-            value: Value to cache
-            ttl_seconds: Time to live in seconds (None for default)
-
-        Returns:
-            True if successfully cached, False otherwise
-        """
         if not self.enabled:
             return False
 
-        cache_key = self._generate_cache_key(cache_type, key_data)
-
         try:
+            cache_key = self._generate_cache_key(cache_type, key_data, ctx)
             # Determine TTL based on cache type
             if ttl_seconds is None:
                 ttl_map = {
@@ -406,16 +392,12 @@ class ResponseCacheManager:
             "cache_enabled": self.enabled,
         }
 
-    async def warm_cache(self, cache_type: str, data_loader: Callable) -> int:
-        """Warm cache with frequently accessed data using enhanced strategies.
-
-        Args:
-            cache_type: Type of cache to warm
-            data_loader: Async function that returns data to cache
-
-        Returns:
-            Number of items cached
-        """
+    async def warm_cache(
+        self,
+        cache_type: str,
+        data_loader: Callable,
+        ctx: Optional[TenantContext] = None,
+    ) -> int:
         if not self.enabled:
             return 0
 
@@ -423,12 +405,10 @@ class ResponseCacheManager:
             data = await data_loader()
             count = 0
 
-            # Use Redis-like cache for intelligent warming if available
             if REDIS_LIKE_CACHE_AVAILABLE and redis_like_cache:
-                # Batch operations for better performance
                 operations = []
                 for key, value in data.items():
-                    cache_key = self._generate_cache_key(cache_type, key)
+                    cache_key = self._generate_cache_key(cache_type, key, ctx)
                     operations.append(
                         {
                             "type": "set",
@@ -445,9 +425,8 @@ class ResponseCacheManager:
                     count = sum(1 for result in results if result)
                     logger.info(f"Redis-like cache warming: {count} items cached for {cache_type}")
 
-            # Fallback to standard warming
             for key, value in data.items():
-                success = await self.set_cached_response(cache_type, key, value)
+                success = await self.set_cached_response(cache_type, key, value, ctx=ctx)
                 if success:
                     count += 1
 
@@ -458,12 +437,9 @@ class ResponseCacheManager:
             logger.error(f"Cache warming failed: {e}")
             return 0
 
-    async def warm_frequently_accessed_data(self) -> Dict[str, int]:
-        """Warm cache with frequently accessed data patterns.
-
-        Returns:
-            Dictionary with warming results per cache type
-        """
+    async def warm_frequently_accessed_data(
+        self, ctx: Optional[TenantContext] = None
+    ) -> Dict[str, int]:
         results = {}
 
         # Warm UCM capabilities for common resource types
@@ -483,7 +459,7 @@ class ResponseCacheManager:
                 },
             }
 
-        results["ucm"] = await self.warm_cache("ucm", load_ucm_data)
+        results["ucm"] = await self.warm_cache("ucm", load_ucm_data, ctx=ctx)
 
         # Warm validation patterns for common field combinations
         async def load_validation_data():
@@ -499,7 +475,7 @@ class ResponseCacheManager:
                 },
             }
 
-        results["validation"] = await self.warm_cache("validation", load_validation_data)
+        results["validation"] = await self.warm_cache("validation", load_validation_data, ctx=ctx)
 
         # Warm API response patterns
         async def load_api_data():
@@ -508,7 +484,7 @@ class ResponseCacheManager:
                 "capabilities_schema": {"type": "object", "properties": {}},
             }
 
-        results["api"] = await self.warm_cache("api", load_api_data)
+        results["api"] = await self.warm_cache("api", load_api_data, ctx=ctx)
 
         total_warmed = sum(results.values())
         logger.info(
@@ -522,67 +498,56 @@ class ResponseCacheManager:
 response_cache = ResponseCacheManager()
 
 
-def cache_response(cache_type: str, ttl_seconds: Optional[int] = None):
-    """Decorator for automatic response caching.
-
-    Args:
-        cache_type: Type of cache ('api', 'validation', 'ucm')
-        ttl_seconds: Time to live in seconds
-    """
-
-    def decorator(func: Callable) -> Callable:
+def cache_response(
+    cache_type: str, ttl_seconds: Optional[int] = None
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(func)
-        async def async_wrapper(*args, **kwargs):
-            # Generate cache key from function arguments
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            ctx = kwargs.pop("ctx", None)
             cache_key_data = {"function": func.__name__, "args": str(args), "kwargs": kwargs}
 
-            # Try to get cached result
-            cached_result = await response_cache.get_cached_response(cache_type, cache_key_data)
+            cached_result = await response_cache.get_cached_response(
+                cache_type, cache_key_data, ctx=ctx
+            )
             if cached_result is not None:
                 return cached_result
 
-            # Execute function and cache result
             result = await func(*args, **kwargs)
             await response_cache.set_cached_response(
-                cache_type, cache_key_data, result, ttl_seconds
+                cache_type, cache_key_data, result, ttl_seconds, ctx=ctx
             )
             return result
 
         @wraps(func)
-        def sync_wrapper(*args, **kwargs):
-            # For sync functions, use asyncio.run for cache operations
+        def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+            ctx = kwargs.pop("ctx", None)
             cache_key_data = {"function": func.__name__, "args": str(args), "kwargs": kwargs}
 
-            # Try to get cached result (sync version)
             try:
                 loop = asyncio.get_running_loop()
                 cached_result = loop.run_until_complete(
-                    response_cache.get_cached_response(cache_type, cache_key_data)
+                    response_cache.get_cached_response(cache_type, cache_key_data, ctx=ctx)
                 )
                 if cached_result is not None:
                     return cached_result
             except RuntimeError:
-                # No event loop running, skip caching
                 pass
 
-            # Execute function
             result = func(*args, **kwargs)
 
-            # Cache result (sync version)
             try:
                 loop = asyncio.get_running_loop()
                 loop.run_until_complete(
                     response_cache.set_cached_response(
-                        cache_type, cache_key_data, result, ttl_seconds
+                        cache_type, cache_key_data, result, ttl_seconds, ctx=ctx
                     )
                 )
             except RuntimeError:
-                # No event loop running, skip caching
                 pass
 
             return result
 
-        # Return appropriate wrapper based on function type
         if inspect.iscoroutinefunction(func):
             return async_wrapper
         else:

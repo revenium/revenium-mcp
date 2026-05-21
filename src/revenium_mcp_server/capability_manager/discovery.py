@@ -490,12 +490,12 @@ class CapabilityDiscovery:
                                 "duration_ms",
                             ],
                             "optional": [
-                                "organization_id",
+                                "organization_name",
                                 "subscriber_email",
                                 "task_type",
                                 "agent",
                                 "trace_id",
-                                "product_id",
+                                "product_name",
                                 "subscription_id",
                                 "subscriber_credential",
                                 "subscriber_credential_name",
@@ -543,12 +543,12 @@ class CapabilityDiscovery:
                         "duration_ms",
                     ],
                     "optional": [
-                        "organization_id",
+                        "organization_name",
                         "subscriber_email",
                         "task_type",
                         "agent",
                         "trace_id",
-                        "product_id",
+                        "product_name",
                         "subscription_id",
                         "subscriber_credential",
                         "subscriber_credential_name",
@@ -572,12 +572,12 @@ class CapabilityDiscovery:
                             "duration_ms",
                         ],
                         "optional": [
-                            "organization_id",
+                            "organization_name",
                             "subscriber_email",
                             "task_type",
                             "agent",
                             "trace_id",
-                            "product_id",
+                            "product_name",
                             "subscription_id",
                             "subscriber_credential",
                             "subscriber_credential_name",
@@ -604,12 +604,12 @@ class CapabilityDiscovery:
             return {
                 "required": ["model", "provider", "input_tokens", "output_tokens", "duration_ms"],
                 "optional": [
-                    "organization_id",
+                    "organization_name",
                     "subscriber_email",
                     "task_type",
                     "agent",
                     "trace_id",
-                    "product_id",
+                    "product_name",
                     "subscription_id",
                     "subscriber_credential",
                     "subscriber_credential_name",
@@ -628,12 +628,12 @@ class CapabilityDiscovery:
                             "duration_ms",
                         ],
                         "optional": [
-                            "organization_id",
+                            "organization_name",
                             "subscriber_email",
                             "task_type",
                             "agent",
                             "trace_id",
-                            "product_id",
+                            "product_name",
                             "subscription_id",
                             "subscriber_credential",
                             "subscriber_credential_name",
@@ -659,7 +659,7 @@ class CapabilityDiscovery:
             # Return basic fallback schema
             return {
                 "required": ["model", "provider", "input_tokens", "output_tokens", "duration_ms"],
-                "optional": ["organization_id", "subscriber_email", "task_type", "agent"],
+                "optional": ["organization_name", "subscriber_email", "task_type", "agent"],
                 "error": f"Failed to discover transaction fields: {str(e)}",
             }
 

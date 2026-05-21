@@ -75,17 +75,14 @@ class TestConfigurationStore:
         assert store_via_fn is store_via_ctor
 
     def test_clear_cache(self):
-        """Test clear_cache resets discovery state."""
         store = get_config_store()
-        # Set some state
-        store._discovery_attempted = True
-        store._discovered_config = DiscoveredConfig(team_id="test")
+        store._discovery_attempted.add("_default_")
+        store._discovered_configs["_default_"] = DiscoveredConfig(team_id="test")
 
-        # Clear
         store.clear_cache()
 
-        assert store._discovery_attempted is False
-        assert store._discovered_config is None
+        assert len(store._discovery_attempted) == 0
+        assert len(store._discovered_configs) == 0
 
 
 class TestOnboardingDetectionHelpers:

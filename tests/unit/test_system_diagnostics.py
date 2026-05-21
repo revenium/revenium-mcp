@@ -65,7 +65,7 @@ class TestSystemDiagnosticsRouting:
         """Configuration actions delegate to config_tool."""
         result = await diagnostics_tool.handle_action("environment_variables", {})
         diagnostics_tool.config_tool.handle_action.assert_called_once_with(
-            "environment_variables", {}
+            "environment_variables", {}, ctx=None
         )
         assert result[0].text == "config result"
 
@@ -73,7 +73,7 @@ class TestSystemDiagnosticsRouting:
     async def test_debug_action_delegates_to_debug_tool(self, diagnostics_tool):
         """Debug actions delegate to debug_tool."""
         result = await diagnostics_tool.handle_action("debug", {})
-        diagnostics_tool.debug_tool.handle_action.assert_called_once_with("debug", {})
+        diagnostics_tool.debug_tool.handle_action.assert_called_once_with("debug", {}, ctx=None)
         assert result[0].text == "debug result"
 
     @pytest.mark.asyncio
@@ -81,7 +81,7 @@ class TestSystemDiagnosticsRouting:
         """Log analysis actions delegate to log_tool."""
         result = await diagnostics_tool.handle_action("get_internal_logs", {"size": 50})
         diagnostics_tool.log_tool.handle_action.assert_called_once_with(
-            "get_internal_logs", {"size": 50}
+            "get_internal_logs", {"size": 50}, ctx=None
         )
 
     @pytest.mark.asyncio

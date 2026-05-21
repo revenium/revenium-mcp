@@ -12,7 +12,7 @@ import json
 import os
 import re
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 from urllib.parse import urljoin
 
 import httpx
@@ -23,6 +23,7 @@ from .auth import AuthConfig, AuthenticationError, get_auth_config, get_bearer_a
 from .config_store import get_config_value
 from .endpoint_registry import DEFAULT_APP_BASE_URL
 from .exceptions import AlertToolsError
+from .log_context import redact_headers
 from .logging_config import async_operation_context
 
 
@@ -241,12 +242,19 @@ class ReveniumClient:
                     f"Loaded auth configuration with base URL: {self._auth_config.base_url}"
                 )
             except AuthenticationError as exc:
-                # BACK-1270 #9: wrap the infrastructure-shaped AuthenticationError
-                # in a 401-equivalent ToolError envelope so callers see auth-shape
-                # (matches Phase-10c probe contract; does not leak env-var names).
-                from .common.auth_response_envelope import auth_error_to_tool_error
+                from .common.auth_response_envelope import (
+                    auth_error_to_tool_error,
+                    auth_scope_unresolved_to_tool_error,
+                )
 
-                logger.error("Failed to load auth configuration: missing required auth env vars")
+                exc_msg = str(exc)
+                if "REVENIUM_TEAM_ID" in exc_msg:
+                    logger.error(
+                        "Failed to load auth configuration: API key present but team scope unresolved"
+                    )
+                    raise auth_scope_unresolved_to_tool_error() from exc
+
+                logger.error(f"Failed to load auth configuration: {exc_msg}")
                 raise auth_error_to_tool_error("missing credential") from exc
             except Exception as e:
                 logger.error(f"Failed to load auth configuration: {e}")
@@ -286,7 +294,7 @@ class ReveniumClient:
         """Async context manager entry."""
         return self
 
-    async def __aexit__(self, _exc_type, _exc_val, _exc_tb) -> None:
+    async def __aexit__(self, _exc_type: Any, _exc_val: Any, _exc_tb: Any) -> None:
         """Async context manager exit."""
         await self.close()
 
@@ -374,7 +382,7 @@ class ReveniumClient:
         """Build full URL from endpoint."""
         return urljoin(self.base_url, endpoint.lstrip("/"))
 
-    def _format_error_response(self, error_data: Dict[str, Any]) -> str:
+    def _format_error_response(self, error_data: Any) -> str:
         """Format error response data into a readable string.
 
         Args:
@@ -396,13 +404,13 @@ class ReveniumClient:
                 else:
                     details_str = str(details)
                 return f"{message} - {details_str}"
-            return message
+            return str(message)
 
         # Alternative formats
         if "error" in error_data:
             error_info = error_data["error"]
             if isinstance(error_info, dict):
-                return error_info.get("message", str(error_info))
+                return cast(str, error_info.get("message", str(error_info)))
             return str(error_info)
 
         # Validation error format
@@ -658,7 +666,7 @@ class ReveniumClient:
                     raw_response_debug = {
                         "http_status_code": response.status_code,
                         "http_reason_phrase": response.reason_phrase,
-                        "response_headers": dict(response.headers),
+                        "response_headers": redact_headers(dict(response.headers)),
                         "response_text": (
                             response.text[:1000] if response.text else None
                         ),  # First 1000 chars
@@ -669,7 +677,7 @@ class ReveniumClient:
                         "request_url": str(url),
                         "request_params": params,
                         "request_json": json_data,
-                        "request_headers": dict(self.client.headers),
+                        "request_headers": redact_headers(dict(self.client.headers)),
                     }
 
                     # Enhanced logging for debugging
@@ -714,10 +722,7 @@ class ReveniumClient:
                         comprehensive_error = ReveniumAPIError(
                             message=enhanced_message,
                             status_code=response.status_code,
-                            response_data={
-                                "error_data": error_data,
-                                "raw_response_debug": raw_response_debug,
-                            },
+                            response_data={"error_data": error_data},
                         )
                     elif "failed to decode hashed id" in error_text.lower():
                         # Infer resource type from the endpoint path
@@ -744,10 +749,7 @@ class ReveniumClient:
                         comprehensive_error = ReveniumAPIError(
                             message=enhanced_message,
                             status_code=response.status_code,
-                            response_data={
-                                "error_data": error_data,
-                                "raw_response_debug": raw_response_debug,
-                            },
+                            response_data={"error_data": error_data},
                         )
                     elif (
                         use_bearer
@@ -779,26 +781,20 @@ class ReveniumClient:
                         comprehensive_error = ReveniumAPIError(
                             message=enhanced_message,
                             status_code=response.status_code,
-                            response_data={
-                                "error_data": error_data,
-                                "raw_response_debug": raw_response_debug,
-                            },
+                            response_data={"error_data": error_data},
                         )
                     else:
                         # Create ReveniumAPIError with comprehensive debug data
                         comprehensive_error = ReveniumAPIError(
                             message=f"HTTP {response.status_code}: {error_text}",
                             status_code=response.status_code,
-                            response_data={
-                                "error_data": error_data,
-                                "raw_response_debug": raw_response_debug,
-                            },
+                            response_data={"error_data": error_data},
                         )
                     raise comprehensive_error
 
                 # Parse response
                 if response.content:
-                    result = response.json()
+                    result: Union[Dict[str, Any], List[Any]] = response.json()
                     logger.debug(
                         "Response parsed successfully",
                         operation_id=operation_id,
@@ -880,7 +876,7 @@ class ReveniumClient:
     def _extract_pagination_info(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """Extract pagination information from response."""
         if isinstance(response, dict) and "page" in response:
-            return response["page"]
+            return cast(Dict[str, Any], response["page"])
         return {}
 
     async def get(
@@ -952,7 +948,7 @@ class ReveniumClient:
         return await self._request("PATCH", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
 
     # Products API methods
-    async def get_products(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
+    async def get_products(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of products with pagination.
 
         Args:
@@ -966,8 +962,7 @@ class ReveniumClient:
         params = {"page": page, "size": size}
         params.update(filters)
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/products", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/products", params=params))
     async def get_product_by_id(self, product_id: str) -> Dict[str, Any]:
         """Get a specific product by ID.
 
@@ -978,8 +973,7 @@ class ReveniumClient:
             Product data
         """
         params = self._add_team_id_to_params()
-        return await self.get(f"/profitstream/v2/api/products/{product_id}", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/products/{product_id}", params=params))
     async def create_product(self, product_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new product with enhanced validation and field mapping.
 
@@ -1048,9 +1042,9 @@ class ReveniumClient:
         APIFieldMapper.log_field_mapping(product_data, mapped_data, "product creation")
 
         try:
-            result = await self.post(
+            result = cast(Dict[str, Any], await self.post(
                 "/profitstream/v2/api/products", data=mapped_data, params=params
-            )
+            ))
             logger.info(f"Product creation successful: {result.get('id', 'Unknown ID')}")
             return result
         except Exception as e:
@@ -1084,9 +1078,9 @@ class ReveniumClient:
         APIFieldMapper.log_field_mapping(product_data, mapped_data, f"product {product_id} update")
 
         try:
-            result = await self.put(
+            result = cast(Dict[str, Any], await self.put(
                 f"/profitstream/v2/api/products/{product_id}", data=mapped_data, params=params
-            )
+            ))
             logger.info(f"Product update successful: {product_id}")
             return result
         except Exception as e:
@@ -1103,10 +1097,9 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return await self.delete(f"/profitstream/v2/api/products/{product_id}", params=params)
-
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/products/{product_id}", params=params))
     # Subscriptions API methods
-    async def get_subscriptions(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
+    async def get_subscriptions(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of subscriptions with pagination.
 
         Args:
@@ -1120,8 +1113,7 @@ class ReveniumClient:
         params = {"page": page, "size": size}
         params.update(filters)
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/subscriptions", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/subscriptions", params=params))
     async def get_subscription_by_id(self, subscription_id: str) -> Dict[str, Any]:
         """Get a specific subscription by ID.
 
@@ -1132,9 +1124,9 @@ class ReveniumClient:
             Subscription data
         """
         params = self._add_team_id_to_params()
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             f"/profitstream/v2/api/subscriptions/{subscription_id}", params=params
-        )
+        ))
 
     async def create_subscription(self, subscription_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new subscription.
@@ -1146,9 +1138,9 @@ class ReveniumClient:
             Created subscription data
         """
         params = self._add_team_id_to_params()
-        return await self.post(
+        return cast(Dict[str, Any], await self.post(
             "/profitstream/v2/api/subscriptions", data=subscription_data, params=params
-        )
+        ))
 
     async def update_subscription(
         self, subscription_id: str, subscription_data: Dict[str, Any]
@@ -1163,11 +1155,11 @@ class ReveniumClient:
             Updated subscription data
         """
         params = self._add_team_id_to_params()
-        return await self.put(
+        return cast(Dict[str, Any], await self.put(
             f"/profitstream/v2/api/subscriptions/{subscription_id}",
             data=subscription_data,
             params=params,
-        )
+        ))
 
     async def cancel_subscription(self, subscription_id: str) -> Dict[str, Any]:
         """Cancel a subscription.
@@ -1179,12 +1171,12 @@ class ReveniumClient:
             Cancellation response
         """
         params = self._add_team_id_to_params()
-        return await self.delete(
+        return cast(Dict[str, Any], await self.delete(
             f"/profitstream/v2/api/subscriptions/{subscription_id}", params=params
-        )
+        ))
 
     # Sources API methods
-    async def get_sources(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
+    async def get_sources(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of sources with pagination.
 
         Args:
@@ -1198,8 +1190,7 @@ class ReveniumClient:
         params = {"page": page, "size": size}
         params.update(filters)
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/sources", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/sources", params=params))
     async def get_source_by_id(self, source_id: str) -> Dict[str, Any]:
         """Get a specific source by ID.
 
@@ -1210,8 +1201,7 @@ class ReveniumClient:
             Source data
         """
         params = self._add_team_id_to_params()
-        return await self.get(f"/profitstream/v2/api/sources/{source_id}", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/sources/{source_id}", params=params))
     async def create_source(self, source_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new source.
 
@@ -1222,8 +1212,7 @@ class ReveniumClient:
             Created source data
         """
         params = self._add_team_id_to_params()
-        return await self.post("/profitstream/v2/api/sources", data=source_data, params=params)
-
+        return cast(Dict[str, Any], await self.post("/profitstream/v2/api/sources", data=source_data, params=params))
     async def update_source(self, source_id: str, source_data: Dict[str, Any]) -> Dict[str, Any]:
         """Update an existing source.
 
@@ -1235,9 +1224,9 @@ class ReveniumClient:
             Updated source data
         """
         params = self._add_team_id_to_params()
-        return await self.put(
+        return cast(Dict[str, Any], await self.put(
             f"/profitstream/v2/api/sources/{source_id}", data=source_data, params=params
-        )
+        ))
 
     async def delete_source(self, source_id: str) -> Dict[str, Any]:
         """Delete a source.
@@ -1249,12 +1238,11 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return await self.delete(f"/profitstream/v2/api/sources/{source_id}", params=params)
-
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/sources/{source_id}", params=params))
     # Customer Management API methods
 
     # Users API methods
-    async def get_users(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
+    async def get_users(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of users with pagination.
 
         Args:
@@ -1269,8 +1257,7 @@ class ReveniumClient:
         params.update(filters)
         # Users endpoint requires teamId (not tenantId like organizations)
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/users", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/users", params=params))
     async def get_user_by_id(self, user_id: str) -> Dict[str, Any]:
         """Get a specific user by ID.
 
@@ -1281,8 +1268,7 @@ class ReveniumClient:
             User data
         """
         params = self._add_team_id_to_params()
-        return await self.get(f"/profitstream/v2/api/users/{user_id}", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/users/{user_id}", params=params))
     async def get_user_by_email(self, email: str) -> Dict[str, Any]:
         """Get a user by email address.
 
@@ -1293,8 +1279,7 @@ class ReveniumClient:
             User data
         """
         params = self._add_team_id_to_params()
-        return await self.get(f"/profitstream/v2/api/users/email/{email}", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/users/email/{email}", params=params))
     async def create_user(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new user.
 
@@ -1305,8 +1290,7 @@ class ReveniumClient:
             Created user data
         """
         params = self._add_team_id_to_params()
-        return await self.post("/profitstream/v2/api/users", data=user_data, params=params)
-
+        return cast(Dict[str, Any], await self.post("/profitstream/v2/api/users", data=user_data, params=params))
     async def update_user(self, user_id: str, user_data: Dict[str, Any]) -> Dict[str, Any]:
         """Update an existing user.
 
@@ -1318,9 +1302,9 @@ class ReveniumClient:
             Updated user data
         """
         params = self._add_team_id_to_params()
-        return await self.put(
+        return cast(Dict[str, Any], await self.put(
             f"/profitstream/v2/api/users/{user_id}", data=user_data, params=params
-        )
+        ))
 
     async def delete_user(self, user_id: str) -> Dict[str, Any]:
         """Delete a user.
@@ -1332,8 +1316,7 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return await self.delete(f"/profitstream/v2/api/users/{user_id}", params=params)
-
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/users/{user_id}", params=params))
     async def get_current_user(self) -> Dict[str, Any]:
         """Get the user associated with the current security context.
 
@@ -1341,10 +1324,9 @@ class ReveniumClient:
             Current user data
         """
         params = self._add_team_id_to_params()
-        return await self.get("/profitstream/v2/api/users/current", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/users/current", params=params))
     # Subscribers API methods
-    async def get_subscribers(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
+    async def get_subscribers(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of subscribers with pagination.
 
         Args:
@@ -1359,8 +1341,7 @@ class ReveniumClient:
         params.update(filters)
         # Subscribers endpoint requires teamId (not tenantId)
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/subscribers", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/subscribers", params=params))
     async def get_subscriber_by_id(self, subscriber_id: str) -> Dict[str, Any]:
         """Get a specific subscriber by ID.
 
@@ -1371,8 +1352,7 @@ class ReveniumClient:
             Subscriber data
         """
         params = self._add_team_id_to_params()
-        return await self.get(f"/profitstream/v2/api/subscribers/{subscriber_id}", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/subscribers/{subscriber_id}", params=params))
     async def get_subscriber_by_email(self, email: str) -> Dict[str, Any]:
         """Get a subscriber by email address.
 
@@ -1383,8 +1363,7 @@ class ReveniumClient:
             Subscriber data
         """
         params = self._add_team_id_to_params()
-        return await self.get(f"/profitstream/v2/api/subscribers/email/{email}", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/subscribers/email/{email}", params=params))
     async def create_subscriber(self, subscriber_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new subscriber.
 
@@ -1395,9 +1374,9 @@ class ReveniumClient:
             Created subscriber data
         """
         params = self._add_team_id_to_params()
-        return await self.post(
+        return cast(Dict[str, Any], await self.post(
             "/profitstream/v2/api/subscribers", data=subscriber_data, params=params
-        )
+        ))
 
     async def update_subscriber(
         self, subscriber_id: str, subscriber_data: Dict[str, Any]
@@ -1412,9 +1391,9 @@ class ReveniumClient:
             Updated subscriber data
         """
         params = self._add_team_id_to_params()
-        return await self.put(
+        return cast(Dict[str, Any], await self.put(
             f"/profitstream/v2/api/subscribers/{subscriber_id}", data=subscriber_data, params=params
-        )
+        ))
 
     async def delete_subscriber(self, subscriber_id: str) -> Dict[str, Any]:
         """Delete a subscriber.
@@ -1426,10 +1405,9 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return await self.delete(f"/profitstream/v2/api/subscribers/{subscriber_id}", params=params)
-
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/subscribers/{subscriber_id}", params=params))
     # Credentials API methods
-    async def get_credentials(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
+    async def get_credentials(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of credentials with pagination.
 
         Args:
@@ -1443,8 +1421,7 @@ class ReveniumClient:
         params = {"page": page, "size": size}
         params.update(filters)
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/credentials", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/credentials", params=params))
     async def get_credential_by_id(self, credential_id: str) -> Dict[str, Any]:
         """Get a specific credential by ID.
 
@@ -1455,8 +1432,7 @@ class ReveniumClient:
             Credential data
         """
         params = self._add_team_id_to_params()
-        return await self.get(f"/profitstream/v2/api/credentials/{credential_id}", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/credentials/{credential_id}", params=params))
     async def create_credential(self, credential_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new subscriber credential.
 
@@ -1479,8 +1455,7 @@ class ReveniumClient:
         if "teamId" not in credential_data:
             credential_data["teamId"] = self.team_id
 
-        return await self.post("/profitstream/v2/api/credentials", data=credential_data)
-
+        return cast(Dict[str, Any], await self.post("/profitstream/v2/api/credentials", data=credential_data))
     async def update_credential(
         self, credential_id: str, credential_data: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -1497,9 +1472,9 @@ class ReveniumClient:
         if "teamId" not in credential_data:
             credential_data["teamId"] = self.team_id
 
-        return await self.put(
+        return cast(Dict[str, Any], await self.put(
             f"/profitstream/v2/api/credentials/{credential_id}", data=credential_data
-        )
+        ))
 
     async def delete_credential(self, credential_id: str) -> Dict[str, Any]:
         """Delete a subscriber credential.
@@ -1510,8 +1485,7 @@ class ReveniumClient:
         Returns:
             Deletion confirmation
         """
-        return await self.delete(f"/profitstream/v2/api/credentials/{credential_id}")
-
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/credentials/{credential_id}"))
     # Helper methods for credential management
     async def resolve_subscriber_email_to_id(self, email: str) -> Optional[str]:
         """Resolve subscriber email to subscriber ID.
@@ -1529,7 +1503,7 @@ class ReveniumClient:
 
             for subscriber in subscribers:
                 if subscriber.get("email") == email:
-                    return subscriber.get("id")
+                    return cast(Optional[str], subscriber.get("id"))
 
             return None
         except Exception as e:
@@ -1552,7 +1526,7 @@ class ReveniumClient:
 
             for org in organizations:
                 if org.get("name") == name:
-                    return org.get("id")
+                    return cast(Optional[str], org.get("id"))
 
             return None
         except Exception as e:
@@ -1560,7 +1534,7 @@ class ReveniumClient:
             return None
 
     # Organizations API methods
-    async def get_organizations(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
+    async def get_organizations(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of organizations with pagination.
 
         Args:
@@ -1575,8 +1549,7 @@ class ReveniumClient:
         params.update(filters)
         # Organizations endpoint requires tenantId (not teamId)
         params = self._add_tenant_id_to_params(params)
-        return await self.get("/profitstream/v2/api/organizations", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/organizations", params=params))
     async def get_organization_by_id(self, organization_id: str) -> Dict[str, Any]:
         """Get a specific organization by ID.
 
@@ -1587,9 +1560,9 @@ class ReveniumClient:
             Organization data
         """
         params = self._add_tenant_id_to_params()
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             f"/profitstream/v2/api/organizations/{organization_id}", params=params
-        )
+        ))
 
     async def create_organization(self, organization_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new organization.
@@ -1601,9 +1574,9 @@ class ReveniumClient:
             Created organization data
         """
         params = self._add_tenant_id_to_params()
-        return await self.post(
+        return cast(Dict[str, Any], await self.post(
             "/profitstream/v2/api/organizations", data=organization_data, params=params
-        )
+        ))
 
     async def update_organization(
         self, organization_id: str, organization_data: Dict[str, Any]
@@ -1618,11 +1591,11 @@ class ReveniumClient:
             Updated organization data
         """
         params = self._add_tenant_id_to_params()
-        return await self.put(
+        return cast(Dict[str, Any], await self.put(
             f"/profitstream/v2/api/organizations/{organization_id}",
             data=organization_data,
             params=params,
-        )
+        ))
 
     async def delete_organization(self, organization_id: str) -> Dict[str, Any]:
         """Delete an organization.
@@ -1634,9 +1607,9 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_tenant_id_to_params()
-        return await self.delete(
+        return cast(Dict[str, Any], await self.delete(
             f"/profitstream/v2/api/organizations/{organization_id}", params=params
-        )
+        ))
 
     async def get_organization_tags(self, organization_id: str) -> Dict[str, Any]:
         """Get all tags associated with an organization.
@@ -1648,12 +1621,12 @@ class ReveniumClient:
             Organization tags data
         """
         params = self._add_tenant_id_to_params()
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             f"/profitstream/v2/api/organizations/{organization_id}/tags", params=params
-        )
+        ))
 
     # Teams API methods
-    async def get_teams(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
+    async def get_teams(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of teams with pagination.
 
         Args:
@@ -1668,8 +1641,7 @@ class ReveniumClient:
         params.update(filters)
         # Teams endpoint requires tenantId instead of teamId
         params = self._add_tenant_id_to_params(params)
-        return await self.get("/profitstream/v2/api/teams", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/teams", params=params))
     async def get_team_by_id(self, team_id: str) -> Dict[str, Any]:
         """Get a specific team by ID.
 
@@ -1680,8 +1652,7 @@ class ReveniumClient:
             Team data
         """
         params = self._add_tenant_id_to_params()
-        return await self.get(f"/profitstream/v2/api/teams/{team_id}", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/teams/{team_id}", params=params))
     async def create_team(self, team_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new team.
 
@@ -1692,8 +1663,7 @@ class ReveniumClient:
             Created team data
         """
         params = self._add_tenant_id_to_params()
-        return await self.post("/profitstream/v2/api/teams", data=team_data, params=params)
-
+        return cast(Dict[str, Any], await self.post("/profitstream/v2/api/teams", data=team_data, params=params))
     async def update_team(self, team_id: str, team_data: Dict[str, Any]) -> Dict[str, Any]:
         """Update an existing team.
 
@@ -1705,9 +1675,9 @@ class ReveniumClient:
             Updated team data
         """
         params = self._add_tenant_id_to_params()
-        return await self.put(
+        return cast(Dict[str, Any], await self.put(
             f"/profitstream/v2/api/teams/{team_id}", data=team_data, params=params
-        )
+        ))
 
     async def delete_team(self, team_id: str) -> Dict[str, Any]:
         """Delete a team.
@@ -1719,8 +1689,7 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_tenant_id_to_params()
-        return await self.delete(f"/profitstream/v2/api/teams/{team_id}", params=params)
-
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/teams/{team_id}", params=params))
     async def get_team_tags(self, team_id: str) -> Dict[str, Any]:
         """Get all tags associated with a team.
 
@@ -1731,12 +1700,11 @@ class ReveniumClient:
             Team tags data
         """
         params = self._add_tenant_id_to_params()
-        return await self.get(f"/profitstream/v2/api/teams/{team_id}/tags", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/teams/{team_id}/tags", params=params))
     # AI Anomaly and Alert Management API methods
 
     # AI Anomaly API methods
-    async def get_anomalies(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
+    async def get_anomalies(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of AI anomalies with pagination.
 
         Args:
@@ -1750,8 +1718,7 @@ class ReveniumClient:
         params = {"page": page, "size": size}
         params.update(filters)
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/sources/ai/anomaly", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/sources/ai/anomaly", params=params))
     async def get_anomaly_by_id(self, anomaly_id: str) -> Dict[str, Any]:
         """Get a specific AI anomaly by ID.
 
@@ -1762,9 +1729,9 @@ class ReveniumClient:
             Anomaly data
         """
         params = self._add_team_id_to_params()
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             f"/profitstream/v2/api/sources/ai/anomaly/{anomaly_id}", params=params
-        )
+        ))
 
     async def create_anomaly(self, anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new AI anomaly.
@@ -1780,8 +1747,7 @@ class ReveniumClient:
             anomaly_data["teamId"] = self.auth_config.team_id
 
         # For anomaly creation, teamId goes in the body, not query params
-        return await self.post("/profitstream/v2/api/sources/ai/anomaly", data=anomaly_data)
-
+        return cast(Dict[str, Any], await self.post("/profitstream/v2/api/sources/ai/anomaly", data=anomaly_data))
     async def update_anomaly(self, anomaly_id: str, anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
         """Update an existing AI anomaly.
 
@@ -1793,11 +1759,11 @@ class ReveniumClient:
             Updated anomaly data
         """
         params = self._add_team_id_to_params()
-        return await self.put(
+        return cast(Dict[str, Any], await self.put(
             f"/profitstream/v2/api/sources/ai/anomaly/{anomaly_id}",
             data=anomaly_data,
             params=params,
-        )
+        ))
 
     async def delete_anomaly(self, anomaly_id: str) -> Dict[str, Any]:
         """Delete an AI anomaly.
@@ -1809,9 +1775,9 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return await self.delete(
+        return cast(Dict[str, Any], await self.delete(
             f"/profitstream/v2/api/sources/ai/anomaly/{anomaly_id}", params=params
-        )
+        ))
 
     async def clear_all_anomalies(self) -> Dict[str, Any]:
         """Clear all AI anomalies.
@@ -1820,8 +1786,7 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return await self.delete("/profitstream/v2/api/sources/ai/anomaly", params=params)
-
+        return cast(Dict[str, Any], await self.delete("/profitstream/v2/api/sources/ai/anomaly", params=params))
     async def get_anomaly_metrics(self, anomaly_id: str) -> Dict[str, Any]:
         """Get metrics from AI anomaly builder.
 
@@ -1832,9 +1797,9 @@ class ReveniumClient:
             Anomaly metrics data
         """
         params = self._add_team_id_to_params()
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             f"/profitstream/v2/api/sources/ai/anomaly/{anomaly_id}/metric", params=params
-        )
+        ))
 
     # AI Alert API methods
     async def get_alerts(
@@ -1843,7 +1808,7 @@ class ReveniumClient:
         size: int = 20,
         start: Optional[str] = None,
         end: Optional[str] = None,
-        **filters,
+        **filters: Any,
     ) -> Dict[str, Any]:
         """Get list of AI alerts with pagination and date range.
 
@@ -1871,8 +1836,7 @@ class ReveniumClient:
         # Add team ID
         params = self._add_team_id_to_params(params)
 
-        return await self.get("/profitstream/v2/api/sources/ai/alert", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/sources/ai/alert", params=params))
     async def get_alert_by_id(self, alert_id: str) -> Dict[str, Any]:
         """Get a specific AI alert by ID.
 
@@ -1883,8 +1847,7 @@ class ReveniumClient:
             Alert data
         """
         params = self._add_team_id_to_params()
-        return await self.get(f"/profitstream/v2/api/sources/ai/alert/{alert_id}", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/sources/ai/alert/{alert_id}", params=params))
     async def update_alert(self, alert_id: str, update_data: Dict[str, Any]) -> Dict[str, Any]:
         """Update a specific AI alert by ID.
 
@@ -1896,9 +1859,9 @@ class ReveniumClient:
             Updated alert data
         """
         params = self._add_team_id_to_params()
-        return await self.put(
+        return cast(Dict[str, Any], await self.put(
             f"/profitstream/v2/api/sources/ai/alert/{alert_id}", data=update_data, params=params
-        )
+        ))
 
     async def delete_alert(self, alert_id: str) -> Dict[str, Any]:
         """Delete a specific AI alert by ID.
@@ -1910,10 +1873,9 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return await self.delete(f"/profitstream/v2/api/sources/ai/alert/{alert_id}", params=params)
-
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/sources/ai/alert/{alert_id}", params=params))
     # AI Models API methods
-    async def get_ai_models(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
+    async def get_ai_models(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of AI models with pagination.
 
         Args:
@@ -1927,10 +1889,9 @@ class ReveniumClient:
         params = {"page": page, "size": size}
         params.update(filters)
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/sources/ai/models", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/sources/ai/models", params=params))
     async def search_ai_models(
-        self, query: str, page: int = 0, size: int = 20, **filters
+        self, query: str, page: int = 0, size: int = 20, **filters: Any
     ) -> Dict[str, Any]:
         """Search AI models by query using server-side filtering.
 
@@ -1946,14 +1907,13 @@ class ReveniumClient:
         params = {"query": query, "page": page, "size": size}
         params.update(filters)
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/sources/ai/models", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/sources/ai/models", params=params))
     # Note: Individual AI model endpoint has ID format issues
     # Use search_ai_models() or get_ai_models() to find specific models by ID
 
     # Metering Element Definition API methods
     async def get_metering_element_definitions(
-        self, page: int = 0, size: int = 20, **filters
+        self, page: int = 0, size: int = 20, **filters: Any
     ) -> Dict[str, Any]:
         """Get list of metering element definitions with pagination.
 
@@ -1968,8 +1928,7 @@ class ReveniumClient:
         params = {"page": page, "size": size, "paged": "true"}
         params.update(filters)
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/metering-element-definitions", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/metering-element-definitions", params=params))
     async def get_metering_element_definition_by_id(self, element_id: str) -> Dict[str, Any]:
         """Get a specific metering element definition by ID.
 
@@ -1979,8 +1938,7 @@ class ReveniumClient:
         Returns:
             Metering element definition data
         """
-        return await self.get(f"/profitstream/v2/api/metering-element-definitions/{element_id}")
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/metering-element-definitions/{element_id}"))
     async def create_metering_element_definition(
         self, element_data: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -2000,9 +1958,9 @@ class ReveniumClient:
         logger.debug(f"Element data: {json.dumps(element_data, indent=2, default=str)}")
 
         try:
-            result = await self.post(
+            result = cast(Dict[str, Any], await self.post(
                 "/profitstream/v2/api/metering-element-definitions", data=element_data
-            )
+            ))
             logger.info(
                 f"Metering element definition creation successful: {result.get('id', 'Unknown ID')}"
             )
@@ -2031,9 +1989,9 @@ class ReveniumClient:
         logger.debug(f"Element data: {json.dumps(element_data, indent=2, default=str)}")
 
         try:
-            result = await self.put(
+            result = cast(Dict[str, Any], await self.put(
                 f"/profitstream/v2/api/metering-element-definitions/{element_id}", data=element_data
-            )
+            ))
             logger.info(f"Metering element definition update successful: {element_id}")
             return result
         except Exception as e:
@@ -2052,9 +2010,9 @@ class ReveniumClient:
         logger.info(f"Deleting metering element definition: {element_id}")
 
         try:
-            result = await self.delete(
+            result = cast(Dict[str, Any], await self.delete(
                 f"/profitstream/v2/api/metering-element-definitions/{element_id}"
-            )
+            ))
             logger.info(f"Metering element definition deletion successful: {element_id}")
             return result
         except Exception as e:
@@ -2073,8 +2031,7 @@ class ReveniumClient:
         # Use the field mapper to ensure proper field mapping
         mapped_data = APIFieldMapper().map_transaction_fields(transaction_data)
 
-        return await self.post("/profitstream/v2/api/ai/completions", data=mapped_data)
-
+        return cast(Dict[str, Any], await self.post("/profitstream/v2/api/ai/completions", data=mapped_data))
     # Slack Configuration API methods
     async def get_slack_configurations(self, page: int = 0, size: int = 20) -> Dict[str, Any]:
         """Get list of Slack configurations with pagination.
@@ -2088,7 +2045,7 @@ class ReveniumClient:
         """
         params = {"page": page, "size": size}
         params = self._add_team_id_to_params(params)
-        raw_response = await self.get("/profitstream/v2/api/configurations/slack", params=params)
+        raw_response = cast(Dict[str, Any], await self.get("/profitstream/v2/api/configurations/slack", params=params))
 
         # Transform _embedded response format to standard content format
         configurations = self._extract_embedded_data(raw_response)
@@ -2115,8 +2072,7 @@ class ReveniumClient:
         Returns:
             Slack configuration data
         """
-        return await self.get(f"/profitstream/v2/api/configurations/slack/{config_id}")
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/configurations/slack/{config_id}"))
     # Jobs & Outcomes API methods (/profitstream/v2/api/jobs)
 
     async def get_jobs(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
@@ -2132,8 +2088,7 @@ class ReveniumClient:
         """
         params: Dict[str, Any] = {"page": page, "size": size, **filters}
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/jobs", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/jobs", params=params))
     async def get_job_by_id(self, job_id: str) -> Dict[str, Any]:
         """Get a specific job by ID.
 
@@ -2144,8 +2099,7 @@ class ReveniumClient:
             Job data
         """
         params = self._add_team_id_to_params({})
-        return await self.get(f"/profitstream/v2/api/jobs/{job_id}", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/jobs/{job_id}", params=params))
     async def get_job_transactions(self, job_id: str, page: int = 0, size: int = 20) -> Dict[str, Any]:
         """Get transactions for a specific job.
 
@@ -2159,8 +2113,7 @@ class ReveniumClient:
         """
         params: Dict[str, Any] = {"page": page, "size": size}
         params = self._add_team_id_to_params(params)
-        return await self.get(f"/profitstream/v2/api/jobs/{job_id}/transactions", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/jobs/{job_id}/transactions", params=params))
     async def get_job_roi(self, job_id: str) -> Dict[str, Any]:
         """Get ROI metrics for a specific job.
 
@@ -2171,8 +2124,7 @@ class ReveniumClient:
             ROI metrics data
         """
         params = self._add_team_id_to_params({})
-        return await self.get(f"/profitstream/v2/api/jobs/{job_id}/roi", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/jobs/{job_id}/roi", params=params))
     async def get_job_types(self) -> Dict[str, Any]:
         """Get available job types.
 
@@ -2180,8 +2132,7 @@ class ReveniumClient:
             Response containing available job types
         """
         params = self._add_team_id_to_params({})
-        return await self.get("/profitstream/v2/api/jobs/types", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/jobs/types", params=params))
     async def get_job_conversion_funnel(self, **filters: Any) -> Dict[str, Any]:
         """Get conversion funnel analytics (total/successful/converted).
 
@@ -2193,8 +2144,7 @@ class ReveniumClient:
         """
         params: Dict[str, Any] = {**filters}
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/jobs/conversion-funnel", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/jobs/conversion-funnel", params=params))
     async def report_job_outcome(self, job_id: str, outcome_data: Dict[str, Any]) -> Dict[str, Any]:
         """Report an outcome for a specific job.
 
@@ -2209,10 +2159,9 @@ class ReveniumClient:
             ReveniumAPIError: With status_code 409 if outcome already reported
         """
         params = self._add_team_id_to_params({})
-        return await self.post(f"/profitstream/v2/api/jobs/{job_id}/outcomes", data=outcome_data, params=params)
-
+        return cast(Dict[str, Any], await self.post(f"/profitstream/v2/api/jobs/{job_id}/outcomes", data=outcome_data, params=params))
     # Tool Registry API methods
-    async def list_tools(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
+    async def list_tools(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of tools with pagination.
 
         Args:
@@ -2226,8 +2175,7 @@ class ReveniumClient:
         params = {"page": page, "size": size}
         params.update(filters)
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/tools", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/tools", params=params))
     async def get_tool(self, tool_id: str) -> Dict[str, Any]:
         """Get a specific tool by ID.
 
@@ -2238,8 +2186,7 @@ class ReveniumClient:
             Tool data
         """
         params = self._add_team_id_to_params()
-        return await self.get(f"/profitstream/v2/api/tools/{tool_id}", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/tools/{tool_id}", params=params))
     async def get_tool_by_tool_id(self, tool_id: str) -> Dict[str, Any]:
         """Get a specific tool by its toolId (team-scoped).
 
@@ -2250,8 +2197,7 @@ class ReveniumClient:
             Tool data
         """
         params = self._add_team_id_to_params()
-        return await self.get(f"/profitstream/v2/api/tools/by-tool-id/{tool_id}", params=params)
-
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/tools/by-tool-id/{tool_id}", params=params))
     async def create_tool(self, tool_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new tool.
 
@@ -2262,8 +2208,7 @@ class ReveniumClient:
             Created tool data
         """
         params = self._add_team_id_to_params()
-        return await self.post("/profitstream/v2/api/tools", data=tool_data, params=params)
-
+        return cast(Dict[str, Any], await self.post("/profitstream/v2/api/tools", data=tool_data, params=params))
     async def update_tool(self, tool_id: str, tool_data: Dict[str, Any]) -> Dict[str, Any]:
         """Update an existing tool using PUT.
 
@@ -2275,8 +2220,7 @@ class ReveniumClient:
             Updated tool data
         """
         params = self._add_team_id_to_params()
-        return await self.put(f"/profitstream/v2/api/tools/{tool_id}", data=tool_data, params=params)
-
+        return cast(Dict[str, Any], await self.put(f"/profitstream/v2/api/tools/{tool_id}", data=tool_data, params=params))
     async def delete_tool(self, tool_id: str) -> Dict[str, Any]:
         """Delete a tool.
 
@@ -2287,8 +2231,7 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return await self.delete(f"/profitstream/v2/api/tools/{tool_id}", params=params)
-
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/tools/{tool_id}", params=params))
     async def restore_tool(self, tool_id: str) -> Dict[str, Any]:
         """Restore a previously deleted tool.
 
@@ -2299,8 +2242,7 @@ class ReveniumClient:
             Restored tool data
         """
         params = self._add_team_id_to_params()
-        return await self.post(f"/profitstream/v2/api/tools/{tool_id}/restore", params=params)
-
+        return cast(Dict[str, Any], await self.post(f"/profitstream/v2/api/tools/{tool_id}/restore", params=params))
     async def search_tools(self, query: str, page: int = 0, size: int = 20) -> Dict[str, Any]:  # noqa: E501
         """Search tools by text query.
 
@@ -2314,8 +2256,7 @@ class ReveniumClient:
         """
         params = {"name": query, "page": page, "size": size}
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/tools", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/tools", params=params))
     async def record_tool_event(self, tool_id: str, event_data: Dict[str, Any]) -> Dict[str, Any]:
         """Record an event for a tool by merging tool_id into payload and submitting to metering.
 
@@ -2328,8 +2269,7 @@ class ReveniumClient:
         """
         payload = {**event_data, "toolId": tool_id}
         params = self._add_team_id_to_params()
-        return await self.post("/meter/v2/tool/events", data=payload, params=params)
-
+        return cast(Dict[str, Any], await self.post("/meter/v2/tool/events", data=payload, params=params))
     async def meter_tool_event(self, event_data: Dict[str, Any]) -> Dict[str, Any]:
         """Submit a tool/function call for metering via global endpoint.
 
@@ -2340,8 +2280,7 @@ class ReveniumClient:
             Metered event data
         """
         params = self._add_team_id_to_params()
-        return await self.post("/meter/v2/tool/events", data=event_data, params=params)
-
+        return cast(Dict[str, Any], await self.post("/meter/v2/tool/events", data=event_data, params=params))
     async def get_tool_events(self, tool_id: str, page: int = 0, size: int = 20) -> Dict[str, Any]:
         """Get events for a specific tool via the global tool events log endpoint.
 
@@ -2355,9 +2294,8 @@ class ReveniumClient:
         """
         params = {"toolId": tool_id, "page": page, "size": size}
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/sources/metrics/tool/events", params=params)
-
-    async def list_tool_events(self, page: int = 0, size: int = 20, **filters) -> Dict[str, Any]:
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/sources/metrics/tool/events", params=params))
+    async def list_tool_events(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """List tool event logs via global filterable endpoint.
 
         Args:
@@ -2372,8 +2310,7 @@ class ReveniumClient:
         params = {"page": page, "size": size}
         params.update(filters)
         params = self._add_team_id_to_params(params)
-        return await self.get("/profitstream/v2/api/sources/metrics/tool/events", params=params)
-
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/sources/metrics/tool/events", params=params))
     # Tool Analytics endpoints — hosted on app.revenium.ai, Bearer auth
     # Base: https://app.revenium.ai, path prefix: /api/v2/analytics/
 
@@ -2386,7 +2323,7 @@ class ReveniumClient:
             )
         return url
 
-    async def get_cost_by_tool(self, **filters) -> Dict[str, Any]:
+    async def get_cost_by_tool(self, **filters: Any) -> Dict[str, Any]:
         """Cost breakdown by tool over time.
 
         Args:
@@ -2397,14 +2334,14 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/cost-by-tool",
             params=params,
             base_url=self._get_app_base_url(),
             use_bearer=True,
-        )
+        ))
 
-    async def get_cost_by_tool_aggregated(self, **filters) -> Dict[str, Any]:
+    async def get_cost_by_tool_aggregated(self, **filters: Any) -> Dict[str, Any]:
         """Aggregated cost per tool.
 
         Args:
@@ -2415,14 +2352,14 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/cost-by-tool-aggregated",
             params=params,
             base_url=self._get_app_base_url(),
             use_bearer=True,
-        )
+        ))
 
-    async def get_cost_by_tool_agent(self, **filters) -> Dict[str, Any]:
+    async def get_cost_by_tool_agent(self, **filters: Any) -> Dict[str, Any]:
         """Tool cost grouped by agent.
 
         Args:
@@ -2433,14 +2370,14 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/cost-by-tool-agent",
             params=params,
             base_url=self._get_app_base_url(),
             use_bearer=True,
-        )
+        ))
 
-    async def get_agent_tool_breakdown(self, **filters) -> Dict[str, Any]:
+    async def get_agent_tool_breakdown(self, **filters: Any) -> Dict[str, Any]:
         """Cost per (agent, tool) pair.
 
         Args:
@@ -2451,14 +2388,14 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/agent-tool-breakdown",
             params=params,
             base_url=self._get_app_base_url(),
             use_bearer=True,
-        )
+        ))
 
-    async def get_cost_by_tool_provider(self, **filters) -> Dict[str, Any]:
+    async def get_cost_by_tool_provider(self, **filters: Any) -> Dict[str, Any]:
         """Cost by tool provider over time.
 
         Args:
@@ -2469,14 +2406,14 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/cost-by-tool-provider",
             params=params,
             base_url=self._get_app_base_url(),
             use_bearer=True,
-        )
+        ))
 
-    async def get_cost_by_tool_provider_aggregated(self, **filters) -> Dict[str, Any]:
+    async def get_cost_by_tool_provider_aggregated(self, **filters: Any) -> Dict[str, Any]:
         """Aggregated cost by provider.
 
         Args:
@@ -2487,14 +2424,14 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/cost-by-tool-provider-aggregated",
             params=params,
             base_url=self._get_app_base_url(),
             use_bearer=True,
-        )
+        ))
 
-    async def get_top_tools_by_call_count(self, **filters) -> Dict[str, Any]:
+    async def get_top_tools_by_call_count(self, **filters: Any) -> Dict[str, Any]:
         """Top 20 tools by call count.
 
         Args:
@@ -2505,14 +2442,14 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/top-tools-by-call-count",
             params=params,
             base_url=self._get_app_base_url(),
             use_bearer=True,
-        )
+        ))
 
-    async def get_tool_success_rate(self, **filters) -> Dict[str, Any]:
+    async def get_tool_success_rate(self, **filters: Any) -> Dict[str, Any]:
         """Success rate per tool.
 
         Args:
@@ -2523,14 +2460,14 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/tool-success-rate",
             params=params,
             base_url=self._get_app_base_url(),
             use_bearer=True,
-        )
+        ))
 
-    async def get_tool_latency(self, **filters) -> Dict[str, Any]:
+    async def get_tool_latency(self, **filters: Any) -> Dict[str, Any]:
         """Average execution duration per tool.
 
         Args:
@@ -2541,12 +2478,12 @@ class ReveniumClient:
         """
         params = {}
         params.update(filters)
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/tool-latency",
             params=params,
             base_url=self._get_app_base_url(),
             use_bearer=True,
-        )
+        ))
 
     async def get_tool_filter_options(self) -> Dict[str, Any]:
         """Available tool IDs for filter dropdowns.
@@ -2554,11 +2491,11 @@ class ReveniumClient:
         Returns:
             Filter options for tools
         """
-        return await self.get(
+        return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/filter-options/tools",
             base_url=self._get_app_base_url(),
             use_bearer=True,
-        )
+        ))
 
 
 # Global client instance for connection pooling optimization

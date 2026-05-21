@@ -11,7 +11,10 @@ the dual-layer delegation pattern.
 import json
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -182,7 +185,7 @@ class ProductManager:
         }
 
     async def create_product(
-        self, arguments: Dict[str, Any], enhancement_processor=None
+        self, arguments: Dict[str, Any], enhancement_processor: Any = None
     ) -> Dict[str, Any]:
         """Enhanced create with unified progressive complexity + NLP support."""
         # Handle both field names for backward compatibility
@@ -503,7 +506,7 @@ class ProductManager:
 class ProductValidator:
     """Internal manager for product validation and schema discovery with UCM integration."""
 
-    def __init__(self, ucm_integration_helper=None):
+    def __init__(self, ucm_integration_helper: Any = None) -> None:
         """Initialize product validator.
 
         Args:
@@ -511,6 +514,7 @@ class ProductValidator:
         """
         self.ucm_helper = ucm_integration_helper
 
+        self.schema_discovery: Optional[Any] = None
         try:
             from ..schema_discovery import ProductSchemaDiscovery
 
@@ -523,7 +527,7 @@ class ProductValidator:
         """Get product capabilities using UCM - no fallbacks to ensure API accuracy."""
         if self.ucm_helper:
             try:
-                return await self.ucm_helper.ucm.get_capabilities("products")
+                return cast(Dict[str, Any], await self.ucm_helper.ucm.get_capabilities("products"))
             except ToolError:
                 # Re-raise ToolError exceptions without modification
                 # This preserves helpful error messages with specific suggestions
@@ -783,11 +787,15 @@ class ProductValidator:
 class ProductEnhancementProcessor:
     """Internal processor for enhanced product operations."""
 
-    def __init__(self, client: ReveniumClient, ucm_helper=None):
+    def __init__(self, client: ReveniumClient, ucm_helper: Any = None) -> None:
         """Initialize enhancement processor."""
         self.client = client
         self.ucm_helper = ucm_helper
         # Initialize specialized processors
+        self.nlp_processor: Optional[Any] = None
+        self.template_library: Optional[Any] = None
+        self.error_handler: Optional[Any] = None
+        self.clarification_engine: Optional[Any] = None
         try:
             from ..intelligent_clarification_engine import IntelligentClarificationEngine
             from ..nlp_processor import ProductNLPProcessor
@@ -800,10 +808,6 @@ class ProductEnhancementProcessor:
             self.clarification_engine = IntelligentClarificationEngine()
         except ImportError as e:
             logger.warning(f"Some enhanced features not available: {e}")
-            self.nlp_processor = None
-            self.template_library = None
-            self.error_handler = None
-            self.clarification_engine = None
 
     async def create_simple(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Create product with smart defaults."""
@@ -1323,7 +1327,7 @@ class ProductEnhancementProcessor:
 
     def _validate_setup_fee_configuration(self, setup_fee_data: Dict[str, Any]) -> Dict[str, Any]:
         """Validate and enhance setup fee configuration with business rules."""
-        validation_result = {
+        validation_result: Dict[str, Any] = {
             "valid": True,
             "warnings": [],
             "errors": [],
@@ -1703,7 +1707,9 @@ class ProductHierarchyManager:
             },
         }
 
-    def _validate_create_with_subscription_parameters(self, arguments: Dict[str, Any]):
+    def _validate_create_with_subscription_parameters(
+        self, arguments: Dict[str, Any]
+    ) -> tuple:
         """Validate main parameters for create_with_subscription."""
         product_data = arguments.get("product_data")
         subscription_data = arguments.get("subscription_data")
@@ -1734,7 +1740,7 @@ class ProductHierarchyManager:
 
     def _validate_required_fields(
         self, product_data: Dict[str, Any], subscription_data: Dict[str, Any]
-    ):
+    ) -> None:
         """Validate required fields for product and subscription data."""
         # Validate product_data required fields
         product_required_fields = {
@@ -2109,7 +2115,7 @@ class ProductManagement(ToolBase):
     tool_type = ToolType.CRUD
     tool_version = "2.0.0"
 
-    def __init__(self, ucm_helper=None):
+    def __init__(self, ucm_helper: Any = None) -> None:
         """Initialize consolidated product management.
 
         Args:
@@ -2119,9 +2125,9 @@ class ProductManagement(ToolBase):
         self.formatter = UnifiedResponseFormatter("manage_products")
         self.validator = ProductValidator(ucm_helper)
 
-    async def _setup_managers(self):
+    async def _setup_managers(self, ctx: Optional["TenantContext"] = None) -> tuple:
         """Setup and initialize managers with client."""
-        client = await self.get_client()
+        client = await self.get_client(ctx=ctx)
         return (
             ProductManager(client),
             ProductEnhancementProcessor(client, self.ucm_helper),
@@ -2140,7 +2146,11 @@ class ProductManagement(ToolBase):
         return None
 
     async def _handle_standard_crud_actions(
-        self, action: str, arguments: Dict[str, Any], product_manager: ProductManager
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        product_manager: ProductManager,
+        ctx: Optional["TenantContext"] = None,
     ) -> Optional[List[Union[TextContent, ImageContent, EmbeddedResource]]]:
         """Handle standard CRUD actions: list, get, create, update, delete."""
         if action == "list":
@@ -2169,7 +2179,7 @@ class ProductManagement(ToolBase):
 
         elif action in ["create", "update", "delete"]:
             # Get enhancement processor for unified create functionality
-            client = await self.get_client()
+            client = await self.get_client(ctx=ctx)
             enhancement_processor = ProductEnhancementProcessor(client, self.ucm_helper)
             return await self._handle_crud_with_dry_run(
                 action, arguments, product_manager, enhancement_processor
@@ -2641,12 +2651,16 @@ class ProductManagement(ToolBase):
         )
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle product management actions using focused handler methods."""
         try:
             # Setup managers
-            product_manager, enhancement_processor, hierarchy_manager = await self._setup_managers()
+            product_manager, enhancement_processor, hierarchy_manager = await self._setup_managers(ctx=ctx)
 
             # Handle introspection actions
             result = await self._handle_introspection_actions(action)
@@ -2654,7 +2668,7 @@ class ProductManagement(ToolBase):
                 return result
 
             # Handle standard CRUD actions
-            result = await self._handle_standard_crud_actions(action, arguments, product_manager)
+            result = await self._handle_standard_crud_actions(action, arguments, product_manager, ctx=ctx)
             if result is not None:
                 return result
             elif action == "create":
@@ -3079,18 +3093,12 @@ class ProductManagement(ToolBase):
 
         except ToolError as e:
             logger.error(f"Tool error in manage_products: {e}")
-            # Format ToolError with detailed guidance for agents
-            from ..common.error_handling import format_structured_error
-
-            formatted_error_text = format_structured_error(e, include_debug_info=False)
-            return [TextContent(type="text", text=formatted_error_text)]
+            raise e
         except ReveniumAPIError as e:
             logger.error(f"Revenium API error in manage_products: {e}")
-            # Re-raise ReveniumAPIError to be handled by standardized_tool_execution
             raise e
         except Exception as e:
             logger.error(f"Unexpected error in manage_products: {e}")
-            # Re-raise Exception to be handled by standardized_tool_execution
             raise e
 
     async def _handle_get_capabilities(

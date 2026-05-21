@@ -4,15 +4,23 @@ This module provides the single, unified base class for all MCP tools, eliminati
 the dual hierarchy and reducing abstraction layers.
 """
 
-import logging
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, List, Optional, TYPE_CHECKING, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
+from loguru import logger
+
+from ..auth.auth_mode import read_auth_mode
+from ..auth.config_factory import AuthConfigFactory
+from ..auth.claims_middleware import current_tenant_context
 from ..client import ReveniumClient
 from ..common.error_handling import format_error_response
+from ..log_context import bind_tenant_context, clear_tenant_context
 from ..introspection.metadata import (
     MetadataProvider,
     PerformanceMetrics,
@@ -23,9 +31,6 @@ from ..introspection.metadata import (
     ToolType,
     UsagePattern,
 )
-
-logger = logging.getLogger(__name__)
-
 
 class ToolBase(ABC, MetadataProvider):
     """Unified base class for all MCP tools with metadata provider capabilities.
@@ -118,12 +123,21 @@ class ToolBase(ABC, MetadataProvider):
 
         return bool(self.ucm_helper)
 
-    async def get_client(self) -> ReveniumClient:
+    async def get_client(self, ctx: Optional["TenantContext"] = None) -> ReveniumClient:
         """Get or create a Revenium API client.
 
+        Args:
+            ctx: Optional tenant context. When provided, builds a fresh client
+                scoped to that context (no caching, prevents tenant leakage).
+                When None, falls back to the cached env-based client (legacy).
+
         Returns:
-            Revenium client instance
+            Revenium client instance.
         """
+        if ctx is not None:
+            config = AuthConfigFactory.from_tenant_context(ctx)
+            return ReveniumClient(auth_config=config)
+
         if self.client is None:
             self.client = ReveniumClient()
         return self.client
@@ -248,13 +262,19 @@ class ToolBase(ABC, MetadataProvider):
 
     @abstractmethod
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle a tool action.
 
         Args:
             action: Action to perform
             arguments: Action arguments
+            ctx: Optional tenant context for per-request auth (multi-tenant mode).
+                When None, the tool uses the env-based singleton (legacy mode).
 
         Returns:
             Tool response
@@ -262,35 +282,59 @@ class ToolBase(ABC, MetadataProvider):
         pass
 
     async def execute(
-        self, action: str, **kwargs
+        self,
+        action: str,
+        *,
+        ctx: Optional["TenantContext"] = None,
+        **kwargs,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Execute the tool with the given action and parameters.
 
         Args:
             action: Action to perform
+            ctx: Optional tenant context for per-request auth (multi-tenant mode).
+                When None, the tool uses the env-based singleton (legacy mode).
             **kwargs: Action parameters
 
         Returns:
             Tool response
         """
+        # Auth guard runs BEFORE bind_tenant_context and the error-handling
+        # try/except so that a PermissionError propagates to the caller
+        # (FastMCP middleware) instead of being swallowed as a tool error
+        # response, and so we don't bind logging context for a request that
+        # is about to be rejected.
+        if ctx is None:
+            # Fallback to the ContextVar populated by TenantContextMiddleware
+            # (clerk mode). In env mode the ContextVar stays empty and ctx
+            # remains None, preserving Phase 1's cached-self.client behavior.
+            ctx = current_tenant_context()
+            if ctx is None and read_auth_mode() == "clerk":
+                # Fail closed: in clerk mode the middleware must have run,
+                # otherwise we would silently fall back to the env-mode
+                # cached client and leak cross-tenant data.
+                raise PermissionError(
+                    "Tenant context unavailable — TenantContextMiddleware did not run"
+                )
+
+        tokens = bind_tenant_context(ctx)
         start_time = datetime.now()
         success = False
 
         try:
-            # Check UCM status when tool is actually used (lazy evaluation)
             self._check_ucm_status()
 
             logger.info(f"Executing {self.tool_name} action: {action}")
-            result = await self.handle_action(action, kwargs)
+            result = await self.handle_action(action, kwargs, ctx=ctx)
             success = True
             return result
         except Exception as e:
             logger.error(f"Error in {self.tool_name} action {action}: {e}")
             return self.format_error_response(e, f"{self.tool_name}.{action}")
         finally:
-            # Update performance metrics
             execution_time = (datetime.now() - start_time).total_seconds() * 1000
             await self.update_performance_metrics(execution_time, success)
+            clear_tenant_context(tokens)
 
     async def update_performance_metrics(self, execution_time: float, success: bool):
         """Update performance metrics for this tool execution.

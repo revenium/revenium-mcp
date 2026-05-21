@@ -165,14 +165,36 @@ isort src/ tests/
 ### Linting
 
 ```bash
-# Run all linters
+# Style/lint
 flake8 src/
-mypy src/
-pylint src/
+ruff check src/ tests/
 
-# Fix common issues automatically
-autopep8 --in-place --recursive src/
+# Mypy regression gate (the type-check command CI runs)
+uv run --extra dev python scripts/check_mypy_regressions.py
+
+# Syntax smoke check (catches malformed merges; not a type gate)
+python -m compileall -q src
 ```
+
+#### Mypy posture
+
+The repo's `[tool.mypy]` config is strict (`disallow_untyped_defs`,
+`warn_return_any`, etc.) but the codebase carries a large pre-existing type
+error backlog. Running raw `mypy src/` is therefore **expected to fail** on
+current `main` until the BACK-1271 cleanup epic is complete.
+
+The short-term gate is `scripts/check_mypy_regressions.py`. It diffs the
+current mypy output against `scripts/mypy-baseline.txt` and only fails when
+new errors are introduced — existing backlog errors do not block merges.
+
+To regenerate the baseline after intentional improvements:
+
+```bash
+uv run --extra dev python scripts/check_mypy_regressions.py --update
+```
+
+`compileall` is a syntax-only smoke check (catches malformed merge conflict
+resolution and similar) and does **not** validate types.
 
 ## Architecture Guidelines
 
@@ -346,9 +368,14 @@ git commit -m "docs(README): clarify AI routing optional feature"
    black src/ tests/
    isort src/ tests/
 
-   # Run linters (some existing code may have issues - focus on your changes)
+   # Style/lint
    flake8 src/
-   mypy src/
+   ruff check src/ tests/
+
+   # Mypy regression gate (raw `mypy src/` is expected to fail until the
+   # BACK-1271 cleanup epic completes — use the gate to confirm your change
+   # does not introduce new type errors)
+   uv run --extra dev python scripts/check_mypy_regressions.py
 
    # Run tests
    pytest

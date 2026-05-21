@@ -59,7 +59,7 @@ class CircuitBreaker:
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.failure_count = 0
-        self.last_failure_time = 0
+        self.last_failure_time: float = 0.0
         self.state = "closed"  # closed, open, half_open
 
     def is_healthy(self) -> bool:
@@ -101,7 +101,7 @@ class RateLimiter:
             requests_per_minute: Maximum requests allowed per minute
         """
         self.requests_per_minute = requests_per_minute
-        self.tokens = requests_per_minute
+        self.tokens: float = float(requests_per_minute)
         self.last_refill = time.time()
         self.lock = asyncio.Lock()
 
@@ -258,17 +258,18 @@ class AIClient:
         try:
             # Use OpenAI SDK with Revenium middleware
             # Run synchronous OpenAI call in thread pool to maintain async interface
+            create_kwargs: Dict[str, Any] = {
+                "model": self.config.model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": self.config.max_tokens,
+                "temperature": self.config.temperature,
+                "response_format": {"type": "json_object"},
+                "usage_metadata": usage_metadata,
+            }
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,
-                lambda: self.openai_client.chat.completions.create(
-                    model=self.config.model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=self.config.max_tokens,
-                    temperature=self.config.temperature,
-                    response_format={"type": "json_object"},
-                    usage_metadata=usage_metadata,
-                ),
+                lambda: self.openai_client.chat.completions.create(**create_kwargs),
             )
 
             # Track usage (the middleware will also track this)

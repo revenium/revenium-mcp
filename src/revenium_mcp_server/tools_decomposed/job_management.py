@@ -7,7 +7,10 @@ ROI, conversion funnels, and reporting outcomes.
 import asyncio
 import json
 import time
-from typing import Any, Dict, List, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -358,11 +361,15 @@ class JobManagement(ToolBase):
     tool_version = "1.0.0"
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle job management actions."""
         try:
-            client = await self.get_client()
+            client = await self.get_client(ctx=ctx)
             job_manager = JobManager(client)
 
             # --- Meta-actions ---

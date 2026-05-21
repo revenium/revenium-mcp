@@ -153,7 +153,8 @@ class TestAuthEnvelopeIs401Equivalent:
         # monkeypatch so pytest reverts the singleton even if the test body
         # raises between setup and the implicit teardown.
         monkeypatch.setattr(ConfigManager, "_instance", None)
-        monkeypatch.setattr(ConfigManager, "_config", None)
+        cm = ConfigManager()
+        cm._configs.clear()
 
         client = ReveniumClient()
 
@@ -173,3 +174,90 @@ class TestAuthEnvelopeIs401Equivalent:
         # machine-checked.
         assert "REVENIUM_API_KEY" not in str(exc.value.suggestions)
         assert_no_framework_leak(exc.value.message)
+
+
+class TestAuthScopeUnresolvedIsDistinguishable:
+    @pytest.mark.asyncio
+    async def test_api_key_present_team_scope_unresolved_returns_distinct_envelope(
+        self, monkeypatch
+    ):
+        from src.revenium_mcp_server.auth import AuthenticationError
+        from src.revenium_mcp_server import client as client_module
+        from src.revenium_mcp_server.client import ReveniumClient
+        from src.revenium_mcp_server.common.error_handling import (
+            ErrorCodes,
+            ToolError,
+        )
+
+        def fake_get_auth_config():
+            raise AuthenticationError(
+                "REVENIUM_TEAM_ID environment variable is required or could not be auto-discovered"
+            )
+
+        monkeypatch.setattr(client_module, "get_auth_config", fake_get_auth_config)
+
+        revenium_client = ReveniumClient()
+
+        with pytest.raises(ToolError) as exc:
+            await revenium_client.get_jobs(page=0, size=20)
+
+        assert exc.value.error_code == ErrorCodes.AUTH_SCOPE_UNRESOLVED
+        assert exc.value.error_code != ErrorCodes.UNAUTHORIZED
+        assert "team scope" in exc.value.message.lower()
+        assert "REVENIUM_TEAM_ID environment variable is required" not in exc.value.message
+        assert "could not be auto-discovered" not in exc.value.message
+        suggestion_blob = str(exc.value.suggestions)
+        assert "Retry" in suggestion_blob or "retry" in suggestion_blob
+
+    @pytest.mark.asyncio
+    async def test_unknown_auth_error_defaults_to_unauthorized(self, monkeypatch):
+        """Any AuthenticationError that does not positively identify as a
+        team-scope failure must fall back to UNAUTHORIZED rather than
+        misclassify as AUTH_SCOPE_UNRESOLVED. Guards against a future auth
+        error (e.g. invalid key format, discovery network failure) silently
+        emitting misleading retry guidance."""
+        from src.revenium_mcp_server.auth import AuthenticationError
+        from src.revenium_mcp_server import client as client_module
+        from src.revenium_mcp_server.client import ReveniumClient
+        from src.revenium_mcp_server.common.error_handling import (
+            ErrorCodes,
+            ToolError,
+        )
+
+        def fake_get_auth_config():
+            raise AuthenticationError("Unexpected new auth error category")
+
+        monkeypatch.setattr(client_module, "get_auth_config", fake_get_auth_config)
+
+        revenium_client = ReveniumClient()
+
+        with pytest.raises(ToolError) as exc:
+            await revenium_client.get_jobs(page=0, size=20)
+
+        assert exc.value.error_code == ErrorCodes.UNAUTHORIZED
+        assert exc.value.error_code != ErrorCodes.AUTH_SCOPE_UNRESOLVED
+
+    @pytest.mark.asyncio
+    async def test_api_key_missing_keeps_unauthorized_envelope(self, monkeypatch):
+        from src.revenium_mcp_server.auth import AuthenticationError
+        from src.revenium_mcp_server import client as client_module
+        from src.revenium_mcp_server.client import ReveniumClient
+        from src.revenium_mcp_server.common.error_handling import (
+            ErrorCodes,
+            ToolError,
+        )
+
+        def fake_get_auth_config():
+            raise AuthenticationError(
+                "REVENIUM_API_KEY environment variable is required"
+            )
+
+        monkeypatch.setattr(client_module, "get_auth_config", fake_get_auth_config)
+
+        revenium_client = ReveniumClient()
+
+        with pytest.raises(ToolError) as exc:
+            await revenium_client.get_jobs(page=0, size=20)
+
+        assert exc.value.error_code == ErrorCodes.UNAUTHORIZED
+        assert exc.value.error_code != ErrorCodes.AUTH_SCOPE_UNRESOLVED

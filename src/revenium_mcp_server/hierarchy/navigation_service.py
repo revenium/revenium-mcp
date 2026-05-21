@@ -40,13 +40,10 @@ class HierarchyPath:
 class HierarchyNavigationService:
     """Service for navigating relationships in the Products → Subscriptions → Credentials hierarchy."""
 
-    def __init__(self, client: Optional[ReveniumClient] = None):
-        """Initialize the hierarchy navigation service.
-
-        Args:
-            client: ReveniumClient instance for API calls
-        """
-        self.client = client or ReveniumClient()
+    def __init__(self, client: ReveniumClient):
+        if client is None:
+            raise ValueError("client is required")
+        self.client = client
         self._cache = {}
         self._cache_ttl = timedelta(minutes=2)  # Cache for 2 minutes
         self._last_cache_clear = datetime.now()
@@ -692,11 +689,12 @@ class HierarchyNavigationService:
 _hierarchy_navigation_service = None
 
 
-def get_hierarchy_navigation_service() -> HierarchyNavigationService:
-    """Get the global hierarchy navigation service instance (lazy initialization)."""
+def get_hierarchy_navigation_service(client: Optional[ReveniumClient] = None) -> HierarchyNavigationService:
+    if client is not None:
+        return HierarchyNavigationService(client)
     global _hierarchy_navigation_service
     if _hierarchy_navigation_service is None:
-        _hierarchy_navigation_service = HierarchyNavigationService()
+        _hierarchy_navigation_service = HierarchyNavigationService(ReveniumClient())
     return _hierarchy_navigation_service
 
 

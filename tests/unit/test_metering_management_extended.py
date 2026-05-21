@@ -77,12 +77,12 @@ class TestHandleActionSubmitTransaction:
 
     @pytest.mark.asyncio
     async def test_submit_with_optional_fields(self):
-        """Submit with subscriber, organization_id, and other optional fields."""
+        """Submit with subscriber, organization_name, and other optional fields."""
         mgmt, client = _make_mgmt_with_client()
         args = {
             **VALID_TX,
-            "organization_id": "org_abc",
-            "product_id": "prod_123",
+            "organization_name": "org_abc",
+            "product_name": "prod_123",
             "task_type": "analysis",
             "agent": "TestAgent",
             "trace_id": "trace_001",
@@ -115,7 +115,7 @@ class TestHandleActionSubmitTransaction:
         call_args = client.post.call_args
         payload = call_args[1]["data"] if "data" in (call_args[1] or {}) else call_args[0][1] if len(call_args[0]) > 1 else None
         if payload:
-            assert "organizationId" in payload
+            assert "organizationName" in payload
             assert "subscriber" in payload
 
     @pytest.mark.asyncio
@@ -125,7 +125,7 @@ class TestHandleActionSubmitTransaction:
         args = {
             **VALID_TX,
             "dry_run": True,
-            "organization_id": "org_abc",
+            "organization_name": "org_abc",
             "subscriber": {"id": "sub_1", "email": "a@b.com", "credential": {"name": "key"}},
         }
         with patch.object(
@@ -456,10 +456,8 @@ class TestListAiModelsTotalCount:
         fake_client = MagicMock()
         fake_client.get_ai_models = AsyncMock(return_value=api_response)
 
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient",
-            return_value=fake_client,
-        ):
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = fake_client
             result = await mgmt._handle_list_ai_models({"page": 0, "size": page_size})
 
         text = result[0].text

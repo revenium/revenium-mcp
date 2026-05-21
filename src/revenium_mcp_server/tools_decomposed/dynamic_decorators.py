@@ -6,7 +6,7 @@ need for manual synchronization across multiple locations.
 """
 
 import logging
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 from fastmcp import FastMCP
 
@@ -14,8 +14,10 @@ from .tool_registry import get_tool_description
 
 logger = logging.getLogger(__name__)
 
+F = TypeVar("F", bound=Callable[..., Any])
 
-def dynamic_mcp_tool(tool_name: str):
+
+def dynamic_mcp_tool(tool_name: str) -> Callable[[F], F]:
     """Decorator factory that creates @mcp.tool with dynamic description.
 
     This decorator factory creates an @mcp.tool decorator that automatically
@@ -35,37 +37,21 @@ def dynamic_mcp_tool(tool_name: str):
             return await standardized_tool_execution("manage_alerts", action, **kwargs)
     """
 
-    def decorator(func: Callable) -> Callable:
-        """Apply @mcp.tool with dynamic description to function.
-
-        Args:
-            func: Function to decorate
-
-        Returns:
-            Decorated function with @mcp.tool applied
-        """
+    def decorator(func: F) -> F:
         try:
-            # Get description from tool class registry
             description = get_tool_description(tool_name)
-
-            # Set function docstring for MCP protocol compliance
             func.__doc__ = description
-
-            # Apply FastMCP @mcp.tool decorator
-            # Note: This assumes 'mcp' is available in the calling scope
-            # The actual decorator will be applied when this is used in enhanced_server.py
-            func._dynamic_mcp_description = description
-            func._dynamic_mcp_tool_name = tool_name
+            func._dynamic_mcp_description = description  # type: ignore[attr-defined]
+            func._dynamic_mcp_tool_name = tool_name  # type: ignore[attr-defined]
 
             logger.debug(f"Dynamic description set for {tool_name}: {description}")
             return func
 
         except Exception as e:
-            # Graceful fallback - don't break tool registration
             fallback_description = f"Tool: {tool_name} (description unavailable)"
             func.__doc__ = fallback_description
-            func._dynamic_mcp_description = fallback_description
-            func._dynamic_mcp_tool_name = tool_name
+            func._dynamic_mcp_description = fallback_description  # type: ignore[attr-defined]
+            func._dynamic_mcp_tool_name = tool_name  # type: ignore[attr-defined]
 
             logger.warning(f"Could not get dynamic description for {tool_name}: {e}")
             logger.warning(f"Using fallback description: {fallback_description}")
@@ -98,14 +84,14 @@ def apply_mcp_tool_decorator(mcp_instance: FastMCP, func: Callable) -> Any:
         return func
 
 
-def create_standardized_tool_execution():
+def create_standardized_tool_execution() -> Callable[..., Any]:
     """Create standardized tool execution function for reduced code duplication.
 
     Returns:
         Async function that handles standardized tool execution pattern
     """
 
-    async def standardized_tool_execution(tool_name: str, action: str, **kwargs) -> Any:
+    async def standardized_tool_execution(tool_name: str, action: str, **kwargs: Any) -> Any:
         """Execute tool action using standardized pattern.
 
         This function provides a consistent execution pattern for all tools,

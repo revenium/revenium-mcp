@@ -36,10 +36,10 @@ class OnboardingDetectionService:
     first-time user detection and onboarding state management.
     """
 
+    _DEFAULT_TENANT = "_default_"
+
     def __init__(self):
-        """Initialize the onboarding detection service."""
-        self._cache_checked = False
-        self._last_detection_result: Optional[OnboardingState] = None
+        self._detection_results: Dict[str, OnboardingState] = {}
 
     async def detect_first_time_user(self) -> bool:
         """Detect if this is a first-time user.
@@ -141,7 +141,7 @@ class OnboardingDetectionService:
             logger.warning(f"📁 Unexpected error checking cache: {e}")
             return False
 
-    async def get_onboarding_state(self) -> OnboardingState:
+    async def get_onboarding_state(self, team_id: str = _DEFAULT_TENANT) -> OnboardingState:
         """Get comprehensive onboarding state.
 
         Returns:
@@ -176,7 +176,7 @@ class OnboardingDetectionService:
             timestamp=datetime.now(timezone.utc),
         )
 
-        self._last_detection_result = state
+        self._detection_results[team_id] = state
         logger.debug(
             f"📋 Onboarding state: first_time={is_first_time}, cache_exists={cache_exists}"
         )
@@ -335,13 +335,8 @@ class OnboardingDetectionService:
 
         return recommendations
 
-    def get_last_detection_result(self) -> Optional[OnboardingState]:
-        """Get the last detection result without re-running detection.
-
-        Returns:
-            Last OnboardingState result or None if not yet run
-        """
-        return self._last_detection_result
+    def get_last_detection_result(self, team_id: str = _DEFAULT_TENANT) -> Optional[OnboardingState]:
+        return self._detection_results.get(team_id)
 
     async def mark_onboarding_completed(self) -> bool:
         """Mark onboarding as completed by ensuring cache exists.
@@ -366,10 +361,8 @@ class OnboardingDetectionService:
                     await config_store.get_configuration()
 
                     # Verify auto-discovery actually completed
-                    if (
-                        config_store._discovered_config
-                        and config_store._discovered_config.has_required_fields()
-                    ):
+                    discovered = config_store._discovered_configs.get(config_store._DEFAULT_TENANT)
+                    if discovered and discovered.has_required_fields():
                         logger.info(
                             f"✅ Auto-discovery completed for cache creation on attempt {attempt + 1}"
                         )

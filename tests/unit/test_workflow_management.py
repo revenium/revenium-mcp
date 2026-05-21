@@ -15,6 +15,16 @@ from src.revenium_mcp_server.tools_decomposed.workflow_management import (
 from src.revenium_mcp_server.common.error_handling import ToolError
 
 
+@pytest.fixture(autouse=True)
+def _clear_active_workflows():
+    """active_workflows lives at the class level (BACK-1314) so it survives
+    across WorkflowManager instances within a process. Clear between tests
+    to keep tests independent."""
+    WorkflowManager.active_workflows.clear()
+    yield
+    WorkflowManager.active_workflows.clear()
+
+
 @pytest.fixture
 def wf_tool():
     """Create a WorkflowManagement instance."""
@@ -107,6 +117,62 @@ class TestHandleActionRouting:
         text = result[0].text
         assert "DRY RUN" in text
         assert "wf_test" in text
+
+    @pytest.mark.asyncio
+    async def test_start_dry_run_rejects_invalid_workflow_type(self, wf_tool):
+        """Dry-run must mirror live-path validation for invalid workflow_type."""
+        with pytest.raises(ToolError) as exc_info:
+            await wf_tool.handle_action(
+                "start",
+                {"workflow_type": "BAD_TYPE", "context": {}, "dry_run": True},
+            )
+        assert "BAD_TYPE" in str(exc_info.value) or "Invalid workflow type" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_start_dry_run_rejects_missing_required_context(self, wf_tool):
+        """Dry-run must mirror live-path required-context validation."""
+        with pytest.raises(ToolError) as exc_info:
+            await wf_tool.handle_action(
+                "start",
+                {
+                    "workflow_type": "customer_onboarding",
+                    "context": {},
+                    "dry_run": True,
+                },
+            )
+        assert "Missing required context" in str(exc_info.value)
+
+
+class TestWorkflowManagerSharedState:
+    """active_workflows is shared across WorkflowManager instances within
+    a process so the start -> get / next_step / complete_step contract
+    holds across separate MCP calls handled by fresh tool instances."""
+
+    @pytest.mark.asyncio
+    async def test_workflow_id_resolvable_from_independent_instance(self):
+        producer = WorkflowManager()
+        wf = await producer.start_workflow(
+            {
+                "workflow_type": "customer_onboarding",
+                "context": {
+                    "customer_email": "x@y.com",
+                    "organization_name": "Acme",
+                },
+            }
+        )
+        consumer = WorkflowManager()
+        retrieved = await consumer.get_workflow({"workflow_id": wf["id"]})
+        assert retrieved["id"] == wf["id"]
+
+    @pytest.mark.asyncio
+    async def test_list_shows_workflow_started_by_other_instance(self):
+        producer = WorkflowManager()
+        wf = await producer.start_workflow(
+            {"workflow_type": "generic", "context": {}}
+        )
+        consumer = WorkflowManager()
+        listed = await consumer.list_workflows({})
+        assert wf["id"] in listed["active_workflows"]
 
 
 class TestWorkflowManagerLifecycle:
@@ -268,6 +334,98 @@ class TestWorkflowManagerLifecycle:
         result = await wf_manager.list_workflows({})
         assert wf["id"] in result["active_workflows"]
         assert result["total_active"] == 1
+
+    @pytest.mark.asyncio
+    async def test_complete_step_on_generic_workflow_does_not_keyerror(self, wf_manager):
+        """Generic workflows must accept complete_step without KeyError on completed_steps."""
+        wf = await wf_manager.start_workflow(
+            {"workflow_type": "generic", "context": {}}
+        )
+        result = await wf_manager.complete_step(
+            {"workflow_id": wf["id"], "step_result": {"ok": True}}
+        )
+        assert result["workflow_id"] == wf["id"]
+        assert result["step_completed"] == 1
+        assert result["total_completed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_list_workflows_honors_page_and_size(self, wf_manager):
+        """list_workflows must slice the active set when page/size are provided."""
+        ids = []
+        for _ in range(5):
+            wf = await wf_manager.start_workflow(
+                {"workflow_type": "generic", "context": {}}
+            )
+            ids.append(wf["id"])
+
+        page0 = await wf_manager.list_workflows({"page": 0, "size": 2})
+        assert page0["active_workflows"] == ids[0:2]
+        assert page0["total_active"] == 5
+
+        page1 = await wf_manager.list_workflows({"page": 1, "size": 2})
+        assert page1["active_workflows"] == ids[2:4]
+
+        page2 = await wf_manager.list_workflows({"page": 2, "size": 2})
+        assert page2["active_workflows"] == ids[4:5]
+
+    @pytest.mark.asyncio
+    async def test_list_workflows_page_without_size_uses_default_size(self, wf_manager):
+        """Passing page without size must NOT silently return the full list."""
+        ids = []
+        for _ in range(25):
+            wf = await wf_manager.start_workflow(
+                {"workflow_type": "generic", "context": {}}
+            )
+            ids.append(wf["id"])
+
+        result = await wf_manager.list_workflows({"page": 1})
+        assert result["total_active"] == 25
+        assert result["active_workflows"] == ids[20:]
+        assert len(result["active_workflows"]) == 5
+
+
+class TestWorkflowIdEntropy:
+    @pytest.mark.asyncio
+    async def test_workflow_id_uses_full_uuid_hex(self, wf_manager):
+        """ID should carry the full 128-bit UUID (32 hex chars), not 8."""
+        import re
+
+        wf = await wf_manager.start_workflow(
+            {"workflow_type": "generic", "context": {}}
+        )
+        assert re.fullmatch(r"wf_[0-9a-f]{32}", wf["id"]), (
+            f"workflow id must be wf_ + 32 hex chars, got {wf['id']!r}"
+        )
+
+
+class TestWorkflowEviction:
+    @pytest.mark.asyncio
+    async def test_active_workflows_capped_with_fifo_eviction(self):
+        """Once active_workflows hits MAX_ACTIVE_WORKFLOWS, the oldest entry
+        must be evicted (FIFO) so memory does not grow unbounded."""
+        manager = WorkflowManager()
+        original_max = WorkflowManager.MAX_ACTIVE_WORKFLOWS
+        WorkflowManager.MAX_ACTIVE_WORKFLOWS = 3
+        try:
+            first = await manager.start_workflow(
+                {"workflow_type": "generic", "context": {}}
+            )
+            second = await manager.start_workflow(
+                {"workflow_type": "generic", "context": {}}
+            )
+            third = await manager.start_workflow(
+                {"workflow_type": "generic", "context": {}}
+            )
+            fourth = await manager.start_workflow(
+                {"workflow_type": "generic", "context": {}}
+            )
+            assert first["id"] not in manager.active_workflows
+            assert second["id"] in manager.active_workflows
+            assert third["id"] in manager.active_workflows
+            assert fourth["id"] in manager.active_workflows
+            assert len(manager.active_workflows) == 3
+        finally:
+            WorkflowManager.MAX_ACTIVE_WORKFLOWS = original_max
 
 
 class TestWorkflowValidator:

@@ -105,7 +105,7 @@ class SimpleMetricsCollector:
         total_queries = len(self.metrics)
         successful_queries = [m for m in self.metrics if m.success]
 
-        success_rate = 0
+        success_rate = 0.0
         if total_queries > 0:
             success_rate = len(successful_queries) / total_queries
 
@@ -137,7 +137,7 @@ class SimpleMetricsCollector:
 
     def _get_routing_method_counts(self) -> Dict[str, int]:
         """Get routing method breakdown."""
-        method_counts = {}
+        method_counts: Dict[str, int] = {}
         for metric in self.metrics:
             method = metric.routing_method.value
             method_counts[method] = method_counts.get(method, 0) + 1
@@ -370,11 +370,11 @@ class SimpleMetricsCollector:
         rule_avg_time: float,
     ) -> Dict[str, Any]:
         """Create comparison metrics dictionary."""
-        success_diff_pct = 0
+        success_diff_pct = 0.0
         if rule_success_rate > 0:
             success_diff_pct = (ai_success_rate - rule_success_rate) / rule_success_rate * 100
 
-        perf_improvement_pct = 0
+        perf_improvement_pct = 0.0
         if rule_avg_time > 0:
             perf_improvement_pct = (rule_avg_time - ai_avg_time) / rule_avg_time * 100
 
@@ -423,7 +423,7 @@ class SimpleMetricsCollector:
         self, ai_metrics: List[RoutingMetrics], rule_metrics: List[RoutingMetrics]
     ) -> List[str]:
         """Check performance comparison recommendations."""
-        recommendations = []
+        recommendations: List[str] = []
         if not ai_metrics or not rule_metrics:
             return recommendations
 

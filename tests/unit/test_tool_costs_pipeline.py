@@ -183,7 +183,7 @@ class TestBusinessAnalyticsToolCostActions:
     """Tests for tool cost actions in BusinessAnalyticsManagement."""
 
     @pytest.fixture
-    def tool(self):
+    def tool(self, monkeypatch):
         t = BusinessAnalyticsManagement(ucm_helper=None)
         mock_simple = MagicMock()
         mock_simple.get_cost_summary = AsyncMock(return_value="summary text")
@@ -198,9 +198,20 @@ class TestBusinessAnalyticsToolCostActions:
         mock_simple.get_tool_costs_by_provider = AsyncMock(return_value="tool costs by provider")
         t.simple_analytics_engine = mock_simple
 
+        # Handlers now construct SimpleAnalyticsEngine per-request via
+        # `engine = SimpleAnalyticsEngine(client)`. Patch the constructor at the
+        # module path the handler imports from so every construction returns the
+        # same mock as `t.simple_analytics_engine`, keeping existing assertions valid.
+        monkeypatch.setattr(
+            "src.revenium_mcp_server.tools_decomposed.business_analytics_management.SimpleAnalyticsEngine",
+            lambda *_a, **_kw: mock_simple,
+        )
+
         mock_spike = MagicMock()
         mock_spike.analyze_temporal_anomalies = AsyncMock(return_value={"anomalies": []})
         t.enhanced_spike_analyzer = mock_spike
+        # Pre-seed the cached client so `await self.get_client(ctx=None)` returns it
+        # without trying to instantiate a real ReveniumClient (which requires env vars).
         t.client = MagicMock()
         return t
 

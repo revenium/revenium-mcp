@@ -18,7 +18,7 @@ class MCPMetadataConfig:
 
     product: str = "MCP"
     agent_type: str = "mcp-server"
-    organization_id: str = "revenium-mcp-server"
+    organization_name: str = "revenium-mcp-server"
     subscription_id: str = "mcp-ai-routing"
     enable_detailed_tracking: bool = True
     include_query_context: bool = True
@@ -36,12 +36,27 @@ class ReveniumMetadataBuilder:
         self.config = config or self._load_default_config()
         logger.debug(f"Metadata builder initialized with config: {self.config}")
 
+    @staticmethod
+    def _resolve_org_name_env() -> str:
+        """Resolve REVENIUM_MCP_ORG_NAME, falling back to deprecated REVENIUM_MCP_ORG_ID with a warning."""
+        new = os.getenv("REVENIUM_MCP_ORG_NAME")
+        if new:
+            return new
+        legacy = os.getenv("REVENIUM_MCP_ORG_ID")
+        if legacy:
+            logger.warning(
+                "REVENIUM_MCP_ORG_ID is deprecated; use REVENIUM_MCP_ORG_NAME. "
+                "Falling back to the legacy value for now."
+            )
+            return legacy
+        return "revenium-mcp-server"
+
     def _load_default_config(self) -> MCPMetadataConfig:
         """Load default configuration from environment variables."""
         return MCPMetadataConfig(
             product=os.getenv("REVENIUM_MCP_PRODUCT", "MCP"),
             agent_type=os.getenv("REVENIUM_MCP_AGENT_TYPE", "mcp-server"),
-            organization_id=os.getenv("REVENIUM_MCP_ORG_ID", "revenium-mcp-server"),
+            organization_name=self._resolve_org_name_env(),
             subscription_id=os.getenv("REVENIUM_MCP_SUBSCRIPTION_ID", "mcp-ai-routing"),
             enable_detailed_tracking=os.getenv("REVENIUM_MCP_DETAILED_TRACKING", "true").lower()
             == "true",
@@ -71,12 +86,12 @@ class ReveniumMetadataBuilder:
         trace_id = session_id or f"mcp-routing-{uuid.uuid4().hex[:12]}"
 
         # Build base metadata
-        metadata = {
+        metadata: Dict[str, Any] = {
             "product": self.config.product,
             "agent": self.config.agent_type,
             "trace_id": trace_id,
             "task_type": f"query-routing-{tool_context}",
-            "organization_id": self.config.organization_id,
+            "organization_name": self.config.organization_name,
             "subscription_id": self.config.subscription_id,
         }
 
@@ -126,12 +141,12 @@ class ReveniumMetadataBuilder:
         trace_id = session_id or f"mcp-execution-{uuid.uuid4().hex[:12]}"
 
         # Build base metadata
-        metadata = {
+        metadata: Dict[str, Any] = {
             "product": self.config.product,
             "agent": self.config.agent_type,
             "trace_id": trace_id,
             "task_type": f"tool-execution-{tool_name}-{action}",
-            "organization_id": self.config.organization_id,
+            "organization_name": self.config.organization_name,
             "subscription_id": self.config.subscription_id,
         }
 
@@ -167,12 +182,12 @@ class ReveniumMetadataBuilder:
         trace_id = session_id or f"mcp-error-{uuid.uuid4().hex[:12]}"
 
         # Build base metadata
-        metadata = {
+        metadata: Dict[str, Any] = {
             "product": self.config.product,
             "agent": self.config.agent_type,
             "trace_id": trace_id,
             "task_type": f"error-handling-{error_type}",
-            "organization_id": self.config.organization_id,
+            "organization_name": self.config.organization_name,
             "subscription_id": self.config.subscription_id,
         }
 
@@ -210,12 +225,12 @@ class ReveniumMetadataBuilder:
         trace_id = session_id or f"mcp-custom-{uuid.uuid4().hex[:12]}"
 
         # Build base metadata
-        metadata = {
+        metadata: Dict[str, Any] = {
             "product": self.config.product,
             "agent": self.config.agent_type,
             "trace_id": trace_id,
             "task_type": task_type,
-            "organization_id": self.config.organization_id,
+            "organization_name": self.config.organization_name,
             "subscription_id": self.config.subscription_id,
         }
 

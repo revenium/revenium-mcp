@@ -11,7 +11,7 @@ Licensed under the MIT License. See LICENSE file for details.
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, List, Optional, Union
+from typing import Any, AsyncGenerator, List, Optional, Union
 
 from dotenv import load_dotenv
 
@@ -39,6 +39,16 @@ from .tools_decomposed.tool_registry import get_tool_description
 
 # Import version information
 from .version import get_package_version
+
+# Centralized AUTH_MODE parser — also re-exported here so existing callers
+# of _read_auth_mode() in this module continue to work without change.
+from .auth.auth_mode import read_auth_mode as _read_auth_mode  # noqa: F401
+from .transport_mode import (
+    read_http_host,
+    read_http_port,
+    read_transport_mode,
+    validate_mode_combination,
+)
 
 
 def _check_app_base_url_drift() -> Optional[str]:
@@ -129,8 +139,46 @@ async def lifespan_manager() -> AsyncGenerator[None, None]:
     logger.info("Shutting down enhanced MCP server")
 
 
-def create_enhanced_server() -> FastMCP:
+def _require_envs(names: list[str]) -> dict[str, str]:
+    """Return a dict of {name: value} for each name, raising if any are missing.
+
+    Args:
+        names: Env var names that must be set and non-empty.
+
+    Returns:
+        Dict mapping each name to its value.
+
+    Raises:
+        ValueError: If any names are missing or empty, listing all of them.
+    """
+    missing = [n for n in names if not (os.getenv(n) or "").strip()]
+    if missing:
+        raise ValueError(
+            f"AUTH_MODE=clerk requires env vars: {', '.join(missing)}"
+        )
+    return {n: os.getenv(n, "").strip() for n in names}
+
+
+def _register_tenant_middleware(mcp: "FastMCP", auth_mode: str) -> None:
+    """Register the TenantContextMiddleware when AUTH_MODE=clerk.
+
+    In env mode this is a no-op so the ContextVar path is not exercised and
+    Phase 1's cached-self.client behavior is preserved.
+    """
+    if auth_mode != "clerk":
+        return
+    from .auth.claims_middleware import TenantContextMiddleware
+    from .auth.tenant_resolver import get_resolver
+
+    mcp.add_middleware(TenantContextMiddleware(get_resolver()))
+
+
+def create_enhanced_server(auth: Optional[Any] = None) -> FastMCP:
     """Create and configure the enhanced MCP server.
+
+    Args:
+        auth: Optional FastMCP auth provider (e.g. OIDCProxy). When None, the
+            server runs without authentication (stdio/env mode).
 
     Returns:
         Configured FastMCP server instance
@@ -175,6 +223,7 @@ def create_enhanced_server() -> FastMCP:
     server_version = get_package_version()
     mcp = FastMCP(
         name=f"Revenium MCP Server v{server_version}",
+        auth=auth,
         instructions="""
 # Enhanced Revenium Platform API MCP Server
 
@@ -301,6 +350,21 @@ async def main() -> None:
     # This ensures all crashes are logged, including initialization failures
     crash_handler = install_crash_logging()
 
+    # Load .env before reading AUTH_MODE or any required envs so that the
+    # documented .env.example workflow works for clerk mode as well.
+    load_dotenv(override=False)
+
+    # Read and validate AUTH_MODE + TRANSPORT_MODE before any server construction.
+    # validate_mode_combination fails fast on invalid pairs (e.g., clerk+stdio).
+    auth_mode = _read_auth_mode()
+    transport_mode = read_transport_mode()
+    validate_mode_combination(auth_mode, transport_mode)
+    logger.info(
+        "Starting MCP server with AUTH_MODE=%s TRANSPORT_MODE=%s",
+        auth_mode,
+        transport_mode,
+    )
+
     # Check if we're in verbose startup mode
     startup_verbose = os.getenv("MCP_STARTUP_VERBOSE", "false").lower() == "true"
 
@@ -308,8 +372,46 @@ async def main() -> None:
         logger.info("Starting Enhanced Revenium Platform API MCP Server with Onboarding Support")
         logger.info(f"Crash logging enabled: {crash_handler.crash_log_file}")
 
+    # Build auth based on AUTH_MODE. Env mode: auth=None (stdio, unchanged).
+    # Clerk mode: validate all required envs, then instantiate OIDCProxy.
+    auth_obj = None
+    clerk_envs: dict[str, str] = {}
+    if auth_mode == "clerk":
+        clerk_envs = _require_envs([
+            "CLERK_DOMAIN",
+            "CLERK_OAUTH_CLIENT_ID",
+            "CLERK_OAUTH_CLIENT_SECRET",
+            "MCP_SERVER_BASE_URL",
+            "REVENIUM_TENANT_ID",
+            "REVENIUM_API_KEY",
+        ])
+        from fastmcp.server.auth.oidc_proxy import OIDCProxy
+        # TEST-ONLY: integration tests can set CLERK_OIDC_CONFIG_URL_OVERRIDE
+        # to point OIDCProxy at a local fake Clerk. Must be https:// (the guard
+        # below rejects plaintext to prevent JWKS substitution attacks).
+        # Never set in production.
+        config_url_override = os.getenv("CLERK_OIDC_CONFIG_URL_OVERRIDE")
+        if config_url_override and not config_url_override.startswith("https://"):
+            raise ValueError(
+                "CLERK_OIDC_CONFIG_URL_OVERRIDE must use https:// "
+                "(plaintext OIDC discovery enables JWKS substitution attacks)"
+            )
+        config_url = config_url_override or (
+            f"https://{clerk_envs['CLERK_DOMAIN']}"
+            "/.well-known/openid-configuration"
+        )
+        auth_obj = OIDCProxy(
+            config_url=config_url,
+            client_id=clerk_envs["CLERK_OAUTH_CLIENT_ID"],
+            client_secret=clerk_envs["CLERK_OAUTH_CLIENT_SECRET"],
+            base_url=clerk_envs["MCP_SERVER_BASE_URL"],
+            required_scopes=["openid", "profile", "email"],
+            algorithm="RS256",
+        )
+
     # Create server
-    mcp = create_enhanced_server()
+    mcp = create_enhanced_server(auth=auth_obj)
+    _register_tenant_middleware(mcp, auth_mode)
 
     # STARTUP CHECK: Validate API key configuration
     api_key = os.getenv("REVENIUM_API_KEY")
@@ -330,10 +432,10 @@ async def main() -> None:
         logger.warning("See: https://github.com/revenium/revenium-mcp#configuration")
         logger.warning("=" * 60)
     else:
-        # API key is set - now validate that it actually works
+        from .log_context import redact_key
+
         if startup_verbose:
-            key_preview = f"{api_key[:15]}..." if len(api_key) > 15 else api_key[:5] + "..."
-            logger.info(f"API Key configured: {key_preview}")
+            logger.info(f"API Key configured: {redact_key(api_key)}")
             if base_url:
                 logger.info(f"Base URL: {base_url}")
             logger.info("Validating API key...")
@@ -365,7 +467,7 @@ async def main() -> None:
                 logger.error("")
                 logger.error("CURRENT CONFIGURATION:")
                 logger.error(f"  REVENIUM_BASE_URL: {validation_result['base_url']}")
-                logger.error(f"  REVENIUM_API_KEY: {api_key[:5]}...{api_key[-5:] if len(api_key) > 10 else ''}")
+                logger.error(f"  REVENIUM_API_KEY: {redact_key(api_key)}")
                 logger.error("")
                 logger.error("TO FIX:")
                 logger.error("1. Verify your API key in the Revenium web console")
@@ -453,48 +555,47 @@ async def main() -> None:
         file=sys.stderr,
     )
 
-    # Run the server with API key warning if needed
-    if api_key_missing_or_invalid:
-        # Monkey patch to show API key warning after FastMCP banner
-        original_run_async = mcp.run_async
-
-        async def run_with_api_key_warning():
-            # Start the server in the background
-            server_task = asyncio.create_task(original_run_async())
-
-            # Wait for FastMCP to display its banner
-            await asyncio.sleep(1.0)
-
-            # Show the critical API key warning after the banner
-            if not api_key:
-                print(
-                    "\n[CRITICAL] REVENIUM_API_KEY not found - server will not work until this is set.",
-                    file=sys.stderr,
-                )
-                print(
-                    "           The key can be found within the Revenium web console on the API Keys page.\n",
-                    file=sys.stderr,
-                )
-            else:
-                print(
-                    "\n[CRITICAL] REVENIUM_API_KEY validation failed - server will not work correctly.",
-                    file=sys.stderr,
-                )
-                print(
-                    "           Check that REVENIUM_BASE_URL matches your API key's environment.",
-                    file=sys.stderr,
-                )
-                print(
-                    "           Most common issue: API key from one environment used with different BASE_URL.\n",
-                    file=sys.stderr,
-                )
-
-            # Wait for the server to complete
-            await server_task
-
-        await run_with_api_key_warning()
+    if transport_mode == "http":
+        host = read_http_host()
+        port = read_http_port()
+        logger.info("Starting HTTP transport on %s:%s", host, port)
+        await mcp.run_async(transport="http", host=host, port=port)
     else:
-        await mcp.run_async()
+        # stdio path: current behavior + API-key-warning monkey-patch.
+        # Works for both env+stdio (default) and any future stdio modes.
+        if api_key_missing_or_invalid:
+            original_run_async = mcp.run_async
+
+            async def run_with_api_key_warning():
+                server_task = asyncio.create_task(original_run_async())
+                await asyncio.sleep(1.0)
+                if not api_key:
+                    print(
+                        "\n[CRITICAL] REVENIUM_API_KEY not found - server will not work until this is set.",
+                        file=sys.stderr,
+                    )
+                    print(
+                        "           The key can be found within the Revenium web console on the API Keys page.\n",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "\n[CRITICAL] REVENIUM_API_KEY validation failed - server will not work correctly.",
+                        file=sys.stderr,
+                    )
+                    print(
+                        "           Check that REVENIUM_BASE_URL matches your API key's environment.",
+                        file=sys.stderr,
+                    )
+                    print(
+                        "           Most common issue: API key from one environment used with different BASE_URL.\n",
+                        file=sys.stderr,
+                    )
+                await server_task
+
+            await run_with_api_key_warning()
+        else:
+            await mcp.run_async()
 
 
 def main_sync() -> None:

@@ -655,23 +655,45 @@ class TestGetAlert:
         assert "not found" in text.lower()
 
     @pytest.mark.asyncio
-    async def test_get_alert_other_status_codes_propagate_through_decorator(self, manager):
+    async def test_get_alert_other_status_codes_propagate_as_exception(self, manager):
         """A 502 (or any non-403/404/500) is not folded into AlertNotFoundError;
-        the decorator's catch-all renders 'Unexpected Error' for genuinely
-        unexpected upstream failures, keeping them distinguishable from a
-        clean 'not found' case."""
+        it propagates as ReveniumAPIError so the MCP envelope reports isError=true."""
         client = MagicMock()
         client.get_alert_by_id = AsyncMock(
             side_effect=ReveniumAPIError("bad gateway", status_code=502)
         )
 
-        result = await manager.get_alert(client, "alert-id")
+        with pytest.raises(ReveniumAPIError) as exc_info:
+            await manager.get_alert(client, "alert-id")
 
-        assert len(result) == 1
-        # The decorator's catch-all branch renders "Unexpected Error" for
-        # uncategorized failures — explicitly opposite of the 403/404/500
-        # case above so the two paths don't accidentally collapse.
-        assert "Unexpected Error" in result[0].text
+        assert exc_info.value.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_get_alert_unauthorized_tool_error_propagates_not_invalid_value(
+        self, manager
+    ):
+        """UnauthorizedToolError must propagate through the decorator (it
+        subclasses ValueError via AuthenticationError, and pre-fix matched
+        the decorator's `except ValueError` branch and surfaced as
+        'Invalid Value' TextContent with isError=false)."""
+        from src.revenium_mcp_server.common.auth_response_envelope import (
+            auth_error_to_tool_error,
+        )
+        from src.revenium_mcp_server.common.error_handling import (
+            ErrorCodes,
+            ToolError,
+        )
+
+        client = MagicMock()
+        client.get_alert_by_id = AsyncMock(
+            side_effect=auth_error_to_tool_error("missing credential")
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await manager.get_alert(client, "alert-id")
+
+        assert exc_info.value.error_code == ErrorCodes.UNAUTHORIZED
+        assert "Invalid Value" not in exc_info.value.message
 
 
 class TestUpdateAlert:

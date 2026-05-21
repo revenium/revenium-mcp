@@ -228,8 +228,8 @@ STANDARD_AI_METERING_ELEMENTS = [
     ),
     # Customer Attribution Elements
     MeteringElementTemplate(
-        name="organizationId",
-        description="Organization Identifier",
+        name="organizationName",
+        description="Organization Name",
         category="metadata",
         type=MeteringElementType.STRING,
         default_value="",
@@ -237,8 +237,8 @@ STANDARD_AI_METERING_ELEMENTS = [
         example_values=["acme-corp", "enterprise-client", "startup-inc"],
     ),
     MeteringElementTemplate(
-        name="productId",
-        description="Product Identifier",
+        name="productName",
+        description="Product Name",
         category="metadata",
         type=MeteringElementType.STRING,
         default_value="",

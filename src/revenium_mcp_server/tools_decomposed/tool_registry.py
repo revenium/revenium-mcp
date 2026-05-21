@@ -100,7 +100,7 @@ def _get_tool_registry() -> Dict[str, Type[ToolBase]]:
         This function will be populated with imports as we convert each tool.
         Starting with imports for converted tools only.
     """
-    registry = {}
+    registry: Dict[str, Type[ToolBase]] = {}
 
     # Import and register converted tool classes
     # Note: We'll add imports here as we convert each tool
@@ -251,7 +251,7 @@ def validate_tool_descriptions() -> Dict[str, Any]:
         Validation report with any issues found
     """
     tool_registry = _get_tool_registry()
-    validation_report = {
+    validation_report: Dict[str, Any] = {
         "total_tools": len(tool_registry),
         "valid_tools": 0,
         "missing_description": [],

@@ -48,6 +48,7 @@ class ErrorCodes:
     # the client boundary so callers see a structured 401-shape error instead
     # of the raw "REVENIUM_API_KEY environment variable is required" message.
     UNAUTHORIZED = "UNAUTHORIZED"
+    AUTH_SCOPE_UNRESOLVED = "AUTH_SCOPE_UNRESOLVED"
 
     # UCM errors
     UCM_ERROR = "UCM_ERROR"
@@ -493,9 +494,10 @@ def format_error_response(
                 )
                 return _format_api_validation_error(synthetic_api_error, context)
 
-    # Generic error formatting for other exceptions
+    from ..log_context import sanitize_error_message
+
     error_text = "**TOOL_ERROR**\n\n"
-    error_text += f"**Message**: {str(error)}\n\n"
+    error_text += f"**Message**: {sanitize_error_message(str(error))}\n\n"
 
     if context:
         error_text += f"**Context**: {context}\n\n"

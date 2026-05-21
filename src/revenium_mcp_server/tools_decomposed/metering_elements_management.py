@@ -5,7 +5,10 @@ following the proven alert/source/customer/product/workflow/metering management 
 """
 
 import json
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -479,11 +482,15 @@ class MeteringElementsManagement(ToolBase):
         }
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle metering elements management actions."""
         try:
-            client = await self.get_client()
+            client = await self.get_client(ctx=ctx)
             # Initialize elements manager with client for PartialUpdateHandler support
             elements_manager = MeteringElementsManager(client)
 
@@ -620,15 +627,36 @@ class MeteringElementsManagement(ToolBase):
                     ]
 
                 result = await elements_manager.create_from_template(client, arguments)
-                # Format template create response consistently
-                return self.formatter.format_success_response(
-                    message=f"Metering element created from template '{arguments.get('template_name', 'N/A')}'",
-                    data=result,
-                    next_steps=[
-                        f"Use 'get' action with element_id='{result.get('id')}' to view details",
+                template_name = arguments.get("template_name", "N/A")
+                element_id = result.get("id")
+                element_name = result.get("name", template_name)
+
+                if result.get("isSystem"):
+                    message = (
+                        f"Existing system metering element '{element_name}' returned — "
+                        f"the template matched a pre-registered system definition, so no new "
+                        f"element was created"
+                    )
+                    next_steps = [
+                        f"Use 'get' action with element_id='{element_id}' to view details",
+                        (
+                            "System elements cannot be modified — choose a different template "
+                            "name (or use 'create' with custom name) to create a user-scoped element"
+                        ),
+                        "Use 'list' action to see all elements",
+                    ]
+                else:
+                    message = f"Metering element created from template '{template_name}'"
+                    next_steps = [
+                        f"Use 'get' action with element_id='{element_id}' to view details",
                         "Use 'assign_to_source' to connect to data sources",
                         "Use 'update' action to modify the element",
-                    ],
+                    ]
+
+                return self.formatter.format_success_response(
+                    message=message,
+                    data=result,
+                    next_steps=next_steps,
                     action="create_from_template",
                 )
             elif action == "update":

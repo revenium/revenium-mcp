@@ -4,6 +4,7 @@ This package contains shared utilities used across the MCP server.
 Includes validation, pagination, error handling, and formatting utilities.
 """
 
+from .cache_key_factory import CacheKeyFactory
 from .error_handling import (
     StandardErrorBuilder,
     StandardErrorFormatter,
@@ -25,6 +26,8 @@ from .validation import (
 )
 
 __all__ = [
+    # Cache
+    "CacheKeyFactory",
     # Validation
     "InputValidator",
     "ValidationError",

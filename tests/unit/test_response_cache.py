@@ -4,10 +4,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.revenium_mcp_server.auth.tenant_context import TenantContext
 from src.revenium_mcp_server.core.response_cache import (
     ResponseCacheManager,
     cache_response,
 )
+
+_VALID_API_KEY = "abcdef1234567890"
 
 
 # ---------------------------------------------------------------------------
@@ -21,7 +24,7 @@ class TestCacheKeyGeneration:
         key1 = mgr._generate_cache_key("api", "test-data")
         key2 = mgr._generate_cache_key("api", "test-data")
         assert key1 == key2
-        assert key1.startswith("api:")
+        assert "api:" in key1
 
     def test_dict_key_sorted(self):
         mgr = ResponseCacheManager.__new__(ResponseCacheManager)
@@ -36,6 +39,19 @@ class TestCacheKeyGeneration:
         key1 = mgr._generate_cache_key("api", "data")
         key2 = mgr._generate_cache_key("ucm", "data")
         assert key1 != key2
+
+    def test_with_tenant_context(self):
+        mgr = ResponseCacheManager.__new__(ResponseCacheManager)
+        mgr.enabled = True
+        ctx = TenantContext(team_id="team-1", api_key=_VALID_API_KEY, tenant_id="t-9")
+        key = mgr._generate_cache_key("api", "data", ctx)
+        assert key.startswith("team-1:t-9:")
+
+    def test_no_context_prefixed(self):
+        mgr = ResponseCacheManager.__new__(ResponseCacheManager)
+        mgr.enabled = True
+        key = mgr._generate_cache_key("api", "data")
+        assert key.startswith("_no_ctx_::")
 
 
 # ---------------------------------------------------------------------------
@@ -207,3 +223,100 @@ class TestCacheResponseDecorator:
 
         result = await my_async_func(4)
         assert result == 12
+
+
+class TestTenantIsolation:
+
+    def _make_manager(self):
+        mgr = ResponseCacheManager.__new__(ResponseCacheManager)
+        mgr.enabled = True
+        mgr.l1_cache = {}
+        mgr.l2_cache = MagicMock()
+        mgr.l2_cache.get = MagicMock(return_value=None)
+        mgr.l2_cache.set = MagicMock(return_value=True)
+        mgr.l3_cache = MagicMock()
+        mgr.l3_cache.get = MagicMock(return_value=None)
+        mgr.l3_cache.set = MagicMock(return_value=True)
+        mgr.l4_cache = MagicMock()
+        mgr.l4_cache.get = MagicMock(return_value=None)
+        mgr.l4_cache.set = MagicMock(return_value=True)
+        mgr.stats = {
+            "l1_hits": 0, "l1_misses": 0,
+            "l2_hits": 0, "l2_misses": 0,
+            "l3_hits": 0, "l3_misses": 0,
+            "l4_hits": 0, "l4_misses": 0,
+            "total_requests": 0,
+        }
+        return mgr
+
+    @pytest.mark.asyncio
+    async def test_tenant_a_data_not_returned_for_tenant_b(self):
+        mgr = self._make_manager()
+        ctx_a = TenantContext(team_id="team-a", api_key=_VALID_API_KEY, tenant_id="tenant-a")
+        ctx_b = TenantContext(team_id="team-b", api_key=_VALID_API_KEY, tenant_id="tenant-b")
+
+        await mgr.set_cached_response("api", "shared_key", "secret_a", ctx=ctx_a)
+
+        result_b = await mgr.get_cached_response("api", "shared_key", cache_level="l1", ctx=ctx_b)
+        assert result_b is None
+
+        result_a = await mgr.get_cached_response("api", "shared_key", cache_level="l1", ctx=ctx_a)
+        assert result_a == "secret_a"
+
+    @pytest.mark.asyncio
+    async def test_same_team_different_tenant_isolated(self):
+        mgr = self._make_manager()
+        ctx_t1 = TenantContext(team_id="team-x", api_key=_VALID_API_KEY, tenant_id="tenant-1")
+        ctx_t2 = TenantContext(team_id="team-x", api_key=_VALID_API_KEY, tenant_id="tenant-2")
+
+        await mgr.set_cached_response("api", "data", "value-t1", ctx=ctx_t1)
+
+        result_t2 = await mgr.get_cached_response("api", "data", cache_level="l1", ctx=ctx_t2)
+        assert result_t2 is None
+
+        result_t1 = await mgr.get_cached_response("api", "data", cache_level="l1", ctx=ctx_t1)
+        assert result_t1 == "value-t1"
+
+    @pytest.mark.asyncio
+    async def test_no_context_uses_default_namespace(self):
+        mgr = self._make_manager()
+
+        await mgr.set_cached_response("api", "key1", "no_ctx_value")
+        result = await mgr.get_cached_response("api", "key1", cache_level="l1")
+        assert result == "no_ctx_value"
+
+    @pytest.mark.asyncio
+    async def test_no_context_isolated_from_tenant(self):
+        mgr = self._make_manager()
+        ctx = TenantContext(team_id="team-z", api_key=_VALID_API_KEY)
+
+        await mgr.set_cached_response("api", "key1", "tenant_value", ctx=ctx)
+
+        result_no_ctx = await mgr.get_cached_response("api", "key1", cache_level="l1")
+        assert result_no_ctx is None
+
+    @pytest.mark.asyncio
+    async def test_key_generation_includes_tenant_prefix(self):
+        mgr = self._make_manager()
+        ctx = TenantContext(team_id="team-1", api_key=_VALID_API_KEY, tenant_id="tenant-9")
+
+        key = mgr._generate_cache_key("api", "test-data", ctx)
+        assert key.startswith("team-1:tenant-9:")
+
+    @pytest.mark.asyncio
+    async def test_key_generation_no_context(self):
+        mgr = self._make_manager()
+
+        key = mgr._generate_cache_key("api", "test-data")
+        assert key.startswith("_no_ctx_::")
+
+    @pytest.mark.asyncio
+    async def test_stats_still_track_correctly_with_tenant(self):
+        mgr = self._make_manager()
+        ctx = TenantContext(team_id="team-1", api_key=_VALID_API_KEY)
+
+        await mgr.set_cached_response("api", "k", "v", ctx=ctx)
+        await mgr.get_cached_response("api", "k", cache_level="l1", ctx=ctx)
+
+        assert mgr.stats["l1_hits"] == 1
+        assert mgr.stats["total_requests"] == 1

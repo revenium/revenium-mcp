@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, cast
 
 from loguru import logger
 
@@ -80,7 +80,7 @@ class AIRoutingConfig:
     _skip_file_loading: bool = field(default=False, init=False)
     _skip_env_loading: bool = field(default=False, init=False)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Initialize configuration from environment and runtime sources."""
         if not self._skip_env_loading:
             self._load_environment_config()
@@ -89,7 +89,9 @@ class AIRoutingConfig:
         self._validate_configuration()
 
     @classmethod
-    def create_for_testing(cls, config_file: Optional[str] = None, **kwargs) -> "AIRoutingConfig":
+    def create_for_testing(
+        cls, config_file: Optional[str] = None, **kwargs: Any
+    ) -> "AIRoutingConfig":
         """Create configuration instance for testing with all external loading disabled.
 
         Args:
@@ -203,7 +205,7 @@ class AIRoutingConfig:
             logger.warning(f"Invalid ai_percentage: {self.ai_percentage}, resetting to 0")
             self.ai_percentage = 0
 
-        if not isinstance(self.testing_mode, TestingMode):
+        if not isinstance(cast(Any, self.testing_mode), TestingMode):
             logger.warning(f"Invalid testing_mode: {self.testing_mode}, resetting to DISABLED")
             self.testing_mode = TestingMode.DISABLED
 
@@ -249,11 +251,9 @@ class AIRoutingConfig:
         elif self.testing_mode == TestingMode.A_B_SPLIT:
             # Use query hash for consistent routing decisions
             return self._should_route_to_ai_by_percentage(query)
-        elif self.testing_mode == TestingMode.SHADOW:
-            # Shadow mode: always return False (use rule-based) but AI will run in background
+        else:
+            # SHADOW mode: always return False (use rule-based) but AI will run in background
             return False
-
-        return False
 
     def _should_route_to_ai_by_percentage(self, query: str) -> bool:
         """Determine AI routing based on percentage and query hash.
@@ -307,9 +307,9 @@ class AIRoutingConfig:
 
         return errors
 
-    def _get_current_values(self, keys) -> Dict[str, Any]:
+    def _get_current_values(self, keys: Iterable[str]) -> Dict[str, Any]:
         """Get current values for specified keys."""
-        current = {}
+        current: Dict[str, Any] = {}
         for key in keys:
             if key == "global_enabled":
                 current[key] = self.global_enabled

@@ -410,12 +410,15 @@ class TestHandleActionHierarchy:
         assert "p2" in result[0].text
 
     @pytest.mark.asyncio
-    async def test_unknown_action_returns_error_text(self):
+    async def test_unknown_action_raises_tool_error(self):
+        """Unknown action must propagate ToolError so the MCP envelope reports isError=true."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
         mgmt, _ = _make_mgmt_with_client()
-        result = await mgmt.handle_action("totally_bogus_action", {})
-        assert isinstance(result[0], TextContent)
-        text_lower = result[0].text.lower()
-        assert "unknown action" in text_lower or "not supported" in text_lower
+        with pytest.raises(ToolError) as exc_info:
+            await mgmt.handle_action("totally_bogus_action", {})
+        msg = str(exc_info.value).lower()
+        assert "unknown action" in msg or "not supported" in msg
 
 
 # ===========================================================================

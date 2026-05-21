@@ -4,7 +4,10 @@ Unified Slack integration management combining configuration, OAuth workflow, an
 Provides comprehensive Slack workspace management and alert integration capabilities.
 """
 
-from typing import Any, ClassVar, Dict, List, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -76,7 +79,11 @@ class SlackManagement(ToolBase):
         logger.info("🔧 Slack Management consolidated tool initialized")
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle Slack management actions using delegation.
 
@@ -98,7 +105,7 @@ class SlackManagement(ToolBase):
             if action in self.action_routing:
                 source_tool = self.action_routing[action]
                 logger.debug(f"Delegating action '{action}' to {source_tool.__class__.__name__}")
-                return await source_tool.handle_action(action, arguments)
+                return await source_tool.handle_action(action, arguments, ctx=ctx)
             else:
                 # Unknown action - provide helpful error
                 return await self._handle_unknown_action(action)

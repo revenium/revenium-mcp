@@ -3,7 +3,7 @@
 This module provides shared validation functions used across the MCP server.
 """
 
-from typing import Any, Dict, List, Union, Type
+from typing import Any, Dict, List, Mapping
 from ..validators import InputValidator
 from ..exceptions import ValidationError
 
@@ -76,7 +76,7 @@ def validate_id_format(id_value: Any, field_name: str = "id") -> str:
 
 def preprocess_numeric_parameters(
     arguments: Dict[str, Any],
-    numeric_params: Dict[str, Type[Union[int, float]]]
+    numeric_params: Mapping[str, type],
 ) -> Dict[str, Any]:
     """Convert string numeric parameters to appropriate types.
 

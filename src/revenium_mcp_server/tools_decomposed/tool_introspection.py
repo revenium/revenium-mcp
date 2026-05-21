@@ -4,7 +4,10 @@ This tool provides comprehensive tool introspection and metadata access,
 including capabilities, dependencies, performance metrics, and usage patterns.
 """
 
-from typing import Any, ClassVar, Dict, List, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -72,7 +75,11 @@ class ToolIntrospection(ToolBase):
         ]
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle tool introspection actions.
 
@@ -83,6 +90,7 @@ class ToolIntrospection(ToolBase):
         Returns:
             Tool response
         """
+        # ctx accepted for interface compliance; no upstream API calls in this tool.
         try:
             # Context7 Single Source of Truth: Handle capabilities and examples from tool class
             if action == "get_capabilities":

@@ -79,7 +79,7 @@ class TestValidateTransactionInputsEdgeCases:
 
     def test_optional_string_field_non_string_type(self):
         """Line 337: optional string field with non-string type."""
-        args = {**VALID_TRANSACTION, "organization_id": 12345}
+        args = {**VALID_TRANSACTION, "organization_name": 12345}
         result = self.mgr._validate_transaction_inputs(args)
         assert result is False
 
@@ -195,8 +195,8 @@ class TestFieldCombinationWarnings:
         assert any("Task tracking" in w for w in warnings)
 
     async def test_product_billing_without_subscriber_warns(self):
-        """Line 576: product_id without subscriber produces warning."""
-        args = {**VALID_TRANSACTION, "product_id": "prod_001"}
+        """Line 576: product_name without subscriber produces warning."""
+        args = {**VALID_TRANSACTION, "product_name": "prod_001"}
         warnings = self.mgr._validate_field_combinations(args)
         assert any("Product billing" in w or "revenue attribution" in w for w in warnings)
 
@@ -256,10 +256,10 @@ class TestValidateTransactionInputsWithDetails:
 
     async def test_optional_string_non_string_type(self):
         """Line 1229: optional string field with non-string."""
-        args = {**VALID_TRANSACTION, "organization_id": 999}
+        args = {**VALID_TRANSACTION, "organization_name": 999}
         result = await self.mgr._validate_transaction_inputs_with_details(args)
         assert result["valid"] is False
-        assert "organization_id" in result["message"]
+        assert "organization_name" in result["message"]
 
     async def test_optional_string_empty(self):
         """Line 1232: optional string field empty."""
@@ -319,7 +319,7 @@ class TestValidateTransactionInputsWithDetails:
 
     async def test_field_error_categorization(self):
         """Line 1348: field errors category."""
-        args = {**VALID_TRANSACTION, "organization_id": "x" * 501}
+        args = {**VALID_TRANSACTION, "organization_name": "x" * 501}
         result = await self.mgr._validate_transaction_inputs_with_details(args)
         assert result["valid"] is False
 
@@ -652,10 +652,15 @@ class TestAIModelHandlers:
     def setup_method(self):
         self.mm = make_mm()
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_list_ai_models_success(self, MockClient):
+    def _install_mock_client(self, client):
+        """Helper: patch self.mm.get_client to return the supplied client mock."""
+        mock_gc = AsyncMock(return_value=client)
+        self.mm.get_client = mock_gc
+        return mock_gc
+
+    async def test_list_ai_models_success(self):
         """Lines 4055-4094."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.get_ai_models = AsyncMock(return_value={
             "_embedded": {
                 "aIModelResourceList": [
@@ -664,37 +669,38 @@ class TestAIModelHandlers:
                 ]
             }
         })
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_list_ai_models({})
         assert any("gpt-4o" in c.text for c in result)
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_list_ai_models_empty(self, MockClient):
+    async def test_list_ai_models_empty(self):
         """Line 4096: no models found."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.get_ai_models = AsyncMock(return_value={})
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_list_ai_models({})
         assert "No AI models found" in result[0].text
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_list_ai_models_exception(self, MockClient):
+    async def test_list_ai_models_exception(self):
         """Line 4107-4111: exception handling."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.get_ai_models = AsyncMock(side_effect=RuntimeError("fail"))
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_list_ai_models({})
         assert len(result) > 0  # Returns error response
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_search_ai_models_no_query_returns_error(self, MockClient):
+    async def test_search_ai_models_no_query_returns_error(self):
         """Line 4119: missing query parameter returns error response."""
+        mock_client = MagicMock()
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_search_ai_models({})
         assert len(result) > 0
         # The ToolError is caught by except and formatted as error response
         assert any("query" in c.text.lower() or "missing" in c.text.lower() or "error" in c.text.lower() for c in result)
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_search_ai_models_success(self, MockClient):
+    async def test_search_ai_models_success(self):
         """Server-side search returns matching models."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.search_ai_models = AsyncMock(return_value={
             "_embedded": {
                 "aIModelResourceList": [
@@ -706,32 +712,32 @@ class TestAIModelHandlers:
             },
             "page": {"totalElements": 1, "totalPages": 1},
         })
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_search_ai_models({"query": "gpt"})
         assert "gpt-4o" in result[0].text
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_search_ai_models_no_results(self, MockClient):
+    async def test_search_ai_models_no_results(self):
         """Server-side search returns empty list."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.search_ai_models = AsyncMock(return_value={
             "_embedded": {"aIModelResourceList": []},
             "page": {"totalElements": 0, "totalPages": 0},
         })
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_search_ai_models({"query": "nonexistent"})
         assert "No models found" in result[0].text
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_search_ai_models_empty_response(self, MockClient):
+    async def test_search_ai_models_empty_response(self):
         """Empty API response without _embedded key."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.search_ai_models = AsyncMock(return_value={})
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_search_ai_models({"query": "test"})
         assert "No results found" in result[0].text
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_get_supported_providers_success(self, MockClient):
+    async def test_get_supported_providers_success(self):
         """Lines 4236-4290."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.get_ai_models = AsyncMock(return_value={
             "_embedded": {
                 "aIModelResourceList": [
@@ -741,29 +747,30 @@ class TestAIModelHandlers:
                 ]
             }
         })
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_get_supported_providers({})
         text = result[0].text
         assert "OPENAI" in text
         assert "ANTHROPIC" in text
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_get_supported_providers_empty(self, MockClient):
+    async def test_get_supported_providers_empty(self):
         """Line 4292: no providers found."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.get_ai_models = AsyncMock(return_value={})
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_get_supported_providers({})
         assert "No providers found" in result[0].text
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_validate_model_provider_missing_params(self, MockClient):
+    async def test_validate_model_provider_missing_params(self):
         """Lines 4313-4337: missing model/provider returns error."""
+        mock_client = MagicMock()
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_validate_model_provider({"model": "gpt-4"})
         assert len(result) > 0
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_validate_model_provider_exact_match(self, MockClient):
+    async def test_validate_model_provider_exact_match(self):
         """Lines 4361-4371: exact match found."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.search_ai_models = AsyncMock(return_value={
             "_embedded": {
                 "aIModelResourceList": [
@@ -772,15 +779,15 @@ class TestAIModelHandlers:
                 ]
             }
         })
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_validate_model_provider(
             {"model": "gpt-4o", "provider": "openai"}
         )
         assert "Valid" in result[0].text
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_validate_model_provider_partial_match(self, MockClient):
+    async def test_validate_model_provider_partial_match(self):
         """Lines 4373-4383: partial match suggestions."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.search_ai_models = AsyncMock(return_value={
             "_embedded": {
                 "aIModelResourceList": [
@@ -789,15 +796,15 @@ class TestAIModelHandlers:
                 ]
             }
         })
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_validate_model_provider(
             {"model": "gpt-4o", "provider": "anthropic"}
         )
         assert "Invalid" in result[0].text or "Did you mean" in result[0].text
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_validate_model_provider_no_match(self, MockClient):
+    async def test_validate_model_provider_no_match(self):
         """Lines 4385-4393: no match at all."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.search_ai_models = AsyncMock(return_value={
             "_embedded": {
                 "aIModelResourceList": [
@@ -805,39 +812,41 @@ class TestAIModelHandlers:
                 ]
             }
         })
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_validate_model_provider(
             {"model": "nonexistent", "provider": "unknown"}
         )
         assert "Not Found" in result[0].text
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_validate_model_provider_empty_response(self, MockClient):
+    async def test_validate_model_provider_empty_response(self):
         """Line 4395: empty API response."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.search_ai_models = AsyncMock(return_value={})
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_validate_model_provider(
             {"model": "gpt-4o", "provider": "openai"}
         )
         assert "failed" in result[0].text.lower()
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_estimate_cost_missing_params(self, MockClient):
+    async def test_estimate_cost_missing_params(self):
         """Lines 4419-4434: missing model/provider returns error."""
+        mock_client = MagicMock()
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_estimate_transaction_cost({"input_tokens": 100})
         assert len(result) > 0
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_estimate_cost_invalid_tokens(self, MockClient):
+    async def test_estimate_cost_invalid_tokens(self):
         """Lines 4439-4457: non-integer tokens returns error."""
+        mock_client = MagicMock()
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_estimate_transaction_cost(
             {"model": "gpt-4o", "provider": "openai", "input_tokens": "abc"}
         )
         assert len(result) > 0
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_estimate_cost_success(self, MockClient):
+    async def test_estimate_cost_success(self):
         """Lines 4477-4507: successful cost estimation."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.search_ai_models = AsyncMock(return_value={
             "_embedded": {
                 "aIModelResourceList": [
@@ -846,31 +855,32 @@ class TestAIModelHandlers:
                 ]
             }
         })
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_estimate_transaction_cost(
             {"model": "gpt-4o", "provider": "openai", "input_tokens": 1000, "output_tokens": 500}
         )
         assert "Cost Estimate" in result[0].text
         assert "$" in result[0].text
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_estimate_cost_model_not_found(self, MockClient):
+    async def test_estimate_cost_model_not_found(self):
         """Line 4509: model not found for cost estimation."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.search_ai_models = AsyncMock(return_value={
             "_embedded": {"aIModelResourceList": [
                 {"name": "claude-3", "provider": "ANTHROPIC"},
             ]}
         })
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_estimate_transaction_cost(
             {"model": "nonexistent", "provider": "unknown", "input_tokens": 100, "output_tokens": 50}
         )
         assert "not found" in result[0].text.lower()
 
-    @patch("src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient")
-    async def test_estimate_cost_empty_response(self, MockClient):
+    async def test_estimate_cost_empty_response(self):
         """Line 4518: empty API response."""
-        mock_client = MockClient.return_value
+        mock_client = MagicMock()
         mock_client.search_ai_models = AsyncMock(return_value={})
+        self._install_mock_client(mock_client)
         result = await self.mm._handle_estimate_transaction_cost(
             {"model": "gpt-4o", "provider": "openai", "input_tokens": 100, "output_tokens": 50}
         )

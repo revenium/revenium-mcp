@@ -4,7 +4,10 @@ Unified system setup and onboarding tool providing welcome guidance, setup valid
 and email configuration for streamlined user onboarding experience.
 """
 
-from typing import Any, ClassVar, Dict, List, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -76,7 +79,11 @@ class SystemSetup(ToolBase):
         logger.info("System Setup consolidated tool initialized")
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle system setup actions using delegation.
 
@@ -100,7 +107,7 @@ class SystemSetup(ToolBase):
             if action in self.action_routing:
                 source_tool = self.action_routing[action]
                 logger.debug(f"Delegating action '{action}' to {source_tool.__class__.__name__}")
-                return await source_tool.handle_action(action, arguments)
+                return await source_tool.handle_action(action, arguments, ctx=ctx)
             else:
                 # Unknown action - provide helpful error
                 return await self._handle_unknown_action(action)

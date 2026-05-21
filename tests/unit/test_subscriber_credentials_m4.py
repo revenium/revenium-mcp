@@ -467,7 +467,7 @@ class TestListCredentials:
             "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credentials_list",
             return_value=[{"id": "c1", "label": "Key One", "externalSecret": "***"}],
         ):
-            result = await cred_tool._list_credentials({"page": 0, "size": 20})
+            result = await cred_tool._list_credentials({"page": 0, "size": 20}, client=mock_client)
 
         assert result["action"] == "list"
         assert result["resource_type"] == "subscriber_credentials"
@@ -486,7 +486,8 @@ class TestListCredentials:
             return_value=[],
         ):
             await cred_tool._list_credentials(
-                {"page": 1, "size": 10, "filters": {"status": "active"}}
+                {"page": 1, "size": 10, "filters": {"status": "active"}},
+                client=mock_client,
             )
         mock_client.get_credentials.assert_called_once_with(page=1, size=10, status="active")
 
@@ -502,7 +503,7 @@ class TestGetCredential:
     async def test_get_credential_missing_id_raises_toolerror(self, cred_tool):
         """_get_credential without credential_id raises ToolError (lines 492-501)."""
         with pytest.raises(ToolError):
-            await cred_tool._get_credential({})
+            await cred_tool._get_credential({}, client=MagicMock())
 
     @pytest.mark.asyncio
     async def test_get_credential_returns_obfuscated_data(self, cred_tool, mock_client):
@@ -513,7 +514,7 @@ class TestGetCredential:
             "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credential_data",
             return_value={"id": "c1", "label": "Key", "externalSecret": "***"},
         ):
-            result = await cred_tool._get_credential({"credential_id": "c1"})
+            result = await cred_tool._get_credential({"credential_id": "c1"}, client=mock_client)
         assert result["externalSecret"] == "***"
         mock_client.get_credential_by_id.assert_called_once_with("c1")
 
@@ -534,15 +535,19 @@ class TestCreateCredential:
             "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credential_data",
             return_value=created,
         ):
-            result = await cred_tool._create_credential({
-                "credential_data": {
-                    "label": "New Key",
-                    "subscriberId": "sub_1",
-                    "organizationId": "org_1",
-                    "externalId": "ext_key",
-                    "externalSecret": "secret123",
-                }
-            })
+            result = await cred_tool._create_credential(
+                {
+                    "credential_data": {
+                        "label": "New Key",
+                        "subscriberId": "sub_1",
+                        "organizationId": "org_1",
+                        "externalId": "ext_key",
+                        "externalSecret": "secret123",
+                    }
+                },
+                client=mock_client,
+                dry_run_validator=MagicMock(),
+            )
         assert result["id"] == "c_new"
         mock_client.create_credential.assert_called_once()
 
@@ -555,31 +560,39 @@ class TestCreateCredential:
             "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credential_data",
             return_value=created,
         ):
-            result = await cred_tool._create_credential({
-                "label": "Param Key",
-                "subscriberId": "sub_2",
-                "organizationId": "org_2",
-                "externalId": "ext_k2",
-                "externalSecret": "secret456",
-            })
+            result = await cred_tool._create_credential(
+                {
+                    "label": "Param Key",
+                    "subscriberId": "sub_2",
+                    "organizationId": "org_2",
+                    "externalId": "ext_k2",
+                    "externalSecret": "secret456",
+                },
+                client=mock_client,
+                dry_run_validator=MagicMock(),
+            )
         assert result["id"] == "c_new2"
 
     @pytest.mark.asyncio
-    async def test_create_missing_all_data_raises_toolerror(self, cred_tool):
+    async def test_create_missing_all_data_raises_toolerror(self, cred_tool, mock_client):
         """No credential_data and no individual params raises ToolError (lines 563-601)."""
         with pytest.raises(ToolError):
-            await cred_tool._create_credential({})
+            await cred_tool._create_credential({}, client=mock_client, dry_run_validator=MagicMock())
 
     @pytest.mark.asyncio
-    async def test_create_missing_required_field_raises_validation_error(self, cred_tool):
+    async def test_create_missing_required_field_raises_validation_error(self, cred_tool, mock_client):
         """Missing required field in credential_data raises validation ToolError (lines 686-705)."""
         with pytest.raises(ToolError) as exc_info:
-            await cred_tool._create_credential({
-                "credential_data": {
-                    "label": "Incomplete Key",
-                    # missing subscriberId, organizationId, externalId, externalSecret
-                }
-            })
+            await cred_tool._create_credential(
+                {
+                    "credential_data": {
+                        "label": "Incomplete Key",
+                        # missing subscriberId, organizationId, externalId, externalSecret
+                    }
+                },
+                client=mock_client,
+                dry_run_validator=MagicMock(),
+            )
         assert "Missing required fields" in str(exc_info.value.message)
 
     @pytest.mark.asyncio
@@ -591,15 +604,19 @@ class TestCreateCredential:
             "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credential_data",
             return_value=created,
         ):
-            await cred_tool._create_credential({
-                "credential_data": {
-                    "label": "Auto Name",
-                    "subscriberId": "s1",
-                    "organizationId": "o1",
-                    "externalId": "k",
-                    "externalSecret": "s",
-                }
-            })
+            await cred_tool._create_credential(
+                {
+                    "credential_data": {
+                        "label": "Auto Name",
+                        "subscriberId": "s1",
+                        "organizationId": "o1",
+                        "externalId": "k",
+                        "externalSecret": "s",
+                    }
+                },
+                client=mock_client,
+                dry_run_validator=MagicMock(),
+            )
         payload = mock_client.create_credential.call_args[0][0]
         assert payload["name"] == "Auto Name"
 
@@ -612,22 +629,26 @@ class TestCreateCredential:
             "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credential_data",
             return_value=created,
         ):
-            await cred_tool._create_credential({
-                "credential_data": {
-                    "label": "Key",
-                    "subscriberId": "s1",
-                    "organizationId": "o1",
-                    "externalId": "k",
-                    "externalSecret": "s",
-                }
-            })
+            await cred_tool._create_credential(
+                {
+                    "credential_data": {
+                        "label": "Key",
+                        "subscriberId": "s1",
+                        "organizationId": "o1",
+                        "externalId": "k",
+                        "externalSecret": "s",
+                    }
+                },
+                client=mock_client,
+                dry_run_validator=MagicMock(),
+            )
         payload = mock_client.create_credential.call_args[0][0]
         assert payload["teamId"] == "team_abc"
 
     @pytest.mark.asyncio
-    async def test_create_dry_run_returns_validation_result(self, cred_tool):
+    async def test_create_dry_run_returns_validation_result(self, cred_tool, mock_client):
         """dry_run=True returns validation result without calling create (lines 625-670)."""
-        from src.revenium_mcp_server.dry_run.credential_dry_run import BillingImpact
+        from src.revenium_mcp_server.dry_run.credential_dry_run import BillingImpact, CredentialDryRunValidator
 
         dry_run_result = MagicMock()
         dry_run_result.operation = "create"
@@ -644,28 +665,31 @@ class TestCreateCredential:
         dry_run_result.next_steps = ["proceed"]
         dry_run_result.preview_data = {"label": "Dry Key"}
 
-        cred_tool.dry_run_validator.validate_create_operation = AsyncMock(
-            return_value=dry_run_result
-        )
+        mock_dry_run_validator = MagicMock(spec=CredentialDryRunValidator)
+        mock_dry_run_validator.validate_create_operation = AsyncMock(return_value=dry_run_result)
         cred_tool.business_context.get_billing_impact_explanation = MagicMock(
             return_value={"impact": "low"}
         )
 
-        result = await cred_tool._create_credential({
-            "dry_run": True,
-            "credential_data": {
-                "label": "Dry Key",
-                "subscriberId": "s1",
-                "organizationId": "o1",
-                "externalId": "k",
-                "externalSecret": "s",
+        result = await cred_tool._create_credential(
+            {
+                "dry_run": True,
+                "credential_data": {
+                    "label": "Dry Key",
+                    "subscriberId": "s1",
+                    "organizationId": "o1",
+                    "externalId": "k",
+                    "externalSecret": "s",
+                },
             },
-        })
+            client=mock_client,
+            dry_run_validator=mock_dry_run_validator,
+        )
 
         assert result["dry_run"] is True
         assert result["ready_to_proceed"] is True
         assert result["validation_result"]["valid"] is True
-        cred_tool.dry_run_validator.validate_create_operation.assert_called_once()
+        mock_dry_run_validator.validate_create_operation.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_create_resolves_subscriber_email(self, cred_tool, mock_client):
@@ -677,15 +701,19 @@ class TestCreateCredential:
             "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credential_data",
             return_value=created,
         ):
-            await cred_tool._create_credential({
-                "credential_data": {
-                    "label": "Email Key",
-                    "subscriber_email": "user@test.com",
-                    "organizationId": "o1",
-                    "externalId": "k",
-                    "externalSecret": "s",
-                }
-            })
+            await cred_tool._create_credential(
+                {
+                    "credential_data": {
+                        "label": "Email Key",
+                        "subscriber_email": "user@test.com",
+                        "organizationId": "o1",
+                        "externalId": "k",
+                        "externalSecret": "s",
+                    }
+                },
+                client=mock_client,
+                dry_run_validator=MagicMock(),
+            )
         payload = mock_client.create_credential.call_args[0][0]
         assert payload["subscriberId"] == "sub_resolved"
         assert "subscriber_email" not in payload
@@ -703,16 +731,20 @@ class TestCreateCredential:
             return_value=created,
         ):
             # Should not raise; just log warning
-            result = await cred_tool._create_credential({
-                "credential_data": {
-                    "label": "Key",
-                    "subscriber_email": "bad@test.com",
-                    "subscriberId": "s1",  # fallback
-                    "organizationId": "o1",
-                    "externalId": "k",
-                    "externalSecret": "s",
-                }
-            })
+            result = await cred_tool._create_credential(
+                {
+                    "credential_data": {
+                        "label": "Key",
+                        "subscriber_email": "bad@test.com",
+                        "subscriberId": "s1",  # fallback
+                        "organizationId": "o1",
+                        "externalId": "k",
+                        "externalSecret": "s",
+                    }
+                },
+                client=mock_client,
+                dry_run_validator=MagicMock(),
+            )
         assert result["id"] == "c6"
 
     @pytest.mark.asyncio
@@ -725,21 +757,25 @@ class TestCreateCredential:
             "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credential_data",
             return_value=created,
         ):
-            await cred_tool._create_credential({
-                "credential_data": {
-                    "label": "Org Key",
-                    "subscriberId": "s1",
-                    "organization_name": "TechCorp",
-                    "externalId": "k",
-                    "externalSecret": "s",
-                }
-            })
+            await cred_tool._create_credential(
+                {
+                    "credential_data": {
+                        "label": "Org Key",
+                        "subscriberId": "s1",
+                        "organization_name": "TechCorp",
+                        "externalId": "k",
+                        "externalSecret": "s",
+                    }
+                },
+                client=mock_client,
+                dry_run_validator=MagicMock(),
+            )
         payload = mock_client.create_credential.call_args[0][0]
         assert payload["organizationId"] == "org_resolved"
         assert "organization_name" not in payload
 
     @pytest.mark.asyncio
-    async def test_create_nlp_wrong_intent_returns_error_dict(self, cred_tool):
+    async def test_create_nlp_wrong_intent_returns_error_dict(self, cred_tool, mock_client):
         """NLP processing with wrong intent (not CREATE) returns error dict instead of creating (lines 521-527)."""
         from src.revenium_mcp_server.nlp.credential_nlp_processor import CredentialIntent
 
@@ -749,7 +785,11 @@ class TestCreateCredential:
         cred_tool.nlp_processor.process_natural_language = AsyncMock(return_value=nlp_result)
         cred_tool.nlp_processor.extract_credential_data = MagicMock(return_value={})
 
-        result = await cred_tool._create_credential({"text": "Delete credential cred_1"})
+        result = await cred_tool._create_credential(
+            {"text": "Delete credential cred_1"},
+            client=mock_client,
+            dry_run_validator=MagicMock(),
+        )
         assert result["action"] == "create"
         assert "error" in result
         assert "delete" in result["error"].lower()
@@ -763,16 +803,16 @@ class TestUpdateCredential:
     """Test _update_credential method."""
 
     @pytest.mark.asyncio
-    async def test_update_missing_credential_id_raises_toolerror(self, cred_tool):
+    async def test_update_missing_credential_id_raises_toolerror(self, cred_tool, mock_client):
         """_update_credential without credential_id raises ToolError (lines 739-748)."""
         with pytest.raises(ToolError):
-            await cred_tool._update_credential({"credential_data": {"label": "New"}})
+            await cred_tool._update_credential({"credential_data": {"label": "New"}}, client=mock_client)
 
     @pytest.mark.asyncio
-    async def test_update_missing_credential_data_raises_toolerror(self, cred_tool):
+    async def test_update_missing_credential_data_raises_toolerror(self, cred_tool, mock_client):
         """_update_credential without credential_data raises ToolError (lines 750-768)."""
         with pytest.raises(ToolError):
-            await cred_tool._update_credential({"credential_id": "c1"})
+            await cred_tool._update_credential({"credential_id": "c1"}, client=mock_client)
 
     @pytest.mark.asyncio
     async def test_update_success_returns_result_dict(self, cred_tool, mock_client):
@@ -798,7 +838,8 @@ class TestUpdateCredential:
                 return_value={"impact": "low"}
             )
             result = await cred_tool._update_credential(
-                {"credential_id": "c1", "credential_data": {"label": "New Label"}}
+                {"credential_id": "c1", "credential_data": {"label": "New Label"}},
+                client=mock_client,
             )
         assert result["action"] == "update"
         assert result["credential_id"] == "c1"
@@ -826,7 +867,8 @@ class TestUpdateCredential:
                 return_value={}
             )
             await cred_tool._update_credential(
-                {"credential_id": "c1", "credential_data": {"label": "New"}}
+                {"credential_id": "c1", "credential_data": {"label": "New"}},
+                client=mock_client,
             )
         payload = mock_client.update_credential.call_args[0][1]
         assert payload["label"] == "New"
@@ -838,7 +880,8 @@ class TestUpdateCredential:
         mock_client.get_credential_by_id = AsyncMock(return_value=None)
         with pytest.raises(ToolError):
             await cred_tool._update_credential(
-                {"credential_id": "missing_c", "credential_data": {"label": "X"}}
+                {"credential_id": "missing_c", "credential_data": {"label": "X"}},
+                client=mock_client,
             )
 
     @pytest.mark.asyncio
@@ -861,7 +904,8 @@ class TestUpdateCredential:
         ):
             cred_tool.business_context.get_billing_impact_explanation = MagicMock(return_value={})
             await cred_tool._update_credential(
-                {"credential_id": "c1", "credential_data": {"label": "Updated"}}
+                {"credential_id": "c1", "credential_data": {"label": "Updated"}},
+                client=mock_client,
             )
         payload = mock_client.update_credential.call_args[0][1]
         assert payload["subscriberId"] == "sub_nested"
@@ -886,7 +930,8 @@ class TestUpdateCredential:
         ):
             cred_tool.business_context.get_billing_impact_explanation = MagicMock(return_value={})
             await cred_tool._update_credential(
-                {"credential_id": "c1", "credential_data": {"label": "Updated"}}
+                {"credential_id": "c1", "credential_data": {"label": "Updated"}},
+                client=mock_client,
             )
         payload = mock_client.update_credential.call_args[0][1]
         assert payload["organizationId"] == "org_nested"
@@ -912,7 +957,8 @@ class TestUpdateCredential:
         ):
             cred_tool.business_context.get_billing_impact_explanation = MagicMock(return_value={})
             await cred_tool._update_credential(
-                {"credential_id": "c1", "credential_data": {"label": "Updated"}}
+                {"credential_id": "c1", "credential_data": {"label": "Updated"}},
+                client=mock_client,
             )
         payload = mock_client.update_credential.call_args[0][1]
         assert payload["subscriptions"] == [{"id": "sub_1"}]
@@ -939,7 +985,8 @@ class TestUpdateCredential:
         ):
             cred_tool.business_context.get_billing_impact_explanation = MagicMock(return_value={})
             await cred_tool._update_credential(
-                {"credential_id": "c1", "credential_data": {"label": "Updated"}}
+                {"credential_id": "c1", "credential_data": {"label": "Updated"}},
+                client=mock_client,
             )
         payload = mock_client.update_credential.call_args[0][1]
         assert "id" not in payload
@@ -954,7 +1001,8 @@ class TestUpdateCredential:
         mock_client.get_credential_by_id = AsyncMock(side_effect=error)
         with pytest.raises(ToolError) as exc_info:
             await cred_tool._update_credential(
-                {"credential_id": "c1", "credential_data": {"label": "X"}}
+                {"credential_id": "c1", "credential_data": {"label": "X"}},
+                client=mock_client,
             )
         assert "API error" in exc_info.value.message
 
@@ -966,7 +1014,8 @@ class TestUpdateCredential:
         )
         with pytest.raises(ToolError) as exc_info:
             await cred_tool._update_credential(
-                {"credential_id": "c1", "credential_data": {"label": "X"}}
+                {"credential_id": "c1", "credential_data": {"label": "X"}},
+                client=mock_client,
             )
         assert exc_info.value.error_code == ErrorCodes.PROCESSING_ERROR
 
@@ -979,16 +1028,16 @@ class TestDeleteCredential:
     """Test _delete_credential method."""
 
     @pytest.mark.asyncio
-    async def test_delete_missing_credential_id_raises_toolerror(self, cred_tool):
+    async def test_delete_missing_credential_id_raises_toolerror(self, cred_tool, mock_client):
         """_delete_credential without credential_id raises ToolError (lines 961-972)."""
         with pytest.raises(ToolError):
-            await cred_tool._delete_credential({})
+            await cred_tool._delete_credential({}, client=mock_client)
 
     @pytest.mark.asyncio
     async def test_delete_calls_client_and_returns_dict(self, cred_tool, mock_client):
         """Successful delete calls client.delete_credential and returns status dict (lines 974-981)."""
         mock_client.delete_credential = AsyncMock(return_value=None)
-        result = await cred_tool._delete_credential({"credential_id": "c1"})
+        result = await cred_tool._delete_credential({"credential_id": "c1"}, client=mock_client)
         mock_client.delete_credential.assert_called_once_with("c1")
         assert result["action"] == "delete"
         assert result["credential_id"] == "c1"

@@ -5,7 +5,7 @@ queries into the specific parameter formats expected by different MCP tools.
 """
 
 # Standard library imports
-from typing import Any, Dict, List
+from typing import Any, Dict, List, cast
 
 # Third-party imports
 from loguru import logger
@@ -23,7 +23,7 @@ class ParameterMappingError(Exception):
 class ParameterMapper:
     """Maps extracted parameters to tool-specific parameter formats."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize parameter mapper with operation mappings."""
         self.operation_mappings = self._build_operation_mappings()
 
@@ -163,7 +163,7 @@ class ParameterMapper:
         self, params: Dict[str, Any], config: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Apply parameter transformations based on configuration."""
-        transformed = {}
+        transformed: Dict[str, Any] = {}
         transformations = config.get("parameter_transformations", {})
 
         for source_param, target_path in transformations.items():
@@ -232,14 +232,14 @@ class ParameterMapper:
         if operation_key not in self.operation_mappings:
             return []
 
-        return self.operation_mappings[operation_key].get("required_params", [])
+        return cast(List[str], self.operation_mappings[operation_key].get("required_params", []))
 
     def get_optional_parameters(self, operation_key: str) -> List[str]:
         """Get optional parameters for an operation."""
         if operation_key not in self.operation_mappings:
             return []
 
-        return self.operation_mappings[operation_key].get("optional_params", [])
+        return cast(List[str], self.operation_mappings[operation_key].get("optional_params", []))
 
     def validate_parameters(
         self, operation_key: str, extracted_params: ExtractedParameters

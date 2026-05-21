@@ -386,18 +386,17 @@ class TestProductManagementHandleAction:
     """Test ProductManagement.handle_action routing and dry-run modes."""
 
     @pytest.mark.asyncio
-    async def test_unknown_action_returns_error_response(self, product_mgmt):
-        """Unknown action returns formatted error (ProductManagement catches ToolError internally)."""
+    async def test_unknown_action_raises_tool_error(self, product_mgmt):
+        """Unknown action raises ToolError so the MCP envelope reports isError=true."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
         with patch.object(product_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_gc.return_value = MagicMock()
 
-            result = await product_mgmt.handle_action("nonexistent_action", {})
+            with pytest.raises(ToolError) as exc_info:
+                await product_mgmt.handle_action("nonexistent_action", {})
 
-        # ProductManagement catches ToolError and formats it as TextContent
-        assert len(result) >= 1
-        assert isinstance(result[0], TextContent)
-        text_lower = result[0].text.lower()
-        assert "unknown action" in text_lower or "not supported" in text_lower
+        assert "not supported" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
     async def test_create_dry_run_returns_preview(self, product_mgmt):

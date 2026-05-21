@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from ..client import ReveniumClient
-from ..models import FilterParams, PaginationParams
+from ..models import FilterCondition, FilterOperator, FilterParams, PaginationParams
 from ..pagination import PaginationHelper
 
 
@@ -24,7 +24,7 @@ class TimeRange:
     start: datetime
     end: datetime
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate time range."""
         if self.start >= self.end:
             raise ValueError("Start time must be before end time")
@@ -185,14 +185,14 @@ class AnalyticsEngine:
         anomalies_by_team = dict(team_counter.most_common(10))  # Top 10 teams
 
         # Detection rule types
-        rule_type_counter = Counter()
+        rule_type_counter: Counter[str] = Counter()
         for anomaly in all_anomalies:
             for rule in anomaly.get("detection_rules", []):
                 rule_type_counter[rule.get("rule_type", "unknown")] += 1
         detection_rule_types = dict(rule_type_counter)
 
         # Most common metrics
-        metric_counter = Counter()
+        metric_counter: Counter[str] = Counter()
         for anomaly in all_anomalies:
             for rule in anomaly.get("detection_rules", []):
                 metric_counter[rule.get("metric", "unknown")] += 1
@@ -261,8 +261,8 @@ class AnalyticsEngine:
             page += 1
 
         # Count alerts by anomaly
-        anomaly_alert_counts = Counter()
-        anomaly_details = {}
+        anomaly_alert_counts: Counter[str] = Counter()
+        anomaly_details: Dict[str, Any] = {}
 
         for alert in all_alerts:
             anomaly_id = alert.get("anomaly_id")
@@ -324,7 +324,7 @@ class AnalyticsEngine:
         if anomaly_id:
             # Add anomaly-specific filter
             filters.conditions.append(
-                {"field": "anomaly_id", "operator": "eq", "value": anomaly_id}
+                FilterCondition(field="anomaly_id", operator=FilterOperator.EQUALS, value=anomaly_id)
             )
 
         # Collect all alerts
@@ -385,7 +385,7 @@ class AnalyticsEngine:
         # Top triggering anomalies (if not filtered by anomaly_id)
         top_triggering_anomalies = []
         if not anomaly_id:
-            anomaly_counter = Counter()
+            anomaly_counter: Counter[str] = Counter()
             for alert in all_alerts:
                 if alert.get("anomaly_id"):
                     anomaly_counter[alert["anomaly_id"]] += 1
@@ -418,7 +418,7 @@ class AnalyticsEngine:
     ) -> List[Dict[str, Any]]:
         """Analyze anomaly creation trend over time."""
         # Create daily buckets
-        daily_counts = defaultdict(int)
+        daily_counts: Dict[str, int] = defaultdict(int)
 
         for anomaly in anomalies:
             created_at = anomaly.get("created_at")
@@ -447,7 +447,7 @@ class AnalyticsEngine:
     ) -> List[Dict[str, Any]]:
         """Analyze alert frequency over time."""
         # Create hourly buckets for detailed analysis
-        hourly_counts = defaultdict(int)
+        hourly_counts: Dict[str, int] = defaultdict(int)
 
         for alert in alerts:
             trigger_timestamp = alert.get("trigger_timestamp")

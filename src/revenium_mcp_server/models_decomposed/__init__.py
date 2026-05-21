@@ -4,8 +4,15 @@ This package contains all Pydantic data models organized by domain.
 Each module contains models for a specific resource type (products, customers, etc.).
 """
 
-# Temporary backward compatibility - import from original models.py
-from ..models import *
+from ..models import (
+    FilterCondition,
+    FilterParams,
+    PaginatedResponse,
+    PaginationMetadata,
+    PaginationParams,
+    SortField,
+    SortOrder,
+)
 
 # Import alert models
 from .alerts import (

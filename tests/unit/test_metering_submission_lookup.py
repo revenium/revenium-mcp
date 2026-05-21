@@ -192,7 +192,25 @@ class TestSubmitTransaction:
         err = excinfo.value
         assert getattr(err, "field", None) == "transaction_id"
         assert getattr(err, "value", None) == "mcp-test-p3-tx-NOT_A_GUID"
-        # Must not have reached the backend
+        client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_string_transaction_id_is_rejected(self):
+        client = _make_client()
+        args = {**VALID_ARGS, "transaction_id": ""}
+        cache_patch, _ = _patch_cache()
+        with cache_patch:
+            with patch.object(
+                self.mgr,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                with pytest.raises(ToolError) as excinfo:
+                    await self.mgr.submit_transaction(client, args)
+
+        err = excinfo.value
+        assert getattr(err, "field", None) == "transaction_id"
         client.post.assert_not_called()
 
     @pytest.mark.asyncio
@@ -263,8 +281,8 @@ class TestSubmitTransaction:
         client = _make_client()
         args = {
             **VALID_ARGS,
-            "organization_id": "org_123",
-            "product_id": "prod_456",
+            "organization_name": "org_123",
+            "product_name": "prod_456",
             "task_type": "summarization",
             "agent": "test-agent",
         }
@@ -279,15 +297,15 @@ class TestSubmitTransaction:
                 await self.mgr.submit_transaction(client, args)
 
         posted_payload = client.post.call_args[1]["data"]
-        assert posted_payload["organizationId"] == "org_123"
-        assert posted_payload["productId"] == "prod_456"
+        assert posted_payload["organizationName"] == "org_123"
+        assert posted_payload["productName"] == "prod_456"
         assert posted_payload["taskType"] == "summarization"
         assert posted_payload["agent"] == "test-agent"
 
     @pytest.mark.asyncio
     async def test_none_optional_fields_excluded_from_payload(self):
         client = _make_client()
-        args = {**VALID_ARGS, "organization_id": None}
+        args = {**VALID_ARGS, "organization_name": None}
         cache_patch, _ = _patch_cache()
         with cache_patch:
             with patch.object(
@@ -299,7 +317,57 @@ class TestSubmitTransaction:
                 await self.mgr.submit_transaction(client, args)
 
         posted_payload = client.post.call_args[1]["data"]
-        assert "organizationId" not in posted_payload
+        assert "organizationName" not in posted_payload
+
+    # --- Deprecated alias rejection ---
+
+    @pytest.mark.asyncio
+    async def test_submit_ai_transaction_rejects_deprecated_organization_id_alias(self):
+        """Passing the deprecated `organization_id` alias must raise a ToolError
+        that names both the old and new field so callers can migrate."""
+        client = _make_client()
+        args = {**VALID_ARGS, "organization_id": "org_123"}
+        cache_patch, _ = _patch_cache()
+        with cache_patch:
+            with patch.object(
+                self.mgr,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                with pytest.raises(ToolError) as excinfo:
+                    await self.mgr.submit_transaction(client, args)
+
+        err = excinfo.value
+        assert getattr(err, "field", None) == "organization_id"
+        message = str(err)
+        assert "organization_id" in message
+        assert "organization_name" in message
+        client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_ai_transaction_rejects_deprecated_product_id_alias(self):
+        """Passing the deprecated `product_id` alias must raise a ToolError
+        that names both the old and new field so callers can migrate."""
+        client = _make_client()
+        args = {**VALID_ARGS, "product_id": "prod_456"}
+        cache_patch, _ = _patch_cache()
+        with cache_patch:
+            with patch.object(
+                self.mgr,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                with pytest.raises(ToolError) as excinfo:
+                    await self.mgr.submit_transaction(client, args)
+
+        err = excinfo.value
+        assert getattr(err, "field", None) == "product_id"
+        message = str(err)
+        assert "product_id" in message
+        assert "product_name" in message
+        client.post.assert_not_called()
 
     # --- Subscriber handling ---
 

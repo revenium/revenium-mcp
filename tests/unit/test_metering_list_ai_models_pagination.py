@@ -27,11 +27,10 @@ class TestListAiModelsPaginationCoercion:
     async def test_string_page_is_coerced_to_int(self):
         """page='0' must be coerced to int 0 and reach the upstream client."""
         mgmt = _make_mgmt()
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.metering_management.ReveniumClient"
-        ) as MockCls:
-            client = MockCls.return_value
-            client.get_ai_models = AsyncMock(return_value={"_embedded": {"aIModelResourceList": []}})
+        client = AsyncMock()
+        client.get_ai_models = AsyncMock(return_value={"_embedded": {"aIModelResourceList": []}})
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = client
             await mgmt._handle_list_ai_models({"page": "0", "size": "5"})
         client.get_ai_models.assert_called_once()
         kwargs = client.get_ai_models.call_args.kwargs

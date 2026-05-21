@@ -5,7 +5,10 @@ debug_auto_discovery infrastructure to ensure maximum code reuse and consistency
 """
 
 from datetime import datetime
-from typing import Any, ClassVar, Dict, List, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -49,7 +52,11 @@ class ConfigurationStatus(ToolBase):
         self.formatter = UnifiedResponseFormatter("configuration_status")
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle configuration status actions.
 
@@ -60,6 +67,7 @@ class ConfigurationStatus(ToolBase):
         Returns:
             Tool response
         """
+        # ctx accepted for interface compliance; no upstream API calls in this tool.
         try:
             if action == "environment_variables":
                 return await self._handle_environment_variables(arguments)

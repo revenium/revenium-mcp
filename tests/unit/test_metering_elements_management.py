@@ -658,6 +658,47 @@ class TestMeteringElementsManagementHandleAction:
         assert isinstance(result[0], TextContent)
         assert len(result[0].text) > 0
 
+    @pytest.mark.asyncio
+    async def test_create_from_template_new_element_reports_created(self, mgmt):
+        template_name = next(iter(MeteringElementsManager().element_templates))
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_client.create_metering_element_definition = AsyncMock(
+                return_value={"id": "elem_new", "name": template_name, "isSystem": False}
+            )
+            mock_gc.return_value = mock_client
+            result = await mgmt.handle_action(
+                "create_from_template",
+                {"template_name": template_name},
+            )
+        text = result[0].text
+        assert "created from template" in text.lower()
+        assert template_name in text
+        assert "existing system" not in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_create_from_template_existing_system_reports_returned(self, mgmt):
+        template_name = next(iter(MeteringElementsManager().element_templates))
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_client.create_metering_element_definition = AsyncMock(
+                return_value={
+                    "id": "sys_elem",
+                    "name": template_name,
+                    "isSystem": True,
+                    "created": "2025-12-24",
+                }
+            )
+            mock_gc.return_value = mock_client
+            result = await mgmt.handle_action(
+                "create_from_template",
+                {"template_name": template_name},
+            )
+        text = result[0].text
+        assert "existing system metering element" in text.lower()
+        assert "created from template" not in text.lower()
+        assert "System elements cannot be modified" in text
+
 
 class TestMeteringElementsCapabilitiesElementTypesFallback:
     """Element Types section in get_capabilities must always render concrete items.

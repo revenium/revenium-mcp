@@ -226,9 +226,10 @@ class LoggingConfig:
         self._setup_logging()
 
     def _setup_logging(self):
-        """Set up structured logging with loguru and structlog."""
-        # Remove default loguru handler
+        from .log_context import tenant_log_patcher
+
         logger.remove()
+        logger.configure(patcher=tenant_log_patcher)
 
         # Add console handler with structured format.
         # Renders loguru `extra` fields (structured kwargs) when present so stderr

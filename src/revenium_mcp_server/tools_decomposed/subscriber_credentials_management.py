@@ -7,7 +7,10 @@ extensive business context for product managers managing billing automation.
 
 import time
 from datetime import datetime, timezone
-from typing import Any, ClassVar, Dict, List, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -169,12 +172,18 @@ class SubscriberCredentialsManagement(ToolBase):
     def __init__(self, ucm_helper=None, client=None):
         """Initialize enhanced subscriber credentials management tool."""
         super().__init__(ucm_helper)
-        self.client: ReveniumClient = client or ReveniumClient()
+        # Stored as ToolBase.client for two cases:
+        #   (a) test injection (tests pass client=mock_client to the constructor)
+        #   (b) the legacy no-ctx path where get_client(ctx=None) returns self.client
+        # All production paths that receive a real ctx create a fresh per-request
+        # client via get_client(ctx=ctx) and bypass this field.
+        self.client: Optional[ReveniumClient] = client
         self.formatter = UnifiedResponseFormatter("manage_subscriber_credentials")
 
         # Initialize enhanced capabilities
         self.nlp_processor = CredentialNLPProcessor()
-        self.dry_run_validator = CredentialDryRunValidator(self.client)
+        # NOTE: dry_run_validator is now built per-request inside handle_action so it
+        # uses the same ctx-scoped client as the rest of the request.
         self.business_context = CredentialBusinessContext()
 
         # Initialize handlers for modular functionality
@@ -245,26 +254,34 @@ class SubscriberCredentialsManagement(ToolBase):
         }
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle subscriber credentials management actions."""
         try:
             logger.info(f"Handling subscriber credentials action: {action}")
 
+            # Acquire ctx-scoped client and per-request dry-run validator
+            client = await self.get_client(ctx=ctx)
+            dry_run_validator = CredentialDryRunValidator(client)
+
             # Initialize hierarchy manager
-            hierarchy_manager = CredentialsHierarchyManager(self.client)
+            hierarchy_manager = CredentialsHierarchyManager(client)
 
             # Route to appropriate handler
             if action == "list":
-                result = await self._list_credentials(arguments)
+                result = await self._list_credentials(arguments, client=client)
             elif action == "get":
-                result = await self._get_credential(arguments)
+                result = await self._get_credential(arguments, client=client)
             elif action == "create":
-                result = await self._create_credential(arguments)
+                result = await self._create_credential(arguments, client=client, dry_run_validator=dry_run_validator)
             elif action == "update":
-                result = await self._update_credential(arguments)
+                result = await self._update_credential(arguments, client=client)
             elif action == "delete":
-                result = await self._delete_credential(arguments)
+                result = await self._delete_credential(arguments, client=client)
             elif action == "get_capabilities":
                 result = await self.documentation_handler.get_capabilities(arguments)
                 # Result is now formatted markdown text, wrap in TextContent
@@ -332,7 +349,7 @@ class SubscriberCredentialsManagement(ToolBase):
                     )
                 from mcp.types import TextContent
                 try:
-                    subscriber_id = await self.client.resolve_subscriber_email_to_id(email)
+                    subscriber_id = await client.resolve_subscriber_email_to_id(email)
                 except Exception as e:
                     raise ToolError(
                         message=f"Failed to resolve subscriber email: {e}",
@@ -357,7 +374,7 @@ class SubscriberCredentialsManagement(ToolBase):
                     )
                 from mcp.types import TextContent
                 try:
-                    org_id = await self.client.resolve_organization_name_to_id(org_name)
+                    org_id = await client.resolve_organization_name_to_id(org_name)
                 except Exception as e:
                     raise ToolError(
                         message=f"Failed to resolve organization name: {e}",
@@ -525,7 +542,7 @@ class SubscriberCredentialsManagement(ToolBase):
                 ],
             )
 
-    async def _list_credentials(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def _list_credentials(self, arguments: Dict[str, Any], *, client: ReveniumClient) -> Dict[str, Any]:
         """List subscriber credentials with pagination."""
         # BACK-1270 (items #4 + #5): reject malformed / out-of-range page|size
         # at the tool boundary before they reach the API client. Closes the
@@ -535,9 +552,9 @@ class SubscriberCredentialsManagement(ToolBase):
         size = arguments.get("size", 20)
         filters = arguments.get("filters", {})
 
-        response = await self.client.get_credentials(page=page, size=size, **filters)
-        credentials = self.client._extract_embedded_data(response)
-        page_info = self.client._extract_pagination_info(response)
+        response = await client.get_credentials(page=page, size=size, **filters)
+        credentials = client._extract_embedded_data(response)
+        page_info = client._extract_pagination_info(response)
 
         # SECURITY: Obfuscate sensitive fields in credentials before returning to user
         # This prevents API keys and secrets from being exposed in tool outputs
@@ -551,7 +568,7 @@ class SubscriberCredentialsManagement(ToolBase):
             "total_found": len(credentials),
         }
 
-    async def _get_credential(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def _get_credential(self, arguments: Dict[str, Any], *, client: ReveniumClient) -> Dict[str, Any]:
         """Get specific credential by ID."""
         credential_id = arguments.get("credential_id")
         if not credential_id:
@@ -565,7 +582,7 @@ class SubscriberCredentialsManagement(ToolBase):
                 },
             )
 
-        credential = await self.client.get_credential_by_id(credential_id)
+        credential = await client.get_credential_by_id(credential_id)
 
         # SECURITY: Obfuscate sensitive fields in credential before returning to user
         # This prevents API keys and secrets from being exposed in tool outputs
@@ -573,7 +590,7 @@ class SubscriberCredentialsManagement(ToolBase):
 
         return obfuscated_credential
 
-    async def _create_credential(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def _create_credential(self, arguments: Dict[str, Any], *, client: ReveniumClient, dry_run_validator: CredentialDryRunValidator) -> Dict[str, Any]:
         """Create new subscriber credential with enhanced NLP and dry run support."""
         # Check for natural language input first
         text_input = arguments.get("text") or arguments.get("description")
@@ -668,7 +685,7 @@ class SubscriberCredentialsManagement(ToolBase):
         # Resolve email and organization names if provided
         if "subscriber_email" in credential_data:
             try:
-                subscriber_id = await self.client.resolve_subscriber_email_to_id(
+                subscriber_id = await client.resolve_subscriber_email_to_id(
                     credential_data["subscriber_email"]
                 )
                 credential_data["subscriberId"] = subscriber_id
@@ -678,7 +695,7 @@ class SubscriberCredentialsManagement(ToolBase):
 
         if "organization_name" in credential_data:
             try:
-                org_id = await self.client.resolve_organization_name_to_id(
+                org_id = await client.resolve_organization_name_to_id(
                     credential_data["organization_name"]
                 )
                 credential_data["organizationId"] = org_id
@@ -688,7 +705,7 @@ class SubscriberCredentialsManagement(ToolBase):
 
         # Perform dry run validation if requested
         if dry_run:
-            dry_run_result = await self.dry_run_validator.validate_create_operation(credential_data)
+            dry_run_result = await dry_run_validator.validate_create_operation(credential_data)
 
             # Get business impact analysis
             business_impact = self.business_context.get_billing_impact_explanation(
@@ -775,10 +792,10 @@ class SubscriberCredentialsManagement(ToolBase):
 
         # Ensure teamId is set
         if "teamId" not in credential_data:
-            credential_data["teamId"] = self.client.team_id
+            credential_data["teamId"] = client.team_id
 
         # Create the credential
-        result = await self.client.create_credential(credential_data)
+        result = await client.create_credential(credential_data)
 
         # SECURITY: Obfuscate sensitive fields in created credential before returning to user
         # This prevents API keys and secrets from being exposed in tool outputs
@@ -791,7 +808,7 @@ class SubscriberCredentialsManagement(ToolBase):
 
         return obfuscated_result
 
-    async def _update_credential(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def _update_credential(self, arguments: Dict[str, Any], *, client: ReveniumClient) -> Dict[str, Any]:
         """Update existing subscriber credential using custom merge logic.
 
         This implementation uses a custom read-modify-write pattern similar to the working
@@ -838,7 +855,7 @@ class SubscriberCredentialsManagement(ToolBase):
 
         try:
             # Step 1: Get current credential data (read-modify-write pattern)
-            current_credential = await self.client.get_credential_by_id(credential_id)
+            current_credential = await client.get_credential_by_id(credential_id)
 
             if not current_credential:
                 raise create_resource_not_found_error(
@@ -871,7 +888,7 @@ class SubscriberCredentialsManagement(ToolBase):
 
             # Step 5: Ensure required fields have defaults if missing
             if "teamId" not in merged_data or not merged_data["teamId"]:
-                merged_data["teamId"] = self.client.team_id
+                merged_data["teamId"] = client.team_id
 
             # Step 5.5: Extract required IDs from nested objects if not already present
             # The API requires subscriberId and organizationId as direct fields, not nested objects
@@ -956,7 +973,7 @@ class SubscriberCredentialsManagement(ToolBase):
                 f"Updating credential {credential_id} with merged payload keys: {list(final_payload.keys())}"
             )
             logger.debug(f"Full payload: {final_payload}")
-            updated_credential = await self.client.update_credential(credential_id, final_payload)
+            updated_credential = await client.update_credential(credential_id, final_payload)
 
             logger.info(f"Successfully updated credential: {credential_id}")
 
@@ -1020,7 +1037,7 @@ class SubscriberCredentialsManagement(ToolBase):
                     ],
                 )
 
-    async def _delete_credential(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def _delete_credential(self, arguments: Dict[str, Any], *, client: ReveniumClient) -> Dict[str, Any]:
         """Delete subscriber credential."""
         credential_id = arguments.get("credential_id")
         if not credential_id:
@@ -1036,7 +1053,7 @@ class SubscriberCredentialsManagement(ToolBase):
                 },
             )
 
-        await self.client.delete_credential(credential_id)
+        await client.delete_credential(credential_id)
         return {
             "action": "delete",
             "resource_type": "subscriber_credentials",

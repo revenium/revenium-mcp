@@ -7,8 +7,12 @@ following the same patterns as email notification management.
 """
 
 import os
-from typing import Any, ClassVar, Dict, List, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
 
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
+
+from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
@@ -57,12 +61,16 @@ class SlackConfigurationManagement(ToolBase):
         self.formatter = UnifiedResponseFormatter("slack_configuration_management")
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle Slack configuration management actions with structured error handling."""
         try:
-            client = await self.get_client()
-            return await self._route_action(action, client, arguments)
+            client = await self.get_client(ctx=ctx)
+            return await self._route_action(action, client, arguments, ctx=ctx)
 
         except ToolError:
             # Re-raise ToolError exceptions without modification
@@ -72,7 +80,14 @@ class SlackConfigurationManagement(ToolBase):
             # Re-raise Exception to be handled by standardized_tool_execution
             raise e
 
-    async def _route_action(self, action: str, client: ReveniumClient, arguments: Dict[str, Any]):
+    async def _route_action(
+        self,
+        action: str,
+        client: ReveniumClient,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
+    ):
         """Route action to appropriate handler."""
         # Action routing with structured errors
         if action == "list_configurations":
@@ -80,7 +95,7 @@ class SlackConfigurationManagement(ToolBase):
         elif action == "get_configuration":
             return await self._handle_get_configuration(client, arguments)
         elif action == "set_default_configuration":
-            return await self._handle_set_default_configuration(client, arguments)
+            return await self._handle_set_default_configuration(client, arguments, ctx=ctx)
         elif action == "get_default_configuration":
             return await self._handle_get_default_configuration(client, arguments)
         elif action == "get_app_oauth_url":
@@ -177,7 +192,11 @@ class SlackConfigurationManagement(ToolBase):
         ]
 
     async def _handle_set_default_configuration(
-        self, client: ReveniumClient, arguments: Dict[str, Any]
+        self,
+        client: ReveniumClient,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Set a Slack configuration as the default for alerts."""
         config_id = self._validate_config_id(arguments, "set_default_configuration")
@@ -191,9 +210,17 @@ class SlackConfigurationManagement(ToolBase):
         config = await client.get_slack_configuration_by_id(config_id)
 
         # Set environment variable
-        os.environ["REVENIUM_DEFAULT_SLACK_CONFIG_ID"] = config_id
+        if ctx is None:
+            os.environ["REVENIUM_DEFAULT_SLACK_CONFIG_ID"] = config_id
+        else:
+            # Multi-tenant: env vars are process-global and would leak across tenants.
+            # Per-tenant default storage is a Phase-2 follow-up; for now, do not persist.
+            logger.info(
+                "Skipping env write in multi-tenant mode "
+                "(Phase 2 will add per-tenant storage)"
+            )
 
-        return format_default_set_success(config, config_id)
+        return format_default_set_success(config, config_id, ctx_is_set=ctx is not None)
 
     async def _handle_get_default_configuration(
         self, client: ReveniumClient, arguments: Dict[str, Any]

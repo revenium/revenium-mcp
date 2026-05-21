@@ -1598,14 +1598,51 @@ class TestHandleActionGetToolMetadata:
 
 class TestHandleActionUnknown:
     @pytest.mark.asyncio
-    async def test_unknown_action_returns_error_in_text_content(self):
-        """Unknown action is caught by the error handler and returned as TextContent."""
+    async def test_unknown_action_raises_tool_error(self):
+        """Unknown action propagates ToolError so the MCP envelope reports isError=true."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
         mgmt, _ = _make_mgmt()
 
-        result = await mgmt.handle_action("does_not_exist", {})
+        with pytest.raises(ToolError) as exc_info:
+            await mgmt.handle_action("does_not_exist", {})
 
-        text = result[0].text
-        assert "does_not_exist" in text or "Unknown" in text
+        msg = str(exc_info.value)
+        assert "does_not_exist" in msg or "not supported" in msg.lower()
+
+
+class TestHandleActionPropagatesToolError:
+    @pytest.mark.asyncio
+    async def test_invalid_action_propagates(self):
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        mgmt, _ = _make_mgmt()
+        with pytest.raises(ToolError):
+            await mgmt.handle_action("invalid", {})
+
+    @pytest.mark.asyncio
+    async def test_negative_page_propagates(self):
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        mgmt, _ = _make_mgmt()
+        with pytest.raises(ToolError):
+            await mgmt.handle_action("list", {"page": -1})
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_page_propagates(self):
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        mgmt, _ = _make_mgmt()
+        with pytest.raises(ToolError):
+            await mgmt.handle_action("list", {"page": "not_a_number"})
+
+    @pytest.mark.asyncio
+    async def test_create_missing_args_propagates(self):
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        mgmt, _ = _make_mgmt()
+        with pytest.raises(ToolError):
+            await mgmt.handle_action("create", {})
 
 
 # ===========================================================================

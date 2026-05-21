@@ -8,7 +8,8 @@ from typing import Dict, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-from .constants import DEFAULT_BASE_URL
+from ..config_store import get_config_value
+from ..constants import DEFAULT_BASE_URL
 
 
 class AuthenticationError(ValueError):
@@ -114,10 +115,9 @@ class AuthConfig(BaseModel):
 
 
 class ConfigManager:
-    """Singleton configuration manager."""
+    _DEFAULT_TENANT = "_default_"
 
     _instance: Optional["ConfigManager"] = None
-    _config: Optional[AuthConfig] = None
 
     def __new__(cls) -> "ConfigManager":
         if cls._instance is None:
@@ -125,15 +125,12 @@ class ConfigManager:
         return cls._instance
 
     def __init__(self):
-        """Initialize the configuration manager."""
         if not hasattr(self, "_initialized"):
             self._initialized = True
-            self._config = None
+            self._configs: Dict[str, AuthConfig] = {}
 
     def load_from_env(self) -> AuthConfig:
         """Load configuration from environment variables with auto-discovery fallback."""
-        from .config_store import get_config_value
-
         # Override pattern: explicit env vars → discovered values → error
         api_key = get_config_value("REVENIUM_API_KEY")
         if not api_key:
@@ -183,24 +180,22 @@ class ConfigManager:
 
         return AuthConfig(**config_data)
 
-    def get_config(self, force_reload: bool = False) -> AuthConfig:
-        """Get the current configuration."""
-        if self._config is None or force_reload:
-            # Determine configuration source
+    def get_config(self, force_reload: bool = False, team_id: str = _DEFAULT_TENANT) -> AuthConfig:
+        if team_id not in self._configs or force_reload:
             config_file = os.getenv("REVENIUM_CONFIG_FILE")
 
             if config_file:
-                # Production mode: load from JSON file
-                self._config = self.load_from_json(config_file)
+                self._configs[team_id] = self.load_from_json(config_file)
             else:
-                # Development mode: load from environment variables
-                self._config = self.load_from_env()
+                self._configs[team_id] = self.load_from_env()
 
-        return self._config
+        return self._configs[team_id]
 
-    def clear_cache(self):
-        """Clear the cached configuration."""
-        self._config = None
+    def clear_cache(self, team_id: Optional[str] = None):
+        if team_id is None:
+            self._configs.clear()
+        else:
+            self._configs.pop(team_id, None)
 
 
 # Utility functions for easy access
