@@ -181,7 +181,7 @@ python -m compileall -q src
 The repo's `[tool.mypy]` config is strict (`disallow_untyped_defs`,
 `warn_return_any`, etc.) but the codebase carries a large pre-existing type
 error backlog. Running raw `mypy src/` is therefore **expected to fail** on
-current `main` until the BACK-1271 cleanup epic is complete.
+current `main` until the ongoing typing cleanup completes.
 
 The short-term gate is `scripts/check_mypy_regressions.py`. It diffs the
 current mypy output against `scripts/mypy-baseline.txt` and only fails when
@@ -373,7 +373,7 @@ git commit -m "docs(README): clarify AI routing optional feature"
    ruff check src/ tests/
 
    # Mypy regression gate (raw `mypy src/` is expected to fail until the
-   # BACK-1271 cleanup epic completes — use the gate to confirm your change
+   # ongoing typing cleanup completes — use the gate to confirm your change
    # does not introduce new type errors)
    uv run --extra dev python scripts/check_mypy_regressions.py
 
