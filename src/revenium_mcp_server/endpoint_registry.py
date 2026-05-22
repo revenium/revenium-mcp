@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 from .config_store import get_config_value
 
 
+class NewApiRequiredError(RuntimeError):
+    pass
+
+
 # Default production base URL for the new analytics API
 DEFAULT_APP_BASE_URL = "https://app.revenium.ai"
 
@@ -51,6 +55,9 @@ class EndpointConfig:
     Example: the three response-time endpoints return seconds in the new API but milliseconds
     in the old API, so ``unit_multiplier=1000.0`` normalises new-API values to milliseconds.
     """
+
+    force_new: bool = False
+    """When True, always route to ``new_path`` regardless of REVENIUM_USE_NEW_ANALYTICS_API."""
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +146,7 @@ _ENDPOINT_REGISTRY: Dict[str, EndpointConfig] = {
     "revenue_metric_by_organization": EndpointConfig(
         old_path="/profitstream/v2/api/sources/metrics/ai/revenue-metric-by-organization",
         new_path="/api/v2/analytics/revenue-per-customer",
+        force_new=True,
     ),
     # Old: /profitstream/v2/api/sources/metrics/ai/revenue-metric-by-product
     # New: /api/v2/analytics/revenue-per-product  (BACK-718 swap #12)
@@ -153,6 +161,7 @@ _ENDPOINT_REGISTRY: Dict[str, EndpointConfig] = {
         old_path="/profitstream/v2/api/sources/metrics/ai/percentage-revenue-metric-by-organization",
         new_path="/api/v2/analytics/revenue-per-customer",
         client_side_only=True,
+        force_new=True,
     ),
     # Old: percentage-revenue-metric-by-product
     # New: fetch from revenue-per-product, calculate pct client-side  (BACK-718)
@@ -224,6 +233,13 @@ def _use_new_api() -> bool:
     return value in ("true", "1", "yes")
 
 
+def _should_use_new_path(config: "EndpointConfig") -> bool:
+    """Return True if this endpoint should route to its new path."""
+    if config.new_path is None:
+        return False
+    return config.force_new or _use_new_api()
+
+
 def _resolved_app_base_url() -> str:
     """Return the configured new-analytics base URL, falling back to the default.
 
@@ -259,7 +275,7 @@ def get_endpoint_path(endpoint_key: str) -> str:
         KeyError: If the key is not in the registry
     """
     config = get_endpoint_config(endpoint_key)
-    if _use_new_api() and config.new_path is not None:
+    if _should_use_new_path(config):
         return config.new_path
     return config.old_path
 
@@ -287,14 +303,7 @@ def get_endpoint_config(key: str) -> EndpointConfig:
         )
     config = _ENDPOINT_REGISTRY[key]
 
-    if _use_new_api():
-        if config.new_path is None and config.mapping_status == "TBD":
-            # No new API mapping yet — fall back to legacy routing so that enabling
-            # REVENIUM_USE_NEW_ANALYTICS_API for already-migrated endpoints does not
-            # simultaneously break all unmapped (TBD) endpoints.
-            # The caller receives the legacy config unchanged; Phase 2 will supply
-            # new_path values as each endpoint is confirmed.
-            return config
+    if _should_use_new_path(config):
         # Patch new_base_url to whatever is currently configured
         try:
             app_base_url = _resolved_app_base_url()
@@ -314,7 +323,15 @@ def get_endpoint_config(key: str) -> EndpointConfig:
                 client_side_only=config.client_side_only,
                 mapping_status=config.mapping_status,
                 unit_multiplier=config.unit_multiplier,
+                force_new=config.force_new,
             )
+    elif _use_new_api() and config.new_path is None and config.mapping_status == "TBD":
+        # No new API mapping yet — fall back to legacy routing so that enabling
+        # REVENIUM_USE_NEW_ANALYTICS_API for already-migrated endpoints does not
+        # simultaneously break all unmapped (TBD) endpoints.
+        # The caller receives the legacy config unchanged; Phase 2 will supply
+        # new_path values as each endpoint is confirmed.
+        return config
 
     return config
 
@@ -361,12 +378,16 @@ def resolve_analytics_request(
     """
     config = get_endpoint_config(key)
 
-    if config.mapping_status == "NEW_API_ONLY" and not _use_new_api():
-        raise RuntimeError(
+    if (
+        config.mapping_status == "NEW_API_ONLY"
+        and not _use_new_api()
+        and not config.force_new
+    ):
+        raise NewApiRequiredError(
             f"Endpoint {key!r} is new-API only; set REVENIUM_USE_NEW_ANALYTICS_API=true to use it."
         )
 
-    if _use_new_api() and config.new_path is not None:
+    if _should_use_new_path(config):
         from .analytics_parameters import TimePeriod
         from .date_parser import period_to_date_range
 
@@ -420,4 +441,4 @@ def get_unit_multiplier(key: str) -> float:
         KeyError: If the key is not in the registry
     """
     config = get_endpoint_config(key)
-    return config.unit_multiplier if _use_new_api() else 1.0
+    return config.unit_multiplier if _should_use_new_path(config) else 1.0

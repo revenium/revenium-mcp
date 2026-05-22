@@ -38,9 +38,9 @@ class DiscoveredConfig:
 class ConfigurationStore:
     """Simple in-memory configuration store with auto-discovery."""
 
+    _DEFAULT_TENANT = "_default_"
+
     _instance: Optional["ConfigurationStore"] = None
-    _discovered_config: Optional[DiscoveredConfig] = None
-    _discovery_attempted: bool = False
 
     def __new__(cls) -> "ConfigurationStore":
         if cls._instance is None:
@@ -48,53 +48,43 @@ class ConfigurationStore:
         return cls._instance
 
     def __init__(self):
-        """Initialize the configuration store."""
         if not hasattr(self, "_initialized"):
             self._initialized = True
-            self._discovered_config = None
-            self._discovery_attempted = False
+            self._discovered_configs: Dict[str, DiscoveredConfig] = {}
+            self._discovery_attempted: set = set()
 
-    async def get_configuration(self) -> DiscoveredConfig:
-        """Get configuration with auto-discovery if needed."""
-        # If we haven't attempted discovery yet, try it
-        if not self._discovery_attempted:
-            await self._attempt_discovery()
+    async def get_configuration(self, team_id: str = _DEFAULT_TENANT) -> DiscoveredConfig:
+        if team_id not in self._discovery_attempted:
+            await self._attempt_discovery(team_id)
 
-        # Return discovered config or empty config
-        return self._discovered_config or DiscoveredConfig()
+        return self._discovered_configs.get(team_id, DiscoveredConfig())
 
-    def get_configuration_sync(self) -> DiscoveredConfig:
-        """Get configuration synchronously (for use in sync contexts)."""
-        # If we haven't attempted discovery yet, try it
-        if not self._discovery_attempted:
+    def get_configuration_sync(self, team_id: str = _DEFAULT_TENANT) -> DiscoveredConfig:
+        if team_id not in self._discovery_attempted:
             try:
-                # Run discovery in a new event loop
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
-                    loop.run_until_complete(self._attempt_discovery())
+                    loop.run_until_complete(self._attempt_discovery(team_id))
                 finally:
                     loop.close()
             except Exception as e:
                 logger.warning(f"Sync discovery failed: {e}")
 
-        # Return discovered config or empty config
-        return self._discovered_config or DiscoveredConfig()
+        return self._discovered_configs.get(team_id, DiscoveredConfig())
 
-    def _run_discovery_in_thread(self) -> None:
-        """Run discovery in a separate thread with its own event loop."""
+    def _run_discovery_in_thread(self, team_id: str = _DEFAULT_TENANT) -> None:
         import asyncio
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._attempt_discovery())
+            loop.run_until_complete(self._attempt_discovery(team_id))
         finally:
             loop.close()
 
-    async def _attempt_discovery(self) -> None:
-        """Attempt to discover configuration from API."""
-        self._discovery_attempted = True
+    async def _attempt_discovery(self, team_id: str = _DEFAULT_TENANT) -> None:
+        self._discovery_attempted.add(team_id)
 
         try:
             # Check if we have an API key
@@ -114,7 +104,7 @@ class ConfigurationStore:
             discovered_values = await discovery_service.discover_configuration()
 
             # Create discovered config object
-            self._discovered_config = DiscoveredConfig(
+            self._discovered_configs[team_id] = DiscoveredConfig(
                 team_id=discovered_values.get("REVENIUM_TEAM_ID"),
                 tenant_id=discovered_values.get("REVENIUM_TENANT_ID"),
                 owner_id=discovered_values.get("REVENIUM_OWNER_ID"),
@@ -126,7 +116,7 @@ class ConfigurationStore:
             )
 
             logger.info(
-                f"✅ Auto-discovery successful: {len(self._discovered_config.to_dict())} values discovered"
+                f"Auto-discovery successful: {len(self._discovered_configs[team_id].to_dict())} values discovered"
             )
 
         except Exception as e:
@@ -157,11 +147,10 @@ class ConfigurationStore:
                         if response.status_code == 200:
                             user_data = response.json()
 
-                            # Extract values manually
-                            team_id = None
+                            discovered_team_id = None
                             teams = user_data.get("teams", [])
                             if teams and len(teams) > 0:
-                                team_id = teams[0].get("id")
+                                discovered_team_id = teams[0].get("id")
 
                             tenant_id = None
                             tenant = user_data.get("tenant", {})
@@ -172,8 +161,8 @@ class ConfigurationStore:
                             email = user_data.get("email") or user_data.get("label")
 
                             # Create discovered config with extracted values
-                            self._discovered_config = DiscoveredConfig(
-                                team_id=team_id,
+                            self._discovered_configs[team_id] = DiscoveredConfig(
+                                team_id=discovered_team_id,
                                 tenant_id=tenant_id,
                                 owner_id=owner_id,
                                 default_email=email,
@@ -183,20 +172,18 @@ class ConfigurationStore:
                             )
 
                             logger.info(
-                                f"✅ Manual extraction successful: team_id={team_id}, tenant_id={tenant_id}"
+                                f"Manual extraction successful: team_id={discovered_team_id}, tenant_id={tenant_id}"
                             )
                             return
 
             except Exception as fallback_error:
                 logger.warning(f"Manual extraction also failed: {fallback_error}")
 
-            # Final fallback - empty config
-            self._discovered_config = DiscoveredConfig()
+            self._discovered_configs[team_id] = DiscoveredConfig()
 
     def get_value_with_override(
-        self, env_var_name: str, default: Optional[str] = None
+        self, env_var_name: str, default: Optional[str] = None, team_id: str = _DEFAULT_TENANT
     ) -> Optional[str]:
-        """Get a configuration value with override pattern: cached override → env var → discovered → default."""
         # First check for cached user overrides (highest priority)
         try:
             from .config_cache import _default_cache
@@ -214,8 +201,7 @@ class ConfigurationStore:
         if env_value:
             return env_value
 
-        # Ensure we have attempted discovery
-        if not self._discovery_attempted:
+        if team_id not in self._discovery_attempted:
             # Trigger discovery synchronously - handle existing event loop
             try:
                 import asyncio
@@ -227,30 +213,30 @@ class ConfigurationStore:
                     import concurrent.futures
 
                     with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(self._run_discovery_in_thread)
+                        future = executor.submit(self._run_discovery_in_thread, team_id)
                         future.result(timeout=10)  # 10 second timeout
                 except RuntimeError:
                     # No event loop running, create a new one
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
                     try:
-                        loop.run_until_complete(self._attempt_discovery())
+                        loop.run_until_complete(self._attempt_discovery(team_id))
                     finally:
                         loop.close()
             except Exception as e:
                 logger.warning(f"Discovery failed in get_value_with_override: {e}")
 
-        # Check discovered config
-        if self._discovered_config:
+        discovered = self._discovered_configs.get(team_id)
+        if discovered:
             field_map = {
-                "REVENIUM_API_KEY": self._discovered_config.api_key,
-                "REVENIUM_TEAM_ID": self._discovered_config.team_id,
-                "REVENIUM_TENANT_ID": self._discovered_config.tenant_id,
-                "REVENIUM_OWNER_ID": self._discovered_config.owner_id,
-                "REVENIUM_DEFAULT_EMAIL": self._discovered_config.default_email,
-                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": self._discovered_config.default_slack_config_id,
-                "REVENIUM_BASE_URL": self._discovered_config.base_url,
-                "REVENIUM_APP_BASE_URL": self._discovered_config.app_base_url,
+                "REVENIUM_API_KEY": discovered.api_key,
+                "REVENIUM_TEAM_ID": discovered.team_id,
+                "REVENIUM_TENANT_ID": discovered.tenant_id,
+                "REVENIUM_OWNER_ID": discovered.owner_id,
+                "REVENIUM_DEFAULT_EMAIL": discovered.default_email,
+                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": discovered.default_slack_config_id,
+                "REVENIUM_BASE_URL": discovered.base_url,
+                "REVENIUM_APP_BASE_URL": discovered.app_base_url,
             }
             discovered_value = field_map.get(env_var_name)
             if discovered_value:
@@ -259,10 +245,13 @@ class ConfigurationStore:
         # Return default if provided
         return default
 
-    def clear_cache(self):
-        """Clear the cached configuration."""
-        self._discovered_config = None
-        self._discovery_attempted = False
+    def clear_cache(self, team_id: Optional[str] = None):
+        if team_id is None:
+            self._discovered_configs.clear()
+            self._discovery_attempted.clear()
+        else:
+            self._discovered_configs.pop(team_id, None)
+            self._discovery_attempted.discard(team_id)
 
 
 # Global instance

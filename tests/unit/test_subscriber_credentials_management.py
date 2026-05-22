@@ -67,7 +67,9 @@ class TestHandleActionRouting:
             }
         )
         result = await cred_tool.handle_action("list", {})
-        cred_tool._list_credentials.assert_called_once_with({})
+        args, kwargs = cred_tool._list_credentials.call_args
+        assert args == ({},)
+        assert "client" in kwargs
         assert len(result) >= 1
 
     @pytest.mark.asyncio
@@ -212,7 +214,7 @@ class TestListCredentialsPaginationValidation:
     @pytest.mark.asyncio
     async def test_list_rejects_float_size_with_structured_error(self, cred_tool):
         with pytest.raises(ToolError) as exc:
-            await cred_tool._list_credentials({"page": 0, "size": 3.7})
+            await cred_tool._list_credentials({"page": 0, "size": 3.7}, client=cred_tool.client)
         assert exc.value.field == "size"
         assert "integer" in exc.value.message.lower()
         assert_no_framework_leak(exc.value.message)
@@ -221,13 +223,13 @@ class TestListCredentialsPaginationValidation:
     @pytest.mark.asyncio
     async def test_list_rejects_size_zero(self, cred_tool):
         with pytest.raises(ToolError) as exc:
-            await cred_tool._list_credentials({"page": 0, "size": 0})
+            await cred_tool._list_credentials({"page": 0, "size": 0}, client=cred_tool.client)
         assert exc.value.field == "size"
         assert "[1, 100]" in exc.value.message or "1" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_list_rejects_size_max_int(self, cred_tool):
         with pytest.raises(ToolError) as exc:
-            await cred_tool._list_credentials({"page": 0, "size": 2147483647})
+            await cred_tool._list_credentials({"page": 0, "size": 2147483647}, client=cred_tool.client)
         assert exc.value.field == "size"
         assert "[1, 100]" in exc.value.message or "100" in exc.value.message

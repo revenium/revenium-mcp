@@ -114,7 +114,7 @@ class TransactionLevelAnalyticsProcessor:
     - ProfitabilityAnalyticsProcessor
     """
 
-    def __init__(self, ucm_helper=None):
+    def __init__(self, ucm_helper: Any = None) -> None:
         """Initialize the transaction-level analytics processor."""
         logger.info("Initializing TransactionLevelAnalyticsProcessor")
 
@@ -600,7 +600,7 @@ class TransactionLevelAnalyticsProcessor:
         """Fetch summary data from multiple endpoints concurrently following CostAnalyticsProcessor patterns."""
         extra_old_params = {"group": group} if group != "TOTAL" else None
 
-        def _make_call(key, extra=None, extra_new=None):
+        def _make_call(key: str, extra: Any = None, extra_new: Any = None) -> Any:
             path, params, call_kwargs = resolve_analytics_request(
                 key, team_id, period, extra_old_params=extra, extra_new_params=extra_new
             )
@@ -631,7 +631,7 @@ class TransactionLevelAnalyticsProcessor:
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
         # Combine results with task names following existing error handling patterns
-        summary_data = {}
+        summary_data: Dict[str, Any] = {}
         for i, (task_name, result) in enumerate(zip(tasks.keys(), results)):
             if isinstance(result, Exception):
                 logger.warning(f"Failed to fetch {task_name}: {result}")
@@ -650,11 +650,11 @@ class TransactionLevelAnalyticsProcessor:
         # Initialize metrics following existing patterns
         total_transactions = 0
         total_cost = 0.0
-        cost_by_provider = {}
-        cost_by_model = {}
-        cost_by_subscriber = {}
-        performance_metrics = {}
-        transaction_trends = []
+        cost_by_provider: Dict[str, Any] = {}
+        cost_by_model: Dict[str, Any] = {}
+        cost_by_subscriber: Dict[str, Any] = {}
+        performance_metrics: Dict[str, Any] = {}
+        transaction_trends: List[Any] = []
 
         # Process total cost by provider over time following CostAnalyticsProcessor patterns
         try:
@@ -908,7 +908,7 @@ class TransactionLevelAnalyticsProcessor:
 
         extra_old_params = {"group": group} if group != "TOTAL" else None
 
-        def _make_call(key):
+        def _make_call(key: str) -> Any:
             path, params, call_kwargs = resolve_analytics_request(
                 key, team_id, period, extra_old_params=extra_old_params
             )
@@ -925,7 +925,7 @@ class TransactionLevelAnalyticsProcessor:
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
         # Combine results with task names following existing error handling patterns
-        customer_data = {}
+        customer_data: Dict[str, Any] = {}
         for i, (task_name, result) in enumerate(zip(tasks.keys(), results)):
             if isinstance(result, Exception):
                 logger.warning(f"Failed to fetch {task_name}: {result}")
@@ -969,9 +969,9 @@ class TransactionLevelAnalyticsProcessor:
 
                     if org_name not in organization_data:
                         organization_data[org_name] = {
-                            "cost": 0,
-                            "revenue": 0,
-                            "percentage_revenue": 0,
+                            "cost": 0.0,
+                            "revenue": 0.0,
+                            "percentage_revenue": 0.0,
                             "transactions": 0,
                         }
                     organization_data[org_name]["cost"] += org_cost
@@ -998,9 +998,9 @@ class TransactionLevelAnalyticsProcessor:
 
                     if org_name not in organization_data:
                         organization_data[org_name] = {
-                            "cost": 0,
-                            "revenue": 0,
-                            "percentage_revenue": 0,
+                            "cost": 0.0,
+                            "revenue": 0.0,
+                            "percentage_revenue": 0.0,
                             "transactions": 0,
                         }
                     organization_data[org_name]["revenue"] += org_revenue
@@ -1027,9 +1027,9 @@ class TransactionLevelAnalyticsProcessor:
 
                     if org_name not in organization_data:
                         organization_data[org_name] = {
-                            "cost": 0,
-                            "revenue": 0,
-                            "percentage_revenue": 0,
+                            "cost": 0.0,
+                            "revenue": 0.0,
+                            "percentage_revenue": 0.0,
                             "transactions": 0,
                         }
                     organization_data[org_name]["percentage_revenue"] += org_percentage
@@ -1094,9 +1094,9 @@ class TransactionLevelAnalyticsProcessor:
 
                     if product_name not in product_data_dict:
                         product_data_dict[product_name] = {
-                            "cost": 0,
-                            "revenue": 0,
-                            "percentage_revenue": 0,
+                            "cost": 0.0,
+                            "revenue": 0.0,
+                            "percentage_revenue": 0.0,
                             "transactions": 0,
                         }
                     product_data_dict[product_name]["cost"] += product_cost
@@ -1123,9 +1123,9 @@ class TransactionLevelAnalyticsProcessor:
 
                     if product_name not in product_data_dict:
                         product_data_dict[product_name] = {
-                            "cost": 0,
-                            "revenue": 0,
-                            "percentage_revenue": 0,
+                            "cost": 0.0,
+                            "revenue": 0.0,
+                            "percentage_revenue": 0.0,
                             "transactions": 0,
                         }
                     product_data_dict[product_name]["revenue"] += product_revenue
@@ -1152,9 +1152,9 @@ class TransactionLevelAnalyticsProcessor:
 
                     if product_name not in product_data_dict:
                         product_data_dict[product_name] = {
-                            "cost": 0,
-                            "revenue": 0,
-                            "percentage_revenue": 0,
+                            "cost": 0.0,
+                            "revenue": 0.0,
+                            "percentage_revenue": 0.0,
                             "transactions": 0,
                         }
                     product_data_dict[product_name]["percentage_revenue"] += product_percentage
@@ -1354,7 +1354,7 @@ class TransactionLevelAnalyticsProcessor:
 
         extra_old_params = {"group": group} if group != "TOTAL" else None
 
-        def _make_call(key):
+        def _make_call(key: str) -> Any:
             path, params, call_kwargs = resolve_analytics_request(
                 key, team_id, period, extra_old_params=extra_old_params
             )
@@ -1371,7 +1371,7 @@ class TransactionLevelAnalyticsProcessor:
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
         # Combine results with task names following existing error handling patterns
-        product_data = {}
+        product_data: Dict[str, Any] = {}
         for i, (task_name, result) in enumerate(zip(tasks.keys(), results)):
             if isinstance(result, Exception):
                 logger.warning(f"Failed to fetch {task_name}: {result}")
@@ -1548,7 +1548,7 @@ class TransactionLevelAnalyticsProcessor:
 
         extra_old_params = {"group": group} if group != "TOTAL" else None
 
-        def _make_call(key):
+        def _make_call(key: str) -> Any:
             path, params, call_kwargs = resolve_analytics_request(
                 key, team_id, period, extra_old_params=extra_old_params
             )
@@ -1565,7 +1565,7 @@ class TransactionLevelAnalyticsProcessor:
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
         # Combine results with task names following existing error handling patterns
-        agent_data = {}
+        agent_data: Dict[str, Any] = {}
         for i, (task_name, result) in enumerate(zip(tasks.keys(), results)):
             if isinstance(result, Exception):
                 logger.warning(f"Failed to fetch {task_name}: {result}")
@@ -1744,7 +1744,7 @@ class TransactionLevelAnalyticsProcessor:
                                 agent_cost += metric_result
 
                     if agent_name not in agent_data_dict:
-                        agent_data_dict[agent_name] = {"cost": 0, "calls": 0, "performance": 0}
+                        agent_data_dict[agent_name] = {"cost": 0.0, "calls": 0, "performance": 0}
                     agent_data_dict[agent_name]["cost"] += agent_cost
 
         # Process call count metrics by agents
@@ -1768,7 +1768,7 @@ class TransactionLevelAnalyticsProcessor:
                                 agent_calls += int(metric_result)
 
                     if agent_name not in agent_data_dict:
-                        agent_data_dict[agent_name] = {"cost": 0, "calls": 0, "performance": 0}
+                        agent_data_dict[agent_name] = {"cost": 0.0, "calls": 0, "performance": 0}
                     agent_data_dict[agent_name]["calls"] += agent_calls
 
         # Process performance metrics by agents
@@ -1793,14 +1793,14 @@ class TransactionLevelAnalyticsProcessor:
                                 agent_performance += metric_result * perf_agents_multiplier
 
                     if agent_name not in agent_data_dict:
-                        agent_data_dict[agent_name] = {"cost": 0, "calls": 0, "performance": 0}
+                        agent_data_dict[agent_name] = {"cost": 0.0, "calls": 0, "performance": 0}
                     agent_data_dict[agent_name]["performance"] += agent_performance
 
         # Calculate performance metrics and create AgentAnalyticsData objects
         agents = []
         for agent_name, data in agent_data_dict.items():
             cost = data["cost"]
-            calls = data["calls"]
+            calls = int(data["calls"])
             performance = data["performance"]
 
             # Calculate derived metrics
@@ -1836,7 +1836,7 @@ class TransactionLevelAnalyticsProcessor:
 
         extra_old_params = {"group": group} if group != "TOTAL" else None
 
-        def _make_call(key):
+        def _make_call(key: str) -> Any:
             path, params, call_kwargs = resolve_analytics_request(
                 key, team_id, period, extra_old_params=extra_old_params
             )
@@ -1854,7 +1854,7 @@ class TransactionLevelAnalyticsProcessor:
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
         # Combine results with task names following existing error handling patterns
-        task_data = {}
+        task_data: Dict[str, Any] = {}
         for i, (task_name, result) in enumerate(zip(tasks.keys(), results)):
             if isinstance(result, Exception):
                 logger.warning(f"Failed to fetch {task_name}: {result}")
@@ -2078,7 +2078,7 @@ class TransactionLevelAnalyticsProcessor:
                                 provider_cost += metric_result
 
                     if provider_name not in provider_data_dict:
-                        provider_data_dict[provider_name] = {"cost": 0, "performance": 0}
+                        provider_data_dict[provider_name] = {"cost": 0.0, "performance": 0}
                     provider_data_dict[provider_name]["cost"] += provider_cost
 
         # Process performance metrics by provider
@@ -2103,7 +2103,7 @@ class TransactionLevelAnalyticsProcessor:
                                 provider_performance += metric_result * perf_prov_multiplier
 
                     if provider_name not in provider_data_dict:
-                        provider_data_dict[provider_name] = {"cost": 0, "performance": 0}
+                        provider_data_dict[provider_name] = {"cost": 0.0, "performance": 0}
                     provider_data_dict[provider_name]["performance"] += provider_performance
 
         # Process cost metrics by model
@@ -2127,7 +2127,7 @@ class TransactionLevelAnalyticsProcessor:
                                 model_cost += metric_result
 
                     if model_name not in model_data_dict:
-                        model_data_dict[model_name] = {"cost": 0, "performance": 0}
+                        model_data_dict[model_name] = {"cost": 0.0, "performance": 0.0}
                     model_data_dict[model_name]["cost"] += model_cost
 
         # Process performance metrics by model
@@ -2152,7 +2152,7 @@ class TransactionLevelAnalyticsProcessor:
                                 model_performance += metric_result * perf_mdl_multiplier
 
                     if model_name not in model_data_dict:
-                        model_data_dict[model_name] = {"cost": 0, "performance": 0}
+                        model_data_dict[model_name] = {"cost": 0.0, "performance": 0.0}
                     model_data_dict[model_name]["performance"] += model_performance
 
         # Create TaskAnalyticsData objects for providers and models
@@ -2230,7 +2230,7 @@ class TransactionLevelAnalyticsProcessor:
                     for metric in group.get("metrics", []):
                         if not isinstance(metric, dict):
                             continue
-                        value = float(metric.get("metricResult", metric.get("revenue", 0)))
+                        value = float(metric.get("metricResult", metric.get("revenue", 0)) or 0)
                         total_revenue += value
                         entity_revenues[entity] = entity_revenues.get(entity, 0.0) + value
 
@@ -2254,7 +2254,7 @@ class TransactionLevelAnalyticsProcessor:
         if isinstance(revenue_data, dict):
             groups = revenue_data.get("groups", [])
             total_revenue = 0.0
-            entity_revenues: Dict[str, float] = {}
+            entity_revenues = {}
             for group in groups:
                 if not isinstance(group, dict):
                     continue
@@ -2262,7 +2262,7 @@ class TransactionLevelAnalyticsProcessor:
                 for metric in group.get("metrics", []):
                     if not isinstance(metric, dict):
                         continue
-                    value = float(metric.get("metricResult", metric.get("revenue", 0)))
+                    value = float(metric.get("metricResult", metric.get("revenue", 0)) or 0)
                     total_revenue += value
                     entity_revenues[entity] = entity_revenues.get(entity, 0.0) + value
 

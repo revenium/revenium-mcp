@@ -166,13 +166,10 @@ class EntityReference:
 class EntityLookupService:
     """Service for resolving entities by various identifiers with multiple strategies."""
 
-    def __init__(self, client: Optional[ReveniumClient] = None):
-        """Initialize the entity lookup service.
-
-        Args:
-            client: ReveniumClient instance for API calls
-        """
-        self.client = client or ReveniumClient()
+    def __init__(self, client: ReveniumClient):
+        if client is None:
+            raise ValueError("client is required")
+        self.client = client
         self._cache = {}
         self._cache_ttl = timedelta(minutes=5)  # Cache for 5 minutes
         self._last_cache_clear = datetime.now()
@@ -993,11 +990,12 @@ class EntityLookupService:
 _entity_lookup_service = None
 
 
-def get_entity_lookup_service() -> EntityLookupService:
-    """Get the global entity lookup service instance (lazy initialization)."""
+def get_entity_lookup_service(client: Optional[ReveniumClient] = None) -> EntityLookupService:
+    if client is not None:
+        return EntityLookupService(client)
     global _entity_lookup_service
     if _entity_lookup_service is None:
-        _entity_lookup_service = EntityLookupService()
+        _entity_lookup_service = EntityLookupService(ReveniumClient())
     return _entity_lookup_service
 
 

@@ -4,7 +4,7 @@ This module provides comprehensive schema discovery, examples, and validation
 capabilities to make the MCP server much more agent-friendly.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from loguru import logger
 
@@ -25,11 +25,10 @@ from .product_validators import ProductValidationEngine
 class SchemaDiscoveryEngine:
     """Provides comprehensive schema discovery and capabilities for agents."""
 
-    def __init__(self):
-        """Initialize the schema discovery engine."""
-        self.capabilities = self._build_capabilities()
-        self.examples = self._build_examples()
-        self.validation_rules = self._build_validation_rules()
+    def __init__(self) -> None:
+        self.capabilities: Dict[str, Any] = self._build_capabilities()
+        self.examples: Dict[str, List[Dict[str, Any]]] = self._build_examples()
+        self.validation_rules: Dict[str, Dict[str, Any]] = self._build_validation_rules()
 
     def get_capabilities(self, resource_type: str = "anomalies") -> Dict[str, Any]:
         """Get comprehensive capabilities and schema information.
@@ -43,9 +42,9 @@ class SchemaDiscoveryEngine:
         logger.info(f"Getting capabilities for resource type: {resource_type}")
 
         if resource_type == "anomalies":
-            return self.capabilities["anomalies"]
+            return cast(Dict[str, Any], self.capabilities["anomalies"])
         elif resource_type == "alerts":
-            return self.capabilities["alerts"]
+            return cast(Dict[str, Any], self.capabilities["alerts"])
         else:
             return {
                 "error": f"Unknown resource type: {resource_type}",
@@ -103,7 +102,7 @@ class SchemaDiscoveryEngine:
             }
 
         rules = self.validation_rules[resource_type]
-        validation_result = {
+        validation_result: Dict[str, Any] = {
             "valid": True,
             "errors": [],
             "warnings": [],
@@ -212,7 +211,7 @@ class SchemaDiscoveryEngine:
 
     def _validate_detection_rule(self, rule: Dict[str, Any], rule_index: int) -> Dict[str, Any]:
         """Validate a single detection rule."""
-        result = {"valid": True, "errors": [], "warnings": [], "suggestions": []}
+        result: Dict[str, Any] = {"valid": True, "errors": [], "warnings": [], "suggestions": []}
 
         # Check required fields
         required_fields = ["rule_type", "metric", "operator", "value"]
@@ -271,7 +270,7 @@ class SchemaDiscoveryEngine:
 
     def _get_valid_values_for_field(self, field: str) -> List[str]:
         """Get valid values for a specific field."""
-        field_mappings = {
+        field_mappings: Dict[str, List[str]] = {
             "rule_type": ["THRESHOLD", "CUMULATIVE_USAGE", "RELATIVE_CHANGE"],
             "metric": self.capabilities["anomalies"]["metrics"]["all"],
             "operator": self.capabilities["anomalies"]["operators"]["all"],
@@ -657,8 +656,7 @@ class SchemaDiscoveryEngine:
 class ProductSchemaDiscovery(SchemaDiscoveryEngine):
     """Product-specific schema discovery and validation capabilities."""
 
-    def __init__(self):
-        """Initialize the product schema discovery engine."""
+    def __init__(self) -> None:
         super().__init__()
         # Add product-specific capabilities to the base capabilities
         self.capabilities["products"] = self._build_product_capabilities()
@@ -667,7 +665,7 @@ class ProductSchemaDiscovery(SchemaDiscoveryEngine):
 
     def get_product_capabilities(self) -> Dict[str, Any]:
         """Get comprehensive product schema capabilities."""
-        return self.capabilities["products"]
+        return cast(Dict[str, Any], self.capabilities["products"])
 
     def get_product_examples(self, example_type: Optional[str] = None) -> Dict[str, Any]:
         """Get product creation examples and templates."""
@@ -965,8 +963,7 @@ class ProductSchemaDiscovery(SchemaDiscoveryEngine):
 class SourceSchemaDiscovery(SchemaDiscoveryEngine):
     """Source-specific schema discovery and validation capabilities."""
 
-    def __init__(self):
-        """Initialize the source schema discovery engine."""
+    def __init__(self) -> None:
         super().__init__()
         # Add source-specific capabilities to the base capabilities
         self.capabilities["sources"] = self._build_source_capabilities()
@@ -975,7 +972,7 @@ class SourceSchemaDiscovery(SchemaDiscoveryEngine):
 
     def get_source_capabilities(self) -> Dict[str, Any]:
         """Get comprehensive source schema capabilities."""
-        return self.capabilities["sources"]
+        return cast(Dict[str, Any], self.capabilities["sources"])
 
     def get_source_examples(self, example_type: Optional[str] = None) -> Dict[str, Any]:
         """Get source creation examples and templates."""
@@ -988,7 +985,7 @@ class SourceSchemaDiscovery(SchemaDiscoveryEngine):
         logger.info(f"Validating source configuration (dry_run: {dry_run})")
 
         # Basic validation for source configuration
-        validation_result = {
+        validation_result: Dict[str, Any] = {
             "valid": True,
             "errors": [],
             "warnings": [],
@@ -1214,8 +1211,7 @@ class SourceSchemaDiscovery(SchemaDiscoveryEngine):
 class SubscriptionSchemaDiscovery(SchemaDiscoveryEngine):
     """Subscription-specific schema discovery and validation capabilities."""
 
-    def __init__(self):
-        """Initialize the subscription schema discovery engine."""
+    def __init__(self) -> None:
         super().__init__()
         # Add subscription-specific capabilities to the base capabilities
         self.capabilities["subscriptions"] = self._build_subscription_capabilities()
@@ -1224,20 +1220,20 @@ class SubscriptionSchemaDiscovery(SchemaDiscoveryEngine):
 
     def get_subscription_capabilities(self) -> Dict[str, Any]:
         """Get comprehensive subscription schema capabilities."""
-        return self.capabilities["subscriptions"]
+        return cast(Dict[str, Any], self.capabilities["subscriptions"])
 
     def get_subscription_examples(self, example_type: Optional[str] = None) -> Dict[str, Any]:
         """Get subscription creation examples and templates."""
         return self.get_examples("subscriptions", example_type)
 
     def validate_subscription_configuration(
-        self, config_data: Dict[str, Any], dry_run: bool = True, client=None
+        self, config_data: Dict[str, Any], dry_run: bool = True, client: Any = None
     ) -> Dict[str, Any]:
         """Validate subscription configuration with detailed feedback."""
         logger.info(f"Validating subscription configuration (dry_run: {dry_run})")
 
         # Basic validation for subscription configuration
-        validation_result = {
+        validation_result: Dict[str, Any] = {
             "valid": True,
             "errors": [],
             "warnings": [],
@@ -1570,8 +1566,7 @@ class SubscriptionSchemaDiscovery(SchemaDiscoveryEngine):
 class CustomerSchemaDiscovery(SchemaDiscoveryEngine):
     """Customer-specific schema discovery and validation capabilities."""
 
-    def __init__(self):
-        """Initialize the customer schema discovery engine."""
+    def __init__(self) -> None:
         super().__init__()
         # Add customer-specific capabilities to the base capabilities
         self.capabilities["customers"] = self._build_customer_capabilities()
@@ -1580,7 +1575,7 @@ class CustomerSchemaDiscovery(SchemaDiscoveryEngine):
 
     def get_customer_capabilities(self) -> Dict[str, Any]:
         """Get comprehensive customer schema capabilities."""
-        return self.capabilities["customers"]
+        return cast(Dict[str, Any], self.capabilities["customers"])
 
     def get_customer_examples(self, example_type: Optional[str] = None) -> Dict[str, Any]:
         """Get customer creation examples and templates."""
@@ -1593,7 +1588,7 @@ class CustomerSchemaDiscovery(SchemaDiscoveryEngine):
         logger.info(f"Validating {resource_type} configuration (dry_run: {dry_run})")
 
         # Basic validation for customer configuration
-        validation_result = {
+        validation_result: Dict[str, Any] = {
             "valid": True,
             "errors": [],
             "warnings": [],

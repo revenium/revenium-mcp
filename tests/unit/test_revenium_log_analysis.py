@@ -70,7 +70,7 @@ class TestRouteAction:
             return_value=[TextContent(type="text", text="internal")]
         )
         result = await log_tool._route_action("get_internal_logs", {"page": 0})
-        log_tool._handle_get_internal_logs.assert_called_once_with({"page": 0})
+        log_tool._handle_get_internal_logs.assert_called_once_with({"page": 0}, ctx=None)
 
     @pytest.mark.asyncio
     async def test_routes_get_integration_logs(self, log_tool):

@@ -11,7 +11,7 @@ This module provides specialized profitability analytics capabilities including:
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, cast
 
 from loguru import logger
 
@@ -74,7 +74,7 @@ class ProfitabilityAnalyticsProcessor:
     revenue and cost analytics endpoints from the Revenium API.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the profitability analytics processor."""
 
     async def analyze_profitability(
@@ -106,19 +106,25 @@ class ProfitabilityAnalyticsProcessor:
 
         try:
             # Fetch revenue and cost data concurrently
-            revenue_data, cost_data = await asyncio.gather(
+            gathered: List[Any] = await asyncio.gather(
                 self._fetch_revenue_data(client, team_id, period, group, entity_type),
                 self._fetch_cost_data(client, team_id, period, group, entity_type),
                 return_exceptions=True,
             )
+            revenue_result = gathered[0]
+            cost_result = gathered[1]
 
             # Handle potential exceptions
-            if isinstance(revenue_data, Exception):
-                logger.warning(f"Revenue data fetch failed: {revenue_data}")
-                revenue_data = {}
-            if isinstance(cost_data, Exception):
-                logger.warning(f"Cost data fetch failed: {cost_data}")
-                cost_data = {}
+            revenue_data: Dict[str, Any] = {}
+            cost_data: Dict[str, Any] = {}
+            if isinstance(revenue_result, BaseException):
+                logger.warning(f"Revenue data fetch failed: {revenue_result}")
+            else:
+                revenue_data = revenue_result
+            if isinstance(cost_result, BaseException):
+                logger.warning(f"Cost data fetch failed: {cost_result}")
+            else:
+                cost_data = cost_result
 
             # Process and analyze the combined data
             profitability_data = self._process_profitability_data(
@@ -264,9 +270,9 @@ class ProfitabilityAnalyticsProcessor:
             )
 
             # Handle potential exceptions
-            if isinstance(current_data, Exception):
+            if isinstance(current_data, BaseException):
                 raise current_data
-            if isinstance(comparison_data, Exception):
+            if isinstance(comparison_data, BaseException):
                 raise comparison_data
 
             # Calculate period-over-period changes
@@ -324,7 +330,7 @@ class ProfitabilityAnalyticsProcessor:
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
         # Combine results with task names
-        revenue_data = {}
+        revenue_data: Dict[str, Any] = {}
         for i, (task_name, result) in enumerate(zip(tasks.keys(), results)):
             if isinstance(result, Exception):
                 logger.warning(f"Failed to fetch {task_name}: {result}")
@@ -363,7 +369,7 @@ class ProfitabilityAnalyticsProcessor:
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
         # Combine results with task names
-        cost_data = {}
+        cost_data: Dict[str, Any] = {}
         for i, (task_name, result) in enumerate(zip(tasks.keys(), results)):
             if isinstance(result, Exception):
                 logger.warning(f"Failed to fetch {task_name}: {result}")
@@ -382,9 +388,9 @@ class ProfitabilityAnalyticsProcessor:
         # Initialize totals
         total_revenue = 0.0
         total_cost = 0.0
-        profitability_by_customer = {}
-        profitability_by_product = {}
-        profitability_by_period = []
+        profitability_by_customer: Dict[str, Dict[str, float]] = {}
+        profitability_by_product: Dict[str, Dict[str, float]] = {}
+        profitability_by_period: List[Dict[str, Any]] = []
 
         # Process revenue data - handle groups structure from revenue endpoints
         revenue_by_org = revenue_data.get("revenue_by_organization", {})
@@ -400,11 +406,11 @@ class ProfitabilityAnalyticsProcessor:
                     if not isinstance(metric, dict):
                         continue
 
-                    revenue = float(metric.get("metricResult", metric.get("revenue", 0)))
+                    revenue = float(metric.get("metricResult", metric.get("revenue", 0)) or 0)
                     total_revenue += revenue
 
                     if org not in profitability_by_customer:
-                        profitability_by_customer[org] = {"revenue": 0, "cost": 0}
+                        profitability_by_customer[org] = {"revenue": 0.0, "cost": 0.0}
                     profitability_by_customer[org]["revenue"] += revenue
 
         # Process cost data - handle groups structure from cost endpoints
@@ -421,11 +427,11 @@ class ProfitabilityAnalyticsProcessor:
                     if not isinstance(metric, dict):
                         continue
 
-                    cost = float(metric.get("metricResult", metric.get("cost", 0)))
+                    cost = float(metric.get("metricResult", metric.get("cost", 0)) or 0)
                     total_cost += cost
 
                     if org not in profitability_by_customer:
-                        profitability_by_customer[org] = {"revenue": 0, "cost": 0}
+                        profitability_by_customer[org] = {"revenue": 0.0, "cost": 0.0}
                     profitability_by_customer[org]["cost"] += cost
 
         # Process product revenue data - handle groups structure
@@ -442,10 +448,10 @@ class ProfitabilityAnalyticsProcessor:
                     if not isinstance(metric, dict):
                         continue
 
-                    revenue = float(metric.get("metricResult", metric.get("revenue", 0)))
+                    revenue = float(metric.get("metricResult", metric.get("revenue", 0)) or 0)
 
                     if product not in profitability_by_product:
-                        profitability_by_product[product] = {"revenue": 0, "cost": 0}
+                        profitability_by_product[product] = {"revenue": 0.0, "cost": 0.0}
                     profitability_by_product[product]["revenue"] += revenue
 
         # Process product cost data - handle groups structure
@@ -462,10 +468,10 @@ class ProfitabilityAnalyticsProcessor:
                     if not isinstance(metric, dict):
                         continue
 
-                    cost = float(metric.get("metricResult", metric.get("cost", 0)))
+                    cost = float(metric.get("metricResult", metric.get("cost", 0)) or 0)
 
                     if product not in profitability_by_product:
-                        profitability_by_product[product] = {"revenue": 0, "cost": 0}
+                        profitability_by_product[product] = {"revenue": 0.0, "cost": 0.0}
                     profitability_by_product[product]["cost"] += cost
 
         # Calculate profitability metrics
@@ -551,7 +557,7 @@ class ProfitabilityAnalyticsProcessor:
         )
         try:
             response = await client._request_with_retry("GET", path, params=params, **call_kwargs)
-            return response
+            return cast(Dict[str, Any], response)
         except ReveniumAPIError as e:
             logger.warning(f"Failed to fetch customer revenue: {e}")
             return {"data": []}
@@ -565,7 +571,7 @@ class ProfitabilityAnalyticsProcessor:
         )
         try:
             response = await client._request_with_retry("GET", path, params=params, **call_kwargs)
-            return response
+            return cast(Dict[str, Any], response)
         except ReveniumAPIError as e:
             logger.warning(f"Failed to fetch customer costs: {e}")
             return {"data": []}
@@ -579,7 +585,7 @@ class ProfitabilityAnalyticsProcessor:
         )
         try:
             response = await client._request_with_retry("GET", path, params=params, **call_kwargs)
-            return response
+            return cast(Dict[str, Any], response)
         except ReveniumAPIError as e:
             logger.warning(f"Failed to fetch product revenue: {e}")
             return {"data": []}
@@ -593,7 +599,7 @@ class ProfitabilityAnalyticsProcessor:
         )
         try:
             response = await client._request_with_retry("GET", path, params=params, **call_kwargs)
-            return response
+            return cast(Dict[str, Any], response)
         except ReveniumAPIError as e:
             logger.warning(f"Failed to fetch product costs: {e}")
             return {"data": []}
@@ -602,7 +608,7 @@ class ProfitabilityAnalyticsProcessor:
         self, revenue_data: Dict[str, Any], cost_data: Dict[str, Any], top_n: int
     ) -> List[CustomerProfitability]:
         """Process customer profitability data."""
-        customer_data = {}
+        customer_data: Dict[str, Dict[str, float]] = {}
 
         # Process revenue data - handle groups structure like cost analytics
         groups = revenue_data.get("groups", [])
@@ -618,10 +624,10 @@ class ProfitabilityAnalyticsProcessor:
                     continue
 
                 # Extract revenue from metricResult or revenue field
-                revenue = float(metric.get("metricResult", metric.get("revenue", 0)))
+                revenue = float(metric.get("metricResult", metric.get("revenue", 0)) or 0)
 
                 if customer_id not in customer_data:
-                    customer_data[customer_id] = {"revenue": 0, "cost": 0}
+                    customer_data[customer_id] = {"revenue": 0.0, "cost": 0.0}
                 customer_data[customer_id]["revenue"] += revenue
 
         # Process cost data - handle groups structure like cost analytics
@@ -638,10 +644,10 @@ class ProfitabilityAnalyticsProcessor:
                     continue
 
                 # Extract cost from metricResult or cost field
-                cost = float(metric.get("metricResult", metric.get("cost", 0)))
+                cost = float(metric.get("metricResult", metric.get("cost", 0)) or 0)
 
                 if customer_id not in customer_data:
-                    customer_data[customer_id] = {"revenue": 0, "cost": 0}
+                    customer_data[customer_id] = {"revenue": 0.0, "cost": 0.0}
                 customer_data[customer_id]["cost"] += cost
 
         # Calculate profitability and create CustomerProfitability objects
@@ -677,7 +683,7 @@ class ProfitabilityAnalyticsProcessor:
         self, revenue_data: Dict[str, Any], cost_data: Dict[str, Any], top_n: int
     ) -> List[ProductProfitability]:
         """Process product profitability data."""
-        product_data = {}
+        product_data: Dict[str, Dict[str, Any]] = {}
 
         # Process revenue data - handle groups structure like cost analytics
         groups = revenue_data.get("groups", [])
@@ -693,10 +699,10 @@ class ProfitabilityAnalyticsProcessor:
                     continue
 
                 # Extract revenue from metricResult or revenue field
-                revenue = float(metric.get("metricResult", metric.get("revenue", 0)))
+                revenue = float(metric.get("metricResult", metric.get("revenue", 0)) or 0)
 
                 if product_id not in product_data:
-                    product_data[product_id] = {"revenue": 0, "cost": 0, "customers": set()}
+                    product_data[product_id] = {"revenue": 0.0, "cost": 0.0, "customers": set()}
                 product_data[product_id]["revenue"] += revenue
 
                 # Track unique customers for this product
@@ -718,10 +724,10 @@ class ProfitabilityAnalyticsProcessor:
                     continue
 
                 # Extract cost from metricResult or cost field
-                cost = float(metric.get("metricResult", metric.get("cost", 0)))
+                cost = float(metric.get("metricResult", metric.get("cost", 0)) or 0)
 
                 if product_id not in product_data:
-                    product_data[product_id] = {"revenue": 0, "cost": 0, "customers": set()}
+                    product_data[product_id] = {"revenue": 0.0, "cost": 0.0, "customers": set()}
                 product_data[product_id]["cost"] += cost
 
         # Calculate profitability and create ProductProfitability objects
@@ -832,7 +838,7 @@ class ProfitabilityAnalyticsProcessor:
             for metric in group.get("metrics", []):
                 if not isinstance(metric, dict):
                     continue
-                value = float(metric.get("metricResult", metric.get("revenue", 0)))
+                value = float(metric.get("metricResult", metric.get("revenue", 0)) or 0)
                 total_revenue += value
                 entity_revenues[entity] = entity_revenues.get(entity, 0.0) + value
 

@@ -8,7 +8,7 @@ to provide reliable analytics with 95%+ success rate.
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Union, cast
 
 from ..auth import AuthenticationError
 from .response_formatter import ResponseFormatter
@@ -150,10 +150,10 @@ class ProviderCostsProcessor(AnalyticsProcessor):
             period=params["period"], aggregation=params["aggregation"]
         )
 
-    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format provider costs response."""
         return self.formatter.format_provider_costs_response(
-            data=data, period=params["period"], aggregation=params["aggregation"]
+            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -182,10 +182,10 @@ class ModelCostsProcessor(AnalyticsProcessor):
             period=params["period"], aggregation=params["aggregation"]
         )
 
-    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format model costs response."""
         return self.formatter.format_model_costs_response(
-            data=data, period=params["period"], aggregation=params["aggregation"]
+            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -214,10 +214,10 @@ class CustomerCostsProcessor(AnalyticsProcessor):
             period=params["period"], aggregation=params["aggregation"]
         )
 
-    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format customer costs response."""
         return self.formatter.format_customer_costs_response(
-            data=data, period=params["period"], aggregation=params["aggregation"]
+            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -246,10 +246,10 @@ class CostSpikeProcessor(AnalyticsProcessor):
             threshold=params["threshold"], period=params["period"]
         )
 
-    def format_response(self, data: Dict[str, Any], params: Dict[str, Any]) -> str:
+    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format cost spike response."""
         return self.formatter.format_cost_spike_response(
-            data=data, threshold=params["threshold"], period=params["period"]
+            data=cast(Dict[str, Any], data), threshold=params["threshold"], period=params["period"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -271,10 +271,10 @@ class ApiKeyCostsProcessor(AnalyticsProcessor):
             period=params["period"], aggregation=params["aggregation"]
         )
 
-    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format API key costs response."""
         return self.formatter.format_api_key_costs_response(
-            data=data, period=params["period"], aggregation=params["aggregation"]
+            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -303,10 +303,10 @@ class AgentCostsProcessor(AnalyticsProcessor):
             period=params["period"], aggregation=params["aggregation"]
         )
 
-    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format agent costs response."""
         return self.formatter.format_agent_costs_response(
-            data=data, period=params["period"], aggregation=params["aggregation"]
+            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -337,10 +337,10 @@ class UserCostsProcessor(AnalyticsProcessor):
             filters=params.get("filters"),
         )
 
-    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format user costs response."""
         return self.formatter.format_user_costs_response(
-            data=data, period=params["period"], aggregation=params["aggregation"]
+            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -369,10 +369,10 @@ class CostSummaryProcessor(AnalyticsProcessor):
             period=params["period"], aggregation=params["aggregation"]
         )
 
-    def format_response(self, data: Dict[str, Any], params: Dict[str, Any]) -> str:
+    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format cost summary response."""
         return self.formatter.format_cost_summary_response(
-            data=data, period=params["period"], aggregation=params["aggregation"]
+            data=cast(Dict[str, Any], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -399,9 +399,9 @@ class ToolCostsProcessor(AnalyticsProcessor):
             period=params["period"], aggregation=params["aggregation"]
         )
 
-    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
         return self.formatter.format_tool_costs_response(
-            data=data, period=params["period"], aggregation=params["aggregation"]
+            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -427,9 +427,9 @@ class TopToolsProcessor(AnalyticsProcessor):
             period=params["period"], aggregation=params["aggregation"]
         )
 
-    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
         return self.formatter.format_tool_costs_response(
-            data=data, period=params["period"], aggregation=params["aggregation"]
+            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -453,9 +453,9 @@ class ToolCostsByAgentProcessor(AnalyticsProcessor):
             period=params["period"], aggregation=params["aggregation"]
         )
 
-    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
         return self.formatter.format_tool_costs_response(
-            data=data, period=params["period"], aggregation=params["aggregation"]
+            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -479,9 +479,9 @@ class ToolCostsByProviderProcessor(AnalyticsProcessor):
             period=params["period"], aggregation=params["aggregation"]
         )
 
-    def format_response(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
         return self.formatter.format_tool_costs_response(
-            data=data, period=params["period"], aggregation=params["aggregation"]
+            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -506,7 +506,7 @@ class SimpleAnalyticsEngine:
     - Fail-fast approach for invalid inputs
     """
 
-    def __init__(self, client):
+    def __init__(self, client: Any) -> None:
         """
         Initialize the analytics engine.
 
@@ -542,7 +542,7 @@ class SimpleAnalyticsEngine:
         self.tool_costs_by_agent_processor = ToolCostsByAgentProcessor(self.dependencies, self.logger)
         self.tool_costs_by_provider_processor = ToolCostsByProviderProcessor(self.dependencies, self.logger)
 
-    async def get_provider_costs(self, **kwargs) -> str:
+    async def get_provider_costs(self, **kwargs: Any) -> str:
         """
         Get provider cost ranking with validation and formatting.
 
@@ -555,7 +555,7 @@ class SimpleAnalyticsEngine:
         params = AnalyticsParams(operation_type="provider costs", kwargs=kwargs)
         return await self.provider_processor.process_analytics_request(params)
 
-    async def get_model_costs(self, **kwargs) -> str:
+    async def get_model_costs(self, **kwargs: Any) -> str:
         """
         Get model cost ranking with validation and formatting.
 
@@ -568,7 +568,7 @@ class SimpleAnalyticsEngine:
         params = AnalyticsParams(operation_type="model costs", kwargs=kwargs)
         return await self.model_processor.process_analytics_request(params)
 
-    async def get_customer_costs(self, **kwargs) -> str:
+    async def get_customer_costs(self, **kwargs: Any) -> str:
         """
         Get customer cost ranking with validation and formatting.
 
@@ -581,7 +581,7 @@ class SimpleAnalyticsEngine:
         params = AnalyticsParams(operation_type="customer costs", kwargs=kwargs)
         return await self.customer_processor.process_analytics_request(params)
 
-    async def get_api_key_costs(self, **kwargs) -> str:
+    async def get_api_key_costs(self, **kwargs: Any) -> str:
         """
         Get API key cost ranking with validation and formatting.
 
@@ -594,7 +594,7 @@ class SimpleAnalyticsEngine:
         params = AnalyticsParams(operation_type="API key costs", kwargs=kwargs)
         return await self.api_key_processor.process_analytics_request(params)
 
-    async def get_agent_costs(self, **kwargs) -> str:
+    async def get_agent_costs(self, **kwargs: Any) -> str:
         """
         Get agent cost ranking with validation and formatting.
 
@@ -607,7 +607,7 @@ class SimpleAnalyticsEngine:
         params = AnalyticsParams(operation_type="agent costs", kwargs=kwargs)
         return await self.agent_processor.process_analytics_request(params)
 
-    async def get_user_costs(self, **kwargs) -> str:
+    async def get_user_costs(self, **kwargs: Any) -> str:
         """
         Get user cost ranking with validation and formatting.
 
@@ -620,7 +620,7 @@ class SimpleAnalyticsEngine:
         params = AnalyticsParams(operation_type="user costs", kwargs=kwargs)
         return await self.user_processor.process_analytics_request(params)
 
-    async def investigate_cost_spike(self, **kwargs) -> str:
+    async def investigate_cost_spike(self, **kwargs: Any) -> str:
         """
         Investigate cost spikes above threshold.
 
@@ -633,7 +633,7 @@ class SimpleAnalyticsEngine:
         params = AnalyticsParams(operation_type="cost spike investigation", kwargs=kwargs)
         return await self.spike_processor.process_analytics_request(params)
 
-    async def get_cost_summary(self, **kwargs) -> str:
+    async def get_cost_summary(self, **kwargs: Any) -> str:
         """
         Get comprehensive cost summary.
 
@@ -646,22 +646,22 @@ class SimpleAnalyticsEngine:
         params = AnalyticsParams(operation_type="cost summary", kwargs=kwargs)
         return await self.summary_processor.process_analytics_request(params)
 
-    async def get_tool_costs(self, **kwargs) -> str:
+    async def get_tool_costs(self, **kwargs: Any) -> str:
         """Get tool cost ranking with validation and formatting."""
         params = AnalyticsParams(operation_type="tool costs", kwargs=kwargs)
         return await self.tool_costs_processor.process_analytics_request(params)
 
-    async def get_top_tools(self, **kwargs) -> str:
+    async def get_top_tools(self, **kwargs: Any) -> str:
         """Get top tools by call count with validation and formatting."""
         params = AnalyticsParams(operation_type="top tools", kwargs=kwargs)
         return await self.top_tools_processor.process_analytics_request(params)
 
-    async def get_tool_costs_by_agent(self, **kwargs) -> str:
+    async def get_tool_costs_by_agent(self, **kwargs: Any) -> str:
         """Get tool costs grouped by agent with validation and formatting."""
         params = AnalyticsParams(operation_type="tool costs by agent", kwargs=kwargs)
         return await self.tool_costs_by_agent_processor.process_analytics_request(params)
 
-    async def get_tool_costs_by_provider(self, **kwargs) -> str:
+    async def get_tool_costs_by_provider(self, **kwargs: Any) -> str:
         """Get tool costs grouped by provider with validation and formatting."""
         params = AnalyticsParams(operation_type="tool costs by provider", kwargs=kwargs)
         return await self.tool_costs_by_provider_processor.process_analytics_request(params)

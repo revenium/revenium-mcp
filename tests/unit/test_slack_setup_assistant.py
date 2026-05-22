@@ -5,10 +5,13 @@ configuration detection, default selection, and error paths.
 All ReveniumClient calls are mocked.
 """
 
+import os
+
 import pytest
 from unittest.mock import AsyncMock, patch
 
 
+from src.revenium_mcp_server.auth.tenant_context import TenantContext
 from src.revenium_mcp_server.tools_decomposed.slack_setup_assistant import SlackSetupAssistant
 
 
@@ -61,10 +64,7 @@ class TestGuidedSetup:
     async def test_no_configs_shows_oauth_instructions(self, setup_tool):
         """When no Slack configs exist, guide user to OAuth."""
         mock_client = _mock_client_with_configs([])
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
-            return_value=mock_client,
-        ):
+        with patch.object(setup_tool, "get_client", AsyncMock(return_value=mock_client)):
             result = await setup_tool.handle_action("guided_setup", {})
         text = result[0].text
         assert "No Slack Configurations Found" in text
@@ -77,9 +77,8 @@ class TestGuidedSetup:
             {"id": "cfg-1", "name": "Prod Config", "teamName": "ProdWS"}
         ]
         mock_client = _mock_client_with_configs(configs, total=1)
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
-            return_value=mock_client,
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
             "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
             return_value="cfg-1",
@@ -96,9 +95,8 @@ class TestGuidedSetup:
             {"id": "cfg-1", "name": "Config A", "teamName": "WS-A"}
         ]
         mock_client = _mock_client_with_configs(configs, total=1)
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
-            return_value=mock_client,
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
             "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
             return_value=None,
@@ -114,11 +112,8 @@ class TestGuidedSetup:
         mock_client.get_slack_configurations = AsyncMock(
             side_effect=RuntimeError("Network error")
         )
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=None)
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
-            return_value=mock_client,
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ):
             result = await setup_tool.handle_action("guided_setup", {})
         # Should not raise, should return error text
@@ -141,9 +136,8 @@ class TestSelectDefaultConfiguration:
     async def test_successful_set_default(self, setup_tool):
         configs = [{"id": "cfg-1", "name": "My Config", "teamName": "WS", "channelName": "#ch"}]
         mock_client = _mock_client_with_configs(configs)
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
-            return_value=mock_client,
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch.dict("os.environ", {}, clear=False):
             result = await setup_tool.handle_action(
                 "select_default_configuration", {"config_id": "cfg-1"}
@@ -158,16 +152,43 @@ class TestSelectDefaultConfiguration:
         mock_client.get_slack_configuration_by_id = AsyncMock(
             side_effect=RuntimeError("Not found")
         )
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=None)
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
-            return_value=mock_client,
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ):
             result = await setup_tool.handle_action(
                 "select_default_configuration", {"config_id": "bad-id"}
             )
         assert "error" in result[0].text.lower() or len(result[0].text) > 20
+
+    @pytest.mark.asyncio
+    async def test_select_default_skips_env_write_when_ctx_set(self, setup_tool):
+        """Multi-tenant mode (ctx non-None) must NOT write the process-global
+        REVENIUM_DEFAULT_SLACK_CONFIG_ID env var — that would leak Tenant A's
+        selection into Tenant B's subsequent requests."""
+        ctx = TenantContext(team_id="team-1", api_key="abcdef1234567890")
+        configs = [{"id": "cfg-tenant", "name": "Tenant Cfg", "teamName": "WS", "channelName": "ch"}]
+        mock_client = _mock_client_with_configs(configs)
+
+        # Capture starting env state and ensure our key is absent.
+        original = os.environ.pop("REVENIUM_DEFAULT_SLACK_CONFIG_ID", None)
+        try:
+            with patch.object(
+                setup_tool, "get_client", AsyncMock(return_value=mock_client)
+            ):
+                result = await setup_tool.handle_action(
+                    "select_default_configuration",
+                    {"config_id": "cfg-tenant"},
+                    ctx=ctx,
+                )
+            # Env var must NOT have been written.
+            assert "REVENIUM_DEFAULT_SLACK_CONFIG_ID" not in os.environ
+            # Response should make clear the selection is not persisted globally.
+            text = result[0].text
+            assert "Session" in text or "session" in text
+            assert "cfg-tenant" in text
+        finally:
+            if original is not None:
+                os.environ["REVENIUM_DEFAULT_SLACK_CONFIG_ID"] = original
 
 
 class TestSetupStatus:
@@ -179,9 +200,8 @@ class TestSetupStatus:
         mock_client = _mock_client_with_configs(
             [{"id": "cfg-1", "name": "C1", "teamName": "WS"}], total=1
         )
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
-            return_value=mock_client,
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
             "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
             side_effect=lambda key, *args: {
@@ -198,9 +218,8 @@ class TestSetupStatus:
         mock_client = _mock_client_with_configs(
             [{"id": "cfg-1", "name": "C1"}], total=1
         )
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
-            return_value=mock_client,
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
             "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
             side_effect=lambda key, *args: {
@@ -215,9 +234,8 @@ class TestSetupStatus:
     async def test_not_configured_status(self, setup_tool):
         """With no configs, status should say NOT CONFIGURED."""
         mock_client = _mock_client_with_configs([], total=0)
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
-            return_value=mock_client,
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
             "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
             side_effect=lambda key, *args: {
@@ -263,9 +281,8 @@ class TestWorkspaceAndChannelFieldExtraction:
         """guided_setup should display workspace from teamName field."""
         configs = [{"id": "cfg-1", "name": "Alerts", "teamName": "Acme Corp"}]
         mock_client = _mock_client_with_configs(configs, total=1)
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
-            return_value=mock_client,
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
             "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
             return_value="cfg-1",
@@ -279,9 +296,8 @@ class TestWorkspaceAndChannelFieldExtraction:
         """When teamName is absent, guided_setup should use team.label."""
         configs = [{"id": "cfg-1", "name": "Alerts", "team": {"label": "Fallback Team"}}]
         mock_client = _mock_client_with_configs(configs, total=1)
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
-            return_value=mock_client,
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
             "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
             return_value="cfg-1",
@@ -298,9 +314,8 @@ class TestWorkspaceAndChannelFieldExtraction:
             {"id": "cfg-2", "name": "Dev", "teamName": "Revenium Dev", "channelName": "dev-alerts"},
         ]
         mock_client = _mock_client_with_configs(configs, total=2)
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
-            return_value=mock_client,
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
             "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
             return_value=None,
@@ -319,9 +334,8 @@ class TestWorkspaceAndChannelFieldExtraction:
             {"id": "cfg-1", "name": "Prod", "team": {"label": "Nested WS"}, "channelName": "ch1"},
         ]
         mock_client = _mock_client_with_configs(configs, total=1)
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
-            return_value=mock_client,
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
             "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
             return_value=None,
@@ -335,9 +349,8 @@ class TestWorkspaceAndChannelFieldExtraction:
         """select_default_configuration should show teamName and channelName."""
         configs = [{"id": "cfg-1", "name": "My Config", "teamName": "WS1", "channelName": "general"}]
         mock_client = _mock_client_with_configs(configs)
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient",
-            return_value=mock_client,
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch.dict("os.environ", {}, clear=False):
             result = await setup_tool.handle_action(
                 "select_default_configuration", {"config_id": "cfg-1"}

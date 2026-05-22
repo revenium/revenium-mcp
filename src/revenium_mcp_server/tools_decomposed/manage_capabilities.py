@@ -6,7 +6,10 @@ decomposed into functions ≤25 lines with ≤3 parameters each.
 
 import json
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
@@ -51,7 +54,11 @@ class ManageCapabilities(ToolBase):
         self.formatter = UnifiedResponseFormatter("manage_capabilities")
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle capability management actions.
 

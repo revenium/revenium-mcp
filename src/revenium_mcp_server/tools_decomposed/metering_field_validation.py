@@ -7,7 +7,10 @@ MeteringTransactionManager and MeteringValidator infrastructure.
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 
@@ -131,12 +134,12 @@ class TestDataGenerator:
         import random
 
         return {
-            "organization_id": random.choice(industry_pattern["organization_ids"]),
+            "organization_name": random.choice(industry_pattern["organization_names"]),
             "task_type": random.choice(industry_pattern["task_types"]),
             "agent": random.choice(industry_pattern["agents"]),
             "task_id": f"task_{index:04d}_{random.randint(1000, 9999)}",
             "trace_id": f"trace_{index:04d}_{random.randint(10000, 99999)}",
-            "product_id": f"prod_{random.choice(['ai_assistant', 'code_gen', 'data_analysis'])}",
+            "product_name": f"prod_{random.choice(['ai_assistant', 'code_gen', 'data_analysis'])}",
             "subscription_id": f"sub_{random.randint(100000, 999999)}",
             "response_quality_score": random.choice(self.field_templates["quality_scores"]),
         }
@@ -167,7 +170,7 @@ class TestDataGenerator:
         """Build industry-specific data patterns."""
         return {
             "financial_services": {
-                "organization_ids": [
+                "organization_names": [
                     "goldman-sachs",
                     "jp-morgan",
                     "wells-fargo",
@@ -183,7 +186,7 @@ class TestDataGenerator:
                 "agents": ["RiskBot_v2.1", "FraudDetector_AI", "MarketIntel_v3.0", "PortfolioAI"],
             },
             "healthcare": {
-                "organization_ids": [
+                "organization_names": [
                     "mayo-clinic",
                     "johns-hopkins",
                     "cleveland-clinic",
@@ -203,7 +206,7 @@ class TestDataGenerator:
                 ],
             },
             "legal": {
-                "organization_ids": [
+                "organization_names": [
                     "baker-mckenzie",
                     "latham-watkins",
                     "skadden",
@@ -218,7 +221,7 @@ class TestDataGenerator:
                 "agents": ["LegalBot_v2.0", "ContractAI", "ComplianceChecker", "DocReviewer"],
             },
             "technology": {
-                "organization_ids": ["microsoft", "google", "amazon", "meta", "apple"],
+                "organization_names": ["microsoft", "google", "amazon", "meta", "apple"],
                 "task_types": [
                     "code_generation",
                     "bug_analysis",
@@ -288,7 +291,7 @@ class TestDataGenerator:
             # Empty optional fields (omit task_id to avoid validation error)
             {"trace_id": None},
             # Unicode characters
-            {"organization_id": "test-org-ñáéíóú", "task_type": "análisis_de_riesgo"},
+            {"organization_name": "test-org-ñáéíóú", "task_type": "análisis_de_riesgo"},
             # Very long strings
             {"task_type": "very_long_task_type_" + "x" * 100},
             # Quality score boundary values
@@ -1416,13 +1419,18 @@ class MeteringFieldValidationManagement(ToolBase):
         self.validator = MeteringValidator(self.transaction_manager)
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle metering field validation actions.
 
         Args:
             action: Action to perform
             arguments: Action arguments
+            ctx: Optional tenant context for authentication
 
         Returns:
             Formatted response
@@ -1432,7 +1440,7 @@ class MeteringFieldValidationManagement(ToolBase):
             if action == "generate_test_data":
                 return await self._handle_generate_test_data(arguments)
             elif action == "submit_test_batch":
-                return await self._handle_submit_test_batch(arguments)
+                return await self._handle_submit_test_batch(arguments, ctx=ctx)
             elif action == "analyze_field_mapping":
                 return await self._handle_analyze_field_mapping(arguments)
             elif action == "validate_test_data":
@@ -1466,7 +1474,7 @@ class MeteringFieldValidationManagement(ToolBase):
         )
 
     async def _handle_submit_test_batch(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Submit test batch for validation."""
         test_data = arguments.get("test_data", [])
@@ -1479,7 +1487,7 @@ class MeteringFieldValidationManagement(ToolBase):
 
         # Submit each transaction in the batch
         results = []
-        client = await self.get_client()
+        client = await self.get_client(ctx=ctx)
 
         for i, transaction in enumerate(test_data):
             try:

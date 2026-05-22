@@ -92,7 +92,7 @@ class TestTestDataGenerator:
     def test_generate_batch_enterprise_fields_included_by_default(self):
         result = self.gen.generate_batch({"count": 1})
         tx = result[0]
-        assert "organization_id" in tx
+        assert "organization_name" in tx
         assert "task_type" in tx
         assert "agent" in tx
 
@@ -101,7 +101,7 @@ class TestTestDataGenerator:
             {"count": 1, "include_enterprise_fields": False}
         )
         tx = result[0]
-        assert "organization_id" not in tx
+        assert "organization_name" not in tx
 
     def test_generate_batch_with_edge_cases(self):
         # Edge cases apply to every 5th transaction (index 0, 5, 10...)

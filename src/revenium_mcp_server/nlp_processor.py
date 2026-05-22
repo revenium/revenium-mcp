@@ -65,7 +65,7 @@ class ParsedQuery:
 class NLPProcessor:
     """Advanced Natural Language Processor for anomaly and alert management."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the NLP processor with patterns and mappings."""
         self.intent_patterns = self._build_intent_patterns()
         self.entity_patterns = self._build_entity_patterns()
@@ -194,7 +194,7 @@ class NLPProcessor:
             return Intent.UNKNOWN, 0.0
 
         # Get intent with highest score
-        best_intent = max(intent_scores, key=intent_scores.get)
+        best_intent = max(intent_scores, key=lambda k: intent_scores[k])
         confidence = intent_scores[best_intent]
 
         return Intent(best_intent), confidence
@@ -486,24 +486,24 @@ class NLPProcessor:
     def _build_time_patterns(self) -> Dict[str, Callable]:
         """Build time extraction patterns with extractors."""
 
-        def extract_last_days(match):
+        def extract_last_days(match: Any) -> Dict[str, Any]:
             days = int(match.group(1))
             return {"days": days}
 
-        def extract_last_hours(match):
+        def extract_last_hours(match: Any) -> Dict[str, Any]:
             hours = int(match.group(1))
             return {"hours": hours}
 
-        def extract_last_week(_match):
+        def extract_last_week(_match: Any) -> Dict[str, Any]:
             return {"days": 7}
 
-        def extract_last_month(_match):
+        def extract_last_month(_match: Any) -> Dict[str, Any]:
             return {"days": 30}
 
-        def extract_today(_match):
+        def extract_today(_match: Any) -> Dict[str, Any]:
             return {"hours": 24}
 
-        def extract_yesterday(_match):
+        def extract_yesterday(_match: Any) -> Dict[str, Any]:
             yesterday = datetime.now() - timedelta(days=1)
             return {"specific_date": yesterday.date().isoformat()}
 
@@ -666,7 +666,7 @@ class ProductNLPProcessor:
     product creation requests into structured Revenium API calls.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the product NLP processor with product-specific mappings."""
         self.product_type_mappings = self._build_product_type_mappings()
         self.pricing_model_mappings = self._build_pricing_model_mappings()
@@ -690,7 +690,7 @@ class ProductNLPProcessor:
         normalized_text = text.lower().strip()
 
         # Initialize result structure
-        result = {
+        result: Dict[str, Any] = {
             "name": "",
             "description": text,
             "version": "1.0.0",
@@ -934,7 +934,7 @@ class ProductNLPProcessor:
 
     def _extract_pricing_info(self, text: str) -> Dict[str, Any]:
         """Extract pricing information from text."""
-        pricing_info = {"tiers": []}
+        pricing_info: Dict[str, Any] = {"tiers": []}
 
         # Look for price patterns
         price_patterns = [
@@ -943,13 +943,12 @@ class ProductNLPProcessor:
             r"(\d+(?:\.\d{2})?)\s*(?:cents?)",  # 50 cents
         ]
 
-        prices = []
+        prices: List[float] = []
         for pattern in price_patterns:
-            matches = re.finditer(pattern, text, re.IGNORECASE)
-            for match in matches:
+            for price_match in re.finditer(pattern, text, re.IGNORECASE):
                 try:
-                    price = float(match.group(1))
-                    if "cent" in match.group(0).lower():
+                    price = float(price_match.group(1))
+                    if "cent" in price_match.group(0).lower():
                         price = price / 100  # Convert cents to dollars
                     prices.append(price)
                 except ValueError:

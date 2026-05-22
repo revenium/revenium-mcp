@@ -259,6 +259,57 @@ class TestProcessAgentData:
         result = self.analyzer._process_agent_data(data)
         assert result[0]["cost"] == 125.0
 
+    def test_duplicate_group_names_collapsed_into_single_row(self):
+        """Multiple groups sharing the same groupName must collapse into a single row.
+
+        The upstream analytics endpoint exposes no secondary identifier per row,
+        so emitting N identical-looking rows for the same agent is the bug —
+        callers cannot distinguish them. They must be merged with costs summed.
+        """
+        data = [
+            {
+                "groups": [
+                    {"groupName": "claude-code", "metrics": [{"metricResult": 100}]},
+                    {"groupName": "claude-code", "metrics": [{"metricResult": 200}]},
+                    {"groupName": "claude-code", "metrics": [{"metricResult": 50}]},
+                    {"groupName": "tessie", "metrics": [{"metricResult": 30}]},
+                    {"groupName": "tessie", "metrics": [{"metricResult": 20}]},
+                ]
+            }
+        ]
+        result = self.analyzer._process_agent_data(data)
+        names = [r["agent"] for r in result]
+        assert names.count("claude-code") == 1
+        assert names.count("tessie") == 1
+        assert len(result) == 2
+
+        by_name = {r["agent"]: r["cost"] for r in result}
+        assert by_name["claude-code"] == 350.0
+        assert by_name["tessie"] == 50.0
+
+        # Sorted descending by cost
+        assert result[0]["agent"] == "claude-code"
+        assert result[1]["agent"] == "tessie"
+
+        # Percentages add to 100
+        assert result[0]["percentage"] == pytest.approx(350.0 / 400.0 * 100)
+        assert result[1]["percentage"] == pytest.approx(50.0 / 400.0 * 100)
+
+    def test_direct_format_duplicate_names_collapsed(self):
+        """Same dedupe contract for the direct (non-groups) response shape."""
+        data = [
+            {"groupName": "agent-x", "metrics": [{"metricResult": 10}]},
+            {"groupName": "agent-x", "metrics": [{"metricResult": 15}]},
+            {"groupName": "agent-y", "metrics": [{"metricResult": 5}]},
+        ]
+        result = self.analyzer._process_agent_data(data)
+        names = [r["agent"] for r in result]
+        assert names.count("agent-x") == 1
+        assert names.count("agent-y") == 1
+        by_name = {r["agent"]: r["cost"] for r in result}
+        assert by_name["agent-x"] == 25.0
+        assert by_name["agent-y"] == 5.0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # _process_model_data / _process_customer_data (simple processors)

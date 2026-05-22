@@ -388,6 +388,15 @@ class SlackPromptingMixin:
 
         Returns:
             True if preference was set successfully
+
+        Note:
+            Phase-2 risk: this writes to ``os.environ``, which is process-global
+            and would leak preferences across tenants in multi-tenant mode.
+            The mixin has no ``ctx`` reachable here and no current callers, so
+            the env write is left as-is pending Phase-2 per-tenant preference
+            storage. When this method is wired up, thread ``ctx`` through and
+            apply the same ``if ctx is None`` guard used in
+            ``slack_setup_assistant._handle_select_default_configuration``.
         """
         try:
             import os
@@ -400,6 +409,7 @@ class SlackPromptingMixin:
 
             env_var = preference_map.get(preference)
             if env_var:
+                # Phase-2 risk: process-global env write; see method docstring.
                 os.environ[env_var] = str(value)
                 return True
 

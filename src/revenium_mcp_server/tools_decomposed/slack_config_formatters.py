@@ -116,21 +116,42 @@ def format_configuration_details(config: Dict[str, Any], config_id: str) -> List
     return [TextContent(type="text", text=result_text)]
 
 
-def format_default_set_success(config: Dict[str, Any], config_id: str) -> List[TextContent]:
-    """Format successful default configuration set response."""
+def format_default_set_success(
+    config: Dict[str, Any], config_id: str, *, ctx_is_set: bool = False
+) -> List[TextContent]:
+    """Format successful default configuration set response.
+
+    When ``ctx_is_set`` is True (multi-tenant mode), the response reflects that
+    the selection applies to the current request only and is not persisted
+    globally — per-tenant persistent default storage is deferred to Phase 2.
+    """
     name = config.get("name", "Unnamed Configuration")
     # Use correct API field names from the actual response
     team_name = config.get("teamName") or config.get("team", {}).get("label", "Unknown Workspace")
     channel_name = config.get("channelName", "N/A")
 
-    result_text = "# Default Slack Configuration Set\n\n"
+    if ctx_is_set:
+        result_text = "# Default Slack Configuration Set for This Session Only\n\n"
+        result_text += (
+            "_Per-tenant persistent default storage is deferred to Phase 2; "
+            "this selection applies to the current request only._\n\n"
+        )
+    else:
+        result_text = "# Default Slack Configuration Set\n\n"
+
     result_text += f"**Configuration:** {name}\n"
     result_text += f"**Workspace:** {team_name}\n"
     result_text += f"**Channel:** {channel_name}\n"
     result_text += f"**ID:** `{config_id}`\n\n"
-    result_text += "This configuration will now be used as the default for new alerts.\n\n"
-    result_text += "**Note:** To make persistent, add to your .env file:\n"
-    result_text += f'```bash\nREVENIUM_DEFAULT_SLACK_CONFIG_ID="{config_id}"\n```\n'
+
+    if ctx_is_set:
+        result_text += (
+            "This configuration will be used for the current request only.\n"
+        )
+    else:
+        result_text += "This configuration will now be used as the default for new alerts.\n\n"
+        result_text += "**Note:** To make persistent, add to your .env file:\n"
+        result_text += f'```bash\nREVENIUM_DEFAULT_SLACK_CONFIG_ID="{config_id}"\n```\n'
 
     return [TextContent(type="text", text=result_text)]
 

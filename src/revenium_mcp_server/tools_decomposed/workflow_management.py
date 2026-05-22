@@ -6,7 +6,10 @@ tool with internal composition, following the proven alert/source/customer/produ
 
 import json
 import uuid
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -31,10 +34,57 @@ from .unified_tool_base import ToolBase
 class WorkflowManager:
     """Internal manager for workflow orchestration operations."""
 
+    active_workflows: Dict[str, Dict[str, Any]] = {}
+    MAX_ACTIVE_WORKFLOWS: int = 10000
+
     def __init__(self):
         """Initialize workflow manager."""
-        self.active_workflows = {}
         self.workflow_templates = self._build_workflow_templates()
+
+    def validate_start_args(self, workflow_type: str, context: Dict[str, Any]) -> None:
+        if workflow_type not in self.workflow_templates and workflow_type != "generic":
+            available_types = list(self.workflow_templates.keys()) + ["generic"]
+            raise create_structured_validation_error(
+                message=f"Invalid workflow type '{workflow_type}'",
+                field="workflow_type",
+                value=workflow_type,
+                suggestions=[
+                    "Use get_workflow_templates() to see all available types",
+                    "Check the workflow type name for typos",
+                    "Use 'generic' for custom workflows",
+                    "Choose from the available workflow types listed below",
+                ],
+                examples={
+                    "available_types": available_types,
+                    "usage": "create(workflow_type='customer_onboarding', context={...})",
+                    "generic_workflow": "create(workflow_type='generic', context={...})",
+                },
+            )
+
+        if workflow_type != "generic":
+            template = self.workflow_templates[workflow_type]
+            missing_context = [
+                field
+                for field in template.get("required_context", [])
+                if field not in context
+            ]
+            if missing_context:
+                raise create_structured_validation_error(
+                    message=f"Missing required context for {workflow_type} workflow",
+                    field="context",
+                    value=context,
+                    suggestions=[
+                        f"Provide the missing context fields: {', '.join(missing_context)}",
+                        "Use get_workflow_templates() to see required context for each workflow type",
+                        "Check the workflow template documentation",
+                        "Ensure all required fields are included in the context",
+                    ],
+                    examples={
+                        "missing_fields": missing_context,
+                        "required_context": template.get("required_context", []),
+                        "usage": f"create(workflow_type='{workflow_type}', context={{...}})",
+                    },
+                )
 
     def _build_workflow_templates(self) -> Dict[str, Dict[str, Any]]:
         """Build workflow templates for common operations."""
@@ -86,11 +136,21 @@ class WorkflowManager:
         }
 
     async def list_workflows(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """List active workflows."""
+        all_ids = list(self.active_workflows.keys())
+        raw_page = arguments.get("page")
+        raw_size = arguments.get("size")
+        paginated = raw_page is not None or raw_size is not None
+        if paginated:
+            page = raw_page if isinstance(raw_page, int) and raw_page >= 0 else 0
+            size = raw_size if isinstance(raw_size, int) and raw_size > 0 else 20
+            start = page * size
+            paginated_ids = all_ids[start : start + size]
+        else:
+            paginated_ids = all_ids
         return {
             "action": "list",
-            "active_workflows": list(self.active_workflows.keys()),
-            "total_active": len(self.active_workflows),
+            "active_workflows": paginated_ids,
+            "total_active": len(all_ids),
             "available_templates": list(self.workflow_templates.keys()),
         }
 
@@ -128,30 +188,10 @@ class WorkflowManager:
         workflow_type = arguments.get("workflow_type", "generic")
         context = arguments.get("context", {})
 
-        # Validate workflow type
-        if workflow_type not in self.workflow_templates and workflow_type != "generic":
-            available_types = list(self.workflow_templates.keys()) + ["generic"]
-            raise create_structured_validation_error(
-                message=f"Invalid workflow type '{workflow_type}'",
-                field="workflow_type",
-                value=workflow_type,
-                suggestions=[
-                    "Use get_workflow_templates() to see all available types",
-                    "Check the workflow type name for typos",
-                    "Use 'generic' for custom workflows",
-                    "Choose from the available workflow types listed below",
-                ],
-                examples={
-                    "available_types": available_types,
-                    "usage": "create(workflow_type='customer_onboarding', context={...})",
-                    "generic_workflow": "create(workflow_type='generic', context={...})",
-                },
-            )
+        self.validate_start_args(workflow_type, context)
 
-        # Generate workflow ID
-        workflow_id = f"wf_{uuid.uuid4().hex[:8]}"
+        workflow_id = f"wf_{uuid.uuid4().hex}"
 
-        # Build workflow configuration
         if workflow_type == "generic":
             workflow = {
                 "id": workflow_id,
@@ -160,35 +200,11 @@ class WorkflowManager:
                 "steps": [],
                 "context": context,
                 "current_step": 0,
+                "completed_steps": [],
                 "created_at": json.dumps({"timestamp": "now"}),
             }
         else:
             template = self.workflow_templates[workflow_type]
-
-            # Validate required context
-            missing_context = []
-            for required_field in template.get("required_context", []):
-                if required_field not in context:
-                    missing_context.append(required_field)
-
-            if missing_context:
-                raise create_structured_validation_error(
-                    message=f"Missing required context for {workflow_type} workflow",
-                    field="context",
-                    value=context,
-                    suggestions=[
-                        f"Provide the missing context fields: {', '.join(missing_context)}",
-                        "Use get_workflow_templates() to see required context for each workflow type",
-                        "Check the workflow template documentation",
-                        "Ensure all required fields are included in the context",
-                    ],
-                    examples={
-                        "missing_fields": missing_context,
-                        "required_context": template.get("required_context", []),
-                        "usage": f"create(workflow_type='{workflow_type}', context={{...}})",
-                    },
-                )
-
             workflow = {
                 "id": workflow_id,
                 "type": workflow_type,
@@ -202,6 +218,9 @@ class WorkflowManager:
                 "created_at": json.dumps({"timestamp": "now"}),
             }
 
+        if len(self.active_workflows) >= self.MAX_ACTIVE_WORKFLOWS:
+            oldest_id = next(iter(self.active_workflows))
+            self.active_workflows.pop(oldest_id, None)
         self.active_workflows[workflow_id] = workflow
 
         return workflow
@@ -367,9 +386,14 @@ class WorkflowManagement(ToolBase):
         self.validator = WorkflowValidator()
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle workflow management actions."""
+        # ctx accepted for interface compliance; no upstream API calls in this tool.
         try:
             # Route to appropriate handler
             if action == "list":
@@ -377,11 +401,11 @@ class WorkflowManagement(ToolBase):
             elif action == "get":
                 result = await self.workflow_manager.get_workflow(arguments)
             elif action == "start":
-                # Handle dry_run mode for workflow start
                 dry_run = arguments.get("dry_run", False)
                 if dry_run:
-                    workflow_type = arguments.get("workflow_type")
+                    workflow_type = arguments.get("workflow_type", "generic")
                     context = arguments.get("context", {})
+                    self.workflow_manager.validate_start_args(workflow_type, context)
                     return [
                         TextContent(
                             type="text",
@@ -845,7 +869,21 @@ complete_step(workflow_id="wf_123", step_result={...}) # Complete current step
                     "description": "Workflow configuration data as dictionary/object",
                     "additionalProperties": True,
                 },
-                # Control parameters
+                "step_result": {
+                    "type": "object",
+                    "description": "Result payload for complete_step actions",
+                    "additionalProperties": True,
+                },
+                "page": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Zero-based page index for list pagination",
+                },
+                "size": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Page size for list pagination",
+                },
                 "dry_run": {
                     "type": "boolean",
                     "description": "Validation-only mode without executing workflow operations (default: false)",

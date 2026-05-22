@@ -737,9 +737,9 @@ class TestGetAlertTrendAnalysis:
         # The appended condition must have the correct field, operator, and value
         matching = [
             c for c in filter_obj.conditions
-            if c.get("field") == "anomaly_id"
-            and c.get("operator") == "eq"
-            and c.get("value") == "target-anomaly-id"
+            if c.field == "anomaly_id"
+            and c.operator.value == "eq"
+            and c.value == "target-anomaly-id"
         ]
         assert len(matching) == 1, (
             f"Expected one anomaly_id=eq condition, got: {filter_obj.conditions}"

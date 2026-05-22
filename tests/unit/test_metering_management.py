@@ -282,11 +282,11 @@ class TestValidateFieldCombinations:
         args = VALID_TRANSACTION.copy()
         args["subscriber"] = {"id": "u1"}
         warnings = self.mgr._validate_field_combinations(args)
-        assert any("organization_id" in w or "attribution" in w.lower() for w in warnings)
+        assert any("organization_name" in w or "attribution" in w.lower() for w in warnings)
 
     def test_attribution_without_subscriber_adds_suggestion(self):
         args = VALID_TRANSACTION.copy()
-        args["organization_id"] = "org_abc"
+        args["organization_name"] = "org_abc"
         warnings = self.mgr._validate_field_combinations(args)
         assert any("subscriber" in w.lower() for w in warnings)
 

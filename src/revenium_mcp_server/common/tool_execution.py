@@ -6,11 +6,18 @@ across the codebase to ensure consistent tool execution patterns.
 Separated from enhanced_server.py to avoid circular import issues.
 """
 
+from __future__ import annotations
+
 import time
-from typing import Any, Dict, List, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
+
+from ..log_context import bind_tenant_context, clear_tenant_context, sanitize_error_message
 
 
 async def standardized_tool_execution(
@@ -19,6 +26,7 @@ async def standardized_tool_execution(
     arguments: Dict[str, Any],
     tool_class: Any,
     use_direct_execution: bool = True,
+    ctx: Optional[TenantContext] = None,
 ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
     """Standardized tool execution path with proper exception handling and performance monitoring.
 
@@ -44,8 +52,7 @@ async def standardized_tool_execution(
     from ..common.error_handling import IntrospectionError, ToolExecutionError
     from ..introspection.integration import introspection_integration
 
-    # Performance monitoring removed - infrastructure monitoring handled externally
-    # Performance monitoring - start timing
+    tokens = bind_tenant_context(ctx)
     start_time = time.time()
 
     try:
@@ -128,7 +135,7 @@ async def standardized_tool_execution(
                 # All tools now use the unified constructor pattern: ucm_helper parameter
                 tool_instance = tool_class(ucm_helper=ucm_helper)
 
-                result = await tool_instance.handle_action(action, arguments)
+                result = await tool_instance.handle_action(action, arguments, ctx=ctx)
 
                 # Performance monitoring for direct execution
                 direct_time = (time.time() - direct_start) * 1000
@@ -158,8 +165,7 @@ async def standardized_tool_execution(
                     # Re-raise the ToolError directly to preserve user-friendly message
                     raise fallback_error
 
-                # For other errors, check if they contain user-friendly messages
-                error_str = str(fallback_error)
+                error_str = sanitize_error_message(str(fallback_error))
                 if any(indicator in error_str for indicator in [
                     "Invalid organization ID format",
                     "Invalid subscriber",
@@ -168,21 +174,20 @@ async def standardized_tool_execution(
                     "validation error",
                     "missing parameter"
                 ]):
-                    # This appears to be a user-friendly error, just raise it directly
                     raise ToolExecutionError(error_str, tool_name=tool_name, action=action)
 
-                # For truly technical errors, provide minimal context
                 raise ToolExecutionError(
-                    f"Tool execution failed: {str(fallback_error)}",
+                    f"Tool execution failed: {error_str}",
                     tool_name=tool_name,
                     action=action,
                 )
 
     except Exception as e:
-        # Catch-all for any other exceptions
         total_time = (time.time() - start_time) * 1000
 
         logger.error(
             f"PERFORMANCE: {tool_name}.{action} - ERROR after {total_time:.2f}ms: {str(e)}"
         )
         raise
+    finally:
+        clear_tenant_context(tokens)

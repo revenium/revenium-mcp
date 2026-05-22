@@ -23,7 +23,9 @@ from .exceptions import (
 )
 
 
-def handle_alert_tool_errors(operation_name: str):
+def handle_alert_tool_errors(
+    operation_name: str,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator to handle errors in alert tool operations.
 
     Args:
@@ -33,11 +35,14 @@ def handle_alert_tool_errors(operation_name: str):
         Decorator function
     """
 
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(func)
         async def wrapper(
-            *args, **kwargs
+            *args: Any, **kwargs: Any
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+            from .client import ReveniumAPIError
+            from .common.error_handling import ToolError
+
             try:
                 return await func(*args, **kwargs)
 
@@ -45,6 +50,9 @@ def handle_alert_tool_errors(operation_name: str):
                 # Handle our custom exceptions with rich formatting
                 logger.error(f"Alert tools error in {operation_name}: {e.to_dict()}")
                 return [TextContent(type="text", text=e.format_user_message())]
+
+            except (ToolError, ReveniumAPIError):
+                raise
 
             except ValidationError as e:
                 # Handle ValidationError using its built-in formatting to avoid duplication

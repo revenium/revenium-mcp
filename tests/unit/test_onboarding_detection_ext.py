@@ -17,8 +17,7 @@ class TestOnboardingDetectionServiceInit:
 
     def test_initial_state(self):
         svc = OnboardingDetectionService()
-        assert svc._cache_checked is False
-        assert svc._last_detection_result is None
+        assert len(svc._detection_results) == 0
         assert svc.get_last_detection_result() is None
 
 

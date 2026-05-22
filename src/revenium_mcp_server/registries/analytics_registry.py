@@ -354,9 +354,9 @@ class AnalyticsRegistry(BaseToolRegistry):
             "task_type",
             "agent",
             "description",
-            "organization_id",
+            "organization_name",
             "subscription_id",
-            "product_id",
+            "product_name",
         ]:
             value = arguments.get(param)
             if value is not None:
@@ -435,9 +435,9 @@ class AnalyticsRegistry(BaseToolRegistry):
 
         # Business context
         builder = builder.with_business_context(
-            organization_id=arguments.get("organization_id"),
+            organization_name=arguments.get("organization_name"),
             subscription_id=arguments.get("subscription_id"),
-            product_id=arguments.get("product_id"),
+            product_name=arguments.get("product_name"),
         )
 
         # Quality metrics and metadata
@@ -638,9 +638,9 @@ Use `get_examples()` to see Builder Pattern implementations in action.
     "trace_id": "trace_conversation_456",
     "task_id": "task_analysis_789",
     "task_type": "business_analysis",
-    "organization_id": "org_acme_corp",
+    "organization_name": "org_acme_corp",
     "subscription_id": "sub_enterprise_plan",
-    "product_id": "product_ai_assistant",
+    "product_name": "product_ai_assistant",
     "response_quality_score": 0.95,
     "stop_reason": "stop",
     "is_streamed": false,

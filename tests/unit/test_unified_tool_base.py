@@ -5,9 +5,12 @@ formatting, error formatting, UCM integration checking, and metadata
 generation for all MCP tools.
 """
 
+import inspect
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from src.revenium_mcp_server.auth.tenant_context import TenantContext
 from src.revenium_mcp_server.tools_decomposed.unified_tool_base import ToolBase
 from mcp.types import TextContent
 
@@ -19,7 +22,7 @@ class ConcreteTestTool(ToolBase):
     tool_description = "A test tool"
     business_category = "Test Tools"
 
-    async def handle_action(self, action, arguments):
+    async def handle_action(self, action, arguments, ctx=None):
         if action == "fail":
             raise RuntimeError("intentional failure")
         return [TextContent(type="text", text=f"handled: {action}")]
@@ -97,6 +100,27 @@ class TestExecute:
         assert abs(metrics.success_rate - (2 / 3)) < 0.01
         assert metrics.avg_response_time_ms >= 0
         assert metrics.min_response_time_ms <= metrics.peak_response_time_ms
+
+    @pytest.mark.asyncio
+    async def test_execute_forwards_ctx_to_handle_action(self):
+        """When execute() is called with a ctx, it should pass ctx to handle_action."""
+
+        class _CtxCapturingTool(ToolBase):
+            tool_name = "ctx_capture"
+
+            async def handle_action(self, action, arguments, ctx=None):
+                self.captured = {"action": action, "arguments": arguments, "ctx": ctx}
+                return []
+
+        tool = _CtxCapturingTool()
+        sample_ctx = TenantContext(team_id="test-team", api_key="test-key-1234567890")
+
+        result = await tool.execute("list", ctx=sample_ctx, foo="bar", baz=42)
+
+        assert tool.captured["action"] == "list"
+        assert tool.captured["arguments"] == {"foo": "bar", "baz": 42}
+        assert tool.captured["ctx"] is sample_ctx
+        assert result == []
 
 
 class TestPerformanceMetrics:
@@ -288,3 +312,130 @@ class TestMetadataProvider:
         summary = await tool._get_agent_summary()
         assert "test_tool" in summary
         assert "A test tool" in summary
+
+
+# ---------------------------------------------------------------------------
+# Task A6: get_client(ctx) — TDD tests
+# ---------------------------------------------------------------------------
+
+
+class _DummyTool(ToolBase):
+    """Minimal concrete subclass used only for these tests."""
+    tool_name = "dummy"
+
+    async def handle_action(self, action, arguments, ctx=None):
+        return []
+
+
+class TestGetClientWithContext:
+    @pytest.fixture(autouse=True)
+    def _reset_caches(self):
+        """Ensure auth singleton caches are empty before each test.
+
+        Each test in this class monkeypatches env vars and/or builds per-request
+        ReveniumClients. Without this fixture, a previously-cached config
+        or discovered auto-config from a prior test could leak through.
+        """
+        from src.revenium_mcp_server.auth import ConfigManager
+        from src.revenium_mcp_server.config_store import get_config_store
+        ConfigManager().clear_cache()
+        get_config_store().clear_cache()
+
+    @pytest.mark.asyncio
+    async def test_no_ctx_returns_cached_client(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_API_KEY", "test-key-1234567890")
+        monkeypatch.setenv("REVENIUM_TEAM_ID", "test-team")
+
+        tool = _DummyTool()
+        c1 = await tool.get_client()
+        c2 = await tool.get_client()
+        assert c1 is c2  # cached
+
+    @pytest.mark.asyncio
+    async def test_with_ctx_returns_fresh_client(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_API_KEY", "test-key-1234567890")
+        monkeypatch.setenv("REVENIUM_TEAM_ID", "test-team")
+
+        ctx = TenantContext(team_id="t-A", api_key="ctx-key-A-1234567890")
+        tool = _DummyTool()
+        c1 = await tool.get_client(ctx=ctx)
+        c2 = await tool.get_client(ctx=ctx)
+        assert c1 is not c2  # not cached when ctx provided
+
+    @pytest.mark.asyncio
+    async def test_with_ctx_uses_factory_config(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_API_KEY", "env-key-1234567890")
+        monkeypatch.setenv("REVENIUM_TEAM_ID", "env-team")
+
+        ctx = TenantContext(
+            team_id="ctx-team",
+            api_key="ctx-key-1234567890",
+            base_url="https://ctx.example.com",
+        )
+        tool = _DummyTool()
+        client = await tool.get_client(ctx=ctx)
+        assert client.auth_config.team_id == "ctx-team"
+        assert client.auth_config.api_key == "ctx-key-1234567890"
+        assert client.auth_config.base_url == "https://ctx.example.com"
+
+    @pytest.mark.asyncio
+    async def test_two_different_contexts_isolated(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_API_KEY", "env-key-1234567890")
+        monkeypatch.setenv("REVENIUM_TEAM_ID", "env-team")
+
+        ctx_a = TenantContext(team_id="A", api_key="key-A-1234567890")
+        ctx_b = TenantContext(team_id="B", api_key="key-B-1234567890")
+        tool = _DummyTool()
+
+        client_a = await tool.get_client(ctx=ctx_a)
+        client_b = await tool.get_client(ctx=ctx_b)
+        assert client_a is not client_b
+        assert client_a.auth_config.team_id == "A"
+        assert client_b.auth_config.team_id == "B"
+
+    @pytest.mark.asyncio
+    async def test_ctx_call_does_not_pollute_env_cache(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_API_KEY", "env-key-1234567890")
+        monkeypatch.setenv("REVENIUM_TEAM_ID", "env-team")
+
+        ctx = TenantContext(team_id="ctx-team", api_key="ctx-key-1234567890")
+        tool = _DummyTool()
+
+        await tool.get_client(ctx=ctx)
+        env_client = await tool.get_client()  # no ctx — should use env
+
+        assert env_client.auth_config.team_id == "env-team"
+
+
+def test_ctx_is_keyword_only_in_base_class():
+    """`ctx` MUST be keyword-only on ToolBase.handle_action / ToolBase.execute.
+
+    Guards against accidental positional binding (a caller passing a dict
+    positionally would silently bind it to `ctx`, producing a confusing
+    AttributeError deep inside auth resolution).
+    """
+    for method in (ToolBase.handle_action, ToolBase.execute):
+        params = inspect.signature(method).parameters
+        assert "ctx" in params, f"{method.__qualname__} missing `ctx`"
+        assert params["ctx"].kind is inspect.Parameter.KEYWORD_ONLY, (
+            f"{method.__qualname__}: `ctx` must be KEYWORD_ONLY, "
+            f"got {params['ctx'].kind!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_execute_fails_closed_in_clerk_mode_when_no_ctx(monkeypatch):
+    """In clerk mode, if no explicit ctx is passed AND ContextVar is empty
+    (middleware was skipped), execute must raise PermissionError instead of
+    silently falling back to the env-mode cached client."""
+    from src.revenium_mcp_server.auth.claims_middleware import _current_tenant
+
+    monkeypatch.setenv("AUTH_MODE", "clerk")
+    # Clear the ContextVar so current_tenant_context() returns None.
+    token = _current_tenant.set(None)
+    try:
+        tool = ConcreteTestTool()
+        with pytest.raises(PermissionError, match="Tenant context unavailable"):
+            await tool.execute("noop")
+    finally:
+        _current_tenant.reset(token)

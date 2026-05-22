@@ -49,7 +49,6 @@ def _make_client(configs, total=None):
     return client
 
 
-_PATCH_CLIENT = "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.ReveniumClient"
 _PATCH_CFG = "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value"
 _PATCH_ONBOARDING = (
     "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_onboarding_state"
@@ -74,7 +73,7 @@ class TestActionRouting:
         client = _make_client(configs)
         state = MagicMock(is_first_time=False)
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value="c1"),
             patch(_PATCH_ONBOARDING, return_value=AsyncMock(return_value=state)),
         ):
@@ -92,7 +91,7 @@ class TestActionRouting:
         client = _make_client(configs)
         state = MagicMock()
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value="c1"),
             patch(_PATCH_ONBOARDING, AsyncMock(return_value=state)),
         ):
@@ -123,7 +122,7 @@ class TestGuidedSetupDefaultNotFound:
         client = _make_client(configs, total=1)
         # Default is set to a different ID not in the list
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value="c-missing"),
         ):
             result = await tool.handle_action("guided_setup", {})
@@ -141,7 +140,7 @@ class TestDetectAndRecommend:
     async def test_zero_configs_delegates_to_guided_setup(self, tool):
         """detect_and_recommend with no configs delegates to guided_setup (OAuth flow)."""
         client = _make_client([])
-        with patch(_PATCH_CLIENT, return_value=client):
+        with patch.object(tool, "get_client", AsyncMock(return_value=client)):
             result = await tool.handle_action("detect_and_recommend", {})
         text = result[0].text
         assert "initiate_oauth" in text or "No Slack Configurations" in text
@@ -155,7 +154,7 @@ class TestDetectAndRecommend:
         ]
         client = _make_client(configs, total=2)
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value=None),
         ):
             result = await tool.handle_action("detect_and_recommend", {})
@@ -170,7 +169,7 @@ class TestDetectAndRecommend:
         configs = [{"id": "c1", "name": "My Config", "teamName": "WS", "channelName": "ch", "createdDate": "2024"}]
         client = _make_client(configs, total=1)
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value="c1"),
         ):
             result = await tool.handle_action("detect_and_recommend", {})
@@ -184,7 +183,7 @@ class TestDetectAndRecommend:
         configs = [{"id": "c1", "name": "My Config", "teamName": "WS", "channelName": "ch", "createdDate": "2024"}]
         client = _make_client(configs, total=1)
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value="nonexistent-id"),
         ):
             result = await tool.handle_action("detect_and_recommend", {})
@@ -196,9 +195,7 @@ class TestDetectAndRecommend:
         """detect_and_recommend API failure returns ValidationError message (not a bare exception)."""
         client = AsyncMock()
         client.get_slack_configurations = AsyncMock(side_effect=RuntimeError("fail"))
-        client.__aenter__ = AsyncMock(return_value=client)
-        client.__aexit__ = AsyncMock(return_value=None)
-        with patch(_PATCH_CLIENT, return_value=client):
+        with patch.object(tool, "get_client", AsyncMock(return_value=client)):
             result = await tool.handle_action("detect_and_recommend", {})
         text = result[0].text
         # ValidationError.format_user_message() produces "Failed to detect and recommend" message
@@ -224,7 +221,7 @@ class TestSetupStatusDefaultConfigFetchFailure:
         config_fetcher.__aexit__ = AsyncMock(return_value=None)
 
         with (
-            patch(_PATCH_CLIENT, return_value=config_fetcher),
+            patch.object(tool, "get_client", AsyncMock(return_value=config_fetcher)),
             patch(
                 _PATCH_CFG,
                 side_effect=lambda k, *a: {
@@ -281,7 +278,7 @@ class TestOnboardingSetup:
         """First-time user with no configs gets OAuth setup steps."""
         client = _make_client([], total=0)
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value=None),
             patch(_PATCH_ONBOARDING, _onboarding_state(True)),
         ):
@@ -296,7 +293,7 @@ class TestOnboardingSetup:
         configs = [{"id": "c1", "name": "N", "teamName": "WS"}]
         client = _make_client(configs, total=1)
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value=None),
             patch(_PATCH_ONBOARDING, _onboarding_state(True)),
         ):
@@ -311,7 +308,7 @@ class TestOnboardingSetup:
         configs = [{"id": "c1", "name": "N", "teamName": "WS"}]
         client = _make_client(configs, total=1)
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value="c1"),
             patch(_PATCH_ONBOARDING, _onboarding_state(True)),
         ):
@@ -324,7 +321,7 @@ class TestOnboardingSetup:
         """Returning user (not first-time) with no configs sees setup steps without onboarding section."""
         client = _make_client([], total=0)
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value=None),
             patch(_PATCH_ONBOARDING, _onboarding_state(False)),
         ):
@@ -340,7 +337,7 @@ class TestOnboardingSetup:
         configs = [{"id": "c1", "name": "N", "teamName": "WS"}]
         client = _make_client(configs, total=1)
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value="c1"),
             patch(_PATCH_ONBOARDING, _onboarding_state(False)),
         ):
@@ -353,10 +350,8 @@ class TestOnboardingSetup:
         """API error during onboarding_setup returns structured error text."""
         client = AsyncMock()
         client.get_slack_configurations = AsyncMock(side_effect=RuntimeError("boom"))
-        client.__aenter__ = AsyncMock(return_value=client)
-        client.__aexit__ = AsyncMock(return_value=None)
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_ONBOARDING, _onboarding_state(True)),
         ):
             result = await tool.handle_action("onboarding_setup", {})
@@ -376,7 +371,7 @@ class TestFirstTimeGuidance:
         client = _make_client([], total=0)
         state = MagicMock()
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value=None),
             patch(_PATCH_ONBOARDING, AsyncMock(return_value=state)),
         ):
@@ -392,7 +387,7 @@ class TestFirstTimeGuidance:
         client = _make_client(configs, total=1)
         state = MagicMock()
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value=None),
             patch(_PATCH_ONBOARDING, AsyncMock(return_value=state)),
         ):
@@ -408,7 +403,7 @@ class TestFirstTimeGuidance:
         client = _make_client(configs, total=1)
         state = MagicMock()
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value="c1"),
             patch(_PATCH_ONBOARDING, AsyncMock(return_value=state)),
         ):
@@ -422,7 +417,7 @@ class TestFirstTimeGuidance:
         client = _make_client([], total=0)
         state = MagicMock()
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value=None),
             patch(_PATCH_ONBOARDING, AsyncMock(return_value=state)),
         ):
@@ -437,7 +432,7 @@ class TestFirstTimeGuidance:
         client = _make_client(configs, total=1)
         state = MagicMock()
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_CFG, return_value="c1"),
             patch(_PATCH_ONBOARDING, AsyncMock(return_value=state)),
         ):
@@ -455,7 +450,7 @@ class TestFirstTimeGuidance:
         client.__aexit__ = AsyncMock(return_value=None)
         state = MagicMock()
         with (
-            patch(_PATCH_CLIENT, return_value=client),
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_ONBOARDING, AsyncMock(return_value=state)),
         ):
             result = await tool.handle_action("first_time_guidance", {})

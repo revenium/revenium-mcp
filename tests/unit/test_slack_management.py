@@ -73,20 +73,20 @@ class TestSlackManagementRouting:
         result = await slack_mgmt.handle_action("list_configurations", {"page": 0})
         assert result[0].text == "config_response"
         slack_mgmt.config_tool.handle_action.assert_called_once_with(
-            "list_configurations", {"page": 0}
+            "list_configurations", {"page": 0}, ctx=None
         )
 
     @pytest.mark.asyncio
     async def test_oauth_action_delegates_to_oauth_tool(self, slack_mgmt):
         result = await slack_mgmt.handle_action("initiate_oauth", {})
         assert result[0].text == "oauth_response"
-        slack_mgmt.oauth_tool.handle_action.assert_called_once_with("initiate_oauth", {})
+        slack_mgmt.oauth_tool.handle_action.assert_called_once_with("initiate_oauth", {}, ctx=None)
 
     @pytest.mark.asyncio
     async def test_setup_action_delegates_to_setup_tool(self, slack_mgmt):
         result = await slack_mgmt.handle_action("guided_setup", {})
         assert result[0].text == "setup_response"
-        slack_mgmt.setup_tool.handle_action.assert_called_once_with("guided_setup", {})
+        slack_mgmt.setup_tool.handle_action.assert_called_once_with("guided_setup", {}, ctx=None)
 
     @pytest.mark.asyncio
     async def test_get_capabilities_returns_capabilities_text(self, slack_mgmt):

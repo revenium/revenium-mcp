@@ -29,7 +29,7 @@ class EnhancedToolIntegrationError(Exception):
 class EnhancedToolIntegration:
     """Enhanced integration layer for AI routing with MCP tools."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize enhanced tool integration with components."""
         self.parameter_mapper = ParameterMapper()
         self.tool_executor = ToolExecutor()
@@ -63,7 +63,7 @@ class EnhancedToolIntegration:
 
             # Execute the tool
             result = await self.tool_executor.execute_tool(
-                routing_result.tool, routing_result.action, mapped_parameters
+                routing_result.tool_name, routing_result.action, mapped_parameters
             )
 
             # Enhance result with metadata
@@ -79,17 +79,22 @@ class EnhancedToolIntegration:
     def _validate_routing_result(self, routing_result: RoutingResult) -> None:
         """Validate that the routing result is executable."""
         # Check tool availability
-        if not tool_registry.is_tool_available(routing_result.tool):
-            raise EnhancedToolIntegrationError(f"Tool '{routing_result.tool}' is not available")
+        if not tool_registry.is_tool_available(routing_result.tool_name):
+            raise EnhancedToolIntegrationError(
+                f"Tool '{routing_result.tool_name}' is not available"
+            )
 
         # Check action support
-        if not tool_registry.validate_tool_action(routing_result.tool, routing_result.action):
+        if not tool_registry.validate_tool_action(
+            routing_result.tool_name, routing_result.action
+        ):
             raise EnhancedToolIntegrationError(
-                f"Tool '{routing_result.tool}' does not support action '{routing_result.action}'"
+                f"Tool '{routing_result.tool_name}' does not support action "
+                f"'{routing_result.action}'"
             )
 
         # Validate parameter requirements
-        operation_key = f"{routing_result.tool}.{routing_result.action}"
+        operation_key = f"{routing_result.tool_name}.{routing_result.action}"
         missing_params = self.parameter_mapper.validate_parameters(
             operation_key, routing_result.parameters
         )
@@ -101,7 +106,7 @@ class EnhancedToolIntegration:
 
     def _map_parameters(self, routing_result: RoutingResult) -> Dict[str, Any]:
         """Map routing result parameters to tool-specific format."""
-        operation_key = f"{routing_result.tool}.{routing_result.action}"
+        operation_key = f"{routing_result.tool_name}.{routing_result.action}"
 
         try:
             mapped_params = self.parameter_mapper.map_parameters(
@@ -131,7 +136,7 @@ class EnhancedToolIntegration:
                     data = json.loads(content.text)
                     if isinstance(data, dict):
                         data["_ai_routing_metadata"] = {
-                            "tool": routing_result.tool,
+                            "tool": routing_result.tool_name,
                             "action": routing_result.action,
                             "confidence": routing_result.confidence,
                             "routing_method": routing_result.routing_method,

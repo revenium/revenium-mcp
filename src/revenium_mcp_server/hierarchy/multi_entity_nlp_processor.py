@@ -145,20 +145,14 @@ class MultiEntityNLPProcessor:
 
     def __init__(
         self,
-        client: Optional[ReveniumClient] = None,
+        client: ReveniumClient,
         navigation_service: Optional[HierarchyNavigationService] = None,
         lookup_service: Optional[EntityLookupService] = None,
         validator: Optional[CrossTierValidator] = None,
     ):
-        """Initialize the multi-entity NLP processor.
-
-        Args:
-            client: ReveniumClient instance for API calls
-            navigation_service: HierarchyNavigationService for relationship traversal
-            lookup_service: EntityLookupService for entity resolution
-            validator: CrossTierValidator for validation
-        """
-        self.client = client or ReveniumClient()
+        if client is None:
+            raise ValueError("client is required")
+        self.client = client
         self.navigation_service = navigation_service or HierarchyNavigationService(self.client)
         self.lookup_service = lookup_service or EntityLookupService(self.client)
         self.validator = validator or CrossTierValidator(
@@ -992,11 +986,12 @@ class MultiEntityNLPProcessor:
 _multi_entity_nlp_processor = None
 
 
-def get_multi_entity_nlp_processor() -> MultiEntityNLPProcessor:
-    """Get the global multi entity NLP processor instance (lazy initialization)."""
+def get_multi_entity_nlp_processor(client: Optional[ReveniumClient] = None) -> MultiEntityNLPProcessor:
+    if client is not None:
+        return MultiEntityNLPProcessor(client)
     global _multi_entity_nlp_processor
     if _multi_entity_nlp_processor is None:
-        _multi_entity_nlp_processor = MultiEntityNLPProcessor()
+        _multi_entity_nlp_processor = MultiEntityNLPProcessor(ReveniumClient())
     return _multi_entity_nlp_processor
 
 

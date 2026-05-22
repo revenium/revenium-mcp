@@ -211,11 +211,58 @@ class TestValidateNumericFields:
         assert not any("input_tokens" in e for e in errors)
 
     @pytest.mark.asyncio
-    async def test_zero_value_passes(self):
+    async def test_zero_value_rejected(self):
         mgr = _mgr()
         args = {**VALID_TX, "input_tokens": 0}
         errors = await mgr._validate_numeric_fields(args)
-        assert not any("input_tokens" in e for e in errors)
+        assert any("input_tokens" in e and "positive" in e.lower() for e in errors)
+
+    @pytest.mark.asyncio
+    async def test_zero_value_allowed_for_output_tokens_and_duration(self):
+        mgr = _mgr()
+        for field in ("output_tokens", "duration_ms"):
+            args = {**VALID_TX, field: 0}
+            errors = await mgr._validate_numeric_fields(args)
+            assert not any(field in e for e in errors), (
+                f"{field}=0 should be accepted, got errors={errors!r}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_bool_value_rejected_at_validator_level(self):
+        """bool is an int subclass; validator must reject True/False explicitly so
+        a caller who passes a boolean by accident does not get silently treated
+        as 0/1. Belt to the StrictInt suspenders at the Pydantic schema layer."""
+        mgr = _mgr()
+        for field in ("input_tokens", "output_tokens", "duration_ms"):
+            for raw in (True, False):
+                args = {**VALID_TX, field: raw}
+                errors = await mgr._validate_numeric_fields(args)
+                assert any(field in e and "bool" in e.lower() for e in errors), (
+                    f"{field}={raw!r} should be rejected as bool, got errors={errors!r}"
+                )
+
+    @pytest.mark.asyncio
+    async def test_time_to_first_token_zero_allowed(self):
+        mgr = _mgr()
+        args = {**VALID_TX, "time_to_first_token": 0}
+        errors = await mgr._validate_special_fields(args)
+        assert not any("time_to_first_token" in e for e in errors), (
+            f"time_to_first_token=0 should be accepted, got errors={errors!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_time_to_first_token_negative_rejected(self):
+        mgr = _mgr()
+        args = {**VALID_TX, "time_to_first_token": -1}
+        errors = await mgr._validate_special_fields(args)
+        assert any("time_to_first_token" in e and "non-negative" in e.lower() for e in errors)
+
+    @pytest.mark.asyncio
+    async def test_time_to_first_token_positive_passes(self):
+        mgr = _mgr()
+        args = {**VALID_TX, "time_to_first_token": 250}
+        errors = await mgr._validate_special_fields(args)
+        assert errors == []
 
     @pytest.mark.asyncio
     async def test_float_type_rejected(self):
@@ -338,7 +385,7 @@ class TestValidateOptionalFields:
     @pytest.mark.asyncio
     async def test_valid_optional_string(self):
         mgr = _mgr()
-        args = {**VALID_TX, "organization_id": "org_123"}
+        args = {**VALID_TX, "organization_name": "org_123"}
         errors = await mgr._validate_optional_fields(args)
         assert errors == []
 
@@ -373,7 +420,7 @@ class TestValidateOptionalFields:
     @pytest.mark.asyncio
     async def test_none_optional_field_ignored(self):
         mgr = _mgr()
-        args = {**VALID_TX, "organization_id": None}
+        args = {**VALID_TX, "organization_name": None}
         errors = await mgr._validate_optional_fields(args)
         assert errors == []
 
@@ -837,7 +884,7 @@ class TestValidateSpecialFields:
         mgr = _mgr()
         args = {**VALID_TX, "time_to_first_token": -10}
         errors = await mgr._validate_special_fields(args)
-        assert any("positive" in e.lower() for e in errors)
+        assert any("non-negative" in e.lower() for e in errors)
 
     @pytest.mark.asyncio
     async def test_over_60000_rejected(self):
@@ -1109,7 +1156,7 @@ class TestValidateTransactionInputsWithDetails:
     @pytest.mark.asyncio
     async def test_optional_string_too_long(self):
         mgr = _mgr()
-        args = {**VALID_TX, "organization_id": "x" * 501}
+        args = {**VALID_TX, "organization_name": "x" * 501}
         result = await mgr._validate_transaction_inputs_with_details(args)
         assert result["valid"] is False
         assert "Too long" in result["message"]
@@ -1159,7 +1206,7 @@ class TestValidateTransactionInputsWithDetails:
         args = {**VALID_TX, "time_to_first_token": -1}
         result = await mgr._validate_transaction_inputs_with_details(args)
         assert result["valid"] is False
-        assert "positive" in result["message"].lower()
+        assert "non-negative" in result["message"].lower()
 
     @pytest.mark.asyncio
     async def test_time_to_first_token_too_large(self):

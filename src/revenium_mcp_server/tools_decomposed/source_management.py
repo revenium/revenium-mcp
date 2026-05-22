@@ -5,7 +5,10 @@ tool with internal composition, following the proven alert management template.
 """
 
 import json
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -779,12 +782,16 @@ class SourceManagement(ToolBase):
         return examples_text
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle source management actions with intelligent routing."""
         try:
             # Get client and initialize managers
-            client = await self.get_client()
+            client = await self.get_client(ctx=ctx)
             source_manager = SourceManager(client)
             enhancement_processor = SourceEnhancementProcessor(client)
 

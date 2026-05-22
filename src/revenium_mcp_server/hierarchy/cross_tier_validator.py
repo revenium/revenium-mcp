@@ -94,18 +94,13 @@ class CrossTierValidator:
 
     def __init__(
         self,
-        client: Optional[ReveniumClient] = None,
+        client: ReveniumClient,
         navigation_service: Optional[HierarchyNavigationService] = None,
         lookup_service: Optional[EntityLookupService] = None,
     ):
-        """Initialize the cross-tier validator.
-
-        Args:
-            client: ReveniumClient instance for API calls
-            navigation_service: HierarchyNavigationService for relationship traversal
-            lookup_service: EntityLookupService for entity resolution
-        """
-        self.client = client or ReveniumClient()
+        if client is None:
+            raise ValueError("client is required")
+        self.client = client
         self.navigation_service = navigation_service or HierarchyNavigationService(self.client)
         self.lookup_service = lookup_service or EntityLookupService(self.client)
 
@@ -948,11 +943,12 @@ class CrossTierValidator:
 _cross_tier_validator = None
 
 
-def get_cross_tier_validator() -> CrossTierValidator:
-    """Get the global cross tier validator instance (lazy initialization)."""
+def get_cross_tier_validator(client: Optional[ReveniumClient] = None) -> CrossTierValidator:
+    if client is not None:
+        return CrossTierValidator(client)
     global _cross_tier_validator
     if _cross_tier_validator is None:
-        _cross_tier_validator = CrossTierValidator()
+        _cross_tier_validator = CrossTierValidator(ReveniumClient())
     return _cross_tier_validator
 
 

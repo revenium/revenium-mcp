@@ -5,6 +5,35 @@ All notable changes to the Revenium MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.9] - 2026-05-21
+
+### Added
+- `time_to_first_token` field on the `manage_metering` submission schema, grouped under streaming performance
+- `has_more` pagination flag and per-source breakdown on `manage_metering` analytics responses
+
+### Changed
+- `manage_metering` analytics egress now filters high-cardinality fields out of responses surfaced to coding-assistant integrations
+- `analyze_cost_anomalies` output renders as Markdown with nested time/entity summary subsections instead of a flat string
+- `get_agent_costs` aggregates duplicate rows by agent name so the same agent under different IDs collapses into one row
+- `revenue_metric_by_organization` now uses the new analytics endpoint, matching the rest of the analytics surface
+- `get_user_costs` is hidden from `manage_tools_analytics` when the new-analytics-API flag is off
+- `manage_workflows` dry-run and live execution paths share one schema and persist `workflow_id` consistently
+
+### Fixed
+- `lookup_transactions` no longer hangs when called with an empty-string `transaction_id`
+- Invalid-action errors on `manage_metering` list all 12 actions instead of just 7
+- `manage_metering` rejects zero tokens, zero `duration_ms`, and empty-string `transaction_id` at the boundary with a structured error
+- `manage_products` errors propagate so the MCP envelope correctly marks `isError=true`
+- `manage_alerts` decorator propagates `ToolError` and `ReveniumAPIError` instead of swallowing them
+- `manage_metering_elements.create_from_template` returns a clear message when the element already exists as a system element instead of a misleading failure
+
+### Removed
+- Deprecated `organizationId`/`productId` fields removed from the AI metering MCP surface; use the canonical field names
+
+### Security
+- API keys redacted in all server log output (request logs, error logs, debug logs)
+- Error responses sanitized so `raw_response_debug` payloads no longer leak to MCP clients on API failures
+
 ## [0.2.8] - 2026-05-07
 
 ### Added
@@ -150,6 +179,7 @@ No functional changes. Changelog formatting update only.
 - Configuration via environment variables
 - System diagnostics and transaction verification tools
 
+[0.2.9]: https://github.com/revenium/revenium-mcp/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/revenium/revenium-mcp/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/revenium/revenium-mcp/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/revenium/revenium-mcp/compare/v0.2.5...v0.2.6

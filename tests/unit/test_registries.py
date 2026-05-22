@@ -144,11 +144,11 @@ class TestMeteringTransactionBuilder:
             MeteringTransactionBuilder()
             .with_model_and_provider("gpt-4", "OPENAI")
             .with_metrics(input_tokens=10, output_tokens=5, duration_ms=100)
-            .with_business_context(organization_id="org1", product_id="prod1")
+            .with_business_context(organization_name="org1", product_name="prod1")
             .build()
         )
-        assert tx.organization_id == "org1"
-        assert tx.product_id == "prod1"
+        assert tx.organization_name == "org1"
+        assert tx.product_name == "prod1"
 
     def test_with_quality_metrics(self):
         """with_quality_metrics should set quality score and streaming flag."""

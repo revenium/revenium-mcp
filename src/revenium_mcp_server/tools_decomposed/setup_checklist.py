@@ -5,7 +5,10 @@ infrastructure from config_store.py and slack_setup_assistant patterns.
 """
 
 from datetime import datetime
-from typing import Any, ClassVar, Dict, List, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -49,7 +52,11 @@ class SetupChecklist(ToolBase):
         self.formatter = UnifiedResponseFormatter("setup_checklist")
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle setup checklist actions.
 

@@ -27,7 +27,7 @@ class BaseToolRegistry(ABC):
     registry_description: ClassVar[str] = "Base tool registry implementation"
     registry_version: ClassVar[str] = "1.0.0"
 
-    def __init__(self, domain_name: Optional[str] = None, ucm_helper=None):
+    def __init__(self, domain_name: Optional[str] = None, ucm_helper: Any = None):
         """Initialize the tool registry.
 
         Args:
@@ -37,8 +37,8 @@ class BaseToolRegistry(ABC):
         self.domain_name = domain_name or self.registry_name
         self.ucm_helper = ucm_helper
         self.logger = logging.getLogger(f"{__name__}.{self.domain_name}")
-        self._registered_tools = {}
-        self._tool_metadata = {}
+        self._registered_tools: Dict[str, Any] = {}
+        self._tool_metadata: Dict[str, Dict[str, Any]] = {}
 
     async def _standardized_tool_execution(
         self, tool_name: str, action: str, arguments: Dict[str, Any], tool_class: Any = None
@@ -51,27 +51,26 @@ class BaseToolRegistry(ABC):
         try:
             self.logger.info(f"Registry executing {tool_name}.{action}")
 
-            # Import standardized execution function for backward compatibility
-            from ..enhanced_server import standardized_tool_execution
+            from ..common.tool_execution import standardized_tool_execution
 
-            # Execute with standardized pattern
             return await standardized_tool_execution(tool_name, action, arguments, tool_class)
 
         except Exception as e:
             self.logger.error(f"Registry execution failed: {tool_name}.{action}: {e}")
             raise
 
-    async def _get_tool_instance(self, tool_name: str):
+    async def _get_tool_instance(self, tool_name: str) -> Any:
         """Get tool instance by name (for advanced registries)."""
         tool_class = self._registered_tools.get(tool_name)
         if tool_class:
-            # Instantiate the tool class if it's not already an instance
             if isinstance(tool_class, type):
                 return tool_class(self.ucm_helper)
             return tool_class
         return None
 
-    def _register_tool(self, tool_name: str, tool_class, metadata: Optional[Dict[str, Any]] = None):
+    def _register_tool(
+        self, tool_name: str, tool_class: Any, metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
         """Register a tool in this registry.
 
         Args:

@@ -11,6 +11,7 @@ from typing import Dict, Any, Optional, List, Union
 from loguru import logger
 from fastmcp import FastMCP
 from mcp.types import TextContent, ImageContent, EmbeddedResource
+from pydantic import StrictInt
 
 from .config import ToolConfig
 # Note: PROFILE_DEFINITIONS is used indirectly through ToolConfig.is_tool_enabled()
@@ -540,9 +541,9 @@ class ToolConfigurationRegistry:
             action: str = "get_capabilities",
             model: Optional[str] = None,
             provider: Optional[str] = None,
-            input_tokens: Optional[Union[int, str]] = None,
-            output_tokens: Optional[Union[int, str]] = None,
-            duration_ms: Optional[Union[int, str]] = None,
+            input_tokens: Optional[Union[StrictInt, str]] = None,
+            output_tokens: Optional[Union[StrictInt, str]] = None,
+            duration_ms: Optional[Union[StrictInt, str]] = None,
             organization_id: Optional[str] = None,
             subscription_id: Optional[str] = None,
             product_id: Optional[str] = None,
@@ -573,7 +574,8 @@ class ToolConfigurationRegistry:
             agent: Optional[str] = None,
             is_streamed: Optional[Union[bool, str]] = None,
             response_quality_score: Optional[Union[float, str]] = None,
-            stop_reason: Optional[str] = None
+            stop_reason: Optional[str] = None,
+            time_to_first_token: Optional[Union[int, str]] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
             # Map arguments
             arguments = {
@@ -614,7 +616,8 @@ class ToolConfigurationRegistry:
                 # Quality and performance parameters
                 "is_streamed": is_streamed,
                 "response_quality_score": response_quality_score,
-                "stop_reason": stop_reason
+                "stop_reason": stop_reason,
+                "time_to_first_token": time_to_first_token
             }
 
             # NUMERIC PREPROCESSING: Convert string numeric parameters to appropriate types
@@ -628,7 +631,8 @@ class ToolConfigurationRegistry:
                 'max_retries': int,
                 'retry_interval': int,
                 'page_size': int,
-                'response_quality_score': float
+                'response_quality_score': float,
+                'time_to_first_token': int
             }
             arguments = preprocess_numeric_parameters(arguments, numeric_params)
 
@@ -760,85 +764,103 @@ class ToolConfigurationRegistry:
             workflow_data: Optional[Union[dict, str]] = None,
             workflow_type: Optional[str] = None,
             context: Optional[Union[dict, str]] = None,
+            step_result: Optional[Union[dict, str]] = None,
+            page: Optional[Union[int, str]] = None,
+            size: Optional[Union[int, str]] = None,
             dry_run: Optional[Union[bool, str]] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-            # Map arguments
             arguments = {
                 "action": action,
                 "workflow_id": workflow_id,
                 "workflow_data": workflow_data,
                 "workflow_type": workflow_type,
                 "context": context,
-                "dry_run": dry_run
+                "step_result": step_result,
+                "page": page,
+                "size": size,
+                "dry_run": dry_run,
             }
 
-            # SMART INPUT PREPROCESSING: Handle agent interface serialization issues for context
+            _MAX_JSON_STRING_BYTES = 1_048_576  # 1 MiB cap on JSON-string inputs
+
+            def _reject_oversized_json(field_name: str, raw: str) -> None:
+                from ..common.error_handling import ErrorCodes, ToolError
+                raise ToolError(
+                    message=(
+                        f"{field_name} JSON payload is {len(raw)} bytes; "
+                        f"maximum is {_MAX_JSON_STRING_BYTES} bytes (1 MiB)."
+                    ),
+                    error_code=ErrorCodes.VALIDATION_ERROR,
+                    field=field_name,
+                    value=len(raw),
+                    suggestions=[
+                        f"Send {field_name} as a smaller JSON payload",
+                        "Trim or split the data before sending",
+                    ],
+                )
+
             processed_context = context
             if isinstance(context, str):
+                if len(context) > _MAX_JSON_STRING_BYTES:
+                    _reject_oversized_json("context", context)
                 try:
                     import json
                     processed_context = json.loads(context)
                     arguments["context"] = processed_context
                 except json.JSONDecodeError:
-                    # Return helpful error message for malformed JSON
                     from mcp.types import TextContent
                     return [TextContent(
                         type="text",
                         text=f"**❌ Invalid JSON String for context**\n\n"
-                             f"**Error**: context appears to be malformed JSON: `{context}`\n\n"
-                             f"**Solution**: Send context as proper JSON object:\n"
-                             f"```json\n"
-                             f'{{\n'
-                             f'  \"action\": \"start\",\n'
-                             f'  \"workflow_type\": \"customer_onboarding\",\n'
-                             f'  \"context\": {{\n'
-                             f'    \"customer_email\": \"user@company.com\",\n'
-                             f'    \"organization_name\": \"Company Name\"\n'
-                             f'  }}\n'
-                             f'}}\n'
-                             f"```\n\n"
-                             f"**Alternative**: Use workflow_data parameter for complex configurations"
+                             f"**Error**: context appears to be malformed JSON: `{context[:200]}`\n\n"
+                             f"**Solution**: Send context as a proper JSON object."
                     )]
 
-            # SMART INPUT PREPROCESSING: Handle agent interface serialization issues for workflow_data
             processed_workflow_data = workflow_data
             if isinstance(workflow_data, str):
+                if len(workflow_data) > _MAX_JSON_STRING_BYTES:
+                    _reject_oversized_json("workflow_data", workflow_data)
                 try:
                     import json
                     processed_workflow_data = json.loads(workflow_data)
                     arguments["workflow_data"] = processed_workflow_data
                 except json.JSONDecodeError:
-                    # Return helpful error message for malformed JSON
                     from mcp.types import TextContent
                     return [TextContent(
                         type="text",
                         text=f"**❌ Invalid JSON String for workflow_data**\n\n"
-                             f"**Error**: workflow_data appears to be malformed JSON: `{workflow_data}`\n\n"
-                             f"**Solution**: Send workflow_data as proper JSON object:\n"
-                             f"```json\n"
-                             f'{{\n'
-                             f'  \"action\": \"create\",\n'
-                             f'  \"workflow_data\": {{\n'
-                             f'    \"name\": \"Workflow Name\",\n'
-                             f'    \"description\": \"Workflow Description\"\n'
-                             f'  }}\n'
-                             f'}}\n'
-                             f"```\n\n"
-                             f"**Alternative**: Use context parameter for workflow execution context"
+                             f"**Error**: workflow_data appears to be malformed JSON: `{workflow_data[:200]}`\n\n"
+                             f"**Solution**: Send workflow_data as a proper JSON object."
                     )]
 
-            # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
+            processed_step_result = step_result
+            if isinstance(step_result, str):
+                if len(step_result) > _MAX_JSON_STRING_BYTES:
+                    _reject_oversized_json("step_result", step_result)
+                try:
+                    import json
+                    processed_step_result = json.loads(step_result)
+                    arguments["step_result"] = processed_step_result
+                except json.JSONDecodeError:
+                    from mcp.types import TextContent
+                    return [TextContent(
+                        type="text",
+                        text=f"**❌ Invalid JSON String for step_result**\n\n"
+                             f"**Error**: step_result appears to be malformed JSON: `{step_result[:200]}`\n\n"
+                             f"**Solution**: Send step_result as a proper JSON object."
+                    )]
+
+            numeric_params = {"page": int, "size": int}
+            arguments = preprocess_numeric_parameters(arguments, numeric_params)
+
             boolean_params = ["dry_run"]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
 
-            # Remove None values
             arguments = {k: v for k, v in arguments.items() if v is not None}
 
-            # Import tool class
             from ..tools_decomposed.workflow_management import WorkflowManagement
             from ..common.tool_execution import standardized_tool_execution
 
-            # Use standardized execution path
             result = await standardized_tool_execution(
                 tool_name="manage_workflows",
                 action=action,
@@ -1536,7 +1558,7 @@ class ToolConfigurationRegistry:
 
             result = await standardized_tool_execution(
                 tool_name="manage_tools",
-                action=action,
+                action=action if isinstance(action, str) else str(action),
                 arguments=arguments,
                 tool_class=ToolManagement
             )

@@ -1124,82 +1124,61 @@ class SimpleCostAnalyzer:
         return processed_data
 
     def _process_agent_data(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Process and rank agent cost data following existing patterns."""
-        processed_data = []
-        total_cost = 0.0
+        """Process and rank agent cost data following existing patterns.
 
-        # Handle multiple response formats with comprehensive debug logging
+        Aggregates by agent name so multiple backend rows sharing the same
+        groupName collapse into one row with summed cost. The upstream
+        analytics endpoint does not expose a secondary identifier per row,
+        so an agent that appears N times is treated as one logical agent
+        rather than emitting N identical-looking entries.
+        """
+        cost_by_agent: Dict[str, float] = {}
+
         try:
-            # Handle both single dict and list of dicts response formats
             responses = data if isinstance(data, list) else [data]
 
             for response in responses:
                 if not isinstance(response, dict):
                     continue
 
-                # Handle API response structure similar to customer costs
                 if "groups" in response:
-                    # Format: {'groups': [{'groupName': 'agent-name', 'metrics': [...]}]}
                     groups = response.get("groups", [])
                     if not isinstance(groups, list):
                         continue
-
-                    for group_data in groups:
-                        if not isinstance(group_data, dict):
-                            continue
-
-                        # Extract agent name
-                        agent_name = group_data.get("groupName", "Unknown Agent")
-                        metrics = group_data.get("metrics", [])
-
-                        if not isinstance(metrics, list):
-                            continue
-
-                        group_cost = 0.0
-                        for metric in metrics:
-                            if not isinstance(metric, dict):
-                                continue
-
-                            # Use the proven metricResult extraction
-                            metric_result = metric.get("metricResult", 0)
-                            if isinstance(metric_result, (int, float)):
-                                group_cost += metric_result
-
-                        if group_cost > 0:
-                            processed_data.append({"agent": agent_name, "cost": group_cost})
-                            total_cost += group_cost
-
+                    group_items = groups
                 else:
-                    # Direct format: dict with groupName → metrics → metricResult
-                    agent_name = response.get("groupName", "Unknown Agent")
-                    metrics = response.get("metrics", [])
+                    group_items = [response]
 
+                for group_data in group_items:
+                    if not isinstance(group_data, dict):
+                        continue
+
+                    agent_name = group_data.get("groupName", "Unknown Agent")
+                    metrics = group_data.get("metrics", [])
                     if not isinstance(metrics, list):
                         continue
 
-                    group_cost = 0.0
                     for metric in metrics:
                         if not isinstance(metric, dict):
                             continue
-
-                        # Use the proven metricResult extraction
                         metric_result = metric.get("metricResult", 0)
                         if isinstance(metric_result, (int, float)):
-                            group_cost += metric_result
-
-                    if group_cost > 0:
-                        processed_data.append({"agent": agent_name, "cost": group_cost})
-                        total_cost += group_cost
+                            cost_by_agent[agent_name] = (
+                                cost_by_agent.get(agent_name, 0.0) + metric_result
+                            )
 
         except Exception as e:
             self.logger.error(f"Error processing agent data: {e}")
             return []
 
-        # Calculate percentages
+        processed_data = [
+            {"agent": name, "cost": cost}
+            for name, cost in cost_by_agent.items()
+            if cost > 0
+        ]
+        total_cost = sum(item["cost"] for item in processed_data)
         for item in processed_data:
             item["percentage"] = (item["cost"] / total_cost * 100) if total_cost > 0 else 0
-
-        # Sort by cost descending
         processed_data.sort(key=lambda x: x.get("cost", 0), reverse=True)
         return processed_data
 

@@ -5,7 +5,6 @@ compliant MCP errors, ensuring backward compatibility while achieving
 full MCP protocol compliance.
 """
 
-import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Type, Union
 
@@ -13,6 +12,7 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly.error_handling import AgentFriendlyError
+from ..log_context import sanitize_error_message
 from ..common.error_handling import ResourceError, ToolError
 
 # Import existing error types for translation
@@ -121,16 +121,15 @@ class MCPErrorTranslator:
         error_code = self._get_error_code_for_type(type(error))
         error_data = create_structured_error_data(error, context, trace_id)
 
-        return MCPError(code=error_code, message=str(error), data=error_data)
+        return MCPError(code=error_code, message=sanitize_error_message(str(error)), data=error_data)
 
     def _translate_known_error(
         self, exception: Exception, context: Optional[Dict[str, Any]], trace_id: str
     ) -> MCPError:
-        """Translate known exception types to MCP errors."""
         error_code = self._get_error_code_for_type(type(exception))
         error_data = create_known_error_data(exception, context, trace_id)
 
-        return MCPError(code=error_code, message=str(exception), data=error_data)
+        return MCPError(code=error_code, message=sanitize_error_message(str(exception)), data=error_data)
 
     def _translate_unknown_error(
         self, exception: Exception, context: Optional[Dict[str, Any]], trace_id: str
@@ -145,8 +144,7 @@ class MCPErrorTranslator:
         Returns:
             MCPError instance
         """
-        # Get stack trace for debugging
-        stack_trace = traceback.format_exc()
+        logger.error(f"Unexpected error: {exception!r}", exc_info=True)
 
         error_data = MCPErrorData(
             suggestions=[
@@ -164,13 +162,12 @@ class MCPErrorTranslator:
             context={
                 **(context or {}),
                 "exception_type": type(exception).__name__,
-                "stack_trace": stack_trace,
             },
         )
 
         return MCPError(
             code=JSONRPCErrorCode.INTERNAL_ERROR,
-            message=f"Unexpected error: {str(exception)}",
+            message=f"Unexpected error: {sanitize_error_message(str(exception))}",
             data=error_data,
         )
 

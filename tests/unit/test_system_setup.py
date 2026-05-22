@@ -61,7 +61,7 @@ class TestSystemSetupRouting:
         for action in ["show_welcome", "setup_checklist", "environment_status", "next_steps", "complete_setup", "help", "get_actions"]:
             setup_tool.welcome_tool.handle_action.reset_mock()
             result = await setup_tool.handle_action(action, {})
-            setup_tool.welcome_tool.handle_action.assert_called_once_with(action, {})
+            setup_tool.welcome_tool.handle_action.assert_called_once_with(action, {}, ctx=None)
 
     @pytest.mark.asyncio
     async def test_checklist_actions_delegate_to_checklist_tool(self, setup_tool):

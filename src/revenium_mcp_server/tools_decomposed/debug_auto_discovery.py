@@ -6,7 +6,10 @@ validation infrastructure to ensure consistency with the system.
 
 import os
 from datetime import datetime
-from typing import Any, ClassVar, Dict, List, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -46,7 +49,11 @@ class DebugAutoDiscovery(ToolBase):
         self.formatter = UnifiedResponseFormatter("debug_auto_discovery")
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle debug auto-discovery actions.
 

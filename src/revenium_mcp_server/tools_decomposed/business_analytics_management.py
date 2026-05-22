@@ -8,7 +8,10 @@ This tool provides business analytics capabilities including:
 - Cost summary reports
 """
 
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -19,17 +22,20 @@ from ..analytics.simple_analytics_engine import SimpleAnalyticsEngine
 from ..analytics.validation import ValidationError
 from ..auth import AuthenticationError
 from ..client import ReveniumAPIError
+from ..endpoint_registry import NewApiRequiredError, _use_new_api
 from ..introspection.metadata import ToolCapability
 from .unified_tool_base import ToolBase
 
+MatplotlibChartRenderer: Optional[type] = None
 try:
-    from ..services import ChartRenderConfig, MatplotlibChartRenderer
+    from ..services import ChartRenderConfig
+    from ..services import MatplotlibChartRenderer as _MatplotlibChartRenderer
 
+    MatplotlibChartRenderer = _MatplotlibChartRenderer
     CHART_RENDERING_AVAILABLE = True
 except ImportError:
     from ..services import ChartRenderConfig
 
-    MatplotlibChartRenderer = None
     CHART_RENDERING_AVAILABLE = False
 from ..common.error_handling import (
     ErrorCodes,
@@ -73,7 +79,7 @@ class BusinessAnalyticsManagement(ToolBase):
 
     tool_version: ClassVar[str] = "1.0.0"
 
-    def __init__(self, ucm_helper=None) -> None:
+    def __init__(self, ucm_helper: Any = None) -> None:
         """Initialize the Business Analytics Management tool.
 
         Args:
@@ -84,14 +90,13 @@ class BusinessAnalyticsManagement(ToolBase):
         # Initialize response formatter for consistent output
         self.formatter = UnifiedResponseFormatter("business_analytics_management")
 
-        # Initialize analytics engines
-        self.simple_analytics_engine = None  # Lazy initialization
-        self.enhanced_spike_analyzer = None  # Lazy initialization
         logger.info("Business Analytics Management initialized successfully")
-        self.ucm_integration = None
+        self.ucm_integration: Optional[Any] = None
 
         # Chart visualization services (Matplotlib-based)
-        if CHART_RENDERING_AVAILABLE and MatplotlibChartRenderer:
+        self.chart_config: Optional[Any] = None
+        self.chart_renderer: Optional[Any] = None
+        if CHART_RENDERING_AVAILABLE and MatplotlibChartRenderer is not None:
             try:
                 self.chart_config = ChartRenderConfig()
                 self.chart_renderer = MatplotlibChartRenderer(
@@ -107,16 +112,16 @@ class BusinessAnalyticsManagement(ToolBase):
         else:
             logger.info("Chart visualization disabled: Matplotlib not available")
             self.chart_generation_enabled = False
-            self.chart_config = ChartRenderConfig() if ChartRenderConfig else None
+            self.chart_config = ChartRenderConfig() if ChartRenderConfig is not None else None
             self.chart_renderer = None
 
         # Resource type for UCM integration
         self.resource_type = "analytics"
 
         # Alert management tool integration for cross-tool capabilities
-        self._alert_management_tool = None
+        self._alert_management_tool: Optional[Any] = None
 
-    async def _generate_visual_chart(self, chart_data) -> Optional[ImageContent]:
+    async def _generate_visual_chart(self, chart_data: Any) -> Optional[ImageContent]:
         """Generate visual chart from ChartData object using Matplotlib.
 
         Args:
@@ -147,13 +152,18 @@ class BusinessAnalyticsManagement(ToolBase):
             return None
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle business analytics actions.
 
         Args:
             action: Action to perform
             arguments: Action arguments
+            ctx: Optional tenant context for authentication
 
         Returns:
             Tool response
@@ -173,30 +183,30 @@ class BusinessAnalyticsManagement(ToolBase):
             elif action == "get_agent_summary":
                 return await self._handle_get_agent_summary()
             elif action == "get_provider_costs":
-                return await self._handle_get_provider_costs(arguments)
+                return await self._handle_get_provider_costs(arguments, ctx=ctx)
             elif action == "get_model_costs":
-                return await self._handle_get_model_costs(arguments)
+                return await self._handle_get_model_costs(arguments, ctx=ctx)
             elif action == "get_customer_costs":
-                return await self._handle_get_customer_costs(arguments)
+                return await self._handle_get_customer_costs(arguments, ctx=ctx)
             elif action == "get_api_key_costs":
-                return await self._handle_get_api_key_costs(arguments)
+                return await self._handle_get_api_key_costs(arguments, ctx=ctx)
             elif action == "get_agent_costs":
-                return await self._handle_get_agent_costs(arguments)
+                return await self._handle_get_agent_costs(arguments, ctx=ctx)
             elif action == "get_user_costs":
-                return await self._handle_get_user_costs(arguments)
+                return await self._handle_get_user_costs(arguments, ctx=ctx)
             elif action == "get_tool_costs":
-                return await self._handle_get_tool_costs(arguments)
+                return await self._handle_get_tool_costs(arguments, ctx=ctx)
             elif action == "get_top_tools":
-                return await self._handle_get_top_tools(arguments)
+                return await self._handle_get_top_tools(arguments, ctx=ctx)
             elif action == "get_tool_costs_by_agent":
-                return await self._handle_get_tool_costs_by_agent(arguments)
+                return await self._handle_get_tool_costs_by_agent(arguments, ctx=ctx)
             elif action == "get_tool_costs_by_provider":
-                return await self._handle_get_tool_costs_by_provider(arguments)
+                return await self._handle_get_tool_costs_by_provider(arguments, ctx=ctx)
 
             elif action == "get_cost_summary":
-                return await self._handle_get_cost_summary(arguments)
+                return await self._handle_get_cost_summary(arguments, ctx=ctx)
             elif action == "analyze_cost_anomalies":
-                return await self._handle_analyze_cost_anomalies(arguments)
+                return await self._handle_analyze_cost_anomalies(arguments, ctx=ctx)
             elif action in [
                 "get_cost_trends",
                 "analyze_profitability",
@@ -229,19 +239,16 @@ class BusinessAnalyticsManagement(ToolBase):
             )
 
     async def _handle_get_cost_summary(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get_cost_summary request using the new simplified engine."""
         try:
             logger.info("Processing get_cost_summary request")
 
-            # Initialize analytics engine with client if not already done
-            if self.simple_analytics_engine is None:
-                client = await self.get_client()
-                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
+            client = await self.get_client(ctx=ctx)
+            engine = SimpleAnalyticsEngine(client)
 
-            # Use the new simplified analytics engine
-            response = await self.simple_analytics_engine.get_cost_summary(**arguments)
+            response = await engine.get_cost_summary(**arguments)
 
             logger.info("Cost summary analysis completed successfully")
             return [TextContent(type="text", text=response)]
@@ -362,6 +369,17 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - **Time Periods**: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - **Aggregations**: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
+        if not _use_new_api():
+            capabilities = capabilities.replace(
+                "6. **get_user_costs**\n"
+                "   - Analyze costs by user email (subscriber)\n"
+                "   - Returns cost, request count, and token usage per user\n"
+                "   - Data from coding assistant traces (Cursor, Claude Code, Gemini CLI)\n\n",
+                "",
+            )
+            for old, new in [("7.", "6."), ("8.", "7."), ("9.", "8."), ("10.", "9.")]:
+                capabilities = capabilities.replace(old, new, 1)
+
         return [TextContent(type="text", text=capabilities)]
 
     async def _handle_get_agent_summary(
@@ -557,66 +575,33 @@ If you're seeing this error, please report it as it indicates a reliability issu
 """
         return [TextContent(type="text", text=examples)]
 
-    async def _handle_unimplemented_feature(
-        self, action: str
-    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Handle requests for features not yet implemented."""
-        response = f"""
-❌ **Action Not Available**
-
-**Requested Action**: {action}
-
-**Available Actions:**
-- get_capabilities (see supported features)
-- get_examples (see working examples)
-- get_provider_costs
-- get_model_costs
-- get_customer_costs
-
-- get_cost_summary
-- analyze_cost_anomalies
-
-Use `get_capabilities()` for current status.
-"""
-        return [TextContent(type="text", text=response)]
-
     async def _handle_unsupported_action(
         self, action: str
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Handle requests for unsupported actions."""
-        response = f"""
-❌ **Action Not Supported**
+        actions = await self._get_supported_actions()
+        action_list = "\n".join(f"- {a}" for a in actions)
+        response = f"""**Action Not Supported**
 
 **Requested Action**: {action}
 
 **Available Actions:**
-- get_capabilities (see supported features)
-- get_examples (see working examples)
-- get_provider_costs
-- get_model_costs
-- get_customer_costs
-
-- get_cost_summary
-- analyze_cost_anomalies
+{action_list}
 
 Use `get_capabilities()` for current status.
 """
         return [TextContent(type="text", text=response)]
 
     async def _handle_get_provider_costs(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get_provider_costs request using the new simplified engine."""
         try:
             logger.info("Processing get_provider_costs request")
 
-            # Initialize analytics engine with client if not already done
-            if self.simple_analytics_engine is None:
-                client = await self.get_client()
-                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
+            client = await self.get_client(ctx=ctx)
+            engine = SimpleAnalyticsEngine(client)
 
-            # Use the new simplified analytics engine
-            response = await self.simple_analytics_engine.get_provider_costs(**arguments)
+            response = await engine.get_provider_costs(**arguments)
 
             logger.info("Provider costs analysis completed successfully")
             return [TextContent(type="text", text=response)]
@@ -670,19 +655,16 @@ If you're seeing this error, please report it as it indicates a reliability issu
             return [TextContent(type="text", text=error_response)]
 
     async def _handle_get_model_costs(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get_model_costs request using the new simplified engine."""
         try:
             logger.info("Processing get_model_costs request")
 
-            # Initialize analytics engine with client if not already done
-            if self.simple_analytics_engine is None:
-                client = await self.get_client()
-                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
+            client = await self.get_client(ctx=ctx)
+            engine = SimpleAnalyticsEngine(client)
 
-            # Use the new simplified analytics engine
-            response = await self.simple_analytics_engine.get_model_costs(**arguments)
+            response = await engine.get_model_costs(**arguments)
 
             logger.info("Model costs analysis completed successfully")
             return [TextContent(type="text", text=response)]
@@ -736,19 +718,16 @@ If you're seeing this error, please report it as it indicates a reliability issu
             return [TextContent(type="text", text=error_response)]
 
     async def _handle_get_customer_costs(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get_customer_costs request using the new simplified engine."""
         try:
             logger.info("Processing get_customer_costs request")
 
-            # Initialize analytics engine with client if not already done
-            if self.simple_analytics_engine is None:
-                client = await self.get_client()
-                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
+            client = await self.get_client(ctx=ctx)
+            engine = SimpleAnalyticsEngine(client)
 
-            # Use the new simplified analytics engine
-            response = await self.simple_analytics_engine.get_customer_costs(**arguments)
+            response = await engine.get_customer_costs(**arguments)
 
             logger.info("Customer costs analysis completed successfully")
             return [TextContent(type="text", text=response)]
@@ -802,19 +781,16 @@ If you're seeing this error, please report it as it indicates a reliability issu
             return [TextContent(type="text", text=error_response)]
 
     async def _handle_get_api_key_costs(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get_api_key_costs request using the new simplified engine."""
         try:
             logger.info("Processing get_api_key_costs request")
 
-            # Initialize analytics engine with client if not already done
-            if self.simple_analytics_engine is None:
-                client = await self.get_client()
-                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
+            client = await self.get_client(ctx=ctx)
+            engine = SimpleAnalyticsEngine(client)
 
-            # Use the new simplified analytics engine
-            response = await self.simple_analytics_engine.get_api_key_costs(**arguments)
+            response = await engine.get_api_key_costs(**arguments)
 
             logger.info("API key costs analysis completed successfully")
             return [TextContent(type="text", text=response)]
@@ -868,19 +844,16 @@ If you're seeing this error, please report it as it indicates a reliability issu
             return [TextContent(type="text", text=error_response)]
 
     async def _handle_get_agent_costs(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get_agent_costs request using the new simplified engine."""
         try:
             logger.info("Processing get_agent_costs request")
 
-            # Initialize analytics engine with client if not already done
-            if self.simple_analytics_engine is None:
-                client = await self.get_client()
-                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
+            client = await self.get_client(ctx=ctx)
+            engine = SimpleAnalyticsEngine(client)
 
-            # Use the new simplified analytics engine
-            response = await self.simple_analytics_engine.get_agent_costs(**arguments)
+            response = await engine.get_agent_costs(**arguments)
 
             logger.info("Agent costs analysis completed successfully")
             return [TextContent(type="text", text=response)]
@@ -934,17 +907,16 @@ If you're seeing this error, please report it as it indicates a reliability issu
             return [TextContent(type="text", text=error_response)]
 
     async def _handle_get_user_costs(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get_user_costs request — cost attribution by subscriber email."""
         try:
             logger.info("Processing get_user_costs request")
 
-            if self.simple_analytics_engine is None:
-                client = await self.get_client()
-                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
+            client = await self.get_client(ctx=ctx)
+            engine = SimpleAnalyticsEngine(client)
 
-            response = await self.simple_analytics_engine.get_user_costs(**arguments)
+            response = await engine.get_user_costs(**arguments)
 
             logger.info("User costs analysis completed successfully")
             return [TextContent(type="text", text=response)]
@@ -973,6 +945,11 @@ If you're seeing this error, please report it as it indicates a reliability issu
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
             raise
+        except NewApiRequiredError:
+            return [TextContent(type="text", text=(
+                "**get_user_costs** requires the new analytics API.\n\n"
+                "Set the environment variable `REVENIUM_USE_NEW_ANALYTICS_API=true` to enable it."
+            ))]
         except Exception as e:
             logger.error(f"Error in get_user_costs: {e}")
             error_details = self._format_api_error_details(e)
@@ -982,7 +959,6 @@ If you're seeing this error, please report it as it indicates a reliability issu
 
 **Troubleshooting:**
 - Verify your parameters: period (required), aggregation (optional, defaults to TOTAL)
-- This endpoint requires the cost-by-user API (FRONT-931)
 - User cost data is only available for coding assistant traces (Cursor, Claude Code, Gemini CLI)
 
 **Supported Parameters:**
@@ -998,15 +974,14 @@ If you're seeing this error, please report it as it indicates a reliability issu
             return [TextContent(type="text", text=error_response)]
 
     async def _handle_get_tool_costs(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get_tool_costs request using the simplified engine."""
         try:
             logger.info("Processing get_tool_costs request")
-            if self.simple_analytics_engine is None:
-                client = await self.get_client()
-                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
-            response = await self.simple_analytics_engine.get_tool_costs(**arguments)
+            client = await self.get_client(ctx=ctx)
+            engine = SimpleAnalyticsEngine(client)
+            response = await engine.get_tool_costs(**arguments)
             logger.info("Tool costs analysis completed successfully")
             return [TextContent(type="text", text=response)]
         except ValidationError as e:
@@ -1049,15 +1024,14 @@ If you're seeing this error, please report it as it indicates a reliability issu
             return [TextContent(type="text", text=error_response)]
 
     async def _handle_get_top_tools(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get_top_tools request using the simplified engine."""
         try:
             logger.info("Processing get_top_tools request")
-            if self.simple_analytics_engine is None:
-                client = await self.get_client()
-                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
-            response = await self.simple_analytics_engine.get_top_tools(**arguments)
+            client = await self.get_client(ctx=ctx)
+            engine = SimpleAnalyticsEngine(client)
+            response = await engine.get_top_tools(**arguments)
             logger.info("Top tools analysis completed successfully")
             return [TextContent(type="text", text=response)]
         except ValidationError as e:
@@ -1099,15 +1073,14 @@ If you're seeing this error, please report it as it indicates a reliability issu
             return [TextContent(type="text", text=error_response)]
 
     async def _handle_get_tool_costs_by_agent(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get_tool_costs_by_agent request using the simplified engine."""
         try:
             logger.info("Processing get_tool_costs_by_agent request")
-            if self.simple_analytics_engine is None:
-                client = await self.get_client()
-                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
-            response = await self.simple_analytics_engine.get_tool_costs_by_agent(**arguments)
+            client = await self.get_client(ctx=ctx)
+            engine = SimpleAnalyticsEngine(client)
+            response = await engine.get_tool_costs_by_agent(**arguments)
             logger.info("Tool costs by agent analysis completed successfully")
             return [TextContent(type="text", text=response)]
         except ValidationError as e:
@@ -1150,15 +1123,14 @@ If you're seeing this error, please report it as it indicates a reliability issu
             return [TextContent(type="text", text=error_response)]
 
     async def _handle_get_tool_costs_by_provider(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get_tool_costs_by_provider request using the simplified engine."""
         try:
             logger.info("Processing get_tool_costs_by_provider request")
-            if self.simple_analytics_engine is None:
-                client = await self.get_client()
-                self.simple_analytics_engine = SimpleAnalyticsEngine(client)
-            response = await self.simple_analytics_engine.get_tool_costs_by_provider(**arguments)
+            client = await self.get_client(ctx=ctx)
+            engine = SimpleAnalyticsEngine(client)
+            response = await engine.get_tool_costs_by_provider(**arguments)
             logger.info("Tool costs by provider analysis completed successfully")
             return [TextContent(type="text", text=response)]
         except ValidationError as e:
@@ -1200,8 +1172,145 @@ If you're seeing this error, please report it as it indicates a reliability issu
 """
             return [TextContent(type="text", text=error_response)]
 
+    @staticmethod
+    def _md_cell(value: Any) -> str:
+        """Escape characters that would break a markdown table cell."""
+        return str(value).replace("\\", "\\\\").replace("|", "\\|")
+
+    @staticmethod
+    def _render_grouped_summary(grouped: Dict[str, Any], lines: List[str]) -> None:
+        """Render a nested summary dict (group -> inner-fields-dict) as readable markdown."""
+        for group, inner in grouped.items():
+            lines.append(f"### {group}")
+            if isinstance(inner, dict):
+                for field, val in inner.items():
+                    field_label = field.replace("_", " ").capitalize()
+                    if isinstance(val, list):
+                        rendered = ", ".join(str(v) for v in val) if val else "—"
+                    elif isinstance(val, float):
+                        rendered = f"{val:.2f}"
+                    else:
+                        rendered = str(val)
+                    lines.append(f"- **{field_label}**: {rendered}")
+            else:
+                lines.append(f"- {inner}")
+            lines.append("")
+
+    def _format_anomaly_results_markdown(self, result: Dict[str, Any]) -> str:
+
+        lines: List[str] = []
+
+        period = result.get("period_analyzed", "—")
+        sensitivity = result.get("sensitivity_used", "—")
+        anomalies = result.get("temporal_anomalies") or []
+        total = result.get("total_anomalies_detected", len(anomalies))
+
+        lines.append(f"# Cost Anomaly Analysis — {period}")
+        lines.append("")
+
+        summary_bits = [
+            f"**Sensitivity:** {sensitivity}",
+            f"**Total anomalies detected:** {total}",
+        ]
+        if "time_groups_analyzed" in result:
+            summary_bits.append(f"**Time groups analyzed:** {result['time_groups_analyzed']}")
+        lines.append(" · ".join(summary_bits))
+        lines.append("")
+
+        if result.get("period_conversion_notice"):
+            lines.append(f"> ⚠️ {result['period_conversion_notice']}")
+            lines.append("")
+
+        entities_analyzed = result.get("entities_analyzed") or {}
+        if entities_analyzed:
+            lines.append("## Entities Analyzed")
+            for dim, count in entities_analyzed.items():
+                lines.append(f"- **{dim}**: {count}")
+            lines.append("")
+
+        lines.append("## Anomalies Detected")
+        lines.append("")
+        if anomalies:
+            lines.append(
+                "| Entity | Type | Time | Value | Normal Range | % Above | z-score | Severity |"
+            )
+            lines.append("|---|---|---|---|---|---|---|---|")
+            for a in anomalies:
+                entity = self._md_cell(a.get("entity_name", "—"))
+                etype = self._md_cell(a.get("entity_type", "—"))
+                label = self._md_cell(a.get("time_group_label") or a.get("time_group", "—"))
+                value = a.get("anomaly_value", 0) or 0
+                nmin = a.get("normal_range_min", 0) or 0
+                nmax = a.get("normal_range_max", 0) or 0
+                pct = a.get("percentage_above_normal", 0) or 0
+                z = a.get("z_score", 0) or 0
+                sev = a.get("severity_score", 0) or 0
+                lines.append(
+                    f"| {entity} | {etype} | {label} | ${value:.2f} | "
+                    f"${nmin:.2f}–${nmax:.2f} | {pct:.1f}% | {z:.1f} | {sev:.1f} |"
+                )
+            lines.append("")
+
+            contexts = [a for a in anomalies if a.get("context")]
+            if contexts:
+                lines.append("### Anomaly Context")
+                for a in contexts:
+                    name = a.get("entity_name", "—")
+                    label = a.get("time_group_label") or a.get("time_group", "—")
+                    lines.append(f"- **{name}** ({label}): {a['context']}")
+                lines.append("")
+        else:
+            lines.append("_No anomalies detected for the analyzed period._")
+            lines.append("")
+
+        tps = result.get("time_period_summary")
+        if isinstance(tps, dict) and tps:
+            lines.append("## Time Period Summary")
+            lines.append("")
+            self._render_grouped_summary(tps, lines)
+
+        es = result.get("entity_summary")
+        if isinstance(es, dict) and es:
+            lines.append("## Entity Summary")
+            lines.append("")
+            self._render_grouped_summary(es, lines)
+
+        if result.get("new_entities_detected"):
+            lines.append("## New Entities Detected")
+            lines.append("")
+            ne_summary = result.get("new_entity_summary")
+            if ne_summary:
+                lines.append(ne_summary)
+                lines.append("")
+            ne_by_type = result.get("new_entities_by_type") or {}
+            for entity_type, data in ne_by_type.items():
+                count = data.get("count", 0)
+                lines.append(f"### {entity_type.title()} ({count})")
+                lines.append("")
+                if data.get("summary"):
+                    lines.append(data["summary"])
+                    lines.append("")
+                for entity in data.get("entities", []):
+                    name = entity.get("entity_name", "—")
+                    cost = entity.get("total_cost_impact", 0) or 0
+                    periods = entity.get("periods_active", 0)
+                    lines.append(
+                        f"- **{name}** — ${cost:.2f} impact across {periods} period(s)"
+                    )
+                lines.append("")
+
+        recs = result.get("recommendations") or []
+        if recs:
+            lines.append("## Recommendations")
+            lines.append("")
+            for rec in recs:
+                lines.append(f"- {rec}")
+            lines.append("")
+
+        return "\n".join(lines).rstrip() + "\n"
+
     async def _handle_analyze_cost_anomalies(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle analyze_cost_anomalies request using Enhanced Spike Analyzer v2.0."""
         # BACK-1270 (item #7): coerce min_impact_threshold to float at the
@@ -1224,10 +1333,8 @@ If you're seeing this error, please report it as it indicates a reliability issu
         try:
             logger.info("Processing analyze_cost_anomalies request")
 
-            # Initialize enhanced spike analyzer with client if not already done
-            if self.enhanced_spike_analyzer is None:
-                client = await self.get_client()
-                self.enhanced_spike_analyzer = EnhancedSpikeAnalyzer(client)
+            client = await self.get_client(ctx=ctx)
+            analyzer = EnhancedSpikeAnalyzer(client)
 
             # Extract parameters with defaults
             period = arguments.get("period")
@@ -1319,7 +1426,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 )
 
             # Perform temporal anomaly analysis with optional new entity detection
-            result = await self.enhanced_spike_analyzer.analyze_temporal_anomalies(
+            result = await analyzer.analyze_temporal_anomalies(
                 period=period,
                 sensitivity=sensitivity,
                 min_impact_threshold=min_impact_threshold,
@@ -1328,10 +1435,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 min_new_entity_threshold=min_new_entity_threshold,
             )
 
-            # Format response as JSON
-            import json
-
-            response = json.dumps(result, indent=2)
+            response = self._format_anomaly_results_markdown(result)
 
             logger.info("Temporal anomaly analysis completed successfully")
             return [TextContent(type="text", text=response)]
@@ -1381,8 +1485,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 
     # Metadata Provider Implementation
     async def _get_supported_actions(self) -> List[str]:
-        """Get supported actions for tool introspection."""
-        return [
+        actions = [
             "get_capabilities",
             "get_examples",
             "get_agent_summary",
@@ -1391,13 +1494,18 @@ If you're seeing this error, please report it as it indicates a reliability issu
             "get_customer_costs",
             "get_api_key_costs",
             "get_agent_costs",
+        ]
+        if _use_new_api():
+            actions.append("get_user_costs")
+        actions.extend([
             "get_tool_costs",
             "get_top_tools",
             "get_tool_costs_by_agent",
             "get_tool_costs_by_provider",
             "get_cost_summary",
             "analyze_cost_anomalies",
-        ]
+        ])
+        return actions
 
     async def _get_tool_capabilities(self) -> List[ToolCapability]:
         """Get tool capabilities for tool introspection."""

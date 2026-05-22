@@ -9,7 +9,10 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -73,7 +76,7 @@ _DATE_KEYS = frozenset({"created", "updated"})
 _RESOURCE_PATH = re.compile(r"/profitstream/v2/api/(\w+)/[^/]+/?$")
 
 
-def _sanitize_undefined_sentinels(data):
+def _sanitize_undefined_sentinels(data: Any) -> Any:
     """Recursively replace backend-returned `"undefined"` literals and
     locale-formatted date strings with sensible nulls (BACK-1311).
 
@@ -1030,7 +1033,9 @@ class SubscriptionManager:
 
         return product_id, client_email, name, billing_frequency_hint
 
-    def _validate_simple_required_parameters(self, product_id: str, client_email: str):
+    def _validate_simple_required_parameters(
+        self, product_id: str, client_email: str
+    ) -> None:
         """Validate required parameters for simple subscription creation."""
         if not product_id:
             raise create_structured_missing_parameter_error(
@@ -1062,7 +1067,7 @@ class SubscriptionManager:
                 },
             )
 
-    async def _validate_simple_product(self, product_id: str):
+    async def _validate_simple_product(self, product_id: str) -> Any:
         """Validate product existence and availability for simple subscription."""
         try:
             product = await self.client.get_product_by_id(product_id)
@@ -1184,7 +1189,7 @@ class SubscriptionManager:
 
     def _validate_text_input(self, arguments: Dict[str, Any]) -> str:
         """Validate text input parameter for create_from_text."""
-        text = arguments.get("text", "")
+        text: str = arguments.get("text", "")
         if not text:
             raise create_structured_missing_parameter_error(
                 parameter_name="text",
@@ -1230,7 +1235,7 @@ class SubscriptionManager:
 
         return product_id, client_email
 
-    def _raise_product_safety_error(self):
+    def _raise_product_safety_error(self) -> None:
         """Raise safety error for missing product specification."""
         raise ToolError(
             message="🚨 BILLING SAFETY ERROR: Cannot create subscription without explicit product specification",
@@ -1251,7 +1256,7 @@ class SubscriptionManager:
             },
         )
 
-    def _raise_client_email_safety_error(self):
+    def _raise_client_email_safety_error(self) -> None:
         """Raise safety error for missing client email specification."""
         raise ToolError(
             message="🚨 BILLING SAFETY ERROR: Cannot create subscription without explicit client email",
@@ -1355,7 +1360,7 @@ class SubscriptionManager:
 
         # Simple keyword-based analysis (in production, would use NLP/LLM)
         # NOTE: These are internal analysis results, NOT API field values
-        analysis = {
+        analysis: Dict[str, Any] = {
             "billing_frequency_hint": "monthly",  # Internal hint for description generation
             "subscription_name": None,
             "product_id": None,  # Never assume - must be explicit
@@ -1406,7 +1411,7 @@ class SubscriptionManager:
 class SubscriptionValidator:
     """Internal manager for subscription validation and schema discovery with UCM integration."""
 
-    def __init__(self, ucm_integration_helper=None) -> None:
+    def __init__(self, ucm_integration_helper: Any = None) -> None:
         """Initialize subscription validator.
 
         Args:
@@ -1414,6 +1419,7 @@ class SubscriptionValidator:
         """
         self.ucm_helper = ucm_integration_helper
 
+        self.schema_discovery: Optional[Any] = None
         try:
             from ..schema_discovery import SubscriptionSchemaDiscovery
 
@@ -1426,7 +1432,7 @@ class SubscriptionValidator:
         """Get subscription capabilities using UCM or fallback."""
         if self.ucm_helper:
             try:
-                return await self.ucm_helper.ucm.get_capabilities("subscriptions")
+                return cast(Dict[str, Any], await self.ucm_helper.ucm.get_capabilities("subscriptions"))
             except ToolError:
 
                 # Re-raise ToolError exceptions without modification
@@ -1555,7 +1561,7 @@ class SubscriptionValidator:
                     and schema_examples.get("examples")
                     and len(schema_examples["examples"]) > 0
                 ):
-                    return schema_examples
+                    return cast(Dict[str, Any], schema_examples)
                 # If schema discovery returns empty, fall back to static examples
                 logger.info("Schema discovery returned empty examples, using fallback")
             except Exception as e:
@@ -1592,7 +1598,10 @@ class SubscriptionValidator:
                 },
             )
 
-        return self.schema_discovery.validate_subscription_configuration(subscription_data, dry_run)
+        return cast(
+            Dict[str, Any],
+            self.schema_discovery.validate_subscription_configuration(subscription_data, dry_run),
+        )
 
 
 class SubscriptionAnalytics:
@@ -1663,9 +1672,9 @@ class SubscriptionHierarchyManager:
         """Initialize hierarchy manager with client."""
         self.client = client
         self.formatter = UnifiedResponseFormatter("manage_subscriptions")
-        self.navigation_service = hierarchy_navigation_service
-        self.lookup_service = entity_lookup_service
-        self.validator = cross_tier_validator
+        self.navigation_service: Any = hierarchy_navigation_service
+        self.lookup_service: Any = entity_lookup_service
+        self.validator: Any = cross_tier_validator
 
     async def get_product_details(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get product details for a given subscription."""
@@ -1809,7 +1818,7 @@ class SubscriptionHierarchyManager:
 
     async def _validate_credentials_hierarchy(
         self, subscription_data: Dict[str, Any], credentials_data: Dict[str, Any]
-    ):
+    ) -> None:
         """Validate the hierarchy operation for credentials creation."""
         validation_result = await self.validator.validate_hierarchy_operation(
             {
@@ -1841,7 +1850,7 @@ class SubscriptionHierarchyManager:
 
     def _prepare_credentials_subscription_data(
         self, subscription_data: Dict[str, Any], arguments: Dict[str, Any]
-    ):
+    ) -> Dict[str, Any]:
         """Prepare subscription data for credentials creation."""
         # Apply field mapping for subscription data
         if "productId" not in subscription_data and "product_id" in subscription_data:
@@ -1863,6 +1872,8 @@ class SubscriptionHierarchyManager:
                 logger.warning(
                     "REVENIUM_OWNER_ID not available from configuration store, API will use default owner"
                 )
+
+        return subscription_data
 
     async def _create_subscription_and_credentials(
         self, subscription_data: Dict[str, Any], credentials_data: Dict[str, Any]
@@ -1926,7 +1937,7 @@ class SubscriptionManagement(ToolBase):
     tool_type = ToolType.CRUD
     tool_version = "2.0.0"
 
-    def __init__(self, ucm_helper=None) -> None:
+    def __init__(self, ucm_helper: Any = None) -> None:
         """Initialize consolidated subscription management.
 
         Args:
@@ -1937,12 +1948,16 @@ class SubscriptionManagement(ToolBase):
         self.validator = SubscriptionValidator(ucm_helper)
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle subscription management actions with intelligent routing."""
         try:
             # Get client and initialize managers
-            client = await self.get_client()
+            client = await self.get_client(ctx=ctx)
             subscription_manager = SubscriptionManager(client)
             analytics_processor = SubscriptionAnalytics(client)
             hierarchy_manager = SubscriptionHierarchyManager(client)
@@ -1984,7 +1999,7 @@ class SubscriptionManagement(ToolBase):
             raise e
 
     async def _handle_crud_actions(
-        self, action: str, arguments: Dict[str, Any], subscription_manager
+        self, action: str, arguments: Dict[str, Any], subscription_manager: Any
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle basic CRUD actions for subscriptions."""
         if action == "list":
@@ -2209,9 +2224,10 @@ class SubscriptionManagement(ToolBase):
                     + json.dumps(result, indent=2),
                 )
             ]
+        raise ValueError(f"Unhandled CRUD action: {action}")
 
     async def _handle_creation_actions(
-        self, action: str, arguments: Dict[str, Any], subscription_manager
+        self, action: str, arguments: Dict[str, Any], subscription_manager: Any
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle subscription creation actions."""
         if action == "create_simple":
@@ -2248,9 +2264,14 @@ class SubscriptionManagement(ToolBase):
                     text="✅ **Product Validation Results**\n\n" + json.dumps(result, indent=2),
                 )
             ]
+        raise ValueError(f"Unhandled creation action: {action}")
 
     async def _handle_analytics_actions(
-        self, action: str, arguments: Dict[str, Any], subscription_manager, analytics_processor
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        subscription_manager: Any,
+        analytics_processor: Any,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle analytics and search actions."""
         if action == "get_metrics":
@@ -2285,6 +2306,7 @@ class SubscriptionManagement(ToolBase):
                     + json.dumps(result, indent=2),
                 )
             ]
+        raise ValueError(f"Unhandled analytics action: {action}")
 
     async def _handle_discovery_actions(
         self, action: str, arguments: Dict[str, Any]
@@ -2299,9 +2321,10 @@ class SubscriptionManagement(ToolBase):
             return await self._handle_validate_action(arguments)
         elif action == "get_agent_summary":
             return await self._handle_get_agent_summary()
+        raise ValueError(f"Unhandled discovery action: {action}")
 
     async def _handle_hierarchy_actions(
-        self, action: str, arguments: Dict[str, Any], hierarchy_manager
+        self, action: str, arguments: Dict[str, Any], hierarchy_manager: Any
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle hierarchy navigation actions."""
         if action == "get_product_details":
@@ -2331,6 +2354,7 @@ class SubscriptionManagement(ToolBase):
                     + json.dumps(result, indent=2),
                 )
             ]
+        raise ValueError(f"Unhandled hierarchy action: {action}")
 
     async def _handle_validate_action(
         self, arguments: Dict[str, Any]

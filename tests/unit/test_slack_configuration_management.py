@@ -4,10 +4,13 @@ Tests the SlackConfigurationManagement class action routing, validation,
 dry-run behavior, and error handling. All API calls are mocked.
 """
 
+import os
+
 import pytest
 from unittest.mock import AsyncMock, patch
 
 
+from src.revenium_mcp_server.auth.tenant_context import TenantContext
 from src.revenium_mcp_server.tools_decomposed.slack_configuration_management import (
     SlackConfigurationManagement,
 )
@@ -148,6 +151,32 @@ class TestSlackConfigSetDefault:
         with patch.object(config_tool, "get_client", return_value=mock_client):
             with pytest.raises(ToolError):
                 await config_tool.handle_action("set_default_configuration", {})
+
+    @pytest.mark.asyncio
+    async def test_set_default_skips_env_write_when_ctx_set(self, config_tool, mock_client):
+        """Multi-tenant mode (ctx non-None) must NOT write the process-global
+        REVENIUM_DEFAULT_SLACK_CONFIG_ID env var — that would leak Tenant A's
+        selection into Tenant B's subsequent requests."""
+        ctx = TenantContext(team_id="team-1", api_key="abcdef1234567890")
+
+        # Capture starting env state and ensure our key is absent.
+        original = os.environ.pop("REVENIUM_DEFAULT_SLACK_CONFIG_ID", None)
+        try:
+            with patch.object(config_tool, "get_client", return_value=mock_client):
+                result = await config_tool.handle_action(
+                    "set_default_configuration",
+                    {"config_id": "cfg-1"},
+                    ctx=ctx,
+                )
+            # Env var must NOT have been written.
+            assert "REVENIUM_DEFAULT_SLACK_CONFIG_ID" not in os.environ
+            # Response should make clear the selection is not persisted globally.
+            text = result[0].text
+            assert "Session" in text or "session" in text
+            assert "cfg-1" in text
+        finally:
+            if original is not None:
+                os.environ["REVENIUM_DEFAULT_SLACK_CONFIG_ID"] = original
 
 
 class TestSlackConfigGetDefault:

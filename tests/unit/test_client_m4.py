@@ -296,7 +296,7 @@ class TestLazyAuthLoading:
             ErrorCodes,
             ToolError,
         )
-        monkeypatch.setattr(ConfigManager(), "_config", None)
+        ConfigManager().clear_cache()
 
         monkeypatch.delenv("REVENIUM_API_KEY", raising=False)
         monkeypatch.delenv("REVENIUM_TEAM_ID", raising=False)
@@ -628,6 +628,81 @@ class TestRequest:
             with pytest.raises(ReveniumAPIError) as exc_info:
                 await self.client._request("POST", "/endpoint")
         assert exc_info.value is original
+
+    @pytest.mark.parametrize(
+        "error_text, status_code, reason",
+        [
+            ("Forbidden", 403, "Forbidden"),
+            ("invalid json format for this field", 400, "Bad Request"),
+            ("failed to decode hashed id: XYZ", 400, "Bad Request"),
+        ],
+        ids=["else_branch", "json_format_branch", "hashed_id_branch"],
+    )
+    @pytest.mark.asyncio
+    async def test_error_response_does_not_leak_raw_debug_to_caller(
+        self, error_text, status_code, reason
+    ):
+        """Every error-construction branch must strip raw_response_debug from response_data."""
+        body = {"timestamp": 123, "status": status_code, "error": reason, "path": "/x"}
+        resp = _mock_httpx_response(
+            status_code,
+            json_data=body,
+            content=f'{{"message":"{error_text}"}}'.encode(),
+            reason_phrase=reason,
+        )
+        resp.text = error_text
+        resp.json.return_value = {"message": error_text, **body}
+        resp.headers = {
+            "x-revenium-backend": "api",
+            "x-amzn-requestid": "abc-123",
+            "x-amz-apigw-id": "xyz==",
+        }
+        with self._patch_httpx(resp):
+            with pytest.raises(ReveniumAPIError) as exc_info:
+                await self.client._request(
+                    "GET",
+                    "/profitstream/v2/api/sources/ai/models",
+                    params={"teamId": "secret-team"},
+                )
+        err = exc_info.value
+        assert err.status_code == status_code
+        assert "raw_response_debug" not in (err.response_data or {})
+        assert err.response_data["error_data"]["status"] == status_code
+        rendered = repr(err.response_data)
+        assert "secret-team" not in rendered
+        assert "x-revenium-backend" not in rendered
+        assert "x-amzn-requestid" not in rendered
+        assert "python-httpx" not in rendered
+
+    @pytest.mark.asyncio
+    async def test_bearer_default_host_branch_does_not_leak_raw_debug(self, monkeypatch):
+        """The bearer-host fallback path also strips raw_response_debug."""
+        from src.revenium_mcp_server import client as client_mod
+
+        monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
+        bearer_client = _client(team_id="secret-team", base_url=client_mod.DEFAULT_APP_BASE_URL)
+        resp = _mock_httpx_response(
+            403,
+            json_data={"timestamp": 1, "status": 403, "error": "Forbidden", "path": "/x"},
+            content=b'{"status":403}',
+            reason_phrase="Forbidden",
+        )
+        resp.text = "Invalid or inactive API key"
+        resp.json.return_value = {"message": "Invalid or inactive API key"}
+        resp.headers = {"x-revenium-backend": "api", "x-amzn-requestid": "id-1"}
+
+        with patch.object(
+            bearer_client.client, "request", new_callable=AsyncMock, return_value=resp
+        ):
+            with pytest.raises(ReveniumAPIError) as exc_info:
+                await bearer_client._request("GET", "/api/v2/analytics/cost-by-model")
+
+        err = exc_info.value
+        assert "raw_response_debug" not in (err.response_data or {})
+        rendered = repr(err.response_data)
+        assert "secret-team" not in rendered
+        assert "x-revenium-backend" not in rendered
+        assert "x-amzn-requestid" not in rendered
 
 
 # ===========================================================================

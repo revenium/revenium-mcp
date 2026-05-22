@@ -374,7 +374,7 @@ class AnomalyManager:
         logger.debug(f"Incoming anomaly_data: {json.dumps(anomaly_data, indent=2, default=str)}")
 
         # Apply comprehensive validation and sanitization
-        validated_data = {}
+        validated_data: Dict[str, Any] = {}
 
         # Validate and sanitize each field
         if "name" in anomaly_data:
@@ -602,7 +602,7 @@ class AnomalyManager:
         merged_data = current_anomaly.copy()
 
         # Handle field name conversions for user-friendly field names
-        converted_updates = {}
+        converted_updates: Dict[str, Any] = {}
         for key, value in update_data.items():
             if key == "email":
                 # Convert 'email' to 'notificationAddresses'
@@ -749,15 +749,15 @@ class AnomalyManager:
             elif key == "tracking_period":
                 # Convert 'tracking_period' to 'periodDuration' for CUMULATIVE_USAGE alerts
                 # Map user-friendly period names to API format
-                period_mapping = {
+                tracking_period_mapping: Dict[str, str] = {
                     "daily": "DAILY",
                     "weekly": "WEEKLY",
                     "monthly": "MONTHLY",
                     "quarterly": "QUARTERLY",
                 }
                 period_value = str(value).lower()
-                if period_value in period_mapping:
-                    converted_updates["periodDuration"] = period_mapping[period_value]
+                if period_value in tracking_period_mapping:
+                    converted_updates["periodDuration"] = tracking_period_mapping[period_value]
                 else:
                     # Pass through as-is if already in API format
                     converted_updates["periodDuration"] = str(value)
@@ -989,7 +989,7 @@ class AnomalyManager:
 
     def _validate_direct_api_format(self, anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
         """Validate and sanitize direct API format data."""
-        validated_data = {}
+        validated_data: Dict[str, Any] = {}
 
         # CRITICAL FIX: Process convenience notification fields before validation
         processed_data = self._process_convenience_notification_fields(anomaly_data.copy())

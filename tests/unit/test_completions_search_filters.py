@@ -116,8 +116,8 @@ class TestFilterPassThroughLookup:
         await self.mm._handle_lookup_recent_transactions(
             client, {"page": 0, "recent_page_size": 20, "provider": "anthropic", "start_date": "2026-03-01T00:00:00Z"}
         )
-        call_kwargs = client.get.call_args
-        params = call_kwargs[1]["params"]
+        completions_call = client.get.call_args_list[0]
+        params = completions_call[1]["params"]
         assert params["provider"] == "anthropic"
         assert params["startDate"] == "2026-03-01T00:00:00Z"
 
@@ -132,8 +132,8 @@ class TestFilterPassThroughLookup:
         await self.mm._handle_lookup_recent_transactions(
             client, {"page": 0, "recent_page_size": 20}
         )
-        call_kwargs = client.get.call_args
-        params = call_kwargs[1]["params"]
+        completions_call = client.get.call_args_list[0]
+        params = completions_call[1]["params"]
         assert "provider" not in params
         assert "startDate" not in params
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "revenium-mcp"
-version = "0.2.8"
+version = "0.2.9"
 description = "Model Context Protocol (MCP) server for Revenium API monitoring, analytics, and AI spending management"
 readme = "README.md"
 license = "MIT"
@@ -52,8 +52,16 @@ dev = [
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.23.0",
     "pytest-mock>=3.10.0",
+    "pytest-httpserver>=1.0.0",
+    "PyJWT[crypto]>=2.8.0",
     "ruff>=0.4.0",
-    "mypy>=1.0.0",
+    # mypy is pinned to a single minor series so the regression-gate baseline
+    # (scripts/mypy-baseline.txt) stays deterministic across environments.
+    # mypy 1.20 changed the no-untyped-def message ("arguments" -> "parameters")
+    # vs 1.19, and mypy 2.x changes it further; either would invalidate the
+    # checked-in baseline. Bump this pin in the same PR that regenerates the
+    # baseline so local and CI keep agreeing.
+    "mypy>=1.20.0,<1.21.0",
     "pre-commit>=3.0.0",
     "psutil>=5.9.0",
 ]
@@ -62,6 +70,8 @@ test = [
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.23.0",
     "pytest-mock>=3.10.0",
+    "pytest-httpserver>=1.0.0",
+    "PyJWT[crypto]>=2.8.0",
     "requests-mock>=1.10.0",
     "psutil>=5.9.0",
 ]
@@ -83,6 +93,7 @@ where = ["src"]
 
 [tool.mypy]
 python_version = "3.11"
+plugins = ["pydantic.mypy"]
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
@@ -95,6 +106,10 @@ warn_unused_ignores = true
 warn_no_return = true
 warn_unreachable = true
 strict_equality = true
+
+[[tool.mypy.overrides]]
+module = ["h2", "dateutil", "dateutil.parser"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 minversion = "7.0"

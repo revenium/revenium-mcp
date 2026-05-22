@@ -6,7 +6,10 @@ debug_auto_discovery tool.
 """
 
 import asyncio
-from typing import Any, ClassVar, Dict, List, Sequence, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -79,7 +82,11 @@ class WelcomeSetup(ToolBase):
         }
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> Sequence[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle welcome and setup actions.
 
@@ -90,6 +97,7 @@ class WelcomeSetup(ToolBase):
         Returns:
             Tool response
         """
+        # ctx accepted for interface compliance; no upstream API calls in this tool.
         try:
             # Context7 default action pattern: If no action provided, default to show_welcome
             if not action:

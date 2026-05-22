@@ -8,12 +8,15 @@ and recommendations.
 """
 
 import os
-from typing import Any, ClassVar, Dict, List, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
 
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
+
+from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
-from ..client import ReveniumClient
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
@@ -60,24 +63,28 @@ class SlackSetupAssistant(ToolBase):
         self.formatter = UnifiedResponseFormatter("slack_setup_assistant")
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle Slack setup assistant actions with onboarding integration."""
         try:
             if action == "guided_setup":
-                return await self._handle_guided_setup(arguments)
+                return await self._handle_guided_setup(arguments, ctx=ctx)
             elif action == "detect_and_recommend":
-                return await self._handle_detect_and_recommend(arguments)
+                return await self._handle_detect_and_recommend(arguments, ctx=ctx)
             elif action == "select_default_configuration":
-                return await self._handle_select_default_configuration(arguments)
+                return await self._handle_select_default_configuration(arguments, ctx=ctx)
             elif action == "setup_status":
-                return await self._handle_setup_status(arguments)
+                return await self._handle_setup_status(arguments, ctx=ctx)
             elif action == "quick_setup":
                 return await self._handle_quick_setup(arguments)
             elif action == "onboarding_setup":
-                return await self._handle_onboarding_setup(arguments)
+                return await self._handle_onboarding_setup(arguments, ctx=ctx)
             elif action == "first_time_guidance":
-                return await self._handle_first_time_guidance(arguments)
+                return await self._handle_first_time_guidance(arguments, ctx=ctx)
             elif action == "get_examples":
                 return await self._handle_get_examples(arguments)
             elif action == "get_capabilities":
@@ -123,15 +130,15 @@ class SlackSetupAssistant(ToolBase):
             return [TextContent(type="text", text=format_structured_error(error))]
 
     async def _handle_guided_setup(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Complete guided setup flow with intelligent detection."""
         try:
             # Step 1: Detect existing configurations
-            async with ReveniumClient() as client:
-                response = await client.get_slack_configurations(page=0, size=20)
-                configurations = response.get("content", [])
-                total_elements = response.get("totalElements", 0)
+            client = await self.get_client(ctx=ctx)
+            response = await client.get_slack_configurations(page=0, size=20)
+            configurations = response.get("content", [])
+            total_elements = response.get("totalElements", 0)
 
             result_text = "# Slack Setup Assistant - Guided Setup\n\n"
 
@@ -160,10 +167,10 @@ class SlackSetupAssistant(ToolBase):
                         result_text += "- View all configurations: `slack_management(action='list_configurations')`\n"
                     else:
                         result_text += "**Default configuration not found.** Let's fix this.\n\n"
-                        return await self._handle_detect_and_recommend(arguments)
+                        return await self._handle_detect_and_recommend(arguments, ctx=ctx)
                 else:
                     result_text += "**No default configuration set.** Let's choose one:\n\n"
-                    return await self._handle_detect_and_recommend(arguments)
+                    return await self._handle_detect_and_recommend(arguments, ctx=ctx)
             else:
                 # No configurations found - guide through OAuth
                 result_text += "## No Slack Configurations Found\n\n"
@@ -202,17 +209,17 @@ class SlackSetupAssistant(ToolBase):
             return [TextContent(type="text", text=error.format_user_message())]
 
     async def _handle_detect_and_recommend(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Detect existing configurations and provide recommendations."""
         try:
-            async with ReveniumClient() as client:
-                response = await client.get_slack_configurations(page=0, size=20)
-                configurations = response.get("content", [])
-                total_elements = response.get("totalElements", 0)
+            client = await self.get_client(ctx=ctx)
+            response = await client.get_slack_configurations(page=0, size=20)
+            configurations = response.get("content", [])
+            total_elements = response.get("totalElements", 0)
 
             if total_elements == 0:
-                return await self._handle_guided_setup(arguments)
+                return await self._handle_guided_setup(arguments, ctx=ctx)
 
             current_default = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
 
@@ -289,9 +296,10 @@ class SlackSetupAssistant(ToolBase):
             return [TextContent(type="text", text=error.format_user_message())]
 
     async def _handle_select_default_configuration(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Set default configuration with confirmation."""
+        multi_tenant = ctx is not None
         config_id = arguments.get("config_id")
         if not config_id:
             error = ValidationError(
@@ -303,17 +311,32 @@ class SlackSetupAssistant(ToolBase):
 
         try:
             # Verify the configuration exists
-            async with ReveniumClient() as client:
-                config = await client.get_slack_configuration_by_id(config_id)
+            client = await self.get_client(ctx=ctx)
+            config = await client.get_slack_configuration_by_id(config_id)
 
             # Set the environment variable
-            os.environ["REVENIUM_DEFAULT_SLACK_CONFIG_ID"] = config_id
+            if not multi_tenant:
+                os.environ["REVENIUM_DEFAULT_SLACK_CONFIG_ID"] = config_id
+            else:
+                # Multi-tenant: env vars are process-global and would leak across tenants.
+                # Per-tenant default storage is a Phase-2 follow-up; for now, do not persist.
+                logger.info(
+                    "Skipping env write in multi-tenant mode "
+                    "(Phase 2 will add per-tenant storage)"
+                )
 
             name = config.get("name", "Unnamed Configuration")
             workspace = config.get("teamName") or config.get("team", {}).get("label", "Unknown Workspace")
             channel = config.get("channelName", "N/A")
 
-            result_text = "# Default Slack Configuration Set Successfully\n\n"
+            if not multi_tenant:
+                result_text = "# Default Slack Configuration Set Successfully\n\n"
+            else:
+                result_text = (
+                    "# Default Slack Configuration Set for This Session Only\n\n"
+                    "_Per-tenant persistent default storage is deferred to Phase 2; "
+                    "this selection applies to the current request only._\n\n"
+                )
             result_text += "## New Default Configuration\n"
             result_text += f"**{name}**\n"
             result_text += f"- **Workspace:** {workspace}\n"
@@ -357,14 +380,14 @@ class SlackSetupAssistant(ToolBase):
             return [TextContent(type="text", text=error.format_user_message())]
 
     async def _handle_setup_status(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Show current Slack setup status and recommendations."""
         try:
             # Get configuration count
-            async with ReveniumClient() as client:
-                response = await client.get_slack_configurations(page=0, size=1)
-                total_elements = response.get("totalElements", 0)
+            client = await self.get_client(ctx=ctx)
+            response = await client.get_slack_configurations(page=0, size=1)
+            total_elements = response.get("totalElements", 0)
 
             # Get default configuration
             current_default = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
@@ -395,12 +418,11 @@ class SlackSetupAssistant(ToolBase):
 
             if current_default:
                 try:
-                    async with ReveniumClient() as client:
-                        config = await client.get_slack_configuration_by_id(current_default)
-                        name = config.get("name", "Unnamed Configuration")
-                        workspace = config.get("teamName") or config.get("team", {}).get("label", "Unknown Workspace")
-                        result_text += f"- **Default Config Name:** {name}\n"
-                        result_text += f"- **Default Workspace:** {workspace}\n"
+                    config = await client.get_slack_configuration_by_id(current_default)
+                    name = config.get("name", "Unnamed Configuration")
+                    workspace = config.get("teamName") or config.get("team", {}).get("label", "Unknown Workspace")
+                    result_text += f"- **Default Config Name:** {name}\n"
+                    result_text += f"- **Default Workspace:** {workspace}\n"
                 except Exception:
                     result_text += (
                         f"- **Default Config ID:** `{current_default}` (Configuration not found)\n"
@@ -484,7 +506,7 @@ class SlackSetupAssistant(ToolBase):
             return [TextContent(type="text", text=error.format_user_message())]
 
     async def _handle_onboarding_setup(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Enhanced setup process specifically designed for onboarding integration.
 
@@ -508,9 +530,9 @@ class SlackSetupAssistant(ToolBase):
                 result_text += "🔧 **Slack Setup** - Let's enhance your notification setup.\n\n"
 
             # Check current Slack status using existing logic
-            async with ReveniumClient() as client:
-                response = await client.get_slack_configurations(page=0, size=20)
-                total_elements = response.get("totalElements", 0)
+            client = await self.get_client(ctx=ctx)
+            response = await client.get_slack_configurations(page=0, size=20)
+            total_elements = response.get("totalElements", 0)
 
             current_default = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
 
@@ -599,7 +621,7 @@ class SlackSetupAssistant(ToolBase):
             return [TextContent(type="text", text=format_structured_error(error))]
 
     async def _handle_first_time_guidance(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Comprehensive guidance specifically for first-time users.
 
@@ -613,9 +635,9 @@ class SlackSetupAssistant(ToolBase):
             result_text += "Welcome to Revenium! Let's set up Slack notifications to enhance your monitoring experience.\n\n"
 
             # Check current status using existing logic
-            async with ReveniumClient() as client:
-                response = await client.get_slack_configurations(page=0, size=20)
-                total_elements = response.get("totalElements", 0)
+            client = await self.get_client(ctx=ctx)
+            response = await client.get_slack_configurations(page=0, size=20)
+            total_elements = response.get("totalElements", 0)
 
             current_default = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
 

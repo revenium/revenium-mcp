@@ -16,7 +16,10 @@ Follows MCP best practices:
 """
 
 import json
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -97,7 +100,11 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
         pass
 
     async def handle_action(
-        self, action: str, arguments: Dict[str, Any]
+        self,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle alert management actions with unified routing.
 
@@ -110,7 +117,7 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
         """
         try:
             # Get client
-            client = await self.get_client()
+            client = await self.get_client(ctx=ctx)
 
             # Compatibility alias for the anomaly_id parameter. The capabilities
             # text and several example payloads still call the resource
@@ -463,7 +470,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
         """Get quick start guide."""
         return [
             "**ALWAYS START HERE**: get_capabilities() - Understand alert types and required fields",
-            "**See Examples**: get_examples(alert_type='budget_threshold'), get_examples(alert_type='spike_detection'), or get_examples(alert_type='relative_change')",
+            "**See Examples**: get_examples(alert_type='budget_threshold'), get_examples(alert_type='threshold'), or get_examples(alert_type='relative_change')",
             "**Quick Creation**: create_cumulative_usage_alert() for budget tracking, create_threshold_alert() for spike detection, or create with alertType RELATIVE_CHANGE for trend detection",
             "**Investigation**: query(text='show alerts from last week') for natural language search",
             "**Analytics**: get_metrics() to analyze alert patterns and frequency",
@@ -726,7 +733,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                 ],
                 examples={
                     "create_monitoring": 'create(resource_type="anomalies", anomaly_data={...})',
-                    "spike_detection": 'create_threshold_alert(name="Error Spike", threshold=5, period_minutes=10)  # Spike Detection',
+                    "threshold": 'create_threshold_alert(name="Error Spike", threshold=5, period_minutes=10)  # Spike Detection',
                     "budget_threshold": 'create_cumulative_usage_alert(name="Budget Alert", threshold=1000, period="monthly")  # Budget Threshold',
                 },
             )
@@ -2271,7 +2278,7 @@ update(
 
 ## **Quick Start**
 - `get_examples(alert_type="budget_threshold")` - Budget/quota examples with filtering
-- `get_examples(alert_type="spike_detection")` - Real-time monitoring examples with filtering
+- `get_examples(alert_type="threshold")` - Real-time monitoring examples with filtering
 - `get_examples(alert_type="relative_change")` - Trend detection with INCREASES_BY/DECREASES_BY
 - `get_examples(alert_type="update")` - How to update existing alerts (including Slack setup)
 
@@ -2478,14 +2485,14 @@ create(resource_type="anomalies", anomaly_data={
                 suggestions=[
                     "Try calling get_examples() without parameters for general examples",
                     "Use alert_type='budget_threshold' for budget tracking examples",
-                    "Use alert_type='spike_detection' for real-time monitoring examples",
+                    "Use alert_type='threshold' for real-time monitoring examples",
                     "Use alert_type='relative_change' for trend detection examples",
                     "Check if the alert_type parameter is spelled correctly",
                 ],
                 examples={
                     "general_examples": "get_examples()",
                     "budget_examples": "get_examples(alert_type='budget_threshold')",
-                    "monitoring_examples": "get_examples(alert_type='spike_detection')",
+                    "monitoring_examples": "get_examples(alert_type='threshold')",
                     "relative_change_examples": "get_examples(alert_type='relative_change')",
                 },
             )

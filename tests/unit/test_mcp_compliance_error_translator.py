@@ -111,12 +111,11 @@ class TestTranslateUnknownExceptions:
         assert result.data.trace_id.startswith("mcp-")
 
     def test_translate_unknown_error_directly(self, translator):
-        """Directly calling _translate_unknown_error captures exception_type and stack_trace."""
         exc = RuntimeError("direct call")
         result = translator._translate_unknown_error(exc, {"ctx": "val"}, "trace-99")
         assert result.code == JSONRPCErrorCode.INTERNAL_ERROR
         assert "RuntimeError" in result.data.context["exception_type"]
-        assert "stack_trace" in result.data.context
+        assert "stack_trace" not in result.data.context
         assert result.data.trace_id == "trace-99"
 
 
