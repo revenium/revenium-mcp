@@ -1011,7 +1011,7 @@ class TestHttpMethodDelegates:
         self.client._request_with_retry = AsyncMock(return_value={"a": 1})
         result = await self.client.get("/ep", params={"p": 1})
         self.client._request_with_retry.assert_called_once_with(
-            "GET", "/ep", params={"p": 1}, base_url=None, use_bearer=False
+            "GET", "/ep", params={"p": 1}, base_url=None, use_bearer=False, unwrap_hal_embedded=True,
         )
         assert result == {"a": 1}
 
@@ -1020,7 +1020,7 @@ class TestHttpMethodDelegates:
         self.client._request = AsyncMock(return_value={"b": 2})
         result = await self.client.get("/ep", use_retry=False)
         self.client._request.assert_called_once_with(
-            "GET", "/ep", params=None, base_url=None, use_bearer=False
+            "GET", "/ep", params=None, base_url=None, use_bearer=False, unwrap_hal_embedded=True,
         )
         assert result == {"b": 2}
 
@@ -1029,7 +1029,8 @@ class TestHttpMethodDelegates:
         self.client._request_with_retry = AsyncMock(return_value={"created": True})
         result = await self.client.post("/ep", data={"x": 1})
         self.client._request_with_retry.assert_called_once_with(
-            "POST", "/ep", params=None, json_data={"x": 1}, base_url=None, use_bearer=False
+            "POST", "/ep", params=None, json_data={"x": 1}, base_url=None, use_bearer=False,
+            extra_headers=None, unwrap_hal_embedded=True,
         )
         assert result == {"created": True}
 
@@ -1038,7 +1039,8 @@ class TestHttpMethodDelegates:
         self.client._request = AsyncMock(return_value={"c": 3})
         result = await self.client.post("/ep", data={"y": 2}, use_retry=False)
         self.client._request.assert_called_once_with(
-            "POST", "/ep", params=None, json_data={"y": 2}, base_url=None, use_bearer=False
+            "POST", "/ep", params=None, json_data={"y": 2}, base_url=None, use_bearer=False,
+            extra_headers=None, unwrap_hal_embedded=True,
         )
         assert result == {"c": 3}
 

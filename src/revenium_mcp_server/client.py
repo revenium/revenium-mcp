@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import re
+import uuid as _uuid
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 from urllib.parse import urljoin
@@ -25,6 +26,16 @@ from .endpoint_registry import DEFAULT_APP_BASE_URL
 from .exceptions import AlertToolsError
 from .log_context import redact_headers
 from .logging_config import async_operation_context
+
+
+def _new_idempotency_key() -> str:
+    """Return a fresh UUID4 string for use as an Idempotency-Key header.
+
+    Generated once per client-method call; the same key flows through any
+    transient retries inside _request_with_retry, so the backend dedupes
+    correctly when the network blips mid-request.
+    """
+    return str(_uuid.uuid4())
 
 
 class ConnectionPoolConfig:
@@ -135,11 +146,16 @@ class ReveniumAPIError(Exception):
     """Exception raised for Revenium API errors."""
 
     def __init__(
-        self, message: str, status_code: Optional[int] = None, response_data: Optional[Dict] = None
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        response_data: Optional[Dict] = None,
+        code: Optional[str] = None,
     ) -> None:
         self.message = message
         self.status_code = status_code
         self.response_data = response_data
+        self.code = code
         super().__init__(self.message)
 
 
@@ -483,6 +499,8 @@ class ReveniumClient:
         max_retries: Optional[int] = None,
         base_url: Optional[str] = None,
         use_bearer: bool = False,
+        extra_headers: Optional[Dict[str, str]] = None,
+        unwrap_hal_embedded: bool = True,
     ) -> Union[Dict[str, Any], List[Any]]:
         """Make HTTP request with retry logic for transient failures.
 
@@ -494,6 +512,7 @@ class ReveniumClient:
             max_retries: Maximum number of retries (uses config default if None)
             base_url: Optional base URL override for this single call
             use_bearer: If True, use Authorization: Bearer header instead of x-api-key
+            extra_headers: Optional headers forwarded to `_request` (e.g. Idempotency-Key).
 
         Returns:
             Response data as dictionary
@@ -508,7 +527,16 @@ class ReveniumClient:
 
         for attempt in range(max_retries + 1):
             try:
-                return await self._request(method, endpoint, params, json_data, base_url=base_url, use_bearer=use_bearer)
+                return await self._request(
+                    method,
+                    endpoint,
+                    params,
+                    json_data,
+                    base_url=base_url,
+                    use_bearer=use_bearer,
+                    extra_headers=extra_headers,
+                    unwrap_hal_embedded=unwrap_hal_embedded,
+                )
 
             except ReveniumAPIError as e:
                 last_error = e
@@ -575,6 +603,8 @@ class ReveniumClient:
         json_data: Optional[Dict[str, Any]] = None,
         base_url: Optional[str] = None,
         use_bearer: bool = False,
+        extra_headers: Optional[Dict[str, str]] = None,
+        unwrap_hal_embedded: bool = True,
     ) -> Union[Dict[str, Any], List[Any]]:
         """Make HTTP request to Revenium API.
 
@@ -585,6 +615,14 @@ class ReveniumClient:
             json_data: JSON request body
             base_url: Optional base URL override for this single call (e.g. new analytics host)
             use_bearer: If True, use Authorization: Bearer header instead of x-api-key
+            extra_headers: Optional headers to merge on top of the computed auth headers
+                (e.g. Idempotency-Key on POSTs). Values override auth-header keys when
+                they collide.
+            unwrap_hal_embedded: When True (default) and use_bearer is also True, dict
+                responses are passed through `_extract_embedded_data`, which assumes a
+                HAL+JSON envelope and returns `[]` for any dict lacking `_embedded`.
+                Set False for Bearer-auth endpoints that return plain JSON (e.g. AI
+                Insights), otherwise the payload is silently coerced to an empty list.
 
         Returns:
             Response data as dictionary
@@ -631,6 +669,9 @@ class ReveniumClient:
                 else:
                     request_headers = self.auth_config.get_auth_headers()
 
+                if extra_headers:
+                    request_headers = {**request_headers, **extra_headers}
+
                 response = await self.client.request(
                     method=method, url=url, params=params, json=json_data, headers=request_headers
                 )
@@ -645,6 +686,28 @@ class ReveniumClient:
 
                 # Check for HTTP errors
                 if response.status_code >= 400:
+                    # RFC 7807 problem-details path. AI Insights endpoints (and any future
+                    # endpoint adopting this format) carry a structured `code` field that
+                    # callers need for UX mapping. Detect Content-Type and short-circuit
+                    # before the legacy envelope decode below — legacy path remains for
+                    # everything else.
+                    content_type = response.headers.get("content-type", "").lower()
+                    if "application/problem+json" in content_type:
+                        try:
+                            problem = response.json()
+                        except Exception:
+                            problem = {}
+                        raise ReveniumAPIError(
+                            message=(
+                                problem.get("detail")
+                                or problem.get("title")
+                                or f"HTTP {response.status_code}"
+                            ),
+                            status_code=response.status_code,
+                            response_data=problem,
+                            code=problem.get("code"),
+                        )
+
                     error_data = None
                     error_text = ""
 
@@ -801,7 +864,7 @@ class ReveniumClient:
                         response_size=len(response.content),
                     )
                     # Auto-unwrap HAL+JSON _embedded when using new analytics API host
-                    if use_bearer and isinstance(result, dict):
+                    if use_bearer and unwrap_hal_embedded and isinstance(result, dict):
                         result = self._extract_embedded_data(result)
                     return result
                 else:
@@ -886,11 +949,18 @@ class ReveniumClient:
         use_retry: bool = True,
         base_url: Optional[str] = None,
         use_bearer: bool = False,
+        unwrap_hal_embedded: bool = True,
     ) -> Union[Dict[str, Any], List[Any]]:
         """Make a GET request to the API."""
         if use_retry:
-            return await self._request_with_retry("GET", endpoint, params=params, base_url=base_url, use_bearer=use_bearer)
-        return await self._request("GET", endpoint, params=params, base_url=base_url, use_bearer=use_bearer)
+            return await self._request_with_retry(
+                "GET", endpoint, params=params, base_url=base_url,
+                use_bearer=use_bearer, unwrap_hal_embedded=unwrap_hal_embedded,
+            )
+        return await self._request(
+            "GET", endpoint, params=params, base_url=base_url,
+            use_bearer=use_bearer, unwrap_hal_embedded=unwrap_hal_embedded,
+        )
 
     async def post(
         self,
@@ -900,11 +970,31 @@ class ReveniumClient:
         use_retry: bool = True,
         base_url: Optional[str] = None,
         use_bearer: bool = False,
+        extra_headers: Optional[Dict[str, str]] = None,
+        unwrap_hal_embedded: bool = True,
     ) -> Union[Dict[str, Any], List[Any]]:
         """Make a POST request to the API."""
         if use_retry:
-            return await self._request_with_retry("POST", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
-        return await self._request("POST", endpoint, params=params, json_data=data, base_url=base_url, use_bearer=use_bearer)
+            return await self._request_with_retry(
+                "POST",
+                endpoint,
+                params=params,
+                json_data=data,
+                base_url=base_url,
+                use_bearer=use_bearer,
+                extra_headers=extra_headers,
+                unwrap_hal_embedded=unwrap_hal_embedded,
+            )
+        return await self._request(
+            "POST",
+            endpoint,
+            params=params,
+            json_data=data,
+            base_url=base_url,
+            use_bearer=use_bearer,
+            extra_headers=extra_headers,
+            unwrap_hal_embedded=unwrap_hal_embedded,
+        )
 
     async def put(
         self,
@@ -2496,6 +2586,219 @@ class ReveniumClient:
             base_url=self._get_app_base_url(),
             use_bearer=True,
         ))
+
+    # ── AI Insights API methods (BACK-1455) ────────────────────────────
+
+    async def list_investigators(self) -> List[Dict[str, Any]]:
+        """GET /insights/investigators — list registered AI investigators (detectors).
+
+        Returns:
+            List of {id, displayName, category, version}.
+        """
+        result = await self.get(
+            "/api/v2/insights/investigators",
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+            unwrap_hal_embedded=False,
+        )
+        # Endpoint returns a bare JSON array; the get() return type union allows it.
+        return cast(List[Dict[str, Any]], result)
+
+    async def get_recommendation_run(
+        self, run_id: str, *, slim: bool = False,
+    ) -> Dict[str, Any]:
+        """GET /insights/runs/:runId — return one analysis run.
+
+        Args:
+            run_id: backend-issued run identifier.
+            slim: when True, request the V4-4 MCP-friendly compact response.
+
+        Returns:
+            Full RunOutput dict (or slim variant when slim=True).
+        """
+        params: Dict[str, Any] = {"slim": "true"} if slim else {}
+        result = await self.get(
+            f"/api/v2/insights/runs/{run_id}", params=params,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+            unwrap_hal_embedded=False,
+        )
+        return cast(Dict[str, Any], result)
+
+    async def list_recommendation_runs(
+        self,
+        *,
+        limit: int = 20,
+        cursor: Optional[str] = None,
+        status: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        triggered_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """GET /insights/runs — cursor-paginated list of analysis runs.
+
+        Args:
+            limit: page size (backend caps at 100).
+            cursor: opaque next-page token from prior response.
+            status: filter (running|completed|partial|failed|cancelled).
+            since: ISO 8601 lower bound on `created`.
+            until: ISO 8601 upper bound on `created`.
+            triggered_by: filter (user|system|schedule|api).
+
+        Returns:
+            {"data": [...], "next_cursor": str | None}
+        """
+        params: Dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        if status:
+            params["status"] = status
+        if since:
+            params["since"] = since
+        if until:
+            params["until"] = until
+        if triggered_by:
+            params["triggered_by"] = triggered_by
+        result = await self.get(
+            "/api/v2/insights/runs", params=params,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+            unwrap_hal_embedded=False,
+        )
+        return cast(Dict[str, Any], result)
+
+    async def list_recommendation_feedback(
+        self,
+        run_id: str,
+        *,
+        limit: int = 20,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """GET /insights/runs/:runId/feedback — cursor-paginated feedback list.
+
+        Args:
+            run_id: ID of the recommendation run.
+            limit: page size (backend caps at 100).
+            cursor: opaque next-page token from prior response.
+
+        Returns:
+            {"data": [...], "next_cursor": str | None}
+        """
+        params: Dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        result = await self.get(
+            f"/api/v2/insights/runs/{run_id}/feedback",
+            params=params,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+            unwrap_hal_embedded=False,
+        )
+        return cast(Dict[str, Any], result)
+
+    async def trigger_recommendation_run(
+        self,
+        period_start: str,
+        period_end: str,
+        *,
+        filter_agent: Optional[List[str]] = None,
+        filter_product_id: Optional[List[str]] = None,
+        filter_trace_type: Optional[List[str]] = None,
+        filter_consuming_org_id: Optional[List[str]] = None,
+        filter_environment: str = "",
+        filter_include_coding_assistants: bool = True,
+        filter_include_coding_assistants_for_cost_detectors: bool = False,
+        exclude_investigator_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """POST /insights/runs — trigger an analysis run (returns 202 + runId).
+
+        Args:
+            period_start, period_end: ISO 8601 strings. Backend enforces
+                ``period_end > period_start`` and a 90-day max span.
+            filter_*: optional whitelist/scoping arrays — empty list = unfiltered.
+            exclude_investigator_ids: skip specific detectors; None = run all.
+
+        Returns:
+            {"runId": str, "findingsCount": int, "recommendationsCount": int,
+             "totalDurationMs": int, "status": str, "failedInvestigators": [...],
+             "duplicated": bool, "findingsTruncated": bool,
+             "findingsConsideredCount": int}
+
+        Notes:
+            A fresh UUID4 ``Idempotency-Key`` header is generated per call. The
+            same key is reused across any transient retries inside
+            ``_request_with_retry``, so the backend dedupes correctly when the
+            network blips mid-request.
+        """
+        body: Dict[str, Any] = {
+            "periodStart": period_start,
+            "periodEnd": period_end,
+            "filterAgent": filter_agent or [],
+            "filterProductId": filter_product_id or [],
+            "filterTraceType": filter_trace_type or [],
+            "filterConsumingOrgId": filter_consuming_org_id or [],
+            "filterEnvironment": filter_environment,
+            "filterIncludeCodingAssistants": filter_include_coding_assistants,
+            "filterIncludeCodingAssistantsForCostDetectors":
+                filter_include_coding_assistants_for_cost_detectors,
+        }
+        if exclude_investigator_ids is not None:
+            body["excludeInvestigatorIds"] = exclude_investigator_ids
+
+        result = await self.post(
+            "/api/v2/insights/runs",
+            data=body,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+            unwrap_hal_embedded=False,
+            extra_headers={"Idempotency-Key": _new_idempotency_key()},
+        )
+        return cast(Dict[str, Any], result)
+
+    async def submit_recommendation_feedback(
+        self,
+        run_id: str,
+        recommendation_id: str,
+        action: str,
+        *,
+        dismissal_reason: str = "",
+        confidence_rating: int = 0,
+        realized_savings: Union[str, float, int] = 0,
+        realized_savings_currency: str = "USD",
+        realized_savings_measured_at: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """POST /insights/feedback — record feedback on a recommendation.
+
+        Args:
+            action: one of acknowledged | implemented | dismissed |
+                not_applicable | already_aware.
+            confidence_rating: -1, 0, or 1.
+            realized_savings_currency: ISO 4217 3-letter code; uppercased here
+                as a safety net (backend zod also transforms, but we own the wire).
+
+        Notes:
+            Fresh UUID4 ``Idempotency-Key`` per call; reused across retries.
+        """
+        body: Dict[str, Any] = {
+            "runId": run_id,
+            "recommendationId": recommendation_id,
+            "action": action,
+            "dismissalReason": dismissal_reason,
+            "confidenceRating": confidence_rating,
+            "realizedSavings": realized_savings,
+            "realizedSavingsCurrency": realized_savings_currency.upper(),
+        }
+        if realized_savings_measured_at is not None:
+            body["realizedSavingsMeasuredAt"] = realized_savings_measured_at
+        result = await self.post(
+            "/api/v2/insights/feedback",
+            data=body,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+            unwrap_hal_embedded=False,
+            extra_headers={"Idempotency-Key": _new_idempotency_key()},
+        )
+        return cast(Dict[str, Any], result)
 
 
 # Global client instance for connection pooling optimization

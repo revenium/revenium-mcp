@@ -48,6 +48,7 @@ TOOL_REGISTRATION_PRIORITY_ORDER = [
 
     # Group 3: Monitoring & Analytics (Operational insights)
     "manage_alerts",                   # Cost monitoring and alerting
+    "manage_ai_insights",              # AI-driven insights and recommendations
     "business_analytics_management",   # Analytics and reporting
     "manage_metering",                 # Transaction processing and metering
 
@@ -140,6 +141,8 @@ class ToolConfigurationRegistry:
                 await self._register_business_analytics_management(mcp)
             elif tool_name == "manage_alerts":
                 await self._register_manage_alerts(mcp)
+            elif tool_name == "manage_ai_insights":
+                await self._register_manage_ai_insights(mcp)
             elif tool_name == "slack_management":
                 await self._register_slack_management(mcp)
             elif tool_name == "manage_metering":
@@ -376,6 +379,78 @@ class ToolConfigurationRegistry:
                 action=action,
                 arguments=arguments,
                 tool_class=AlertManagement
+            )
+            return result
+
+    async def _register_manage_ai_insights(self, mcp: FastMCP) -> None:
+        """Register consolidated AI Insights management tool (BACK-1455)."""
+        @mcp.tool()
+        @dynamic_mcp_tool("manage_ai_insights")
+        async def manage_ai_insights(
+            action: str = "get_capabilities",
+            run_id: Optional[str] = None,
+            recommendation_id: Optional[str] = None,
+            feedback_action: Optional[str] = None,
+            period_start: Optional[str] = None,
+            period_end: Optional[str] = None,
+            filter_agent: Optional[List[str]] = None,
+            filter_product_id: Optional[List[str]] = None,
+            filter_trace_type: Optional[List[str]] = None,
+            filter_consuming_org_id: Optional[List[str]] = None,
+            filter_environment: Optional[str] = None,
+            filter_include_coding_assistants: Optional[bool] = None,
+            filter_include_coding_assistants_for_cost_detectors: Optional[bool] = None,
+            exclude_investigator_ids: Optional[List[str]] = None,
+            slim: Optional[bool] = None,
+            max_results: Optional[int] = None,
+            status: Optional[str] = None,
+            since: Optional[str] = None,
+            until: Optional[str] = None,
+            triggered_by: Optional[str] = None,
+            dismissal_reason: Optional[str] = None,
+            confidence_rating: Optional[int] = None,
+            realized_savings: Optional[Union[str, float, int]] = None,
+            realized_savings_currency: Optional[str] = None,
+            realized_savings_measured_at: Optional[str] = None,
+        ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+
+            arguments = {
+                "action": action,
+                "run_id": run_id,
+                "recommendation_id": recommendation_id,
+                "feedback_action": feedback_action,
+                "period_start": period_start,
+                "period_end": period_end,
+                "filter_agent": filter_agent,
+                "filter_product_id": filter_product_id,
+                "filter_trace_type": filter_trace_type,
+                "filter_consuming_org_id": filter_consuming_org_id,
+                "filter_environment": filter_environment,
+                "filter_include_coding_assistants": filter_include_coding_assistants,
+                "filter_include_coding_assistants_for_cost_detectors":
+                    filter_include_coding_assistants_for_cost_detectors,
+                "exclude_investigator_ids": exclude_investigator_ids,
+                "slim": slim,
+                "max_results": max_results,
+                "status": status,
+                "since": since,
+                "until": until,
+                "triggered_by": triggered_by,
+                "dismissal_reason": dismissal_reason,
+                "confidence_rating": confidence_rating,
+                "realized_savings": realized_savings,
+                "realized_savings_currency": realized_savings_currency,
+                "realized_savings_measured_at": realized_savings_measured_at,
+            }
+            arguments = {k: v for k, v in arguments.items() if v is not None}
+
+            from ..tools_decomposed.ai_insights_management import AIInsightsManagement
+            from ..common.tool_execution import standardized_tool_execution
+            result = await standardized_tool_execution(
+                tool_name="manage_ai_insights",
+                action=action,
+                arguments=arguments,
+                tool_class=AIInsightsManagement,
             )
             return result
 
@@ -1574,6 +1649,7 @@ class ToolConfigurationRegistry:
         tool_mapping = {
             "business_analytics_management": ("business_analytics_management", "BusinessAnalyticsManagement"),
             "manage_alerts": ("alert_management", "AlertManagement"),
+            "manage_ai_insights": ("ai_insights_management", "AIInsightsManagement"),
             "slack_management": ("slack_management", "SlackManagement"),
             "manage_metering": ("metering_management", "MeteringManagement"),
             "system_setup": ("system_setup", "SystemSetup"),

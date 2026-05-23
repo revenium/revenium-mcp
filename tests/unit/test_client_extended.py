@@ -214,7 +214,7 @@ class TestHTTPConvenienceMethods:
         self.client._request_with_retry = AsyncMock(return_value={"data": []})
         result = await self.client.get("/endpoint", params={"page": 0})
         assert result == {"data": []}
-        self.client._request_with_retry.assert_awaited_once_with("GET", "/endpoint", params={"page": 0}, base_url=None, use_bearer=False)
+        self.client._request_with_retry.assert_awaited_once_with("GET", "/endpoint", params={"page": 0}, base_url=None, use_bearer=False, unwrap_hal_embedded=True)
 
     @pytest.mark.asyncio
     async def test_get_without_retry(self):
