@@ -5,6 +5,17 @@ All notable changes to the Revenium MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.10] - 2026-05-22
+
+### Added
+- `manage_ai_insights` tool exposes the Revenium AI Insights API with actions `list_investigators`, `get_run`, `list_runs`, `list_feedback`, `trigger_run`, and `submit_feedback`
+- Cursor-based auto-pagination on `manage_ai_insights.list_runs` and `list_feedback`
+- Automatic idempotency keys on `manage_ai_insights.trigger_run` so retries do not double-fire recommendation runs
+- `manage_ai_insights.get_run` returns a slim payload by default; pass `slim=false` for the full record
+
+### Changed
+- API failures returning `application/problem+json` (RFC 7807) are now mapped to structured tool errors with the upstream `code` field preserved, instead of opaque HTTP envelopes
+
 ## [0.2.9] - 2026-05-21
 
 ### Added
@@ -179,6 +190,7 @@ No functional changes. Changelog formatting update only.
 - Configuration via environment variables
 - System diagnostics and transaction verification tools
 
+[0.2.10]: https://github.com/revenium/revenium-mcp/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/revenium/revenium-mcp/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/revenium/revenium-mcp/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/revenium/revenium-mcp/compare/v0.2.6...v0.2.7

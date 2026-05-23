@@ -4,11 +4,14 @@ import os
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-# Set test environment variables
-os.environ["REVENIUM_API_KEY"] = "test_api_key_12345"
-os.environ["REVENIUM_TEAM_ID"] = "test_team_id_456"
-os.environ["REVENIUM_BASE_URL"] = "https://api.test.revenium.ai"
-os.environ["LOG_LEVEL"] = "ERROR"  # Reduce log noise during tests
+# Default test environment variables — only set when not already provided by the
+# caller. Using `setdefault` lets integration/smoke runs override with real
+# credentials (e.g. live AI Insights smoke against dev) without the unit-test
+# defaults silently shadowing them.
+os.environ.setdefault("REVENIUM_API_KEY", "test_api_key_12345")
+os.environ.setdefault("REVENIUM_TEAM_ID", "test_team_id_456")
+os.environ.setdefault("REVENIUM_BASE_URL", "https://api.test.revenium.ai")
+os.environ.setdefault("LOG_LEVEL", "ERROR")  # Reduce log noise during tests
 
 
 @pytest.fixture

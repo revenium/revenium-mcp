@@ -38,7 +38,7 @@ If or when you're ready to turn AI costs into AI revenue, the Revenium MCP will 
 ### Profile-Based Tool Selection
 The MCP provides the appropriate tools for each use case depending on your chosen startup profile:
 - **Starter Profile (7 tools):** Cost monitoring, alerts, analytics, AI metering integration
-- **Business Profile (17 tools):** All Starter tools plus product management, customer management, subscriptions, billing, tool registry
+- **Business Profile (18 tools):** All Starter tools plus product management, customer management, subscriptions, billing, tool registry, AI insights
 
 ## Getting Started
 
@@ -135,40 +135,6 @@ When you use this MCP server, the following data flows between your AI assistant
 - API keys are never logged or exposed in tool responses
 - Data handling is subject to [Revenium's privacy policy](https://www.revenium.ai/privacy-policy)
 
-## AI Query Routing (Optional Feature)
-
-The MCP server includes an **optional** AI-powered query routing feature for natural language interpretation. **This feature is disabled by default** and is not required for normal operation.
-
-### What It Does
-
-When enabled, the server can use OpenAI's API to interpret natural language queries and route them to appropriate tools. This is an experimental feature that adds intelligent query understanding.
-
-### Self-Metering
-
-When AI routing is enabled, the MCP server automatically tracks its own OpenAI usage back to your Revenium account:
-- Uses `revenium-middleware-openai` to meter its own API calls
-- Creates transactions visible in your Revenium dashboard
-- Provides full transparency into the MCP server's operational costs
-
-### Enabling AI Routing
-
-AI routing is **disabled by default**. To enable it, add to your `.env` file:
-
-```bash
-# .env
-REVENIUM_API_KEY=hak_your_api_key_here
-OPENAI_API_KEY=sk-your_openai_key_here
-AI_ROUTING_ENABLED=true
-AI_MODEL_NAME=gpt-3.5-turbo  # Optional: default model
-```
-
-Then run:
-```bash
-uvx revenium-mcp
-```
-
-**Note:** Without AI routing enabled, the MCP operates normally using direct tool calls. No OpenAI API key or additional costs are required.
-
 ## Environment Configuration
 
 The MCP server uses environment variables for configuration. **The method you use depends on your setup:**
@@ -232,7 +198,7 @@ The MCP server supports two profiles to match your use case:
 | Profile | Tools | Target Users | Use Cases |
 |---------|-------|--------------|-----------|
 | **Starter** (default) | 7 tools | Cost monitoring & alerts | Cost analysis, AI transaction metering |
-| **Business** | 17 tools | Full platform | Product & subscription management, usage-based billing, comprehensive analytics, tool registry |
+| **Business** | 18 tools | Full platform | Product & subscription management, usage-based billing, comprehensive analytics, tool registry, AI insights |
 
 The server uses the **Starter** profile by default. To use the **Business** profile, set the `TOOL_PROFILE` environment variable:
 
@@ -245,7 +211,7 @@ TOOL_PROFILE=starter
 EOF
 uvx revenium-mcp
 
-# Business Profile (17 tools) - Usage-based billing & AI Analytics
+# Business Profile (18 tools) - Usage-based billing & AI Analytics
 cat > .env << EOF
 REVENIUM_API_KEY=hak_your_api_key_here
 TOOL_PROFILE=business
