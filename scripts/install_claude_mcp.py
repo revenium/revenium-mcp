@@ -5,10 +5,8 @@ Automatically installs and configures the MCP server for Claude Desktop.
 """
 
 import json
-import os
 import sys
 import subprocess
-import shutil
 from pathlib import Path
 
 def get_python_path():

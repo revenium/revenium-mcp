@@ -128,4 +128,7 @@ def get_resolver() -> TenantResolver:
     from .auth_mode import read_auth_mode
     if read_auth_mode() == "clerk":
         return ClerkTenantResolver()
+    # api_key mode never reaches here: ApiKeyAuthMiddleware builds the
+    # TenantContext directly from the verified AccessToken, so no resolver
+    # is consulted. env mode falls through to the env-backed resolver.
     return EnvTenantResolver()

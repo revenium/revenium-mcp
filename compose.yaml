@@ -1,0 +1,40 @@
+name: revenium-mcp
+
+services:
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: revenium-mcp-server
+    # Copy .env.example to .env before first run
+    env_file:
+      - .env
+    # These three are required for the compose stack regardless of what .env says.
+    # Locking the transport to HTTP overrides any TRANSPORT_MODE in .env: a
+    # containerized server must serve HTTP, and api_key+stdio would be
+    # rejected at startup.
+    environment:
+      TRANSPORT_MODE: http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.11-alpine
+    container_name: revenium-mcp-caddy
+    depends_on:
+      mcp-server:
+        condition: service_healthy
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

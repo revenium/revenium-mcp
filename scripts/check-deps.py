@@ -35,6 +35,12 @@ def install_dependency(package_name):
     except subprocess.CalledProcessError:
         return False
 
+def check_server_import():
+    """Check if the MCP server entrypoint can be imported."""
+    from revenium_mcp_server.enhanced_server import main as server_main
+
+    return callable(server_main)
+
 def main():
     """Check dependencies and install missing ones."""
     print("🔍 Checking Revenium MCP Server dependencies...")
@@ -55,7 +61,8 @@ def main():
         # Test server import
         print("\n🧪 Testing server import...")
         try:
-            from src.revenium_mcp_server.enhanced_server import main as server_main
+            if not check_server_import():
+                raise TypeError("revenium_mcp_server.enhanced_server.main is not callable")
             print("  ✅ Server import successful!")
             return True
         except Exception as e:
@@ -86,7 +93,8 @@ def main():
     # Test server import after installation
     print("\n🧪 Testing server import...")
     try:
-        from src.revenium_mcp_server.enhanced_server import main as server_main
+        if not check_server_import():
+            raise TypeError("revenium_mcp_server.enhanced_server.main is not callable")
         print("  ✅ Server import successful!")
         print("\n🚀 Server is ready to start!")
         print("   Run: python run_server.py")

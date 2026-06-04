@@ -38,6 +38,10 @@ def _new_idempotency_key() -> str:
     return str(_uuid.uuid4())
 
 
+def _idempotency_headers(key: Optional[str] = None) -> Dict[str, str]:
+    return {"Idempotency-Key": key if key is not None else _new_idempotency_key()}
+
+
 class ConnectionPoolConfig:
     """Configuration for HTTP connection pooling."""
 
@@ -2109,19 +2113,27 @@ class ReveniumClient:
             logger.error("Metering element definition deletion failed: {}", str(e))
             raise
 
-    async def submit_ai_transaction(self, transaction_data: Dict[str, Any]) -> Dict[str, Any]:
+    async def submit_ai_transaction(
+        self,
+        transaction_data: Dict[str, Any],
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Submit AI transaction data to the metering endpoint.
 
         Args:
             transaction_data: Transaction data to submit
+            idempotency_key: Optional explicit key; auto-generated if omitted.
 
         Returns:
             Response from the API
         """
-        # Use the field mapper to ensure proper field mapping
         mapped_data = APIFieldMapper().map_transaction_fields(transaction_data)
 
-        return cast(Dict[str, Any], await self.post("/profitstream/v2/api/ai/completions", data=mapped_data))
+        return cast(Dict[str, Any], await self.post(
+            "/profitstream/v2/api/ai/completions",
+            data=mapped_data,
+            extra_headers=_idempotency_headers(idempotency_key),
+        ))
     # Slack Configuration API methods
     async def get_slack_configurations(self, page: int = 0, size: int = 20) -> Dict[str, Any]:
         """Get list of Slack configurations with pagination.
@@ -2347,30 +2359,47 @@ class ReveniumClient:
         params = {"name": query, "page": page, "size": size}
         params = self._add_team_id_to_params(params)
         return cast(Dict[str, Any], await self.get("/profitstream/v2/api/tools", params=params))
-    async def record_tool_event(self, tool_id: str, event_data: Dict[str, Any]) -> Dict[str, Any]:
+    async def record_tool_event(
+        self,
+        tool_id: str,
+        event_data: Dict[str, Any],
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Record an event for a tool by merging tool_id into payload and submitting to metering.
 
         Args:
             tool_id: The tool ID (merged into event_data as toolId)
             event_data: Event data to record
+            idempotency_key: Optional explicit key; auto-generated if omitted.
 
         Returns:
             Metered event data
         """
         payload = {**event_data, "toolId": tool_id}
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.post("/meter/v2/tool/events", data=payload, params=params))
-    async def meter_tool_event(self, event_data: Dict[str, Any]) -> Dict[str, Any]:
+        return cast(Dict[str, Any], await self.post(
+            "/meter/v2/tool/events", data=payload, params=params,
+            extra_headers=_idempotency_headers(idempotency_key),
+        ))
+    async def meter_tool_event(
+        self,
+        event_data: Dict[str, Any],
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Submit a tool/function call for metering via global endpoint.
 
         Args:
             event_data: Event data to meter
+            idempotency_key: Optional explicit key; auto-generated if omitted.
 
         Returns:
             Metered event data
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.post("/meter/v2/tool/events", data=event_data, params=params))
+        return cast(Dict[str, Any], await self.post(
+            "/meter/v2/tool/events", data=event_data, params=params,
+            extra_headers=_idempotency_headers(idempotency_key),
+        ))
     async def get_tool_events(self, tool_id: str, page: int = 0, size: int = 20) -> Dict[str, Any]:
         """Get events for a specific tool via the global tool events log endpoint.
 

@@ -13,14 +13,14 @@ def read_auth_mode() -> str:
     fails fast at startup instead of degrading silently to env mode.
 
     Returns:
-        Either ``"env"`` (default, backward-compat) or ``"clerk"``.
+        One of ``"env"`` (default, backward-compat), ``"clerk"``, or ``"api_key"``.
 
     Raises:
         ValueError: when AUTH_MODE is set to an unsupported value.
     """
     mode = os.getenv("AUTH_MODE", "env").strip().lower()
-    if mode not in ("env", "clerk"):
+    if mode not in ("env", "clerk", "api_key"):
         raise ValueError(
-            f"AUTH_MODE must be 'env' or 'clerk', got {mode!r}"
+            f"AUTH_MODE must be 'env', 'clerk', or 'api_key', got {mode!r}"
         )
     return mode

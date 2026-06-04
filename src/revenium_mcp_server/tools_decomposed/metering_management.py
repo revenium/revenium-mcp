@@ -772,9 +772,10 @@ The subscriber data structure has been updated. The old individual fields are no
         # Check 2: Invalid task_id field (API compatibility)
         if "task_id" in arguments:
             return (
-                "⚠️ CRITICAL: **INVALID FIELD: task_id**\n\n"
-                "The 'task_id' field is not supported by the Revenium API "
-                "and will cause 400 errors.\n\n"
+                "⚠️ **Unsupported field: task_id**\n\n"
+                "The 'task_id' field is not supported by the Revenium API — it "
+                "was removed from the wire contract and is silently ignored "
+                "(no error is returned).\n\n"
                 "**Remove this field**: task_id\n\n"
                 "**Use trace_id instead**: For session/conversation tracking, use 'trace_id'\n\n"
                 "**Example**:\n"
@@ -1307,8 +1308,8 @@ The subscriber data structure has been updated. The old individual fields are no
             if "task_id" in arguments:
                 return {
                     "valid": False,
-                    "message": "⚠️ CRITICAL: **INVALID FIELD: task_id**\n\n"
-                    "The 'task_id' field is not supported by the Revenium API and will cause 400 errors.\n\n"
+                    "message": "⚠️ **Unsupported field: task_id**\n\n"
+                    "The 'task_id' field is not supported by the Revenium API — it was removed from the wire contract and is silently ignored (no error is returned).\n\n"
                     "**Remove this field**: task_id\n\n"
                     "**Use trace_id instead**: For session/conversation tracking, use 'trace_id'\n\n"
                     "**Example**:\n"

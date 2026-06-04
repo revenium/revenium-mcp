@@ -309,12 +309,13 @@ class ToolBase(ABC, MetadataProvider):
             # (clerk mode). In env mode the ContextVar stays empty and ctx
             # remains None, preserving Phase 1's cached-self.client behavior.
             ctx = current_tenant_context()
-            if ctx is None and read_auth_mode() == "clerk":
-                # Fail closed: in clerk mode the middleware must have run,
+            if ctx is None and read_auth_mode() in ("clerk", "api_key"):
+                # Fail closed: the per-request tenant middleware must have run,
                 # otherwise we would silently fall back to the env-mode
                 # cached client and leak cross-tenant data.
                 raise PermissionError(
-                    "Tenant context unavailable — TenantContextMiddleware did not run"
+                    "Tenant context unavailable — TenantContextMiddleware (clerk) "
+                    "or ApiKeyAuthMiddleware (api_key) did not run"
                 )
 
         tokens = bind_tenant_context(ctx)

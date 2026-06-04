@@ -67,6 +67,10 @@ class TestValidateFastChecks:
         result = await mgr._validate_fast_checks(args)
         assert result is not None
         assert "task_id" in result
+        # Regression: the API silently ignores task_id, it does not 400 — the
+        # message must not claim an error code that never happens.
+        assert "400" not in result
+        assert "ignored" in result.lower()
 
     @pytest.mark.asyncio
     async def test_missing_model_fails(self):
@@ -1083,6 +1087,10 @@ class TestValidateTransactionInputsWithDetails:
         result = await mgr._validate_transaction_inputs_with_details(args)
         assert result["valid"] is False
         assert "task_id" in result["message"]
+        # Regression: the API silently ignores task_id, it does not 400 — the
+        # message must not claim an error code that never happens.
+        assert "400" not in result["message"]
+        assert "ignored" in result["message"].lower()
 
     @pytest.mark.asyncio
     async def test_negative_tokens_rejected(self):

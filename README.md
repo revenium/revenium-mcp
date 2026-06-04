@@ -80,6 +80,93 @@ Done! Claude Code will manage the configuration.
 
 See [Installation](#installation) for Cursor, Augment, and other integrations.
 
+### For Containerized Deployment
+
+Build and run the MCP server in a container. Useful for hosted HTTP deployments and CI integration. Clone this repository first, then from the repo root:
+
+```bash
+docker build -t revenium-mcp .
+docker run -d --name revenium-mcp \
+  -p 8000:8000 \
+  -e AUTH_MODE=api_key \
+  -e REVENIUM_BASE_URL=https://api.revenium.ai \
+  -e MCP_SERVER_BASE_URL=https://mcp.your-domain.com \
+  revenium-mcp
+```
+
+In `api_key` mode there is no server-wide `REVENIUM_API_KEY` — each caller
+authenticates with their own Revenium key (`rev_sk_` write or `rev_rk_` read),
+sent as an `Authorization: Bearer` header and validated per request against
+the platform.
+
+Defaults baked into the image:
+- `TRANSPORT_MODE=http` (stdio doesn't make sense in a container)
+- `MCP_HOST=0.0.0.0` (binds all interfaces inside the container)
+- `MCP_PORT=8000`
+
+The container runs as a non-root user (`mcp`, UID 1000). Health probes:
+- `GET /health` — liveness, always returns 200 (no external calls)
+- `GET /ready` — readiness, returns 200 when the Revenium API is reachable with the configured key (503 otherwise)
+
+### For Full HTTPS Stack via docker compose
+
+Local multi-tenant deployment with Caddy doing TLS termination.
+
+```bash
+cp .env.example .env
+# Edit .env — set AUTH_MODE=api_key, REVENIUM_BASE_URL=https://api.revenium.ai,
+# and MCP_SERVER_BASE_URL=https://localhost:8443
+docker compose up --build
+```
+
+Endpoints:
+- `https://localhost:8443/mcp` — the MCP protocol endpoint
+- `https://localhost:8443/health` — liveness, no auth
+- `https://localhost:8443/ready` — readiness, no auth
+
+**First-time TLS:** Caddy generates a self-signed cert via its internal CA. Browsers will warn "untrusted certificate". The cert is cryptographically valid — accept the warning for local dev. If you need the cert trusted system-wide, extract the root CA from the `caddy_data` volume and add it to your OS trust store using the OS-specific procedure (out of scope for this README).
+
+The cert persists in the `caddy_data` volume between runs.
+
+To stop:
+```bash
+docker compose down
+```
+
+To wipe state (including the cert):
+```bash
+docker compose down -v
+```
+
+### Connecting a client to the local compose stack
+
+Once the compose stack is running, point any MCP client that supports remote
+HTTP servers at the endpoint and send your Revenium key as a bearer token
+(for a hosted deployment, replace `https://localhost:8443` with your server's
+public URL):
+
+```json
+{
+  "mcpServers": {
+    "revenium": {
+      "url": "https://localhost:8443/mcp",
+      "headers": {
+        "Authorization": "Bearer rev_sk_your_key_here"
+      }
+    }
+  }
+}
+```
+
+Clients that only speak stdio can use the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) shim.
+
+**TLS note for Node-based clients (including `mcp-remote`):** Caddy signs
+`localhost` with its internal CA, which Node.js does not trust by default.
+Export the root CA from the `caddy_data` volume and pass it via
+`NODE_EXTRA_CA_CERTS=/path/to/caddy-root.crt`, or — for a quick local-only
+workaround, never in production — set `NODE_TLS_REJECT_UNAUTHORIZED=0`. See
+the "First-time TLS" note above for the browser equivalent.
+
 ## MCP Specification
 
 Implements [Model Context Protocol](https://modelcontextprotocol.io/specification/2025-06-18) version **2025-06-18**.

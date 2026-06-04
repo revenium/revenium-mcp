@@ -49,6 +49,7 @@ from .transport_mode import (
     read_transport_mode,
     validate_mode_combination,
 )
+from .health_endpoints import register_health_endpoints
 
 
 def _check_app_base_url_drift() -> Optional[str]:
@@ -65,9 +66,9 @@ def _check_app_base_url_drift() -> Optional[str]:
         return (
             f"REVENIUM_BASE_URL is configured ({base_url}) but REVENIUM_APP_BASE_URL is not. "
             "Analytics endpoints (cost-by-tool, cost-by-user, Slack OAuth) will default to "
-            "https://app.revenium.ai (production). If your REVENIUM_API_KEY belongs to a "
+            "https://app.revenium.ai (production). If REVENIUM_BASE_URL points at a "
             "non-production environment, those endpoints will return 401. "
-            "Set REVENIUM_APP_BASE_URL to the app host matching your API key."
+            "Set REVENIUM_APP_BASE_URL to the app host matching REVENIUM_BASE_URL."
         )
     return None
 
@@ -139,11 +140,12 @@ async def lifespan_manager() -> AsyncGenerator[None, None]:
     logger.info("Shutting down enhanced MCP server")
 
 
-def _require_envs(names: list[str]) -> dict[str, str]:
+def _require_envs(names: list[str], *, label: str = "Required env vars") -> dict[str, str]:
     """Return a dict of {name: value} for each name, raising if any are missing.
 
     Args:
         names: Env var names that must be set and non-empty.
+        label: Prefix used in the ValueError message.
 
     Returns:
         Dict mapping each name to its value.
@@ -153,24 +155,30 @@ def _require_envs(names: list[str]) -> dict[str, str]:
     """
     missing = [n for n in names if not (os.getenv(n) or "").strip()]
     if missing:
-        raise ValueError(
-            f"AUTH_MODE=clerk requires env vars: {', '.join(missing)}"
-        )
+        raise ValueError(f"{label}: {', '.join(missing)}")
     return {n: os.getenv(n, "").strip() for n in names}
 
 
-def _register_tenant_middleware(mcp: "FastMCP", auth_mode: str) -> None:
-    """Register the TenantContextMiddleware when AUTH_MODE=clerk.
+def _register_tenant_middleware(
+    mcp: "FastMCP", auth_mode: str, *, validator: Any = None
+) -> None:
+    """Register the per-request tenant middleware for the active auth mode.
 
-    In env mode this is a no-op so the ContextVar path is not exercised and
-    Phase 1's cached-self.client behavior is preserved.
+    clerk -> TenantContextMiddleware (reads OIDC claims).
+    api_key -> ApiKeyAuthMiddleware (reads the verified AccessToken).
+    env -> no-op (single-tenant; ContextVar path not exercised).
     """
-    if auth_mode != "clerk":
-        return
-    from .auth.claims_middleware import TenantContextMiddleware
-    from .auth.tenant_resolver import get_resolver
+    if auth_mode == "clerk":
+        from .auth.claims_middleware import TenantContextMiddleware
+        from .auth.tenant_resolver import get_resolver
 
-    mcp.add_middleware(TenantContextMiddleware(get_resolver()))
+        mcp.add_middleware(TenantContextMiddleware(get_resolver()))
+    elif auth_mode == "api_key":
+        if validator is None:
+            raise ValueError("validator is required for api_key mode")
+        from .auth.api_key_middleware import ApiKeyAuthMiddleware
+
+        mcp.add_middleware(ApiKeyAuthMiddleware(validator))
 
 
 def create_enhanced_server(auth: Optional[Any] = None) -> FastMCP:
@@ -286,6 +294,10 @@ Set REVENIUM_API_KEY environment variable with your Revenium API key.
     from .middleware.framework_leak_guard import FrameworkLeakGuardMiddleware
     mcp.add_middleware(FrameworkLeakGuardMiddleware())
 
+    # /health and /ready are auth-exempt by FastMCP design (custom routes
+    # are appended outside RequireAuthMiddleware) and inert in stdio mode.
+    register_health_endpoints(mcp)
+
     return mcp
 
 
@@ -344,6 +356,24 @@ async def register_tools(mcp: FastMCP) -> None:
     logger.info("All tools registered successfully via ToolConfigurationRegistry")
 
 
+def _read_api_key_cache_ttl(default: int) -> int:
+    """Read and validate API_KEY_CACHE_TTL_SECONDS; fail fast on bad input."""
+    raw = os.getenv("API_KEY_CACHE_TTL_SECONDS", "").strip()
+    if not raw:
+        return default
+    try:
+        ttl = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"API_KEY_CACHE_TTL_SECONDS must be an integer, got {raw!r}"
+        ) from exc
+    if ttl <= 0:
+        raise ValueError(
+            f"API_KEY_CACHE_TTL_SECONDS must be a positive integer, got {ttl}"
+        )
+    return ttl
+
+
 async def main() -> None:
     """Run the enhanced MCP server with CLI argument support and onboarding integration."""
     # Install crash logging FIRST (before any other operations)
@@ -360,7 +390,7 @@ async def main() -> None:
     transport_mode = read_transport_mode()
     validate_mode_combination(auth_mode, transport_mode)
     logger.info(
-        "Starting MCP server with AUTH_MODE=%s TRANSPORT_MODE=%s",
+        "Starting MCP server with AUTH_MODE={} TRANSPORT_MODE={}",
         auth_mode,
         transport_mode,
     )
@@ -374,7 +404,8 @@ async def main() -> None:
 
     # Build auth based on AUTH_MODE. Env mode: auth=None (stdio, unchanged).
     # Clerk mode: validate all required envs, then instantiate OIDCProxy.
-    auth_obj = None
+    auth_obj: Any = None
+    api_key_validator = None
     clerk_envs: dict[str, str] = {}
     if auth_mode == "clerk":
         clerk_envs = _require_envs([
@@ -384,7 +415,7 @@ async def main() -> None:
             "MCP_SERVER_BASE_URL",
             "REVENIUM_TENANT_ID",
             "REVENIUM_API_KEY",
-        ])
+        ], label="AUTH_MODE=clerk requires env vars")
         from fastmcp.server.auth.oidc_proxy import OIDCProxy
         # TEST-ONLY: integration tests can set CLERK_OIDC_CONFIG_URL_OVERRIDE
         # to point OIDCProxy at a local fake Clerk. Must be https:// (the guard
@@ -409,9 +440,32 @@ async def main() -> None:
             algorithm="RS256",
         )
 
+    if auth_mode == "api_key":
+        api_key_envs = _require_envs([
+            "REVENIUM_BASE_URL",
+            "MCP_SERVER_BASE_URL",
+        ], label="AUTH_MODE=api_key requires env vars")
+        from .auth.api_key_validator import (
+            DEFAULT_CACHE_TTL_SECONDS,
+            ApiKeyValidator,
+        )
+        from .auth.api_key_middleware import ApiKeyTokenVerifier
+
+        ttl_seconds = _read_api_key_cache_ttl(DEFAULT_CACHE_TTL_SECONDS)
+        # /users/me lives on the same host as the downstream tool calls, so the
+        # validator reuses REVENIUM_BASE_URL rather than a separate platform var.
+        api_key_validator = ApiKeyValidator(
+            platform_base_url=api_key_envs["REVENIUM_BASE_URL"],
+            ttl_seconds=ttl_seconds,
+        )
+        auth_obj = ApiKeyTokenVerifier(
+            validator=api_key_validator,
+            base_url=api_key_envs["MCP_SERVER_BASE_URL"],
+        )
+
     # Create server
     mcp = create_enhanced_server(auth=auth_obj)
-    _register_tenant_middleware(mcp, auth_mode)
+    _register_tenant_middleware(mcp, auth_mode, validator=api_key_validator)
 
     # STARTUP CHECK: Validate API key configuration
     api_key = os.getenv("REVENIUM_API_KEY")
@@ -420,72 +474,76 @@ async def main() -> None:
     # Track if API key is missing or invalid for later warning display
     api_key_missing_or_invalid = False
 
-    if not api_key:
-        # API key is missing
-        api_key_missing_or_invalid = True
-        logger.warning("=" * 60)
-        logger.warning("REVENIUM_API_KEY is not set!")
-        logger.warning("=" * 60)
-        logger.warning("The server will start but most features will be unavailable.")
-        logger.warning("")
-        logger.warning("To configure, copy .env.example to .env and add your API key")
-        logger.warning("See: https://github.com/revenium/revenium-mcp#configuration")
-        logger.warning("=" * 60)
-    else:
-        from .log_context import redact_key
+    # Env/clerk modes only: validate the server-wide REVENIUM_API_KEY here.
+    # api_key mode deliberately has no server-wide key — each caller supplies
+    # their own per-request bearer — so skip this validation entirely.
+    if auth_mode != "api_key":
+        if not api_key:
+            # API key is missing
+            api_key_missing_or_invalid = True
+            logger.warning("=" * 60)
+            logger.warning("REVENIUM_API_KEY is not set!")
+            logger.warning("=" * 60)
+            logger.warning("The server will start but most features will be unavailable.")
+            logger.warning("")
+            logger.warning("To configure, copy .env.example to .env and add your API key")
+            logger.warning("See: https://github.com/revenium/revenium-mcp#configuration")
+            logger.warning("=" * 60)
+        else:
+            from .log_context import redact_key
 
-        if startup_verbose:
-            logger.info(f"API Key configured: {redact_key(api_key)}")
-            if base_url:
-                logger.info(f"Base URL: {base_url}")
-            logger.info("Validating API key...")
+            if startup_verbose:
+                logger.info(f"API Key configured: {redact_key(api_key)}")
+                if base_url:
+                    logger.info(f"Base URL: {base_url}")
+                logger.info("Validating API key...")
 
-        # Validate the API key by making a test API call
-        try:
-            from .client import ReveniumClient
+            # Validate the API key by making a test API call
+            try:
+                from .client import ReveniumClient
 
-            client = ReveniumClient()
-            validation_result = await client.validate_api_key()
+                client = ReveniumClient()
+                validation_result = await client.validate_api_key()
 
-            if validation_result["valid"]:
-                # API key is valid
-                if startup_verbose:
-                    logger.info("API key validation successful")
-            else:
-                # API key validation failed
+                if validation_result["valid"]:
+                    # API key is valid
+                    if startup_verbose:
+                        logger.info("API key validation successful")
+                else:
+                    # API key validation failed
+                    api_key_missing_or_invalid = True
+                    logger.error("=" * 60)
+                    logger.error("API KEY VALIDATION FAILED")
+                    logger.error("=" * 60)
+                    logger.error(f"Error: {validation_result['error']}")
+                    logger.error("")
+                    logger.error("COMMON CAUSES:")
+                    logger.error("1. API key is invalid or expired")
+                    logger.error("2. BASE_URL does not match the API key")
+                    logger.error("   - Check that REVENIUM_BASE_URL matches where your API key was created")
+                    logger.error("   - Most common issue: API key from one environment used with different BASE_URL")
+                    logger.error("")
+                    logger.error("CURRENT CONFIGURATION:")
+                    logger.error(f"  REVENIUM_BASE_URL: {validation_result['base_url']}")
+                    logger.error(f"  REVENIUM_API_KEY: {redact_key(api_key)}")
+                    logger.error("")
+                    logger.error("TO FIX:")
+                    logger.error("1. Verify your API key in the Revenium web console")
+                    logger.error("2. Ensure REVENIUM_BASE_URL matches your API key's environment")
+                    logger.error("3. Update your .env file or environment variables")
+                    logger.error("=" * 60)
+
+            except Exception as e:
+                # Validation failed with exception
                 api_key_missing_or_invalid = True
                 logger.error("=" * 60)
-                logger.error("API KEY VALIDATION FAILED")
+                logger.error("API KEY VALIDATION ERROR")
                 logger.error("=" * 60)
-                logger.error(f"Error: {validation_result['error']}")
+                logger.error(f"Failed to validate API key: {e}")
                 logger.error("")
-                logger.error("COMMON CAUSES:")
-                logger.error("1. API key is invalid or expired")
-                logger.error("2. BASE_URL does not match the API key")
-                logger.error("   - Check that REVENIUM_BASE_URL matches where your API key was created")
-                logger.error("   - Most common issue: API key from one environment used with different BASE_URL")
-                logger.error("")
-                logger.error("CURRENT CONFIGURATION:")
-                logger.error(f"  REVENIUM_BASE_URL: {validation_result['base_url']}")
-                logger.error(f"  REVENIUM_API_KEY: {redact_key(api_key)}")
-                logger.error("")
-                logger.error("TO FIX:")
-                logger.error("1. Verify your API key in the Revenium web console")
-                logger.error("2. Ensure REVENIUM_BASE_URL matches your API key's environment")
-                logger.error("3. Update your .env file or environment variables")
+                logger.error("The server will start but API calls may fail.")
+                logger.error("Please check your REVENIUM_API_KEY and REVENIUM_BASE_URL configuration.")
                 logger.error("=" * 60)
-
-        except Exception as e:
-            # Validation failed with exception
-            api_key_missing_or_invalid = True
-            logger.error("=" * 60)
-            logger.error("API KEY VALIDATION ERROR")
-            logger.error("=" * 60)
-            logger.error(f"Failed to validate API key: {e}")
-            logger.error("")
-            logger.error("The server will start but API calls may fail.")
-            logger.error("Please check your REVENIUM_API_KEY and REVENIUM_BASE_URL configuration.")
-            logger.error("=" * 60)
 
     # Warn when REVENIUM_BASE_URL is set but REVENIUM_APP_BASE_URL is not — the
     # latter silently falls back to production and breaks non-prod analytics calls.
