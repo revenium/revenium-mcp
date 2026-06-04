@@ -63,6 +63,9 @@ class TestCheckAppBaseUrlDrift:
         assert msg is not None
         assert "https://api.dev.revenium.ai" in msg
         assert "REVENIUM_APP_BASE_URL" in msg
+        # Mode-neutral: must not reference a server-wide REVENIUM_API_KEY, which
+        # does not exist in api_key mode where this warning also fires.
+        assert "REVENIUM_API_KEY" not in msg
 
     def test_silent_when_app_base_also_set(self, monkeypatch):
         monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.dev.revenium.ai")

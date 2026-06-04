@@ -53,15 +53,15 @@ def clear_python_cache(root_dir: str = ".") -> None:
             print(f"❌ Failed to remove {pyo_file}: {e}")
     
     # Summary
-    print(f"\n🧹 **Cache Clearing Summary**")
+    print("\n🧹 **Cache Clearing Summary**")
     print(f"   📁 Directories removed: {len(removed_dirs)}")
     print(f"   📄 Files removed: {len(removed_files)}")
     
     if removed_dirs or removed_files:
-        print(f"\n✅ **Cache cleared successfully!**")
-        print(f"   🔄 **Next step**: Restart your MCP server to load fresh modules")
+        print("\n✅ **Cache cleared successfully!**")
+        print("   🔄 **Next step**: Restart your MCP server to load fresh modules")
     else:
-        print(f"\n✨ **No cache files found** - your environment is already clean!")
+        print("\n✨ **No cache files found** - your environment is already clean!")
 
 
 if __name__ == "__main__":

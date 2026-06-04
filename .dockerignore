@@ -1,0 +1,56 @@
+# VCS
+.git/
+.gitignore
+.gitattributes
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+build/
+dist/
+
+# IDE / tooling
+.vscode/
+.idea/
+.claude/
+.cursor/
+
+# Tests + docs (not needed in runtime image)
+tests/
+docs/
+scripts/
+
+# CI configs (image doesn't need them)
+.github/
+
+# Dev / repo tooling (not needed in build)
+uv.lock
+requirements.txt
+run_server.py
+run_server_dev.py
+*.sh
+public-allowlist-mcp.txt
+.serena/
+
+# Secrets / local env (HARD safety boundary)
+.env
+.env.*
+!.env.example
+
+# Misc
+*.md
+!README.md
+*.log
+*.swp
+.DS_Store

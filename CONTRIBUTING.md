@@ -27,6 +27,10 @@ Thank you for your interest in contributing to this project!
 
 For detailed development instructions, testing guidelines, and code quality standards, see [DEVELOPMENT.md](./DEVELOPMENT.md).
 
+## PR coverage requirements
+
+Bug-fix PRs must declare a bug class (A-M) from `.claude/commands/mcp-functional-testing.bug-classes.yaml` in the PR body. PRs adding new MCP tools, actions, or endpoints must update `.claude/commands/mcp-test-coverage-matrix.yaml`. The PR template prompts for both; the `pr-coverage-check` CI workflow verifies them. See `docs/mcp-test-skill-improvement-plan.md` section 8.1.
+
 ## Questions?
 
 - Check existing issues first

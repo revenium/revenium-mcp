@@ -185,6 +185,15 @@ def test_env_mode_does_not_register_tenant_context_middleware(monkeypatch):
     assert not fake_mcp.add_middleware.called
 
 
+def test_api_key_mode_requires_validator(monkeypatch):
+    from src.revenium_mcp_server.enhanced_server import _register_tenant_middleware
+
+    fake_mcp = MagicMock()
+    with pytest.raises(ValueError, match="validator is required"):
+        _register_tenant_middleware(fake_mcp, auth_mode="api_key", validator=None)
+    assert not fake_mcp.add_middleware.called
+
+
 @pytest.mark.asyncio
 async def test_main_wires_oidc_proxy_middleware_and_http_transport_in_clerk_mode(
     clerk_env, monkeypatch
@@ -273,3 +282,47 @@ async def test_main_wires_oidc_proxy_middleware_and_http_transport_in_clerk_mode
     fake_mcp.run_async.assert_called_once_with(
         transport="http", host="127.0.0.1", port=9000
     )
+
+
+def test_api_key_mode_registers_api_key_middleware(monkeypatch):
+    from src.revenium_mcp_server.enhanced_server import _register_tenant_middleware
+    from src.revenium_mcp_server.auth.api_key_middleware import ApiKeyAuthMiddleware
+
+    fake_mcp = MagicMock()
+    fake_validator = MagicMock()
+    _register_tenant_middleware(
+        fake_mcp, auth_mode="api_key", validator=fake_validator
+    )
+    assert fake_mcp.add_middleware.called
+    added = fake_mcp.add_middleware.call_args.args[0]
+    assert isinstance(added, ApiKeyAuthMiddleware)
+
+
+def test_api_key_mode_missing_platform_url_raises(monkeypatch):
+    """api_key mode fails fast when its required env vars are absent."""
+    from src.revenium_mcp_server.enhanced_server import _require_envs
+
+    monkeypatch.delenv("REVENIUM_BASE_URL", raising=False)
+    monkeypatch.delenv("MCP_SERVER_BASE_URL", raising=False)
+    with pytest.raises(ValueError, match="REVENIUM_BASE_URL|MCP_SERVER_BASE_URL"):
+        _require_envs(["REVENIUM_BASE_URL", "MCP_SERVER_BASE_URL"])
+
+
+def test_api_key_cache_ttl_rejects_non_integer(monkeypatch):
+    from src.revenium_mcp_server.enhanced_server import _read_api_key_cache_ttl
+    monkeypatch.setenv("API_KEY_CACHE_TTL_SECONDS", "abc")
+    with pytest.raises(ValueError, match="must be an integer"):
+        _read_api_key_cache_ttl(30)
+
+
+def test_api_key_cache_ttl_rejects_non_positive(monkeypatch):
+    from src.revenium_mcp_server.enhanced_server import _read_api_key_cache_ttl
+    monkeypatch.setenv("API_KEY_CACHE_TTL_SECONDS", "0")
+    with pytest.raises(ValueError, match="positive"):
+        _read_api_key_cache_ttl(30)
+
+
+def test_api_key_cache_ttl_defaults_when_unset(monkeypatch):
+    from src.revenium_mcp_server.enhanced_server import _read_api_key_cache_ttl
+    monkeypatch.delenv("API_KEY_CACHE_TTL_SECONDS", raising=False)
+    assert _read_api_key_cache_ttl(30) == 30

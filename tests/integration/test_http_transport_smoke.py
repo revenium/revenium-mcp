@@ -106,3 +106,39 @@ async def test_env_http_serves_tools_list_anonymously(env_http_server):
         assert "result" in payload, payload
         assert "tools" in payload["result"], payload
         assert len(payload["result"]["tools"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_env_http_serves_health_endpoint(env_http_server):
+    """/health responds 200 with healthy status over the real HTTP transport."""
+    async with httpx.AsyncClient() as c:
+        resp = await asyncio.wait_for(
+            c.get(f"{env_http_server['base_url']}/health", timeout=5.0),
+            timeout=10.0,
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "healthy"}
+
+
+@pytest.mark.asyncio
+async def test_env_http_ready_returns_503_when_backend_unreachable(env_http_server):
+    """/ready returns 503 with a sanitised reason when Revenium is unreachable.
+
+    The smoke fixture intentionally points REVENIUM_BASE_URL at an
+    unreachable address so startup doesn't touch the network. /ready
+    correctly reflects that the server can bind but cannot serve traffic.
+    """
+    async with httpx.AsyncClient() as c:
+        resp = await asyncio.wait_for(
+            c.get(f"{env_http_server['base_url']}/ready", timeout=5.0),
+            timeout=10.0,
+        )
+
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "not_ready"
+    assert body["reason"] in {"revenium_api_unreachable", "timeout"}
+    # Body must NOT leak topology.
+    assert "base_url" not in body
+    assert "127.0.0.1" not in resp.text

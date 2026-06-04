@@ -5,6 +5,18 @@ All notable changes to the Revenium MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.11] - 2026-06-04
+
+### Added
+- `/health` (liveness) and `/ready` (readiness) endpoints on the HTTP transport, exempt from auth, with a cached upstream reachability probe
+- Automatic `Idempotency-Key` headers on metering submissions so client retries do not double-record transactions
+- Container deployment: Dockerfile and docker-compose stack (HTTPS via Caddy), documented in README and `.env.example`
+
+### Changed
+- Invalid `AUTH_MODE`/`TRANSPORT_MODE` combinations (`clerk`+`stdio`, `api_key`+`stdio`) now fail fast at startup with a clear error
+- `manage_metering` validation message for `task_id` now states the field is silently ignored by the API rather than causing a 400; use `trace_id` instead
+- New dependency: `cachetools>=5.3.0` (api_key validation cache)
+
 ## [0.2.10] - 2026-05-22
 
 ### Added
@@ -190,6 +202,7 @@ No functional changes. Changelog formatting update only.
 - Configuration via environment variables
 - System diagnostics and transaction verification tools
 
+[0.2.11]: https://github.com/revenium/revenium-mcp/compare/v0.2.10...v0.2.11
 [0.2.10]: https://github.com/revenium/revenium-mcp/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/revenium/revenium-mcp/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/revenium/revenium-mcp/compare/v0.2.7...v0.2.8

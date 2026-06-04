@@ -125,18 +125,20 @@ def validate_mode_combination(auth_mode: str, transport_mode: str) -> None:
         - env + http    -> allowed with WARNING (HTTP without auth)
         - clerk + http  -> production path, silent
         - clerk + stdio -> ValueError (OAuth needs HTTP callbacks)
+        - api_key + http -> production path, silent
+        - api_key + stdio -> ValueError (per-request bearer auth needs HTTP endpoint)
 
     Args:
-        auth_mode: Validated AUTH_MODE value ("env" or "clerk").
+        auth_mode: Validated AUTH_MODE value ("env", "clerk", or "api_key").
         transport_mode: Validated TRANSPORT_MODE value ("stdio" or "http").
 
     Raises:
-        ValueError: when the combination is invalid (clerk + stdio).
+        ValueError: when the combination is invalid (clerk + stdio, api_key + stdio).
     """
-    if auth_mode == "clerk" and transport_mode == "stdio":
+    if auth_mode in ("clerk", "api_key") and transport_mode == "stdio":
         raise ValueError(
-            "AUTH_MODE=clerk requires TRANSPORT_MODE=http "
-            "(OAuth callbacks need an HTTP endpoint). "
+            f"AUTH_MODE={auth_mode} requires TRANSPORT_MODE=http "
+            "(per-request bearer auth needs an HTTP endpoint). "
             "Set TRANSPORT_MODE=http or switch AUTH_MODE=env."
         )
     if auth_mode == "env" and transport_mode == "http":
