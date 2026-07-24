@@ -54,6 +54,7 @@ async def test_valid_200_maps_identity():
     assert identity.tenant_id == "tenant_abc"
     assert identity.team_id == "team_xyz"
     assert identity.scope_from_prefix == "READ"
+    assert identity.team_ids == ("team_xyz",)
 
 
 @pytest.mark.asyncio
@@ -249,3 +250,78 @@ async def test_unknown_prefix_falls_through_to_upstream():
         identity = await v.validate("tok_not_rev_prefixed_123")
     assert identity.scope_from_prefix == "UNKNOWN"
     assert client.get.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_identity_carries_full_team_ids():
+    """team_ids preserves every team from /users/me, in order."""
+    body = {
+        **USERS_ME,
+        "teams": [{"id": "team_xyz"}, {"id": "team_second"}],
+    }
+    v, client = _validator_with_response(_resp(200, json_body=body))
+    with patch(
+        "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
+        return_value=client,
+    ):
+        identity = await v.validate("rev_rk_abcdef123456")
+    assert identity.team_ids == ("team_xyz", "team_second")
+    assert identity.team_id == "team_xyz"
+
+
+@pytest.mark.asyncio
+async def test_team_ids_contains_only_default_when_teams_missing():
+    """No teams array at all: team_ids still includes the resolved default."""
+    v, client = _validator_with_response(_resp(200, json_body=USERS_ME))
+    with patch(
+        "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
+        return_value=client,
+    ):
+        identity = await v.validate("rev_rk_abcdef123456")
+    assert identity.team_ids == ("team_xyz",)
+
+
+@pytest.mark.asyncio
+async def test_default_team_prepended_when_absent_from_teams():
+    """Platform inconsistency: defaultTeamId not present in teams — keep the
+    invariant that the resolved default is always a member of team_ids."""
+    body = {**USERS_ME, "teams": [{"id": "team_other"}]}
+    v, client = _validator_with_response(_resp(200, json_body=body))
+    with patch(
+        "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
+        return_value=client,
+    ):
+        identity = await v.validate("rev_rk_abcdef123456")
+    assert identity.team_id == "team_xyz"
+    assert identity.team_ids == ("team_xyz", "team_other")
+
+
+@pytest.mark.asyncio
+async def test_first_team_fallback_team_ids_keeps_full_list():
+    """defaultTeamId null: team_id falls back to teams[0] and team_ids keeps all."""
+    body = {
+        **USERS_ME,
+        "defaultTeamId": None,
+        "teams": [{"id": "team_first"}, {"id": "team_second"}],
+    }
+    v, client = _validator_with_response(_resp(200, json_body=body))
+    with patch(
+        "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
+        return_value=client,
+    ):
+        identity = await v.validate("rev_rk_abcdef123456")
+    assert identity.team_id == "team_first"
+    assert identity.team_ids == ("team_first", "team_second")
+
+
+@pytest.mark.asyncio
+async def test_team_entry_missing_id_fails_closed_as_malformed():
+    """A team entry without 'id' rejects the response as malformed (fail closed)."""
+    body = {**USERS_ME, "teams": [{"id": "team_xyz"}, {"name": "no-id-here"}]}
+    v, client = _validator_with_response(_resp(200, json_body=body))
+    with patch(
+        "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
+        return_value=client,
+    ):
+        with pytest.raises(ApiKeyValidationError, match="Malformed"):
+            await v.validate("rev_rk_abcdef123456")

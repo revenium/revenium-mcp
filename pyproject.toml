@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "revenium-mcp"
-version = "0.2.11"
+version = "0.3.0"
 description = "Model Context Protocol (MCP) server for Revenium API monitoring, analytics, and AI spending management"
 readme = "README.md"
 license = "MIT"
@@ -32,7 +32,12 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "fastmcp>=3.2.0,<4.0.0",
+    # Exact pin: Docker images resolve dependencies at build time, so this
+    # must match uv.lock (the version CI tests). fastmcp >= 3.4.3 enables
+    # host-header validation by default, which rejects every hosted request
+    # with 421 unless FASTMCP_HTTP_ALLOWED_HOSTS is configured — upgrade
+    # deliberately, with that allowlist set per environment.
+    "fastmcp==3.2.0",
     "httpx>=0.25.0",
     "pydantic>=2.0.0",
     "loguru>=0.7.0",
@@ -41,10 +46,19 @@ dependencies = [
     "openai>=1.0.0",
     "revenium-middleware-openai>=0.4.6",
     "matplotlib>=3.7.0",
-    "numpy>=1.24.0",
+    # numpy 2.5 stubs use Python 3.12-only syntax, while mypy checks this
+    # project as Python 3.11. Keep the lint baseline deterministic until the
+    # project raises its mypy target.
+    "numpy>=1.24.0,<2.5.0",
     "aiofiles>=23.0.0",
     "diskcache>=5.6.0",
     "cachetools>=5.3.0",
+    "redis>=5.0",
+    # Direct dependency: auth/client_storage.py imports key_value.aio for the
+    # OAuth proxy's shared Redis store. Floor 0.4.5: earlier RedisStore drops
+    # the rediss:// scheme (no TLS), which hangs every storage call against
+    # the TLS-required ElastiCache. Ceiling matches fastmcp 3.2.0's pin.
+    "py-key-value-aio>=0.4.5,<0.5.0",
 ]
 
 [project.optional-dependencies]
@@ -55,6 +69,7 @@ dev = [
     "pytest-mock>=3.10.0",
     "pytest-httpserver>=1.0.0",
     "PyJWT[crypto]>=2.8.0",
+    "fakeredis>=2.20",
     "ruff>=0.4.0",
     # mypy is pinned to a single minor series so the regression-gate baseline
     # (scripts/mypy-baseline.txt) stays deterministic across environments.
@@ -63,6 +78,8 @@ dev = [
     # checked-in baseline. Bump this pin in the same PR that regenerates the
     # baseline so local and CI keep agreeing.
     "mypy>=1.20.0,<1.21.0",
+    "types-aiofiles",
+    "types-psutil",
     "pre-commit>=3.0.0",
     "psutil>=5.9.0",
 ]
@@ -74,6 +91,7 @@ test = [
     "pytest-httpserver>=1.0.0",
     "PyJWT[crypto]>=2.8.0",
     "requests-mock>=1.10.0",
+    "fakeredis>=2.20",
     "psutil>=5.9.0",
 ]
 
@@ -109,12 +127,23 @@ warn_unreachable = true
 strict_equality = true
 
 [[tool.mypy.overrides]]
-module = ["h2", "dateutil", "dateutil.parser"]
+module = ["h2", "dateutil", "dateutil.parser", "diskcache", "fastmcp", "fastmcp.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["cachetools"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["revenium_mcp_server.monitoring.metrics"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "revenium_mcp_server.health_endpoints",
+    "revenium_mcp_server.tool_configuration.registry",
+]
+disable_error_code = ["untyped-decorator"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"
@@ -129,6 +158,7 @@ markers = [
     "unit: marks tests as unit tests",
     "integration: marks tests as integration tests",
     "slow: marks tests as slow running",
+    "timeout: per-test timeout in seconds (enforced when pytest-timeout is installed)",
 ]
 
 [tool.coverage.run]

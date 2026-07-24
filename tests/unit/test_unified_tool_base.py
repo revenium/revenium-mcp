@@ -439,3 +439,64 @@ async def test_execute_fails_closed_in_clerk_mode_when_no_ctx(monkeypatch):
             await tool.execute("noop")
     finally:
         _current_tenant.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_get_client_resolves_ctx_from_contextvar(monkeypatch):
+    """get_client() with no explicit ctx must resolve the middleware-populated
+    ContextVar and build a fresh, uncached client from it."""
+    from src.revenium_mcp_server.auth.claims_middleware import _current_tenant
+    from src.revenium_mcp_server.auth.tenant_context import TenantContext
+
+    monkeypatch.setenv("AUTH_MODE", "api_key")
+    ctx = TenantContext(
+        team_id="team_a", api_key="hak_tenant_a", tenant_id="tenant_a"
+    )
+    token = _current_tenant.set(ctx)
+    try:
+        tool = ConcreteTestTool()
+        client = await tool.get_client()
+        assert client.api_key == "hak_tenant_a"
+        assert client.team_id == "team_a"
+        # Per-request clients must never be cached on the tool instance.
+        assert tool.client is None
+    finally:
+        _current_tenant.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auth_mode", ["clerk", "api_key"])
+async def test_get_client_fails_closed_when_no_ctx(monkeypatch, auth_mode):
+    """In clerk/api_key mode with an empty ContextVar, get_client() must raise
+    PermissionError instead of falling back to the cached env client."""
+    from src.revenium_mcp_server.auth.claims_middleware import _current_tenant
+
+    monkeypatch.setenv("AUTH_MODE", auth_mode)
+    token = _current_tenant.set(None)
+    try:
+        tool = ConcreteTestTool()
+        with pytest.raises(PermissionError, match="Tenant context unavailable"):
+            await tool.get_client()
+    finally:
+        _current_tenant.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_get_client_env_mode_keeps_cached_client(monkeypatch):
+    """env mode (legacy) keeps the cached env-based client behavior."""
+    from src.revenium_mcp_server.auth import ConfigManager
+    from src.revenium_mcp_server.auth.claims_middleware import _current_tenant
+
+    monkeypatch.setenv("AUTH_MODE", "env")
+    monkeypatch.setenv("REVENIUM_API_KEY", "hak_env_key")
+    monkeypatch.setenv("REVENIUM_TEAM_ID", "team_env")
+    ConfigManager().clear_cache()
+    token = _current_tenant.set(None)
+    try:
+        tool = ConcreteTestTool()
+        first = await tool.get_client()
+        second = await tool.get_client()
+        assert first is second
+    finally:
+        _current_tenant.reset(token)
+        ConfigManager().clear_cache()

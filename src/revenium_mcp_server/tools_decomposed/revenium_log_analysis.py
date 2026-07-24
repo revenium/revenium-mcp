@@ -8,6 +8,7 @@ This tool provides log analysis capabilities including:
 - Diagnostic insights and troubleshooting
 """
 
+import json
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
@@ -42,7 +43,7 @@ class ReveniumLogAnalysis(ToolBase):
 
     tool_name: ClassVar[str] = "revenium_log_analysis"
     tool_description: ClassVar[str] = (
-        "Revenium log analysis for system troubleshooting and diagnostic investigation. Key actions: get_internal_logs, get_integration_logs, get_recent_logs, search_logs, analyze_operations. Default size: 200 records (max: 1000). Use get_examples() for usage guidance and get_capabilities() for status."
+        "Revenium log analysis for system troubleshooting and diagnostic investigation. Key actions: get_internal_logs, get_integration_logs, get_recent_logs, search_logs, analyze_operations, get_ingestion_failures, set_strict_ingestion_mode. Default size: 200 records (max: 1000). Use get_examples() for usage guidance and get_capabilities() for status."
     )
     business_category: ClassVar[str] = "System & Monitoring Tools"
     tool_type: ClassVar[ToolType] = ToolType.UTILITY
@@ -72,6 +73,9 @@ class ReveniumLogAnalysis(ToolBase):
             return await self._route_action(action, arguments, ctx=ctx)
         except ToolError:
             # Re-raise ToolError exceptions without modification
+            raise
+        except PermissionError:
+            # Auth failures must fail closed — never mask as a tool-error envelope.
             raise
         except Exception as e:
             raise self._create_action_error(action, e)
@@ -179,6 +183,9 @@ class ReveniumLogAnalysis(ToolBase):
                 if page >= page_info.get("totalPages", 1) - 1:
                     break
 
+            except PermissionError:
+                # Auth failures must fail closed — never mask as a tool-error envelope.
+                raise
             except Exception as e:
                 logger.warning(f"Failed to retrieve page {page}: {e}")
                 break
@@ -236,6 +243,9 @@ class ReveniumLogAnalysis(ToolBase):
                     logger.info(f"Reached last page ({page_info.get('totalPages', 1)} total pages)")
                     break
 
+            except PermissionError:
+                # Auth failures must fail closed — never mask as a tool-error envelope.
+                raise
             except Exception as e:
                 logger.warning(f"Failed to search page {page}: {e}")
                 break
@@ -386,8 +396,218 @@ No log entries found for analysis. This may be expected for integration logs.
             return await self._handle_search_logs(arguments, ctx=ctx)
         elif action == "analyze_operations":
             return await self._handle_analyze_operations(arguments, ctx=ctx)
+        elif action == "get_ingestion_failures":
+            return await self._handle_get_ingestion_failures(arguments, ctx=ctx)
+        elif action == "set_strict_ingestion_mode":
+            return await self._handle_set_strict_ingestion_mode(arguments, ctx=ctx)
         else:
             return await self._handle_unsupported_action(action)
+
+    # Per-entry cap for rendered originalPayload JSON, so a page of large
+    # payloads cannot blow past the MCP transport's response limits.
+    _MAX_RENDERED_PAYLOAD_CHARS = 2000
+    # Bound on the COMPLETE rendered response: entries stop being appended
+    # once the budget is spent (a page of many per-entry-capped payloads can
+    # still exceed the transport limit otherwise).
+    _MAX_RENDERED_RESPONSE_CHARS = 24000
+
+    async def _handle_get_ingestion_failures(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """List AI transactions rejected by strict ingestion mode.
+
+        Newest-first, paginated; each entry carries structured error details
+        and the prompt-redacted original payload, so a rejected integration
+        can be diagnosed without server access.
+        """
+        page = arguments.get("page", 0)
+        size = arguments.get("size", 20)
+        error_code = arguments.get("error_code")
+
+        self._validate_page_size(size)
+
+        try:
+            client = await self.get_client(ctx=ctx)
+            filters = {"errorCode": error_code} if error_code else {}
+            response = await client.get_ingestion_failures(page=page, size=size, **filters)
+            failures = client._extract_embedded_data(response)
+            page_info = client._extract_pagination_info(response)
+
+            if not failures:
+                scope = f" with error code '{error_code}'" if error_code else ""
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            f"**Ingestion Failures**\n\nNo strict-ingestion rejections{scope} "
+                            "for this tenant. Either strict mode is disabled or every "
+                            "transaction referenced known entities."
+                        ),
+                    )
+                ]
+
+            lines = [
+                f"**Ingestion Failures** (page {page + 1}, "
+                f"{page_info.get('totalElements', len(failures))} total)\n"
+            ]
+            rendered_chars = len(lines[0])
+            rendered_count = 0
+            for failure in failures:
+                entry_lines = []
+                ts = failure.get("failureTimestamp", "unknown time")
+                entry_lines.append(f"### {ts}")
+                for err in failure.get("errors") or []:
+                    code = err.get("errorCode", "UNKNOWN")
+                    message = err.get("message", "")
+                    entry_lines.append(f"- **{code}**: {message}")
+                payload = failure.get("originalPayload")
+                if payload:
+                    # Bound per-entry rendering: callers control page size, and
+                    # an oversized MCP response gets rejected by the transport.
+                    rendered = json.dumps(payload, indent=2, default=str)
+                    if len(rendered) > self._MAX_RENDERED_PAYLOAD_CHARS:
+                        rendered = (
+                            rendered[: self._MAX_RENDERED_PAYLOAD_CHARS]
+                            + "\n... (payload truncated; fetch the entry via the REST API for the full payload)"
+                        )
+                    entry_lines.append(f"```json\n{rendered}\n```")
+                entry_text_len = sum(len(line) + 1 for line in entry_lines)
+                # Bound the COMPLETE response: stop before this entry would
+                # blow the budget, and say how many were cut and how to narrow.
+                if rendered_chars + entry_text_len > self._MAX_RENDERED_RESPONSE_CHARS:
+                    remaining = len(failures) - rendered_count
+                    lines.append(
+                        f"\n... output truncated: {remaining} more entries on this page "
+                        "were not rendered. Use a smaller size, filter with error_code, "
+                        "or paginate to see them."
+                    )
+                    break
+                lines.extend(entry_lines)
+                rendered_chars += entry_text_len
+                rendered_count += 1
+            lines.append(
+                "\nEntries are newest-first; the original payload is prompt-redacted "
+                "by the server. Filter with error_code, paginate with page/size."
+            )
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        except ToolError:
+            raise
+        except PermissionError:
+            # Auth failures must fail closed — never mask as a tool-error envelope.
+            raise
+        except Exception as e:
+            logger.error(f"Failed to retrieve ingestion failures: {e}")
+            raise ToolError(
+                message=f"Failed to retrieve ingestion failures: {str(e)}",
+                error_code=ErrorCodes.API_ERROR,
+                field="ingestion_failures",
+                suggestions=[
+                    "Verify the tenant id is available (auto-discovered from the API key)",
+                    "Check API connectivity and authentication",
+                    "Strict-ingestion rejections only exist when strict mode has been enabled",
+                ],
+            )
+
+    async def _handle_set_strict_ingestion_mode(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Toggle the tenant's strict ingestion mode, guarded by confirm.
+
+        Strict mode changes ingestion behavior for the whole tenant, so the
+        toggle requires an explicit confirm=true; without it the handler
+        returns a preview of the consequences and makes no API call.
+        """
+        enabled = arguments.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ToolError(
+                message="set_strict_ingestion_mode requires 'enabled' (boolean)",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="enabled",
+                value=enabled,
+                suggestions=[
+                    "Pass enabled=true to turn strict mode on, enabled=false to turn it off",
+                    "Add confirm=true to apply the change",
+                ],
+            )
+
+        # Only the boolean True applies the change — loosely typed MCP
+        # arguments (confirm="false", confirm=1) must not bypass the guard.
+        if arguments.get("confirm") is not True:
+            state = "ENABLE" if enabled else "DISABLE"
+            effect = (
+                "AI ingestion will REJECT transactions that reference entities "
+                "(Product, Subscriber, Credential, Consuming Organization) which do "
+                "not already exist for the tenant, instead of auto-creating them. "
+                "Rejections are listed by get_ingestion_failures."
+                if enabled
+                else "AI ingestion will resume AUTO-CREATING unknown referenced "
+                "entities (Product, Subscriber, Credential, Consuming Organization) "
+                "instead of rejecting those transactions."
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"**Confirmation Required — {state} strict ingestion mode**\n\n"
+                        f"This changes ingestion behavior for the entire tenant:\n\n{effect}\n\n"
+                        f"To apply, repeat the call with confirm=true:\n"
+                        f'`set_strict_ingestion_mode(enabled={str(enabled).lower()}, confirm=true)`'
+                    ),
+                )
+            ]
+
+        try:
+            client = await self.get_client(ctx=ctx)
+            result = await client.set_strict_ingestion_mode(enabled)
+            new_state = result.get("strictIngestionMode")
+            if not isinstance(new_state, bool):
+                # The PATCH succeeded but the response did not carry the
+                # field — report that honestly instead of echoing the
+                # requested value back as the server's confirmed state.
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            "**Strict Ingestion Mode — change accepted, state not confirmed**\n\n"
+                            "The server accepted the request but its response did not include "
+                            "strictIngestionMode, so the resulting state could not be verified. "
+                            "Check the tenant's current state before relying on it."
+                        ),
+                    )
+                ]
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"**Strict Ingestion Mode Updated**\n\n"
+                        f"- **State**: {'enabled' if new_state else 'disabled'}\n"
+                        f"- **Tenant**: {result.get('id', 'current')}\n\n"
+                        + (
+                            "Transactions referencing unknown entities will now be "
+                            "rejected — monitor them with get_ingestion_failures."
+                            if new_state
+                            else "Unknown referenced entities will now be auto-created again."
+                        )
+                    ),
+                )
+            ]
+        except ToolError:
+            raise
+        except PermissionError:
+            # Auth failures must fail closed — never mask as a tool-error envelope.
+            raise
+        except Exception as e:
+            logger.error(f"Failed to toggle strict ingestion mode: {e}")
+            raise ToolError(
+                message=f"Failed to toggle strict ingestion mode: {str(e)}",
+                error_code=ErrorCodes.API_ERROR,
+                field="strict_ingestion_mode",
+                suggestions=[
+                    "Verify the tenant id is available (auto-discovered from the API key)",
+                    "Check that your API key can manage the tenant",
+                ],
+            )
 
     async def _handle_get_internal_logs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -402,6 +622,9 @@ No log entries found for analysis. This may be expected for integration logs.
             return self.response_formatter.format_log_response(response, "internal", page, size)
 
         except ToolError:
+            raise
+        except PermissionError:
+            # Auth failures must fail closed — never mask as a tool-error envelope.
             raise
         except Exception as e:
             logger.error(f"Failed to retrieve internal logs: {e}")
@@ -425,6 +648,9 @@ No log entries found for analysis. This may be expected for integration logs.
             return self.response_formatter.format_log_response(response, "integration", page, size)
 
         except ToolError:
+            raise
+        except PermissionError:
+            # Auth failures must fail closed — never mask as a tool-error envelope.
             raise
         except Exception as e:
             logger.error(f"Failed to retrieve integration logs: {e}")
@@ -450,6 +676,9 @@ No log entries found for analysis. This may be expected for integration logs.
             return self.response_formatter.format_multi_page_response(all_entries, log_type, pages)
 
         except ToolError:
+            raise
+        except PermissionError:
+            # Auth failures must fail closed — never mask as a tool-error envelope.
             raise
         except Exception as e:
             logger.error(f"Failed to get recent logs: {e}")
@@ -501,6 +730,9 @@ No log entries found for analysis. This may be expected for integration logs.
                 )
         except ToolError:
             raise
+        except PermissionError:
+            # Auth failures must fail closed — never mask as a tool-error envelope.
+            raise
         except Exception as e:
             logger.error(f"Failed to search logs: {e}")
             raise ToolError(
@@ -524,6 +756,9 @@ No log entries found for analysis. This may be expected for integration logs.
             return [TextContent(type="text", text=response_text)]
 
         except ToolError:
+            raise
+        except PermissionError:
+            # Auth failures must fail closed — never mask as a tool-error envelope.
             raise
         except Exception as e:
             logger.error(f"Failed to analyze operations: {e}")

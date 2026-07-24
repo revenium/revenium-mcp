@@ -165,7 +165,7 @@ Unified system setup and onboarding combining welcome guidance, setup checklist,
 ### Setup Validation
 - `check_requirements` - Verify critical configuration items
 - `check_optional` - Check recommended settings
-- `check_system_status` - Validate connectivity and health
+- `check_system_status` - Validate connectivity, health, and per-pathway data ingestion
 - `get_recommendations` - Get personalized setup guidance
 
 ### Email Configuration
@@ -201,76 +201,76 @@ Use `get_examples()` for detailed usage examples and parameter guidance.
 
 ### Show Welcome Message
 ```json
-{{"action": "show_welcome"}}
+{"action": "show_welcome"}
 ```
 
 ### Check Setup Status
 ```json
-{{"action": "setup_checklist"}}
+{"action": "setup_checklist"}
 ```
 
 ### View Environment Variables
 ```json
-{{"action": "environment_status"}}
+{"action": "environment_status"}
 ```
 
 ### Get Next Steps
 ```json
-{{"action": "next_steps"}}
+{"action": "next_steps"}
 ```
 
 ### Complete Setup
 ```json
-{{"action": "complete_setup", "confirm_completion": true}}
+{"action": "complete_setup", "confirm_completion": true}
 ```
 
 ## **Setup Validation Examples**
 
 ### Check Critical Requirements
 ```json
-{{"action": "check_requirements"}}
+{"action": "check_requirements"}
 ```
 
 ### Check Optional Settings
 ```json
-{{"action": "check_optional"}}
+{"action": "check_optional"}
 ```
 
 ### Validate System Health
 ```json
-{{"action": "check_system_status"}}
+{"action": "check_system_status"}
 ```
 
 ### Get Recommendations
 ```json
-{{"action": "get_recommendations"}}
+{"action": "get_recommendations"}
 ```
 
 ## **Email Configuration Examples**
 
 ### Check Email Status
 ```json
-{{"action": "check_status"}}
+{"action": "check_status"}
 ```
 
 ### Update Email Address
 ```json
-{{"action": "update_email", "email": "alerts@company.com"}}
+{"action": "update_email", "email": "alerts@company.com"}
 ```
 
 ### Validate Email Format
 ```json
-{{"action": "validate_email", "email": "test@example.com"}}
+{"action": "validate_email", "email": "test@example.com"}
 ```
 
 ### Get Email Setup Guidance
 ```json
-{{"action": "setup_guidance"}}
+{"action": "setup_guidance"}
 ```
 
 ### Test Email Configuration
 ```json
-{{"action": "test_configuration"}}
+{"action": "test_configuration"}
 ```
 
 ## **Complete Setup Workflows**

@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import sys
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 
@@ -498,6 +499,40 @@ class ResponseCacheManager:
 response_cache = ResponseCacheManager()
 
 
+def _resolve_response_cache(func: Callable[..., Any]) -> "ResponseCacheManager":
+    """Resolve the response-cache singleton from the decorated function's own module.
+
+    The wrapper must read the cache via the *caller module's* ``response_cache``
+    name rather than closing over this module's global. Callers (and the test
+    suite) neutralise the cache by patching ``<caller_module>.response_cache``
+    (e.g. ``...metering_management.response_cache``); binding the closure to this
+    module's global would make that patch inert and let a stale cached result be
+    returned before the wrapped body ever runs (BACK-2382). Fall back to this
+    module's own singleton if the caller module has no such name.
+    """
+    module = sys.modules.get(func.__module__)
+    return getattr(module, "response_cache", response_cache)
+
+
+def _cache_key_data(func: Callable[..., Any], args: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a deterministic, content-addressed cache key payload.
+
+    ``str(args)`` embeds the ``repr`` of a bound method's ``self``/``cls`` — which
+    for an object without a custom ``__repr__`` includes its memory address. That
+    made the key non-deterministic across instances and, when CPython reused a
+    freed address, produced cross-instance key collisions that returned another
+    instance's cached result (BACK-2382). Drop the leading ``self``/``cls`` so the
+    key reflects only the call's actual inputs.
+    """
+    qualname = getattr(func, "__qualname__", func.__name__)
+    # A class-qualified method has a dotted qualname like "Cls.method"; a nested
+    # function has "<locals>" in its qualname and is not a method. Strip the
+    # leading receiver only for the former.
+    is_method = "." in qualname and "<locals>" not in qualname
+    key_args = args[1:] if (is_method and args) else args
+    return {"function": qualname, "args": str(key_args), "kwargs": kwargs}
+
+
 def cache_response(
     cache_type: str, ttl_seconds: Optional[int] = None
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -505,16 +540,15 @@ def cache_response(
         @wraps(func)
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
             ctx = kwargs.pop("ctx", None)
-            cache_key_data = {"function": func.__name__, "args": str(args), "kwargs": kwargs}
+            cache = _resolve_response_cache(func)
+            cache_key_data = _cache_key_data(func, args, kwargs)
 
-            cached_result = await response_cache.get_cached_response(
-                cache_type, cache_key_data, ctx=ctx
-            )
+            cached_result = await cache.get_cached_response(cache_type, cache_key_data, ctx=ctx)
             if cached_result is not None:
                 return cached_result
 
             result = await func(*args, **kwargs)
-            await response_cache.set_cached_response(
+            await cache.set_cached_response(
                 cache_type, cache_key_data, result, ttl_seconds, ctx=ctx
             )
             return result
@@ -522,12 +556,13 @@ def cache_response(
         @wraps(func)
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
             ctx = kwargs.pop("ctx", None)
-            cache_key_data = {"function": func.__name__, "args": str(args), "kwargs": kwargs}
+            cache = _resolve_response_cache(func)
+            cache_key_data = _cache_key_data(func, args, kwargs)
 
             try:
                 loop = asyncio.get_running_loop()
                 cached_result = loop.run_until_complete(
-                    response_cache.get_cached_response(cache_type, cache_key_data, ctx=ctx)
+                    cache.get_cached_response(cache_type, cache_key_data, ctx=ctx)
                 )
                 if cached_result is not None:
                     return cached_result
@@ -539,7 +574,7 @@ def cache_response(
             try:
                 loop = asyncio.get_running_loop()
                 loop.run_until_complete(
-                    response_cache.set_cached_response(
+                    cache.set_cached_response(
                         cache_type, cache_key_data, result, ttl_seconds, ctx=ctx
                     )
                 )

@@ -1047,3 +1047,50 @@ class TestProcessAgentDataEdgeCases:
         data = [{"groupName": "solo-agent", "metrics": [{"metricResult": 700.0}]}]
         result = self.analyzer._process_agent_data(data)
         assert result[0]["percentage"] == pytest.approx(100.0)
+
+
+# ---------------------------------------------------------------------------
+# get_agent_costs — costSources filter passthrough (BACK-2348)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGetAgentCostsCostSourceFilter:
+    """costSources filter maps to the new API's costSource query param."""
+
+    async def test_filter_sent_as_cost_source_param_on_new_api(self, monkeypatch):
+        """filters.costSources reaches the wire as repeated costSource values."""
+        monkeypatch.setenv("REVENIUM_USE_NEW_ANALYTICS_API", "true")
+        monkeypatch.setenv("REVENIUM_APP_BASE_URL", "https://app.dev.example")
+        analyzer = _make_analyzer()
+        analyzer.client.get.return_value = []
+        await analyzer.get_agent_costs(
+            "SEVEN_DAYS", "TOTAL", filters={"costSources": ["provider_billing"]}
+        )
+        analyzer.client.get.assert_awaited_once()
+        _, kwargs = analyzer.client.get.call_args
+        assert kwargs["params"]["costSource"] == ["provider_billing"]
+
+    async def test_no_filter_omits_cost_source_param(self, monkeypatch):
+        """Omitting the filter keeps costSource off the request entirely."""
+        monkeypatch.setenv("REVENIUM_USE_NEW_ANALYTICS_API", "true")
+        monkeypatch.setenv("REVENIUM_APP_BASE_URL", "https://app.dev.example")
+        analyzer = _make_analyzer()
+        analyzer.client.get.return_value = []
+        await analyzer.get_agent_costs("SEVEN_DAYS", "TOTAL")
+        analyzer.client.get.assert_awaited_once()
+        _, kwargs = analyzer.client.get.call_args
+        assert "costSource" not in kwargs["params"]
+
+    async def test_filter_on_legacy_api_raises_validation_error(self, monkeypatch):
+        """The legacy profitstream endpoint has no costSource param; failing
+        loudly beats silently returning unfiltered data labeled as filtered."""
+        from src.revenium_mcp_server.analytics.validation import ValidationError
+
+        monkeypatch.setenv("REVENIUM_USE_NEW_ANALYTICS_API", "false")
+        analyzer = _make_analyzer()
+        with pytest.raises(ValidationError, match="new analytics API"):
+            await analyzer.get_agent_costs(
+                "SEVEN_DAYS", "TOTAL", filters={"costSources": ["provider_billing"]}
+            )
+        analyzer.client.get.assert_not_called()

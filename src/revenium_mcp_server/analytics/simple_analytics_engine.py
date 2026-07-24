@@ -300,7 +300,9 @@ class AgentCostsProcessor(AnalyticsProcessor):
     async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Fetch agent costs data."""
         return await self.analyzer.get_agent_costs(
-            period=params["period"], aggregation=params["aggregation"]
+            period=params["period"],
+            aggregation=params["aggregation"],
+            filters=params.get("filters"),
         )
 
     def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
@@ -554,6 +556,137 @@ class SimpleAnalyticsEngine:
         """
         params = AnalyticsParams(operation_type="provider costs", kwargs=kwargs)
         return await self.provider_processor.process_analytics_request(params)
+
+    async def get_transaction_count(self, **kwargs: Any) -> str:
+        """
+        Get the team's aggregate transaction volume for a period.
+
+        A single real total from the transaction-count-by-team endpoint —
+        not derived from cost. Defaults to SEVEN_DAYS when no period is given.
+
+        Args:
+            **kwargs: Parameters including period
+
+        Returns:
+            Formatted transaction volume response
+        """
+        period = self.validator.validate_period(str(kwargs.get("period") or "SEVEN_DAYS"))
+
+        count = await self.analyzer.get_transaction_count(period)
+
+        if count is None:
+            return f"""# **Transaction Volume**
+
+## **No Data Available**
+
+**Time Period**: {period}
+
+No transaction count was returned for the specified period.
+
+**Suggestions:**
+- Try a longer time period (e.g., THIRTY_DAYS)
+- Check if there was any AI activity during this period
+"""
+
+        return f"""# **Transaction Volume**
+
+**Time Period**: {period}
+**Total Transactions**: {count:,}
+
+Scope: your team's transactions on the analytics API — the same universe the
+cost endpoints report (coding-assistant transactions excluded).
+"""
+
+    async def get_filter_options(self, **kwargs: Any) -> str:
+        """Enumerate the valid filter values for an analytics dimension.
+
+        Lets callers discover the real names the cost endpoints' ``filters``
+        arguments expect, instead of guessing and getting empty results.
+
+        Args:
+            **kwargs: ``dimension`` (required) and ``period`` (optional,
+                defaults to THIRTY_DAYS)
+
+        Returns:
+            Formatted, compact list of valid values with a usage-guidance line
+
+        Raises:
+            ValidationError: If the dimension is unknown (never hits the API)
+        """
+        dimension = str(kwargs.get("dimension") or "").strip()
+        period = self.validator.validate_period(str(kwargs.get("period") or "THIRTY_DAYS"))
+        raw_page = kwargs.get("page") or 0
+        try:
+            page = max(0, int(raw_page))
+        except (TypeError, ValueError):
+            page = 0
+
+        values = await self.analyzer.get_analytics_filter_options(dimension, period)
+
+        # Dimension-aware usage guidance: pointing every dimension at
+        # filters.agents sends callers to the wrong argument.
+        _GUIDANCE_BY_DIMENSION = {
+            "agents": "filters.agents on get_user_costs, or the agents argument on get_task_completion",
+            "models": "filters.models on get_user_costs",
+            "providers": "filters.providers on get_user_costs, or the providers argument on get_token_breakdown",
+            "users": "filters.users on get_user_costs",
+        }
+        specific = _GUIDANCE_BY_DIMENSION.get(dimension.replace("-", "_").replace("_", "-"))
+        if specific is None:
+            specific = _GUIDANCE_BY_DIMENSION.get(dimension)
+        guidance = (
+            f"Use these values in {specific}."
+            if specific
+            else "Use these values in the corresponding filter arguments on the cost actions."
+        )
+
+        if not values:
+            return f"""# **Filter Options: {dimension}**
+
+**Time Period**: {period}
+
+No values found for this dimension in the selected period.
+
+{guidance}
+"""
+
+        ordered = sorted(values)
+        total = len(ordered)
+        cap = 100
+        # The server returns the full set (it ignores page/size — live-
+        # verified), so slices are client-side over the sorted list: callers
+        # retrieve the rest with page=1, page=2, ...
+        start = page * cap
+        if start >= total > 0:
+            # A page past the end must not render "values 101-100 of 40".
+            return f"""# **Filter Options: {dimension}**
+
+**Time Period**: {period}
+
+Page {page} is beyond the end — this dimension has {total} value(s). Pass page=0 for the first slice.
+
+{guidance}
+"""
+        shown = ordered[start : start + cap]
+        lines = "\n".join(f"- {v}" for v in shown)
+        overflow = ""
+        if total > start + len(shown):
+            overflow = (
+                f"\n\n_Showing values {start + 1}\u2013{start + len(shown)} of {total} — "
+                f"pass page={page + 1} for the next slice, or narrow the period._"
+            )
+        elif page > 0:
+            overflow = f"\n\n_Showing values {start + 1}\u2013{start + len(shown)} of {total}._"
+
+        return f"""# **Filter Options: {dimension}**
+
+**Time Period**: {period}
+**Values** ({total}):
+
+{lines}{overflow}
+
+{guidance}
+"""
 
     async def get_model_costs(self, **kwargs: Any) -> str:
         """

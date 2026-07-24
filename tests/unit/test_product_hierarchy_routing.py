@@ -112,11 +112,11 @@ def _make_hierarchy_manager(client=None):
     """Build a ProductHierarchyManager with mocked services."""
     client = client or _make_client()
     with patch(
-        "src.revenium_mcp_server.tools_decomposed.product_management.hierarchy_navigation_service"
+        "src.revenium_mcp_server.tools_decomposed.product_management.get_hierarchy_navigation_service"
     ) as mock_nav, patch(
-        "src.revenium_mcp_server.tools_decomposed.product_management.entity_lookup_service"
+        "src.revenium_mcp_server.tools_decomposed.product_management.get_entity_lookup_service"
     ) as mock_lookup, patch(
-        "src.revenium_mcp_server.tools_decomposed.product_management.cross_tier_validator"
+        "src.revenium_mcp_server.tools_decomposed.product_management.get_cross_tier_validator"
     ) as mock_validator:
         mock_nav_instance = MagicMock()
         mock_nav.return_value = mock_nav_instance

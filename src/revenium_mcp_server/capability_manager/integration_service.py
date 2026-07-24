@@ -216,6 +216,18 @@ class UCMIntegrationService:
             Dictionary containing health metrics
         """
         if not self._initialized:
+            from ..auth.auth_mode import read_auth_mode
+
+            # In clerk/OAuth mode there is no static API key at startup, so UCM never
+            # initializes — expected, not an error: tools run on static capabilities.
+            if read_auth_mode() == "clerk":
+                return {
+                    "status": "static_capabilities",
+                    "detail": (
+                        "UCM dynamic capabilities are unavailable by design in Clerk/OAuth "
+                        "mode; tools use static capabilities and operate normally."
+                    ),
+                }
             return {"status": "not_initialized", "error": "UCM integration service not initialized"}
 
         ucm_health = await self.ucm.get_health_status() if self.ucm else {}

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Any, Optional
 
 from loguru import logger
 
 from . import ConfigManager
+from ..config_store import get_config_value
+from ..constants import DEFAULT_BASE_URL
 from .api_key_scope import APIKeyScope
 from .tenant_context import TenantContext
 
@@ -15,14 +17,18 @@ class TenantResolver(ABC):
     """Abstract resolver that produces a TenantContext from JWT claims."""
 
     @abstractmethod
-    def resolve(self, claims: dict) -> TenantContext:
-        """Map verified JWT claims to a TenantContext."""
+    def resolve(
+        self, claims: dict, *, clerk_jwt: Optional[str] = None
+    ) -> TenantContext:
+        """Map verified JWT claims (and the verified token itself) to a TenantContext."""
 
 
 class EnvTenantResolver(TenantResolver):
     """Backward-compat resolver: ignores claims, returns env-backed context."""
 
-    def resolve(self, claims: dict) -> TenantContext:
+    def resolve(
+        self, claims: dict, *, clerk_jwt: Optional[str] = None
+    ) -> TenantContext:
         cfg = ConfigManager().get_config()
         return TenantContext(
             team_id=cfg.team_id,
@@ -33,44 +39,62 @@ class EnvTenantResolver(TenantResolver):
 
 
 class ClerkTenantResolver(TenantResolver):
-    """Maps Clerk JWT claims + shared REVENIUM_API_KEY → TenantContext."""
+    """Maps Clerk JWT claims to a TenantContext carrying the caller's own JWT.
+
+    Multi-tenant: the tenant comes from the JWT, not from deployment env.
+    Downstream calls authenticate with the forwarded JWT — no shared API key.
+    """
 
     REQUIRED_CLAIMS = ("revenium_team_id", "tenant_id", "sub")
 
-    def __init__(self) -> None:
-        self._cfg = ConfigManager().get_config()
-        self._expected_tenant_id = self._cfg.tenant_id
-        if not self._expected_tenant_id:
-            raise RuntimeError(
-                "REVENIUM_TENANT_ID must be set when AUTH_MODE=clerk "
-                "(used to validate JWT tenant_id matches the deployed tenant)."
-            )
-
-    def resolve(self, claims: dict) -> TenantContext:
+    def resolve(
+        self, claims: dict, *, clerk_jwt: Optional[str] = None
+    ) -> TenantContext:
+        resolved = {c: _get_claim(claims, c) for c in self.REQUIRED_CLAIMS}
         missing = [
             c for c in self.REQUIRED_CLAIMS
-            if not (isinstance(claims.get(c), str) and claims.get(c).strip())
+            if not (isinstance(resolved[c], str) and resolved[c].strip())
         ]
         if missing:
             raise PermissionError(
                 f"JWT is missing required claim(s): {', '.join(missing)}"
             )
-
-        jwt_tenant = claims["tenant_id"]
-        if jwt_tenant != self._expected_tenant_id:
+        if not clerk_jwt or not clerk_jwt.strip():
             raise PermissionError(
-                "JWT tenant_id does not match this deployment"
+                "No verified access token available to forward downstream"
             )
 
+        # ConfigManager requires REVENIUM_API_KEY, which clerk mode no longer
+        # has — resolve the downstream base URL directly (same pattern as
+        # ApiKeyAuthMiddleware).
+        base_url = get_config_value("REVENIUM_BASE_URL") or DEFAULT_BASE_URL
         return TenantContext(
-            team_id=claims["revenium_team_id"],
-            tenant_id=jwt_tenant,
-            user_id=claims["sub"],
-            api_key=self._cfg.api_key,
-            base_url=self._cfg.base_url,
+            team_id=resolved["revenium_team_id"],
+            tenant_id=resolved["tenant_id"],
+            user_id=resolved["sub"],
+            clerk_jwt=clerk_jwt,
+            base_url=base_url,
             scopes=_parse_scopes(claims.get("scope")),
-            api_key_scopes=_parse_api_key_scopes(claims.get("revenium_api_scopes")),
+            api_key_scopes=_parse_api_key_scopes(
+                _get_claim(claims, "revenium_api_scopes")
+            ),
         )
+
+
+def _get_claim(claims: dict, name: str) -> Any:
+    """Read a claim top-level, falling back to nested ``private_metadata``.
+
+    Clerk OAuth ID tokens carry custom user claims nested under a
+    ``private_metadata`` object; session-token-shaped JWTs carry them
+    top-level. Prefer the top-level value when present.
+    """
+    top = claims.get(name)
+    if top not in (None, ""):
+        return top
+    pm = claims.get("private_metadata")
+    if isinstance(pm, dict):
+        return pm.get(name)
+    return None
 
 
 def _parse_scopes(scope_claim) -> Optional[list[str]]:

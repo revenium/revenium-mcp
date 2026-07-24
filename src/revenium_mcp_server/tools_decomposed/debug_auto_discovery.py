@@ -311,7 +311,7 @@ The diagnostic will show:
 
 ## **Integration with Other Tools**
 - Run this before using other Revenium tools if you encounter setup issues
-- Use results to guide configuration of welcome_and_setup and setup_checklist tools
+- Use results to guide configuration of system_setup tool
 - Provides foundation for configuration_status comprehensive diagnostics
 """
         return [TextContent(type="text", text=examples_text)]

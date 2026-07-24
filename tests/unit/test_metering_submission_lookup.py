@@ -942,7 +942,7 @@ class TestBuildApiResultEntry:
         metadata = {"pages_searched": 2, "transactions_examined": 2000}
 
         result = self.mgr._build_api_result_entry(
-            "tx_001", True, data, metadata, max_retries=3
+            "tx_001", True, data, metadata, attempts=3
         )
         assert result["found"] is True
         assert result["source"] == "api"
@@ -952,7 +952,7 @@ class TestBuildApiResultEntry:
     def test_failure_returns_not_found_with_message(self):
         metadata = {"pages_searched": 5, "transactions_examined": 5000}
         result = self.mgr._build_api_result_entry(
-            "tx_001", False, None, metadata, max_retries=3
+            "tx_001", False, None, metadata, attempts=3
         )
         assert result["found"] is False
         assert result["source"] == "api"
@@ -961,14 +961,14 @@ class TestBuildApiResultEntry:
 
     def test_failure_without_metadata_has_simple_message(self):
         result = self.mgr._build_api_result_entry(
-            "tx_001", False, None, {}, max_retries=3
+            "tx_001", False, None, {}, attempts=3
         )
         assert result["found"] is False
         assert "tx_001" in result["message"]
 
     def test_failure_with_none_metadata(self):
         result = self.mgr._build_api_result_entry(
-            "tx_001", False, None, None, max_retries=3
+            "tx_001", False, None, None, attempts=3
         )
         assert result["found"] is False
 
@@ -976,7 +976,7 @@ class TestBuildApiResultEntry:
         """success=True but data=None should still mark as not-found."""
         metadata = {"pages_searched": 1}
         result = self.mgr._build_api_result_entry(
-            "tx_001", True, None, metadata, max_retries=3
+            "tx_001", True, None, metadata, attempts=3
         )
         assert result["found"] is False
 
@@ -1063,9 +1063,12 @@ class TestProcessApiResults:
 
         call_count = 0
 
-        async def mock_retry(op, tid, max_retries, interval, name):
+        seen_retry_on_empty = []
+
+        async def mock_retry(op, tid, max_retries, interval, name, **kwargs):
             nonlocal call_count
             call_count += 1
+            seen_retry_on_empty.append(kwargs.get("retry_on_empty"))
             if tid == "tx_found":
                 return True, {"transactionId": tid}, {"found": True, "pages_searched": 1, "transactions_examined": 100}, None
             return False, None, {"found": False, "pages_searched": 5, "transactions_examined": 5000}, None
@@ -1084,6 +1087,10 @@ class TestProcessApiResults:
 
         assert len(results) == 2
         assert call_count == 2
+        # params in this test omits retry_on_empty — the lookup-specific
+        # fallback must be the prompt-not-found default (False), not the
+        # legacy retry-on-empty behavior.
+        assert seen_retry_on_empty == [False, False]
 
 
 # ===========================================================================
@@ -1600,3 +1607,151 @@ class TestBuildConfigurationObject:
         config = self.mgr._build_configuration_object(params)
         assert "transaction_ids" not in config
         assert "return_transaction_data" not in config
+
+
+class TestLookupNotFoundFastPath:
+    """A lookup for a nonexistent transaction must return promptly by default;
+    retry-on-empty is opt-in (explicit max_retries/retry_interval = the
+    post-submit polling flow), and transport errors keep retrying."""
+
+    def setup_method(self):
+        self.mgr = MeteringTransactionManager()
+
+    @pytest.mark.asyncio
+    async def test_retry_on_empty_false_returns_after_single_attempt(self):
+        call_count = 0
+
+        async def op():
+            nonlocal call_count
+            call_count += 1
+            return None, {}
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            success, result, _, error = await self.mgr._execute_with_retry(
+                op, "tx_bogus", max_retries=3, retry_interval=15,
+                operation_name="lookup", retry_on_empty=False,
+            )
+        assert success is False
+        assert call_count == 1
+        mock_sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retry_on_empty_false_still_retries_exceptions(self):
+        call_count = 0
+
+        async def op():
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("transient transport error")
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            success, _, _, error = await self.mgr._execute_with_retry(
+                op, "tx_bogus", max_retries=3, retry_interval=15,
+                operation_name="lookup", retry_on_empty=False,
+            )
+        assert success is False
+        assert call_count == 3
+        assert isinstance(error, RuntimeError)
+
+    def test_extract_parameters_defaults_to_no_empty_retry(self):
+        params = self.mgr._extract_lookup_parameters({"transaction_ids": ["tx_1"]})
+        assert params["retry_on_empty"] is False
+
+    def test_extract_parameters_explicit_knobs_enable_polling(self):
+        for knob in ({"max_retries": 3}, {"retry_interval": 15}):
+            params = self.mgr._extract_lookup_parameters(
+                {"transaction_ids": ["tx_1"], **knob}
+            )
+            assert params["retry_on_empty"] is True, f"knob {knob} should enable polling"
+
+    @pytest.mark.asyncio
+    async def test_default_lookup_searches_once_for_missing_transaction(self):
+        client = MagicMock()
+        search_calls = 0
+
+        async def fake_search(*args, **kwargs):
+            nonlocal search_calls
+            search_calls += 1
+            return None, {"transactions_examined": 0, "pages_searched": 1}
+
+        params = self.mgr._extract_lookup_parameters({"transaction_ids": ["tx_bogus"]})
+        with patch.object(self.mgr, "_search_transaction_pages", side_effect=fake_search), \
+             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            results = await self.mgr._process_api_results(client, ["tx_bogus"], params)
+
+        assert search_calls == 1
+        mock_sleep.assert_not_called()
+        assert results[0]["found"] is False
+
+    @pytest.mark.asyncio
+    async def test_explicit_polling_lookup_retries_on_missing_transaction(self):
+        client = MagicMock()
+        search_calls = 0
+
+        async def fake_search(*args, **kwargs):
+            nonlocal search_calls
+            search_calls += 1
+            return None, {"transactions_examined": 0, "pages_searched": 1}
+
+        params = self.mgr._extract_lookup_parameters(
+            {"transaction_ids": ["tx_bogus"], "max_retries": 3, "retry_interval": 15}
+        )
+        with patch.object(self.mgr, "_search_transaction_pages", side_effect=fake_search), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            results = await self.mgr._process_api_results(client, ["tx_bogus"], params)
+
+        assert search_calls == 3
+        assert results[0]["found"] is False
+
+    @pytest.mark.asyncio
+    async def test_not_found_result_reports_actual_attempts(self):
+        """A default (no-polling) not-found made ONE search pass — the result
+        entry must say attempts=1, not echo max_retries."""
+        client = MagicMock()
+
+        async def fake_search(*args, **kwargs):
+            return None, {"transactions_examined": 0, "pages_searched": 1}
+
+        params = self.mgr._extract_lookup_parameters({"transaction_ids": ["tx_bogus"]})
+        with patch.object(self.mgr, "_search_transaction_pages", side_effect=fake_search), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            results = await self.mgr._process_api_results(client, ["tx_bogus"], params)
+
+        assert results[0]["attempts"] == 1
+
+    @pytest.mark.asyncio
+    async def test_polling_not_found_reports_all_attempts(self):
+        client = MagicMock()
+
+        async def fake_search(*args, **kwargs):
+            return None, {"transactions_examined": 0, "pages_searched": 1}
+
+        params = self.mgr._extract_lookup_parameters(
+            {"transaction_ids": ["tx_bogus"], "max_retries": 3, "retry_interval": 15}
+        )
+        with patch.object(self.mgr, "_search_transaction_pages", side_effect=fake_search), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            results = await self.mgr._process_api_results(client, ["tx_bogus"], params)
+
+        assert results[0]["attempts"] == 3
+
+    @pytest.mark.asyncio
+    async def test_found_on_second_attempt_reports_two_attempts(self):
+        client = MagicMock()
+        calls = []
+
+        async def fake_search(*args, **kwargs):
+            calls.append(1)
+            if len(calls) < 2:
+                return None, {}
+            return {"transactionId": "tx_late"}, {"pages_searched": 2}
+
+        params = self.mgr._extract_lookup_parameters(
+            {"transaction_ids": ["tx_late"], "max_retries": 3, "retry_interval": 15}
+        )
+        with patch.object(self.mgr, "_search_transaction_pages", side_effect=fake_search), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            results = await self.mgr._process_api_results(client, ["tx_late"], params)
+
+        assert results[0]["found"] is True
+        assert results[0]["attempts"] == 2

@@ -641,16 +641,13 @@ class TestCustomerProfitability:
         result = self.p._process_customer_profitability(data, top_n=100)
         assert len(result) == 1
 
-    def test_transaction_count_estimated_from_cost(self):
+    def test_no_fabricated_transaction_fields(self):
+        # Cost-derived transaction estimates were removed: real volume comes
+        # from the transaction-count-by-team endpoint, not max(1, cost/0.01).
         data = _customer_data_multi([("X", 1.0, 10.0, 5.0)])
         result = self.p._process_customer_profitability(data, top_n=10)
-        assert result[0].transaction_count == 100  # 1.0 / 0.01
-        assert result[0].cost_per_transaction == pytest.approx(0.01, abs=0.001)
-
-    def test_zero_cost_transaction_count_default(self):
-        data = _customer_data_multi([("Free", 0.0, 100.0, 10.0)])
-        result = self.p._process_customer_profitability(data, top_n=10)
-        assert result[0].transaction_count == 1
+        assert not hasattr(result[0], "transaction_count")
+        assert not hasattr(result[0], "cost_per_transaction")
 
     def test_empty_cost_data(self):
         data = {
@@ -800,16 +797,12 @@ class TestProductProfitability:
         result = self.p._process_product_profitability(data, top_n=100)
         assert len(result) == 1
 
-    def test_transaction_count_estimated_from_cost(self):
+    def test_no_fabricated_transaction_fields(self):
+        # Same contract as the customer rows: no cost-derived count estimates.
         data = _product_data_multi([("X", 1.0, 10.0, 5.0)])
         result = self.p._process_product_profitability(data, top_n=10)
-        assert result[0].transaction_count == 100  # 1.0 / 0.01
-        assert result[0].cost_per_transaction == pytest.approx(0.01, abs=0.001)
-
-    def test_zero_cost_transaction_count_default(self):
-        data = _product_data_multi([("Free", 0.0, 100.0, 10.0)])
-        result = self.p._process_product_profitability(data, top_n=10)
-        assert result[0].transaction_count == 1
+        assert not hasattr(result[0], "transaction_count")
+        assert not hasattr(result[0], "cost_per_transaction")
 
     def test_empty_product_data(self):
         data = {

@@ -472,6 +472,45 @@ class TestListAiModelsTotalCount:
 # ===========================================================================
 
 
+class TestGetApiEndpointsContent:
+    """The self-doc must describe the real wire contract of the completions
+    read endpoints: teamId required on the list, real param names, the
+    MCP-injected vs REST-caller distinction, and per-endpoint auth headers.
+    The old text documented phantom params (transaction_ids/since/limit)
+    and omitted teamId entirely.
+    """
+
+    @pytest.mark.asyncio
+    async def test_completions_list_documents_real_params(self):
+        mgmt, _ = _make_mgmt_with_client()
+        result = await mgmt._handle_get_api_endpoints()
+        text = result[0].text
+        assert "`teamId` (required" in text
+        assert "`page`" in text and "`size`" in text and "`sort`" in text
+        assert "transaction_ids" not in text
+        assert "`since`" not in text
+        assert "`limit`" not in text
+
+    @pytest.mark.asyncio
+    async def test_distinguishes_mcp_injected_from_rest_supplied(self):
+        mgmt, _ = _make_mgmt_with_client()
+        result = await mgmt._handle_get_api_endpoints()
+        assert "MCP injects" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_by_id_endpoint_documents_spec_path_param(self):
+        mgmt, _ = _make_mgmt_with_client()
+        text = (await mgmt._handle_get_api_endpoints())[0].text
+        assert "completions/{id}" in text
+
+    @pytest.mark.asyncio
+    async def test_headers_are_per_endpoint_not_blanket_required(self):
+        mgmt, _ = _make_mgmt_with_client()
+        text = (await mgmt._handle_get_api_endpoints())[0].text
+        assert "each endpoint reads the one it requires" in text
+        assert "Request Headers (All Endpoints)" not in text
+
+
 class TestHandleActionIntegration:
     """Cover integration support actions routing."""
 

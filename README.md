@@ -38,11 +38,45 @@ If or when you're ready to turn AI costs into AI revenue, the Revenium MCP will 
 ### Profile-Based Tool Selection
 The MCP provides the appropriate tools for each use case depending on your chosen startup profile:
 - **Starter Profile (7 tools):** Cost monitoring, alerts, analytics, AI metering integration
-- **Business Profile (18 tools):** All Starter tools plus product management, customer management, subscriptions, billing, tool registry, AI insights
+- **Business Profile (20 tools):** All Starter tools plus product management, customer management, subscriptions, billing, tool registry, AI insights, AI agents and cost controls
 
 ## Getting Started
 
-### For Claude Code Users (Recommended)
+### Connect to the Hosted Server (Recommended — Nothing to Install)
+
+Revenium hosts the MCP server at `https://mcp.revenium.ai/mcp`. Authentication is an
+OAuth sign-in in your browser — no API key to copy and no local process to manage.
+
+**Claude Code:**
+```bash
+claude mcp add --transport http revenium https://mcp.revenium.ai/mcp
+```
+Then run `/mcp` inside Claude Code and choose **Authenticate** to complete the
+browser sign-in.
+
+**claude.ai (web & desktop):** Settings → Connectors → *Add custom connector* → paste
+`https://mcp.revenium.ai/mcp`.
+
+**Cursor and other MCP clients with remote-server support:**
+```json
+{
+  "mcpServers": {
+    "revenium": { "url": "https://mcp.revenium.ai/mcp" }
+  }
+}
+```
+Some clients declare the transport explicitly — if yours does, set its
+type/transport field to HTTP (for example `"type": "http"` in VS Code).
+
+Clients that only speak stdio can bridge with
+[`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
+```bash
+npx mcp-remote https://mcp.revenium.ai/mcp
+```
+
+Prefer to run the server yourself? Use any of the local options below.
+
+### For Claude Code Users (Local Install)
 
 1. **Install uv:**
    ```bash
@@ -171,8 +205,8 @@ the "First-time TLS" note above for the browser equivalent.
 
 Implements [Model Context Protocol](https://modelcontextprotocol.io/specification/2025-06-18) version **2025-06-18**.
 
-- **Framework:** FastMCP 3.2+
-- **Transport:** stdio
+- **Framework:** FastMCP (pinned to `fastmcp==3.2.0`)
+- **Transport:** stdio (default) and HTTP (set `TRANSPORT_MODE=http`)
 - **Protocol:** JSON-RPC 2.0
 
 ## Requirements
@@ -239,6 +273,11 @@ The MCP server uses environment variables for configuration. **The method you us
 
 ## Installation
 
+> **No install needed for most users:** the hosted server at
+> `https://mcp.revenium.ai/mcp` works with any remote-capable MCP client — see
+> [Connect to the Hosted Server](#connect-to-the-hosted-server-recommended--nothing-to-install).
+> The steps below are for running the server locally.
+
 ### Install Python Package
 
 **Option 1: Installation with uvx** (Recommended for local testing)
@@ -285,7 +324,7 @@ The MCP server supports two profiles to match your use case:
 | Profile | Tools | Target Users | Use Cases |
 |---------|-------|--------------|-----------|
 | **Starter** (default) | 7 tools | Cost monitoring & alerts | Cost analysis, AI transaction metering |
-| **Business** | 18 tools | Full platform | Product & subscription management, usage-based billing, comprehensive analytics, tool registry, AI insights |
+| **Business** | 20 tools | Full platform | Product & subscription management, usage-based billing, comprehensive analytics, tool registry, AI insights, AI agents, cost controls |
 
 The server uses the **Starter** profile by default. To use the **Business** profile, set the `TOOL_PROFILE` environment variable:
 
@@ -298,7 +337,7 @@ TOOL_PROFILE=starter
 EOF
 uvx revenium-mcp
 
-# Business Profile (18 tools) - Usage-based billing & AI Analytics
+# Business Profile (20 tools) - Usage-based billing & AI Analytics
 cat > .env << EOF
 REVENIUM_API_KEY=hak_your_api_key_here
 TOOL_PROFILE=business

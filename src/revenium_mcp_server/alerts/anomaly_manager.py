@@ -345,18 +345,18 @@ class AnomalyManager:
 
         return [TextContent(type="text", text=result_text)]
 
-    @handle_alert_tool_errors("create_anomaly")
-    async def create_anomaly(
-        self, client: ReveniumClient, anomaly_data: Dict[str, Any]
-    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Create a new AI anomaly with comprehensive validation.
+    def validate_anomaly_payload(self, anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate anomaly_data exactly as create_anomaly does, without creating.
 
-        Args:
-            client: Revenium API client
-            anomaly_data: Anomaly configuration data
+        Single validation source for the live create path AND dry-run, so the
+        two can never diverge (a false-green dry-run tells the caller a create
+        will succeed when it will 400).
 
         Returns:
-            Formatted response with created anomaly details
+            The validated/sanitized data dict.
+
+        Raises:
+            ValidationError: on any rule the live create would reject.
         """
         if not isinstance(anomaly_data, dict):
             raise ValidationError(
@@ -366,14 +366,6 @@ class AnomalyManager:
                 expected="Dictionary with anomaly fields",
             )
 
-        logger.info(f"Creating anomaly: {anomaly_data.get('name', 'Unnamed')}")
-
-        # DEBUG: Log the incoming anomaly_data for troubleshooting JSON issues
-        logger.debug(f"Incoming anomaly_data type: {type(anomaly_data)}")
-        logger.debug(f"Incoming anomaly_data keys: {list(anomaly_data.keys()) if isinstance(anomaly_data, dict) else 'Not a dict'}")
-        logger.debug(f"Incoming anomaly_data: {json.dumps(anomaly_data, indent=2, default=str)}")
-
-        # Apply comprehensive validation and sanitization
         validated_data: Dict[str, Any] = {}
 
         # Validate and sanitize each field
@@ -435,6 +427,25 @@ class AnomalyManager:
                         message="Team ID is required", field="team_id", expected="Non-empty string"
                     )
                 validated_data[field] = anomaly_data[field]
+
+        return validated_data
+
+    @handle_alert_tool_errors("create_anomaly")
+    async def create_anomaly(
+        self, client: ReveniumClient, anomaly_data: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Create a new AI anomaly with comprehensive validation.
+
+        Args:
+            client: Revenium API client
+            anomaly_data: Anomaly configuration data
+
+        Returns:
+            Formatted response with created anomaly details
+        """
+        logger.info(f"Creating anomaly: {anomaly_data.get('name', 'Unnamed') if isinstance(anomaly_data, dict) else 'Unnamed'}")
+
+        validated_data = self.validate_anomaly_payload(anomaly_data)
 
         # Convert to API format (only if we have detection_rules, otherwise use direct format)
         if "detection_rules" in validated_data:

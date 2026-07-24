@@ -121,21 +121,118 @@ class TestAlertManagement:
 
     @pytest.mark.asyncio
     async def test_create_simple_preview(self, alert_tools):
-        """Test create_simple action in preview mode."""
+        """create_simple with dry_run=True returns a preview and does NOT create."""
+        alert_tools.anomaly_manager.create_anomaly = AsyncMock()
         arguments = {
-            "anomaly_data": {
-                "name": "Test Simple Alert",
-                "email": "test@example.com",
-                "metric": "TOTAL_COST",
-                "threshold": 50,
-                "check_period_minutes": 1
-            },
-            "dry_run": True
+            "name": "Test Simple Alert",
+            "email": "test@example.com",
+            "metric": "TOTAL_COST",
+            "threshold": 50,
+            "dry_run": True,
         }
+
         result = await alert_tools.handle_action("create_simple", arguments)
 
-        assert len(result) >= 1
+        # No real create call was made.
+        alert_tools.anomaly_manager.create_anomaly.assert_not_called()
+        # Response is a single preview envelope, not an error envelope.
+        assert len(result) == 1
         assert isinstance(result[0], TextContent)
+        text = result[0].text
+        assert "DRY RUN" in text
+        assert "Test Simple Alert" in text
+        assert "TOTAL_COST" in text
+
+    @pytest.mark.asyncio
+    async def test_create_simple_executes_without_dry_run(self, alert_tools):
+        """create_simple without dry_run performs the real create."""
+        sentinel = [TextContent(type="text", text="created")]
+        alert_tools.anomaly_manager.create_anomaly = AsyncMock(return_value=sentinel)
+        arguments = {
+            "name": "Real Alert",
+            "email": "test@example.com",
+            "metric": "TOTAL_COST",
+            "threshold": 50,
+        }
+
+        result = await alert_tools.handle_action("create_simple", arguments)
+
+        alert_tools.anomaly_manager.create_anomaly.assert_awaited_once()
+        assert result == sentinel
+        _client, payload = alert_tools.anomaly_manager.create_anomaly.call_args.args
+        assert payload["label"] == "Real Alert"
+        assert payload["name"] == "Real Alert"
+        assert payload["alertType"] == "THRESHOLD"
+        assert payload["metricType"] == "TOTAL_COST"
+        assert payload["threshold"] == 50.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_slack_mixin_fails_closed_without_ctx(self, alert_tools, monkeypatch):
+        """In api_key mode with no tenant context, the Slack mixin path must
+        fail closed via get_client() rather than building an env client."""
+        from src.revenium_mcp_server.auth.claims_middleware import _current_tenant
+
+        monkeypatch.setenv("AUTH_MODE", "api_key")
+        token = _current_tenant.set(None)
+        try:
+            with pytest.raises(PermissionError):
+                await alert_tools.prompt_for_slack_addition({})
+        finally:
+            _current_tenant.reset(token)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_slack_selection_fails_closed_without_ctx(self, alert_tools, monkeypatch):
+        """handle_slack_configuration_selection must fail closed in api_key mode."""
+        from src.revenium_mcp_server.auth.claims_middleware import _current_tenant
+
+        monkeypatch.setenv("AUTH_MODE", "api_key")
+        token = _current_tenant.set(None)
+        try:
+            with pytest.raises(PermissionError):
+                await alert_tools.handle_slack_configuration_selection()
+        finally:
+            _current_tenant.reset(token)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_slack_apply_fails_closed_without_ctx(self, alert_tools, monkeypatch):
+        """apply_slack_to_notification_config must fail closed in api_key mode.
+
+        Passes an explicit slack_config_id so the method reaches get_client()
+        (it returns early when no slack_config_id can be resolved)."""
+        from src.revenium_mcp_server.auth.claims_middleware import _current_tenant
+
+        monkeypatch.setenv("AUTH_MODE", "api_key")
+        token = _current_tenant.set(None)
+        try:
+            with pytest.raises(PermissionError):
+                await alert_tools.apply_slack_to_notification_config(
+                    {}, slack_config_id="sc_test"
+                )
+        finally:
+            _current_tenant.reset(token)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_post_alert_prompting_fails_closed_without_ctx(self, alert_tools, monkeypatch):
+        """Post-creation Slack prompting must not swallow the mixin's fail-closed
+        PermissionError — the broad except must re-raise auth failures."""
+        from src.revenium_mcp_server.auth.claims_middleware import _current_tenant
+
+        monkeypatch.setenv("AUTH_MODE", "api_key")
+        monkeypatch.setattr(alert_tools, "should_prompt_for_slack", lambda *a, **k: True)
+        token = _current_tenant.set(None)
+        try:
+            with pytest.raises(PermissionError):
+                await alert_tools._post_alert_creation_prompting(
+                    alert_data={},
+                    notification_config={},
+                    alert_context={},
+                )
+        finally:
+            _current_tenant.reset(token)
 
 
 class TestAlertUpdateFlexibleParams:

@@ -17,6 +17,7 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
 
+from ..auth.claims_middleware import current_tenant_context
 from ..log_context import bind_tenant_context, clear_tenant_context, sanitize_error_message
 
 
@@ -52,6 +53,8 @@ async def standardized_tool_execution(
     from ..common.error_handling import IntrospectionError, ToolExecutionError
     from ..introspection.integration import introspection_integration
 
+    if ctx is None:
+        ctx = current_tenant_context()
     tokens = bind_tenant_context(ctx)
     start_time = time.time()
 
@@ -104,6 +107,9 @@ async def standardized_tool_execution(
                     action=action,
                 )
 
+        except PermissionError:
+            # Fail closed on auth failure — never retry via direct execution.
+            raise
         except (IntrospectionError, Exception) as e:
             # Introspection failed, fall back to direct execution
             introspection_time = (time.time() - introspection_start) * 1000
@@ -149,6 +155,9 @@ async def standardized_tool_execution(
 
                 return result
 
+            except PermissionError:
+                # Fail closed on auth failure from the direct path too.
+                raise
             except Exception as fallback_error:
                 # Performance monitoring for failure
                 total_time = (time.time() - start_time) * 1000
@@ -182,6 +191,11 @@ async def standardized_tool_execution(
                     action=action,
                 )
 
+    except PermissionError:
+        # Auth failures are expected control flow in clerk/api_key mode, not a
+        # system error — re-raise without the ERROR-level performance log below,
+        # which would otherwise create false-positive noise and alert triggers.
+        raise
     except Exception as e:
         total_time = (time.time() - start_time) * 1000
 

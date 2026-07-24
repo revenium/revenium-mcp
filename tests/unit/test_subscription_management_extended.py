@@ -1114,9 +1114,9 @@ class TestHandleHierarchyActions:
             navigation_path=["subscriptions", "products"],
         )
         with patch(
-            "src.revenium_mcp_server.tools_decomposed.subscription_management.hierarchy_navigation_service"
+            "src.revenium_mcp_server.tools_decomposed.subscription_management.get_hierarchy_navigation_service"
         ) as mock_nav:
-            mock_nav.get_product_for_subscription = AsyncMock(return_value=nav_result)
+            mock_nav.return_value.get_product_for_subscription = AsyncMock(return_value=nav_result)
             result = await sub_management.handle_action("get_product_details", {"subscription_id": "s1"})
         assert "Product Details" in result[0].text
 
@@ -1129,9 +1129,9 @@ class TestHandleHierarchyActions:
             navigation_path=["subscriptions", "credentials"],
         )
         with patch(
-            "src.revenium_mcp_server.tools_decomposed.subscription_management.hierarchy_navigation_service"
+            "src.revenium_mcp_server.tools_decomposed.subscription_management.get_hierarchy_navigation_service"
         ) as mock_nav:
-            mock_nav.get_credentials_for_subscription = AsyncMock(return_value=nav_result)
+            mock_nav.return_value.get_credentials_for_subscription = AsyncMock(return_value=nav_result)
             result = await sub_management.handle_action("get_credentials", {"subscription_id": "s1"})
         assert "Credentials" in result[0].text
 
@@ -1142,12 +1142,12 @@ class TestHandleHierarchyActions:
         mock_client.create_credential.return_value = {"id": "c_new"}
         val_result = FakeValidationResult(valid=True)
         with patch(
-            "src.revenium_mcp_server.tools_decomposed.subscription_management.cross_tier_validator"
+            "src.revenium_mcp_server.tools_decomposed.subscription_management.get_cross_tier_validator"
         ) as mock_val, patch(
             "src.revenium_mcp_server.tools_decomposed.subscription_management.get_config_value",
             return_value="o1",
         ):
-            mock_val.validate_hierarchy_operation = AsyncMock(return_value=val_result)
+            mock_val.return_value.validate_hierarchy_operation = AsyncMock(return_value=val_result)
             result = await sub_management.handle_action("create_with_credentials", {
                 "subscription_data": {"name": "S", "productId": "p1", "clientEmailAddress": "a@b.com"},
                 "credentials_data": {"name": "Key", "type": "api_key"},
@@ -1329,8 +1329,10 @@ class TestValidateAction:
 class TestMetadataProvider:
     async def test_get_tool_capabilities(self, sub_management):
         caps = await sub_management._get_tool_capabilities()
-        assert len(caps) == 3
+        # The read-only "Subscription Billing Reads" capability is included.
+        assert len(caps) == 4
         assert caps[0].name == "Subscription CRUD Operations"
+        assert any(c.name == "Subscription Billing Reads" for c in caps)
 
     async def test_get_supported_actions(self, sub_management):
         actions = await sub_management._get_supported_actions()

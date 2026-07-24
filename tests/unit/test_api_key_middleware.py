@@ -29,6 +29,17 @@ IDENTITY = ApiKeyIdentity(
     user_id="usr_123",
     tenant_id="tenant_abc",
     team_id="team_xyz",
+    team_ids=("team_xyz",),
+    email="cfo@acme.test",
+    roles=["ROLE_TENANT_ADMIN"],
+    scope_from_prefix="READ",
+)
+
+MULTI_TEAM_IDENTITY = ApiKeyIdentity(
+    user_id="usr_123",
+    tenant_id="tenant_abc",
+    team_id="team_xyz",
+    team_ids=("team_xyz", "team_second"),
     email="cfo@acme.test",
     roles=["ROLE_TENANT_ADMIN"],
     scope_from_prefix="READ",
@@ -217,6 +228,14 @@ async def test_middleware_does_not_invalidate_on_non_auth_error():
 
 
 @pytest.mark.asyncio
+async def test_verify_token_claims_include_team_ids():
+    verifier, _ = _verifier(validate_return=MULTI_TEAM_IDENTITY)
+    token = await verifier.verify_token("rev_rk_abcdef123456")
+    assert token is not None
+    assert token.claims["team_ids"] == ["team_xyz", "team_second"]
+
+
+@pytest.mark.asyncio
 async def test_middleware_resets_context_when_call_next_raises():
     """The _current_tenant ContextVar must be reset even on a downstream exception."""
     from src.revenium_mcp_server.auth.claims_middleware import current_tenant_context
@@ -248,3 +267,196 @@ async def test_middleware_resets_context_when_call_next_raises():
                 await mw.on_call_tool(MagicMock(), call_next)
 
     assert current_tenant_context() is None
+
+
+def _headers_patch(headers):
+    return patch(
+        "src.revenium_mcp_server.auth.api_key_middleware.get_http_headers",
+        return_value=headers,
+    )
+
+
+def _multi_team_access_token(*, include_team_ids: bool = True):
+    fake = MagicMock()
+    fake.token = "rev_rk_abcdef123456"
+    fake.claims = {
+        "tenant_id": "tenant_abc",
+        "team_id": "team_xyz",
+        "user_id": "usr_123",
+        "scope_from_prefix": "READ",
+    }
+    if include_team_ids:
+        fake.claims["team_ids"] = ["team_xyz", "team_second"]
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_valid_team_override_selects_requested_team():
+    from src.revenium_mcp_server.auth.claims_middleware import current_tenant_context
+
+    validator = MagicMock()
+    validator.invalidate = MagicMock()
+    mw = ApiKeyAuthMiddleware(validator=validator)
+
+    seen = {}
+
+    async def call_next(ctx):
+        seen["team_id"] = current_tenant_context().team_id
+        return "ok"
+
+    with _mock_config_manager(), _headers_patch(
+        {"x-revenium-team-id": "team_second"}
+    ), patch(
+        "src.revenium_mcp_server.auth.api_key_middleware.get_access_token",
+        return_value=_multi_team_access_token(),
+    ):
+        result = await mw.on_call_tool(MagicMock(), call_next)
+
+    assert result == "ok"
+    assert seen["team_id"] == "team_second"
+
+
+@pytest.mark.asyncio
+async def test_invalid_team_override_rejected_tool_not_called():
+    from src.revenium_mcp_server.auth.claims_middleware import current_tenant_context
+
+    validator = MagicMock()
+    validator.invalidate = MagicMock()
+    mw = ApiKeyAuthMiddleware(validator=validator)
+
+    called = []
+
+    async def call_next(ctx):
+        called.append(True)
+        return "ok"
+
+    with _mock_config_manager(), _headers_patch(
+        {"x-revenium-team-id": "team_forbidden"}
+    ), patch(
+        "src.revenium_mcp_server.auth.api_key_middleware.get_access_token",
+        return_value=_multi_team_access_token(),
+    ):
+        with pytest.raises(PermissionError, match="not available"):
+            await mw.on_call_tool(MagicMock(), call_next)
+
+    assert called == []
+    assert current_tenant_context() is None
+
+
+@pytest.mark.asyncio
+async def test_empty_header_falls_back_to_default_team():
+    from src.revenium_mcp_server.auth.claims_middleware import current_tenant_context
+
+    validator = MagicMock()
+    validator.invalidate = MagicMock()
+    mw = ApiKeyAuthMiddleware(validator=validator)
+
+    seen = {}
+
+    async def call_next(ctx):
+        seen["team_id"] = current_tenant_context().team_id
+        return "ok"
+
+    with _mock_config_manager(), _headers_patch(
+        {"x-revenium-team-id": "   "}
+    ), patch(
+        "src.revenium_mcp_server.auth.api_key_middleware.get_access_token",
+        return_value=_multi_team_access_token(),
+    ):
+        result = await mw.on_call_tool(MagicMock(), call_next)
+
+    assert result == "ok"
+    assert seen["team_id"] == "team_xyz"
+
+
+@pytest.mark.asyncio
+async def test_override_with_missing_team_ids_claim_fails_closed():
+    validator = MagicMock()
+    validator.invalidate = MagicMock()
+    mw = ApiKeyAuthMiddleware(validator=validator)
+
+    async def call_next(ctx):  # pragma: no cover - must not run
+        return "ok"
+
+    with _mock_config_manager(), _headers_patch(
+        {"x-revenium-team-id": "team_second"}
+    ), patch(
+        "src.revenium_mcp_server.auth.api_key_middleware.get_access_token",
+        return_value=_multi_team_access_token(include_team_ids=False),
+    ):
+        with pytest.raises(PermissionError, match="not available"):
+            await mw.on_call_tool(MagicMock(), call_next)
+
+
+@pytest.mark.asyncio
+async def test_verifier_to_middleware_round_trip_with_override():
+    """The claims produced by verify_token satisfy the middleware's override check."""
+    from src.revenium_mcp_server.auth.claims_middleware import current_tenant_context
+
+    verifier, validator = _verifier(validate_return=MULTI_TEAM_IDENTITY)
+    access_token = await verifier.verify_token("rev_rk_abcdef123456")
+    assert access_token is not None
+
+    mw = ApiKeyAuthMiddleware(validator=validator)
+    seen = {}
+
+    async def call_next(ctx):
+        seen["team_id"] = current_tenant_context().team_id
+        return "ok"
+
+    with _mock_config_manager(), _headers_patch(
+        {"x-revenium-team-id": "team_second"}
+    ), patch(
+        "src.revenium_mcp_server.auth.api_key_middleware.get_access_token",
+        return_value=access_token,
+    ):
+        result = await mw.on_call_tool(MagicMock(), call_next)
+
+    assert result == "ok"
+    assert seen["team_id"] == "team_second"
+
+
+@pytest.mark.asyncio
+async def test_absent_header_uses_default_team():
+    from src.revenium_mcp_server.auth.claims_middleware import current_tenant_context
+
+    validator = MagicMock()
+    validator.invalidate = MagicMock()
+    mw = ApiKeyAuthMiddleware(validator=validator)
+
+    seen = {}
+
+    async def call_next(ctx):
+        seen["team_id"] = current_tenant_context().team_id
+        return "ok"
+
+    with _mock_config_manager(), _headers_patch({}), patch(
+        "src.revenium_mcp_server.auth.api_key_middleware.get_access_token",
+        return_value=_multi_team_access_token(),
+    ):
+        result = await mw.on_call_tool(MagicMock(), call_next)
+
+    assert result == "ok"
+    assert seen["team_id"] == "team_xyz"
+
+
+@pytest.mark.asyncio
+async def test_override_with_none_team_ids_claim_fails_closed():
+    validator = MagicMock()
+    validator.invalidate = MagicMock()
+    mw = ApiKeyAuthMiddleware(validator=validator)
+
+    fake = _multi_team_access_token(include_team_ids=False)
+    fake.claims["team_ids"] = None
+
+    async def call_next(ctx):  # pragma: no cover - must not run
+        return "ok"
+
+    with _mock_config_manager(), _headers_patch(
+        {"x-revenium-team-id": "team_second"}
+    ), patch(
+        "src.revenium_mcp_server.auth.api_key_middleware.get_access_token",
+        return_value=fake,
+    ):
+        with pytest.raises(PermissionError, match="not available"):
+            await mw.on_call_tool(MagicMock(), call_next)

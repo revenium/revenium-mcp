@@ -394,6 +394,18 @@ class TestToolManagerListEvents:
         await tool_manager.list_events({"page": 0, "size": 10})
         mock_client.list_tool_events.assert_called_once_with(page=0, size=10)
 
+    @pytest.mark.asyncio
+    async def test_list_events_passes_query_search_filter(self, tool_manager, mock_client):
+        """The server-side query search term reaches the API call.
+
+        The tool-events endpoint searches transaction ID by exact match for
+        UUID terms, then falls back to partial match across tool name, tool ID
+        and resource/operation.
+        """
+        mock_client.list_tool_events.return_value = {"events": []}
+        await tool_manager.list_events({"filters": {"query": "vector-search"}})
+        mock_client.list_tool_events.assert_called_once_with(page=0, size=20, query="vector-search")
+
 
 # ===========================================================================
 # ToolManager Per-Tool Event Tests (record_event, get_events)
@@ -850,6 +862,95 @@ class TestToolManagerPricingValidation:
                 "tool_data": {"pricing": {"elements": "bad"}},
             })
 
+    def test_string_unit_price_passes(self, tool_manager):
+        """String unitPrice (as returned by GET round-trip) is accepted (BACK-2396)."""
+        pricing = {
+            "currency": "USD",
+            "elements": [{"name": "x", "unitPrice": "0.0005", "aggregationType": "COUNT"}],
+        }
+        assert tool_manager._validate_tool_pricing(pricing) == []
+
+    def test_negative_string_unit_price(self, tool_manager):
+        """Negative string unitPrice is flagged, not raised as a TypeError (BACK-2396)."""
+        pricing = {"elements": [{"name": "x", "unitPrice": "-1"}]}
+        errors = tool_manager._validate_tool_pricing(pricing)
+        assert any("unitPrice must be >= 0" in e for e in errors)
+
+    def test_non_numeric_string_unit_price(self, tool_manager):
+        """Non-numeric string unitPrice produces a structured error, not a raise (BACK-2396)."""
+        pricing = {"elements": [{"name": "x", "unitPrice": "abc"}]}
+        errors = tool_manager._validate_tool_pricing(pricing)
+        assert any("unitPrice must be a number" in e for e in errors)
+
+    def test_string_tier_up_to_ascending_passes(self, tool_manager):
+        """Numeric-string tier upTo values in ascending order pass (BACK-2396)."""
+        pricing = {"elements": [{
+            "name": "x",
+            "tiers": [
+                {"upTo": "5000", "unitPrice": "0.01"},
+                {"upTo": "10000", "unitPrice": "0.008"},
+                {"upTo": None, "unitPrice": "0.005"},
+            ],
+        }]}
+        assert tool_manager._validate_tool_pricing(pricing) == []
+
+    def test_string_tier_up_to_not_ascending(self, tool_manager):
+        """Numeric-string tier upTo values out of order are still caught (BACK-2396).
+
+        Regression guard for the latent lexicographic-comparison bug where
+        "5000" <= "10000" is True as a string comparison but should be
+        evaluated numerically.
+        """
+        pricing = {"elements": [{
+            "name": "x",
+            "tiers": [
+                {"upTo": "10000", "unitPrice": "0.008"},
+                {"upTo": "5000", "unitPrice": "0.01"},
+                {"upTo": None, "unitPrice": "0.005"},
+            ],
+        }]}
+        errors = tool_manager._validate_tool_pricing(pricing)
+        assert any("ascending" in e for e in errors)
+
+    def test_non_numeric_middle_tier_up_to_reported_once(self, tool_manager):
+        """A non-numeric middle-tier upTo produces exactly one "must be a number" error.
+
+        Regression guard: previously each middle tier's upTo was coerced
+        twice (once as "curr" then again as "prev" on the next iteration),
+        so a non-numeric value produced the error message twice.
+        """
+        pricing = {"elements": [{
+            "name": "x",
+            "tiers": [
+                {"upTo": 1000, "unitPrice": "0.01"},
+                {"upTo": "abc", "unitPrice": "0.008"},
+                {"upTo": None, "unitPrice": "0.005"},
+            ],
+        }]}
+        errors = tool_manager._validate_tool_pricing(pricing)
+        must_be_number_errors = [e for e in errors if "upTo must be a number" in e]
+        assert len(must_be_number_errors) == 1
+
+    @pytest.mark.asyncio
+    async def test_update_with_string_unit_price_does_not_raise(
+        self, tool_manager, mock_client
+    ):
+        """update_tool with a string unitPrice (GET round-trip) succeeds without TypeError (BACK-2396)."""
+        mock_client.update_tool = AsyncMock(return_value={"id": "t1", "name": "x"})
+        tool_manager.client = mock_client
+
+        result = await tool_manager.update_tool({
+            "tool_id": "t1",
+            "tool_data": {
+                "pricing": {
+                    "elements": [{"name": "x", "unitPrice": "0.0005", "aggregationType": "COUNT"}]
+                }
+            },
+        })
+
+        assert result == {"id": "t1", "name": "x"}
+        mock_client.update_tool.assert_called_once()
+
 
 # ===========================================================================
 # ToolManagement (top-level) Tests
@@ -928,6 +1029,29 @@ class TestToolManagementHandleAction:
         mock_client.update_tool.assert_called_once()
         call_data = mock_client.update_tool.call_args[0][1]
         assert "teamId" in call_data
+
+    @pytest.mark.asyncio
+    async def test_auth_failure_reraises_api_error(self, tool_mgmt, mock_client):
+        """An auth failure from the client must propagate out of handle_action so
+        FastMCP marks the envelope isError:true, not swallow it into content text."""
+        mock_client.list_tools.side_effect = ReveniumAPIError(
+            "Unauthorized", status_code=401
+        )
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+        with pytest.raises(ReveniumAPIError) as exc:
+            await tool_mgmt.handle_action("list", {"page": 0, "size": 20})
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_auth_failure_reraises_tool_error(self, tool_mgmt, mock_client):
+        """A ToolError raised while handling an action must propagate, not be
+        rendered as ``Tool error: ...`` content text without isError:true."""
+        boom = ToolError(message="unauthorized", error_code=ErrorCodes.API_AUTHORIZATION)
+        mock_client.list_tools.side_effect = boom
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+        with pytest.raises(ToolError) as exc:
+            await tool_mgmt.handle_action("list", {"page": 0, "size": 20})
+        assert exc.value is boom
 
 
 # ===========================================================================
@@ -1177,3 +1301,25 @@ class TestToolManagerSearchClientSideFilter:
         await tool_manager.search_tools({"query": "x", "page": 2, "size": 50})
 
         mock_client.search_tools.assert_called_once_with(query="x", page=2, size=50)
+
+
+class TestGetExamplesAction:
+    """manage_tools was the only tool without get_examples."""
+
+    @pytest.mark.asyncio
+    async def test_get_examples_returns_examples(self):
+        from src.revenium_mcp_server.tools_decomposed.tool_management import ToolManagement
+
+        tool = ToolManagement()
+        result = await tool.handle_action("get_examples", {})
+        text = result[0].text
+        assert "Tool Registry Examples" in text
+        assert "create_simple" in text
+        assert "meter_event" in text
+
+    @pytest.mark.asyncio
+    async def test_get_examples_is_advertised(self):
+        from src.revenium_mcp_server.tools_decomposed.tool_management import ToolManagement
+
+        tool = ToolManagement()
+        assert "get_examples" in await tool._get_supported_actions()

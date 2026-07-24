@@ -46,8 +46,6 @@ class CustomerTransactionData:
     net_profit: float
     profit_margin: float
     percentage_revenue: float
-    transaction_count: int
-    cost_per_transaction: float
 
 
 @dataclass
@@ -60,8 +58,6 @@ class ProductTransactionData:
     net_profit: float
     profit_margin: float
     percentage_revenue: float
-    transaction_count: int
-    cost_per_transaction: float
 
 
 @dataclass
@@ -1042,12 +1038,6 @@ class TransactionLevelAnalyticsProcessor:
             profit = revenue - cost
             margin = (profit / revenue * 100) if revenue > 0 else 0.0
 
-            # Estimate transaction count (placeholder calculation)
-            transaction_count = (
-                max(1, int(cost / 0.01)) if cost > 0 else 1
-            )  # Assume $0.01 per transaction
-            cost_per_transaction = cost / transaction_count if transaction_count > 0 else 0.0
-
             customers.append(
                 CustomerTransactionData(
                     organization_name=org_name,
@@ -1056,8 +1046,6 @@ class TransactionLevelAnalyticsProcessor:
                     net_profit=profit,
                     profit_margin=margin,
                     percentage_revenue=data["percentage_revenue"],
-                    transaction_count=transaction_count,
-                    cost_per_transaction=cost_per_transaction,
                 )
             )
 
@@ -1167,12 +1155,6 @@ class TransactionLevelAnalyticsProcessor:
             profit = revenue - cost
             margin = (profit / revenue * 100) if revenue > 0 else 0.0
 
-            # Estimate transaction count (placeholder calculation)
-            transaction_count = (
-                max(1, int(cost / 0.01)) if cost > 0 else 1
-            )  # Assume $0.01 per transaction
-            cost_per_transaction = cost / transaction_count if transaction_count > 0 else 0.0
-
             products.append(
                 ProductTransactionData(
                     product_name=product_name,
@@ -1181,8 +1163,6 @@ class TransactionLevelAnalyticsProcessor:
                     net_profit=profit,
                     profit_margin=margin,
                     percentage_revenue=data["percentage_revenue"],
-                    transaction_count=transaction_count,
-                    cost_per_transaction=cost_per_transaction,
                 )
             )
 

@@ -29,10 +29,15 @@ from ..common.error_handling import (
 )
 from ..common.pagination_performance import validate_pagination_with_performance
 from ..common.partial_update_handler import PartialUpdateHandler
+from ..common.validation import SAFE_INT_MAX
 from ..common.ucm_config import log_ucm_status
 from ..common.update_configs import UpdateConfigFactory
 from ..config_store import get_config_value
-from ..hierarchy import cross_tier_validator, entity_lookup_service, hierarchy_navigation_service
+from ..hierarchy import (
+    get_cross_tier_validator,
+    get_entity_lookup_service,
+    get_hierarchy_navigation_service,
+)
 from ..introspection.metadata import (
     ResourceRelationship,
     ToolCapability,
@@ -67,6 +72,19 @@ def _validate_products_pagination(page: Any, size: Any) -> None:
                 value=value,
                 suggestions=[
                     f"Pass an integer for {label} (no quotes, no booleans)",
+                ],
+            )
+        # Values beyond 2^53 arrive float64-corrupted from JSON decoders; the
+        # message must not echo the mangled number.
+        if abs(value) > SAFE_INT_MAX:
+            raise ToolError(
+                message=f"{label} exceeds safe integer range (max 2^53)",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=label,
+                value=str(value),
+                suggestions=[
+                    f"Pass {label} as a reasonable integer (e.g. {label}="
+                    f"{0 if label == 'page' else 20})",
                 ],
             )
     if page < 0:
@@ -1610,9 +1628,9 @@ class ProductHierarchyManager:
         """Initialize hierarchy manager with client."""
         self.client = client
         self.formatter = UnifiedResponseFormatter("manage_products")
-        self.navigation_service = hierarchy_navigation_service()
-        self.lookup_service = entity_lookup_service()
-        self.validator = cross_tier_validator()
+        self.navigation_service = get_hierarchy_navigation_service(client)
+        self.lookup_service = get_entity_lookup_service(client)
+        self.validator = get_cross_tier_validator(client)
 
     async def get_subscriptions(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get all subscriptions for a given product."""

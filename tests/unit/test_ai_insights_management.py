@@ -64,14 +64,15 @@ async def test_get_run_honors_explicit_slim_false():
 
 @pytest.mark.asyncio
 async def test_get_run_missing_run_id_returns_validation_error():
+    from src.revenium_mcp_server.common.error_handling import ToolError
     from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
         AIInsightsManagement,
     )
 
     tool = AIInsightsManagement()
-    result = await tool.handle_action("get_run", {})
-    text = result[0].text if hasattr(result[0], "text") else str(result[0])
-    assert "run_id" in text.lower()
+    with pytest.raises(ToolError) as exc:
+        await tool.handle_action("get_run", {})
+    assert "run_id" in exc.value.message.lower() or exc.value.field == "run_id"
 
 
 @pytest.mark.asyncio
@@ -121,25 +122,25 @@ async def test_list_runs_auto_paginates_over_cursor():
 
 
 @pytest.mark.asyncio
-async def test_list_runs_clamps_max_results_to_hard_cap():
+async def test_list_runs_rejects_max_results_over_hard_cap():
+    """Over-cap values are rejected pre-flight with the valid range — a
+    silent clamp hid the constraint from the caller."""
     from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
         AIInsightsManagement,
     )
-
+    from src.revenium_mcp_server.common.error_handling import ToolError
     tool = AIInsightsManagement()
-    counter = {"n": 0}
-    def page_with_cursor(*_a, **_kw):
-        counter["n"] += 1
-        return {"data": [{"runId": "x"}] * 100, "next_cursor": f"c{counter['n']}"}
-
-    mock = AsyncMock(side_effect=page_with_cursor)
+    mock = AsyncMock()
     with patch(
         "src.revenium_mcp_server.client.ReveniumClient.list_recommendation_runs",
         new=mock,
     ):
-        await tool.handle_action("list_runs", {"max_results": 5000})
+        with pytest.raises(ToolError) as exc:
+            await tool.handle_action("list_runs", {"max_results": 5000})
 
-    assert mock.await_count == 10  # 1000 / 100 page size
+    assert "1000" in exc.value.message
+    assert "max_results" in exc.value.message
+    mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -168,11 +169,12 @@ async def test_list_runs_rejects_invalid_max_results_type():
         AIInsightsManagement,
     )
 
+    from src.revenium_mcp_server.common.error_handling import ToolError
     tool = AIInsightsManagement()
-    result = await tool.handle_action("list_runs", {"max_results": "abc"})
-    text = result[0].text if hasattr(result[0], "text") else str(result[0])
-    assert "max_results" in text
-    assert "positive integer" in text.lower()
+    with pytest.raises(ToolError) as exc:
+        await tool.handle_action("list_runs", {"max_results": "abc"})
+    assert "max_results" in exc.value.message
+    assert "positive integer" in exc.value.message.lower()
 
 
 @pytest.mark.asyncio
@@ -181,10 +183,11 @@ async def test_list_runs_rejects_nonpositive_max_results():
         AIInsightsManagement,
     )
 
+    from src.revenium_mcp_server.common.error_handling import ToolError
     tool = AIInsightsManagement()
-    result = await tool.handle_action("list_runs", {"max_results": 0})
-    text = result[0].text if hasattr(result[0], "text") else str(result[0])
-    assert "max_results" in text
+    with pytest.raises(ToolError) as exc:
+        await tool.handle_action("list_runs", {"max_results": 0})
+    assert "max_results" in exc.value.message
 
 
 @pytest.mark.asyncio
@@ -216,10 +219,11 @@ async def test_list_feedback_missing_run_id_validation_error():
         AIInsightsManagement,
     )
 
+    from src.revenium_mcp_server.common.error_handling import ToolError
     tool = AIInsightsManagement()
-    result = await tool.handle_action("list_feedback", {})
-    text = result[0].text if hasattr(result[0], "text") else str(result[0])
-    assert "run_id" in text.lower()
+    with pytest.raises(ToolError) as exc:
+        await tool.handle_action("list_feedback", {})
+    assert "run_id" in exc.value.message.lower() or exc.value.field == "run_id"
 
 
 @pytest.mark.asyncio
@@ -258,12 +262,13 @@ async def test_trigger_run_missing_period_start_validation_error():
         AIInsightsManagement,
     )
 
+    from src.revenium_mcp_server.common.error_handling import ToolError
     tool = AIInsightsManagement()
-    result = await tool.handle_action("trigger_run", {
-        "period_end": "2026-01-31T23:59:59Z",
-    })
-    text = result[0].text if hasattr(result[0], "text") else str(result[0])
-    assert "period_start" in text.lower()
+    with pytest.raises(ToolError) as exc:
+        await tool.handle_action("trigger_run", {
+            "period_end": "2026-01-31T23:59:59Z",
+        })
+    assert "period_start" in exc.value.message.lower() or exc.value.field == "period_start"
 
 
 @pytest.mark.asyncio
@@ -302,6 +307,7 @@ async def test_submit_feedback_missing_required_field(missing_field):
         AIInsightsManagement,
     )
 
+    from src.revenium_mcp_server.common.error_handling import ToolError
     tool = AIInsightsManagement()
     args = {
         "run_id": "r1",
@@ -309,14 +315,18 @@ async def test_submit_feedback_missing_required_field(missing_field):
         "feedback_action": "implemented",
     }
     args.pop(missing_field)
-    result = await tool.handle_action("submit_feedback", args)
-    text = result[0].text if hasattr(result[0], "text") else str(result[0])
-    assert missing_field in text.lower()
+    with pytest.raises(ToolError) as exc:
+        await tool.handle_action("submit_feedback", args)
+    assert missing_field in exc.value.message.lower() or exc.value.field == missing_field
 
 
 @pytest.mark.asyncio
-async def test_api_error_AI_RECOMMENDATIONS_DISABLED_yields_forbidden():
+async def test_api_error_AI_RECOMMENDATIONS_DISABLED_raises_authorization_tool_error():
+    """The disabled state is an authorization failure: it must propagate as a
+    raised ToolError (isError:true envelope) carrying the friendly message and
+    enablement suggestion, not render as success-shaped content."""
     from src.revenium_mcp_server.client import ReveniumAPIError
+    from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
     from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
         AIInsightsManagement,
     )
@@ -329,10 +339,12 @@ async def test_api_error_AI_RECOMMENDATIONS_DISABLED_yields_forbidden():
         "src.revenium_mcp_server.client.ReveniumClient.list_investigators",
         side_effect=err,
     ):
-        result = await tool.handle_action("list_investigators", {})
+        with pytest.raises(ToolError) as exc:
+            await tool.handle_action("list_investigators", {})
 
-    text = result[0].text if hasattr(result[0], "text") else str(result[0])
-    assert "not enabled" in text.lower() or "forbidden" in text.lower()
+    assert "not enabled" in exc.value.message.lower()
+    assert exc.value.error_code == ErrorCodes.API_AUTHORIZATION
+    assert any("enable" in s.lower() for s in exc.value.suggestions)
 
 
 @pytest.mark.asyncio
@@ -379,7 +391,10 @@ async def test_api_error_NOT_FOUND_yields_not_found():
 
 
 @pytest.mark.asyncio
-async def test_api_error_unknown_code_falls_through_to_generic():
+async def test_api_error_unknown_code_reraises():
+    """A code with no bespoke RFC 7807 translation has no friendly render, so it
+    must propagate out of handle_action for FastMCP to mark isError:true rather
+    than be buried in success-shaped generic content text."""
     from src.revenium_mcp_server.client import ReveniumAPIError
     from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
         AIInsightsManagement,
@@ -391,10 +406,10 @@ async def test_api_error_unknown_code_falls_through_to_generic():
         "src.revenium_mcp_server.client.ReveniumClient.list_investigators",
         side_effect=err,
     ):
-        result = await tool.handle_action("list_investigators", {})
+        with pytest.raises(ReveniumAPIError) as exc:
+            await tool.handle_action("list_investigators", {})
 
-    # Generic API_ERROR fallback — still produces some payload.
-    assert len(result) >= 1
+    assert exc.value is err
 
 
 @pytest.mark.asyncio
@@ -454,6 +469,51 @@ def test_priority_order_includes_manage_ai_insights():
         TOOL_REGISTRATION_PRIORITY_ORDER,
     )
     assert "manage_ai_insights" in TOOL_REGISTRATION_PRIORITY_ORDER
+
+
+@pytest.mark.asyncio
+async def test_auth_failure_reraises_api_error():
+    """A generic (auth) ReveniumAPIError with no RFC 7807 translation must
+    propagate out of handle_action so FastMCP marks the envelope isError:true,
+    not swallow it into generic content text."""
+    from src.revenium_mcp_server.client import ReveniumAPIError
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    err = ReveniumAPIError("Unauthorized", status_code=401)
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_investigators",
+        side_effect=err,
+    ):
+        with pytest.raises(ReveniumAPIError) as exc:
+            await tool.handle_action("list_investigators", {})
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_tool_error_propagates():
+    """A ToolError raised while handling an action must propagate, not be
+    rendered as content text without isError:true."""
+    from src.revenium_mcp_server.client import ReveniumAPIError  # noqa: F401
+    from src.revenium_mcp_server.common.error_handling import (
+        ErrorCodes,
+        ToolError,
+    )
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    boom = ToolError(message="unauthorized", error_code=ErrorCodes.API_AUTHORIZATION)
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_investigators",
+        side_effect=boom,
+    ):
+        with pytest.raises(ToolError) as exc:
+            await tool.handle_action("list_investigators", {})
+    assert exc.value is boom
 
 
 def test_business_profile_includes_manage_ai_insights():

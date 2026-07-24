@@ -8,6 +8,7 @@ from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from loguru import logger
 
+from .auth_events import emit_auth_event
 from .tenant_context import TenantContext
 from .tenant_resolver import TenantResolver
 
@@ -37,10 +38,20 @@ class TenantContextMiddleware(Middleware):
     ) -> Any:
         token = get_access_token()
         claims = token.claims if token is not None else {}
+        # OAuthProxy's token swap stores the upstream Clerk access token and
+        # returns it as AccessToken.token — that is the credential forwarded
+        # downstream, re-read per request so upstream refreshes flow through.
+        clerk_jwt = token.token if token is not None else None
         try:
-            tenant_ctx = self._resolver.resolve(claims)
+            tenant_ctx = self._resolver.resolve(claims, clerk_jwt=clerk_jwt)
         except PermissionError as e:
             logger.warning("Tenant resolution rejected: {}", e)
+            emit_auth_event(
+                outcome="failure",
+                auth_mode="clerk",
+                user_id=(claims or {}).get("sub"),
+                reason="tenant_resolution_rejected",
+            )
             raise  # FastMCP wraps it as a JSON-RPC error inside HTTP 200
 
         reset_token = _current_tenant.set(tenant_ctx)

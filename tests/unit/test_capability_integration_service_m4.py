@@ -420,6 +420,24 @@ class TestGetHealthStatus:
         result = await svc.get_health_status()
         assert result["ucm_health"] == {}
 
+    @pytest.mark.asyncio
+    async def test_not_initialized_clerk_mode_reports_static_capabilities(self, monkeypatch):
+        """In clerk mode an uninitialized UCM is expected, not an error."""
+        monkeypatch.setenv("AUTH_MODE", "clerk")
+        svc = _make_service()
+        result = await svc.get_health_status()
+        assert result["status"] == "static_capabilities"
+        assert "error" not in result
+        assert "static capabilities" in result["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_not_initialized_api_key_mode_unchanged(self, monkeypatch):
+        monkeypatch.setenv("AUTH_MODE", "api_key")
+        svc = _make_service()
+        result = await svc.get_health_status()
+        assert result["status"] == "not_initialized"
+        assert "error" in result
+
 
 # ---------------------------------------------------------------------------
 # get_all_capabilities

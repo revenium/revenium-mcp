@@ -22,7 +22,7 @@ from loguru import logger
 from .api_field_mapper import APIFieldMapper
 from .auth import AuthConfig, AuthenticationError, get_auth_config, get_bearer_auth_headers
 from .config_store import get_config_value
-from .endpoint_registry import DEFAULT_APP_BASE_URL
+from .endpoint_registry import DEFAULT_APP_BASE_URL, KNOWN_APP_BASE_URLS, paired_app_base_url
 from .exceptions import AlertToolsError
 from .log_context import redact_headers
 from .logging_config import async_operation_context
@@ -286,7 +286,7 @@ class ReveniumClient:
         return self._auth_config
 
     @property
-    def api_key(self) -> str:
+    def api_key(self) -> Optional[str]:
         """Get the API key."""
         return self.auth_config.api_key
 
@@ -402,6 +402,49 @@ class ReveniumClient:
         """Build full URL from endpoint."""
         return urljoin(self.base_url, endpoint.lstrip("/"))
 
+    def _json_format_suggestions(self, endpoint: str) -> str:
+        """Suggestions for a server-side JSON/validation rejection, scoped to
+        the resource actually being called — a shared template that always
+        pushed alert guidance sent manage_tools callers to convenience
+        methods that do not exist on their tool.
+        """
+        if "anomaly" in (endpoint or ""):
+            return (
+                "**Suggestions:**\n"
+                "• Use convenience methods: create_threshold_alert() or create_cumulative_usage_alert()\n"
+                "• Ensure all required fields are provided: name, alertType, metricType, operatorType, threshold\n"
+                "• Check that field values match expected formats (e.g., alertType: 'THRESHOLD')\n"
+                "• Review the debug logs for detailed request data"
+            )
+        resource_label, _ = self._resource_label_from_endpoint(endpoint or "")
+        return (
+            "**Suggestions:**\n"
+            f"• Check the error above for the exact field the server rejected\n"
+            f"• Use get_capabilities() / get_examples() on this tool for the valid {resource_label.lower()} payload shape\n"
+            "• Review the debug logs for detailed request data"
+        )
+
+    def _enhance_not_found_error(self, error_text: str, endpoint: str) -> Optional[str]:
+        """Rewrite a backend not-found that leaks internal entity names.
+
+        The backend says "Couldn't find Asset/ElementDefinition with ID: X" —
+        internal entity names that don't match any tool surface. Returns the
+        clean resource-labelled message, or None when the text isn't that
+        shape.
+        """
+        m = re.search(r"couldn't find \w+ with id:?\s*([\w-]+)", error_text, re.IGNORECASE)
+        if not m:
+            return None
+        resource_label, resource_label_plural = self._resource_label_from_endpoint(endpoint or "")
+        rid = m.group(1)
+        return (
+            f"{resource_label} not found\n\n"
+            f"No {resource_label.lower()} exists with ID '{rid}' — it may have been deleted.\n\n"
+            f"**Next steps:**\n"
+            f"• Use the list action to see current {resource_label_plural.lower()}\n"
+            f"• Copy IDs from list results rather than reusing stored ones"
+        )
+
     def _format_error_response(self, error_data: Any) -> str:
         """Format error response data into a readable string.
 
@@ -416,15 +459,22 @@ class ReveniumClient:
 
         # Common error response formats
         if "message" in error_data:
-            message = error_data["message"]
+            message = str(error_data["message"])
             if "details" in error_data:
                 details = error_data["details"]
-                if isinstance(details, list):
-                    details_str = "; ".join(str(d) for d in details)
+                if isinstance(details, dict):
+                    # Render the values as plain text — str(dict) produces a
+                    # Python dict-repr that the leak sanitizer strips, taking
+                    # the backend's useful detail with it.
+                    parts = [str(v) for v in details.values() if str(v) and str(v) != message]
+                    details_str = "; ".join(parts)
+                elif isinstance(details, list):
+                    details_str = "; ".join(str(d) for d in details if str(d) != message)
                 else:
-                    details_str = str(details)
-                return f"{message} - {details_str}"
-            return str(message)
+                    details_str = str(details) if str(details) != message else ""
+                if details_str:
+                    return f"{message} - {details_str}"
+            return message
 
         # Alternative formats
         if "error" in error_data:
@@ -669,7 +719,7 @@ class ReveniumClient:
 
                 # Merge auth headers with any existing headers for this request
                 if use_bearer:
-                    request_headers = get_bearer_auth_headers(self.auth_config.api_key)
+                    request_headers = get_bearer_auth_headers(self.auth_config.bearer_credential)
                 else:
                     request_headers = self.auth_config.get_auth_headers()
 
@@ -779,11 +829,7 @@ class ReveniumClient:
                             f"• Field values don't match expected formats\n"
                             f"• Data validation failed on the server side\n\n"
                             f"Original error: {error_text}\n\n"
-                            f"**Suggestions:**\n"
-                            f"• Use convenience methods: create_threshold_alert() or create_cumulative_usage_alert()\n"
-                            f"• Ensure all required fields are provided: name, alertType, metricType, operatorType, threshold\n"
-                            f"• Check that field values match expected formats (e.g., alertType: 'THRESHOLD')\n"
-                            f"• Review the debug logs for detailed request data"
+                            + self._json_format_suggestions(endpoint)
                         )
 
                         comprehensive_error = ReveniumAPIError(
@@ -847,6 +893,14 @@ class ReveniumClient:
                         )
                         comprehensive_error = ReveniumAPIError(
                             message=enhanced_message,
+                            status_code=response.status_code,
+                            response_data={"error_data": error_data},
+                        )
+                    elif response.status_code == 404 and (
+                        enhanced_not_found := self._enhance_not_found_error(error_text, endpoint)
+                    ):
+                        comprehensive_error = ReveniumAPIError(
+                            message=enhanced_not_found,
                             status_code=response.status_code,
                             response_data={"error_data": error_data},
                         )
@@ -1222,6 +1276,36 @@ class ReveniumClient:
             f"/profitstream/v2/api/subscriptions/{subscription_id}", params=params
         ))
 
+    async def get_subscription_billed_amount(self, subscription_id: str) -> Dict[str, Any]:
+        """Get the amount billed for a subscription.
+
+        Args:
+            subscription_id: The subscription ID
+
+        Returns:
+            Dict with ``amountBilled``
+        """
+        params = self._add_team_id_to_params()
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/subscriptions/{subscription_id}/billed-amount",
+            params=params,
+        ))
+
+    async def get_subscription_quota_consumed(self, subscription_id: str) -> Dict[str, Any]:
+        """Get quota limit and consumption for a subscription.
+
+        Args:
+            subscription_id: The subscription ID
+
+        Returns:
+            Dict with ``limit`` and ``consumed``
+        """
+        params = self._add_team_id_to_params()
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/subscriptions/{subscription_id}/quota-consumed",
+            params=params,
+        ))
+
     async def create_subscription(self, subscription_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new subscription.
 
@@ -1333,6 +1417,438 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/sources/{source_id}", params=params))
+
+    # Agents API methods
+    async def get_agents(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
+        """Get list of registered agents with pagination.
+
+        Args:
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Additional filter parameters (e.g. query for
+                server-side search on name/organization)
+
+        Returns:
+            Response containing agents data and pagination info
+        """
+        params = {"page": page, "size": size}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/agents", params=params))
+
+    async def get_agent_by_id(self, agent_id: str) -> Dict[str, Any]:
+        """Get a specific agent by ID.
+
+        Args:
+            agent_id: The agent ID
+
+        Returns:
+            Agent data
+        """
+        params = self._add_team_id_to_params()
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/agents/{agent_id}", params=params))
+
+    async def create_agent(self, agent_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Register a new agent.
+
+        Args:
+            agent_data: Agent data; telemetryKey (the value the agent emits
+                in telemetry) is required, displayName/ownerId optional
+
+        Returns:
+            Created agent data
+        """
+        params = self._add_team_id_to_params()
+        return cast(Dict[str, Any], await self.post("/profitstream/v2/api/agents", data=agent_data, params=params))
+
+    async def update_agent(self, agent_id: str, agent_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Update an existing agent.
+
+        Args:
+            agent_id: The agent ID
+            agent_data: Updated agent data (telemetryKey required by the API)
+
+        Returns:
+            Updated agent data
+        """
+        params = self._add_team_id_to_params()
+        return cast(Dict[str, Any], await self.put(
+            f"/profitstream/v2/api/agents/{agent_id}", data=agent_data, params=params
+        ))
+
+    async def delete_agent(self, agent_id: str) -> Dict[str, Any]:
+        """Delete an agent.
+
+        Args:
+            agent_id: The agent ID
+
+        Returns:
+            Deletion response
+        """
+        params = self._add_team_id_to_params()
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/agents/{agent_id}", params=params))
+
+    async def get_discovered_agents(
+        self, period: str, page: int = 0, size: int = 20, **filters: Any
+    ) -> Dict[str, Any]:
+        """List agents observed in telemetry over a period.
+
+        Includes registration status: registered entries carry the agentId
+        of the managed resource; unregistered ones are candidates for
+        create_agent.
+
+        Args:
+            period: Observation window (required by the API, e.g.
+                TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS)
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Additional filter parameters
+
+        Returns:
+            Response containing discovered agents and pagination info
+        """
+        params = {"period": period, "page": page, "size": size}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/agents/discovered", params=params))
+
+    # AI Cost Controls API methods
+    async def get_cost_controls(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
+        """Get list of AI cost controls with pagination.
+
+        Args:
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Additional filter parameters (e.g. query for
+                server-side search)
+
+        Returns:
+            Response containing cost controls data and pagination info
+        """
+        params = {"page": page, "size": size}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/ai/cost-controls", params=params))
+
+    async def get_cost_control_by_id(self, control_id: str) -> Dict[str, Any]:
+        """Get a specific cost control by ID.
+
+        Args:
+            control_id: The cost control ID
+
+        Returns:
+            Cost control data
+        """
+        params = self._add_team_id_to_params()
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/ai/cost-controls/{control_id}", params=params))
+
+    async def create_cost_control(self, control_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a new cost control.
+
+        The write view is passed through as-is; presence validation happens at
+        the tool boundary. teamId is injected there when the caller omits it.
+
+        Args:
+            control_data: Cost control data to create
+
+        Returns:
+            Created cost control data
+        """
+        params = self._add_team_id_to_params()
+        return cast(Dict[str, Any], await self.post("/profitstream/v2/api/ai/cost-controls", data=control_data, params=params))
+
+    async def update_cost_control(self, control_id: str, control_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Update an existing cost control.
+
+        PATCH is a partial update server-side, so the caller's fields are
+        passed through unchanged (no fetch-and-merge is needed as it is for
+        the full-replacement PUT resources).
+
+        Args:
+            control_id: The cost control ID
+            control_data: Fields to update (partial)
+
+        Returns:
+            Updated cost control data
+        """
+        params = self._add_team_id_to_params()
+        return cast(Dict[str, Any], await self.patch(
+            f"/profitstream/v2/api/ai/cost-controls/{control_id}", data=control_data, params=params
+        ))
+
+    async def delete_cost_control(self, control_id: str) -> Dict[str, Any]:
+        """Delete a cost control.
+
+        Args:
+            control_id: The cost control ID
+
+        Returns:
+            Deletion response
+        """
+        params = self._add_team_id_to_params()
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/ai/cost-controls/{control_id}", params=params))
+
+    async def get_enforcement_events(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
+        """List cost-control enforcement events with pagination.
+
+        Args:
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Additional filter parameters (e.g. since, ruleId)
+
+        Returns:
+            Response containing enforcement events and pagination info
+        """
+        params = {"page": page, "size": size}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/ai/enforcement-events", params=params))
+
+    async def get_enforcement_rules(self) -> Dict[str, Any]:
+        """Get the compiled enforcement rules for the current team.
+
+        The team id is the path parameter (not a query param) for this
+        endpoint; it comes from the client's configured team_id.
+
+        Returns:
+            Compiled enforcement rules, e.g. {"rules": [...], "compiledAt": ...}
+        """
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/ai/enforcement-rules/{self.team_id}"))
+
+    # Invoices API methods
+    async def get_unpaid_invoice_totals(self) -> Dict[str, Any]:
+        """Get the count and total outstanding amount of unpaid invoices.
+
+        Aggregates UNPAID (full amount) and PARTIALLY_PAID (outstanding
+        balance) invoices owned by the team, server-side.
+
+        Returns:
+            Dict with ``count`` and ``totalAmount``
+        """
+        params = self._add_team_id_to_params()
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/invoices/unpaid-totals", params=params
+        ))
+
+    async def get_invoices(
+        self, page: int = 0, size: int = 20, **filters: Any
+    ) -> Dict[str, Any]:
+        """List invoices with page-numbered pagination.
+
+        Args:
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Additional filter parameters forwarded as query params
+                (e.g. invoiceNumber, startDate, endDate, states, payStates,
+                startingAmount, endingAmount)
+
+        Returns:
+            Paginated HAL response; items live under ``_embedded.invoiceResourceList``.
+        """
+        params = {"page": page, "size": size}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/invoices", params=params
+        ))
+
+    async def get_refunds(
+        self, page: int = 0, size: int = 20, **filters: Any
+    ) -> Dict[str, Any]:
+        """List refunds with page-numbered pagination.
+
+        Args:
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Additional filter parameters forwarded as query params
+                (e.g. startDate, endDate, minimum, maximum, query)
+
+        Returns:
+            Paginated HAL response; the embedded collection key is resolved by
+            ``_extract_embedded_data`` (no refunds on the dev tenant to verify it).
+        """
+        params = {"page": page, "size": size}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/refunds", params=params
+        ))
+
+    async def get_period_charges(self, size: int = 20, **filters: Any) -> Dict[str, Any]:
+        """List period charges with keyset/cursor pagination.
+
+        This endpoint is NOT page-numbered: it returns a top-level ``hasMore``
+        flag and an opaque ``cursor``. To page forward, pass the previous
+        response's ``cursor`` back in via ``**filters``; there is deliberately
+        no ``page`` parameter.
+
+        Args:
+            size: Number of items per page
+            **filters: Additional query params (e.g. invoiceId, startDate,
+                endDate, cursor)
+
+        Returns:
+            Top-level dict with ``_embedded.periodChargeResourceList``,
+            ``hasMore`` and ``cursor``.
+        """
+        params: Dict[str, Any] = {"size": size}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/period-charges", params=params
+        ))
+
+    # Tenant ingestion diagnostics API methods
+    def _require_tenant_id(self) -> str:
+        """Return the tenant id from auth config, or fail with guidance.
+
+        The tenant-scoped ingestion endpoints take the tenant id as a path
+        segment; it is normally auto-discovered from the API key.
+        """
+        tenant_id = self.tenant_id
+        if not tenant_id:
+            raise ValueError(
+                "tenant id is not available from the auth context — set "
+                "REVENIUM_TENANT_ID or let auto-discovery resolve it before "
+                "calling tenant-scoped endpoints"
+            )
+        return tenant_id
+
+    async def get_ingestion_failures(
+        self, page: int = 0, size: int = 20, **filters: Any
+    ) -> Dict[str, Any]:
+        """List strict-ingestion rejections for the current tenant.
+
+        Newest-first, paginated; each entry carries the failure timestamp,
+        structured error details and the (prompt-redacted) original payload.
+
+        Args:
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Additional filter parameters (e.g. errorCode)
+
+        Returns:
+            Paginated response of ingestion failures
+        """
+        tenant_id = self._require_tenant_id()
+        params = {"page": page, "size": size}
+        params.update(filters)
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/tenants/{tenant_id}/ingestion-failures", params=params
+        ))
+
+    async def set_strict_ingestion_mode(self, enabled: bool) -> Dict[str, Any]:
+        """Toggle strict ingestion mode for the current tenant.
+
+        When enabled, AI ingestion rejects transactions that reference
+        entities (Product, Subscriber, Credential, Consuming Organization)
+        which do not already exist for the tenant, instead of auto-creating
+        them.
+
+        Args:
+            enabled: Desired strict-ingestion-mode state
+
+        Returns:
+            The updated tenant resource (includes strictIngestionMode)
+        """
+        tenant_id = self._require_tenant_id()
+        return cast(Dict[str, Any], await self.patch(
+            f"/profitstream/v2/api/tenants/{tenant_id}/strict-ingestion-mode",
+            data={"strictIngestionMode": enabled},
+        ))
+
+    # Squads API methods
+    #
+    # Squads are groupings of agents observed in telemetry — the read-only
+    # observability continuation of the agents story. Every route requires
+    # teamId (canViewOrganization) and accepts an optional `period` filter
+    # (server default applies when omitted).
+    async def get_squads(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
+        """List squads observed in telemetry (squad entities).
+
+        Args:
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Additional filter parameters (e.g. period)
+
+        Returns:
+            Response containing squad entities and pagination info
+        """
+        params = {"page": page, "size": size}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/squads/entities", params=params))
+
+    async def get_squad_executions(
+        self, page: int = 0, size: int = 20, **filters: Any
+    ) -> Dict[str, Any]:
+        """List squad executions across all squads (global).
+
+        Args:
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Additional filter parameters (e.g. period, squadName,
+                status)
+
+        Returns:
+            Response containing squad executions and pagination info
+        """
+        params = {"page": page, "size": size}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/squads", params=params))
+
+    async def get_squad_entity_executions(
+        self, squad_id: str, page: int = 0, size: int = 20, **filters: Any
+    ) -> Dict[str, Any]:
+        """List executions scoped to a single squad entity.
+
+        Args:
+            squad_id: The squad entity ID
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Additional filter parameters (e.g. period)
+
+        Returns:
+            Response containing the squad's executions and pagination info
+        """
+        params = {"page": page, "size": size}
+        params.update(filters)
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/squads/entities/{squad_id}/executions", params=params
+        ))
+
+    async def get_squad_detail(self, squad_id: str, **filters: Any) -> Dict[str, Any]:
+        """Get the detail resource for a single squad.
+
+        Args:
+            squad_id: The squad ID
+            **filters: Additional filter parameters (e.g. period)
+
+        Returns:
+            Squad detail resource
+        """
+        params = dict(filters)
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/squads/{squad_id}", params=params))
+
+    async def get_squad_timeline(self, squad_id: str, **filters: Any) -> Dict[str, Any]:
+        """Get the execution timeline for a single squad.
+
+        Args:
+            squad_id: The squad ID
+            **filters: Additional filter parameters (e.g. period)
+
+        Returns:
+            Squad timeline resource with an ordered events list
+        """
+        params = dict(filters)
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/squads/{squad_id}/timeline", params=params
+        ))
+
     # Customer Management API methods
 
     # Users API methods
@@ -1374,6 +1890,18 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/users/email/{email}", params=params))
+
+    async def lookup_user_by_email(self, email: str) -> Dict[str, Any]:
+        """Look up a user by exact email match via the lookup-by-email endpoint.
+
+        Args:
+            email: The user's email address (passed as a query parameter)
+
+        Returns:
+            Full user resource
+        """
+        params = self._add_team_id_to_params({"email": email})
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/users/lookup-by-email", params=params))
     async def create_user(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new user.
 
@@ -1458,6 +1986,18 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/subscribers/email/{email}", params=params))
+
+    async def lookup_subscriber_by_email(self, email: str) -> Dict[str, Any]:
+        """Look up a subscriber by exact email match via the lookup-by-email endpoint.
+
+        Args:
+            email: The subscriber's email address (passed as a query parameter)
+
+        Returns:
+            Full subscriber resource
+        """
+        params = self._add_team_id_to_params({"email": email})
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/subscribers/lookup-by-email", params=params))
     async def create_subscriber(self, subscriber_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new subscriber.
 
@@ -1881,6 +2421,116 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.delete("/profitstream/v2/api/sources/ai/anomaly", params=params))
+
+    async def reset_anomaly_budget(self, anomaly_id: str) -> Dict[str, Any]:
+        """Reset the in-flight budget accumulation for a CUMULATIVE_USAGE anomaly.
+
+        The natural period boundary is unchanged; only the current period's
+        accumulation restarts. The endpoint is authorized per-anomaly (no
+        teamId param) and takes no request body. The server returns 404 for
+        unknown/inaccessible ids and 422 when the anomaly is not a
+        CUMULATIVE_USAGE budget alert.
+
+        Retries are disabled: the reset is a non-idempotent state change, so
+        a retry issued after a lost response could also erase usage recorded
+        between the attempts. Callers re-run explicitly on failure instead.
+
+        Args:
+            anomaly_id: The anomaly ID
+
+        Returns:
+            The updated budget progress resource
+        """
+        return cast(Dict[str, Any], await self.post(
+            f"/profitstream/v2/api/ai/alerts/{anomaly_id}/budget/reset",
+            use_retry=False,
+        ))
+
+    async def get_budget_portfolio(
+        self, page: int = 0, size: int = 20, **filters: Any
+    ) -> Dict[str, Any]:
+        """Get the tenant-wide budget-progress portfolio (paginated HAL).
+
+        Lists budget progress for every CUMULATIVE_USAGE alert visible to the
+        tenant. The route is authorized per-tenant (isAuthenticated) and takes
+        no teamId param, so — like reset_anomaly_budget — we do NOT call
+        _add_team_id_to_params; adding one would not scope the read and the
+        controller ignores it.
+
+        Args:
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Optional query params — ``now`` (ISO timestamp anchoring
+                the progress window) and ``includeTrend`` (bool)
+
+        Returns:
+            Paginated HAL response of budget-progress entries
+        """
+        params: Dict[str, Any] = {"page": page, "size": size}
+        params.update(filters)
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/ai/alerts/budgets/portfolio", params=params
+        ))
+
+    async def get_budget_progress_bulk(
+        self, ids: List[str], **filters: Any
+    ) -> Dict[str, Any]:
+        """Get budget progress for a specific set of anomaly ids.
+
+        Authorized per-tenant (isAuthenticated); no teamId param (see
+        get_budget_portfolio). ``ids`` is REQUIRED and passed through as the
+        list — httpx repeats the ``ids`` query param for each element.
+
+        Args:
+            ids: Anomaly ids to fetch progress for
+            **filters: Optional ``now`` / ``includeTrend`` query params
+
+        Returns:
+            Response with an ``items`` list of progress resources
+        """
+        params: Dict[str, Any] = {"ids": ids}
+        params.update(filters)
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/ai/alerts/budgets/progress", params=params
+        ))
+
+    async def get_anomaly_budget_progress(
+        self, anomaly_id: str, **filters: Any
+    ) -> Dict[str, Any]:
+        """Get the current budget progress for a single anomaly.
+
+        Authorized per-anomaly (canReadAIAnomaly); no teamId param (see
+        get_budget_portfolio). The server returns 404 for unknown/inaccessible
+        ids and 422 when the anomaly is not a CUMULATIVE_USAGE budget alert.
+
+        Args:
+            anomaly_id: The anomaly ID
+            **filters: Optional ``now`` / ``includeTrend`` query params
+
+        Returns:
+            A single budget-progress resource
+        """
+        params: Dict[str, Any] = dict(filters)
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/ai/alerts/{anomaly_id}/budget/progress",
+            params=params,
+        ))
+
+    async def get_data_connected_sources(self) -> Dict[str, Any]:
+        """Get per-pathway data-connection status for the current tenant.
+
+        Breaks the aggregate data-connected check out by ingestion pathway
+        (providerBilling, sdkMetering, codingAssistant, traces), each with
+        a ``connected`` flag and ``lastReceived`` timestamp.
+
+        Returns:
+            Mapping of pathway name to its connection status
+        """
+        params = self._add_team_id_to_params()
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/sources/metrics/ai/data-connected/sources", params=params
+        ))
+
     async def get_anomaly_metrics(self, anomaly_id: str) -> Dict[str, Any]:
         """Get metrics from AI anomaly builder.
 
@@ -2433,12 +3083,33 @@ class ReveniumClient:
     # Tool Analytics endpoints — hosted on app.revenium.ai, Bearer auth
     # Base: https://app.revenium.ai, path prefix: /api/v2/analytics/
 
+    # Known non-production analytics hosts, keyed by the platform API host
+    # they pair with. The analytics host is not derivable by naming rule
+    # (prod: app.revenium.ai; dev: ai.dev.hcapp.io), so environments outside
+    # this map must set REVENIUM_APP_BASE_URL explicitly.
+    # Canonical map lives in endpoint_registry so the registry's
+    # _resolved_app_base_url and this resolver can never disagree.
+    _KNOWN_APP_BASE_URLS = KNOWN_APP_BASE_URLS
+
     def _get_app_base_url(self) -> str:
-        """Return the analytics base URL (app.revenium.ai), falling back to default."""
-        url = get_config_value("REVENIUM_APP_BASE_URL", DEFAULT_APP_BASE_URL) or DEFAULT_APP_BASE_URL
+        """Return the analytics base URL for insights/tool-analytics calls.
+
+        Resolution order: explicit REVENIUM_APP_BASE_URL > analytics host
+        paired with the configured REVENIUM_BASE_URL (known environments) >
+        production default. Without the pairing step, a dev configuration
+        silently pointed every insights call at the production host, where
+        the dev key 401s.
+        """
+        url = get_config_value("REVENIUM_APP_BASE_URL", None)
+        source = "REVENIUM_APP_BASE_URL"
+        if not url:
+            url = paired_app_base_url(
+                get_config_value("REVENIUM_BASE_URL", None), self._KNOWN_APP_BASE_URLS
+            )
+            source = "the analytics base URL derived from the known-host map"
         if not url.startswith("https://"):
             raise ValueError(
-                f"REVENIUM_APP_BASE_URL must use HTTPS to prevent Bearer token leakage, got: {url!r}"
+                f"{source} must use HTTPS to prevent Bearer token leakage, got: {url!r}"
             )
         return url
 

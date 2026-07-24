@@ -82,3 +82,17 @@ class TestFromEnv:
 
         with pytest.raises(ValueError, match="REVENIUM_API_KEY"):
             AuthConfigFactory.from_env()
+
+
+class TestFactoryForwardsClerkJwt:
+    def test_clerk_jwt_forwarded(self):
+        ctx = TenantContext(
+            team_id="team_x",
+            tenant_id="tenant_x",
+            clerk_jwt="eyJhbGciOiJSUzI1NiJ9.payload.sig",
+            base_url="https://api.example.com",
+        )
+        cfg = AuthConfigFactory.from_tenant_context(ctx)
+        assert cfg.clerk_jwt == "eyJhbGciOiJSUzI1NiJ9.payload.sig"
+        assert cfg.api_key is None
+        assert cfg.team_id == "team_x"

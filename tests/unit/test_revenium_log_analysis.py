@@ -5,7 +5,7 @@ _format_analysis_response, and error handling paths.
 """
 
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from mcp.types import TextContent
 
 from src.revenium_mcp_server.tools_decomposed.revenium_log_analysis import (
@@ -238,3 +238,200 @@ class TestCreateActionError:
         assert "bad input" in err.message
         assert err.field == "action"
         assert err.value == "search_logs"
+
+
+# ---------------------------------------------------------------------------
+# Tenant ingestion diagnostics
+# ---------------------------------------------------------------------------
+
+def _ingestion_client(failures=None, strict_result=None):
+    client = MagicMock()
+    client.get_ingestion_failures = AsyncMock(
+        return_value=failures if failures is not None else {"page": {"totalElements": 0}}
+    )
+    client.set_strict_ingestion_mode = AsyncMock(
+        return_value=strict_result or {"id": "ten_1", "strictIngestionMode": True}
+    )
+    client._extract_embedded_data = MagicMock(
+        side_effect=lambda resp: resp.get("_embedded", {}).get("items", [])
+        if isinstance(resp, dict) else []
+    )
+    client._extract_pagination_info = MagicMock(
+        side_effect=lambda resp: resp.get("page", {}) if isinstance(resp, dict) else {}
+    )
+    return client
+
+
+class TestGetIngestionFailures:
+    """get_ingestion_failures lists strict-ingestion rejections."""
+
+    @pytest.mark.asyncio
+    async def test_renders_failures(self, log_tool):
+        failures = {
+            "_embedded": {
+                "items": [
+                    {
+                        "failureTimestamp": "2026-07-21T10:00:00Z",
+                        "errors": [{"errorCode": "UNKNOWN_PRODUCT", "message": "no such product"}],
+                        "originalPayload": {"model": "gpt-4"},
+                    }
+                ]
+            },
+            "page": {"totalElements": 1, "totalPages": 1},
+        }
+        client = _ingestion_client(failures=failures)
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_ingestion_failures", {})
+        text = result[0].text
+        assert "UNKNOWN_PRODUCT" in text
+        assert "2026-07-21T10:00:00Z" in text
+
+    @pytest.mark.asyncio
+    async def test_empty_failures_renders_clean_message(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_ingestion_failures", {})
+        text = result[0].text
+        assert "No" in text or "no" in text
+
+    @pytest.mark.asyncio
+    async def test_error_code_filter_forwarded(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        await log_tool.handle_action(
+            "get_ingestion_failures", {"error_code": "UNKNOWN_PRODUCT"}
+        )
+        kwargs = client.get_ingestion_failures.call_args.kwargs
+        assert kwargs.get("errorCode") == "UNKNOWN_PRODUCT"
+
+
+class TestSetStrictIngestionMode:
+    """set_strict_ingestion_mode is a guarded toggle."""
+
+    @pytest.mark.asyncio
+    async def test_without_confirm_returns_preview_and_no_call(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True}
+        )
+        text = result[0].text
+        assert "confirm" in text.lower()
+        assert "reject" in text.lower()
+        client.set_strict_ingestion_mode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_with_confirm_toggles_and_renders_state(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+        )
+        text = result[0].text
+        assert "enabled" in text.lower()
+        client.set_strict_ingestion_mode.assert_awaited_once_with(True)
+
+    @pytest.mark.asyncio
+    async def test_missing_enabled_raises(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        with pytest.raises(ToolError):
+            await log_tool.handle_action("set_strict_ingestion_mode", {"confirm": True})
+
+
+class TestIngestionHardening:
+    """Review hardening: strict confirm, honest state, bounded rendering."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("confirm", ["false", "true", 1, "yes"])
+    async def test_non_boolean_confirm_returns_preview(self, log_tool, confirm):
+        """Only the boolean True applies the change — loosely typed MCP
+        arguments (confirm='false', confirm=1) must not bypass the guard."""
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True, "confirm": confirm}
+        )
+        assert "confirm" in result[0].text.lower()
+        client.set_strict_ingestion_mode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_state_in_response_is_not_reported_as_confirmed(self, log_tool):
+        """A PATCH response without strictIngestionMode must not echo the
+        requested value back as the server's confirmed state."""
+        client = _ingestion_client(strict_result={"id": "ten_1"})
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+        )
+        text = result[0].text
+        assert "not confirm" in text.lower() or "verify" in text.lower()
+        assert "**State**: enabled" not in text
+
+    @pytest.mark.asyncio
+    async def test_failures_page_size_capped(self, log_tool):
+        """size is validated like every sibling handler (max 1000)."""
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        with pytest.raises(ToolError, match="1000"):
+            await log_tool.handle_action("get_ingestion_failures", {"size": 5000})
+        client.get_ingestion_failures.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_large_payload_rendering_is_bounded(self, log_tool):
+        """A huge originalPayload is truncated, not rendered in full."""
+        failures = {
+            "_embedded": {
+                "items": [
+                    {
+                        "failureTimestamp": "2026-07-21T10:00:00Z",
+                        "errors": [{"errorCode": "UNKNOWN_PRODUCT", "message": "x"}],
+                        "originalPayload": {"blob": "x" * 20000},
+                    }
+                ]
+            },
+            "page": {"totalElements": 1},
+        }
+        client = _ingestion_client(failures=failures)
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_ingestion_failures", {})
+        text = result[0].text
+        assert len(text) < 10000
+        assert "truncated" in text.lower()
+
+
+class TestIngestionTotalResponseBound:
+    """Review hardening round 2: the COMPLETE response is bounded, not just
+    each payload — a page of many capped entries must still fit the MCP
+    transport."""
+
+    @pytest.mark.asyncio
+    async def test_many_large_entries_bound_total_response(self, log_tool):
+        entries = [
+            {
+                "failureTimestamp": f"2026-07-22T10:00:{i:02d}Z",
+                "errors": [{"errorCode": "UNKNOWN_PRODUCT", "message": "x" * 200}],
+                "originalPayload": {"blob": "y" * 5000},
+            }
+            for i in range(20)
+        ]
+        failures = {"_embedded": {"items": entries}, "page": {"totalElements": 20}}
+        client = _ingestion_client(failures=failures)
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_ingestion_failures", {"size": 20})
+        text = result[0].text
+        assert len(text) < 30000
+        assert "truncated" in text.lower() or "more entries" in text.lower()
+        # Guidance for narrowing must be present when output is cut
+        assert "size" in text or "error_code" in text

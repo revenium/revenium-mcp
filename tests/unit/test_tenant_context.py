@@ -245,6 +245,15 @@ class TestTenantContextRedaction:
         dumped = ctx.model_dump()
         assert dumped["api_key"] == "abcdef1234567890"
 
+    def test_model_dump_still_contains_clerk_jwt(self):
+        token = "eyJhbGciOiJSUzI1NiJ9.payload.sig"
+        ctx = TenantContext(
+            team_id="team_x", clerk_jwt=token, base_url="https://api.example.com"
+        )
+        dumped = ctx.model_dump()
+        assert dumped["clerk_jwt"] == token
+        assert dumped["api_key"] is None
+
 
 class TestAuthConfigFactoryPhase1Contract:
     """Pin the Phase-1 behavior of AuthConfigFactory.from_tenant_context().
@@ -330,3 +339,70 @@ class TestApiKeyScopesField:
     def test_defaults_to_none(self):
         ctx = TenantContext(**self._ctx_kwargs())
         assert ctx.api_key_scopes is None
+
+
+class TestCredentialExclusivity:
+    def test_clerk_jwt_alone_is_valid(self):
+        ctx = TenantContext(
+            team_id="team_x",
+            tenant_id="tenant_x",
+            clerk_jwt="eyJhbGciOiJSUzI1NiJ9.payload.sig",
+            base_url="https://api.example.com",
+        )
+        assert ctx.clerk_jwt is not None
+        assert ctx.api_key is None
+
+    def test_api_key_alone_is_valid(self):
+        ctx = TenantContext(
+            team_id="team_x",
+            api_key="rev_sk_0123456789",
+            base_url="https://api.example.com",
+        )
+        assert ctx.api_key == "rev_sk_0123456789"
+        assert ctx.clerk_jwt is None
+
+    def test_both_credentials_rejected(self):
+        with pytest.raises(ValueError, match="exactly one"):
+            TenantContext(
+                team_id="team_x",
+                api_key="rev_sk_0123456789",
+                clerk_jwt="eyJhbGciOiJSUzI1NiJ9.payload.sig",
+                base_url="https://api.example.com",
+            )
+
+    def test_neither_credential_rejected(self):
+        with pytest.raises(ValueError, match="exactly one"):
+            TenantContext(team_id="team_x", base_url="https://api.example.com")
+
+    def test_empty_clerk_jwt_rejected(self):
+        with pytest.raises(ValueError):
+            TenantContext(
+                team_id="team_x", clerk_jwt="   ", base_url="https://api.example.com"
+            )
+
+    def test_repr_never_contains_raw_jwt(self):
+        token = "eyJhbGciOiJSUzI1NiJ9.supersecretpayload.signature"
+        ctx = TenantContext(
+            team_id="team_x", clerk_jwt=token, base_url="https://api.example.com"
+        )
+        assert token not in repr(ctx)
+        assert token not in str(ctx)
+        assert "supersecret" not in repr(ctx)
+
+    def test_model_copy_cannot_violate_exclusivity(self):
+        ctx = TenantContext(
+            team_id="team_x",
+            clerk_jwt="eyJhbGciOiJSUzI1NiJ9.payload.sig",
+            base_url="https://api.example.com",
+        )
+        with pytest.raises(ValueError, match="exactly one"):
+            ctx.model_copy(update={"api_key": "rev_sk_0123456789"})
+
+    def test_model_copy_without_update_still_works(self):
+        ctx = TenantContext(
+            team_id="team_x",
+            clerk_jwt="eyJhbGciOiJSUzI1NiJ9.payload.sig",
+            base_url="https://api.example.com",
+        )
+        copy = ctx.model_copy()
+        assert copy == ctx

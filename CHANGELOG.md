@@ -5,6 +5,42 @@ All notable changes to the Revenium MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-24
+
+### Added
+- `manage_agents` tool: agent registry (list, get, create, update, delete, list_discovered) plus read-only squad observability (list_squads, list_squad_executions, get_squad, get_squad_timeline)
+- `manage_cost_controls` tool: AI spend guardrails (CRUD) with enforcement visibility (list_enforcement_events, get_enforcement_rules)
+- Business analytics: task/profitability/spend-mover actions (get_task_costs, get_task_completion, get_task_performance, get_profit_margins, get_top_movers, get_token_breakdown, get_team_costs, get_vendor_costs, get_token_vs_tool_cost, get_trace_cost_distribution)
+- Business analytics: get_filter_options(dimension=...) discovers valid filter values; get_unpaid_invoice_totals; read-only billing (list_invoices, list_refunds, list_period_charges); costSources filter on get_agent_costs; real transaction volume via get_transaction_count
+- `manage_alerts`: reset_budget for cumulative-usage alerts; get_budget_portfolio and get_budget_progress reads
+- `manage_customers`: lookup_user and lookup_subscriber by exact email
+- `manage_subscriptions`: get_billed_amount and get_quota_consumed reads
+- Tenant ingestion diagnostics: list ingestion failures and a guarded strict-ingestion-mode toggle; per-pathway data-ingestion status in check_system_status
+- Server-side query search on sources, completions and tool-events listings
+- HTTP transport: sliding-window rate limiting on MCP and OAuth endpoints
+- api_key mode: per-request team selection via the X-Revenium-Team-Id header
+- clerk mode: caller JWT forwarded downstream, Redis-backed OAuth client storage for multi-replica deployments, structured auth events
+
+### Changed
+- `system_health` and quick diagnostics are AUTH_MODE-aware (clerk deployments no longer report false criticals)
+- Error responses carry resource-scoped suggestions and preserve upstream 400 detail; not-found lookups return promptly (retry-on-empty is opt-in)
+- fastmcp pinned exactly; container images install the locked dependency set
+
+### Fixed
+- Auth failures now set `isError:true` on `manage_tools`, `manage_agents`, `manage_cost_controls` and `manage_ai_insights`
+- `manage_ai_insights` exposes its real description in `tools/list`
+- `manage_tools` accepts string `unitPrice`/`upTo` (GET round-trip) without TypeError
+- `get_tool_costs` renders real tool names and costs; `get_api_endpoints` documents the real completions wire contract
+- `manage_alerts`: the documented THRESHOLD payload now creates successfully instead of being rejected by the tool's own validator
+- Analytics and insights requests target the host matching the configured environment instead of silently defaulting to production
+- clerk-mode OIDC login no longer rejected (upstream audience dropped, granted scopes restored); the OAuth Redis client store honors `rediss://` TLS
+- Dry-run/live parity restored on sources, alerts and subscriptions; `create_simple` dry-run previews show the real payload
+- Out-of-range `page`/`size` values get a structured validation error instead of echoing corrupted values
+- `manage_workflows` reports explicit `workflow_type` and real `created_at` timestamps
+- Pydantic binding errors on newer fastmcp versions translate to clean structured errors instead of framework tracebacks
+- Metering validation results cache correctly across manager instances (content-addressed cache keys)
+- Hosted multi-tenant correctness: per-request credentials reach the data plane; handlers fail closed without tenant context
+
 ## [0.2.11] - 2026-06-04
 
 ### Added
@@ -202,6 +238,7 @@ No functional changes. Changelog formatting update only.
 - Configuration via environment variables
 - System diagnostics and transaction verification tools
 
+[0.3.0]: https://github.com/revenium/revenium-mcp/compare/v0.2.11...v0.3.0
 [0.2.11]: https://github.com/revenium/revenium-mcp/compare/v0.2.10...v0.2.11
 [0.2.10]: https://github.com/revenium/revenium-mcp/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/revenium/revenium-mcp/compare/v0.2.8...v0.2.9

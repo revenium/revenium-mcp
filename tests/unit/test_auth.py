@@ -287,3 +287,61 @@ class TestUtilityFunctions:
         assert headers.get("x-api-key") == "test_api_key_12345"
         # Timeout must be positive — confirms pydantic validation passed
         assert config.timeout > 0
+
+
+class TestAuthConfigClerkJwt:
+    def test_clerk_jwt_headers_use_bearer(self):
+        cfg = AuthConfig(
+            clerk_jwt="eyJhbGciOiJSUzI1NiJ9.payload.sig",
+            team_id="team_x",
+            base_url="https://api.example.com",
+        )
+        headers = cfg.get_auth_headers()
+        assert headers["Authorization"] == "Bearer eyJhbGciOiJSUzI1NiJ9.payload.sig"
+        assert "x-api-key" not in headers
+
+    def test_api_key_headers_unchanged(self):
+        cfg = AuthConfig(
+            api_key="rev_sk_0123456789",
+            team_id="team_x",
+            base_url="https://api.example.com",
+        )
+        headers = cfg.get_auth_headers()
+        assert headers["x-api-key"] == "rev_sk_0123456789"
+        assert "Authorization" not in headers
+
+    def test_both_credentials_rejected(self):
+        with pytest.raises(ValueError, match="exactly one"):
+            AuthConfig(
+                api_key="rev_sk_0123456789",
+                clerk_jwt="eyJhbGciOiJSUzI1NiJ9.p.s",
+                team_id="team_x",
+            )
+
+    def test_neither_credential_rejected(self):
+        with pytest.raises(ValueError, match="exactly one"):
+            AuthConfig(team_id="team_x")
+
+    def test_bearer_credential_prefers_clerk_jwt(self):
+        cfg = AuthConfig(clerk_jwt="eyJ.p.s12345678", team_id="team_x")
+        assert cfg.bearer_credential == "eyJ.p.s12345678"
+        cfg2 = AuthConfig(api_key="rev_sk_0123456789", team_id="team_x")
+        assert cfg2.bearer_credential == "rev_sk_0123456789"
+
+    def test_model_copy_cannot_violate_exclusivity(self):
+        cfg = AuthConfig(clerk_jwt="eyJ.p.s12345678", team_id="team_x")
+        with pytest.raises(ValueError, match="exactly one"):
+            cfg.model_copy(update={"api_key": "rev_sk_0123456789"})
+
+    def test_frozen_rejects_mutation(self):
+        cfg = AuthConfig(api_key="rev_sk_0123456789", team_id="team_x")
+        with pytest.raises(Exception):
+            cfg.api_key = "rev_sk_9876543210"
+
+    def test_model_copy_roundtrip_preserves_fields(self):
+        cfg = AuthConfig(api_key="rev_sk_0123456789", team_id="team_x", tenant_id="t1")
+        copy = cfg.model_copy()
+        assert copy.api_key == cfg.api_key
+        assert copy.team_id == cfg.team_id
+        assert copy.tenant_id == cfg.tenant_id
+        assert copy.environment == cfg.environment

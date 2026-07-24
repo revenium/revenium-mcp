@@ -19,6 +19,7 @@ import logging
 from typing import Any, Sequence
 
 from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ValidationError as FastMCPValidationError
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from pydantic import ValidationError
 
@@ -34,7 +35,12 @@ class FrameworkLeakGuardMiddleware(Middleware):
     the tool's accepted parameter names for "did you mean" suggestions, and
     re-raises a fastmcp `ToolError` with a caller-actionable message.
 
-    BACK-1312 (audit findings B.1-B.4).
+    The binding error arrives in two shapes depending on the fastmcp version:
+    raw ``pydantic.ValidationError`` (<= 3.2), or wrapped in fastmcp's own
+    ``ValidationError`` with the pydantic original as ``__cause__`` (>= 3.4,
+    fastmcp #4128). Both are translated; everything else propagates untouched.
+
+    BACK-1312 (audit findings B.1-B.4); wrapped shape: BACK-2253.
     """
 
     async def on_call_tool(
@@ -45,20 +51,38 @@ class FrameworkLeakGuardMiddleware(Middleware):
         try:
             return await call_next(context)
         except ValidationError as exc:
-            # BACK-1312 (Tessie review): only translate ValidationError from the
-            # FastMCP signature-binding layer (TypeAdapter title = `call[<tool>]`).
-            # ValidationError raised inside the tool handler body — e.g. from a
-            # BaseModel constructed with bad data — has a different title and must
-            # propagate untouched so the original validation context survives.
-            title = getattr(exc, "title", "") or ""
-            if not title.startswith("call["):
+            msg = await self._translate_binding_error(context, exc)
+            if msg is None:
                 raise
-            tool_name = getattr(context.message, "name", "<unknown_tool>")
-            accepted = await _resolve_accepted_params(context, tool_name)
-            msg = translate_pydantic_error(
-                exc, tool_name=tool_name, accepted_params=accepted
-            )
             raise ToolError(msg) from exc
+        except FastMCPValidationError as exc:
+            cause = exc.__cause__
+            if not isinstance(cause, ValidationError):
+                raise
+            msg = await self._translate_binding_error(context, cause)
+            if msg is None:
+                raise
+            raise ToolError(msg) from exc
+
+    async def _translate_binding_error(
+        self, context: MiddlewareContext, exc: ValidationError
+    ) -> str | None:
+        """Translate a binding-layer ValidationError; None when out of scope.
+
+        BACK-1312 (Tessie review): only translate ValidationError from the
+        FastMCP signature-binding layer (TypeAdapter title = `call[<tool>]`).
+        ValidationError raised inside the tool handler body — e.g. from a
+        BaseModel constructed with bad data — has a different title and must
+        propagate untouched so the original validation context survives.
+        """
+        title = getattr(exc, "title", "") or ""
+        if not title.startswith("call["):
+            return None
+        tool_name = getattr(context.message, "name", "<unknown_tool>")
+        accepted = await _resolve_accepted_params(context, tool_name)
+        return translate_pydantic_error(
+            exc, tool_name=tool_name, accepted_params=accepted
+        )
 
 
 async def _resolve_accepted_params(
@@ -109,9 +133,29 @@ def translate_pydantic_error(
     Returns:
         A clean, caller-facing string.
     """
+    # A Union-typed parameter yields one error per branch for the same field,
+    # and stacked "must be an integer" + "must be a string" paragraphs read as
+    # a contradiction. Keep one message per field, preferring the numeric
+    # guidance — it already offers the digit-string alternative.
+    preferred_types = ("int_from_float", "int_type", "int_parsing")
+    # values are pydantic ErrorDetails TypedDicts; Any keeps mypy honest here
+    by_field: dict[str, Any] = {}
+    field_order: list[str] = []
+    for err in exc.errors():
+        loc = err.get("loc", ())
+        field = str(loc[0]) if loc else "<unknown>"
+        if field not in by_field:
+            by_field[field] = err
+            field_order.append(field)
+        elif (
+            err.get("type") in preferred_types
+            and by_field[field].get("type") not in preferred_types
+        ):
+            by_field[field] = err
+
     paragraphs = [
-        _format_one_error(err, tool_name=tool_name, accepted_params=accepted_params)
-        for err in exc.errors()
+        _format_one_error(by_field[field], tool_name=tool_name, accepted_params=accepted_params)
+        for field in field_order
     ]
     return "\n\n".join(paragraphs)
 

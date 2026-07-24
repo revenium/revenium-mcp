@@ -294,7 +294,8 @@ class AnalyticsValidator:
         Validate parameters for get_agent_costs.
 
         Args:
-            params: Parameters dictionary
+            params: Parameters dictionary, optionally with a ``filters`` dict
+                whose only accepted key is ``costSources``
 
         Returns:
             Validated parameters
@@ -302,16 +303,121 @@ class AnalyticsValidator:
         Raises:
             ValidationError: If parameters are invalid
         """
-        analytics_params = self.validate_analytics_params(params)
+        # Extract filters before base validation (which has a different allowlist)
+        raw_filters = params.get("filters") or {}
+        base_params = {k: v for k, v in params.items() if k != "filters"}
+        analytics_params = self.validate_analytics_params(base_params)
 
-        validated = {"period": analytics_params.period, "aggregation": analytics_params.aggregation}
+        validated: Dict[str, Any] = {
+            "period": analytics_params.period,
+            "aggregation": analytics_params.aggregation,
+        }
+
+        if raw_filters:
+            validated["filters"] = self._validate_array_filters(
+                raw_filters,
+                allowed_keys=self._AGENT_COSTS_FILTER_KEYS,
+                valid_cost_sources=self._AGENT_COSTS_COST_SOURCES,
+                context="agent costs",
+            )
 
         logger.info(f"Validated agent costs params: {validated}")
         return validated
 
     # Filter keys accepted by the cost-by-user endpoints (FRONT-931).
     _USER_COSTS_FILTER_KEYS = {"agents", "providers", "models", "users", "costSources"}
-    _VALID_COST_SOURCES = {"coding_assistant", "revenium_metered"}
+    _VALID_COST_SOURCES = {"coding_assistant", "revenium_metered", "provider_billing"}
+    # Filter surface for get_agent_costs. The cost-by-agent endpoint only
+    # accepts the real-spend cost sources; coding_assistant is not valid here.
+    _AGENT_COSTS_FILTER_KEYS = {"costSources"}
+    _AGENT_COSTS_COST_SOURCES = {"revenium_metered", "provider_billing"}
+
+    def _validate_array_filters(
+        self,
+        raw_filters: Dict[str, Any],
+        allowed_keys: set,
+        valid_cost_sources: set,
+        context: str,
+    ) -> Dict[str, List[str]]:
+        """Normalize and validate array-style filters for cost endpoints.
+
+        Shared by validate_user_costs_params and validate_agent_costs_params;
+        each caller supplies its own key allowlist and costSources enum.
+
+        Args:
+            raw_filters: The raw ``filters`` dict from the request
+            allowed_keys: Filter keys the target endpoint accepts
+            valid_cost_sources: Values accepted for the ``costSources`` key
+            context: Human-readable operation name used in error messages
+
+        Returns:
+            Filters with every value normalized to a list of strings
+
+        Raises:
+            ValidationError: If filters is not a dict, a key is not allowed,
+                or a value is invalid
+        """
+        if not isinstance(raw_filters, dict):
+            raise ValidationError(
+                "filters must be a dictionary",
+                field="filters",
+                suggestions=['Use dict format like {"costSources": ["revenium_metered"]}'],
+            )
+
+        validated_filters: Dict[str, List[str]] = {}
+        for key, value in raw_filters.items():
+            if key not in allowed_keys:
+                raise ValidationError(
+                    f"Unsupported filter key for {context}: {key}",
+                    field="filters",
+                    suggestions=[f"Allowed keys: {', '.join(sorted(allowed_keys))}"],
+                )
+            # Normalise to list for array query params
+            if isinstance(value, str):
+                validated_filters[key] = [value]
+            elif isinstance(value, list):
+                # An empty list would silently drop the filter from the
+                # request and return data the caller would read as filtered.
+                if not value:
+                    raise ValidationError(
+                        f"Filter '{key}' must not be empty",
+                        field=f"filters.{key}",
+                        suggestions=[
+                            f"Provide at least one value for '{key}', or omit the key"
+                        ],
+                    )
+                if len(value) > 100:
+                    raise ValidationError(
+                        f"Filter '{key}' exceeds maximum of 100 items",
+                        field=f"filters.{key}",
+                        suggestions=[f"Provide at most 100 values for '{key}'"],
+                    )
+                validated_filters[key] = [str(v) for v in value]
+            else:
+                validated_filters[key] = [str(value)]
+
+            # Defense-in-depth: cap per-value string length
+            oversized = [v for v in validated_filters[key] if len(v) > 255]
+            if oversized:
+                raise ValidationError(
+                    f"Filter '{key}' contains value(s) longer than 255 characters",
+                    field=f"filters.{key}",
+                    suggestions=[f"Each value for '{key}' must be at most 255 characters"],
+                )
+
+            # Validate costSources enum values
+            if key == "costSources":
+                invalid = [v for v in validated_filters[key] if v not in valid_cost_sources]
+                if invalid:
+                    raise ValidationError(
+                        f"Invalid costSources value(s): {', '.join(invalid)}",
+                        field="filters.costSources",
+                        suggestions=[
+                            f"Valid values: {', '.join(sorted(valid_cost_sources))}"
+                        ],
+                    )
+
+        return validated_filters
 
     def validate_user_costs_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -331,56 +437,19 @@ class AnalyticsValidator:
         base_params = {k: v for k, v in params.items() if k != "filters"}
         analytics_params = self.validate_analytics_params(base_params)
 
-        validated = {"period": analytics_params.period, "aggregation": analytics_params.aggregation}
+        validated: Dict[str, Any] = {
+            "period": analytics_params.period,
+            "aggregation": analytics_params.aggregation,
+        }
 
         # Validate user-costs-specific filters (agents, providers, models, users)
         if raw_filters:
-            user_filters = {}
-            for key, value in raw_filters.items():
-                if key not in self._USER_COSTS_FILTER_KEYS:
-                    raise ValidationError(
-                        f"Unsupported filter key for user costs: {key}",
-                        field="filters",
-                        suggestions=[
-                            f"Allowed keys: {', '.join(sorted(self._USER_COSTS_FILTER_KEYS))}"
-                        ],
-                    )
-                # Normalise to list for array query params
-                if isinstance(value, str):
-                    user_filters[key] = [value]
-                elif isinstance(value, list):
-                    if len(value) > 100:
-                        raise ValidationError(
-                            f"Filter '{key}' exceeds maximum of 100 items",
-                            field=f"filters.{key}",
-                            suggestions=[f"Provide at most 100 values for '{key}'"],
-                        )
-                    user_filters[key] = [str(v) for v in value]
-                else:
-                    user_filters[key] = [str(value)]
-
-                # Defense-in-depth: cap per-value string length
-                oversized = [v for v in user_filters[key] if len(v) > 255]
-                if oversized:
-                    raise ValidationError(
-                        f"Filter '{key}' contains value(s) longer than 255 characters",
-                        field=f"filters.{key}",
-                        suggestions=[f"Each value for '{key}' must be at most 255 characters"],
-                    )
-
-                # Validate costSources enum values
-                if key == "costSources":
-                    invalid = [v for v in user_filters[key] if v not in self._VALID_COST_SOURCES]
-                    if invalid:
-                        raise ValidationError(
-                            f"Invalid costSources value(s): {', '.join(invalid)}",
-                            field="filters.costSources",
-                            suggestions=[
-                                f"Valid values: {', '.join(sorted(self._VALID_COST_SOURCES))}"
-                            ],
-                        )
-
-            validated["filters"] = user_filters
+            validated["filters"] = self._validate_array_filters(
+                raw_filters,
+                allowed_keys=self._USER_COSTS_FILTER_KEYS,
+                valid_cost_sources=self._VALID_COST_SOURCES,
+                context="user costs",
+            )
 
         logger.debug("Validated user costs params: period=%s", validated["period"])
         return validated

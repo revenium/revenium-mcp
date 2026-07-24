@@ -86,13 +86,12 @@ def clerk_env(monkeypatch):
     monkeypatch.setenv("CLERK_OAUTH_CLIENT_ID", "client_test")
     monkeypatch.setenv("CLERK_OAUTH_CLIENT_SECRET", "secret_test")
     monkeypatch.setenv("MCP_SERVER_BASE_URL", "https://mcp.test.io")
-    monkeypatch.setenv("REVENIUM_TENANT_ID", "tenant_test")
-    monkeypatch.setenv("REVENIUM_API_KEY", "key_test_abcd1234")
     monkeypatch.setenv("REVENIUM_TEAM_ID", "team_test")
 
+    # Clerk mode needs no REVENIUM_API_KEY, so the env-backed ConfigManager is
+    # never primed here — only kept isolated between tests.
     from src.revenium_mcp_server.auth import ConfigManager
     ConfigManager().clear_cache()
-    ConfigManager().load_from_env()
 
     yield
 
@@ -110,7 +109,6 @@ def test_clerk_mode_missing_env_raises(monkeypatch):
         "CLERK_OAUTH_CLIENT_ID",
         "CLERK_OAUTH_CLIENT_SECRET",
         "MCP_SERVER_BASE_URL",
-        "REVENIUM_TENANT_ID",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -120,7 +118,6 @@ def test_clerk_mode_missing_env_raises(monkeypatch):
             "CLERK_OAUTH_CLIENT_ID",
             "CLERK_OAUTH_CLIENT_SECRET",
             "MCP_SERVER_BASE_URL",
-            "REVENIUM_TENANT_ID",
         ])
     msg = str(exc.value)
     for name in (
@@ -128,9 +125,34 @@ def test_clerk_mode_missing_env_raises(monkeypatch):
         "CLERK_OAUTH_CLIENT_ID",
         "CLERK_OAUTH_CLIENT_SECRET",
         "MCP_SERVER_BASE_URL",
-        "REVENIUM_TENANT_ID",
     ):
         assert name in msg
+
+
+def test_clerk_mode_does_not_require_tenant_id_or_api_key(monkeypatch):
+    """clerk mode must boot without REVENIUM_TENANT_ID and REVENIUM_API_KEY."""
+    from src.revenium_mcp_server.enhanced_server import _require_envs
+
+    monkeypatch.setenv("CLERK_DOMAIN", "test.clerk.accounts.dev")
+    monkeypatch.setenv("CLERK_OAUTH_CLIENT_ID", "client_id")
+    monkeypatch.setenv("CLERK_OAUTH_CLIENT_SECRET", "client_secret")
+    monkeypatch.setenv("MCP_SERVER_BASE_URL", "https://mcp.test.io")
+    monkeypatch.delenv("REVENIUM_TENANT_ID", raising=False)
+    monkeypatch.delenv("REVENIUM_API_KEY", raising=False)
+
+    # Must not raise — these four are the only clerk-required envs
+    result = _require_envs([
+        "CLERK_DOMAIN",
+        "CLERK_OAUTH_CLIENT_ID",
+        "CLERK_OAUTH_CLIENT_SECRET",
+        "MCP_SERVER_BASE_URL",
+    ])
+    assert set(result.keys()) == {
+        "CLERK_DOMAIN",
+        "CLERK_OAUTH_CLIENT_ID",
+        "CLERK_OAUTH_CLIENT_SECRET",
+        "MCP_SERVER_BASE_URL",
+    }
 
 
 def test_create_enhanced_server_accepts_auth_param(monkeypatch):
@@ -238,7 +260,7 @@ async def test_main_wires_oidc_proxy_middleware_and_http_transport_in_clerk_mode
 
     with (
         patch("src.revenium_mcp_server.enhanced_server.FastMCP", mock_fastmcp_cls),
-        patch("fastmcp.server.auth.oidc_proxy.OIDCProxy", mock_oidc_proxy_cls),
+        patch("src.revenium_mcp_server.auth.oidc_logging.AuthLoggingOIDCProxy", mock_oidc_proxy_cls),
         patch("src.revenium_mcp_server.client.ReveniumClient", mock_revenium_client_cls),
         patch("src.revenium_mcp_server.enhanced_server.install_crash_logging", return_value=MagicMock()),
         patch("src.revenium_mcp_server.enhanced_server.register_tools", new=AsyncMock(return_value=None)),
@@ -253,11 +275,23 @@ async def test_main_wires_oidc_proxy_middleware_and_http_transport_in_clerk_mode
     assert oidc_kwargs["client_id"] == "client_test"
     assert oidc_kwargs["client_secret"] == "secret_test"
     assert oidc_kwargs["base_url"] == "https://mcp.test.io"
-    assert oidc_kwargs["required_scopes"] == ["openid", "profile", "email"]
+    # private_metadata scope: Clerk only surfaces the nested revenium_team_id /
+    # tenant_id claims in the ID token when this scope is granted.
+    assert oidc_kwargs["required_scopes"] == [
+        "openid", "profile", "email", "private_metadata"
+    ]
+    # verify_id_token: the access token is minimal (no email / metadata); the
+    # ID token carries identity, so the proxy verifies and forwards it.
+    assert oidc_kwargs["verify_id_token"] is True
     assert oidc_kwargs["algorithm"] == "RS256"
     assert oidc_kwargs["config_url"] == (
         "https://test-instance.clerk.accounts.dev/.well-known/openid-configuration"
     )
+    # No explicit audience is passed: under verify_id_token the proxy binds
+    # inbound tokens to aud == client_id, and a custom audience would be
+    # forwarded upstream to Clerk, which has no audience whitelist and rejects
+    # it. (See test_clerk_expected_audience_is_ignored for the regression.)
+    assert "audience" not in oidc_kwargs or oidc_kwargs["audience"] is None
 
     # 2. FastMCP was created with auth= pointing to the OIDCProxy instance
     mock_fastmcp_cls.assert_called_once()
@@ -278,10 +312,62 @@ async def test_main_wires_oidc_proxy_middleware_and_http_transport_in_clerk_mode
     assert FrameworkLeakGuardMiddleware in registered_types
     assert TenantContextMiddleware in registered_types
 
-    # 4. run_async was called with transport="http", host, and port
-    fake_mcp.run_async.assert_called_once_with(
-        transport="http", host="127.0.0.1", port=9000
-    )
+    # 4. run_async was called with transport="http", host, port, and middleware
+    fake_mcp.run_async.assert_called_once()
+    run_kwargs = fake_mcp.run_async.call_args.kwargs
+    assert run_kwargs["transport"] == "http"
+    assert run_kwargs["host"] == "127.0.0.1"
+    assert run_kwargs["port"] == 9000
+    assert "middleware" in run_kwargs  # rate-limit middleware list (or None)
+
+
+@pytest.mark.asyncio
+async def test_clerk_expected_audience_is_ignored(
+    clerk_env, monkeypatch
+):
+    """A custom audience is never passed to the proxy, even if the (now legacy)
+    CLERK_EXPECTED_AUDIENCE env is set.
+
+    Regression: Clerk has no audience whitelist for OAuth apps, and the proxy
+    would forward any configured audience upstream to /authorize, so Clerk
+    rejected every login ("Requested audience ... has not been whitelisted").
+    Inbound binding to aud == client_id (verify_id_token) is the protection.
+    """
+    from src.revenium_mcp_server import enhanced_server
+
+    monkeypatch.setenv("MCP_HOST", "127.0.0.1")
+    monkeypatch.setenv("MCP_PORT", "9000")
+    monkeypatch.delenv("CLERK_OIDC_CONFIG_URL_OVERRIDE", raising=False)
+    monkeypatch.setenv("CLERK_EXPECTED_AUDIENCE", "https://custom-audience.example.com/api")
+
+    fake_mcp = MagicMock(name="fake_mcp")
+    fake_mcp.run_async = AsyncMock(return_value=None)
+    mock_fastmcp_cls = MagicMock(name="FastMCP", return_value=fake_mcp)
+    mock_oidc_proxy_instance = MagicMock(name="oidc_proxy_instance")
+    mock_oidc_proxy_cls = MagicMock(name="OIDCProxy", return_value=mock_oidc_proxy_instance)
+    mock_client_instance = MagicMock(name="revenium_client")
+    mock_client_instance.validate_api_key = AsyncMock(return_value={"valid": True})
+    mock_revenium_client_cls = MagicMock(name="ReveniumClient", return_value=mock_client_instance)
+    mock_ucm = MagicMock(name="ucm_integration_service")
+    mock_ucm.initialize = AsyncMock(return_value=None)
+    mock_ucm.integrate_with_mcp_server = AsyncMock(return_value=None)
+    mock_introspection = MagicMock(name="introspection_integration")
+    mock_introspection.initialize = AsyncMock(return_value=None)
+    mock_introspection.get_server_summary = AsyncMock(return_value={"registered_tools": 0})
+
+    with (
+        patch("src.revenium_mcp_server.enhanced_server.FastMCP", mock_fastmcp_cls),
+        patch("src.revenium_mcp_server.auth.oidc_logging.AuthLoggingOIDCProxy", mock_oidc_proxy_cls),
+        patch("src.revenium_mcp_server.client.ReveniumClient", mock_revenium_client_cls),
+        patch("src.revenium_mcp_server.enhanced_server.install_crash_logging", return_value=MagicMock()),
+        patch("src.revenium_mcp_server.enhanced_server.register_tools", new=AsyncMock(return_value=None)),
+        patch.object(enhanced_server, "ucm_integration_service", mock_ucm),
+        patch.object(enhanced_server, "introspection_integration", mock_introspection),
+    ):
+        await enhanced_server.main()
+
+    oidc_kwargs = mock_oidc_proxy_cls.call_args.kwargs
+    assert "audience" not in oidc_kwargs or oidc_kwargs["audience"] is None
 
 
 def test_api_key_mode_registers_api_key_middleware(monkeypatch):

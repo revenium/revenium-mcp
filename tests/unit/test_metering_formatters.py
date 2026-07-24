@@ -250,6 +250,27 @@ class TestFormatAttributionDetails:
         result = self.mm._format_attribution_details(data)
         assert "**Subscriber Credential Name**: my-key" in result
 
+    def test_flat_subscriber_credential_null_no_line(self):
+        """Preview docs retype subscriberCredential as nullable; a null value
+        must skip the credential line, not render 'None'."""
+        data = {"subscriberEmail": "a@b.com", "subscriberCredential": None}
+        result = self.mm._format_attribution_details(data)
+        assert "**Subscriber Email**: a@b.com" in result
+        assert "Subscriber Credential Name" not in result
+
+    def test_flat_subscriber_credential_resource_metadata_label(self):
+        """Live dev payloads return the ResourceMetadata shape; label wins."""
+        data = {
+            "subscriberCredential": {
+                "id": "3BygmAQ",
+                "label": "UNCLASSIFIED",
+                "resourceType": "credential",
+            }
+        }
+        result = self.mm._format_attribution_details(data)
+        assert "**Subscriber Credential Name**: UNCLASSIFIED" in result
+        assert "3BygmAQ" not in result
+
     def test_nested_subscriber_fallback(self):
         data = {
             "subscriber": {
@@ -432,6 +453,32 @@ class TestFormatSubscriberDetails:
         data = {"subscriberCredential": {"name": "fallback-name"}}
         result = self.mm._format_subscriber_details(data)
         assert "**Credential Name**: fallback-name" in result
+
+    def test_null_credential_renders_no_credential_line(self):
+        """Preview docs retype subscriberCredential as nullable; a null value
+        must skip the credential line, not render 'None'."""
+        data = {"subscriberEmail": "a@b.com", "subscriberCredential": None}
+        result = self.mm._format_subscriber_details(data)
+        assert "**Email**: a@b.com" in result
+        assert "Credential Name" not in result
+
+    def test_null_credential_alone_returns_empty(self):
+        assert self.mm._format_subscriber_details({"subscriberCredential": None}) == ""
+
+    def test_credential_resource_metadata_shape_renders_label(self):
+        """Live dev payloads return the ResourceMetadata shape; label wins."""
+        data = {
+            "subscriberCredential": {
+                "id": "3BygmAQ",
+                "label": "UNCLASSIFIED",
+                "resourceType": "credential",
+                "created": "2026-07-01T00:00:00Z",
+                "updated": "2026-07-01T00:00:00Z",
+            }
+        }
+        result = self.mm._format_subscriber_details(data)
+        assert "**Credential Name**: UNCLASSIFIED" in result
+        assert "3BygmAQ" not in result
 
     def test_nested_subscriber_format(self):
         data = {

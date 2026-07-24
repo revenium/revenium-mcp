@@ -329,12 +329,17 @@ class TestProcessCustomerProfitability:
         result = self.processor._process_customer_profitability(data, top_n=10)
         assert result == []
 
-    def test_transaction_count_estimated(self):
-        """Transaction count is estimated from cost data."""
+    def test_no_fabricated_transaction_count(self):
+        """Profitability rows carry no cost-derived transaction estimates.
+
+        The old ``max(1, int(cost / 0.01))`` proxy fabricated counts from
+        cost; real volume now comes from the transaction-count-by-team
+        endpoint via business_analytics_management.get_transaction_count.
+        """
         data = _make_customer_data("AcmeCorp", cost=1.0, revenue=2.0)
         result = self.processor._process_customer_profitability(data, top_n=10)
-        assert result[0].transaction_count >= 1
-        assert result[0].cost_per_transaction > 0
+        assert not hasattr(result[0], "transaction_count")
+        assert not hasattr(result[0], "cost_per_transaction")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -138,9 +138,12 @@ async def test_main_runs_http_with_env_auth_and_warns(env_mode_env, monkeypatch)
             stack.enter_context(p)
         await enhanced_server.main()
 
-    mocks["fake_mcp"].run_async.assert_called_once_with(
-        transport="http", host="127.0.0.1", port=9876
-    )
+    assert mocks["fake_mcp"].run_async.call_count == 1
+    run_kwargs = mocks["fake_mcp"].run_async.call_args.kwargs
+    assert run_kwargs["transport"] == "http"
+    assert run_kwargs["host"] == "127.0.0.1"
+    assert run_kwargs["port"] == 9876
+    assert "middleware" in run_kwargs
     assert any("without authentication" in m.lower() for m in warnings)
 
 

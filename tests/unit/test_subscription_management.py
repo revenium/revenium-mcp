@@ -354,6 +354,160 @@ class TestSubscriptionManagerGet:
 
 
 # ===========================================================================
+# SubscriptionManager - Billing reads
+# ===========================================================================
+
+
+class TestSubscriptionManagerBilledAmount:
+    """Test SubscriptionManager.get_billed_amount behavior."""
+
+    @pytest.mark.asyncio
+    async def test_returns_amount_billed(self, sub_manager, mock_client):
+        mock_client.get_subscription_billed_amount = AsyncMock(
+            return_value={"amountBilled": 42.5}
+        )
+        result = await sub_manager.get_billed_amount({"subscription_id": "sub1"})
+        assert result["amountBilled"] == 42.5
+        mock_client.get_subscription_billed_amount.assert_called_once_with("sub1")
+
+    @pytest.mark.asyncio
+    async def test_zero_billed_is_valid(self, sub_manager, mock_client):
+        mock_client.get_subscription_billed_amount = AsyncMock(
+            return_value={"amountBilled": 0.0}
+        )
+        result = await sub_manager.get_billed_amount({"subscription_id": "sub1"})
+        assert result["amountBilled"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_missing_id_raises(self, sub_manager):
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager.get_billed_amount({})
+        assert "subscription_id" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_amount_raises_not_silent_zero(self, sub_manager, mock_client):
+        """A missing/non-numeric amountBilled is a contract failure, not a zero."""
+        mock_client.get_subscription_billed_amount = AsyncMock(
+            return_value={"amountBilled": None}
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager.get_billed_amount({"subscription_id": "sub1"})
+        assert "amountbilled" in str(exc_info.value).lower() or "unexpected" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_missing_field_raises(self, sub_manager, mock_client):
+        mock_client.get_subscription_billed_amount = AsyncMock(return_value={})
+        with pytest.raises(ToolError):
+            await sub_manager.get_billed_amount({"subscription_id": "sub1"})
+
+    @pytest.mark.asyncio
+    async def test_404_raises_not_found(self, sub_manager, mock_client):
+        mock_client.get_subscription_billed_amount = AsyncMock(
+            side_effect=ReveniumAPIError(message="Not found", status_code=404)
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager.get_billed_amount({"subscription_id": "bad"})
+        assert "not found" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_403_raises_not_found(self, sub_manager, mock_client):
+        mock_client.get_subscription_billed_amount = AsyncMock(
+            side_effect=ReveniumAPIError(message="Forbidden", status_code=403)
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager.get_billed_amount({"subscription_id": "other_team"})
+        assert "not found" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_400_raises_validation_error(self, sub_manager, mock_client):
+        mock_client.get_subscription_billed_amount = AsyncMock(
+            side_effect=ReveniumAPIError(message="Bad request", status_code=400)
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager.get_billed_amount({"subscription_id": "!!!"})
+        assert "invalid" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_500_reraises(self, sub_manager, mock_client):
+        mock_client.get_subscription_billed_amount = AsyncMock(
+            side_effect=ReveniumAPIError(message="Server error", status_code=500)
+        )
+        with pytest.raises(ReveniumAPIError):
+            await sub_manager.get_billed_amount({"subscription_id": "x"})
+
+
+class TestSubscriptionManagerQuotaConsumed:
+    """Test SubscriptionManager.get_quota_consumed behavior."""
+
+    @pytest.mark.asyncio
+    async def test_returns_limit_and_consumed(self, sub_manager, mock_client):
+        mock_client.get_subscription_quota_consumed = AsyncMock(
+            return_value={"limit": 1000, "consumed": 250}
+        )
+        result = await sub_manager.get_quota_consumed({"subscription_id": "sub1"})
+        assert result["limit"] == 1000
+        assert result["consumed"] == 250
+        mock_client.get_subscription_quota_consumed.assert_called_once_with("sub1")
+
+    @pytest.mark.asyncio
+    async def test_zero_values_valid(self, sub_manager, mock_client):
+        mock_client.get_subscription_quota_consumed = AsyncMock(
+            return_value={"limit": 0, "consumed": 0}
+        )
+        result = await sub_manager.get_quota_consumed({"subscription_id": "sub1"})
+        assert result["limit"] == 0
+        assert result["consumed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_id_raises(self, sub_manager):
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager.get_quota_consumed({})
+        assert "subscription_id" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_raises_not_silent_zero(self, sub_manager, mock_client):
+        mock_client.get_subscription_quota_consumed = AsyncMock(
+            return_value={"limit": None, "consumed": None}
+        )
+        with pytest.raises(ToolError):
+            await sub_manager.get_quota_consumed({"subscription_id": "sub1"})
+
+    @pytest.mark.asyncio
+    async def test_partial_field_raises(self, sub_manager, mock_client):
+        mock_client.get_subscription_quota_consumed = AsyncMock(
+            return_value={"limit": 100}
+        )
+        with pytest.raises(ToolError):
+            await sub_manager.get_quota_consumed({"subscription_id": "sub1"})
+
+    @pytest.mark.asyncio
+    async def test_404_raises_not_found(self, sub_manager, mock_client):
+        mock_client.get_subscription_quota_consumed = AsyncMock(
+            side_effect=ReveniumAPIError(message="Not found", status_code=404)
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager.get_quota_consumed({"subscription_id": "bad"})
+        assert "not found" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_403_raises_not_found(self, sub_manager, mock_client):
+        mock_client.get_subscription_quota_consumed = AsyncMock(
+            side_effect=ReveniumAPIError(message="Forbidden", status_code=403)
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager.get_quota_consumed({"subscription_id": "other"})
+        assert "not found" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_500_reraises(self, sub_manager, mock_client):
+        mock_client.get_subscription_quota_consumed = AsyncMock(
+            side_effect=ReveniumAPIError(message="Server error", status_code=500)
+        )
+        with pytest.raises(ReveniumAPIError):
+            await sub_manager.get_quota_consumed({"subscription_id": "x"})
+
+
+# ===========================================================================
 # SubscriptionManager - Create
 # ===========================================================================
 
@@ -693,6 +847,52 @@ class TestSubscriptionManagementHandleAction:
         assert len(result) >= 1
         assert isinstance(result[0], TextContent)
 
+    @pytest.mark.asyncio
+    async def test_get_billed_amount_action_routes_and_renders(self, sub_mgmt):
+        """get_billed_amount routes and renders the billed amount."""
+        with patch.object(sub_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.get_subscription_billed_amount = AsyncMock(
+                return_value={"amountBilled": 12.75}
+            )
+            result = await sub_mgmt.handle_action(
+                "get_billed_amount", {"subscription_id": "sub1"}
+            )
+        assert len(result) >= 1
+        assert isinstance(result[0], TextContent)
+        assert "12.75" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_get_quota_consumed_action_routes_and_renders(self, sub_mgmt):
+        """get_quota_consumed routes and renders limit/consumed."""
+        with patch.object(sub_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.get_subscription_quota_consumed = AsyncMock(
+                return_value={"limit": 1000, "consumed": 250}
+            )
+            result = await sub_mgmt.handle_action(
+                "get_quota_consumed", {"subscription_id": "sub1"}
+            )
+        assert len(result) >= 1
+        assert isinstance(result[0], TextContent)
+        assert "1000" in result[0].text
+        assert "250" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_billing_reads_in_supported_actions(self, sub_mgmt):
+        actions = await sub_mgmt._get_supported_actions()
+        assert "get_billed_amount" in actions
+        assert "get_quota_consumed" in actions
+
+    @pytest.mark.asyncio
+    async def test_billing_reads_in_structured_capabilities(self, sub_mgmt):
+        caps = await sub_mgmt._get_tool_capabilities()
+        all_params = {k for c in caps for k in c.parameters}
+        assert "get_billed_amount" in all_params
+        assert "get_quota_consumed" in all_params
+
 
 # ===========================================================================
 # SubscriptionValidator tests
@@ -831,3 +1031,101 @@ class TestCreateSubscriptionSanitizesNestedProductSentinels:
         assert product["resourceType"] == "product"
         assert product["label"] is None
         assert product["created"] is None
+
+
+class TestSubscriptionsPaginationSafeInteger:
+    """Values beyond 2^53 must hit the safe-integer guard, not the
+    bounds check — and the float-corrupted value must not be echoed back."""
+
+    def test_size_beyond_safe_range_rejected_without_echo(self):
+        from src.revenium_mcp_server.tools_decomposed.subscription_management import (
+            _validate_subscriptions_pagination,
+        )
+
+        corrupted = int(float(2**63))
+        with pytest.raises(ToolError) as exc_info:
+            _validate_subscriptions_pagination(page=0, size=corrupted)
+        msg = str(exc_info.value)
+        assert "exceeds safe integer range" in msg
+        assert str(corrupted) not in msg
+
+    def test_page_beyond_safe_range_rejected_without_echo(self):
+        from src.revenium_mcp_server.tools_decomposed.subscription_management import (
+            _validate_subscriptions_pagination,
+        )
+
+        corrupted = int(float(2**63))
+        with pytest.raises(ToolError) as exc_info:
+            _validate_subscriptions_pagination(page=corrupted, size=20)
+        msg = str(exc_info.value)
+        assert "exceeds safe integer range" in msg
+        assert str(corrupted) not in msg
+
+
+class TestSubscriptionDryRunProductParity:
+    """dry_run must reject a nonexistent product_id like live create does —
+    it previously previewed 'ready to create' for a product the backend
+    rejects with 'Couldn't decode'."""
+
+    @pytest.mark.asyncio
+    async def test_dry_run_rejects_nonexistent_product(self, sub_mgmt, sub_manager, mock_client):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        mock_client.get_product_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("Couldn't decode: NONEXISTENT_PROD", status_code=400)
+        )
+        result = await sub_mgmt._handle_crud_actions(
+            "create",
+            {
+                "subscription_data": {
+                    "name": "probe",
+                    "product_id": "NONEXISTENT_PROD",
+                    "clientEmailAddress": "a@b.io",
+                },
+                "auto_generate": False,
+                "dry_run": True,
+            },
+            sub_manager,
+        )
+        text = result[0].text
+        assert "Dry Run Preview" not in text
+        assert "NONEXISTENT_PROD" in text
+        mock_client.get_product_by_id.assert_awaited_once_with("NONEXISTENT_PROD")
+
+    @pytest.mark.asyncio
+    async def test_dry_run_accepts_existing_product(self, sub_mgmt, sub_manager, mock_client):
+        mock_client.get_product_by_id = AsyncMock(return_value={"id": "prod_ok", "name": "P"})
+        result = await sub_mgmt._handle_crud_actions(
+            "create",
+            {
+                "subscription_data": {
+                    "name": "probe",
+                    "product_id": "prod_ok",
+                    "clientEmailAddress": "a@b.io",
+                },
+                "auto_generate": False,
+                "dry_run": True,
+            },
+            sub_manager,
+        )
+        assert "Dry Run Preview" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_dry_run_lets_unexpected_errors_propagate(self, sub_mgmt, sub_manager, mock_client):
+        """Only API rejections become the dry-run validation message —
+        transport/programming errors must not be echoed into user text."""
+        mock_client.get_product_by_id = AsyncMock(side_effect=RuntimeError("socket exploded"))
+        with pytest.raises(RuntimeError):
+            await sub_mgmt._handle_crud_actions(
+                "create",
+                {
+                    "subscription_data": {
+                        "name": "probe",
+                        "product_id": "prod_x",
+                        "clientEmailAddress": "a@b.io",
+                    },
+                    "auto_generate": False,
+                    "dry_run": True,
+                },
+                sub_manager,
+            )

@@ -80,13 +80,14 @@ async def _probe_platform_reachable() -> _ProbeResult:
 async def _probe_revenium() -> _ProbeResult:
     """Probe Revenium readiness.
 
-    clerk/env: authenticated /users/me validation via the env-baked key.
-    api_key: no env key exists, so probe platform base-URL reachability only.
+    env: authenticated /users/me validation via the env-baked key.
+    clerk/api_key: no server-wide key exists (credentials are per-request),
+    so probe platform base-URL reachability only.
     Never raises.
     """
     from .auth.auth_mode import read_auth_mode
 
-    if read_auth_mode() == "api_key":
+    if read_auth_mode() in ("api_key", "clerk"):
         return await _probe_platform_reachable()
 
     from .client import ReveniumClient

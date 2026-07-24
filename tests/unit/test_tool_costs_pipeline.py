@@ -48,30 +48,74 @@ class TestSimpleCostAnalyzerToolCosts:
         return analyzer
 
     @pytest.mark.asyncio
-    async def test_get_tool_costs_success(self, analyzer):
+    async def test_get_tool_costs_maps_grouped_envelope(self, analyzer):
+        # Real wire shape: the REST transform serves groups of
+        # {groupName: toolId, metrics: [{metricResult: Number(totalCost)}]}
+        # (isotope api-core get-cost-by-tool-aggregated.ts, toAggregatedFormat).
+        # The old parser read fabricated toolId/totalCost fields off these
+        # items and rendered every row as "Unknown Tool" with cost 0.
         analyzer.client.get_cost_by_tool_aggregated = AsyncMock(
-            return_value={
-                "_embedded": {
-                    "items": [
-                        {"toolId": "manage_products", "totalCost": 0.50, "callCount": 28},
-                        {"toolId": "manage_tools", "totalCost": 0.30, "callCount": 15},
-                    ]
-                }
-            }
+            return_value=[
+                {"groupName": "Visa - Travel", "metrics": [
+                    {"metricResult": 41599.25, "metricType": "COST_METRIC_BY_TOOL", "links": []}
+                ]},
+                {"groupName": "algolia.search", "metrics": [
+                    {"metricResult": 0.0144, "metricType": "COST_METRIC_BY_TOOL", "links": []}
+                ]},
+            ]
         )
         result = await analyzer.get_tool_costs("HOUR", "TOTAL")
         assert len(result) == 2
-        assert result[0]["tool"] == "manage_products"
-        assert result[0]["cost"] == 0.50
-        assert result[0]["call_count"] == 28
-        assert "percentage" in result[0]
+        assert result[0]["tool"] == "Visa - Travel"
+        assert result[0]["cost"] == 41599.25
+        assert result[0]["percentage"] == pytest.approx(99.99, abs=0.01)
+        assert result[1]["tool"] == "algolia.search"
+        assert all("Unknown" not in r["tool"] for r in result)
         analyzer.client.get_cost_by_tool_aggregated.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_get_tool_costs_empty_response(self, analyzer):
+    async def test_get_tool_costs_handles_groups_wrapper(self, analyzer):
+        # The aggregated format may arrive wrapped: {startTimestamp, endTimestamp,
+        # groups: [...]} — same handling the sibling actions get.
         analyzer.client.get_cost_by_tool_aggregated = AsyncMock(
-            return_value={"_embedded": {"items": []}}
+            return_value={
+                "startTimestamp": "2026-07-01T00:00:00Z",
+                "endTimestamp": "2026-07-14T00:00:00Z",
+                "groups": [
+                    {"groupName": "Visa - Travel", "metrics": [{"metricResult": 10.0}]},
+                ],
+            }
         )
+        result = await analyzer.get_tool_costs("SEVEN_DAYS", "TOTAL")
+        assert result == [{"tool": "Visa - Travel", "cost": 10.0, "percentage": 100.0}]
+
+    @pytest.mark.asyncio
+    async def test_zero_and_negative_costs_are_retained(self, analyzer):
+        # Parity with the get_model_costs control (renders $0.00 rows) and
+        # honesty for refunds/credits: unlike the sibling actions, tool costs
+        # must not silently drop non-positive groups.
+        analyzer.client.get_cost_by_tool_aggregated = AsyncMock(
+            return_value=[
+                {"groupName": "paid.tool", "metrics": [{"metricResult": 10.0}]},
+                {"groupName": "free.tool", "metrics": [{"metricResult": 0}]},
+                {"groupName": "refunded.tool", "metrics": [{"metricResult": -2.5}]},
+            ]
+        )
+        result = await analyzer.get_tool_costs("SEVEN_DAYS", "TOTAL")
+        by_name = {r["tool"]: r for r in result}
+        assert set(by_name) == {"paid.tool", "free.tool", "refunded.tool"}
+        assert by_name["free.tool"]["cost"] == 0
+        assert by_name["refunded.tool"]["cost"] == -2.5
+        assert result[0]["tool"] == "paid.tool"  # still sorted by cost desc
+
+    def test_fabricated_field_parser_is_gone(self, analyzer):
+        # The toolId/totalCost parser matched a shape the endpoint never
+        # serves; keep it dead.
+        assert not hasattr(analyzer, "_process_tool_cost_items")
+
+    @pytest.mark.asyncio
+    async def test_get_tool_costs_empty_response(self, analyzer):
+        analyzer.client.get_cost_by_tool_aggregated = AsyncMock(return_value=[])
         result = await analyzer.get_tool_costs("HOUR", "TOTAL")
         assert result == []
 

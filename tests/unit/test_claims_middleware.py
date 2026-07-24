@@ -17,6 +17,14 @@ def _make_fake_tenant(team_id: str = "team_x") -> TenantContext:
     )
 
 
+def _mock_token(claims: dict, token: str = "jwt_token_value") -> MagicMock:
+    """Build a mock AccessToken with both .claims and .token attributes."""
+    m = MagicMock()
+    m.claims = claims
+    m.token = token
+    return m
+
+
 @pytest.mark.asyncio
 async def test_middleware_sets_context_var_from_resolved_tenant():
     from src.revenium_mcp_server.auth.claims_middleware import (
@@ -37,13 +45,40 @@ async def test_middleware_sets_context_var_from_resolved_tenant():
     with patch(
         "src.revenium_mcp_server.auth.claims_middleware.get_access_token"
     ) as mock_get:
-        mock_get.return_value = MagicMock(claims={"revenium_team_id": "inside"})
+        mock_get.return_value = _mock_token({"revenium_team_id": "inside"}, token="tok_abc")
         result = await mw.on_call_tool(context=MagicMock(), call_next=call_next)
 
     assert result == "ok"
     assert observed == [_make_fake_tenant(team_id="inside")]
     # After the middleware returns, ContextVar is reset
     assert current_tenant_context() is None
+    # The resolver must receive the token string from AccessToken.token
+    resolver.resolve.assert_called_once_with(
+        {"revenium_team_id": "inside"}, clerk_jwt="tok_abc"
+    )
+
+
+@pytest.mark.asyncio
+async def test_middleware_passes_token_to_resolver():
+    """Middleware forwards AccessToken.token as clerk_jwt to the resolver."""
+    from src.revenium_mcp_server.auth.claims_middleware import TenantContextMiddleware
+
+    resolver = MagicMock()
+    resolver.resolve.return_value = _make_fake_tenant()
+    mw = TenantContextMiddleware(resolver)
+
+    async def call_next(context):
+        return "ok"
+
+    with patch(
+        "src.revenium_mcp_server.auth.claims_middleware.get_access_token"
+    ) as mock_get:
+        mock_get.return_value = _mock_token({"sub": "user_1"}, token="upstream_clerk_jwt")
+        await mw.on_call_tool(context=MagicMock(), call_next=call_next)
+
+    resolver.resolve.assert_called_once_with(
+        {"sub": "user_1"}, clerk_jwt="upstream_clerk_jwt"
+    )
 
 
 @pytest.mark.asyncio
@@ -63,7 +98,7 @@ async def test_middleware_resets_context_var_on_exception():
     with patch(
         "src.revenium_mcp_server.auth.claims_middleware.get_access_token"
     ) as mock_get:
-        mock_get.return_value = MagicMock(claims={})
+        mock_get.return_value = _mock_token({})
         with pytest.raises(RuntimeError, match="boom"):
             await mw.on_call_tool(context=MagicMock(), call_next=call_next)
 
@@ -86,7 +121,7 @@ async def test_middleware_propagates_permission_error():
     with patch(
         "src.revenium_mcp_server.auth.claims_middleware.get_access_token"
     ) as mock_get:
-        mock_get.return_value = MagicMock(claims={})
+        mock_get.return_value = _mock_token({})
         with pytest.raises(PermissionError, match="missing claim"):
             await mw.on_call_tool(context=MagicMock(), call_next=call_next)
 
@@ -110,7 +145,7 @@ async def test_middleware_with_no_token_passes_empty_claims():
         mock_get.return_value = None
         await mw.on_call_tool(context=MagicMock(), call_next=call_next)
 
-    resolver.resolve.assert_called_once_with({})
+    resolver.resolve.assert_called_once_with({}, clerk_jwt=None)
 
 
 def test_current_tenant_context_default_is_none():
@@ -131,7 +166,7 @@ async def test_concurrent_requests_have_isolated_context():
 
     resolver = MagicMock()
 
-    def resolve_fn(claims):
+    def resolve_fn(claims, *, clerk_jwt=None):
         team_id = claims.get("revenium_team_id", "unknown")
         return _make_fake_tenant(team_id=team_id)
 
@@ -144,7 +179,7 @@ async def test_concurrent_requests_have_isolated_context():
     _test_team: ContextVar[str] = ContextVar("test_team", default="unknown")
 
     def fake_get_access_token():
-        return MagicMock(claims={"revenium_team_id": _test_team.get()})
+        return _mock_token({"revenium_team_id": _test_team.get()})
 
     async def _run(team_id: str, observed: list):
         _test_team.set(team_id)

@@ -4,7 +4,7 @@ This tool provides comprehensive configuration diagnostic display using existing
 debug_auto_discovery infrastructure to ensure maximum code reuse and consistency.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
@@ -14,6 +14,7 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
+from ..auth.auth_mode import read_auth_mode
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
@@ -179,7 +180,7 @@ class ConfigurationStatus(ToolBase):
     def _build_environment_variables_analysis(self, validation_result) -> str:
         """Build detailed environment variables analysis."""
         analysis = "# **Environment Variables Analysis**\n\n"
-        analysis += f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+        analysis += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
         analysis += f"**Total Variables**: {len(validation_result.variables)}\n\n"
 
         # Group variables by category
@@ -224,7 +225,12 @@ class ConfigurationStatus(ToolBase):
 
                 # Add additional context for important variables
                 if var_name == "REVENIUM_API_KEY":
-                    analysis += "- Importance: [CRITICAL] - Required for all API operations\n"
+                    # In clerk/OAuth mode auth is per-request via the Clerk JWT, so the
+                    # static API key is optional rather than critical.
+                    if read_auth_mode() == "clerk":
+                        analysis += "- Importance: [OPTIONAL in Clerk/OAuth mode] - Not required; auth is per-request via Clerk\n"
+                    else:
+                        analysis += "- Importance: [CRITICAL] - Required for all API operations\n"
                 elif var_name == "REVENIUM_TEAM_ID":
                     analysis += "- Importance: [CRITICAL] - Required for team access\n"
                 elif var_name == "REVENIUM_DEFAULT_EMAIL":
@@ -259,7 +265,7 @@ class ConfigurationStatus(ToolBase):
             analysis += "## **Recommendations**\n\n"
             analysis += f"Consider configuring the remaining {total_vars - set_vars} variables for optimal functionality.\n"
             analysis += (
-                "Use `welcome_and_setup(action='environment_status')` for detailed guidance.\n"
+                "Use `system_setup(action='check_status')` for detailed guidance.\n"
             )
 
         return analysis
@@ -267,7 +273,7 @@ class ConfigurationStatus(ToolBase):
     def _build_auto_discovery_analysis(self, validation_result) -> str:
         """Build detailed auto-discovery analysis."""
         analysis = "# **Auto-Discovery System Analysis**\n\n"
-        analysis += f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+        analysis += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
         discovered_result = validation_result.discovered_config
         discovered_status = discovered_result.get("status", "unknown")
@@ -340,14 +346,14 @@ class ConfigurationStatus(ToolBase):
             analysis += "- Set REVENIUM_TENANT_ID if known\n"
             analysis += "- Set REVENIUM_OWNER_ID if known\n"
             analysis += "- Configure REVENIUM_DEFAULT_EMAIL for notifications\n"
-            analysis += "- Use `welcome_and_setup()` for guided manual setup\n"
+            analysis += "- Use `system_setup()` for guided manual setup\n"
 
         return analysis
 
     def _build_onboarding_status_analysis(self, onboarding_state, validation_result) -> str:
         """Build detailed onboarding status analysis."""
         analysis = "# **Onboarding Status Analysis**\n\n"
-        analysis += f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+        analysis += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
         # User type and onboarding context
         if onboarding_state.is_first_time:
@@ -413,18 +419,18 @@ class ConfigurationStatus(ToolBase):
 
         if completion_percentage < 50:
             analysis += "**Priority Actions**:\n"
-            analysis += "1. Use `welcome_and_setup(action='show_welcome')` for guidance\n"
+            analysis += "1. Use `system_setup(action='show_welcome')` for guidance\n"
             analysis += "2. Configure essential items with `setup_checklist()`\n"
-            analysis += "3. Check `welcome_and_setup(action='environment_status')` for details\n"
+            analysis += "3. Check `system_setup(action='check_status')` for details\n"
         elif completion_percentage < 80:
             analysis += "**Recommended Actions**:\n"
             analysis += "1. Complete remaining setup items with `setup_checklist()`\n"
             analysis += "2. Configure optional features like Slack notifications\n"
-            analysis += "3. Use `welcome_and_setup(action='next_steps')` for guidance\n"
+            analysis += "3. Use `system_setup(action='setup_checklist')` for guidance\n"
         else:
             analysis += "**Final Steps**:\n"
             analysis += "1. Review setup with `setup_checklist()`\n"
-            analysis += "2. Use `welcome_and_setup(action='complete_setup')` to finish\n"
+            analysis += "2. Use `system_setup(action='setup_checklist')` to finish\n"
             analysis += "3. Start using the system with confidence!\n"
 
         # Integration status
@@ -439,7 +445,7 @@ class ConfigurationStatus(ToolBase):
     def _build_system_health_summary(self, validation_result, onboarding_state) -> str:
         """Build overall system health summary."""
         summary = "# **System Health Summary**\n\n"
-        summary += f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+        summary += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
         # Overall health assessment
         overall_status = validation_result.summary.get("overall_status", False)
@@ -455,12 +461,22 @@ class ConfigurationStatus(ToolBase):
         # For first-time users, missing cache is normal and shouldn't count against health
         cache_system_healthy = onboarding_state.cache_valid or onboarding_state.is_first_time
 
-        # Separate critical vs optional health checks
-        # Critical checks are required for basic functionality
-        critical_checks = [
-            ("API Key Configuration", validation_result.summary.get("api_key_available", False)),
-            ("API Connectivity", validation_result.summary.get("direct_api_works", False)),
-        ]
+        # Critical checks depend on the auth mode. In clerk/OAuth mode there is no
+        # static API key by design (auth is per-request via the Clerk JWT), so the
+        # API-key checks don't apply — the OAuth configuration is what's critical.
+        is_clerk = validation_result.summary.get("auth_mode") == "clerk"
+        if is_clerk:
+            critical_checks = [
+                (
+                    "Clerk OAuth Configuration",
+                    validation_result.summary.get("clerk_configured", False),
+                ),
+            ]
+        else:
+            critical_checks = [
+                ("API Key Configuration", validation_result.summary.get("api_key_available", False)),
+                ("API Connectivity", validation_result.summary.get("direct_api_works", False)),
+            ]
 
         # Optional checks enhance functionality but aren't required for basic operation
         optional_checks = [
@@ -527,12 +543,19 @@ class ConfigurationStatus(ToolBase):
         # Quick diagnostics
         summary += "\n## **Quick Diagnostics**\n\n"
 
-        if not validation_result.summary.get("api_key_available"):
-            summary += "[CRITICAL] API key not configured - system cannot function\n"
-        if not validation_result.summary.get("direct_api_works"):
-            summary += (
-                "[CRITICAL] API connectivity failed - check network and authentication\n"
-            )
+        if is_clerk:
+            if not validation_result.summary.get("clerk_configured"):
+                summary += (
+                    "[CRITICAL] Clerk OAuth not configured - check CLERK_DOMAIN, "
+                    "CLERK_OAUTH_CLIENT_ID, CLERK_OAUTH_CLIENT_SECRET, and MCP_SERVER_BASE_URL\n"
+                )
+        else:
+            if not validation_result.summary.get("api_key_available"):
+                summary += "[CRITICAL] API key not configured - system cannot function\n"
+            if not validation_result.summary.get("direct_api_works"):
+                summary += (
+                    "[CRITICAL] API connectivity failed - check network and authentication\n"
+                )
         if not validation_result.summary.get("auth_config_works"):
             summary += "[WARN] Authentication configuration issues detected\n"
         if not validation_result.summary.get("auto_discovery_works"):
@@ -558,7 +581,7 @@ class ConfigurationStatus(ToolBase):
             summary += (
                 "1. Use `configuration_status(action='full_diagnostic')` for detailed analysis\n"
             )
-            summary += "2. Follow `welcome_and_setup()` for guided resolution\n"
+            summary += "2. Follow `system_setup()` for guided resolution\n"
             summary += "3. Check `setup_checklist()` for specific configuration steps\n"
         else:
             summary += "**Maintenance Actions**:\n"
@@ -575,7 +598,7 @@ class ConfigurationStatus(ToolBase):
             summary += "- Authentication is properly configured\n"
 
             if onboarding_state.is_first_time:
-                summary += "\n**Complete Onboarding**: Use `welcome_and_setup(action='complete_setup')` to finish setup\n"
+                summary += "\n**Complete Onboarding**: Use `system_setup(action='setup_checklist')` to finish setup\n"
         else:
             summary += "[NOT READY] System requires configuration before use\n"
             summary += "- Complete setup using the onboarding tools\n"

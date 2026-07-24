@@ -456,3 +456,68 @@ class TestWorkflowTemplates:
             for i, step in enumerate(template["steps"]):
                 assert "action" in step, f"Template '{name}' step {i} missing 'action'"
                 assert "tool" in step, f"Template '{name}' step {i} missing 'tool'"
+
+
+class TestStartContractHardening:
+    """start must demand an explicit workflow_type, stamp a real timestamp,
+    and be transparent that workflow state is session-scoped server memory."""
+
+    @pytest.mark.asyncio
+    async def test_start_without_workflow_type_raises(self, wf_manager):
+        with pytest.raises(ToolError) as exc_info:
+            await wf_manager.start_workflow({"context": {"note": "x"}})
+        msg = str(exc_info.value).lower()
+        assert "workflow_type" in msg
+
+    @pytest.mark.asyncio
+    async def test_start_created_at_is_real_iso_timestamp(self, wf_manager):
+        from datetime import datetime
+
+        wf = await wf_manager.start_workflow(
+            {"workflow_type": "generic", "context": {"note": "x"}}
+        )
+        assert "timestamp" not in wf["created_at"]
+        # Must parse as ISO-8601.
+        datetime.fromisoformat(wf["created_at"])
+
+    @pytest.mark.asyncio
+    async def test_start_response_declares_session_scope(self, wf_manager):
+        wf = await wf_manager.start_workflow(
+            {"workflow_type": "generic", "context": {"note": "x"}}
+        )
+        assert wf.get("scope") == "session"
+
+    @pytest.mark.asyncio
+    async def test_not_found_error_explains_session_scope(self, wf_manager):
+        with pytest.raises(ToolError) as exc_info:
+            await wf_manager.get_workflow({"workflow_id": "wf_deadbeef"})
+        text = str(getattr(exc_info.value, "suggestions", "")) + str(exc_info.value)
+        assert "server memory" in text or "session" in text
+
+    @pytest.mark.asyncio
+    async def test_next_step_not_found_explains_session_scope(self, wf_manager):
+        with pytest.raises(ToolError) as exc_info:
+            await wf_manager.next_step({"workflow_id": "wf_deadbeef"})
+        text = str(getattr(exc_info.value, "suggestions", "")) + str(exc_info.value)
+        assert "server memory" in text or "session" in text
+
+    @pytest.mark.asyncio
+    async def test_complete_step_not_found_explains_session_scope(self, wf_manager):
+        with pytest.raises(ToolError) as exc_info:
+            await wf_manager.complete_step({"workflow_id": "wf_deadbeef"})
+        text = str(getattr(exc_info.value, "suggestions", "")) + str(exc_info.value)
+        assert "server memory" in text or "session" in text
+
+    @pytest.mark.asyncio
+    async def test_complete_step_records_real_timestamp(self, wf_manager):
+        from datetime import datetime
+
+        wf = await wf_manager.start_workflow(
+            {"workflow_type": "generic", "context": {"n": 1}}
+        )
+        result = await wf_manager.complete_step(
+            {"workflow_id": wf["id"], "step_result": {"ok": True}}
+        )
+        completed = wf_manager.active_workflows[wf["id"]]["completed_steps"][0]
+        assert "timestamp" not in completed["completed_at"]
+        datetime.fromisoformat(completed["completed_at"])

@@ -10,11 +10,6 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-# Load environment variables BEFORE importing middleware
-from dotenv import load_dotenv
-
-load_dotenv()
-
 import httpx
 import openai
 

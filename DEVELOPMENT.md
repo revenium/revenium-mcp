@@ -77,11 +77,13 @@ python -m revenium_mcp_server
 
 **Expected Output:**
 ```
-Revenium MCP Server v0.2.2 ready with 15 tools
-FastMCP 2.13.1
-Server name: Revenium MCP Server v0.2.2
+Revenium MCP Server v0.2.11 ready with 7 tools
+FastMCP 3.2.0
+Server name: Revenium MCP Server v0.2.11
 Transport: STDIO
 ```
+
+The tool count reflects the active `TOOL_PROFILE`: the default `starter` profile registers 7 tools; `business` registers 18.
 
 **Known Startup Warnings (can be ignored):**
 - `DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated` - Will be fixed in next release

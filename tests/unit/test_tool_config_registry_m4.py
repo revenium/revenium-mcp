@@ -482,6 +482,80 @@ class TestManageAlertsJsonPreprocessing:
 
 
 # ---------------------------------------------------------------------------
+# BACK-2374 — manage_alerts budget-progress closure params
+# ---------------------------------------------------------------------------
+
+class TestManageAlertsBudgetProgressParams:
+    """The manage_alerts closure must accept anomaly_ids (list|JSON-string),
+    include_trend, and now — FastMCP derives its input model from the
+    signature."""
+
+    async def _capture(self, **call_kwargs):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_alerts")
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            result = await registered_fn(**call_kwargs)
+        return captured_args, result
+
+    @pytest.mark.asyncio
+    async def test_anomaly_ids_list_passed_through(self):
+        captured, _ = await self._capture(
+            action="get_budget_progress", anomaly_ids=["a1", "a2"]
+        )
+        assert captured.get("anomaly_ids") == ["a1", "a2"]
+
+    @pytest.mark.asyncio
+    async def test_anomaly_ids_json_string_is_parsed_to_list(self):
+        captured, _ = await self._capture(
+            action="get_budget_progress", anomaly_ids='["a1", "a2"]'
+        )
+        assert captured.get("anomaly_ids") == ["a1", "a2"]
+
+    @pytest.mark.asyncio
+    async def test_anomaly_ids_non_list_json_rejected(self):
+        from mcp.types import TextContent
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_alerts")
+        result = await registered_fn(
+            action="get_budget_progress", anomaly_ids='{"not": "a list"}'
+        )
+        assert len(result) == 1
+        assert isinstance(result[0], TextContent)
+        assert "anomaly_ids" in result[0].text.lower()
+
+    @pytest.mark.asyncio
+    async def test_anomaly_ids_malformed_json_rejected(self):
+        from mcp.types import TextContent
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_alerts")
+        result = await registered_fn(
+            action="get_budget_progress", anomaly_ids="not json {{{"
+        )
+        assert len(result) == 1
+        assert isinstance(result[0], TextContent)
+        assert "anomaly_ids" in result[0].text.lower()
+
+    @pytest.mark.asyncio
+    async def test_include_trend_and_now_forwarded(self):
+        captured, _ = await self._capture(
+            action="get_budget_portfolio",
+            include_trend=True,
+            now="2026-07-01T00:00:00Z",
+        )
+        assert captured.get("include_trend") is True
+        assert captured.get("now") == "2026-07-01T00:00:00Z"
+
+
+# ---------------------------------------------------------------------------
 # JSON preprocessing — manage_sources (source_data)
 # ---------------------------------------------------------------------------
 
@@ -525,6 +599,61 @@ class TestManageSourcesJsonPreprocessing:
 
         assert isinstance(captured_args.get("source_data"), dict)
         assert captured_args["source_data"]["name"] == "MySource"
+
+
+# ---------------------------------------------------------------------------
+# business_analytics_management closure — dimension forwarding
+# ---------------------------------------------------------------------------
+
+class TestBusinessAnalyticsDimensionForwarding:
+    @pytest.mark.asyncio
+    async def test_dimension_forwarded_to_execution(self):
+        """The dimension param must reach standardized_tool_execution arguments."""
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(
+            registry, "_register_business_analytics_management"
+        )
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(
+                action="get_filter_options",
+                dimension="models",
+                period="THIRTY_DAYS",
+            )
+
+        assert captured_args.get("dimension") == "models"
+        assert captured_args.get("action") == "get_filter_options"
+
+    @pytest.mark.asyncio
+    async def test_dimension_omitted_when_none(self):
+        """When dimension is not supplied it is stripped (None values removed)."""
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(
+            registry, "_register_business_analytics_management"
+        )
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="get_capabilities")
+
+        assert "dimension" not in captured_args
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +973,52 @@ class TestManageCustomersJsonPreprocessing:
             )
 
         assert captured_args.get("organization_data") == {"name": "NewName"}
+
+    @pytest.mark.asyncio
+    async def test_email_forwarded_for_lookup_user(self):
+        """The email scalar is forwarded through to the tool for lookup_user."""
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_customers")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(
+                action="lookup_user",
+                email="joao@acme.com",
+            )
+
+        assert captured_args.get("email") == "joao@acme.com"
+
+    @pytest.mark.asyncio
+    async def test_email_forwarded_for_lookup_subscriber(self):
+        """The email scalar is forwarded through to the tool for lookup_subscriber."""
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_customers")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(
+                action="lookup_subscriber",
+                email="joao@acme.com",
+            )
+
+        assert captured_args.get("email") == "joao@acme.com"
 
 
 # ---------------------------------------------------------------------------
@@ -1479,3 +1654,394 @@ class TestManageToolsFastMCPSignature:
             await fn(action="get", tool_id="valid-tool-id")
 
         assert captured.get("tool_id") == "valid-tool-id"
+
+
+# ---------------------------------------------------------------------------
+# JSON preprocessing — manage_agents (agent_data / filters)
+# ---------------------------------------------------------------------------
+
+class TestManageAgentsJsonPreprocessing:
+    """Tests for the inner manage_agents closure's dict-param JSON handling."""
+
+    @pytest.mark.asyncio
+    async def test_valid_json_string_agent_data_is_parsed(self):
+        """agent_data sent as a valid JSON object string is converted to a dict."""
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_agents")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(
+                action="create",
+                agent_data='{"telemetryKey": "my-agent"}',
+            )
+
+        assert isinstance(captured_args.get("agent_data"), dict)
+        assert captured_args["agent_data"]["telemetryKey"] == "my-agent"
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_string_agent_data_returns_error_text(self):
+        from mcp.types import TextContent
+
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_agents")
+
+        result = await registered_fn(action="create", agent_data="not json {{{{")
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContent)
+        assert "agent_data" in result[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scalar", ['"just-a-string"', "1", "[]", "true"])
+    async def test_non_object_json_agent_data_returns_error_text(self, scalar):
+        """JSON that parses to a non-dict is rejected with a structured message
+        instead of reaching the manager and failing on .get()."""
+        from mcp.types import TextContent
+
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_agents")
+
+        result = await registered_fn(action="create", agent_data=scalar)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContent)
+        assert "JSON object" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_non_object_json_filters_returns_error_text(self):
+        from mcp.types import TextContent
+
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_agents")
+
+        result = await registered_fn(action="list", filters="[]")
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContent)
+        assert "JSON object" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_squad_params_forwarded_through_closure(self):
+        """squad_id/squad_name/status/period ride the closure into arguments."""
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_agents")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(
+                action="list_squad_executions",
+                squad_id="sq_9",
+                squad_name="checkout",
+                status="COMPLETED",
+                period="SEVEN_DAYS",
+            )
+
+        assert captured_args["squad_id"] == "sq_9"
+        assert captured_args["squad_name"] == "checkout"
+        assert captured_args["status"] == "COMPLETED"
+        assert captured_args["period"] == "SEVEN_DAYS"
+
+
+class TestManageCostControlsJsonPreprocessing:
+    """Tests for the inner manage_cost_controls closure's dict-param JSON handling."""
+
+    @pytest.mark.asyncio
+    async def test_valid_json_string_control_data_is_parsed(self):
+        """control_data sent as a valid JSON object string is converted to a dict."""
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(
+                action="create",
+                control_data='{"name": "Monthly Guardrail", "hardLimit": 1000}',
+            )
+
+        assert isinstance(captured_args.get("control_data"), dict)
+        assert captured_args["control_data"]["name"] == "Monthly Guardrail"
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_string_control_data_returns_error_text(self):
+        from mcp.types import TextContent
+
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
+
+        result = await registered_fn(action="create", control_data="not json {{{{")
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContent)
+        assert "control_data" in result[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scalar", ['"just-a-string"', "1", "[]", "true"])
+    async def test_non_object_json_control_data_returns_error_text(self, scalar):
+        """JSON that parses to a non-dict is rejected with a structured message
+        instead of reaching the manager and failing on .get()."""
+        from mcp.types import TextContent
+
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
+
+        result = await registered_fn(action="create", control_data=scalar)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContent)
+        assert "JSON object" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_non_object_json_filters_returns_error_text(self):
+        from mcp.types import TextContent
+
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
+
+        result = await registered_fn(action="list", filters="[]")
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContent)
+        assert "JSON object" in result[0].text
+
+
+class TestManageCostControlsNumericPreprocessing:
+    """The closure coerces numeric-string page/size before dispatch."""
+
+    @pytest.mark.asyncio
+    async def test_string_page_and_size_are_coerced(self):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="list", page="2", size="5")
+
+        assert captured_args["page"] == 2
+        assert captured_args["size"] == 5
+
+
+class TestBusinessAnalyticsAggregationForwarding:
+    """The new aggregation closure param is forwarded (and None-stripped)."""
+
+    @pytest.mark.asyncio
+    async def test_aggregation_forwarded(self):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(
+            registry, "_register_business_analytics_management"
+        )
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="get_task_costs", aggregation="aggregated")
+        assert captured["aggregation"] == "aggregated"
+
+    @pytest.mark.asyncio
+    async def test_aggregation_none_stripped(self):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(
+            registry, "_register_business_analytics_management"
+        )
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="get_task_costs")
+        assert "aggregation" not in captured
+
+
+class TestBusinessAnalyticsBillingReadClosure:
+    async def _run(self, **kwargs):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(
+            registry, "_register_business_analytics_management"
+        )
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(**kwargs)
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_scalar_billing_params_forwarded(self):
+        captured = await self._run(
+            action="list_invoices",
+            invoice_number="INV-1",
+            starting_amount="10",
+            ending_amount="100",
+        )
+        assert captured["invoice_number"] == "INV-1"
+        # numeric strings coerced to float
+        assert captured["starting_amount"] == 10.0
+        assert captured["ending_amount"] == 100.0
+
+    @pytest.mark.asyncio
+    async def test_refund_and_period_charge_params_forwarded(self):
+        captured = await self._run(
+            action="list_period_charges",
+            minimum="5",
+            maximum="50",
+            cursor="CUR-1",
+            invoice_id="inv_9",
+        )
+        assert captured["minimum"] == 5.0
+        assert captured["maximum"] == 50.0
+        assert captured["cursor"] == "CUR-1"
+        assert captured["invoice_id"] == "inv_9"
+
+    @pytest.mark.asyncio
+    async def test_pay_states_and_states_json_string_parsed_to_list(self):
+        captured = await self._run(
+            action="list_invoices",
+            pay_states='["UNPAID", "PARTIALLY_PAID"]',
+            states='["FINALIZED"]',
+        )
+        assert captured["pay_states"] == ["UNPAID", "PARTIALLY_PAID"]
+        assert captured["states"] == ["FINALIZED"]
+
+    @pytest.mark.asyncio
+    async def test_pay_states_native_list_preserved(self):
+        captured = await self._run(
+            action="list_invoices",
+            pay_states=["UNPAID"],
+            states=["FINALIZED", "DRAFT"],
+        )
+        assert captured["pay_states"] == ["UNPAID"]
+        assert captured["states"] == ["FINALIZED", "DRAFT"]
+
+    @pytest.mark.asyncio
+    async def test_non_list_states_string_left_for_tool_to_reject(self):
+        """A non-JSON-array string is left as-is (the anomaly_ids precedent):
+        the array preprocessor keeps it a string so the tool layer rejects it,
+        rather than silently wrapping a scalar in a list."""
+        captured = await self._run(action="list_invoices", states="FINALIZED")
+        assert captured["states"] == "FINALIZED"
+        assert not isinstance(captured["states"], list)
+
+    @pytest.mark.asyncio
+    async def test_none_billing_params_stripped(self):
+        captured = await self._run(action="list_refunds")
+        for key in (
+            "invoice_number",
+            "pay_states",
+            "states",
+            "starting_amount",
+            "ending_amount",
+            "minimum",
+            "maximum",
+            "cursor",
+            "invoice_id",
+        ):
+            assert key not in captured
+
+
+class TestManageSubscriptionsBillingReadClosure:
+    async def _run(self, **kwargs):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(
+            registry, "_register_manage_subscriptions"
+        )
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(**kwargs)
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_subscription_id_reaches_get_billed_amount(self):
+        captured = await self._run(action="get_billed_amount", subscription_id="sub_9")
+        assert captured["action"] == "get_billed_amount"
+        assert captured["subscription_id"] == "sub_9"
+
+    @pytest.mark.asyncio
+    async def test_subscription_id_reaches_get_quota_consumed(self):
+        captured = await self._run(action="get_quota_consumed", subscription_id="sub_9")
+        assert captured["action"] == "get_quota_consumed"
+        assert captured["subscription_id"] == "sub_9"
+
+
+class TestBillingClosureDateAndQueryParams:
+    """Review: documented billing filters must be reachable via the closure."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("param,value", [
+        ("start_date", "2026-01-01T00:00:00Z"),
+        ("end_date", "2026-02-01T00:00:00Z"),
+        ("query", "acme"),
+    ])
+    async def test_param_forwarded(self, param, value):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(
+            registry, "_register_business_analytics_management"
+        )
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="list_invoices", **{param: value})
+        assert captured[param] == value

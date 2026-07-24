@@ -203,3 +203,36 @@ class TestSimpleAnalyticsEngine:
         for agg in SupportedAggregation:
             assert agg.value in caps["supported_aggregations"]
 
+
+
+class TestAgentCostsProcessorFilters:
+    """AgentCostsProcessor forwards validated filters to the analyzer (BACK-2348)."""
+
+    @pytest.mark.asyncio
+    async def test_filters_forwarded_to_analyzer(self):
+        """Validated costSources filters reach analyzer.get_agent_costs."""
+        from src.revenium_mcp_server.analytics.simple_analytics_engine import (
+            AgentCostsProcessor,
+        )
+
+        deps = make_deps(
+            validated_params={
+                "period": "SEVEN_DAYS",
+                "aggregation": "TOTAL",
+                "filters": {"costSources": ["provider_billing"]},
+            }
+        )
+        processor = AgentCostsProcessor(deps, _logger)
+        params = AnalyticsParams(
+            operation_type="agent costs",
+            kwargs={
+                "period": "SEVEN_DAYS",
+                "filters": {"costSources": ["provider_billing"]},
+            },
+        )
+        await processor.process_analytics_request(params)
+        deps.analyzer.get_agent_costs.assert_awaited_once_with(
+            period="SEVEN_DAYS",
+            aggregation="TOTAL",
+            filters={"costSources": ["provider_billing"]},
+        )

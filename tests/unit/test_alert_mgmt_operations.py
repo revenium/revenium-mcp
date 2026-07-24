@@ -857,10 +857,10 @@ class TestPeriodDurationFlatKwarg:
             return_value=[TextContent(type="text", text="created")]
         )
         await alert_mgmt._handle_anomaly_operations(
-            mock_client, "create", {"periodDuration": "FIVE_MINUTES"}
+            mock_client, "create", {"periodDuration": "FIFTEEN_MINUTES"}
         )
         called_data = alert_mgmt.anomaly_manager.create_anomaly.call_args[0][1]
-        assert called_data == {"periodDuration": "FIVE_MINUTES"}
+        assert called_data == {"periodDuration": "FIFTEEN_MINUTES"}
 
     @pytest.mark.asyncio
     async def test_create_merges_flat_period_duration_when_anomaly_data_lacks_it(
@@ -1174,3 +1174,489 @@ class TestAlertListPaginationValidation:
             )
         assert exc.value.field == "size"
         assert_no_framework_leak(exc.value.message)
+
+
+class TestDryRunLiveParity:
+    """dry_run must accept-or-reject exactly like live create — a false-green
+    dry-run tells the caller a create will succeed when it will 400."""
+
+    @pytest.mark.asyncio
+    async def test_dry_run_rejects_payload_live_would_reject(self):
+        """The audit probe: direct-format payload missing operatorType (and
+        the rest of the direct-API quartet) passed dry-run but 400'd live."""
+        from src.revenium_mcp_server.tools_decomposed.alert_management import (
+            AlertManagement,
+        )
+
+        tools = AlertManagement()
+        client = MagicMock()
+        tools.get_client = AsyncMock(return_value=client)
+        result = await tools.handle_action(
+            "create",
+            {
+                "dry_run": True,
+                "anomaly_data": {"name": "Spike", "alertType": "THRESHOLD"},
+            },
+        )
+        text = result[0].text
+        assert "ready for creation" not in text.lower()
+        assert "detection_rules or direct api format" in text.lower() or "error" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_accepts_payload_live_would_accept(self):
+        from src.revenium_mcp_server.tools_decomposed.alert_management import (
+            AlertManagement,
+        )
+
+        tools = AlertManagement()
+        client = MagicMock()
+        tools.get_client = AsyncMock(return_value=client)
+        result = await tools.handle_action(
+            "create",
+            {
+                "dry_run": True,
+                "anomaly_data": {
+                    "name": "Spike",
+                    "alertType": "THRESHOLD",
+                    "metricType": "TOTAL_COST",
+                    "operatorType": "GREATER_THAN",
+                    "threshold": 100,
+                },
+            },
+        )
+        text = result[0].text
+        assert "DRY RUN" in text
+        assert "valid" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_lets_unexpected_errors_propagate(self):
+        """Only validation failures become 'Dry Run Validation Failed' — a
+        programming error inside the validator must reach error monitoring."""
+        from unittest.mock import patch as _patch
+        from src.revenium_mcp_server.tools_decomposed.alert_management import (
+            AlertManagement,
+        )
+
+        tools = AlertManagement()
+        client = MagicMock()
+        with _patch.object(
+            tools.anomaly_manager, "validate_anomaly_payload",
+            side_effect=RuntimeError("validator bug"),
+        ):
+            with pytest.raises(RuntimeError):
+                await tools._handle_create(
+                    client,
+                    {"resource_type": "anomalies", "dry_run": True, "anomaly_data": {"name": "x"}},
+                )
+
+    @pytest.mark.asyncio
+    async def test_dry_run_accepts_documented_flat_payload(self):
+        """dry_run must see the SAME assembled payload live create sees — the
+        flat-field merge applies to both, or a documented flat payload
+        false-fails in preview while succeeding live."""
+        from src.revenium_mcp_server.tools_decomposed.alert_management import (
+            AlertManagement,
+        )
+
+        tools = AlertManagement()
+        client = MagicMock()
+        tools.get_client = AsyncMock(return_value=client)
+        result = await tools.handle_action(
+            "create",
+            {
+                "dry_run": True,
+                "name": "High Cost Alert",
+                "alertType": "THRESHOLD",
+                "metricType": "TOTAL_COST",
+                "threshold": 100,
+                "periodDuration": "FIFTEEN_MINUTES",
+                "email": "alerts@company.com",
+            },
+        )
+        text = result[0].text
+        assert "Dry Run Successful" in text or "DRY RUN" in text
+        assert "Missing anomaly_data" not in text
+
+    @pytest.mark.asyncio
+    async def test_dry_run_rejects_banned_period_like_live(self):
+        from src.revenium_mcp_server.tools_decomposed.alert_management import (
+            AlertManagement,
+        )
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        tools = AlertManagement()
+        client = MagicMock()
+        tools.get_client = AsyncMock(return_value=client)
+        with pytest.raises(ToolError) as exc_info:
+            await tools.handle_action(
+                "create",
+                {
+                    "dry_run": True,
+                    "name": "Spike",
+                    "alertType": "THRESHOLD",
+                    "metricType": "TOTAL_COST",
+                    "threshold": 100,
+                    "periodDuration": "FIVE_MINUTES",
+                    "email": "a@b.io",
+                },
+            )
+        assert "FIFTEEN_MINUTES" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Part C: _handle_reset_budget (budget accumulation reset)
+# ---------------------------------------------------------------------------
+
+class TestHandleResetBudget:
+    """Tests for _handle_reset_budget."""
+
+    @pytest.mark.asyncio
+    async def test_reset_budget_success(self, alert_mgmt, mock_client):
+        """Successful reset renders the anomaly id and reset confirmation."""
+        mock_client.reset_anomaly_budget.return_value = {
+            "anomalyId": "a1",
+            "currentAccumulation": 0,
+        }
+        result = await alert_mgmt._handle_reset_budget(mock_client, {"anomaly_id": "a1"})
+        text = _text(result)
+        assert "a1" in text
+        assert "reset" in text.lower()
+        mock_client.reset_anomaly_budget.assert_awaited_once_with("a1")
+
+    @pytest.mark.asyncio
+    async def test_reset_budget_missing_id_raises(self, alert_mgmt, mock_client):
+        with pytest.raises(ToolError):
+            await alert_mgmt._handle_reset_budget(mock_client, {})
+
+    @pytest.mark.asyncio
+    async def test_reset_budget_404_translates_to_not_found(self, alert_mgmt, mock_client):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        mock_client.reset_anomaly_budget.side_effect = ReveniumAPIError(
+            "not found", status_code=404
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await alert_mgmt._handle_reset_budget(mock_client, {"anomaly_id": "missing"})
+        assert "missing" in str(exc_info.value.message)
+
+    @pytest.mark.asyncio
+    async def test_reset_budget_422_explains_cumulative_usage_requirement(
+        self, alert_mgmt, mock_client
+    ):
+        """422 means the anomaly is not a CUMULATIVE_USAGE budget alert."""
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        mock_client.reset_anomaly_budget.side_effect = ReveniumAPIError(
+            "not cumulative", status_code=422
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await alert_mgmt._handle_reset_budget(mock_client, {"anomaly_id": "a1"})
+        assert "CUMULATIVE_USAGE" in str(exc_info.value.message) or any(
+            "CUMULATIVE_USAGE" in s for s in exc_info.value.suggestions
+        )
+
+    @pytest.mark.asyncio
+    async def test_reset_budget_routed_via_handle_action_with_alert_id_alias(
+        self, alert_mgmt, mock_client
+    ):
+        """handle_action routes reset_budget and honors the alert_id alias."""
+        mock_client.reset_anomaly_budget.return_value = {"anomalyId": "a9"}
+        result = await alert_mgmt.handle_action("reset_budget", {"alert_id": "a9"})
+        text = _text(result)
+        assert "a9" in text
+        mock_client.reset_anomaly_budget.assert_awaited_once_with("a9")
+
+    @pytest.mark.asyncio
+    async def test_reset_budget_in_supported_actions(self, alert_mgmt):
+        actions = await alert_mgmt._get_supported_actions()
+        assert "reset_budget" in actions
+
+
+# ---------------------------------------------------------------------------
+# BACK-2374 Part D: get_budget_portfolio (tenant-wide budget-progress read)
+# ---------------------------------------------------------------------------
+
+class TestHandleGetBudgetPortfolio:
+    """Tests for _handle_get_budget_portfolio."""
+
+    @staticmethod
+    def _entry(**over):
+        # Real dev payload shape: portfolio/bulk items carry the hashed id
+        # under alertId (anomalyId only exists on the single per-anomaly
+        # endpoint, as the numeric internal id).
+        base = {
+            "alertId": "a1",
+            "name": "Monthly Budget",
+            "metricType": "TOTAL_COST",
+            "threshold": 1000,
+            "currentValue": 250,
+            "percentUsed": 25,
+            "aheadBehindVsLinear": {"status": "ON_TRACK"},
+        }
+        base.update(over)
+        return base
+
+    @pytest.mark.asyncio
+    async def test_portfolio_renders_entry_fields(self, alert_mgmt, mock_client):
+        mock_client.get_budget_portfolio = AsyncMock(return_value={
+            "_embedded": {"budgetProgressList": [self._entry()]},
+            "page": {"number": 0, "size": 20, "totalElements": 1, "totalPages": 1},
+        })
+        mock_client._extract_embedded_data = MagicMock(return_value=[self._entry()])
+        mock_client._extract_pagination_info = MagicMock(
+            return_value={"number": 0, "size": 20, "totalElements": 1, "totalPages": 1}
+        )
+        result = await alert_mgmt._handle_get_budget_portfolio(mock_client, {})
+        text = _text(result)
+        assert "Monthly Budget" in text
+        assert "a1" in text
+        assert "TOTAL_COST" in text
+        assert "ON_TRACK" in text
+        assert "25" in text  # percentUsed
+
+    @pytest.mark.asyncio
+    async def test_portfolio_empty_state(self, alert_mgmt, mock_client):
+        mock_client.get_budget_portfolio = AsyncMock(return_value={"_embedded": {}})
+        mock_client._extract_embedded_data = MagicMock(return_value=[])
+        mock_client._extract_pagination_info = MagicMock(return_value={})
+        result = await alert_mgmt._handle_get_budget_portfolio(mock_client, {})
+        text = _text(result)
+        assert "no budget alerts" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_portfolio_forwards_pagination_and_filters(self, alert_mgmt, mock_client):
+        mock_client.get_budget_portfolio = AsyncMock(return_value={"_embedded": {}})
+        mock_client._extract_embedded_data = MagicMock(return_value=[])
+        mock_client._extract_pagination_info = MagicMock(return_value={})
+        await alert_mgmt._handle_get_budget_portfolio(
+            mock_client, {"page": 2, "size": 5, "include_trend": True, "now": "2026-07-01T00:00:00Z"}
+        )
+        kwargs = mock_client.get_budget_portfolio.call_args.kwargs
+        assert kwargs["page"] == 2
+        assert kwargs["size"] == 5
+        assert kwargs["includeTrend"] is True
+        assert kwargs["now"] == "2026-07-01T00:00:00Z"
+
+    @pytest.mark.asyncio
+    async def test_portfolio_degrades_entry_without_numeric_fields(self, alert_mgmt, mock_client):
+        """An entry missing numeric currentValue/threshold renders 'state
+        unavailable', never zeros or a Python None (BACK-2354 precedent)."""
+        entry = self._entry(currentValue=None, threshold=None, percentUsed=None)
+        mock_client.get_budget_portfolio = AsyncMock(return_value={"_embedded": {}})
+        mock_client._extract_embedded_data = MagicMock(return_value=[entry])
+        mock_client._extract_pagination_info = MagicMock(return_value={})
+        result = await alert_mgmt._handle_get_budget_portfolio(mock_client, {})
+        text = _text(result)
+        assert "state unavailable" in text.lower()
+        assert "None" not in text
+
+    @pytest.mark.asyncio
+    async def test_portfolio_routed_via_handle_action(self, alert_mgmt, mock_client):
+        mock_client.get_budget_portfolio = AsyncMock(return_value={"_embedded": {}})
+        mock_client._extract_embedded_data = MagicMock(return_value=[])
+        mock_client._extract_pagination_info = MagicMock(return_value={})
+        result = await alert_mgmt.handle_action("get_budget_portfolio", {})
+        assert isinstance(result[0], TextContent)
+
+    @pytest.mark.asyncio
+    async def test_portfolio_in_supported_actions(self, alert_mgmt):
+        actions = await alert_mgmt._get_supported_actions()
+        assert "get_budget_portfolio" in actions
+
+
+# ---------------------------------------------------------------------------
+# BACK-2374 Part E: get_budget_progress (single per-anomaly OR bulk read)
+# ---------------------------------------------------------------------------
+
+class TestHandleGetBudgetProgress:
+    """Tests for _handle_get_budget_progress (single + bulk paths)."""
+
+    @staticmethod
+    def _progress_bulk(**over):
+        """Real bulk/portfolio item shape: hashed id under alertId."""
+        base = {
+            "alertId": "a1",
+            "metricType": "TOTAL_COST",
+            "threshold": 1000,
+            "currentValue": 400,
+            "remaining": 600,
+            "percentUsed": 40,
+            "aheadBehindVsLinear": {"status": "ON_TRACK"},
+        }
+        base.update(over)
+        return base
+
+    @staticmethod
+    def _progress(**over):
+        base = {
+            "anomalyId": "a1",
+            "metricType": "TOTAL_COST",
+            "threshold": 1000,
+            "currentValue": 400,
+            "remaining": 600,
+            "percentUsed": 40,
+            "window": {"start": "2026-07-01", "now": "2026-07-10", "endExpected": "2026-07-31"},
+            "aheadBehindVsLinear": {"expectedByNow": 300, "delta": 100, "status": "AHEAD"},
+        }
+        base.update(over)
+        return base
+
+    @pytest.mark.asyncio
+    async def test_single_success_uses_per_anomaly_endpoint(self, alert_mgmt, mock_client):
+        mock_client.get_anomaly_budget_progress = AsyncMock(return_value=self._progress())
+        result = await alert_mgmt._handle_get_budget_progress(mock_client, {"anomaly_id": "a1"})
+        text = _text(result)
+        assert "a1" in text
+        assert "TOTAL_COST" in text
+        assert "AHEAD" in text
+        mock_client.get_anomaly_budget_progress.assert_awaited_once()
+        assert mock_client.get_anomaly_budget_progress.call_args[0][0] == "a1"
+
+    @pytest.mark.asyncio
+    async def test_single_labels_with_requested_hashed_id(self, alert_mgmt, mock_client):
+        """The per-anomaly payload carries the numeric internal anomalyId
+        (live dev evidence: 178302 for hashed id 5jgQQ7); the rendered entry
+        must be identifiable by the id the caller passed."""
+        mock_client.get_anomaly_budget_progress = AsyncMock(
+            return_value=self._progress(anomalyId=178302)
+        )
+        result = await alert_mgmt._handle_get_budget_progress(
+            mock_client, {"anomaly_id": "5jgQQ7"}
+        )
+        text = _text(result)
+        assert "5jgQQ7" in text
+
+    @pytest.mark.asyncio
+    async def test_bulk_entries_render_hashed_alert_id(self, alert_mgmt, mock_client):
+        """Bulk items carry the hashed id under alertId (not anomalyId) —
+        the renderer must not print None (live dev evidence)."""
+        mock_client.get_budget_progress_bulk = AsyncMock(
+            return_value={"items": [self._progress_bulk(alertId="5jgQQ7")]}
+        )
+        result = await alert_mgmt._handle_get_budget_progress(
+            mock_client, {"anomaly_ids": ["5jgQQ7"]}
+        )
+        text = _text(result)
+        assert "5jgQQ7" in text
+        assert "None" not in text
+
+    @pytest.mark.asyncio
+    async def test_single_forwards_filters(self, alert_mgmt, mock_client):
+        mock_client.get_anomaly_budget_progress = AsyncMock(return_value=self._progress())
+        await alert_mgmt._handle_get_budget_progress(
+            mock_client, {"anomaly_id": "a1", "include_trend": True, "now": "2026-07-10T00:00:00Z"}
+        )
+        kwargs = mock_client.get_anomaly_budget_progress.call_args.kwargs
+        assert kwargs["includeTrend"] is True
+        assert kwargs["now"] == "2026-07-10T00:00:00Z"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [400, 403])
+    async def test_single_400_403_translate_to_not_found(self, alert_mgmt, mock_client, status):
+        """Live dev evidence: bogus ids 400, deleted ids 403 — GET-by-id has
+        no input other than the id, so both mean 'no accessible alert'."""
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        mock_client.get_anomaly_budget_progress = AsyncMock(
+            side_effect=ReveniumAPIError("boom", status_code=status)
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await alert_mgmt._handle_get_budget_progress(
+                mock_client, {"anomaly_id": "zZzBogus9"}
+            )
+        assert "zZzBogus9" in str(exc_info.value.message)
+
+    async def test_single_404_translates_to_not_found(self, alert_mgmt, mock_client):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+        mock_client.get_anomaly_budget_progress = AsyncMock(
+            side_effect=ReveniumAPIError("not found", status_code=404)
+        )
+        with pytest.raises(ToolError) as exc:
+            await alert_mgmt._handle_get_budget_progress(mock_client, {"anomaly_id": "missing"})
+        assert "missing" in str(exc.value.message)
+
+    @pytest.mark.asyncio
+    async def test_single_422_explains_cumulative_usage_requirement(self, alert_mgmt, mock_client):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+        mock_client.get_anomaly_budget_progress = AsyncMock(
+            side_effect=ReveniumAPIError("not cumulative", status_code=422)
+        )
+        with pytest.raises(ToolError) as exc:
+            await alert_mgmt._handle_get_budget_progress(mock_client, {"anomaly_id": "a1"})
+        assert "CUMULATIVE_USAGE" in str(exc.value.message) or any(
+            "CUMULATIVE_USAGE" in s for s in exc.value.suggestions
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_5xx_propagates(self, alert_mgmt, mock_client):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+        mock_client.get_anomaly_budget_progress = AsyncMock(
+            side_effect=ReveniumAPIError("boom", status_code=500)
+        )
+        with pytest.raises(ReveniumAPIError):
+            await alert_mgmt._handle_get_budget_progress(mock_client, {"anomaly_id": "a1"})
+
+    @pytest.mark.asyncio
+    async def test_single_via_handle_action_alert_id_alias(self, alert_mgmt, mock_client):
+        """alert_id is mapped to anomaly_id by handle_action, so the single
+        per-anomaly path is reachable via the alias."""
+        mock_client.get_anomaly_budget_progress = AsyncMock(return_value=self._progress(anomalyId=178302))
+        result = await alert_mgmt.handle_action("get_budget_progress", {"alert_id": "a9"})
+        text = _text(result)
+        assert "a9" in text
+        assert mock_client.get_anomaly_budget_progress.call_args[0][0] == "a9"
+
+    @pytest.mark.asyncio
+    async def test_bulk_forwards_ids_and_renders_each(self, alert_mgmt, mock_client):
+        mock_client.get_budget_progress_bulk = AsyncMock(return_value={
+            "items": [self._progress_bulk(alertId="a1"), self._progress_bulk(alertId="a2")]
+        })
+        result = await alert_mgmt._handle_get_budget_progress(
+            mock_client, {"anomaly_ids": ["a1", "a2"]}
+        )
+        text = _text(result)
+        assert "a1" in text
+        assert "a2" in text
+        assert mock_client.get_budget_progress_bulk.call_args[0][0] == ["a1", "a2"]
+
+    @pytest.mark.asyncio
+    async def test_bulk_degrades_entry_without_numeric_fields(self, alert_mgmt, mock_client):
+        good = self._progress(anomalyId="a1")
+        bad = self._progress(anomalyId="a2", currentValue=None, threshold=None, percentUsed=None)
+        mock_client.get_budget_progress_bulk = AsyncMock(return_value={"items": [good, bad]})
+        result = await alert_mgmt._handle_get_budget_progress(
+            mock_client, {"anomaly_ids": ["a1", "a2"]}
+        )
+        text = _text(result)
+        assert "a1" in text
+        assert "a2" in text
+        assert "state unavailable" in text.lower()
+        assert "None" not in text
+
+    @pytest.mark.asyncio
+    async def test_requires_exactly_one_of_id_or_ids(self, alert_mgmt, mock_client):
+        """Neither anomaly_id nor anomaly_ids -> structured validation error."""
+        with pytest.raises(ToolError):
+            await alert_mgmt._handle_get_budget_progress(mock_client, {})
+
+    @pytest.mark.asyncio
+    async def test_rejects_both_id_and_ids(self, alert_mgmt, mock_client):
+        """Both anomaly_id and anomaly_ids -> structured validation error
+        (exactly one is required)."""
+        with pytest.raises(ToolError):
+            await alert_mgmt._handle_get_budget_progress(
+                mock_client, {"anomaly_id": "a1", "anomaly_ids": ["a2"]}
+            )
+
+    @pytest.mark.asyncio
+    async def test_rejects_empty_ids_list(self, alert_mgmt, mock_client):
+        """anomaly_ids=[] selects nothing -> structured validation error;
+        the bulk endpoint must not be called with an empty ids param."""
+        with pytest.raises(ToolError):
+            await alert_mgmt._handle_get_budget_progress(mock_client, {"anomaly_ids": []})
+        mock_client.get_budget_progress_bulk.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_progress_in_supported_actions(self, alert_mgmt):
+        actions = await alert_mgmt._get_supported_actions()
+        assert "get_budget_progress" in actions

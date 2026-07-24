@@ -176,6 +176,30 @@ class TestTagInvalidation:
         assert not cache._cache["k3"].tags.intersection({"api"})
 
     @pytest.mark.asyncio
+    async def test_invalidate_by_tags_with_matching_entries_completes(self):
+        """invalidate_by_tags must not deadlock when entries match: it held
+        self._lock while awaiting self.delete(), which acquires the same
+        non-reentrant lock. Bounded by wait_for so a regression fails fast
+        instead of hanging the suite.
+        """
+        import asyncio
+
+        cache = RedisLikeCache(max_size=100, default_ttl=60)
+        cache._background_tasks_started = True
+        await cache.set("a", 1, tags={"validation"})
+        await cache.set("b", 2, tags={"validation", "other"})
+        await cache.set("c", 3, tags={"other"})
+
+        invalidated = await asyncio.wait_for(
+            cache.invalidate_by_tags({"validation"}), timeout=5
+        )
+
+        assert invalidated == 2
+        assert await cache.get("a") is None
+        assert await cache.get("b") is None
+        assert await cache.get("c") == 3
+
+    @pytest.mark.asyncio
     async def test_set_normalizes_list_tags(self):
         cache = RedisLikeCache(max_size=100)
         cache._background_tasks_started = True

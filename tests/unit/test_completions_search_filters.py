@@ -78,6 +78,16 @@ class TestExtractCompletionsFilters:
         result = _extract_completions_filters(args)
         assert result == {"provider": "anthropic"}
 
+    def test_query_search_param_extracted(self):
+        """The server-side query search term passes through to the API.
+
+        The completions endpoint searches trace/transaction ID by exact match
+        first, then falls back to partial match across agent, model, provider,
+        error reason and subscriber email.
+        """
+        result = _extract_completions_filters({"query": "tx_4bd0aa176b1a"})
+        assert result == {"query": "tx_4bd0aa176b1a"}
+
     def test_all_filter_keys_covered(self):
         """All keys in the param map are extracted when present."""
         args = {k: f"val_{i}" for i, k in enumerate(_COMPLETIONS_FILTER_PARAM_MAP.keys())}

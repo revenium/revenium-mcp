@@ -42,6 +42,7 @@ def mock_client():
     client.get_users = AsyncMock(return_value={})
     client.get_user_by_id = AsyncMock()
     client.get_user_by_email = AsyncMock()
+    client.lookup_user_by_email = AsyncMock()
     client.create_user = AsyncMock()
     client.update_user = AsyncMock()
     client.delete_user = AsyncMock()
@@ -50,6 +51,7 @@ def mock_client():
     client.get_subscribers = AsyncMock(return_value={})
     client.get_subscriber_by_id = AsyncMock()
     client.get_subscriber_by_email = AsyncMock()
+    client.lookup_subscriber_by_email = AsyncMock()
     client.create_subscriber = AsyncMock()
     client.update_subscriber = AsyncMock()
     client.delete_subscriber = AsyncMock()
@@ -284,6 +286,64 @@ class TestUserManagerGet:
             await user_manager.get_user({"user_id": "u1"})
 
 
+class TestUserManagerLookup:
+    """Test UserManager.lookup_user behavior (lookup-by-email)."""
+
+    @pytest.mark.asyncio
+    async def test_lookup_user_success(self, user_manager, mock_client):
+        mock_client.lookup_user_by_email.return_value = {"id": "u9", "email": "joao@acme.com"}
+        result = await user_manager.lookup_user({"email": "joao@acme.com"})
+        assert result["id"] == "u9"
+        mock_client.lookup_user_by_email.assert_called_once_with("joao@acme.com")
+
+    @pytest.mark.asyncio
+    async def test_lookup_user_missing_email_raises(self, user_manager, mock_client):
+        with pytest.raises(ToolError) as exc_info:
+            await user_manager.lookup_user({})
+        assert "email" in str(exc_info.value).lower()
+        mock_client.lookup_user_by_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lookup_user_malformed_email_no_api_call(self, user_manager, mock_client):
+        with pytest.raises(ToolError) as exc_info:
+            await user_manager.lookup_user({"email": "not-an-email"})
+        assert "email" in str(exc_info.value).lower()
+        mock_client.lookup_user_by_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lookup_user_blank_email_no_api_call(self, user_manager, mock_client):
+        with pytest.raises(ToolError):
+            await user_manager.lookup_user({"email": "   "})
+        mock_client.lookup_user_by_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lookup_user_empty_local_part_no_api_call(self, user_manager, mock_client):
+        with pytest.raises(ToolError):
+            await user_manager.lookup_user({"email": "@acme.com"})
+        mock_client.lookup_user_by_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lookup_user_empty_domain_part_no_api_call(self, user_manager, mock_client):
+        with pytest.raises(ToolError):
+            await user_manager.lookup_user({"email": "joao@"})
+        mock_client.lookup_user_by_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lookup_user_404_raises_not_found_naming_email(self, user_manager, mock_client):
+        mock_client.lookup_user_by_email.side_effect = ReveniumAPIError("User not found", status_code=404)
+        with pytest.raises(ToolError) as exc_info:
+            await user_manager.lookup_user({"email": "ghost@acme.com"})
+        message = str(exc_info.value).lower()
+        assert "not found" in message
+        assert "ghost@acme.com" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_lookup_user_500_reraises(self, user_manager, mock_client):
+        mock_client.lookup_user_by_email.side_effect = ReveniumAPIError("Server error", status_code=500)
+        with pytest.raises(ReveniumAPIError):
+            await user_manager.lookup_user({"email": "joao@acme.com"})
+
+
 class TestUserManagerCreate:
     """Test UserManager.create_user behavior."""
 
@@ -451,6 +511,66 @@ class TestSubscriberManagerGet:
         with pytest.raises(ToolError) as exc_info:
             await subscriber_manager.get_subscriber({"email": "bad"})
         assert "invalid" in str(exc_info.value).lower()
+
+
+class TestSubscriberManagerLookup:
+    """Test SubscriberManager.lookup_subscriber behavior (lookup-by-email)."""
+
+    @pytest.mark.asyncio
+    async def test_lookup_subscriber_success(self, subscriber_manager, mock_client):
+        mock_client.lookup_subscriber_by_email.return_value = {
+            "id": "s9", "subscriberId": "sub9", "email": "joao@acme.com"
+        }
+        result = await subscriber_manager.lookup_subscriber({"email": "joao@acme.com"})
+        assert result["id"] == "s9"
+        mock_client.lookup_subscriber_by_email.assert_called_once_with("joao@acme.com")
+
+    @pytest.mark.asyncio
+    async def test_lookup_subscriber_enhances_roles(self, subscriber_manager, mock_client):
+        """Success result is passed through the subscriber enhancer (roles surfaced)."""
+        mock_client.lookup_subscriber_by_email.return_value = {
+            "id": "s9", "subscriberId": "sub9", "email": "joao@acme.com"
+        }
+        result = await subscriber_manager.lookup_subscriber({"email": "joao@acme.com"})
+        assert result["roles"] == ["ROLE_API_CONSUMER"]
+
+    @pytest.mark.asyncio
+    async def test_lookup_subscriber_missing_email_raises(self, subscriber_manager, mock_client):
+        with pytest.raises(ToolError) as exc_info:
+            await subscriber_manager.lookup_subscriber({})
+        assert "email" in str(exc_info.value).lower()
+        mock_client.lookup_subscriber_by_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lookup_subscriber_malformed_email_no_api_call(self, subscriber_manager, mock_client):
+        with pytest.raises(ToolError) as exc_info:
+            await subscriber_manager.lookup_subscriber({"email": "not-an-email"})
+        assert "email" in str(exc_info.value).lower()
+        mock_client.lookup_subscriber_by_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lookup_subscriber_empty_domain_no_api_call(self, subscriber_manager, mock_client):
+        with pytest.raises(ToolError):
+            await subscriber_manager.lookup_subscriber({"email": "bob@"})
+        mock_client.lookup_subscriber_by_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lookup_subscriber_404_raises_not_found_naming_email(self, subscriber_manager, mock_client):
+        mock_client.lookup_subscriber_by_email.side_effect = ReveniumAPIError(
+            "Subscriber not found", status_code=404
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await subscriber_manager.lookup_subscriber({"email": "ghost@acme.com"})
+        assert "not found" in str(exc_info.value).lower()
+        assert "ghost@acme.com" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_lookup_subscriber_500_reraises(self, subscriber_manager, mock_client):
+        mock_client.lookup_subscriber_by_email.side_effect = ReveniumAPIError(
+            "Server error", status_code=500
+        )
+        with pytest.raises(ReveniumAPIError):
+            await subscriber_manager.lookup_subscriber({"email": "joao@acme.com"})
 
 
 class TestSubscriberManagerCreate:
@@ -1266,6 +1386,60 @@ class TestCustomerManagementHandleAction:
             assert "deleted successfully" in result[0].text.lower()
             mock_client.delete_organization.assert_called_once_with("o_del")
 
+    @pytest.mark.asyncio
+    async def test_lookup_user_action_routes_to_user_manager(self, customer_mgmt):
+        """lookup_user action routes to UserManager.lookup_user and renders a result."""
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.lookup_user_by_email = AsyncMock(
+                return_value={"id": "u1", "email": "joao@acme.com"}
+            )
+
+            result = await customer_mgmt.handle_action("lookup_user", {"email": "joao@acme.com"})
+
+            assert isinstance(result[0], TextContent)
+            assert "joao@acme.com" in result[0].text
+            mock_client.lookup_user_by_email.assert_called_once_with("joao@acme.com")
+
+    @pytest.mark.asyncio
+    async def test_lookup_subscriber_action_routes_to_subscriber_manager(self, customer_mgmt):
+        """lookup_subscriber action routes to SubscriberManager.lookup_subscriber."""
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.lookup_subscriber_by_email = AsyncMock(
+                return_value={"id": "s1", "subscriberId": "sub1", "email": "joao@acme.com"}
+            )
+
+            result = await customer_mgmt.handle_action(
+                "lookup_subscriber", {"email": "joao@acme.com"}
+            )
+
+            assert isinstance(result[0], TextContent)
+            assert "joao@acme.com" in result[0].text
+            mock_client.lookup_subscriber_by_email.assert_called_once_with("joao@acme.com")
+
+    @pytest.mark.asyncio
+    async def test_lookup_user_action_malformed_email_makes_no_api_call(self, customer_mgmt):
+        """Boundary validation trips before any client call for a malformed email."""
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.lookup_user_by_email = AsyncMock()
+
+            with pytest.raises(ToolError):
+                await customer_mgmt.handle_action("lookup_user", {"email": "garbage"})
+
+            mock_client.lookup_user_by_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lookup_actions_in_supported_actions(self, customer_mgmt):
+        """lookup_user and lookup_subscriber are advertised as supported actions."""
+        actions = await customer_mgmt._get_supported_actions()
+        assert "lookup_user" in actions
+        assert "lookup_subscriber" in actions
+
 
 class TestCustomerManagementAutoGeneration:
 
@@ -1388,3 +1562,24 @@ class TestUpdateOrganizationPreservesParent:
             "BACK-911 regression: API persists parent via parentId on PUT, but the "
             f"merged payload is missing parentId. payload={sent_payload!r}"
         )
+
+class TestLookupEmailMultiAtRejection:
+    """Review: partition() splits on the first @ only — a@b@c must be rejected."""
+
+    def test_multiple_at_signs_rejected(self):
+        from src.revenium_mcp_server.tools_decomposed.customer_management import (
+            _validate_lookup_email,
+        )
+        from src.revenium_mcp_server.common.error_handling import ToolError
+        import pytest as _pytest
+
+        with _pytest.raises(ToolError):
+            _validate_lookup_email("a@b@c.com", action="lookup_user")
+
+    def test_single_at_still_passes(self):
+        from src.revenium_mcp_server.tools_decomposed.customer_management import (
+            _validate_lookup_email,
+        )
+
+        assert _validate_lookup_email("  a@b.com  ", action="lookup_user") == "a@b.com"
+

@@ -11,8 +11,31 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from ..endpoint_registry import resolve_analytics_request
+from .validation import ValidationError
 
 logger = logging.getLogger(__name__)
+
+# Published filter-options dimensions (from the prod OpenAPI doc). Used as a
+# client-side allowlist for get_analytics_filter_options: an unknown dimension
+# 404s upstream with a poor (HTML/problem) body, so we reject it before the
+# API call and hand the caller the valid list instead. Canonical form is
+# kebab-case; snake_case aliases are normalized before validation.
+_FILTER_OPTION_DIMENSIONS = frozenset(
+    {
+        "agents",
+        "api-keys",
+        "customers",
+        "models",
+        "organizations",
+        "products",
+        "providers",
+        "teams",
+        "tool-providers",
+        "tools",
+        "users",
+        "vendors",
+    }
+)
 
 
 class SimpleCostAnalyzer:
@@ -676,18 +699,24 @@ class SimpleCostAnalyzer:
             # Re-raise original exception to preserve API error details (status codes, response data, etc.)
             raise
 
-    async def get_agent_costs(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
+    async def get_agent_costs(
+        self, period: str, aggregation: str, filters: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
         """
         Get agent costs using proven API endpoint.
 
         Args:
             period: Time period (API-verified values only)
             aggregation: Aggregation type (API-verified values only)
+            filters: Optional dict with a costSources list (revenium_metered,
+                provider_billing) — sent as the new API's costSource param
 
         Returns:
             List of agent cost data
 
         Raises:
+            ValidationError: If costSources is requested while the legacy API
+                (which has no costSource param) is active
             Exception: If API call fails
         """
         try:
@@ -704,10 +733,26 @@ class SimpleCostAnalyzer:
                     raise Exception("Team ID not available from client or environment")
 
             extra_old = {"group": aggregation} if aggregation else {}
+            cost_sources = (filters or {}).get("costSources")
+            extra_new = {"costSource": cost_sources} if cost_sources else None
             path, params, call_kwargs = resolve_analytics_request(
                 "cost_metrics_by_agents_over_time", team_id, period,
                 extra_old_params=extra_old,
+                extra_new_params=extra_new,
             )
+
+            # Empty call_kwargs means the legacy profitstream route was chosen,
+            # which has no costSource param — fail loudly rather than return
+            # unfiltered data the caller would read as filtered.
+            if cost_sources and not call_kwargs:
+                raise ValidationError(
+                    "The costSources filter requires the new analytics API",
+                    field="filters.costSources",
+                    suggestions=[
+                        "Set REVENIUM_USE_NEW_ANALYTICS_API=true to enable cost-source filtering",
+                        "Or omit filters.costSources to query the legacy endpoint",
+                    ],
+                )
 
             self.logger.info(f"DEBUG: Making API call to {path} with params: {params}")
 
@@ -819,6 +864,126 @@ class SimpleCostAnalyzer:
         except Exception as e:
             self.logger.error("Failed to get user costs: %s", e)
             raise
+
+    async def get_transaction_count(self, period: str) -> Optional[int]:
+        """Get the team's aggregate transaction count for a period.
+
+        Single total from the new-API transaction-count-by-team endpoint.
+        teamId is resolved server-side from the API-key auth context, and the
+        count matches the cost endpoints' universe (coding-assistant
+        transactions are excluded on this transport).
+
+        Args:
+            period: Time period (API-verified values only)
+
+        Returns:
+            The total transaction count, or None when the response carries no
+            metric value.
+        """
+        self.logger.info("Getting transaction count for period=%s", period)
+
+        team_id = self._get_team_id()
+        path, params, call_kwargs = resolve_analytics_request(
+            "transaction_count_by_team", team_id, period
+        )
+        response = await self.client.get(path, params=params, **call_kwargs)
+
+        # MetricResponseSchema envelope: the single total lives at
+        # _embedded.items[0].metrics[0].metricResult. The client usually hands
+        # back _embedded.items already unwrapped (a list); accept the full
+        # envelope too. The metric's links are intentionally empty — there is
+        # no drill-down to follow.
+        if isinstance(response, dict):
+            items = response.get("_embedded", {}).get("items", [])
+        elif isinstance(response, list):
+            items = response
+        else:
+            return None
+        if not items or not isinstance(items[0], dict):
+            return None
+        metrics = items[0].get("metrics", [])
+        if not metrics or not isinstance(metrics[0], dict):
+            return None
+        value = metrics[0].get("metricResult")
+        if not isinstance(value, (int, float)):
+            return None
+        return int(value)
+
+    async def get_analytics_filter_options(
+        self, dimension: str, period: str
+    ) -> List[str]:
+        """Enumerate the valid filter values for an analytics dimension.
+
+        Lets callers discover the real names (agents, models, providers, ...)
+        that the cost endpoints' ``filters`` arguments expect, instead of
+        guessing and getting empty results.
+
+        Args:
+            dimension: Filter dimension (e.g. 'models', 'agents'). snake_case
+                aliases (``api_keys``, ``tool_providers``) are normalized to the
+                published kebab-case form before validation.
+            period: Time period (API-verified values only) — bounds the window
+                the values are drawn from.
+
+        Returns:
+            The list of valid filter values (plain strings) for the dimension.
+
+        Raises:
+            ValidationError: If the dimension is not one of the published
+                dimensions. Raised before any API call — an unknown dimension
+                404s upstream with a poor body, so the allowlist is enforced
+                client-side and the valid list is handed back to the caller.
+        """
+        # Normalize: trim, lowercase, snake_case -> kebab-case. This lets both
+        # ``api_keys`` and ``api-keys`` resolve to the canonical ``api-keys``.
+        normalized = dimension.strip().lower().replace("_", "-")
+        if normalized not in _FILTER_OPTION_DIMENSIONS:
+            valid = ", ".join(sorted(_FILTER_OPTION_DIMENSIONS))
+            raise ValidationError(
+                f"Unknown filter dimension: {dimension!r}",
+                field="dimension",
+                suggestions=[f"Valid dimensions: {valid}"],
+            )
+
+        team_id = self._get_team_id()
+        path, params, call_kwargs = resolve_analytics_request(
+            "analytics_filter_options", team_id, period
+        )
+        # Registry entry is dimension-agnostic (base path only); the concrete
+        # dimension is appended here as a path segment.
+        path = f"{path}/{normalized}"
+
+        # The client's default unwrap_hal_embedded=True collapses the HAL
+        # envelope and would drop the plain-string items entirely (they carry
+        # no _embedded of their own to unwrap). Opt out and parse the envelope
+        # ourselves. (This exact bug was found in live verification.)
+        response = await self.client.get(
+            path, params=params, unwrap_hal_embedded=False, **call_kwargs
+        )
+
+        if isinstance(response, dict):
+            items = response.get("_embedded", {}).get("items", [])
+        elif isinstance(response, list):
+            items = response
+        else:
+            return []
+
+        if not isinstance(items, list):
+            return []
+
+        values: List[str] = []
+        for item in items:
+            if isinstance(item, str):
+                values.append(item)
+            elif isinstance(item, dict):
+                # Items are plain strings on the live API; tolerate dicts
+                # defensively by preferring a human label, then an id.
+                label = item.get("label") or item.get("id")
+                if label is not None:
+                    values.append(str(label))
+            else:
+                values.append(str(item))
+        return values
 
     async def get_cost_summary(self, period: str, aggregation: str) -> Dict[str, Any]:
         """
@@ -1282,8 +1447,19 @@ class SimpleCostAnalyzer:
             response = await self.client.get_cost_by_tool_aggregated(teamId=team_id, period=period)
             if not response:
                 return []
-            items = self._extract_embedded_items(response)
-            return self._process_tool_cost_items(items)
+            # The endpoint serves the grouped envelope (groupName = toolId,
+            # metrics[].metricResult = cost) — same shape as the sibling
+            # tool-analytics actions, so it goes through the same parser.
+            # include_all_totals: parity with get_model_costs (renders $0.00
+            # rows) and honesty for refunds/credits — a zero or negative total
+            # must not silently vanish from the tool breakdown.
+            return self._process_grouped_metrics(
+                response,
+                entity_key="tool",
+                metric_key="cost",
+                include_all_totals=True,
+                compute_share=True,
+            )
         except Exception as e:
             self.logger.error(f"Failed to get tool costs: {e}")
             raise
@@ -1333,48 +1509,24 @@ class SimpleCostAnalyzer:
             self.logger.error(f"Failed to get tool costs by provider: {e}")
             raise
 
-    def _extract_embedded_items(self, response: Any) -> List[Dict[str, Any]]:
-        """Extract items from _embedded HAL response format."""
-        if isinstance(response, dict):
-            embedded = response.get("_embedded", {})
-            if isinstance(embedded, dict):
-                items = embedded.get("items", [])
-                if isinstance(items, list):
-                    return items
-            data = response.get("data", [])
-            if isinstance(data, list):
-                return data
-        if isinstance(response, list):
-            return response
-        return []
+    def _process_grouped_metrics(
+        self,
+        response: Any,
+        entity_key: str,
+        metric_key: str,
+        *,
+        include_all_totals: bool = False,
+        compute_share: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Process grouped metrics response (groupName + metrics[].metricResult).
 
-    def _process_tool_cost_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Process tool cost items from aggregated endpoint."""
-        processed = []
-        total_cost = sum(
-            v for item in items
-            if isinstance(item, dict)
-            for v in [item.get("totalCost", 0)]
-            if isinstance(v, (int, float))
-        )
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            tool_id = item.get("toolId", item.get("toolName", "Unknown Tool"))
-            raw_cost = item.get("totalCost", 0)
-            cost = raw_cost if isinstance(raw_cost, (int, float)) else 0
-            entry = {"tool": tool_id, "cost": cost}
-            call_count = item.get("callCount")
-            if call_count is not None and isinstance(call_count, (int, float)):
-                entry["call_count"] = call_count
-            if total_cost > 0:
-                entry["percentage"] = (cost / total_cost) * 100
-            processed.append(entry)
-        processed.sort(key=lambda x: x.get("cost", 0), reverse=True)
-        return processed
-
-    def _process_grouped_metrics(self, response: Any, entity_key: str, metric_key: str) -> List[Dict[str, Any]]:
-        """Process grouped metrics response (groupName + metrics[].metricResult)."""
+        Args:
+            include_all_totals: When True, groups whose total is zero or
+                negative are kept instead of dropped (default preserves the
+                historical positive-only behavior of the sibling actions).
+            compute_share: When True and the summed totals are positive, each
+                entry gains a ``percentage`` share of the sum.
+        """
         processed = []
         responses = response if isinstance(response, list) else [response]
         for item in responses:
@@ -1384,17 +1536,33 @@ class SimpleCostAnalyzer:
                 for group in item.get("groups", []):
                     if not isinstance(group, dict):
                         continue
-                    entry = self._extract_group_entry(group, entity_key, metric_key)
+                    entry = self._extract_group_entry(
+                        group, entity_key, metric_key, include_all_totals=include_all_totals
+                    )
                     if entry:
                         processed.append(entry)
             else:
-                entry = self._extract_group_entry(item, entity_key, metric_key)
+                entry = self._extract_group_entry(
+                    item, entity_key, metric_key, include_all_totals=include_all_totals
+                )
                 if entry:
                     processed.append(entry)
         processed.sort(key=lambda x: x.get(metric_key, 0), reverse=True)
+        if compute_share:
+            total = sum(entry[metric_key] for entry in processed)
+            if total > 0:
+                for entry in processed:
+                    entry["percentage"] = (entry[metric_key] / total) * 100
         return processed
 
-    def _extract_group_entry(self, group: Dict[str, Any], entity_key: str, metric_key: str):
+    def _extract_group_entry(
+        self,
+        group: Dict[str, Any],
+        entity_key: str,
+        metric_key: str,
+        *,
+        include_all_totals: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         """Extract a single entry from a group dict with groupName + metrics."""
         name = group.get("groupName", f"Unknown {entity_key.title()}")
         metrics = group.get("metrics", [])
@@ -1406,6 +1574,229 @@ class SimpleCostAnalyzer:
                 val = metric.get("metricResult", 0)
                 if isinstance(val, (int, float)):
                     total += val
-        if total > 0:
+        if total > 0 or include_all_totals:
             return {entity_key: name, metric_key: total}
         return None
+
+    # ──────────────────────────────────────────────────────────────────────
+    # BACK-2376 task / profitability / spend-mover analytics pack
+    #
+    # These read-only methods hit the new-API-only analytics endpoints on the
+    # analytics host (Bearer auth, force_new routing). Three envelope families
+    # (all verified live on dev):
+    #   A. TIMESERIES  → _flatten_timeseries_items: buckets with per-bucket
+    #      groups flattened, each group carrying its metrics with per-endpoint
+    #      fields (taskType/tokenType) preserved.
+    #   B. AGGREGATED  → _flatten_aggregated_items: one row per (group, metric),
+    #      preserving metricType and top-movers extras (currentValue,
+    #      previousValue, trend).
+    #   C. SCATTER     → dataPoints returned as-is (no _embedded).
+    # Numeric honesty: a metric whose metricResult is missing or non-numeric is
+    # skipped with a debug log (shared _metric_result_or_none) — never coerced
+    # to 0, matching the _process_grouped_metrics behavior.
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _fetch_analytics_envelope(
+        self,
+        key: str,
+        period: str,
+        extra_new_params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Fetch a new-API analytics envelope for ``key`` and ``period``.
+
+        Resolves the request through the registry (force_new → Bearer on the
+        analytics host), performs the GET, and returns the response dict. A
+        non-dict / empty response is normalized to ``{}`` so callers can parse
+        uniformly. ``extra_new_params`` is merged into the new-API query string
+        (e.g. ``{"groupBy": "model"}``, ``{"providers": [...]}``).
+        """
+        team_id = self._get_team_id()
+        path, params, call_kwargs = resolve_analytics_request(
+            key, team_id, period, extra_new_params=extra_new_params
+        )
+        self.logger.debug("Analytics pack call to %s params=%s", path, params)
+        # unwrap_hal_embedded=False: the client's default unwrap collapses the
+        # envelope to the _embedded list (A/B) or [] (scatter has no _embedded),
+        # discarding period metadata and the scatter dataPoints entirely —
+        # the parse helpers here expect the full envelope (live-found).
+        response = await self.client.get(
+            path, params=params, unwrap_hal_embedded=False, **call_kwargs
+        )
+        return response if isinstance(response, dict) else {}
+
+    @staticmethod
+    def _envelope_items(response: Any) -> List[Dict[str, Any]]:
+        """Return ``_embedded.items`` from an analytics envelope.
+
+        The fetch always requests the full envelope (unwrap_hal_embedded=False)
+        and normalizes non-dicts to {}, so this only ever sees a dict; anything
+        else yields an empty list (a clean empty state).
+        """
+        if not isinstance(response, dict):
+            return []
+        embedded = response.get("_embedded", {})
+        if not isinstance(embedded, dict):
+            return []
+        items = embedded.get("items", [])
+        return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
+
+    def _metric_result_or_none(self, metric: Dict[str, Any]) -> Optional[float]:
+        """Return a numeric ``metricResult`` or None (logged) — never fabricate 0."""
+        value = metric.get("metricResult")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        self.logger.debug(
+            "Skipping metric with missing/non-numeric metricResult: %r", metric.get("label")
+        )
+        return None
+
+    def _flatten_metrics(self, metrics: Any) -> List[Dict[str, Any]]:
+        """Preserve each metric dict, dropping those without a numeric result.
+
+        Every surviving metric keeps all its original fields (label, metricType,
+        taskType/tokenType, and top-movers extras) so downstream renderers can
+        label money vs counts and show trend context without a second fetch.
+        """
+        preserved: List[Dict[str, Any]] = []
+        if not isinstance(metrics, list):
+            return preserved
+        for metric in metrics:
+            if not isinstance(metric, dict):
+                continue
+            if self._metric_result_or_none(metric) is None:
+                continue
+            preserved.append(dict(metric))
+        return preserved
+
+    def _flatten_aggregated_items(self, response: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Flatten envelope B into one row per (group, numeric metric).
+
+        Each row is ``{"group": groupName, **metric}`` — the metric's own fields
+        (metricResult, metricType, currentValue/previousValue/trend, …) are
+        carried through verbatim. Groups whose only metrics are non-numeric drop
+        out entirely (numeric honesty).
+        """
+        rows: List[Dict[str, Any]] = []
+        for item in self._envelope_items(response):
+            name = item.get("groupName", "Unknown")
+            for metric in self._flatten_metrics(item.get("metrics", [])):
+                rows.append({"group": name, **metric})
+        return rows
+
+    def _flatten_timeseries_items(self, response: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Flatten envelope A into timeseries buckets with per-bucket groups.
+
+        Returns ``[{startTimestamp, endTimestamp, groups: [{group, metrics}]}]``.
+        Groups with no numeric metric are dropped; a bucket is kept even if some
+        of its groups drop (an empty ``groups`` list is still an honest bucket).
+        """
+        buckets: List[Dict[str, Any]] = []
+        for item in self._envelope_items(response):
+            groups: List[Dict[str, Any]] = []
+            for group in item.get("groups", []) or []:
+                if not isinstance(group, dict):
+                    continue
+                metrics = self._flatten_metrics(group.get("metrics", []))
+                if not metrics:
+                    continue
+                groups.append({"group": group.get("groupName", "Unknown"), "metrics": metrics})
+            buckets.append(
+                {
+                    "startTimestamp": item.get("startTimestamp"),
+                    "endTimestamp": item.get("endTimestamp"),
+                    "groups": groups,
+                }
+            )
+        return buckets
+
+    # ── Public analytics-pack methods ─────────────────────────────────────
+
+    async def get_task_costs(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
+        """Cost by task type. ``aggregation='aggregated'`` → totals (envelope B);
+        anything else → timeseries buckets (envelope A)."""
+        if str(aggregation).lower() == "aggregated":
+            response = await self._fetch_analytics_envelope("cost_by_task_aggregated", period)
+            return self._flatten_aggregated_items(response)
+        response = await self._fetch_analytics_envelope("cost_by_task", period)
+        return self._flatten_timeseries_items(response)
+
+    async def get_task_completion(
+        self, period: str, aggregation: str, agents: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """Task completion counts. ``aggregation='aggregated'`` → totals
+        (envelope B); otherwise timeseries buckets (envelope A). ``agents``
+        optionally filters to specific agent ids."""
+        extra = {"agents": agents} if agents else None
+        if str(aggregation).lower() == "aggregated":
+            response = await self._fetch_analytics_envelope(
+                "task_completion_aggregated", period, extra_new_params=extra
+            )
+            return self._flatten_aggregated_items(response)
+        response = await self._fetch_analytics_envelope(
+            "task_completion", period, extra_new_params=extra
+        )
+        return self._flatten_timeseries_items(response)
+
+    async def get_task_performance_by_agent(self, period: str) -> List[Dict[str, Any]]:
+        """Per-agent task performance (envelope B). Often empty on dev — an
+        empty list is a normal outcome, not an error."""
+        response = await self._fetch_analytics_envelope("task_performance_by_agent", period)
+        return self._flatten_aggregated_items(response)
+
+    async def get_profit_margins(self, period: str, dimension: str) -> List[Dict[str, Any]]:
+        """Profit margin per ``dimension`` (``customer`` or ``product``),
+        envelope B. Raises ValueError for any other dimension."""
+        key_by_dimension = {
+            "customer": "profit_margin_per_customer",
+            "product": "profit_margin_per_product",
+        }
+        key = key_by_dimension.get(str(dimension).lower())
+        if key is None:
+            raise ValueError(
+                f"Unsupported profit-margin dimension {dimension!r}; expected 'customer' or 'product'"
+            )
+        response = await self._fetch_analytics_envelope(key, period)
+        return self._flatten_aggregated_items(response)
+
+    async def get_top_movers(
+        self, period: str, group_by: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Biggest spend movers (envelope B), each row carrying currentValue,
+        previousValue and trend. ``group_by`` (e.g. 'model', 'agent') is
+        forwarded as the API's ``groupBy`` param when provided."""
+        extra = {"groupBy": group_by} if group_by else None
+        response = await self._fetch_analytics_envelope("top_movers", period, extra_new_params=extra)
+        return self._flatten_aggregated_items(response)
+
+    async def get_token_breakdown(
+        self, period: str, providers: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """Token breakdown by type over time (envelope A). ``providers``
+        optionally restricts the breakdown to specific providers."""
+        extra = {"providers": providers} if providers else None
+        response = await self._fetch_analytics_envelope(
+            "token_breakdown_by_type", period, extra_new_params=extra
+        )
+        return self._flatten_timeseries_items(response)
+
+    async def get_team_costs(self, period: str) -> List[Dict[str, Any]]:
+        """Cost by team over time (envelope A timeseries buckets)."""
+        response = await self._fetch_analytics_envelope("cost_by_team_timeseries", period)
+        return self._flatten_timeseries_items(response)
+
+    async def get_vendor_costs(self, period: str) -> List[Dict[str, Any]]:
+        """Cost by vendor (envelope B aggregated totals)."""
+        response = await self._fetch_analytics_envelope("cost_by_vendor", period)
+        return self._flatten_aggregated_items(response)
+
+    async def get_token_vs_tool_cost(self, period: str) -> List[Dict[str, Any]]:
+        """Token cost vs tool cost over time (envelope A timeseries buckets)."""
+        response = await self._fetch_analytics_envelope("token_vs_tool_cost", period)
+        return self._flatten_timeseries_items(response)
+
+    async def get_trace_cost_distribution(self, period: str) -> List[Dict[str, Any]]:
+        """Per-trace cost scatter (envelope C). Returns the top-level
+        ``dataPoints`` list as-is; missing/empty → empty list."""
+        response = await self._fetch_analytics_envelope("trace_cost_distribution", period)
+        points = response.get("dataPoints", [])
+        return [p for p in points if isinstance(p, dict)] if isinstance(points, list) else []

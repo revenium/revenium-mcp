@@ -392,3 +392,37 @@ class TestBuildSystemHealthSummary:
         assert "Health Score" in text
         assert "Critical:" in text
         assert "Optional:" in text
+
+    def _make_clerk_validation(self, clerk_configured=True):
+        """Clerk/OAuth-mode validation summary: no static API key by design."""
+        result = MagicMock()
+        result.summary = {
+            "auth_mode": "clerk",
+            "clerk_configured": clerk_configured,
+            "overall_status": clerk_configured,
+            "api_key_available": False,
+            "direct_api_works": False,
+            "auth_config_works": True,
+            "auto_discovery_works": True,
+        }
+        return result
+
+    def test_clerk_mode_with_config_is_healthy(self, config_tool):
+        """Clerk mode with valid OAuth config is HEALTHY despite no static API key."""
+        state = self._make_state()
+        validation = self._make_clerk_validation(clerk_configured=True)
+        text = config_tool._build_system_health_summary(validation, state)
+        assert "NEEDS ATTENTION" not in text
+        assert "system cannot function" not in text
+        assert "NOT READY" not in text
+        # Critical component is labelled for the OAuth model, not the API-key model
+        assert "Clerk OAuth Configuration" in text
+        assert "API Key Configuration" not in text
+
+    def test_clerk_mode_without_config_is_unhealthy(self, config_tool):
+        """Clerk mode with the OAuth config missing is genuinely unhealthy."""
+        state = self._make_state()
+        validation = self._make_clerk_validation(clerk_configured=False)
+        text = config_tool._build_system_health_summary(validation, state)
+        assert "NEEDS ATTENTION" in text
+        assert "Clerk OAuth" in text

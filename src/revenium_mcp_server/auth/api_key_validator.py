@@ -50,6 +50,7 @@ class ApiKeyIdentity(BaseModel):
     user_id: str
     tenant_id: str
     team_id: str
+    team_ids: tuple[str, ...]
     email: str
     roles: list[str]
     scope_from_prefix: Literal["WRITE", "READ", "METERING", "UNKNOWN"]
@@ -170,23 +171,28 @@ class ApiKeyValidator:
         if status == 200:
             try:
                 data = resp.json()
+                team_ids = tuple(t["id"] for t in (data.get("teams") or []))
                 # defaultTeamId can be null; fall back to the first team so a
                 # user without an explicit default still resolves a tenant.
                 team_id = data.get("defaultTeamId")
                 if not team_id:
-                    teams = data.get("teams") or []
-                    if not teams:
+                    if not team_ids:
                         # Structurally valid response, but the account has no
                         # team — raise a clear error instead of letting a None
                         # team_id fail Pydantic and surface as "Malformed".
                         raise ApiKeyValidationError(
                             "Account has no team assigned; cannot resolve a tenant"
                         )
-                    team_id = teams[0]["id"]
+                    team_id = team_ids[0]
+                if team_id not in team_ids:
+                    # Invariant: the resolved default is always a member of
+                    # team_ids so it passes downstream membership validation.
+                    team_ids = (team_id, *team_ids)
                 return ApiKeyIdentity(
                     user_id=data["id"],
                     tenant_id=data["tenantId"],
                     team_id=team_id,
+                    team_ids=team_ids,
                     email=data.get("email", ""),
                     roles=data.get("roles", []),
                     scope_from_prefix=scope,

@@ -413,13 +413,12 @@ async def main() -> None:
             "CLERK_OAUTH_CLIENT_ID",
             "CLERK_OAUTH_CLIENT_SECRET",
             "MCP_SERVER_BASE_URL",
-            "REVENIUM_TENANT_ID",
-            "REVENIUM_API_KEY",
         ], label="AUTH_MODE=clerk requires env vars")
-        from fastmcp.server.auth.oidc_proxy import OIDCProxy
+        from .auth.oidc_logging import AuthLoggingOIDCProxy
+        from .auth.client_storage import build_client_storage
         # TEST-ONLY: integration tests can set CLERK_OIDC_CONFIG_URL_OVERRIDE
-        # to point OIDCProxy at a local fake Clerk. Must be https:// (the guard
-        # below rejects plaintext to prevent JWKS substitution attacks).
+        # to point AuthLoggingOIDCProxy at a local fake Clerk. Must be https://
+        # (the guard below rejects plaintext to prevent JWKS substitution attacks).
         # Never set in production.
         config_url_override = os.getenv("CLERK_OIDC_CONFIG_URL_OVERRIDE")
         if config_url_override and not config_url_override.startswith("https://"):
@@ -431,13 +430,32 @@ async def main() -> None:
             f"https://{clerk_envs['CLERK_DOMAIN']}"
             "/.well-known/openid-configuration"
         )
-        auth_obj = OIDCProxy(
+        # Shared OAuth state across tasks; unset -> None -> per-task local disk.
+        client_storage = build_client_storage(
+            os.getenv("MCP_OAUTH_REDIS_URL"),
+            clerk_envs["CLERK_OAUTH_CLIENT_SECRET"],
+        )
+        auth_obj = AuthLoggingOIDCProxy(
             config_url=config_url,
             client_id=clerk_envs["CLERK_OAUTH_CLIENT_ID"],
             client_secret=clerk_envs["CLERK_OAUTH_CLIENT_SECRET"],
             base_url=clerk_envs["MCP_SERVER_BASE_URL"],
-            required_scopes=["openid", "profile", "email"],
+            # private_metadata: Clerk only surfaces the nested
+            # revenium_team_id / tenant_id claims in the ID token when this
+            # scope is granted (the access token never carries them).
+            required_scopes=["openid", "profile", "email", "private_metadata"],
+            # The OAuth access token is minimal (no email, no metadata); the
+            # ID token carries the identity claims the resolver and downstream
+            # HyperCurrent need, so verify and forward the ID token instead.
+            verify_id_token=True,
             algorithm="RS256",
+            client_storage=client_storage,
+            # No explicit audience: under verify_id_token the proxy already
+            # binds inbound tokens to aud == client_id (this OAuth app), which
+            # is the confused-deputy protection. Passing a custom audience would
+            # also be forwarded upstream to Clerk's /authorize, and Clerk has no
+            # audience whitelist for OAuth apps, so it rejects any non-default
+            # audience ("Requested audience ... has not been whitelisted").
         )
 
     if auth_mode == "api_key":
@@ -474,10 +492,10 @@ async def main() -> None:
     # Track if API key is missing or invalid for later warning display
     api_key_missing_or_invalid = False
 
-    # Env/clerk modes only: validate the server-wide REVENIUM_API_KEY here.
-    # api_key mode deliberately has no server-wide key — each caller supplies
-    # their own per-request bearer — so skip this validation entirely.
-    if auth_mode != "api_key":
+    # Env mode only: validate the server-wide REVENIUM_API_KEY here.
+    # api_key mode has per-request bearers; clerk mode forwards the caller's
+    # JWT — neither has a server-wide key to validate.
+    if auth_mode == "env":
         if not api_key:
             # API key is missing
             api_key_missing_or_invalid = True
@@ -616,8 +634,16 @@ async def main() -> None:
     if transport_mode == "http":
         host = read_http_host()
         port = read_http_port()
+        from .auth.rate_limit import build_rate_limit_middleware
+
+        asgi_middleware = build_rate_limit_middleware()
         logger.info("Starting HTTP transport on %s:%s", host, port)
-        await mcp.run_async(transport="http", host=host, port=port)
+        await mcp.run_async(
+            transport="http",
+            host=host,
+            port=port,
+            middleware=asgi_middleware,
+        )
     else:
         # stdio path: current behavior + API-key-warning monkey-patch.
         # Works for both env+stdio (default) and any future stdio modes.

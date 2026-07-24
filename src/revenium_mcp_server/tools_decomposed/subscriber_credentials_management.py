@@ -27,7 +27,11 @@ from ..common.error_handling import (
 )
 from ..common.validation import validate_pagination_params
 from ..dry_run.credential_dry_run import CredentialDryRunValidator
-from ..hierarchy import cross_tier_validator, entity_lookup_service, hierarchy_navigation_service
+from ..hierarchy import (
+    get_cross_tier_validator,
+    get_entity_lookup_service,
+    get_hierarchy_navigation_service,
+)
 from ..introspection.metadata import ToolCapability, ToolType
 from ..nlp.credential_nlp_processor import CredentialIntent, CredentialNLPProcessor
 from ..common.security_utils import obfuscate_credentials_list, obfuscate_credential_data
@@ -43,9 +47,9 @@ class CredentialsHierarchyManager:
         """Initialize hierarchy manager with client."""
         self.client = client
         self.formatter = UnifiedResponseFormatter("manage_subscriber_credentials")
-        self.navigation_service = hierarchy_navigation_service
-        self.lookup_service = entity_lookup_service
-        self.validator = cross_tier_validator
+        self.navigation_service = get_hierarchy_navigation_service(client)
+        self.lookup_service = get_entity_lookup_service(client)
+        self.validator = get_cross_tier_validator(client)
 
     async def get_subscription_details(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get subscription details for a given credential."""
@@ -527,6 +531,9 @@ class SubscriberCredentialsManagement(ToolBase):
                         "Try the operation again after a brief delay",
                     ],
                 )
+        except PermissionError:
+            # Auth failures must fail closed — never mask as a tool-error envelope.
+            raise
         except Exception as e:
             logger.error(f"Unexpected error in subscriber credentials management: {e}")
             raise ToolError(

@@ -558,7 +558,7 @@ class SlackSetupAssistant(ToolBase):
                     result_text += "## 🎯 **Onboarding Integration**\n\n"
                     result_text += "Once Slack is configured, you can:\n"
                     result_text += "- Continue with `setup_checklist()` to see overall progress\n"
-                    result_text += "- Use `welcome_and_setup(action='next_steps')` for guidance\n"
+                    result_text += "- Use `system_setup(action='setup_checklist')` for guidance\n"
                     result_text += (
                         "- Create your first alert with automatic Slack notifications\n\n"
                     )
@@ -576,7 +576,7 @@ class SlackSetupAssistant(ToolBase):
                     result_text += "After setting your default:\n"
                     result_text += "- Check `setup_checklist()` to see your progress\n"
                     result_text += (
-                        "- Use `welcome_and_setup(action='complete_setup')` when ready\n\n"
+                        "- Use `system_setup(action='setup_checklist')` when ready\n\n"
                     )
 
             else:
@@ -596,7 +596,7 @@ class SlackSetupAssistant(ToolBase):
                         "- Try `manage_alerts(action='create_simple_alert')` to test Slack\n"
                     )
                     result_text += (
-                        "- Use `welcome_and_setup(action='complete_setup')` when ready\n\n"
+                        "- Use `system_setup(action='setup_checklist')` when ready\n\n"
                     )
                 else:
                     result_text += "**Test Your Setup:**\n"
@@ -698,10 +698,10 @@ class SlackSetupAssistant(ToolBase):
             result_text += "```\nsetup_checklist()\n```\n\n"
 
             result_text += "**Get Personalized Next Steps**:\n"
-            result_text += "```\nwelcome_and_setup(action='next_steps')\n```\n\n"
+            result_text += "```\nsystem_setup(action='setup_checklist')\n```\n\n"
 
             result_text += "**Complete Your Onboarding**:\n"
-            result_text += "```\nwelcome_and_setup(action='complete_setup')\n```\n\n"
+            result_text += "```\nsystem_setup(action='setup_checklist')\n```\n\n"
 
             # Troubleshooting section
             result_text += "## 🔧 **Troubleshooting Tips**\n\n"

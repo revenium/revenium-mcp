@@ -375,3 +375,30 @@ async def test_api_key_mode_missing_url_returns_not_ready(monkeypatch):
     result = await health_endpoints._probe_revenium()
     assert result.ok is False
     assert result.reason == "revenium_api_unreachable"
+
+
+@pytest.mark.asyncio
+async def test_clerk_mode_probe_does_not_call_validate_api_key(monkeypatch):
+    """In clerk mode, readiness must NOT call ReveniumClient.validate_api_key
+    (no env-baked key; credentials are per-request JWTs); it probes platform
+    reachability instead — otherwise /ready is permanently 503."""
+    monkeypatch.setenv("AUTH_MODE", "clerk")
+    monkeypatch.setenv("REVENIUM_BASE_URL", "https://platform.test")
+    monkeypatch.delenv("REVENIUM_API_KEY", raising=False)
+
+    called = {"validate": False}
+
+    class _Boom:
+        async def validate_api_key(self):
+            called["validate"] = True
+            return {"valid": True}
+
+    monkeypatch.setattr(
+        "src.revenium_mcp_server.client.ReveniumClient", lambda *a, **k: _Boom()
+    )
+
+    from src.revenium_mcp_server import health_endpoints
+
+    result = await health_endpoints._probe_revenium()
+    assert called["validate"] is False
+    assert result.ok in (True, False)  # a reachability result, not an auth result
