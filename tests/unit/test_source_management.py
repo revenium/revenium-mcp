@@ -89,6 +89,20 @@ class TestSourceManagerList:
 
         mock_client.get_sources.assert_called_once_with(page=0, size=20, type="API")
 
+    @pytest.mark.asyncio
+    async def test_list_sources_passes_query_search_filter(self, source_manager, mock_client):
+        """The server-side query search term reaches the API call.
+
+        The sources endpoint matches name/organization name by contains and
+        externalId by equals, case-insensitively.
+        """
+        mock_client._extract_embedded_data.return_value = []
+        mock_client._extract_pagination_info.return_value = {"totalPages": 0, "totalElements": 0}
+
+        await source_manager.list_sources({"filters": {"query": "payments"}})
+
+        mock_client.get_sources.assert_called_once_with(page=0, size=20, query="payments")
+
 
 class TestSourceManagerGet:
     """Test SourceManager.get_source behavior."""
@@ -464,3 +478,78 @@ class TestSourceListPaginationValidation:
         assert_no_framework_leak(exc.value.message)
 
 
+
+
+class TestSourceTypeParity:
+    """dry_run and live create must reject an invalid source type identically
+    — dry-run previously echoed 'Validation Successful' for a type the live
+    create 400s on."""
+
+    @pytest.mark.asyncio
+    async def test_dry_run_rejects_invalid_type(self, source_mgmt):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = MagicMock()
+            result = await source_mgmt.handle_action(
+                "create",
+                {
+                    "source_data": {"name": "probe", "type": "NOT_A_VALID_TYPE"},
+                    "dry_run": True,
+                },
+            )
+        text = result[0].text
+        assert "Validation Successful" not in text
+        assert "NOT_A_VALID_TYPE" in text
+        assert "API" in text and "STREAM" in text and "AI" in text
+
+    @pytest.mark.asyncio
+    async def test_live_create_rejects_invalid_type_before_api(self, source_mgmt):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            client = MagicMock()
+            client.create_source = AsyncMock()
+            mock_gc.return_value = client
+            result = await source_mgmt.handle_action(
+                "create",
+                {"source_data": {"name": "probe", "type": "NOT_A_VALID_TYPE"}},
+            )
+        text = result[0].text
+        assert "NOT_A_VALID_TYPE" in text
+        client.create_source.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_accepts_valid_type(self, source_mgmt):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = MagicMock()
+            result = await source_mgmt.handle_action(
+                "create",
+                {
+                    "source_data": {
+                        "name": "probe",
+                        "type": "AI",
+                        "description": "d",
+                        "version": "1.0.0",
+                    },
+                    "dry_run": True,
+                },
+            )
+        assert "DRY RUN" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_dry_run_preview_shows_normalized_type(self, source_mgmt):
+        """Lowercase input is normalized in place so the preview shows exactly
+        what the live path sends."""
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = MagicMock()
+            result = await source_mgmt.handle_action(
+                "create",
+                {
+                    "source_data": {
+                        "name": "probe",
+                        "type": "api",
+                        "description": "d",
+                        "version": "1.0.0",
+                    },
+                    "dry_run": True,
+                },
+            )
+        text = result[0].text
+        assert "**Type:** API" in text

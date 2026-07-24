@@ -817,6 +817,23 @@ class TestFieldMappingAnalyzer:
         assert sub["credential_present"] == 1
         assert sub["credential_name_present"] == 1
 
+    @pytest.mark.asyncio
+    async def test_analyze_transaction_fields_null_credential_not_counted(self):
+        """Preview docs retype subscriberCredential as nullable; a null value
+        must not count as credential presence."""
+        transactions = [
+            {
+                "subscriberEmail": "a@b.com",
+                "subscriberId": "sub1",
+                "subscriberCredential": None,
+            },
+        ]
+        result = await self.analyzer._analyze_transaction_fields(transactions)
+        sub = result["subscriber_analysis"]
+        assert sub["total_with_subscriber"] == 1
+        assert sub["credential_present"] == 0
+        assert sub["credential_name_present"] == 0
+
     # -- _analyze_data_integrity (async) --
 
     @pytest.mark.asyncio

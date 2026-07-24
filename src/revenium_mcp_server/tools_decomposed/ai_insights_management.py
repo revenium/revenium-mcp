@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
 
+from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
@@ -82,8 +83,10 @@ class AIInsightsManagement(ToolBase):
                     suggestions=await self._get_supported_actions(),
                 )
         except ToolError as e:
-            return self._format_tool_error(e)
+            logger.error(f"Tool error in manage_ai_insights: {e}")
+            raise e
         except ReveniumAPIError as e:
+            logger.error(f"Revenium API error in manage_ai_insights: {e}")
             return self._format_api_error(e)
 
     async def _handle_list_investigators(
@@ -118,7 +121,19 @@ class AIInsightsManagement(ToolBase):
                 value=value,
                 suggestions=[f"Pass an integer between 1 and {self.HARD_CAP_MAX_RESULTS}"],
             )
-        return min(value, self.HARD_CAP_MAX_RESULTS)
+        if value > self.HARD_CAP_MAX_RESULTS:
+            raise create_structured_validation_error(
+                message=(
+                    f"max_results must be <= {self.HARD_CAP_MAX_RESULTS}, got {value}"
+                ),
+                field="max_results",
+                value=value,
+                suggestions=[
+                    f"Pass an integer between 1 and {self.HARD_CAP_MAX_RESULTS}",
+                    "Paginate with repeated calls if you need more results",
+                ],
+            )
+        return value
 
     async def _autopaginate(
         self,
@@ -444,27 +459,24 @@ class AIInsightsManagement(ToolBase):
             "required": ["action"],
         }
 
-    def _format_tool_error(
-        self, error: ToolError,
-    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        return self.formatter.format_error_response(
-            message=error.message,
-            error_code=error.error_code,
-            field_errors={error.field: str(error.value)} if error.field else None,
-            suggestions=error.suggestions,
-            examples=error.examples,
-            context=error.context,
-        )
-
     def _format_api_error(
         self, error: ReveniumAPIError,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Map ReveniumAPIError (with optional RFC 7807 code) to a structured tool error."""
+        """Translate the handful of known RFC 7807 codes into friendly guidance.
+
+        Only codes with a bespoke, actionable render are handled here (the
+        not-found / disabled / backend-unavailable translations). Every other
+        error — including auth failures — is re-raised so FastMCP marks the
+        response envelope isError:true instead of hiding the failure in
+        success-shaped content text.
+        """
         code = getattr(error, "code", None)
         raw_message = str(getattr(error, "message", None) or error)
 
         if code == "AI_RECOMMENDATIONS_DISABLED":
-            return self.formatter.format_error_response(
+            # An authorization state, not an informational one: raise so the
+            # envelope carries isError:true while keeping the friendly guidance.
+            raise ToolError(
                 message="AI recommendations is not enabled for this team.",
                 error_code=ErrorCodes.API_AUTHORIZATION,
                 suggestions=[
@@ -487,8 +499,7 @@ class AIInsightsManagement(ToolBase):
                     "Confirm the run_id / recommendation_id from list_runs or trigger_run",
                 ],
             )
-        # Unknown code (or no code) → generic API error.
-        return self.formatter.format_error_response(
-            message=raw_message,
-            error_code=ErrorCodes.API_ERROR,
-        )
+        # Unknown code (or no code, e.g. auth failures) has no bespoke render;
+        # re-raise so FastMCP surfaces it with isError:true rather than burying
+        # it in success-shaped content text.
+        raise error

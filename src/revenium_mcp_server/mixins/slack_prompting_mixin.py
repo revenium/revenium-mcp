@@ -7,9 +7,8 @@ into existing tools to enhance user experience with proactive Slack notification
 """
 
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
-from ..client import ReveniumClient
 from ..config_store import get_config_value
 
 
@@ -23,6 +22,17 @@ class SlackPromptingMixin:
     - Handling configuration selection
     - Fallback to setup assistant when needed
     """
+
+    if TYPE_CHECKING:
+        # Provided by ToolBase when this mixin is combined into a tool class
+        # (e.g. AlertManagement(ToolBase, SlackPromptingMixin)). Declared here
+        # so the type checker knows self.get_client() exists on the mixin.
+        from ..auth.tenant_context import TenantContext
+        from ..client import ReveniumClient
+
+        async def get_client(
+            self, ctx: "Optional[TenantContext]" = None
+        ) -> "ReveniumClient": ...
 
     def should_prompt_for_slack(self, notification_config: Dict[str, Any]) -> bool:
         """Determine if Slack prompting is appropriate.
@@ -64,7 +74,7 @@ class SlackPromptingMixin:
         """
         try:
             # Get current Slack configuration status
-            async with ReveniumClient() as client:
+            async with await self.get_client() as client:
                 response = await client.get_slack_configurations(page=0, size=1)
                 total_configs = response.get("totalElements", 0)
 
@@ -127,6 +137,8 @@ class SlackPromptingMixin:
 
             return prompt_data
 
+        except PermissionError:
+            raise
         except Exception as e:
             # If prompting fails, don't block the main workflow
             return {
@@ -223,7 +235,7 @@ class SlackPromptingMixin:
         """
         try:
             # Get available configurations
-            async with ReveniumClient() as client:
+            async with await self.get_client() as client:
                 response = await client.get_slack_configurations(page=0, size=20)
                 configurations = response.get("content", [])
 
@@ -267,6 +279,9 @@ class SlackPromptingMixin:
 
             return None, selection_message
 
+        except PermissionError:
+            # Auth failures must fail closed — do not swallow.
+            raise
         except Exception as e:
             return None, f"❌ Error handling configuration selection: {str(e)}"
 
@@ -292,7 +307,7 @@ class SlackPromptingMixin:
                 return notification_config
 
             # Verify the configuration exists
-            async with ReveniumClient() as client:
+            async with await self.get_client() as client:
                 await client.get_slack_configuration_by_id(slack_config_id)
 
             # Add Slack configuration to the notification config
@@ -306,6 +321,9 @@ class SlackPromptingMixin:
 
             return updated_config
 
+        except PermissionError:
+            # Auth failures must fail closed — do not swallow.
+            raise
         except Exception:
             # If adding Slack fails, return original config
             return notification_config

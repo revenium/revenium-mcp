@@ -8,6 +8,8 @@ a `did you mean` suggestion when the field is unrecognized.
 """
 from __future__ import annotations
 
+from typing import Optional, Union
+
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
@@ -327,6 +329,98 @@ class TestFrameworkLeakGuardMiddlewareIntegration:
             "caller-side parameter-mismatch error"
         )
 
+    @staticmethod
+    def _make_ctx(tool_name: str = "manage_products"):
+        """Minimal MiddlewareContext stand-in for direct on_call_tool tests."""
+
+        class _Msg:
+            name = tool_name
+
+        class _Ctx:
+            message = _Msg()
+            fastmcp_context = None
+
+        return _Ctx()
+
+    @pytest.mark.asyncio
+    async def test_middleware_translates_fastmcp_wrapped_validation_error(self):
+        """fastmcp >= 3.4 (#4128) wraps the binding-layer pydantic error in
+        fastmcp's own ValidationError with the pydantic original as __cause__.
+        The guard must translate via the cause. Simulated directly so this
+        contract is exercised on every fastmcp version in the matrix."""
+        from fastmcp.exceptions import ToolError
+        from fastmcp.exceptions import ValidationError as FastMCPValidationError
+        from src.revenium_mcp_server.middleware.framework_leak_guard import (
+            FrameworkLeakGuardMiddleware,
+        )
+
+        pydantic_exc = _validation_error(_sample_tool, {"id": "abc"})
+
+        async def call_next(_context):
+            try:
+                raise pydantic_exc
+            except ValidationError:
+                raise FastMCPValidationError(str(pydantic_exc)) from pydantic_exc
+
+        mw = FrameworkLeakGuardMiddleware()
+        with pytest.raises(ToolError) as exc_info:
+            await mw.on_call_tool(self._make_ctx(), call_next)
+
+        text = str(exc_info.value)
+        assert "manage_products" in text
+        assert "'id'" in text
+        assert_no_framework_leak(text)
+
+    @pytest.mark.asyncio
+    async def test_middleware_reraises_wrapped_error_without_pydantic_cause(self):
+        """A fastmcp ValidationError with no pydantic cause (not a binding
+        failure) must propagate untouched."""
+        from fastmcp.exceptions import ValidationError as FastMCPValidationError
+        from src.revenium_mcp_server.middleware.framework_leak_guard import (
+            FrameworkLeakGuardMiddleware,
+        )
+
+        async def call_next(_context):
+            raise FastMCPValidationError("tool-internal validation failure")
+
+        mw = FrameworkLeakGuardMiddleware()
+        with pytest.raises(FastMCPValidationError):
+            await mw.on_call_tool(self._make_ctx(), call_next)
+
+    @pytest.mark.asyncio
+    async def test_middleware_reraises_wrapped_non_binding_pydantic_error(self):
+        """A fastmcp ValidationError whose pydantic cause is NOT a binding
+        error (title != call[<tool>], e.g. a tool-body BaseModel failure that
+        fastmcp wrapped) must propagate untouched — the wrapped-path analogue
+        of the BACK-1312 title-gate rule."""
+        from pydantic import BaseModel
+        from fastmcp.exceptions import ValidationError as FastMCPValidationError
+        from src.revenium_mcp_server.middleware.framework_leak_guard import (
+            FrameworkLeakGuardMiddleware,
+        )
+
+        class _InternalModel(BaseModel):
+            internal_field: int
+
+        try:
+            _InternalModel(internal_field="not_an_int")
+            raise AssertionError("expected ValidationError")
+        except ValidationError as exc:
+            internal_exc = exc
+
+        async def call_next(_context):
+            try:
+                raise internal_exc
+            except ValidationError:
+                raise FastMCPValidationError(str(internal_exc)) from internal_exc
+
+        mw = FrameworkLeakGuardMiddleware()
+        with pytest.raises(FastMCPValidationError) as exc_info:
+            await mw.on_call_tool(self._make_ctx(), call_next)
+
+        # Not rewritten as a caller-side parameter-mismatch error.
+        assert "is not a recognized parameter" not in str(exc_info.value)
+
     @pytest.mark.asyncio
     async def test_real_server_has_middleware_registered(self):
         """create_enhanced_server must register the middleware. End-to-end smoke."""
@@ -351,3 +445,25 @@ class TestFrameworkLeakGuardMiddlewareIntegration:
         assert_no_framework_leak(text)
         assert "_probe_widget" in text
         assert "widget_id" in text
+
+
+class TestUnionFieldMessages:
+    """A Union[int, str] field produces one pydantic error per branch — the
+    translated output must be ONE coherent message, not stacked contradictory
+    'must be an integer' + 'must be a string' paragraphs."""
+
+    def test_union_int_str_field_yields_single_message(self):
+        from src.revenium_mcp_server.middleware.framework_leak_guard import (
+            translate_pydantic_error,
+        )
+        def _union_tool(input_tokens: Optional[Union[int, str]] = None):
+            return None
+
+        exc = _validation_error(_union_tool, {"input_tokens": 3.7})
+        msg = translate_pydantic_error(
+            exc, tool_name="manage_metering", accepted_params=["input_tokens"]
+        )
+        assert msg.count("'input_tokens'") == 1, f"stacked messages: {msg!r}"
+        assert "integer" in msg
+        assert "3.7" in msg
+        assert_no_framework_leak(msg)

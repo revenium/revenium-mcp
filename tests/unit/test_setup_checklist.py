@@ -263,3 +263,134 @@ class TestSlackSetupStatus:
             status = await checklist_tool._check_slack_setup_status()
         assert status["configured"] is False
         assert status["status"] == "error"
+
+
+class TestDataIngestionStatus:
+    """check_system_status names which ingestion pathways have data."""
+
+    @pytest.mark.asyncio
+    async def test_system_status_names_connected_pathways(self, checklist_tool):
+        from unittest.mock import AsyncMock
+
+        mock_client = MagicMock()
+        mock_client.get_data_connected_sources = AsyncMock(
+            return_value={
+                "providerBilling": {"connected": False, "lastReceived": None},
+                "sdkMetering": {"connected": True, "lastReceived": "2026-07-17T16:48:29Z"},
+                "codingAssistant": {"connected": False, "lastReceived": None},
+                "traces": {"connected": True, "lastReceived": "2026-07-06T12:20:37Z"},
+            }
+        )
+        checklist_tool.get_client = AsyncMock(return_value=mock_client)
+
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=_mock_validation_result(),
+        ):
+            result = await checklist_tool.handle_action("check_system_status", {})
+
+        text = result[0].text
+        assert "Data Ingestion" in text
+        assert "Provider billing" in text
+        assert "SDK/API metering" in text
+        assert "Coding-assistant telemetry" in text
+        assert "Distributed traces" in text
+        assert "2026-07-17T16:48:29Z" in text
+
+    @pytest.mark.asyncio
+    async def test_ingestion_section_degrades_when_endpoint_unavailable(self, checklist_tool):
+        """No client / endpoint failure must not break the status report."""
+        from unittest.mock import AsyncMock
+
+        checklist_tool.get_client = AsyncMock(side_effect=Exception("no credentials"))
+
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=_mock_validation_result(),
+        ):
+            result = await checklist_tool.handle_action("check_system_status", {})
+
+        text = result[0].text
+        assert "Data Ingestion" in text
+        assert "unavailable" in text.lower()
+        # The rest of the report still renders
+        assert "API Connectivity" in text
+
+
+class TestDataIngestionHardening:
+    """Review hardening: timeout, generic error reason, malformed payloads."""
+
+    @pytest.mark.asyncio
+    async def test_error_reason_is_generic_not_exception_text(self, checklist_tool):
+        """Raw exception text (auth/request details) stays in logs, not output."""
+        from unittest.mock import AsyncMock
+
+        checklist_tool.get_client = AsyncMock(
+            side_effect=Exception("x-api-key hak_secret123 rejected by upstream")
+        )
+
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=_mock_validation_result(),
+        ):
+            result = await checklist_tool.handle_action("check_system_status", {})
+
+        text = result[0].text
+        assert "unavailable" in text.lower()
+        assert "hak_secret123" not in text
+
+    @pytest.mark.asyncio
+    async def test_malformed_pathway_value_does_not_crash_report(self, checklist_tool):
+        """A non-dict pathway value renders as unknown; the report survives."""
+        from unittest.mock import AsyncMock
+
+        mock_client = MagicMock()
+        mock_client.get_data_connected_sources = AsyncMock(
+            return_value={
+                "providerBilling": True,
+                "sdkMetering": {"connected": True, "lastReceived": "2026-07-17T16:48:29Z"},
+                "codingAssistant": "yes",
+                "traces": None,
+            }
+        )
+        checklist_tool.get_client = AsyncMock(return_value=mock_client)
+
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=_mock_validation_result(),
+        ):
+            result = await checklist_tool.handle_action("check_system_status", {})
+
+        text = result[0].text
+        assert "Overall System Health" in text
+        assert "SDK/API metering" in text and "2026-07-17T16:48:29Z" in text
+        assert "unexpected format" in text.lower()
+        assert "Tool error" not in text and "Failed to execute" not in text
+
+    @pytest.mark.asyncio
+    async def test_fetch_bounded_by_timeout(self, checklist_tool, monkeypatch):
+        """A hanging endpoint cannot stall the whole status report."""
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        async def hang():
+            await asyncio.sleep(30)
+
+        mock_client = MagicMock()
+        mock_client.get_data_connected_sources = AsyncMock(side_effect=hang)
+        checklist_tool.get_client = AsyncMock(return_value=mock_client)
+        monkeypatch.setattr(
+            type(checklist_tool), "_INGESTION_FETCH_TIMEOUT_SECONDS", 0.05
+        )
+
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=_mock_validation_result(),
+        ):
+            result = await asyncio.wait_for(
+                checklist_tool.handle_action("check_system_status", {}), timeout=5
+            )
+
+        text = result[0].text
+        assert "Data Ingestion" in text
+        assert "unavailable" in text.lower()

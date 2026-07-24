@@ -38,6 +38,10 @@ from ..introspection.metadata import (
 from .unified_tool_base import ToolBase
 
 
+# The only source types the backend accepts (mirrored in get_capabilities).
+VALID_SOURCE_TYPES = ("API", "STREAM", "AI")
+
+
 class SourceManager:
     """Internal manager for source CRUD operations."""
 
@@ -326,7 +330,7 @@ class SourceValidator:
         }
 
         return {
-            "source_types": ["API", "STREAM", "AI"],  # VERIFIED: Only these work in actual API
+            "source_types": list(VALID_SOURCE_TYPES),  # VERIFIED: Only these work in actual API
             # Note: source_statuses removed - API doesn't support status field
             "schema": centralized_schema,
             "user_experience_notes": {
@@ -927,6 +931,25 @@ class SourceManagement(ToolBase):
                             )
                         ]
 
+                # Shared dry-run/live guard: the backend only accepts these
+                # source types; dry-run must reject exactly what live rejects.
+                declared_type = source_data.get("type")
+                if isinstance(declared_type, str):
+                    # Normalize here so the dry-run preview shows exactly what
+                    # the live path sends (create_source uppercases too).
+                    source_data["type"] = declared_type.upper()
+                if isinstance(declared_type, str) and declared_type.upper() not in VALID_SOURCE_TYPES:
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"**Validation Failed**: '{declared_type}' is not a valid "
+                                f"source type.\n\n**Valid types:** {', '.join(VALID_SOURCE_TYPES)}\n\n"
+                                f"{'**Dry Run:** True (no creation attempted)' if dry_run else 'No creation attempted.'}"
+                            ),
+                        )
+                    ]
+
                 # Handle dry_run mode for create operations
                 if dry_run:
                     mode_text = "AUTO-GENERATION" if auto_generate else "EXPLICIT CONFIGURATION"
@@ -1438,6 +1461,15 @@ class SourceManagement(ToolBase):
                 "title": "List Active Sources",
                 "description": "View all configured data sources with status",
                 "example": "list(filters={'status': 'active'}, page=0, size=10)",
+            },
+            {
+                "title": "Search Sources",
+                "description": (
+                    "Server-side search: matches sources whose name contains the term, "
+                    "whose externalId equals it, or whose owning organization's name "
+                    "contains it (case-insensitive)"
+                ),
+                "example": "list(filters={'query': 'payments'}, page=0, size=10)",
             },
             {
                 "title": "Update Source Configuration",

@@ -355,3 +355,114 @@ class TestDomainValidators:
         """Standard cost validators propagate period validation errors."""
         with pytest.raises(ValidationError):
             getattr(validator, method)({"period": "BAD_PERIOD", "aggregation": "TOTAL"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Agent costs costSources filter (BACK-2348)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestValidateAgentCostsFilters:
+    """Tests for the costSources filter on validate_agent_costs_params.
+
+    The cost-by-agent endpoint only accepts the real-spend cost sources
+    (revenium_metered, provider_billing) — unlike cost-by-user, which also
+    accepts coding_assistant.
+    """
+
+    @pytest.fixture
+    def validator(self):
+        return AnalyticsValidator()
+
+    def test_cost_sources_list_accepted(self, validator):
+        """A valid costSources list is returned under filters."""
+        result = validator.validate_agent_costs_params(
+            {"period": "SEVEN_DAYS", "filters": {"costSources": ["provider_billing"]}}
+        )
+        assert result["filters"] == {"costSources": ["provider_billing"]}
+
+    def test_cost_sources_string_normalized_to_list(self, validator):
+        """A bare string value is normalized to a single-element list."""
+        result = validator.validate_agent_costs_params(
+            {"period": "SEVEN_DAYS", "filters": {"costSources": "revenium_metered"}}
+        )
+        assert result["filters"]["costSources"] == ["revenium_metered"]
+
+    def test_both_real_spend_values_accepted(self, validator):
+        """Both real-spend enum values pass together."""
+        result = validator.validate_agent_costs_params(
+            {
+                "period": "SEVEN_DAYS",
+                "filters": {"costSources": ["revenium_metered", "provider_billing"]},
+            }
+        )
+        assert result["filters"]["costSources"] == ["revenium_metered", "provider_billing"]
+
+    def test_coding_assistant_rejected(self, validator):
+        """coding_assistant is valid for user costs but not for agent costs."""
+        with pytest.raises(ValidationError) as exc_info:
+            validator.validate_agent_costs_params(
+                {"period": "SEVEN_DAYS", "filters": {"costSources": ["coding_assistant"]}}
+            )
+        assert "coding_assistant" in exc_info.value.message
+        assert any("provider_billing" in s for s in exc_info.value.suggestions)
+
+    def test_unknown_filter_key_rejected(self, validator):
+        """Filter keys other than costSources are rejected for agent costs."""
+        with pytest.raises(ValidationError) as exc_info:
+            validator.validate_agent_costs_params(
+                {"period": "SEVEN_DAYS", "filters": {"agents": ["support-bot"]}}
+            )
+        assert any("costSources" in s for s in exc_info.value.suggestions)
+
+    def test_omitted_filters_leaves_validated_without_filters_key(self, validator):
+        """No filters argument means no filters key in the validated params."""
+        result = validator.validate_agent_costs_params({"period": "SEVEN_DAYS"})
+        assert "filters" not in result
+
+
+class TestFilterValidationHardening:
+    """Shared _validate_array_filters edge cases raised in PR review."""
+
+    @pytest.fixture
+    def validator(self):
+        return AnalyticsValidator()
+
+    def test_provider_billing_accepted_for_user_costs(self, validator):
+        """cost-by-user accepts all three cost sources on prod and dev."""
+        result = validator.validate_user_costs_params(
+            {"period": "SEVEN_DAYS", "filters": {"costSources": ["provider_billing"]}}
+        )
+        assert result["filters"]["costSources"] == ["provider_billing"]
+
+    def test_empty_cost_sources_list_rejected_for_agent_costs(self, validator):
+        """An empty list would silently drop the filter from the request."""
+        with pytest.raises(ValidationError) as exc_info:
+            validator.validate_agent_costs_params(
+                {"period": "SEVEN_DAYS", "filters": {"costSources": []}}
+            )
+        assert exc_info.value.field == "filters.costSources"
+
+    def test_empty_filter_list_rejected_for_user_costs(self, validator):
+        """Empty lists are rejected for every array filter key."""
+        with pytest.raises(ValidationError) as exc_info:
+            validator.validate_user_costs_params(
+                {"period": "SEVEN_DAYS", "filters": {"agents": []}}
+            )
+        assert exc_info.value.field == "filters.agents"
+
+    def test_non_dict_filters_rejected_for_agent_costs(self, validator):
+        """A JSON string instead of an object raises ValidationError, not AttributeError."""
+        with pytest.raises(ValidationError) as exc_info:
+            validator.validate_agent_costs_params(
+                {"period": "SEVEN_DAYS", "filters": "revenium_metered"}
+            )
+        assert exc_info.value.field == "filters"
+
+    def test_non_dict_filters_rejected_for_user_costs(self, validator):
+        """Same guard applies to the user-costs validator."""
+        with pytest.raises(ValidationError) as exc_info:
+            validator.validate_user_costs_params(
+                {"period": "SEVEN_DAYS", "filters": ["revenium_metered"]}
+            )
+        assert exc_info.value.field == "filters"

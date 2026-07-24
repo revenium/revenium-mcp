@@ -19,6 +19,7 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 from ..agent_friendly import UnifiedResponseFormatter
 from ..analytics.enhanced_spike_analyzer import EnhancedSpikeAnalyzer
 from ..analytics.simple_analytics_engine import SimpleAnalyticsEngine
+from ..analytics.simple_cost_analyzer import SimpleCostAnalyzer
 from ..analytics.validation import ValidationError
 from ..auth import AuthenticationError
 from ..client import ReveniumAPIError
@@ -57,7 +58,7 @@ class BusinessAnalyticsManagement(ToolBase):
 
     tool_name: ClassVar[str] = "business_analytics_management"
     tool_description: ClassVar[str] = (
-        "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_user_costs, get_tool_costs, get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_examples() for parameter guidance and get_capabilities() for status."
+        "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_user_costs, get_tool_costs, get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider, get_transaction_count, get_filter_options, get_unpaid_invoice_totals, list_invoices, list_refunds, list_period_charges, get_task_costs, get_task_completion, get_task_performance, get_profit_margins, get_top_movers, get_token_breakdown, get_team_costs, get_vendor_costs, get_token_vs_tool_cost, get_trace_cost_distribution, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_filter_options(dimension=...) to discover valid filter values. Use get_examples() for parameter guidance and get_capabilities() for status."
     )
     business_category: ClassVar[str] = "Metering and Analytics Tools"
     tool_type: ClassVar[ToolType] = ToolType.ANALYTICS
@@ -203,6 +204,38 @@ class BusinessAnalyticsManagement(ToolBase):
             elif action == "get_tool_costs_by_provider":
                 return await self._handle_get_tool_costs_by_provider(arguments, ctx=ctx)
 
+            elif action == "get_transaction_count":
+                return await self._handle_get_transaction_count(arguments, ctx=ctx)
+            elif action == "get_filter_options":
+                return await self._handle_get_filter_options(arguments, ctx=ctx)
+            elif action == "get_unpaid_invoice_totals":
+                return await self._handle_get_unpaid_invoice_totals(arguments, ctx=ctx)
+            elif action == "get_task_costs":
+                return await self._handle_get_task_costs(arguments, ctx=ctx)
+            elif action == "get_task_completion":
+                return await self._handle_get_task_completion(arguments, ctx=ctx)
+            elif action == "get_task_performance":
+                return await self._handle_get_task_performance(arguments, ctx=ctx)
+            elif action == "get_profit_margins":
+                return await self._handle_get_profit_margins(arguments, ctx=ctx)
+            elif action == "get_top_movers":
+                return await self._handle_get_top_movers(arguments, ctx=ctx)
+            elif action == "get_token_breakdown":
+                return await self._handle_get_token_breakdown(arguments, ctx=ctx)
+            elif action == "get_team_costs":
+                return await self._handle_get_team_costs(arguments, ctx=ctx)
+            elif action == "get_vendor_costs":
+                return await self._handle_get_vendor_costs(arguments, ctx=ctx)
+            elif action == "get_token_vs_tool_cost":
+                return await self._handle_get_token_vs_tool_cost(arguments, ctx=ctx)
+            elif action == "get_trace_cost_distribution":
+                return await self._handle_get_trace_cost_distribution(arguments, ctx=ctx)
+            elif action == "list_invoices":
+                return await self._handle_list_invoices(arguments, ctx=ctx)
+            elif action == "list_refunds":
+                return await self._handle_list_refunds(arguments, ctx=ctx)
+            elif action == "list_period_charges":
+                return await self._handle_list_period_charges(arguments, ctx=ctx)
             elif action == "get_cost_summary":
                 return await self._handle_get_cost_summary(arguments, ctx=ctx)
             elif action == "analyze_cost_anomalies":
@@ -321,17 +354,75 @@ If you're seeing this error, please report it as it indicates a reliability issu
 
 5. **get_agent_costs**
    - Analyze costs by agent/application
+   - Optional filters.costSources: revenium_metered, provider_billing
 
 6. **get_user_costs**
    - Analyze costs by user email (subscriber)
    - Returns cost, request count, and token usage per user
    - Data from coding assistant traces (Cursor, Claude Code, Gemini CLI)
 
+6a. **get_transaction_count**
+   - Total transaction volume for your team over a period (real count, not derived from cost)
+   - Single aggregate number; same universe as the cost endpoints (coding-assistant transactions excluded)
+
+6b. **get_unpaid_invoice_totals**
+   - Count and total outstanding amount of unpaid invoices (server-side aggregate)
+   - UNPAID invoices count in full; PARTIALLY_PAID contribute their remaining balance
+
+6c. **list_invoices / list_refunds / list_period_charges**
+   - Read-only billing listings; numeric-honest amounts (missing → 'n/a', never a fabricated 0)
+   - list_invoices / list_refunds: page-numbered; list_period_charges: cursor/keyset (no page param)
+
 7. **get_cost_summary**
    - Generate a summary report of recent AI spending (includes all dimensions)
 
+7a. **get_tool_costs**
+   - Cost breakdown by tool over time
+
+7b. **get_top_tools**
+   - Top tools ranked by cost
+
+7c. **get_tool_costs_by_agent**
+   - Tool cost breakdown segmented by agent
+
+7d. **get_tool_costs_by_provider**
+   - Tool cost breakdown segmented by provider
+
+7e. **get_agent_summary**
+   - Agent-friendly overview of this tool's surface
+
 8. **analyze_cost_anomalies** (Phase 1)
    - Enhanced statistical anomaly detection using z-score analysis
+
+8a. **get_task_costs**
+   - Cost breakdown by task type (timeseries or aggregated via aggregation)
+
+8b. **get_task_completion**
+   - Task completion over time (optional agents filter)
+
+8c. **get_task_performance**
+   - Task performance by agent
+
+8d. **get_profit_margins**
+   - Profit margin per customer or product (dimension argument)
+
+8e. **get_top_movers**
+   - Biggest spend movers with trend (optional group_by)
+
+8f. **get_token_breakdown**
+   - Token usage by type (optional providers filter)
+
+8g. **get_team_costs**
+   - Cost by team over time
+
+8h. **get_vendor_costs**
+   - Cost by vendor
+
+8i. **get_token_vs_tool_cost**
+   - Token spend vs tool spend over time
+
+8j. **get_trace_cost_distribution**
+   - Per-trace cost scatter (transaction, agent, cost, calls, tools)
 
 9. **get_capabilities**
    - Shows current implementation status
@@ -506,6 +597,204 @@ If you're seeing this error, please report it as it indicates a reliability issu
 **Parameters**:
 - `period` (required): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - `group` (optional): TOTAL, MEAN, MAXIMUM, MINIMUM (defaults to TOTAL)
+- `filters` (optional): `{"costSources": [...]}` restricts results to specific cost sources.
+  Valid values: `revenium_metered` (costs metered by Revenium), `provider_billing`
+  (costs imported from provider billing). Omit to include the platform default cost picture.
+  Requires the new analytics API.
+
+```json
+// Agent costs from provider billing imports only
+{
+  "action": "get_agent_costs",
+  "period": "THIRTY_DAYS",
+  "filters": {"costSources": ["provider_billing"]}
+}
+```
+
+### get_transaction_count
+```json
+{
+  "action": "get_transaction_count",
+  "period": "SEVEN_DAYS"
+}
+```
+**Purpose**: Total transaction volume for your team over a period — a single real aggregate count (not derived from cost)
+**Parameters**:
+- `period` (optional, defaults to SEVEN_DAYS): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+
+### get_filter_options
+```json
+{
+  "action": "get_filter_options",
+  "dimension": "models",
+  "period": "THIRTY_DAYS"
+}
+```
+**Purpose**: Enumerate the valid filter values for a dimension (agents, models, providers, ...) so you use real names in the cost endpoints' `filters` arguments instead of guessing
+**Parameters**:
+- `dimension` (required): agents, api-keys, customers, models, organizations, products, providers, teams, tool-providers, tools, users, vendors
+- `period` (optional, defaults to THIRTY_DAYS): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+
+### get_unpaid_invoice_totals
+```json
+{
+  "action": "get_unpaid_invoice_totals"
+}
+```
+**Purpose**: Count and total outstanding amount of unpaid invoices for your team (UNPAID in full, PARTIALLY_PAID by remaining balance), aggregated server-side
+**Parameters**: none — the team comes from your credentials
+
+### get_task_costs
+```json
+{
+  "action": "get_task_costs",
+  "period": "SEVEN_DAYS"
+}
+```
+**Purpose**: Cost broken down by task type over time (new analytics API)
+**Parameters**:
+- `period` (optional, defaults to SEVEN_DAYS)
+- `aggregation` (optional): `aggregated` for totals per task instead of a timeseries
+
+### get_task_completion
+```json
+{
+  "action": "get_task_completion",
+  "period": "SEVEN_DAYS",
+  "agents": ["agent-1"]
+}
+```
+**Purpose**: Task completion counts over time, optionally filtered by agents
+**Parameters**:
+- `period` (optional, defaults to SEVEN_DAYS)
+- `aggregation` (optional): `aggregated` for totals
+- `agents` (optional): list of agent ids to filter to
+
+### get_task_performance
+```json
+{
+  "action": "get_task_performance",
+  "period": "THIRTY_DAYS"
+}
+```
+**Purpose**: Per-agent task performance (aggregated). An empty result is a normal outcome
+**Parameters**:
+- `period` (optional, defaults to SEVEN_DAYS)
+
+### get_profit_margins
+```json
+{
+  "action": "get_profit_margins",
+  "period": "THIRTY_DAYS",
+  "dimension": "customer"
+}
+```
+**Purpose**: Profit margin per customer (default) or per product
+**Parameters**:
+- `period` (optional, defaults to SEVEN_DAYS)
+- `dimension` (optional): `customer` (default) or `product`
+
+### get_top_movers
+```json
+{
+  "action": "get_top_movers",
+  "period": "THIRTY_DAYS",
+  "group_by": "model"
+}
+```
+**Purpose**: Biggest spend movers with current vs previous value and trend direction
+**Parameters**:
+- `period` (optional, defaults to SEVEN_DAYS)
+- `group_by` (optional): dimension to group movers by (e.g. `model`, `agent`)
+
+### get_token_breakdown
+```json
+{
+  "action": "get_token_breakdown",
+  "period": "SEVEN_DAYS",
+  "providers": ["openai"]
+}
+```
+**Purpose**: Token usage broken down by token type over time
+**Parameters**:
+- `period` (optional, defaults to SEVEN_DAYS)
+- `providers` (optional): list of providers to restrict the breakdown to
+
+### get_team_costs
+```json
+{
+  "action": "get_team_costs",
+  "period": "THIRTY_DAYS"
+}
+```
+**Purpose**: Cost by team over time (new analytics API)
+**Parameters**:
+- `period` (optional, defaults to SEVEN_DAYS)
+
+### get_vendor_costs
+```json
+{
+  "action": "get_vendor_costs",
+  "period": "SEVEN_DAYS"
+}
+```
+**Purpose**: Cost by vendor (aggregated totals)
+**Parameters**:
+- `period` (optional, defaults to SEVEN_DAYS)
+
+### get_token_vs_tool_cost
+```json
+{
+  "action": "get_token_vs_tool_cost",
+  "period": "THIRTY_DAYS"
+}
+```
+**Purpose**: Token cost vs tool cost over time
+**Parameters**:
+- `period` (optional, defaults to SEVEN_DAYS)
+
+### get_trace_cost_distribution
+```json
+{
+  "action": "get_trace_cost_distribution",
+  "period": "SEVEN_DAYS"
+}
+```
+**Purpose**: Per-trace cost scatter distribution (transaction id, agent, cost, calls, tools)
+**Parameters**:
+- `period` (optional, defaults to SEVEN_DAYS)
+### list_invoices
+```json
+{
+  "action": "list_invoices",
+  "page": 0,
+  "size": 20,
+  "states": ["FINALIZED"]
+}
+```
+**Purpose**: List invoices with a compact per-entry line (number, state, pay status, total amount + currency code, period). Amounts are numeric-honest: a missing/non-numeric total renders `n/a`, never a fabricated `0`.
+**Parameters** (all optional): `page`, `size`, `invoice_number`, `start_date`, `end_date`, `pay_states`, `states`, `starting_amount`, `ending_amount`
+
+### list_refunds
+```json
+{
+  "action": "list_refunds",
+  "query": "acme"
+}
+```
+**Purpose**: List refunds (empty on most tenants). Same rendering discipline as list_invoices.
+**Parameters** (all optional): `page`, `size`, `query`, `start_date`, `end_date`, `minimum`, `maximum`
+
+### list_period_charges
+```json
+{
+  "action": "list_period_charges",
+  "size": 20,
+  "invoice_id": "inv_1"
+}
+```
+**Purpose**: List period charges. Uses cursor/keyset pagination — there is NO page parameter. When more results exist the response ends with a line telling you the `cursor` value to pass next.
+**Parameters** (all optional): `size`, `invoice_id`, `start_date`, `end_date`, `cursor`
 
 ### get_cost_summary
 ```json
@@ -653,6 +942,774 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_examples()` to see working examples
 """
             return [TextContent(type="text", text=error_response)]
+
+    async def _handle_get_transaction_count(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_transaction_count request via the aggregate count endpoint."""
+        try:
+            logger.info("Processing get_transaction_count request")
+
+            client = await self.get_client(ctx=ctx)
+            engine = SimpleAnalyticsEngine(client)
+
+            response = await engine.get_transaction_count(**arguments)
+
+            logger.info("Transaction count analysis completed successfully")
+            return [TextContent(type="text", text=response)]
+
+        except ValidationError as e:
+            logger.warning(f"Validation error in get_transaction_count: {e.message}")
+            error_response = f"""**Transaction Volume Validation Error**
+
+**Error**: {e.message}
+
+**Suggestions:**
+"""
+            for suggestion in e.suggestions:
+                error_response += f"- {suggestion}\n"
+
+            error_response += """
+**For Help:**
+- Use `get_capabilities()` to see supported parameters
+- Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+"""
+            return [TextContent(type="text", text=error_response)]
+
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_transaction_count: {e}")
+            error_details = self._format_api_error_details(e)
+            error_response = f"""**Transaction Volume Analysis Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- Verify your parameters: period (optional, defaults to SEVEN_DAYS)
+- Try a different time period if no data is available
+
+**Supported Parameters:**
+- **period**: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+- Use `get_examples()` to see working examples
+"""
+            return [TextContent(type="text", text=error_response)]
+
+    async def _handle_get_filter_options(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_filter_options — enumerate valid filter values for a dimension.
+
+        Lets callers discover the real entity names (agents, models, providers,
+        ...) the cost endpoints' ``filters`` arguments expect, so they stop
+        guessing names and getting empty results.
+        """
+        try:
+            logger.info("Processing get_filter_options request")
+
+            client = await self.get_client(ctx=ctx)
+            engine = SimpleAnalyticsEngine(client)
+
+            response = await engine.get_filter_options(**arguments)
+
+            logger.info("Filter options retrieved successfully")
+            return [TextContent(type="text", text=response)]
+
+        except ValidationError as e:
+            logger.warning(f"Validation error in get_filter_options: {e.message}")
+            error_response = f"""**Filter Options Validation Error**
+
+**Error**: {e.message}
+
+**Suggestions:**
+"""
+            for suggestion in e.suggestions:
+                error_response += f"- {suggestion}\n"
+
+            error_response += """
+**For Help:**
+- Use `get_capabilities()` to see supported parameters
+- Use `get_examples()` to see working examples
+"""
+            return [TextContent(type="text", text=error_response)]
+
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_filter_options: {e}")
+            error_details = self._format_api_error_details(e)
+            error_response = f"""**Filter Options Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- Provide a valid `dimension` (e.g. agents, models, providers)
+- Try a different time period if no values are available
+
+**Supported Parameters:**
+- **dimension** (required): agents, api-keys, customers, models, organizations, products, providers, teams, tool-providers, tools, users, vendors
+- **period** (optional, defaults to THIRTY_DAYS): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+- Use `get_examples()` to see working examples
+"""
+            return [TextContent(type="text", text=error_response)]
+
+    async def _handle_get_unpaid_invoice_totals(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_unpaid_invoice_totals — aggregate outstanding invoice state.
+
+        Single server-side aggregate (no period/aggregation parameters): the
+        count of unpaid invoices and their total outstanding amount, where
+        UNPAID invoices contribute their full amount and PARTIALLY_PAID ones
+        their remaining balance.
+        """
+        try:
+            logger.info("Processing get_unpaid_invoice_totals request")
+
+            client = await self.get_client(ctx=ctx)
+            totals = await client.get_unpaid_invoice_totals()
+
+            count = totals.get("count")
+            amount = totals.get("totalAmount")
+            # A missing/null/non-numeric field is a response-contract failure;
+            # defaulting it would report a zero balance as a successful result.
+            if not isinstance(count, (int, float)) or not isinstance(amount, (int, float)):
+                raise ValueError(
+                    f"unexpected response shape from unpaid-totals: {sorted(totals.keys())!r}"
+                )
+
+            response = f"""**Unpaid Invoice Totals**
+
+- **Unpaid invoices**: {count}
+- **Total outstanding**: {amount} (in your billing currency)
+
+UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute their remaining balance. Aggregated server-side across all pages.
+"""
+            logger.info("Unpaid invoice totals retrieved successfully")
+            return [TextContent(type="text", text=response)]
+
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_unpaid_invoice_totals: {e}")
+            error_details = self._format_api_error_details(e)
+            error_response = f"""**Unpaid Invoice Totals Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- This action takes no parameters — the team comes from your credentials
+- Verify your API key can view the team's billing data
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+"""
+            return [TextContent(type="text", text=error_response)]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # BACK-2376 task / profitability / spend-mover analytics pack (10 actions)
+    #
+    # Each handler mirrors _handle_get_unpaid_invoice_totals: build the client,
+    # call SimpleCostAnalyzer directly (no engine indirection — these render
+    # their own compact tables), re-raise AuthenticationError so the MCP
+    # envelope sets isError=true, and turn any other failure into troubleshooting
+    # text. Period is passed through to the analyzer, which forwards it to
+    # resolve_analytics_request (an unknown period falls back to a 30-day window,
+    # matching the sibling analytics actions).
+    # ──────────────────────────────────────────────────────────────────────
+
+    _MAX_RENDERED_ROWS: ClassVar[int] = 50
+
+    @staticmethod
+    def _format_metric_value(value: Any, metric_type: Optional[str]) -> str:
+        """Label a metric value as money, percentage, or plain count from metricType."""
+        if value is None:
+            # Numeric honesty: an absent value renders n/a, never the None literal.
+            return "n/a"
+        if not isinstance(value, (int, float)):
+            return str(value)
+        mtype = (metric_type or "").upper()
+        if mtype in ("MONEY", "COST", "CURRENCY"):
+            return f"${value:,.2f}"
+        if mtype == "PERCENTAGE":
+            return f"{value:.2f}%"
+        # Plain numeric (counts, durations, unknown) — keep it honest, no unit invented.
+        if isinstance(value, float) and value.is_integer():
+            return f"{int(value):,}"
+        return f"{value:,}" if isinstance(value, int) else f"{value:,.4f}"
+
+    def _render_aggregated_rows(
+        self, rows: List[Dict[str, Any]], *, title: str, period: str, value_noun: str
+    ) -> str:
+        """Render envelope-B rows (one per group/metric) as a capped bullet list."""
+        if not rows:
+            return self._empty_state(title, period)
+        lines = [f"**{title}** (period: {period})", ""]
+        for row in rows[: self._MAX_RENDERED_ROWS]:
+            group = row.get("group", "Unknown")
+            value = self._format_metric_value(row.get("metricResult"), row.get("metricType"))
+            extras = []
+            label = row.get("label")
+            if label and label != group:
+                # Distinct metric label carries information (e.g. which metric
+                # within the group) — dropping it loses data.
+                extras.append(str(label))
+            if "trend" in row:
+                extras.append(f"trend {row['trend']}")
+            if "currentValue" in row and "previousValue" in row:
+                cur = self._format_metric_value(row.get("currentValue"), row.get("metricType"))
+                prev = self._format_metric_value(row.get("previousValue"), row.get("metricType"))
+                extras.append(f"{prev} → {cur}")
+            suffix = f" ({', '.join(extras)})" if extras else ""
+            lines.append(f"- **{group}**: {value}{suffix}")
+        overflow = len(rows) - self._MAX_RENDERED_ROWS
+        if overflow > 0:
+            lines.append("")
+            lines.append(f"_…and {overflow} more {value_noun} not shown (showing top {self._MAX_RENDERED_ROWS})._")
+        return "\n".join(lines)
+
+    def _render_timeseries_buckets(
+        self, buckets: List[Dict[str, Any]], *, title: str, period: str
+    ) -> str:
+        """Render envelope-A buckets (timestamped groups) as a capped list."""
+        if not buckets:
+            return self._empty_state(title, period)
+        lines = [f"**{title}** (period: {period})", ""]
+        rendered = 0
+        truncated = False
+        for bucket in buckets:
+            if rendered >= self._MAX_RENDERED_ROWS:
+                truncated = True
+                break
+            start = bucket.get("startTimestamp", "?")
+            end = bucket.get("endTimestamp", "?")
+            groups = bucket.get("groups", [])
+            # Build the bucket atomically so a truncation on its boundary never
+            # leaves an orphan header with zero data lines under it.
+            bucket_lines = [f"**{start} → {end}**"]
+            if not groups:
+                bucket_lines.append("- (no data)")
+            for group in groups:
+                if rendered >= self._MAX_RENDERED_ROWS:
+                    truncated = True
+                    break
+                name = group.get("group", "Unknown")
+                for metric in group.get("metrics", []):
+                    if rendered >= self._MAX_RENDERED_ROWS:
+                        truncated = True
+                        break
+                    label = metric.get("label", "value")
+                    value = self._format_metric_value(
+                        metric.get("metricResult"), metric.get("metricType")
+                    )
+                    bucket_lines.append(f"- {name} — {label}: {value}")
+                    # The cap counts rendered metric lines, not groups — a
+                    # group with many metrics must not blow the budget.
+                    rendered += 1
+                if truncated:
+                    break
+            if len(bucket_lines) > 1 or not groups:
+                lines.extend(bucket_lines)
+            if truncated:
+                break
+        if truncated:
+            lines.append("")
+            lines.append(f"_Output truncated at {self._MAX_RENDERED_ROWS} rows; narrow the period for the full series._")
+        return "\n".join(lines)
+
+    def _render_scatter_points(
+        self, points: List[Dict[str, Any]], *, period: str
+    ) -> str:
+        """Render envelope-C scatter dataPoints as a capped list."""
+        if not points:
+            return self._empty_state("Trace Cost Distribution", period)
+        lines = [f"**Trace Cost Distribution** (period: {period})", ""]
+        for point in points[: self._MAX_RENDERED_ROWS]:
+            tx = point.get("transactionId", "?")
+            agent = point.get("agentName", "?")
+            cost = self._format_metric_value(point.get("totalCost"), "MONEY")
+            calls = point.get("totalCalls", "?")
+            tools = point.get("distinctTools", "?")
+            lines.append(f"- **{tx}** ({agent}): {cost}, {calls} calls, {tools} tools")
+        overflow = len(points) - self._MAX_RENDERED_ROWS
+        if overflow > 0:
+            lines.append("")
+            lines.append(f"_…and {overflow} more traces not shown (showing top {self._MAX_RENDERED_ROWS})._")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _empty_state(title: str, period: str) -> str:
+        return (
+            f"**{title}** (period: {period})\n\n"
+            f"No data found for the period **{period}**. "
+            "Try a longer period, or confirm this metric is populated for your team."
+        )
+
+    def _analytics_pack_error(self, title: str, error: Exception) -> str:
+        """Uniform troubleshooting text for a failed analytics-pack action."""
+        error_details = self._format_api_error_details(error)
+        return f"""**{title} Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- Verify your parameters: period (optional, defaults to a recent window)
+- Supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- Try a different time period if no data is available
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+- Use `get_examples()` to see working examples
+"""
+
+    async def _handle_get_task_costs(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Cost by task type — timeseries by default, totals when aggregation='aggregated'."""
+        period = arguments.get("period") or "SEVEN_DAYS"
+        aggregation = arguments.get("aggregation") or "timeseries"
+        try:
+            client = await self.get_client(ctx=ctx)
+            analyzer = SimpleCostAnalyzer(client)
+            data = await analyzer.get_task_costs(period, aggregation)
+            if str(aggregation).lower() == "aggregated":
+                text = self._render_aggregated_rows(
+                    data, title="Cost by Task", period=period, value_noun="tasks"
+                )
+            else:
+                text = self._render_timeseries_buckets(data, title="Cost by Task", period=period)
+            return [TextContent(type="text", text=text)]
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_task_costs: {e}")
+            return [TextContent(type="text", text=self._analytics_pack_error("Cost by Task", e))]
+
+    async def _handle_get_task_completion(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Task completion counts — timeseries by default, optionally filtered by agents."""
+        period = arguments.get("period") or "SEVEN_DAYS"
+        aggregation = arguments.get("aggregation") or "timeseries"
+        agents = arguments.get("agents")
+        try:
+            client = await self.get_client(ctx=ctx)
+            analyzer = SimpleCostAnalyzer(client)
+            data = await analyzer.get_task_completion(period, aggregation, agents=agents)
+            if str(aggregation).lower() == "aggregated":
+                text = self._render_aggregated_rows(
+                    data, title="Task Completion", period=period, value_noun="tasks"
+                )
+            else:
+                text = self._render_timeseries_buckets(data, title="Task Completion", period=period)
+            return [TextContent(type="text", text=text)]
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_task_completion: {e}")
+            return [TextContent(type="text", text=self._analytics_pack_error("Task Completion", e))]
+
+    async def _handle_get_task_performance(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Per-agent task performance (aggregated). Empty is a normal outcome."""
+        period = arguments.get("period") or "SEVEN_DAYS"
+        try:
+            client = await self.get_client(ctx=ctx)
+            analyzer = SimpleCostAnalyzer(client)
+            rows = await analyzer.get_task_performance_by_agent(period)
+            text = self._render_aggregated_rows(
+                rows, title="Task Performance by Agent", period=period, value_noun="agents"
+            )
+            return [TextContent(type="text", text=text)]
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_task_performance: {e}")
+            return [
+                TextContent(type="text", text=self._analytics_pack_error("Task Performance by Agent", e))
+            ]
+
+    async def _handle_get_profit_margins(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Profit margin per customer (default) or product — dimension is validated."""
+        period = arguments.get("period") or "SEVEN_DAYS"
+        dimension = (arguments.get("dimension") or "customer")
+        if str(dimension).lower() not in ("customer", "product"):
+            text = (
+                "**Profit Margins Validation Error**\n\n"
+                f"**Error**: Unsupported dimension: {dimension}\n\n"
+                "**Suggestions:**\n"
+                "- Use `dimension='customer'` for profit margin per customer\n"
+                "- Use `dimension='product'` for profit margin per product\n"
+            )
+            return [TextContent(type="text", text=text)]
+        try:
+            client = await self.get_client(ctx=ctx)
+            analyzer = SimpleCostAnalyzer(client)
+            rows = await analyzer.get_profit_margins(period, dimension)
+            text = self._render_aggregated_rows(
+                rows,
+                title=f"Profit Margin per {str(dimension).title()}",
+                period=period,
+                value_noun=f"{dimension}s",
+            )
+            return [TextContent(type="text", text=text)]
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_profit_margins: {e}")
+            return [TextContent(type="text", text=self._analytics_pack_error("Profit Margins", e))]
+
+    async def _handle_get_top_movers(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Biggest spend movers, each with current/previous value and trend."""
+        period = arguments.get("period") or "SEVEN_DAYS"
+        group_by = arguments.get("group_by")
+        try:
+            client = await self.get_client(ctx=ctx)
+            analyzer = SimpleCostAnalyzer(client)
+            rows = await analyzer.get_top_movers(period, group_by=group_by)
+            text = self._render_aggregated_rows(
+                rows, title="Top Spend Movers", period=period, value_noun="movers"
+            )
+            return [TextContent(type="text", text=text)]
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_top_movers: {e}")
+            return [TextContent(type="text", text=self._analytics_pack_error("Top Spend Movers", e))]
+
+    async def _handle_get_token_breakdown(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Token breakdown by type over time, optionally filtered by providers."""
+        period = arguments.get("period") or "SEVEN_DAYS"
+        providers = arguments.get("providers")
+        try:
+            client = await self.get_client(ctx=ctx)
+            analyzer = SimpleCostAnalyzer(client)
+            buckets = await analyzer.get_token_breakdown(period, providers=providers)
+            text = self._render_timeseries_buckets(
+                buckets, title="Token Breakdown by Type", period=period
+            )
+            return [TextContent(type="text", text=text)]
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_token_breakdown: {e}")
+            return [
+                TextContent(type="text", text=self._analytics_pack_error("Token Breakdown by Type", e))
+            ]
+
+    async def _handle_get_team_costs(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Cost by team over time."""
+        period = arguments.get("period") or "SEVEN_DAYS"
+        try:
+            client = await self.get_client(ctx=ctx)
+            analyzer = SimpleCostAnalyzer(client)
+            buckets = await analyzer.get_team_costs(period)
+            text = self._render_timeseries_buckets(buckets, title="Cost by Team", period=period)
+            return [TextContent(type="text", text=text)]
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_team_costs: {e}")
+            return [TextContent(type="text", text=self._analytics_pack_error("Cost by Team", e))]
+
+    async def _handle_get_vendor_costs(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Cost by vendor (aggregated totals)."""
+        period = arguments.get("period") or "SEVEN_DAYS"
+        try:
+            client = await self.get_client(ctx=ctx)
+            analyzer = SimpleCostAnalyzer(client)
+            rows = await analyzer.get_vendor_costs(period)
+            text = self._render_aggregated_rows(
+                rows, title="Cost by Vendor", period=period, value_noun="vendors"
+            )
+            return [TextContent(type="text", text=text)]
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_vendor_costs: {e}")
+            return [TextContent(type="text", text=self._analytics_pack_error("Cost by Vendor", e))]
+
+    async def _handle_get_token_vs_tool_cost(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Token cost vs tool cost over time."""
+        period = arguments.get("period") or "SEVEN_DAYS"
+        try:
+            client = await self.get_client(ctx=ctx)
+            analyzer = SimpleCostAnalyzer(client)
+            buckets = await analyzer.get_token_vs_tool_cost(period)
+            text = self._render_timeseries_buckets(
+                buckets, title="Token vs Tool Cost", period=period
+            )
+            return [TextContent(type="text", text=text)]
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_token_vs_tool_cost: {e}")
+            return [TextContent(type="text", text=self._analytics_pack_error("Token vs Tool Cost", e))]
+
+    async def _handle_get_trace_cost_distribution(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Per-trace cost scatter distribution."""
+        period = arguments.get("period") or "SEVEN_DAYS"
+        try:
+            client = await self.get_client(ctx=ctx)
+            analyzer = SimpleCostAnalyzer(client)
+            points = await analyzer.get_trace_cost_distribution(period)
+            text = self._render_scatter_points(points, period=period)
+            return [TextContent(type="text", text=text)]
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_trace_cost_distribution: {e}")
+            return [
+                TextContent(type="text", text=self._analytics_pack_error("Trace Cost Distribution", e))
+            ]
+    # ── Billing reads ──────────────────────────────────────────────────────
+    # snake_case arg → camelCase API param allowlists, per endpoint.
+    _INVOICE_FILTER_MAP: ClassVar[Dict[str, str]] = {
+        "invoice_number": "invoiceNumber",
+        "start_date": "startDate",
+        "end_date": "endDate",
+        "pay_states": "payStates",
+        "states": "states",
+        "starting_amount": "startingAmount",
+        "ending_amount": "endingAmount",
+    }
+    _REFUND_FILTER_MAP: ClassVar[Dict[str, str]] = {
+        "query": "query",
+        "start_date": "startDate",
+        "end_date": "endDate",
+        "minimum": "minimum",
+        "maximum": "maximum",
+    }
+    _PERIOD_CHARGE_FILTER_MAP: ClassVar[Dict[str, str]] = {
+        "invoice_id": "invoiceId",
+        "start_date": "startDate",
+        "end_date": "endDate",
+    }
+
+    @staticmethod
+    def _map_billing_filters(
+        arguments: Dict[str, Any], allowlist: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """Map allowlisted snake_case args to camelCase API params.
+
+        Only keys present in ``allowlist`` (and non-None) are forwarded;
+        everything else — including reserved keys like page/size/action —
+        is dropped so unknown or reserved keys never reach the API.
+        """
+        mapped: Dict[str, Any] = {}
+        for snake, camel in allowlist.items():
+            value = arguments.get(snake)
+            if value is not None:
+                mapped[camel] = value
+        return mapped
+
+    @staticmethod
+    def _render_money(amount: Any, currency: Any) -> str:
+        """Render a monetary amount with its currency code.
+
+        Numeric honesty: a missing/null/non-numeric amount renders ``n/a`` —
+        never a fabricated ``0``. Numbers print with trailing zeros trimmed
+        and no invented currency symbol; the currency code is appended when
+        present (e.g. ``"1234.5 USD"``, ``"n/a"``).
+        """
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+            return "n/a"
+        # Fixed decimals trimmed: 1234.50 -> "1234.5", 25.0 -> "25".
+        text = f"{amount:.2f}".rstrip("0").rstrip(".")
+        code = str(currency).strip() if isinstance(currency, str) and currency.strip() else ""
+        return f"{text} {code}".strip()
+
+    async def _handle_list_invoices(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """List invoices (page-numbered) with a compact per-entry line."""
+        try:
+            logger.info("Processing list_invoices request")
+            client = await self.get_client(ctx=ctx)
+            page = int(arguments.get("page", 0))
+            size = int(arguments.get("size", 20))
+            filters = self._map_billing_filters(arguments, self._INVOICE_FILTER_MAP)
+
+            response = await client.get_invoices(page=page, size=size, **filters)
+            invoices = client._extract_embedded_data(response)
+
+            if not invoices:
+                return [TextContent(type="text", text="**Invoices**\n\nNo invoices found for the given filters.")]
+
+            cap = 50
+            lines = ["**Invoices**", ""]
+            for inv in invoices[:cap]:
+                # `or "n/a"`: real invoices carry explicit nulls (endDate on
+                # open invoices, live-verified) — .get(key, default) misses them.
+                number = inv.get("invoiceNumber") or "n/a"
+                state = inv.get("state") or "n/a"
+                pay_status = inv.get("invoicePayStatus") or "n/a"
+                money = self._render_money(inv.get("totalAmount"), inv.get("currency"))
+                start = inv.get("startDate") or "n/a"
+                end = inv.get("endDate") or "n/a"
+                lines.append(
+                    f"- {number} | {state} | {pay_status} | {money} | {start} → {end}"
+                )
+            if len(invoices) > cap:
+                lines.append("")
+                lines.append(f"… {len(invoices) - cap} more not shown (page size {size}).")
+
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in list_invoices: {e}")
+            error_details = self._format_api_error_details(e)
+            return [TextContent(type="text", text=f"""**List Invoices Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- Optional filters: invoice_number, start_date, end_date, pay_states, states, starting_amount, ending_amount
+- Verify your API key can view the team's billing data
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+""")]
+
+    async def _handle_list_refunds(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """List refunds (page-numbered) with a compact per-entry line."""
+        try:
+            logger.info("Processing list_refunds request")
+            client = await self.get_client(ctx=ctx)
+            page = int(arguments.get("page", 0))
+            size = int(arguments.get("size", 20))
+            filters = self._map_billing_filters(arguments, self._REFUND_FILTER_MAP)
+
+            response = await client.get_refunds(page=page, size=size, **filters)
+            refunds = client._extract_embedded_data(response)
+
+            if not refunds:
+                return [TextContent(type="text", text="**Refunds**\n\nNo refunds found for the given filters (this is normal on most tenants).")]
+
+            cap = 50
+            lines = ["**Refunds**", ""]
+            for refund in refunds[:cap]:
+                money = self._render_money(refund.get("totalAmount"), refund.get("currency"))
+                state = refund.get("state") or "n/a"
+                created = refund.get("created") or refund.get("startDate") or "n/a"
+                lines.append(f"- {money} | {state} | {created}")
+            if len(refunds) > cap:
+                lines.append("")
+                lines.append(f"… {len(refunds) - cap} more not shown (page size {size}).")
+
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in list_refunds: {e}")
+            error_details = self._format_api_error_details(e)
+            return [TextContent(type="text", text=f"""**List Refunds Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- Optional filters: query, start_date, end_date, minimum, maximum
+- Verify your API key can view the team's billing data
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+""")]
+
+    async def _handle_list_period_charges(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """List period charges (cursor/keyset pagination — never a page arg)."""
+        try:
+            logger.info("Processing list_period_charges request")
+            client = await self.get_client(ctx=ctx)
+            size = int(arguments.get("size", 20))
+            filters = self._map_billing_filters(arguments, self._PERIOD_CHARGE_FILTER_MAP)
+            # cursor is keyset-pagination state, not a filter — forward when present.
+            cursor_in = arguments.get("cursor")
+            if cursor_in is not None:
+                filters["cursor"] = cursor_in
+
+            response = await client.get_period_charges(size=size, **filters)
+            charges = client._extract_embedded_data(response)
+
+            if not charges:
+                return [TextContent(type="text", text="**Period Charges**\n\nNo period charges found for the given filters.")]
+
+            cap = 50
+            lines = ["**Period Charges**", ""]
+            for charge in charges[:cap]:
+                cid = charge.get("id") or "n/a"
+                label = charge.get("label") or "n/a"
+                tx = charge.get("transactionId") or "n/a"
+                created = charge.get("created") or "n/a"
+                lines.append(f"- {cid} | {label} | tx={tx} | {created}")
+            if len(charges) > cap:
+                lines.append("")
+                lines.append(f"… {len(charges) - cap} more on this page not shown (page size {size}).")
+
+            # Cursor/keyset continuation — only when the server says there's more.
+            if isinstance(response, dict) and response.get("hasMore"):
+                next_cursor = response.get("cursor")
+                lines.append("")
+                if isinstance(next_cursor, str) and next_cursor:
+                    lines.append(
+                        f"More available — pass cursor='{next_cursor}' to continue."
+                    )
+                else:
+                    # hasMore without a usable cursor: never suggest cursor='None'.
+                    lines.append(
+                        "More available, but the server returned no continuation "
+                        "cursor — narrow with start_date/end_date or invoice_id."
+                    )
+
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in list_period_charges: {e}")
+            error_details = self._format_api_error_details(e)
+            return [TextContent(type="text", text=f"""**List Period Charges Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- Optional filters: invoice_id, start_date, end_date
+- Pagination is cursor-based: pass cursor='<value>' from the previous response (there is no page parameter)
+- Verify your API key can view the team's billing data
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+""")]
 
     async def _handle_get_model_costs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -899,6 +1956,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 **Supported Parameters:**
 - **period**: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - **aggregation**: TOTAL, MEAN, MAXIMUM, MINIMUM (optional, defaults to TOTAL)
+- **filters**: optional, `{{"costSources": ["revenium_metered" | "provider_billing"]}}`
 
 **For Help:**
 - Use `get_capabilities()` to check current status
@@ -1502,6 +2560,23 @@ If you're seeing this error, please report it as it indicates a reliability issu
             "get_top_tools",
             "get_tool_costs_by_agent",
             "get_tool_costs_by_provider",
+            "get_transaction_count",
+            "get_filter_options",
+            "get_unpaid_invoice_totals",
+            # BACK-2376 task / profitability / spend-mover analytics pack
+            "get_task_costs",
+            "get_task_completion",
+            "get_task_performance",
+            "get_profit_margins",
+            "get_top_movers",
+            "get_token_breakdown",
+            "get_team_costs",
+            "get_vendor_costs",
+            "get_token_vs_tool_cost",
+            "get_trace_cost_distribution",
+            "list_invoices",
+            "list_refunds",
+            "list_period_charges",
             "get_cost_summary",
             "analyze_cost_anomalies",
         ])
@@ -1545,6 +2620,44 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 ],
             ),
             ToolCapability(
+                name="Task & Profitability Analytics",
+                description="Task-level cost/completion, per-agent performance, and profit margins by customer or product (new analytics API)",
+                parameters={
+                    "get_task_costs": {"period": "str", "aggregation": "str"},
+                    "get_task_completion": {"period": "str", "aggregation": "str", "agents": "list"},
+                    "get_task_performance": {"period": "str"},
+                    "get_profit_margins": {"period": "str", "dimension": "str"},
+                    "get_team_costs": {"period": "str"},
+                },
+                examples=[
+                    "get_task_costs(period='SEVEN_DAYS')",
+                    "get_task_costs(period='THIRTY_DAYS', aggregation='aggregated')",
+                    "get_task_completion(period='SEVEN_DAYS', agents=['agent-1'])",
+                    "get_task_performance(period='THIRTY_DAYS')",
+                    "get_profit_margins(period='THIRTY_DAYS', dimension='customer')",
+                    "get_profit_margins(period='THIRTY_DAYS', dimension='product')",
+                    "get_team_costs(period='THIRTY_DAYS')",
+                ],
+            ),
+            ToolCapability(
+                name="Spend Movers & Token Analytics",
+                description="Biggest spend movers with trend, token breakdown by type, token-vs-tool cost, vendor costs, and per-trace cost distribution (new analytics API)",
+                parameters={
+                    "get_top_movers": {"period": "str", "group_by": "str"},
+                    "get_token_breakdown": {"period": "str", "providers": "list"},
+                    "get_token_vs_tool_cost": {"period": "str"},
+                    "get_vendor_costs": {"period": "str"},
+                    "get_trace_cost_distribution": {"period": "str"},
+                },
+                examples=[
+                    "get_top_movers(period='THIRTY_DAYS', group_by='model')",
+                    "get_token_breakdown(period='SEVEN_DAYS', providers=['openai'])",
+                    "get_token_vs_tool_cost(period='THIRTY_DAYS')",
+                    "get_vendor_costs(period='SEVEN_DAYS')",
+                    "get_trace_cost_distribution(period='SEVEN_DAYS')",
+                ],
+            ),
+            ToolCapability(
                 name="Anomaly Detection",
                 description="Statistical anomaly detection with optional new entity detection for cost spike identification",
                 parameters={
@@ -1564,17 +2677,59 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 ],
             ),
             ToolCapability(
+                name="Billing Reporting",
+                description="Read-only billing visibility: unpaid-invoice aggregate plus invoice, refund and period-charge listings (numeric-honest — missing amounts render 'n/a', never a fabricated 0)",
+                parameters={
+                    "get_unpaid_invoice_totals": {},
+                    "list_invoices": {
+                        "page": "int",
+                        "size": "int",
+                        "invoice_number": "str",
+                        "start_date": "str",
+                        "end_date": "str",
+                        "pay_states": "list",
+                        "states": "list",
+                        "starting_amount": "float",
+                        "ending_amount": "float",
+                    },
+                    "list_refunds": {
+                        "page": "int",
+                        "size": "int",
+                        "query": "str",
+                        "start_date": "str",
+                        "end_date": "str",
+                        "minimum": "float",
+                        "maximum": "float",
+                    },
+                    "list_period_charges": {
+                        "size": "int",
+                        "invoice_id": "str",
+                        "start_date": "str",
+                        "end_date": "str",
+                        "cursor": "str",
+                    },
+                },
+                examples=[
+                    "get_unpaid_invoice_totals()",
+                    "list_invoices(page=0, size=20, states=['FINALIZED'])",
+                    "list_refunds(query='acme')",
+                    "list_period_charges(size=20, invoice_id='inv_1')",
+                ],
+            ),
+            ToolCapability(
                 name="Tool Discovery",
-                description="Tool capabilities and usage guidance",
+                description="Tool capabilities, filter-value discovery, and usage guidance",
                 parameters={
                     "get_capabilities": {},
                     "get_examples": {"example_type": "str"},
                     "get_agent_summary": {},
+                    "get_filter_options": {"dimension": "str", "period": "str"},
                 },
                 examples=[
                     "get_capabilities()",
                     "get_examples()",
                     "get_agent_summary()",
+                    "get_filter_options(dimension='models')",
                 ],
             ),
         ]

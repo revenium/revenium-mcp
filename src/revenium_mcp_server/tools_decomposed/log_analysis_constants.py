@@ -31,6 +31,15 @@ CAPABILITIES_TEXT = """
    - Operation pattern analysis and frequency reporting
    - Error pattern identification
 
+5a. **get_ingestion_failures** - ✅ **AVAILABLE**
+   - List AI transactions rejected by strict ingestion mode (newest-first)
+   - Structured error details plus the prompt-redacted original payload
+   - Optional error_code filter, page/size pagination
+
+5b. **set_strict_ingestion_mode** - ✅ **AVAILABLE**
+   - Toggle the tenant's strict ingestion mode (requires confirm=true)
+   - Strict mode rejects transactions referencing unknown entities instead of auto-creating them
+
 6. **get_capabilities** - ✅ **AVAILABLE**
    - Shows current implementation status
 
@@ -113,6 +122,27 @@ EXAMPLES_TEXT = """
 }
 ```
 **Purpose**: Retrieve integration logs (may be empty - this is expected).
+
+### get_ingestion_failures
+```json
+{
+  "action": "get_ingestion_failures",
+  "page": 0,
+  "size": 20,
+  "error_code": "UNKNOWN_PRODUCT"
+}
+```
+**Purpose**: List strict-ingestion rejections with error details and the redacted payload (error_code optional).
+
+### set_strict_ingestion_mode
+```json
+{
+  "action": "set_strict_ingestion_mode",
+  "enabled": true,
+  "confirm": true
+}
+```
+**Purpose**: Toggle strict ingestion mode for the tenant. Without confirm=true the call returns a consequences preview and changes nothing.
 
 ### get_recent_logs
 ```json
@@ -232,6 +262,8 @@ UNSUPPORTED_ACTION_TEMPLATE = """
 - get_recent_logs (recent activity analysis)
 - search_logs (advanced filtering)
 - analyze_operations (operation pattern analysis)
+- get_ingestion_failures (strict-ingestion rejections)
+- set_strict_ingestion_mode (guarded strict-mode toggle)
 
 Use `get_capabilities()` for current status.
 """

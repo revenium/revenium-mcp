@@ -2022,6 +2022,39 @@ class TestGetAppBaseUrl:
         with pytest.raises(ValueError, match="must use HTTPS"):
             self.client._get_app_base_url()
 
+    def test_derives_dev_analytics_host_from_base_url(self, monkeypatch):
+        """A dev platform URL must pair with the dev analytics host — the
+        prod default with a dev key 401s on every insights/tool-analytics
+        call. The analytics host is not derivable by naming rule (prod:
+        app.revenium.ai; dev: ai.dev.hcapp.io), hence the known-host map."""
+        monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.dev.hcapp.io")
+        assert self.client._get_app_base_url() == "https://ai.dev.hcapp.io"
+
+    def test_explicit_app_base_url_beats_derivation(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_APP_BASE_URL", "https://custom.example.com")
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.dev.hcapp.io")
+        assert self.client._get_app_base_url() == "https://custom.example.com"
+
+    def test_unknown_base_url_falls_back_to_prod_default(self, monkeypatch):
+        monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.qa.someenv.io")
+        assert self.client._get_app_base_url() == DEFAULT_APP_BASE_URL
+
+    def test_https_error_names_the_derivation_when_url_was_derived(self, monkeypatch):
+        """The HTTPS rejection must name the actual source of the URL — the
+        env-var wording misleads when the value came from the known-host map."""
+        monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.dev.hcapp.io")
+        with patch.object(
+            type(self.client), "_KNOWN_APP_BASE_URLS", {"api.dev.hcapp.io": "http://ai.dev.hcapp.io"}
+        ):
+            with pytest.raises(ValueError) as exc_info:
+                self.client._get_app_base_url()
+        msg = str(exc_info.value)
+        assert "REVENIUM_APP_BASE_URL" not in msg
+        assert "known-host map" in msg or "derived" in msg
+
 
 # ===========================================================================
 # _request — BACK-1094: enhance Bearer 401/403/404 when app host defaulted to prod
@@ -2214,3 +2247,49 @@ class TestRequestSanitizesDictReprLeak:
         # Real content (HTTP 403 prefix added by client + Access Denied) is preserved.
         assert "Access Denied" in msg
 
+
+
+class TestErrorRenderingSweep:
+    """Error surfaces must be resource-scoped, dict-repr-free, and must not
+    swallow the backend's useful detail."""
+
+    def setup_method(self):
+        self.client = _client()
+
+    def test_dict_details_rendered_as_text_not_repr(self):
+        msg = self.client._format_error_response(
+            {
+                "message": "Invalid request",
+                "details": {"error": "periodDuration FIVE_MINUTES is no longer supported; use FIFTEEN_MINUTES or longer"},
+            }
+        )
+        assert "no longer supported" in msg
+        assert "{'error'" not in msg
+
+    def test_detail_equal_to_message_not_duplicated(self):
+        msg = self.client._format_error_response(
+            {
+                "message": "Couldn't find Asset with ID: qx1yQqQ",
+                "details": {"error": "Couldn't find Asset with ID: qx1yQqQ"},
+            }
+        )
+        assert msg.count("Couldn't find Asset") == 1
+
+    def test_json_issue_suggestions_are_resource_scoped(self):
+        text = self.client._json_format_suggestions("/profitstream/v2/api/tool-registry/tools")
+        assert "create_threshold_alert" not in text
+        assert "alertType" not in text
+
+    def test_json_issue_suggestions_keep_alert_guidance_on_anomaly_endpoint(self):
+        text = self.client._json_format_suggestions("/profitstream/v2/api/sources/ai/anomaly")
+        assert "create_threshold_alert" in text
+
+    def test_not_found_leak_rewritten_with_resource_label(self):
+        msg = self.client._enhance_not_found_error(
+            "Couldn't find Asset with ID: qx1yQqQ",
+            "/profitstream/v2/api/sources/qx1yQqQ",
+        )
+        assert msg is not None
+        assert "Asset" not in msg
+        assert "Source" in msg
+        assert "qx1yQqQ" in msg

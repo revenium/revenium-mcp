@@ -150,6 +150,20 @@ def _get_tool_registry() -> Dict[str, Type[ToolBase]]:
         pass
 
     try:
+        from .agent_management import AgentManagement
+
+        registry["manage_agents"] = AgentManagement
+    except ImportError:
+        pass
+
+    try:
+        from .cost_controls_management import CostControlsManagement
+
+        registry["manage_cost_controls"] = CostControlsManagement
+    except ImportError:
+        pass
+
+    try:
         from .metering_elements_management import MeteringElementsManagement
 
         registry["manage_metering_elements"] = MeteringElementsManagement
@@ -205,6 +219,13 @@ def _get_tool_registry() -> Dict[str, Type[ToolBase]]:
         from .tool_introspection import ToolIntrospection
 
         registry["tool_introspection"] = ToolIntrospection
+    except ImportError:
+        pass
+
+    try:
+        from .ai_insights_management import AIInsightsManagement
+
+        registry["manage_ai_insights"] = AIInsightsManagement
     except ImportError:
         pass
 

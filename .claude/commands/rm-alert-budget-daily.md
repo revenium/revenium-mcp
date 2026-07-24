@@ -15,5 +15,10 @@ Use the manage_alerts tool with these parameters:
 ## Use Case
 Daily budget monitoring, immediate alert when daily spending exceeds the threshold amount.
 
+## Related
+Once a budget alert has tripped, `manage_alerts` action `reset_budget`
+(`reset_budget(anomaly_id="...")`) restarts the current period's accumulation
+without waiting for the daily boundary to roll over.
+
 ## Deliverables
 Confirm the alert was created and provide details of the configuration.

@@ -65,6 +65,9 @@ class SystemDiagnostics(ToolBase):
             "get_recent_logs": self.log_tool,
             "search_logs": self.log_tool,
             "analyze_operations": self.log_tool,
+            # Tenant ingestion diagnostics
+            "get_ingestion_failures": self.log_tool,
+            "set_strict_ingestion_mode": self.log_tool,
         }
 
         logger.info("System Diagnostics consolidated tool initialized")
@@ -135,6 +138,8 @@ Unified system diagnostics combining configuration analysis, auto-discovery debu
 • **Recent Logs**: Latest log entries for quick troubleshooting
 • **Log Search**: Search across historical log data
 • **Operation Analysis**: Analyze operation patterns and trends
+• **Ingestion Failures**: Strict-ingestion rejections with error details and redacted payloads
+• **Strict Ingestion Mode**: Guarded toggle for reject-vs-auto-create ingestion behavior
 
 ## **Primary Use Cases**
 • **System Troubleshooting**: Diagnose configuration and connectivity issues
@@ -160,6 +165,10 @@ Unified system diagnostics combining configuration analysis, auto-discovery debu
 - `get_recent_logs` - Latest log entries
 - `search_logs` - Search historical log data
 - `analyze_operations` - Analyze operation patterns
+
+### Tenant Ingestion Diagnostics
+- `get_ingestion_failures` - List strict-ingestion rejections (error_code filter, pagination)
+- `set_strict_ingestion_mode` - Toggle strict mode (requires confirm=true; preview otherwise)
 
 ### Meta Actions
 - `get_capabilities` - Show this capabilities overview

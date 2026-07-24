@@ -599,3 +599,34 @@ class TestUpdateProductPreservesFlatAmount:
             f"BACK-1270 #3: flat_amount stripped or rewritten on partial update. "
             f"payload={sent!r}"
         )
+
+
+class TestProductsPaginationSafeInteger:
+    """Values beyond 2^53 must hit the safe-integer guard, not the
+    bounds check — and the float-corrupted value must not be echoed back."""
+
+    def test_size_beyond_safe_range_rejected_without_echo(self):
+        from src.revenium_mcp_server.tools_decomposed.product_management import (
+            _validate_products_pagination,
+        )
+
+        # 2^63 as it actually arrives: JSON number decoded via float64 by
+        # Go/JS MCP clients, then coerced to int (9223372036854776000).
+        corrupted = int(float(2**63))
+        with pytest.raises(ToolError) as exc_info:
+            _validate_products_pagination(page=0, size=corrupted)
+        msg = str(exc_info.value)
+        assert "exceeds safe integer range" in msg
+        assert str(corrupted) not in msg
+
+    def test_page_beyond_safe_range_rejected_without_echo(self):
+        from src.revenium_mcp_server.tools_decomposed.product_management import (
+            _validate_products_pagination,
+        )
+
+        corrupted = int(float(2**63))
+        with pytest.raises(ToolError) as exc_info:
+            _validate_products_pagination(page=corrupted, size=20)
+        msg = str(exc_info.value)
+        assert "exceeds safe integer range" in msg
+        assert str(corrupted) not in msg

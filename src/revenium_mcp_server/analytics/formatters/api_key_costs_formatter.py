@@ -248,7 +248,10 @@ class ApiKeyCostsFormatter(AnalyticsResponseFormatter):
         Returns:
             Masked API key name
         """
-        if not api_key_name or api_key_name == "Unknown API Key":
+        # Platform sentinel labels are placeholders, not secrets — masking
+        # "ANONYMOUS"/"UNCLASSIFIED" hides meaning and renders the same entity
+        # differently across analytics actions.
+        if not api_key_name or api_key_name in ("Unknown API Key", "ANONYMOUS", "UNCLASSIFIED"):
             return api_key_name
 
         # Show first 4 and last 4 characters, mask the middle

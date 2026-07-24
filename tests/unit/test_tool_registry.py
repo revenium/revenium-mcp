@@ -41,6 +41,25 @@ class TestGetToolDescription:
             desc = get_tool_description("mock_tool")
             assert "description unavailable" in desc
 
+    def test_every_business_profile_tool_has_real_description(self):
+        """Every tool in the business profile must resolve to a real
+        description through the registry. A tool missing from
+        _get_tool_registry() makes dynamic_mcp_tool fall back to
+        'Tool: <name> (description unavailable)', so MCP clients show no
+        useful description even though the tool itself works (its FastMCP
+        closure imports the class directly)."""
+        from src.revenium_mcp_server.tool_configuration.profiles import PROFILE_DEFINITIONS
+
+        fallbacks = {
+            tool: get_tool_description(tool)
+            for tool in sorted(PROFILE_DEFINITIONS["business"])
+            if "description unavailable" in get_tool_description(tool)
+        }
+        assert not fallbacks, (
+            f"tools resolving to the fallback description "
+            f"(missing from _get_tool_registry?): {sorted(fallbacks)}"
+        )
+
 
 class TestGetToolBusinessCategory:
     """Test get_tool_business_category lookup."""
@@ -132,3 +151,27 @@ class TestValidateToolDescriptions:
         assert (
             report["valid_tools"] + len(report["issues"]) == report["total_tools"]
         )
+
+
+class TestManageAgentsDescription:
+    """manage_agents resolves its real description through the shim."""
+
+    def test_manage_agents_returns_class_description(self):
+        from src.revenium_mcp_server.tools_decomposed.agent_management import (
+            AgentManagement,
+        )
+
+        desc = get_tool_description("manage_agents")
+        assert desc == AgentManagement.tool_description
+
+
+class TestManageCostControlsDescription:
+    """manage_cost_controls resolves its real description through the shim."""
+
+    def test_manage_cost_controls_returns_class_description(self):
+        from src.revenium_mcp_server.tools_decomposed.cost_controls_management import (
+            CostControlsManagement,
+        )
+
+        desc = get_tool_description("manage_cost_controls")
+        assert desc == CostControlsManagement.tool_description

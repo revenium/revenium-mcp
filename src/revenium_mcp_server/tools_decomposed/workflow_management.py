@@ -6,6 +6,7 @@ tool with internal composition, following the proven alert/source/customer/produ
 
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
@@ -36,6 +37,14 @@ class WorkflowManager:
 
     active_workflows: Dict[str, Dict[str, Any]] = {}
     MAX_ACTIVE_WORKFLOWS: int = 10000
+
+    # Workflow state lives in server memory only — callers must not treat a
+    # workflow id as durable, and a not-found must say why it can vanish.
+    SESSION_SCOPE_NOTE = (
+        "Workflows are held in server memory for the current session only — "
+        "they are lost on server restart and are not shared across server "
+        "replicas or separate server processes"
+    )
 
     def __init__(self):
         """Initialize workflow manager."""
@@ -178,6 +187,7 @@ class WorkflowManager:
                     "Check the workflow ID for typos",
                     "Ensure the workflow was created successfully",
                     "Use create() to start a new workflow",
+                    WorkflowManager.SESSION_SCOPE_NOTE,
                 ],
             )
 
@@ -185,12 +195,25 @@ class WorkflowManager:
 
     async def start_workflow(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Start a new workflow."""
-        workflow_type = arguments.get("workflow_type", "generic")
+        workflow_type = arguments.get("workflow_type")
+        if not workflow_type:
+            # A silent fallback to "generic" produced degenerate empty
+            # workflows for callers who simply forgot the parameter.
+            raise create_structured_missing_parameter_error(
+                parameter_name="workflow_type",
+                action="start",
+                examples={
+                    "usage": "start(workflow_type='customer_onboarding', context={...})",
+                    "available_types": list(self.workflow_templates.keys()) + ["generic"],
+                    "generic_workflow": "start(workflow_type='generic', context={...}) for custom flows",
+                },
+            )
         context = arguments.get("context", {})
 
         self.validate_start_args(workflow_type, context)
 
         workflow_id = f"wf_{uuid.uuid4().hex}"
+        created_at = datetime.now(timezone.utc).isoformat()
 
         if workflow_type == "generic":
             workflow = {
@@ -201,7 +224,9 @@ class WorkflowManager:
                 "context": context,
                 "current_step": 0,
                 "completed_steps": [],
-                "created_at": json.dumps({"timestamp": "now"}),
+                "created_at": created_at,
+                "scope": "session",
+                "scope_note": self.SESSION_SCOPE_NOTE,
             }
         else:
             template = self.workflow_templates[workflow_type]
@@ -215,7 +240,9 @@ class WorkflowManager:
                 "context": context,
                 "current_step": 0,
                 "completed_steps": [],
-                "created_at": json.dumps({"timestamp": "now"}),
+                "created_at": created_at,
+                "scope": "session",
+                "scope_note": self.SESSION_SCOPE_NOTE,
             }
 
         if len(self.active_workflows) >= self.MAX_ACTIVE_WORKFLOWS:
@@ -249,6 +276,7 @@ class WorkflowManager:
                     "Check the workflow ID for typos",
                     "Ensure the workflow was created successfully",
                     "Use create() to start a new workflow",
+                    WorkflowManager.SESSION_SCOPE_NOTE,
                 ],
             )
 
@@ -300,6 +328,7 @@ class WorkflowManager:
                     "Check the workflow ID for typos",
                     "Ensure the workflow was created successfully",
                     "Use create() to start a new workflow",
+                    WorkflowManager.SESSION_SCOPE_NOTE,
                 ],
             )
 
@@ -309,7 +338,7 @@ class WorkflowManager:
             {
                 "step_number": current_step + 1,
                 "result": step_result,
-                "completed_at": json.dumps({"timestamp": "now"}),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
             }
         )
 
@@ -403,7 +432,20 @@ class WorkflowManagement(ToolBase):
             elif action == "start":
                 dry_run = arguments.get("dry_run", False)
                 if dry_run:
-                    workflow_type = arguments.get("workflow_type", "generic")
+                    workflow_type = arguments.get("workflow_type")
+                    if not workflow_type:
+                        # Dry-run must validate exactly what a live start would.
+                        raise create_structured_missing_parameter_error(
+                            parameter_name="workflow_type",
+                            action="start",
+                            examples={
+                                "usage": "start(workflow_type='customer_onboarding', context={...}, dry_run=True)",
+                                "available_types": list(
+                                    self.workflow_manager.workflow_templates.keys()
+                                )
+                                + ["generic"],
+                            },
+                        )
                     context = arguments.get("context", {})
                     self.workflow_manager.validate_start_args(workflow_type, context)
                     return [

@@ -21,6 +21,8 @@ from .subscription_management import SubscriptionManagement
 
 # Import unified tool base class (legacy base classes removed)
 from .unified_tool_base import ToolBase
+from .agent_management import AgentManagement
+from .cost_controls_management import CostControlsManagement
 from .tool_management import ToolManagement
 from .workflow_management import WorkflowManagement
 
@@ -47,6 +49,8 @@ __all__ = [
     "CustomerManagement",
     "MeteringManagement",
     "MeteringElementsManagement",
+    "AgentManagement",
+    "CostControlsManagement",
     "ToolManagement",
     "WorkflowManagement",
     # Performance monitoring tools removed - infrastructure monitoring handled externally

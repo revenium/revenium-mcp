@@ -4,7 +4,7 @@ This tool provides email configuration and verification guidance using existing
 validation infrastructure from validators.py and config_cache.py update patterns.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
@@ -170,7 +170,7 @@ class EmailVerification(ToolBase):
 
 **New Email**: {validated_email}
 **Status**: Successfully configured
-**Updated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+**Updated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
 
 ## 📧 **What This Means**
 
@@ -193,7 +193,7 @@ Your notification email has been updated and will be used for:
 
 **Email**: {validated_email}
 **Status**: Failed to update configuration
-**Timestamp**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+**Timestamp**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
 
 ## 🔧 **Troubleshooting**
 
@@ -256,7 +256,7 @@ This might be due to:
 **Original**: {email}
 **Validated**: {validated_email}
 **Format**: Valid email address format
-**Timestamp**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+**Timestamp**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
 
 ## 📧 **Validation Details**
 
@@ -282,7 +282,7 @@ This email address is ready to use! You can:
 
 **Email**: {email}
 **Error**: {str(e)}
-**Timestamp**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+**Timestamp**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
 
 ## 📧 **Common Email Format Issues**
 
@@ -358,7 +358,7 @@ This email address is ready to use! You can:
     def _build_email_status(self, current_email: Optional[str]) -> str:
         """Build email configuration status display."""
         status = "# 📧 **Email Configuration Status**\n\n"
-        status += f"**Checked**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+        status += f"**Checked**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
         if current_email:
             status += "## ✅ **Email Configured**\n\n"
@@ -401,7 +401,7 @@ This email address is ready to use! You can:
     def _build_setup_guidance(self, current_email: Optional[str]) -> str:
         """Build comprehensive email setup guidance."""
         guidance = "# 📖 **Email Setup Guidance**\n\n"
-        guidance += f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+        guidance += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
         if current_email:
             guidance += "## ✅ **Current Configuration**\n\n"
@@ -476,7 +476,7 @@ This email address is ready to use! You can:
     def _build_configuration_test(self, current_email: Optional[str]) -> str:
         """Build email configuration test results."""
         test = "# 🧪 **Email Configuration Test**\n\n"
-        test += f"**Test Run**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+        test += f"**Test Run**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
         if current_email:
             test += "## ✅ **Configuration Found**\n\n"

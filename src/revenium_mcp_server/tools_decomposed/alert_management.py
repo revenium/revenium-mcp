@@ -187,6 +187,12 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                 return await self._handle_toggle_anomaly_status(client, arguments)
             elif action == "get_status":
                 return await self._handle_get_anomaly_status(client, arguments)
+            elif action == "reset_budget":
+                return await self._handle_reset_budget(client, arguments)
+            elif action == "get_budget_portfolio":
+                return await self._handle_get_budget_portfolio(client, arguments)
+            elif action == "get_budget_progress":
+                return await self._handle_get_budget_progress(client, arguments)
             else:
                 # Use structured error for unknown action
                 raise ToolError(
@@ -219,7 +225,17 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                             "enable_multiple",
                             "disable_multiple",
                         ],
-                        "individual_control": ["enable", "disable", "toggle_status", "get_status"],
+                        "individual_control": [
+                            "enable",
+                            "disable",
+                            "toggle_status",
+                            "get_status",
+                            "reset_budget",
+                        ],
+                        "budget_progress": [
+                            "get_budget_portfolio",
+                            "get_budget_progress",
+                        ],
                     },
                 )
 
@@ -373,6 +389,9 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
             "disable_all",
             "toggle_status",
             "get_status",
+            "reset_budget",
+            "get_budget_portfolio",
+            "get_budget_progress",
         ]
 
     async def _get_tool_dependencies(self) -> List[ToolDependency]:
@@ -689,7 +708,10 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
         if resource_type == "anomalies":
             # Handle dry_run mode for create operations
             if dry_run:
-                anomaly_data = arguments.get("anomaly_data")
+                # Same assembly the live path uses (flat-field merge, aliases,
+                # operator default, banned-period guard) — the preview must see
+                # exactly what a live create would send.
+                anomaly_data = self._assemble_anomaly_data(arguments)
                 if not anomaly_data:
                     return [
                         TextContent(
@@ -698,7 +720,21 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                         )
                     ]
 
-                # Validate required fields without creating
+                # Run the SAME validation the live create runs — a dry-run
+                # that echoes success for a payload live would 400 is worse
+                # than no dry-run at all.
+                try:
+                    self.anomaly_manager.validate_anomaly_payload(anomaly_data)
+                except (ValidationError, ToolError) as exc:
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                "**Dry Run Validation Failed** — the live create "
+                                f"would reject this payload:\n\n{exc}"
+                            ),
+                        )
+                    ]
                 validation_result = {
                     "dry_run": True,
                     "operation": "create_anomaly",
@@ -887,6 +923,107 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
     # ANOMALY OPERATIONS (from alert_tools.py)
     # ============================================================================
 
+    def _assemble_anomaly_data(self, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Assemble the effective anomaly payload from nested + flat arguments.
+
+        Single assembly source for the live create path AND dry-run, so the
+        preview always sees exactly what a live create would send. Raises the
+        banned-period validation error for both paths.
+        """
+        anomaly_data = arguments.get("anomaly_data")
+        # The MCP signature and the get_examples payloads document these
+        # alert fields as flat top-level kwargs, so callers routinely pass
+        # them that way — fold every one of them into anomaly_data so the
+        # documented payload shape actually creates an alert (previously
+        # only periodDuration/triggerAfterPersistsDuration were folded and
+        # the rest were silently dropped, so a documented flat payload
+        # failed with "Anomaly name is required").
+        # Nested values win over flat kwargs (explicit > implicit).
+        #
+        # Use `is not None` (not truthiness) so falsy-but-meaningful
+        # values like "" are forwarded to the backend rather than
+        # silently dropped at the MCP layer — let the API surface the
+        # error instead of pretending the caller never sent the field.
+        flat_fields = (
+            "name",
+            "alertType",
+            "metricType",
+            "threshold",
+            "isPercentage",
+            "enabled",
+            "description",
+            "tags",
+            "period",
+            "periodDuration",
+            "triggerAfterPersistsDuration",
+            "notificationAddresses",
+            "slackConfigurations",
+            "filters",
+        )
+        merged = {
+            field: arguments[field]
+            for field in flat_fields
+            if arguments.get(field) is not None
+        }
+        # Aliases the signature also exposes: `metric` for metricType, and
+        # the flat `email` the examples use for notificationAddresses.
+        if arguments.get("metric") is not None:
+            merged.setdefault("metricType", arguments["metric"])
+        if arguments.get("email") is not None:
+            merged.setdefault("notificationAddresses", [arguments["email"]])
+        if merged:
+            if isinstance(anomaly_data, dict):
+                for field, flat_value in merged.items():
+                    anomaly_data.setdefault(field, flat_value)
+            elif anomaly_data is None:
+                anomaly_data = merged
+        # operatorType is nested-only in the signature, yet the direct API
+        # format requires it. Threshold-style alerts always mean "fires
+        # above the threshold" — the same GREATER_THAN the
+        # create_threshold_alert convenience hardcodes — so default it.
+        # RELATIVE_CHANGE keeps requiring an explicit operator
+        # (INCREASES_BY / DECREASES_BY is a semantic choice).
+        if (
+            isinstance(anomaly_data, dict)
+            and "operatorType" not in anomaly_data
+            and anomaly_data.get("alertType") in ("THRESHOLD", "CUMULATIVE_USAGE")
+        ):
+            anomaly_data["operatorType"] = "GREATER_THAN"
+        # The platform rejects tracking periods shorter than
+        # FIFTEEN_MINUTES for non-cumulative alerts, but its 400 carries a
+        # generic message — reject locally with the actionable rule.
+        if (
+            isinstance(anomaly_data, dict)
+            and anomaly_data.get("alertType") != "CUMULATIVE_USAGE"
+            and anomaly_data.get("periodDuration")
+            in ("ONE_MINUTE", "FIVE_MINUTES", "TEN_MINUTES")
+        ):
+            raise create_structured_validation_error(
+                message=(
+                    f"periodDuration {anomaly_data['periodDuration']} is not "
+                    "supported by the platform; use FIFTEEN_MINUTES or longer"
+                ),
+                field="periodDuration",
+                value=anomaly_data["periodDuration"],
+                suggestions=[
+                    "Use FIFTEEN_MINUTES, THIRTY_MINUTES, ONE_HOUR, TWELVE_HOURS, DAILY, WEEKLY, MONTHLY, QUARTERLY, or THIRTY_DAYS",
+                ],
+                examples={
+                    "valid_period_durations": [
+                        "FIFTEEN_MINUTES",
+                        "THIRTY_MINUTES",
+                        "ONE_HOUR",
+                        "TWELVE_HOURS",
+                        "DAILY",
+                        "WEEKLY",
+                        "MONTHLY",
+                        "QUARTERLY",
+                        "THIRTY_DAYS",
+                    ],
+                },
+            )
+        return anomaly_data
+
     async def _handle_anomaly_operations(
         self, client: ReveniumClient, action: str, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
@@ -920,27 +1057,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
             return await self.anomaly_manager.get_anomaly(client, anomaly_id)
 
         elif action == "create":
-            anomaly_data = arguments.get("anomaly_data")
-            # Honor flat periodDuration / triggerAfterPersistsDuration kwargs by
-            # injecting them into anomaly_data when provided alongside (or
-            # instead of) the nested payload. Both fields are top-level
-            # arguments in the MCP signature and both appear in the example
-            # payloads from get_examples, so callers frequently pass them flat.
-            # Without this, the values are silently dropped unless nested.
-            # Nested values win over flat kwargs (explicit > implicit).
-            #
-            # Use `is not None` (not truthiness) so falsy-but-meaningful
-            # values like "" are forwarded to the backend rather than
-            # silently dropped at the MCP layer — let the API surface the
-            # error instead of pretending the caller never sent the field.
-            for field in ("periodDuration", "triggerAfterPersistsDuration"):
-                flat_value = arguments.get(field)
-                if flat_value is None:
-                    continue
-                if isinstance(anomaly_data, dict):
-                    anomaly_data.setdefault(field, flat_value)
-                elif anomaly_data is None:
-                    anomaly_data = {field: flat_value}
+            anomaly_data = self._assemble_anomaly_data(arguments)
             if not anomaly_data:
                 error = create_structured_missing_parameter_error(
                     parameter_name="anomaly_data",
@@ -1319,6 +1436,9 @@ get(resource_type="alerts", alert_id="evt_123")  # Specific alert event
 list(resource_type="anomalies")                 # Alert rules/definitions
 create_cumulative_usage_alert(...)              # Budget tracking rule
 create_threshold_alert(...)                     # Real-time monitoring rule
+reset_budget(anomaly_id="anom_123")             # Restart a budget alert's current-period accumulation (id from list(resource_type="anomalies"))
+get_budget_portfolio()                          # Tenant-wide budget-progress snapshot for every CUMULATIVE_USAGE alert
+get_budget_progress(anomaly_id="anom_123")      # Current period spend vs. threshold for one budget alert (or anomaly_ids=[...] for several)
 ```
 
 ## **Alert Type Decision Tree**
@@ -1399,7 +1519,7 @@ The `triggerAfterPersistsDuration` parameter enables sophisticated alert behavio
 ### **How It Works**
 - **periodDuration**: How frequently the alert condition is evaluated (e.g., every 5 minutes)
 - **triggerAfterPersistsDuration**: How long the condition must persist before triggering (e.g., 15 minutes)
-- **Example**: With `periodDuration="FIVE_MINUTES"` and `triggerAfterPersistsDuration="FIFTEEN_MINUTES"`, the alert checks every 5 minutes and only triggers if the threshold is exceeded for 3 consecutive checks
+- **Example**: With `periodDuration="FIFTEEN_MINUTES"` and `triggerAfterPersistsDuration="THIRTY_MINUTES"`, the alert checks every 15 minutes and only triggers if the threshold is exceeded for 2 consecutive checks
 
 ### **Use Cases**
 - **Sustained Cost Spikes**: Only alert if costs remain high for 30 minutes
@@ -1686,6 +1806,29 @@ create(
 )
 ```
 
+## **Budget Accumulation Reset**
+```bash
+# Restart the current period's accumulation for a tripped budget alert
+# (the natural period boundary is unchanged; CUMULATIVE_USAGE alerts only).
+# Use the anomaly definition id from list(resource_type="anomalies") —
+# not a historical alert-event id from list(resource_type="alerts").
+reset_budget(anomaly_id="anom_123")
+```
+
+## **Budget Progress (read-only)**
+```bash
+# Tenant-wide snapshot — every CUMULATIVE_USAGE alert's current-period spend
+# vs. its threshold, with pace-vs-linear status. Paginated.
+get_budget_portfolio(page=0, size=20)
+
+# Progress for one budget alert (period spend, remaining, percent used,
+# and ahead/behind-vs-linear).
+get_budget_progress(anomaly_id="anom_123")
+
+# Progress for a specific set of budget alerts in one call.
+get_budget_progress(anomaly_ids=["anom_123", "anom_456"])
+```
+
 **Pro Tip**: Use metric filtering to create targeted budget alerts that track spending for specific providers, models, customers, or products instead of global budgets!""",
                     )
                 ]
@@ -1706,7 +1849,7 @@ Perfect for real-time monitoring and spike detection.
   "alertType": "THRESHOLD",
   "metricType": "TOTAL_COST",
   "threshold": 100,
-  "periodDuration": "FIVE_MINUTES",
+  "periodDuration": "FIFTEEN_MINUTES",
   "email": "alerts@company.com"
 }
 ```
@@ -1719,7 +1862,7 @@ Perfect for real-time monitoring and spike detection.
   "metricType": "ERROR_RATE",
   "threshold": 5,
   "isPercentage": true,
-  "periodDuration": "ONE_MINUTE",
+  "periodDuration": "FIFTEEN_MINUTES",
   "email": "engineering@company.com"
 }
 ```
@@ -1731,7 +1874,7 @@ Perfect for real-time monitoring and spike detection.
   "alertType": "THRESHOLD",
   "metricType": "TOTAL_COST",
   "threshold": 200,
-  "periodDuration": "FIVE_MINUTES",
+  "periodDuration": "FIFTEEN_MINUTES",
   "triggerAfterPersistsDuration": "FIFTEEN_MINUTES",
   "email": "finance@company.com"
 }
@@ -1745,7 +1888,7 @@ Perfect for real-time monitoring and spike detection.
   "metricType": "ERROR_RATE",
   "threshold": 3,
   "isPercentage": true,
-  "periodDuration": "ONE_MINUTE",
+  "periodDuration": "FIFTEEN_MINUTES",
   "triggerAfterPersistsDuration": "FIFTEEN_MINUTES",
   "email": "ops@company.com"
 }
@@ -1758,7 +1901,7 @@ Perfect for real-time monitoring and spike detection.
   "alertType": "THRESHOLD",
   "metricType": "TOKENS_PER_MINUTE",
   "threshold": 1000,
-  "periodDuration": "ONE_MINUTE",
+  "periodDuration": "FIFTEEN_MINUTES",
   "email": "ops@company.com"
 }
 ```
@@ -2233,13 +2376,11 @@ The update action supports user-friendly parameter names that are automatically 
 | `trigger_after_persists_duration` | `triggerAfterPersistsDuration` | `"trigger_after_persists_duration": "FIFTEEN_MINUTES"` |
 
 ### **Period Minutes Conversion**
-- `1` → `"ONE_MINUTE"`
-- `5` → `"FIVE_MINUTES"`
 - `15` → `"FIFTEEN_MINUTES"`
 - `30` → `"THIRTY_MINUTES"`
 - `60` → `"ONE_HOUR"`
 - `720` → `"TWELVE_HOURS"`
-- `1440` → `"TWENTY_FOUR_HOURS"`
+- `1440` → `"DAILY"`
 
 ## **Common Error Fix**
 
@@ -2412,7 +2553,7 @@ create(resource_type="anomalies", anomaly_data={
   "alertType": "THRESHOLD",
   "metricType": "TOTAL_COST",
   "threshold": 200,
-  "periodDuration": "FIVE_MINUTES",
+  "periodDuration": "FIFTEEN_MINUTES",
   "triggerAfterPersistsDuration": "FIFTEEN_MINUTES",
   "email": "finance@company.com"
 })
@@ -2649,6 +2790,9 @@ create(resource_type="anomalies", anomaly_data={
 
             return prompting_message
 
+        except PermissionError:
+            # Auth failures must fail closed — do not swallow the mixin guard.
+            raise
         except Exception as e:
             # If prompting fails, don't block the main workflow
             logger.warning(f"Slack prompting failed: {e}")
@@ -2835,7 +2979,7 @@ create(resource_type="anomalies", anomaly_data={
         try:
             name = arguments.get("name")
             threshold = arguments.get("threshold")
-            period_minutes = arguments.get("period_minutes", 5)
+            period_minutes = arguments.get("period_minutes", 15)
             provided_email = arguments.get("email")
             slack_config_id = arguments.get("slack_config_id")
             # CRITICAL FIX: Add metric type support
@@ -2905,30 +3049,30 @@ create(resource_type="anomalies", anomaly_data={
                 logger.info(f"Creating threshold alert with metric: {metric_type}")
                 # Note: Metric validation is handled by the API based on UCM capabilities
 
-            # Map period minutes to API format
+            # Map period minutes to API format. The platform rejects tracking
+            # periods shorter than FIFTEEN_MINUTES ("no longer supported; use
+            # FIFTEEN_MINUTES or longer"), so 1/5/10 are not offered.
             period_mapping = {
-                1: "ONE_MINUTE",
-                5: "FIVE_MINUTES",
-                10: "TEN_MINUTES",
                 15: "FIFTEEN_MINUTES",
                 30: "THIRTY_MINUTES",
                 60: "ONE_HOUR",
+                720: "TWELVE_HOURS",
+                1440: "DAILY",
             }
 
             period_duration = period_mapping.get(int(period_minutes))
             if not period_duration:
                 raise create_structured_validation_error(
-                    message=f"Invalid period_minutes '{period_minutes}'",
+                    message=f"Invalid period_minutes '{period_minutes}' — the platform requires FIFTEEN_MINUTES or longer",
                     field="period_minutes",
                     value=period_minutes,
                     suggestions=[
-                        "Use one of the supported period durations",
+                        "Use one of the supported period durations (periods shorter than 15 minutes are no longer supported by the platform)",
                         "Check the period_minutes value for typos",
                         "Ensure the period aligns with monitoring requirements",
-                        "Consider using standard monitoring intervals",
                     ],
                     examples={
-                        "valid_periods": [1, 5, 10, 15, 30, 60],
+                        "valid_periods": [15, 30, 60, 720, 1440],
                         "usage": "create_threshold_alert(period_minutes=15, ...)",
                         "monitoring_context": "Period determines how frequently the alert condition is evaluated",
                     },
@@ -3129,7 +3273,7 @@ create(resource_type="anomalies", anomaly_data={
         # Default logic: if both or neither, prefer cumulative for budget-like terms
         if is_threshold and not is_cumulative:
             alert_type = "THRESHOLD"
-            period_duration = "FIVE_MINUTES"
+            period_duration = "FIFTEEN_MINUTES"
             tracking_period = None
         elif is_cumulative or "budget" in text_lower or "monthly" in text_lower:
             alert_type = "CUMULATIVE_USAGE"
@@ -3146,7 +3290,7 @@ create(resource_type="anomalies", anomaly_data={
         else:
             # Default to threshold for unclear cases
             alert_type = "THRESHOLD"
-            period_duration = "FIVE_MINUTES"
+            period_duration = "FIFTEEN_MINUTES"
             tracking_period = None
 
         # CRITICAL FIX: Extract metric type from text
@@ -3252,6 +3396,7 @@ create(resource_type="anomalies", anomaly_data={
             slack_config_id = arguments.get("slack_config_id")
             metric = arguments.get("metric", "TOTAL_COST")
             threshold = arguments.get("threshold", 100)
+            dry_run = arguments.get("dry_run", False)
 
             # Resolve notification configuration (email + Slack)
             try:
@@ -3270,7 +3415,7 @@ create(resource_type="anomalies", anomaly_data={
                 "operatorType": "GREATER_THAN",
                 "threshold": float(threshold),
                 "isPercentage": False,
-                "periodDuration": "FIVE_MINUTES",
+                "periodDuration": "FIFTEEN_MINUTES",
                 "description": f"Simple alert for {metric} monitoring",
                 "enabled": True,
                 "notificationAddresses": notification_config["notificationAddresses"],
@@ -3278,6 +3423,21 @@ create(resource_type="anomalies", anomaly_data={
                 "triggerAfterPersistsDuration": "",
                 "filters": [],
             }
+
+            if dry_run:
+                preview = {
+                    "dry_run": True,
+                    "operation": "create_simple",
+                    "valid": True,
+                    "message": "**Dry Run Successful**: Simple alert is valid and ready for creation",
+                    "would_create": anomaly_data,
+                }
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"**DRY RUN MODE**\n\n{json.dumps(preview, indent=2)}",
+                    )
+                ]
 
             # Use AnomalyManager with direct API format validation
             return await self.anomaly_manager.create_anomaly(client, anomaly_data)
@@ -3902,6 +4062,288 @@ create(resource_type="anomalies", anomaly_data={
                 },
             )
 
+    async def _handle_reset_budget(
+        self, client: ReveniumClient, arguments: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Reset the in-flight budget accumulation for a CUMULATIVE_USAGE alert.
+
+        The natural period boundary is unchanged — only the current period's
+        accumulation restarts, so a tripped budget alert can re-arm without
+        waiting for the period to roll over.
+        """
+        anomaly_id = arguments.get("anomaly_id")
+
+        if not anomaly_id:
+            raise create_structured_missing_parameter_error(
+                parameter_name="anomaly_id",
+                action="reset budget",
+                examples={
+                    "usage": "reset_budget(anomaly_id='anom_123')",
+                    "valid_format": "Anomaly ID should be a string identifier",
+                    "monitoring_context": (
+                        "Budget reset applies to CUMULATIVE_USAGE alerts only — "
+                        "it restarts the current period's accumulation"
+                    ),
+                },
+            )
+
+        try:
+            result = await client.reset_anomaly_budget(str(anomaly_id))
+        except ReveniumAPIError as e:
+            if e.status_code == 404:
+                raise ToolError(
+                    message=f"Alert not found for id: {anomaly_id!r}",
+                    error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+                    field="anomaly_id",
+                    value=str(anomaly_id),
+                    suggestions=[
+                        "Verify the anomaly_id exists using list()",
+                        "Budget reset only applies to alerts in your organization",
+                    ],
+                )
+            if e.status_code == 422:
+                raise ToolError(
+                    message=(
+                        f"Alert {anomaly_id!r} is not a CUMULATIVE_USAGE budget alert — "
+                        "only cumulative-usage budgets accumulate spend that can be reset"
+                    ),
+                    error_code=ErrorCodes.VALIDATION_ERROR,
+                    field="anomaly_id",
+                    value=str(anomaly_id),
+                    suggestions=[
+                        "Use get(anomaly_id=...) to check the alert's alertType",
+                        "Budget reset applies to alerts created via create_cumulative_usage_alert",
+                    ],
+                )
+            raise
+
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    f"**Budget Accumulation Reset**\n\n"
+                    f"**Alert ID**: `{anomaly_id}`\n"
+                    f"**Effect**: current period accumulation restarted; the natural "
+                    f"period boundary is unchanged\n\n"
+                    + json.dumps(result, indent=2, default=str)
+                ),
+            )
+        ]
+
+    @staticmethod
+    def _budget_progress_filters(arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Map the tool-level ``include_trend``/``now`` args to API query params.
+
+        Only forwards params the caller actually supplied so the controller
+        applies its own defaults for the rest.
+        """
+        filters: Dict[str, Any] = {}
+        if "include_trend" in arguments and arguments["include_trend"] is not None:
+            filters["includeTrend"] = arguments["include_trend"]
+        if arguments.get("now") is not None:
+            filters["now"] = arguments["now"]
+        return filters
+
+    @staticmethod
+    def _render_budget_progress_entry(entry: Dict[str, Any]) -> str:
+        """Render one budget-progress resource as a compact bullet.
+
+        Numeric/shape honesty (BACK-2354 precedent): when the payload lacks a
+        numeric currentValue/threshold the entry is rendered as
+        "state unavailable" rather than fabricated zeros; a missing scalar is
+        omitted rather than printed as Python ``None``.
+        """
+        # Portfolio/bulk items carry the hashed id under alertId; only the
+        # single per-anomaly endpoint returns anomalyId (the numeric internal
+        # id) — live dev evidence. Prefer the caller-usable hashed id.
+        entry_id = entry.get("alertId") or entry.get("anomalyId")
+        name = entry.get("name")
+        label = f"{name} (`{entry_id}`)" if name else f"`{entry_id}`"
+
+        metric = entry.get("metricType")
+        current = entry.get("currentValue")
+        threshold = entry.get("threshold")
+        status = None
+        ahead_behind = entry.get("aheadBehindVsLinear")
+        if isinstance(ahead_behind, dict):
+            status = ahead_behind.get("status")
+
+        # A budget-progress resource is only meaningful with numeric spend vs.
+        # threshold — if either is absent/non-numeric, mark the whole entry.
+        numeric_ok = isinstance(current, (int, float)) and isinstance(threshold, (int, float))
+        if not numeric_ok:
+            metric_suffix = f" — {metric}" if metric else ""
+            return f"- {label}{metric_suffix}: state unavailable"
+
+        parts = [f"- {label}"]
+        if metric:
+            parts.append(f"metric {metric}")
+        parts.append(f"{current}/{threshold}")
+
+        percent = entry.get("percentUsed")
+        if isinstance(percent, (int, float)):
+            parts.append(f"{percent}% used")
+
+        if status:
+            parts.append(f"vs-linear {status}")
+
+        return " · ".join(parts)
+
+    async def _handle_get_budget_portfolio(
+        self, client: ReveniumClient, arguments: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """List tenant-wide budget progress for every CUMULATIVE_USAGE alert.
+
+        Read-only companion to reset_budget: the same budget-progress resource,
+        rendered as a compact per-alert list with pagination. Authorized
+        per-tenant — no id path param, so API errors propagate through the
+        tool's standard tail (no not-found translation here).
+        """
+        page = arguments.get("page", 0)
+        size = arguments.get("size", 20)
+        filters = self._budget_progress_filters(arguments)
+
+        result = await client.get_budget_portfolio(page=page, size=size, **filters)
+
+        entries = client._extract_embedded_data(result)
+        pagination = client._extract_pagination_info(result)
+
+        if not entries:
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        "**Budget Progress Portfolio**\n\n"
+                        "No budget alerts for this tenant. Create one with "
+                        "`create_cumulative_usage_alert(...)` to start tracking "
+                        "period spend."
+                    ),
+                )
+            ]
+
+        lines = [self._render_budget_progress_entry(e) for e in entries]
+
+        total_elements = pagination.get("totalElements")
+        total_pages = pagination.get("totalPages")
+        page_number = pagination.get("number", page)
+        pagination_line = f"Page {page_number}"
+        if total_pages is not None:
+            pagination_line += f" of {total_pages}"
+        if total_elements is not None:
+            pagination_line += f" · {total_elements} total"
+
+        text = (
+            "**Budget Progress Portfolio**\n\n"
+            + "\n".join(lines)
+            + f"\n\n{pagination_line}"
+        )
+        return [TextContent(type="text", text=text)]
+
+    async def _handle_get_budget_progress(
+        self, client: ReveniumClient, arguments: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Read current budget progress for one anomaly or a specific set.
+
+        Exactly one of ``anomaly_id`` (single) or ``anomaly_ids`` (list) is
+        required. The single path uses the per-anomaly endpoint (404 folds to a
+        structured not-found, 422 to a not-a-CUMULATIVE_USAGE explanation, 5xx
+        propagates). The bulk path uses /budgets/progress and renders each item.
+        """
+        anomaly_id = arguments.get("anomaly_id")
+        anomaly_ids = arguments.get("anomaly_ids")
+        has_single = anomaly_id is not None and anomaly_id != ""
+        # bool() so an empty list counts as "not provided" — the bulk endpoint
+        # requires a non-empty ids param.
+        has_bulk = bool(anomaly_ids)
+
+        if has_single == has_bulk:
+            # Both provided, or neither — exactly one is required.
+            raise create_structured_validation_error(
+                message=(
+                    "Provide exactly one of anomaly_id (single) or anomaly_ids (list)"
+                ),
+                field="anomaly_id",
+                value={"anomaly_id": anomaly_id, "anomaly_ids": anomaly_ids},
+                suggestions=[
+                    "Pass anomaly_id='anom_123' for a single alert's progress",
+                    "Pass anomaly_ids=['anom_1', 'anom_2'] for several at once",
+                    "Do not pass both — they select different endpoints",
+                ],
+                examples={
+                    "single": "get_budget_progress(anomaly_id='anom_123')",
+                    "bulk": "get_budget_progress(anomaly_ids=['anom_1', 'anom_2'])",
+                },
+            )
+
+        filters = self._budget_progress_filters(arguments)
+
+        if has_single:
+            try:
+                result = await client.get_anomaly_budget_progress(str(anomaly_id), **filters)
+            except ReveniumAPIError as e:
+                # Live dev evidence: bogus ids 400, deleted ids 403 — GET-by-id
+                # has no input other than the id, so 400/403/404 all mean "no
+                # accessible alert for this id". 5xx propagates.
+                if e.status_code in (400, 403, 404):
+                    raise ToolError(
+                        message=f"Alert not found for id: {anomaly_id!r}",
+                        error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+                        field="anomaly_id",
+                        value=str(anomaly_id),
+                        suggestions=[
+                            "Verify the anomaly_id exists using list()",
+                            "Budget progress only applies to alerts in your organization",
+                        ],
+                    )
+                if e.status_code == 422:
+                    raise ToolError(
+                        message=(
+                            f"Alert {anomaly_id!r} is not a CUMULATIVE_USAGE budget alert — "
+                            "only cumulative-usage budgets accumulate spend with progress"
+                        ),
+                        error_code=ErrorCodes.VALIDATION_ERROR,
+                        field="anomaly_id",
+                        value=str(anomaly_id),
+                        suggestions=[
+                            "Use get(anomaly_id=...) to check the alert's alertType",
+                            "Budget progress applies to alerts created via create_cumulative_usage_alert",
+                        ],
+                    )
+                raise
+
+            # The payload's anomalyId is the numeric internal id; label the
+            # response with the hashed id the caller passed so it stays
+            # correlatable (live dev evidence: 178302 vs 5jgQQ7).
+            text = (
+                f"**Budget Progress** for `{anomaly_id}`\n\n"
+                + self._render_budget_progress_entry(result)
+                + "\n\n"
+                + json.dumps(result, indent=2, default=str)
+            )
+            return [TextContent(type="text", text=text)]
+
+        # Bulk path — /budgets/progress returns {"items": [...]}.
+        # anomaly_ids is guaranteed non-None here (has_bulk branch); coerce to
+        # a concrete list of ids for the client call.
+        ids = list(anomaly_ids or [])
+        result = await client.get_budget_progress_bulk(ids, **filters)
+        items = result.get("items", []) if isinstance(result, dict) else []
+
+        if not items:
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        "**Budget Progress**\n\n"
+                        "No budget progress found for the requested alert ids."
+                    ),
+                )
+            ]
+
+        lines = [self._render_budget_progress_entry(item) for item in items]
+        text = "**Budget Progress**\n\n" + "\n".join(lines)
+        return [TextContent(type="text", text=text)]
+
     async def _get_input_schema(self) -> Dict[str, Any]:
         """Context7 single source of truth for manage_alerts schema."""
         return {
@@ -3920,6 +4362,10 @@ create(resource_type="anomalies", anomaly_data={
                 "threshold": {
                     "anyOf": [{"type": "number"}, {"type": "string"}],
                     "description": "Alert threshold value (required for creating alerts)",
+                },
+                "isPercentage": {
+                    "anyOf": [{"type": "boolean"}, {"type": "string"}, {"type": "null"}],
+                    "description": "Whether the threshold is a percentage (e.g. ERROR_RATE alerts) rather than an absolute value",
                 },
                 # Optional alert configuration
                 "period": {
@@ -3948,9 +4394,22 @@ create(resource_type="anomalies", anomaly_data={
                     "type": "string",
                     "description": "Alert rule ID for get/update/delete operations",
                 },
+                "anomaly_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Alert rule IDs for bulk get_budget_progress reads",
+                },
                 "alert_id": {
                     "type": "string",
                     "description": "Historical alert event ID for querying specific incidents",
+                },
+                "include_trend": {
+                    "anyOf": [{"type": "boolean"}, {"type": "string"}],
+                    "description": "Include trend data in budget-progress reads (get_budget_portfolio, get_budget_progress)",
+                },
+                "now": {
+                    "type": "string",
+                    "description": "ISO timestamp anchoring the budget-progress window (defaults to server time)",
                 },
                 # Query and filtering fields
                 "query": {

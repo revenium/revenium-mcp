@@ -5,6 +5,7 @@ Registry API, covering 27 actions: 10 CRUD, 4 event-metering, 10 analytics, 3 in
 """
 
 import json
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
@@ -542,6 +543,28 @@ class ToolManager:
             },
         }
 
+    @staticmethod
+    def _coerce_decimal(
+        value: Any, field_label: str, errors: List[str]
+    ) -> Optional[Decimal]:
+        """Coerce a numeric or numeric-string value to Decimal for comparison.
+
+        The upstream API serializes BigDecimal fields (e.g. unitPrice, upTo) as
+        JSON strings. Accept both `number` and numeric `string` inputs so a
+        round-tripped GET payload (which returns strings) can be re-submitted
+        via create/update/replace without raising a TypeError. On failure,
+        appends a structured error message and returns None.
+        """
+        try:
+            decimal_value = Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError):
+            errors.append(f"{field_label} must be a number")
+            return None
+        if not decimal_value.is_finite():
+            errors.append(f"{field_label} must be a number")
+            return None
+        return decimal_value
+
     def _validate_tool_pricing(self, pricing: Dict[str, Any]) -> List[str]:
         """Validate pricing structure, return list of error messages."""
         errors: List[str] = []
@@ -554,8 +577,12 @@ class ToolManager:
         for i, element in enumerate(pricing["elements"]):
             if "name" not in element:
                 errors.append(f"pricing.elements[{i}].name is required")
-            if "unitPrice" in element and element["unitPrice"] < 0:
-                errors.append(f"pricing.elements[{i}].unitPrice must be >= 0")
+            if "unitPrice" in element:
+                unit_price = self._coerce_decimal(
+                    element["unitPrice"], f"pricing.elements[{i}].unitPrice", errors
+                )
+                if unit_price is not None and unit_price < 0:
+                    errors.append(f"pricing.elements[{i}].unitPrice must be >= 0")
             agg = element.get("aggregationType")
             if agg and agg not in valid_agg_types:
                 errors.append(
@@ -565,15 +592,40 @@ class ToolManager:
             tiers = element.get("tiers", [])
             if tiers:
                 for j, tier in enumerate(tiers):
-                    if "unitPrice" in tier and tier["unitPrice"] < 0:
-                        errors.append(f"pricing.elements[{i}].tiers[{j}].unitPrice must be >= 0")
+                    if "unitPrice" in tier:
+                        tier_unit_price = self._coerce_decimal(
+                            tier["unitPrice"],
+                            f"pricing.elements[{i}].tiers[{j}].unitPrice",
+                            errors,
+                        )
+                        if tier_unit_price is not None and tier_unit_price < 0:
+                            errors.append(
+                                f"pricing.elements[{i}].tiers[{j}].unitPrice must be >= 0"
+                            )
                 if tiers[-1].get("upTo") is not None:
                     errors.append(f"pricing.elements[{i}].tiers: final tier must have upTo: null")
+                coerced_up: List[Optional[Decimal]] = []
+                for j, tier in enumerate(tiers):
+                    up_raw = tier.get("upTo")
+                    if up_raw is None:
+                        coerced_up.append(None)
+                    else:
+                        coerced_up.append(
+                            self._coerce_decimal(
+                                up_raw, f"pricing.elements[{i}].tiers[{j}].upTo", errors
+                            )
+                        )
                 for j in range(1, len(tiers)):
-                    prev_up = tiers[j - 1].get("upTo")
-                    curr_up = tiers[j].get("upTo")
-                    if prev_up is not None and curr_up is not None and curr_up <= prev_up:
-                        errors.append(f"pricing.elements[{i}].tiers: upTo values must be ascending")
+                    prev_up = coerced_up[j - 1]
+                    curr_up = coerced_up[j]
+                    if (
+                        prev_up is not None
+                        and curr_up is not None
+                        and curr_up <= prev_up
+                    ):
+                        errors.append(
+                            f"pricing.elements[{i}].tiers: upTo values must be ascending"
+                        )
 
         return errors
 
@@ -652,7 +704,10 @@ class ToolManagement(ToolBase):
                                         "type": "object",
                                         "properties": {
                                             "name": {"type": "string", "description": "Element name (e.g. 'requests', 'tokens')"},
-                                            "unitPrice": {"type": "number", "description": "Price per unit"},
+                                            "unitPrice": {
+                                                "type": ["number", "string"],
+                                                "description": "Price per unit (number or numeric string, e.g. from a prior GET response)",
+                                            },
                                             "aggregationType": {
                                                 "type": "string",
                                                 "enum": ["SUM", "COUNT", "AVERAGE", "MAXIMUM", "DISTINCT"],
@@ -664,8 +719,16 @@ class ToolManagement(ToolBase):
                                                 "items": {
                                                     "type": "object",
                                                     "properties": {
-                                                        "upTo": {"description": "Upper limit (null for unlimited/final tier)"},
-                                                        "unitPrice": {"type": "number", "description": "Price per unit in this tier"},
+                                                        "upTo": {
+                                                            "description": "Upper limit (null for unlimited/final tier; number or numeric string)"
+                                                        },
+                                                        "unitPrice": {
+                                                            "type": [
+                                                                "number",
+                                                                "string",
+                                                            ],
+                                                            "description": "Price per unit in this tier (number or numeric string, e.g. from a prior GET response)",
+                                                        },
                                                     },
                                                 },
                                             },
@@ -818,6 +881,7 @@ class ToolManagement(ToolBase):
             "get_pricing_help",
             # Introspection
             "get_capabilities",
+            "get_examples",
             "get_tool_metadata",
         ]
 
@@ -860,11 +924,20 @@ class ToolManagement(ToolBase):
                 description="Record and query tool usage events for billing and analytics",
                 parameters={
                     "meter_event": {"event_data": "dict (toolId, durationMs, success, timestamp optional)"},
-                    "list_events": {"page": "int (optional)", "size": "int (optional)", "filters": "dict (optional, e.g. {'toolId': 'tool_123'})"},
+                    "list_events": {
+                        "page": "int (optional)",
+                        "size": "int (optional)",
+                        "filters": (
+                            "dict (optional, e.g. {'toolId': 'tool_123'}). Supports 'query' for "
+                            "server-side search: exact transaction-ID match for UUID terms, then "
+                            "partial match across tool name, tool ID and resource/operation"
+                        ),
+                    },
                 },
                 examples=[
                     "meter_event(event_data={'toolId': 'tool_123', 'durationMs': 1500, 'success': True})",
                     "list_events(page=0, size=20, filters={'toolId': 'tool_123'})",
+                    "list_events(filters={'query': 'vector-search'})",
                 ],
                 limitations=[
                     "Events are append-only and cannot be modified after creation",
@@ -981,7 +1054,7 @@ class ToolManagement(ToolBase):
                 metadata = await self.get_tool_metadata()
                 return [TextContent(type="text", text=json.dumps(metadata.to_dict(), indent=2))]
 
-            if action == "get_capabilities":
+            if action in ("get_capabilities", "get_examples"):
                 capabilities = {
                     "supported_actions": await self._get_supported_actions(),
                     "schema": await self._get_input_schema(),
@@ -1035,6 +1108,13 @@ class ToolManagement(ToolBase):
                         "get_pricing_help": {"action": "get_pricing_help"},
                     },
                 }
+                if action == "get_examples":
+                    return [
+                        TextContent(
+                            type="text",
+                            text=f"Tool Registry Examples:\n{json.dumps({'action': 'get_examples', 'examples': capabilities['examples']}, indent=2)}",
+                        )
+                    ]
                 return [
                     TextContent(
                         type="text", text=f"Tool Registry Management Capabilities:\n{json.dumps(capabilities, indent=2)}"
@@ -1166,9 +1246,11 @@ class ToolManagement(ToolBase):
                 ]
 
         except ToolError as e:
-            return [TextContent(type="text", text=f"Tool error: {e.message}")]
+            logger.error(f"Tool error in manage_tools: {e}")
+            raise e
         except ReveniumAPIError as e:
-            return [TextContent(type="text", text=f"API error: {str(e)}")]
+            logger.error(f"Revenium API error in manage_tools: {e}")
+            raise e
         except Exception as e:
-            logger.error(f"Error in manage_tools action '{action}': {e}")
-            return [TextContent(type="text", text=f"Error executing manage_tools action '{action}': {str(e)}")]
+            logger.error(f"Unexpected error in manage_tools action '{action}': {e}")
+            raise e

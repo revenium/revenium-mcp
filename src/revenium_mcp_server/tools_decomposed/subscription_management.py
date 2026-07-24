@@ -9,7 +9,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
+from typing import NoReturn, TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -27,12 +27,13 @@ from ..common.error_handling import (
 )
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.update_configs import UpdateConfigFactory
+from ..common.validation import SAFE_INT_MAX
 from ..config_store import get_config_value
 from ..exceptions import ValidationError
 from ..hierarchy import (
-    cross_tier_validator,
-    entity_lookup_service,
-    hierarchy_navigation_service,
+    get_cross_tier_validator,
+    get_entity_lookup_service,
+    get_hierarchy_navigation_service,
 )
 from ..introspection.metadata import (
     DependencyType,
@@ -136,6 +137,19 @@ def _validate_subscriptions_pagination(page: Any, size: Any) -> None:
                 value=value,
                 suggestions=[
                     f"Pass an integer for {label} (no quotes, no booleans)",
+                ],
+            )
+        # Values beyond 2^53 arrive float64-corrupted from JSON decoders; the
+        # message must not echo the mangled number.
+        if abs(value) > SAFE_INT_MAX:
+            raise ToolError(
+                message=f"{label} exceeds safe integer range (max 2^53)",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=label,
+                value=str(value),
+                suggestions=[
+                    f"Pass {label} as a reasonable integer (e.g. {label}="
+                    f"{0 if label == 'page' else 20})",
                 ],
             )
     if page < 0:
@@ -408,6 +422,130 @@ class SubscriptionManager:
             else:
                 # Re-raise other API errors as-is
                 raise
+
+    def _raise_billing_read_not_found(
+        self, error: ReveniumAPIError, subscription_id: str
+    ) -> NoReturn:
+        """Fold upstream 400/403/404 into a structured ToolError.
+
+        Mirrors get_subscription's mapping: 404 → not-found, 400 → invalid-id;
+        403 is treated as not-found because a subscription owned by another
+        team is simply not visible to this API key.
+        Any other status is re-raised unchanged.
+        """
+        if error.status_code in (404, 403):
+            raise ToolError(
+                message=f"Subscription not found for id: {subscription_id}",
+                error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+                field="subscription_id",
+                value=subscription_id,
+                suggestions=[
+                    "Verify the subscription ID exists using list()",
+                    "Confirm your API key's team owns this subscription (billing reads are team-scoped)",
+                    "Use get_examples() to see valid subscription ID formats",
+                ],
+            )
+        elif error.status_code == 400:
+            raise ToolError(
+                message=f"Invalid subscription ID format: {subscription_id}",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="subscription_id",
+                value=subscription_id,
+                suggestions=[
+                    "Subscription IDs should be short alphanumeric strings (e.g., 'WwgyKa')",
+                    "Use list() to see valid subscription IDs",
+                    "Check the ID format - it should not contain special characters",
+                ],
+            )
+        # Re-raise other API errors as-is
+        raise error
+
+    async def get_billed_amount(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Get the amount billed for a subscription (read-only)."""
+        subscription_id = arguments.get("subscription_id")
+        if not subscription_id:
+            raise create_structured_missing_parameter_error(
+                parameter_name="subscription_id",
+                action="get billed amount",
+                examples={
+                    "usage": "get_billed_amount(subscription_id='sub_123')",
+                    "valid_format": "Subscription ID should be a string identifier",
+                    "example_ids": ["sub_123", "subscription_456"],
+                    "billing_safety": "🔒 BILLING SAFETY: Billed-amount is a read-only report of what has been charged",
+                },
+            )
+
+        try:
+            result = await self.client.get_subscription_billed_amount(subscription_id)
+        except ReveniumAPIError as e:
+            self._raise_billing_read_not_found(e, subscription_id)
+
+        amount = result.get("amountBilled")
+        # Numeric honesty (BACK-2354): a missing/null/non-numeric amount is a
+        # response-contract failure, not a successful zero balance.
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+            raise ToolError(
+                message=(
+                    "Unexpected response shape from billed-amount: "
+                    f"amountBilled was {amount!r}"
+                ),
+                error_code=ErrorCodes.API_ERROR,
+                field="amountBilled",
+                value=amount,
+                suggestions=[
+                    "This indicates an upstream contract change — report it",
+                    "Retry; if it persists the billing endpoint may be degraded",
+                ],
+            )
+        return {"subscription_id": subscription_id, "amountBilled": amount}
+
+    async def get_quota_consumed(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Get quota limit and consumption for a subscription (read-only)."""
+        subscription_id = arguments.get("subscription_id")
+        if not subscription_id:
+            raise create_structured_missing_parameter_error(
+                parameter_name="subscription_id",
+                action="get quota consumed",
+                examples={
+                    "usage": "get_quota_consumed(subscription_id='sub_123')",
+                    "valid_format": "Subscription ID should be a string identifier",
+                    "example_ids": ["sub_123", "subscription_456"],
+                    "billing_safety": "🔒 BILLING SAFETY: Quota-consumed is a read-only view of limit vs usage",
+                },
+            )
+
+        try:
+            result = await self.client.get_subscription_quota_consumed(subscription_id)
+        except ReveniumAPIError as e:
+            self._raise_billing_read_not_found(e, subscription_id)
+
+        limit = result.get("limit")
+        consumed = result.get("consumed")
+        # Numeric honesty: both fields must be numbers — never silently default.
+        if (
+            isinstance(limit, bool)
+            or isinstance(consumed, bool)
+            or not isinstance(limit, (int, float))
+            or not isinstance(consumed, (int, float))
+        ):
+            raise ToolError(
+                message=(
+                    "Unexpected response shape from quota-consumed: "
+                    f"limit={limit!r}, consumed={consumed!r}"
+                ),
+                error_code=ErrorCodes.API_ERROR,
+                field="quota",
+                value={"limit": limit, "consumed": consumed},
+                suggestions=[
+                    "This indicates an upstream contract change — report it",
+                    "Retry; if it persists the billing endpoint may be degraded",
+                ],
+            )
+        return {
+            "subscription_id": subscription_id,
+            "limit": limit,
+            "consumed": consumed,
+        }
 
     async def create_subscription(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Create new subscription with Context7 auto-generation support."""
@@ -1672,9 +1810,9 @@ class SubscriptionHierarchyManager:
         """Initialize hierarchy manager with client."""
         self.client = client
         self.formatter = UnifiedResponseFormatter("manage_subscriptions")
-        self.navigation_service: Any = hierarchy_navigation_service
-        self.lookup_service: Any = entity_lookup_service
-        self.validator: Any = cross_tier_validator
+        self.navigation_service = get_hierarchy_navigation_service(client)
+        self.lookup_service = get_entity_lookup_service(client)
+        self.validator = get_cross_tier_validator(client)
 
     async def get_product_details(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get product details for a given subscription."""
@@ -1970,6 +2108,10 @@ class SubscriptionManagement(ToolBase):
             # Route to appropriate handler based on action category
             if action in ["list", "get", "create", "update", "cancel", "delete"]:
                 return await self._handle_crud_actions(action, arguments, subscription_manager)
+            elif action in ["get_billed_amount", "get_quota_consumed"]:
+                return await self._handle_billing_read_actions(
+                    action, arguments, subscription_manager
+                )
             elif action in ["discover_products", "validate_product_for_subscription"]:
                 return await self._handle_creation_actions(action, arguments, subscription_manager)
             elif action in [
@@ -2169,6 +2311,26 @@ class SubscriptionManagement(ToolBase):
                     ]
 
                 if dry_run:
+                    # Parity with live create: the backend rejects a subscription
+                    # whose product does not resolve, so the preview must too.
+                    dry_product_id = subscription_data.get("product_id") or subscription_data.get("productId")
+                    if dry_product_id:
+                        try:
+                            await subscription_manager.client.get_product_by_id(dry_product_id)
+                        except ReveniumAPIError as exc:
+                            return [
+                                TextContent(
+                                    type="text",
+                                    text=(
+                                        "**Dry Run Validation Failed** — the live create "
+                                        f"would reject this payload:\n\n"
+                                        f"**Field**: `product_id`\n"
+                                        f"**Value**: `{dry_product_id}`\n"
+                                        f"**Problem**: product does not resolve ({exc})\n\n"
+                                        "**Tip**: Use `manage_products(action='list')` to find valid product IDs"
+                                    ),
+                                )
+                            ]
                     mode_text = "EXPLICIT CONFIGURATION"
                     return [
                         TextContent(
@@ -2225,6 +2387,35 @@ class SubscriptionManagement(ToolBase):
                 )
             ]
         raise ValueError(f"Unhandled CRUD action: {action}")
+
+    async def _handle_billing_read_actions(
+        self, action: str, arguments: Dict[str, Any], subscription_manager: Any
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle read-only billing actions."""
+        subscription_id = arguments.get("subscription_id")
+        if action == "get_billed_amount":
+            result = await subscription_manager.get_billed_amount(arguments)
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Billed amount for subscription {subscription_id}:\n\n"
+                        + json.dumps(result, indent=2)
+                    ),
+                )
+            ]
+        elif action == "get_quota_consumed":
+            result = await subscription_manager.get_quota_consumed(arguments)
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Quota consumed for subscription {subscription_id}:\n\n"
+                        + json.dumps(result, indent=2)
+                    ),
+                )
+            ]
+        raise ValueError(f"Unhandled billing-read action: {action}")
 
     async def _handle_creation_actions(
         self, action: str, arguments: Dict[str, Any], subscription_manager: Any
@@ -2892,6 +3083,18 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
                 ],
             ),
             ToolCapability(
+                name="Subscription Billing Reads",
+                description="Read-only billing visibility per subscription (numeric-honest: a missing/non-numeric value is a contract error, never a silent 0)",
+                parameters={
+                    "get_billed_amount": {"subscription_id": "str"},
+                    "get_quota_consumed": {"subscription_id": "str"},
+                },
+                examples=[
+                    "get_billed_amount(subscription_id='sub_123')",
+                    "get_quota_consumed(subscription_id='sub_123')",
+                ],
+            ),
+            ToolCapability(
                 name="Enhanced Creation",
                 description="Simplified subscription creation with smart defaults",
                 parameters={
@@ -2914,6 +3117,8 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
         return [
             "list",
             "get",
+            "get_billed_amount",
+            "get_quota_consumed",
             "create",
             "update",
             "cancel",

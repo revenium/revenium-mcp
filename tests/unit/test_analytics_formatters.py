@@ -505,8 +505,9 @@ class TestApiKeyCostsFormatter:
             {"api_key": "real-key-abcdefgh", "cost": 7.5, "percentage": 40.0},
         ]
         result = formatter.format(data, {"period": "SEVEN_DAYS", "aggregation": "TOTAL"})
-        # Exactly one ANONYMOUS-derived row should appear.
-        assert result.count("ANON****MOUS") == 1
+        # Exactly one ANONYMOUS-derived row should appear — rendered verbatim
+        # (sentinel labels are placeholders, not secrets to mask).
+        assert result.count("**1. ANONYMOUS**") + result.count("**2. ANONYMOUS**") == 1
         # Cost was summed: 10 + 5 = 15.
         assert "$15.00" in result
         # Share was summed: 40 + 20 = 60.

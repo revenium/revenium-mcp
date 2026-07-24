@@ -256,8 +256,12 @@ class RedisLikeCache:
                 if entry.tags.intersection(tags):
                     keys_to_delete.append(key)
 
+            # Delete inline: self.delete() acquires self._lock, which is
+            # non-reentrant and already held here.
             for key in keys_to_delete:
-                await self.delete(key)
+                entry = self._cache[key]
+                self._stats.memory_usage_bytes -= entry.size_bytes
+                del self._cache[key]
 
             logger.info(f"Invalidated {len(keys_to_delete)} entries by tags: {tags}")
             return len(keys_to_delete)

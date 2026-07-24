@@ -1031,6 +1031,70 @@ class TestValidateTransactionInputsAsync:
         assert "boom" in result["message"]
 
     @pytest.mark.asyncio
+    async def test_decorator_cache_does_not_leak_across_instances(self):
+        """BACK-2382 regression: the @cache_response decorator on
+        _validate_transaction_inputs_async must not return a previously-cached
+        {"valid": True} for a *different* manager instance whose validation
+        behaviour has been changed (here: a subtask patched to raise).
+
+        The real-world flake fired only in full-suite runs: a sibling test warmed
+        the persistent response cache with VALID_TX -> {"valid": True}, then CPython
+        reused the freed manager's memory address for a later instance, so the
+        decorator's str(self)-derived cache key collided and the stale success was
+        returned before the body ran. Two independent defects made the module-level
+        `metering_management.response_cache` patch (the codebase-standard bypass)
+        inert against the decorator, so tests could not disable the cache.
+
+        A stable __repr__ makes the address-reuse key collision deterministic so
+        this reproduces the flake on every run.
+
+        The warm step writes through the REAL shared response cache (that is the
+        point — the pre-fix decorator ignored the module-level bypass), so the
+        entry must be purged afterwards: with content-addressed keys it is the
+        same key any ordinary VALID_TX call produces, and leaving it behind
+        would reintroduce cross-test order dependence for callers that do not
+        bypass the cache.
+        """
+
+        class _StableReprManager(MeteringTransactionManager):
+            def __repr__(self) -> str:  # deterministic stand-in for address reuse
+                return "<MeteringTransactionManager back-2382-fixed-key>"
+
+        try:
+            # Warm the REAL persistent cache with a success for VALID_TX (no bypass).
+            warm_mgr = _StableReprManager()
+            warm = await warm_mgr._validate_transaction_inputs_async(VALID_TX.copy())
+            assert warm["valid"] is True
+
+            # A different instance sharing the same cache key, with a subtask patched
+            # to raise, and the standard module-level cache bypass applied.
+            mgr = _StableReprManager()
+            with patch.object(
+                mgr, "_validate_numeric_fields", new=AsyncMock(side_effect=RuntimeError("boom"))
+            ):
+                with patch(
+                    "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+                ) as mock_cache:
+                    mock_cache.get_cached_response = AsyncMock(return_value=None)
+                    mock_cache.set_cached_response = AsyncMock()
+                    result = await mgr._validate_transaction_inputs_async(VALID_TX.copy())
+
+            assert result["valid"] is False
+            assert "boom" in result["message"]
+        finally:
+            # Purge every level the warm write can land in (L1 dict, DiskCache
+            # L2-L4, redis-like) so no VALID_TX entry outlives this test.
+            from src.revenium_mcp_server.core import response_cache as rc_module
+
+            rc_module.response_cache.l1_cache.clear()
+            for level_attr in ("l2_cache", "l3_cache", "l4_cache"):
+                level = getattr(rc_module.response_cache, level_attr, None)
+                if level is not None:
+                    level.clear()
+            if rc_module.redis_like_cache is not None:
+                await rc_module.redis_like_cache.invalidate_by_tags({"validation"})
+
+    @pytest.mark.asyncio
     async def test_format_errors_grouped(self):
         mgr = _mgr()
         args = {**VALID_TX, "is_streamed": 42}

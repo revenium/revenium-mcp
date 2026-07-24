@@ -129,3 +129,35 @@ class TestSupportedActions:
         assert "get_internal_logs" in actions
         assert "get_capabilities" in actions
         assert "get_examples" in actions
+
+
+class TestIngestionDiagnosticsRouting:
+    """The tenant ingestion actions route to the log analysis tool."""
+
+    @pytest.mark.asyncio
+    async def test_get_ingestion_failures_routes_to_log_tool(self):
+        from unittest.mock import AsyncMock
+        from mcp.types import TextContent
+
+        tool = SystemDiagnostics()
+        tool.log_tool.handle_action = AsyncMock(
+            return_value=[TextContent(type="text", text="failures")]
+        )
+        result = await tool.handle_action("get_ingestion_failures", {"page": 0})
+        tool.log_tool.handle_action.assert_called_once()
+        assert result[0].text == "failures"
+
+    @pytest.mark.asyncio
+    async def test_set_strict_ingestion_mode_routes_to_log_tool(self):
+        from unittest.mock import AsyncMock
+        from mcp.types import TextContent
+
+        tool = SystemDiagnostics()
+        tool.log_tool.handle_action = AsyncMock(
+            return_value=[TextContent(type="text", text="toggled")]
+        )
+        result = await tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+        )
+        tool.log_tool.handle_action.assert_called_once()
+        assert result[0].text == "toggled"

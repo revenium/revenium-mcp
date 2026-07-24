@@ -62,6 +62,8 @@ TOOL_REGISTRATION_PRIORITY_ORDER = [
     "manage_workflows",                # Automation and workflows
     "manage_jobs",                     # Jobs & Outcomes management
     "manage_tools",                    # Tool Registry management
+    "manage_agents",                   # Agent registry management
+    "manage_cost_controls",            # AI spend guardrails (cost-control CRUD + enforcement visibility)
 
     # Group 5: System Diagnostics (Troubleshooting - last)
     "system_diagnostics"               # System health and troubleshooting
@@ -174,6 +176,10 @@ class ToolConfigurationRegistry:
                 await self._register_tool_introspection(mcp)
             elif tool_name == "manage_tools":
                 await self._register_manage_tools(mcp)
+            elif tool_name == "manage_agents":
+                await self._register_manage_agents(mcp)
+            elif tool_name == "manage_cost_controls":
+                await self._register_manage_cost_controls(mcp)
             else:
                 logger.warning(f"Unknown tool for registration: {tool_name}")
                 return
@@ -194,6 +200,7 @@ class ToolConfigurationRegistry:
         async def business_analytics_management(
             action: str = "get_capabilities",
             breakdown_by: Optional[str] = None,
+            dimension: Optional[str] = None,
             period: Optional[str] = None,
             group: Optional[str] = None,
             filters: Optional[dict] = None,
@@ -206,12 +213,32 @@ class ToolConfigurationRegistry:
             dry_run: Optional[Union[bool, str]] = None,
             example_type: Optional[str] = None,
             detect_new_entities: Optional[Union[bool, str]] = None,
-            min_new_entity_threshold: Optional[Union[float, str]] = None
+            min_new_entity_threshold: Optional[Union[float, str]] = None,
+            # Task / profitability / spend-mover analytics pack params
+            # (dimension is declared above — shared with filter-options discovery)
+            group_by: Optional[str] = None,
+            aggregation: Optional[str] = None,
+            providers: Optional[Union[List[str], str]] = None,
+            agents: Optional[Union[List[str], str]] = None,
+            # Billing reads: list_invoices / list_refunds / list_period_charges
+            invoice_number: Optional[str] = None,
+            pay_states: Optional[Union[List[str], str]] = None,
+            states: Optional[Union[List[str], str]] = None,
+            starting_amount: Optional[Union[float, str]] = None,
+            ending_amount: Optional[Union[float, str]] = None,
+            minimum: Optional[Union[float, str]] = None,
+            maximum: Optional[Union[float, str]] = None,
+            cursor: Optional[str] = None,
+            invoice_id: Optional[str] = None,
+            start_date: Optional[str] = None,
+            end_date: Optional[str] = None,
+            query: Optional[str] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
 
             arguments = {
                 "action": action,
                 "breakdown_by": breakdown_by,
+                "dimension": dimension,
                 "period": period,
                 "group": group,
                 "filters": filters,
@@ -224,7 +251,24 @@ class ToolConfigurationRegistry:
                 "dry_run": dry_run,
                 "example_type": example_type,
                 "detect_new_entities": detect_new_entities,
-                "min_new_entity_threshold": min_new_entity_threshold
+                "min_new_entity_threshold": min_new_entity_threshold,
+                "group_by": group_by,
+                "aggregation": aggregation,
+                "providers": providers,
+                "agents": agents,
+                # Billing reads
+                "start_date": start_date,
+                "end_date": end_date,
+                "query": query,
+                "invoice_number": invoice_number,
+                "pay_states": pay_states,
+                "states": states,
+                "starting_amount": starting_amount,
+                "ending_amount": ending_amount,
+                "minimum": minimum,
+                "maximum": maximum,
+                "cursor": cursor,
+                "invoice_id": invoice_id
             }
 
             # NUMERIC PREPROCESSING: Convert string numeric parameters to appropriate types
@@ -233,7 +277,11 @@ class ToolConfigurationRegistry:
                 'size': int,
                 'threshold': float,
                 'min_impact_threshold': float,
-                'min_new_entity_threshold': float
+                'min_new_entity_threshold': float,
+                'starting_amount': float,
+                'ending_amount': float,
+                'minimum': float,
+                'maximum': float
             }
             arguments = preprocess_numeric_parameters(arguments, numeric_params)
 
@@ -241,8 +289,10 @@ class ToolConfigurationRegistry:
             boolean_params = ["dry_run", "detect_new_entities"]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
 
-            # ARRAY PREPROCESSING: Convert string array parameters to actual Python lists
-            array_params = ["include_dimensions"]
+            # ARRAY PREPROCESSING: Convert string array parameters to actual Python lists.
+            # pay_states/states follow the anomaly_ids precedent: a JSON array string
+            # is parsed to a list; a non-array string is left as-is for the tool to reject.
+            array_params = ["include_dimensions", "providers", "agents", "pay_states", "states"]
             arguments = preprocess_array_parameters(arguments, array_params)
 
             # Remove None values
@@ -271,6 +321,7 @@ class ToolConfigurationRegistry:
             name: Optional[str] = None,
             metric: Optional[str] = None,
             threshold: Optional[Union[float, str]] = None,
+            isPercentage: Optional[Union[bool, str]] = None,
             period: Optional[str] = None,
             period_minutes: Optional[Union[float, str]] = None,
             email: Optional[str] = None,
@@ -287,8 +338,10 @@ class ToolConfigurationRegistry:
             query: Optional[str] = None,
             resource_type: str = "anomalies",
             anomaly_id: Optional[str] = None,
-            anomaly_ids: Optional[List[str]] = None,
+            anomaly_ids: Optional[Union[List[str], str]] = None,
             anomaly_data: Optional[Union[dict, str]] = None,
+            include_trend: Optional[Union[bool, str]] = None,
+            now: Optional[str] = None,
             # P2 Enhancement: Direct update parameters for flexible UX
             description: Optional[str] = None,
             tags: Optional[List[str]] = None,
@@ -328,12 +381,39 @@ class ToolConfigurationRegistry:
                              f"**Not as string**: `\"anomaly_data\": \"{{\\\"name\\\": \\\"Alert\\\"}}\"`"
                     )]
 
+            # SMART INPUT PREPROCESSING: anomaly_ids may arrive as a JSON-string
+            # array (agent serialization). Parse it and require a list so the
+            # bulk get_budget_progress path never receives a non-list.
+            processed_anomaly_ids = anomaly_ids
+            if isinstance(anomaly_ids, str):
+                import json
+                try:
+                    processed_anomaly_ids = json.loads(anomaly_ids)
+                except json.JSONDecodeError:
+                    from mcp.types import TextContent
+                    return [TextContent(
+                        type="text",
+                        text=f"**Invalid JSON String for anomaly_ids**\n\n"
+                             f"**Error**: anomaly_ids appears to be malformed JSON: `{anomaly_ids}`\n\n"
+                             f"**Solution**: Send anomaly_ids as a JSON array of strings, "
+                             f'e.g. `["anom_1", "anom_2"]`.'
+                    )]
+                if not isinstance(processed_anomaly_ids, list):
+                    from mcp.types import TextContent
+                    return [TextContent(
+                        type="text",
+                        text=f"**Invalid anomaly_ids**\n\n"
+                             f"**Error**: expected a JSON array of ids, got `{anomaly_ids}`\n\n"
+                             f'**Solution**: Send anomaly_ids as a JSON array, e.g. `["anom_1", "anom_2"]`.'
+                    )]
+
             arguments = {
                 "action": action,
                 "alert_id": alert_id,
                 "name": name,
                 "metric": metric,
                 "threshold": threshold,
+                "isPercentage": isPercentage,
                 "period": period,
                 "period_minutes": period_minutes,
                 "email": email,
@@ -350,8 +430,10 @@ class ToolConfigurationRegistry:
                 "query": query,
                 "resource_type": resource_type,
                 "anomaly_id": anomaly_id,
-                "anomaly_ids": anomaly_ids,
+                "anomaly_ids": processed_anomaly_ids,  # Use processed list
                 "anomaly_data": processed_anomaly_data,  # Use processed data
+                "include_trend": include_trend,
+                "now": now,
                 # P2 Enhancement: Direct update parameters
                 "description": description,
                 "tags": tags,
@@ -363,7 +445,7 @@ class ToolConfigurationRegistry:
             }
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
-            boolean_params = ["dry_run", "confirm", "enabled"]
+            boolean_params = ["dry_run", "confirm", "enabled", "include_trend"]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
 
             # Remove None values
@@ -1639,6 +1721,176 @@ class ToolConfigurationRegistry:
             )
             return result
 
+    async def _register_manage_agents(self, mcp: FastMCP) -> None:
+        """Register manage agents tool.
+
+        FastMCP derives its Pydantic input model from this function's
+        signature, not from get_schema(). Every kwarg callers may send must
+        appear here, and string-typed params are widened to JSON scalars so
+        we can validate them in-body (returning a structured ToolError
+        instead of leaking a raw framework error).
+        """
+        _JSONScalar = Union[str, int, float, bool]
+
+        @mcp.tool()
+        @dynamic_mcp_tool("manage_agents")
+        async def manage_agents(
+            action: _JSONScalar = "get_capabilities",
+            agent_id: Optional[_JSONScalar] = None,
+            agent_data: Optional[Union[dict, str]] = None,
+            period: Optional[_JSONScalar] = None,
+            squad_id: Optional[_JSONScalar] = None,
+            squad_name: Optional[_JSONScalar] = None,
+            status: Optional[_JSONScalar] = None,
+            page: Union[int, str] = 0,
+            size: Union[int, str] = 20,
+            filters: Optional[Union[dict, str]] = None,
+        ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+            arguments = {
+                "action": action,
+                "agent_id": agent_id,
+                "agent_data": agent_data,
+                "period": period,
+                "squad_id": squad_id,
+                "squad_name": squad_name,
+                "status": status,
+                "page": page,
+                "size": size,
+                "filters": filters or {},
+            }
+
+            arguments = validate_string_params(
+                arguments,
+                string_fields=["action", "agent_id", "period", "squad_id", "squad_name", "status"],
+                action=action if isinstance(action, str) else str(action),
+            )
+
+            # SMART INPUT PREPROCESSING: Handle agent interface serialization
+            for dict_param in ("agent_data", "filters"):
+                val = arguments.get(dict_param)
+                if isinstance(val, str):
+                    try:
+                        import json
+                        arguments[dict_param] = json.loads(val)
+                    except json.JSONDecodeError:
+                        from mcp.types import TextContent as TC
+                        return [TC(
+                            type="text",
+                            text=f"Invalid JSON for {dict_param}: `{val}`. "
+                                 f"Send as a proper JSON object."
+                        )]
+                    # A JSON scalar/array parses fine but is not an object;
+                    # reject here so the manager never calls .get()/.items()
+                    # on a non-dict and leaks a generic execution error.
+                    if not isinstance(arguments[dict_param], dict):
+                        from mcp.types import TextContent as TC
+                        return [TC(
+                            type="text",
+                            text=f"Invalid {dict_param}: expected a JSON object, "
+                                 f"got `{val}`. Send as a proper JSON object."
+                        )]
+
+            # NUMERIC PREPROCESSING
+            numeric_params = {'page': int, 'size': int}
+            arguments = preprocess_numeric_parameters(arguments, numeric_params)
+
+            # Remove None values
+            arguments = {k: v for k, v in arguments.items() if v is not None}
+
+            from ..tools_decomposed.agent_management import AgentManagement
+            from ..common.tool_execution import standardized_tool_execution
+
+            result = await standardized_tool_execution(
+                tool_name="manage_agents",
+                action=action if isinstance(action, str) else str(action),
+                arguments=arguments,
+                tool_class=AgentManagement
+            )
+            return result
+
+    async def _register_manage_cost_controls(self, mcp: FastMCP) -> None:
+        """Register manage cost controls tool.
+
+        FastMCP derives its Pydantic input model from this function's
+        signature, not from get_schema(). Every kwarg callers may send must
+        appear here, and string-typed params are widened to JSON scalars so
+        we can validate them in-body (returning a structured ToolError
+        instead of leaking a raw framework error).
+        """
+        _JSONScalar = Union[str, int, float, bool]
+
+        @mcp.tool()
+        @dynamic_mcp_tool("manage_cost_controls")
+        async def manage_cost_controls(
+            action: _JSONScalar = "get_capabilities",
+            control_id: Optional[_JSONScalar] = None,
+            control_data: Optional[Union[dict, str]] = None,
+            rule_id: Optional[_JSONScalar] = None,
+            since: Optional[_JSONScalar] = None,
+            page: Union[int, str] = 0,
+            size: Union[int, str] = 20,
+            filters: Optional[Union[dict, str]] = None,
+        ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+            arguments = {
+                "action": action,
+                "control_id": control_id,
+                "control_data": control_data,
+                "rule_id": rule_id,
+                "since": since,
+                "page": page,
+                "size": size,
+                "filters": filters or {},
+            }
+
+            arguments = validate_string_params(
+                arguments,
+                string_fields=["action", "control_id", "rule_id", "since"],
+                action=action if isinstance(action, str) else str(action),
+            )
+
+            # SMART INPUT PREPROCESSING: Handle dict-typed params serialized as JSON strings
+            for dict_param in ("control_data", "filters"):
+                val = arguments.get(dict_param)
+                if isinstance(val, str):
+                    try:
+                        import json
+                        arguments[dict_param] = json.loads(val)
+                    except json.JSONDecodeError:
+                        from mcp.types import TextContent as TC
+                        return [TC(
+                            type="text",
+                            text=f"Invalid JSON for {dict_param}: `{val}`. "
+                                 f"Send as a proper JSON object."
+                        )]
+                    # A JSON scalar/array parses fine but is not an object;
+                    # reject here so the manager never calls .get()/.items()
+                    # on a non-dict and leaks a generic execution error.
+                    if not isinstance(arguments[dict_param], dict):
+                        from mcp.types import TextContent as TC
+                        return [TC(
+                            type="text",
+                            text=f"Invalid {dict_param}: expected a JSON object, "
+                                 f"got `{val}`. Send as a proper JSON object."
+                        )]
+
+            # NUMERIC PREPROCESSING
+            numeric_params = {'page': int, 'size': int}
+            arguments = preprocess_numeric_parameters(arguments, numeric_params)
+
+            # Remove None values
+            arguments = {k: v for k, v in arguments.items() if v is not None}
+
+            from ..tools_decomposed.cost_controls_management import CostControlsManagement
+            from ..common.tool_execution import standardized_tool_execution
+
+            result = await standardized_tool_execution(
+                tool_name="manage_cost_controls",
+                action=action if isinstance(action, str) else str(action),
+                arguments=arguments,
+                tool_class=CostControlsManagement
+            )
+            return result
+
     async def _register_tool_metadata(self, tool_name: str) -> None:
         """Register tool metadata with introspection engine.
 
@@ -1664,6 +1916,8 @@ class ToolConfigurationRegistry:
             "manage_capabilities": ("manage_capabilities", "ManageCapabilities"),
             "manage_jobs": ("job_management", "JobManagement"),
             "manage_tools": ("tool_management", "ToolManagement"),
+            "manage_agents": ("agent_management", "AgentManagement"),
+            "manage_cost_controls": ("cost_controls_management", "CostControlsManagement"),
             "tool_introspection": None  # Registered separately
         }
 

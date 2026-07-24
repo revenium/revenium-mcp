@@ -189,56 +189,56 @@ Use `get_examples()` for detailed usage examples and parameter guidance.
 
 ### List All Configurations
 ```json
-{{"action": "list_configurations"}}
+{"action": "list_configurations"}
 ```
 
 ### Get Specific Configuration
 ```json
-{{"action": "get_configuration", "config_id": "slack_config_123"}}
+{"action": "get_configuration", "config_id": "slack_config_123"}
 ```
 
 ### Set Default Configuration
 ```json
-{{"action": "set_default_configuration", "config_id": "slack_config_123"}}
+{"action": "set_default_configuration", "config_id": "slack_config_123"}
 ```
 
 ## **OAuth Workflow Examples**
 
 ### Start OAuth Flow
 ```json
-{{"action": "initiate_oauth"}}
+{"action": "initiate_oauth"}
 ```
 
 ### Start OAuth with Custom Return URL
 ```json
-{{"action": "initiate_oauth", "return_to": "/custom-page"}}
+{"action": "initiate_oauth", "return_to": "/custom-page"}
 ```
 
 ### Check OAuth Status
 ```json
-{{"action": "refresh_configurations"}}
+{"action": "refresh_configurations"}
 ```
 
 ## **Setup Assistant Examples**
 
 ### Guided Setup (Recommended for First-Time Users)
 ```json
-{{"action": "guided_setup"}}
+{"action": "guided_setup"}
 ```
 
 ### Quick Setup (For Experienced Users)
 ```json
-{{"action": "quick_setup"}}
+{"action": "quick_setup"}
 ```
 
 ### Check Setup Status
 ```json
-{{"action": "setup_status"}}
+{"action": "setup_status"}
 ```
 
 ### Get Smart Recommendations
 ```json
-{{"action": "detect_and_recommend"}}
+{"action": "detect_and_recommend"}
 ```
 
 ## **Common Workflows**

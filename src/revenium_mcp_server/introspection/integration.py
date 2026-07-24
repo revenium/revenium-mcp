@@ -316,6 +316,11 @@ class IntrospectionIntegration:
                 action=action,
             )
 
+        except PermissionError:
+            # Auth failure — propagate to the transport layer; do not mask it
+            # as a tool-error response (which would trigger the caller's
+            # direct-execution fallback).
+            raise
         except ToolError:
             # Re-raise ToolError exceptions without modification
             # This preserves helpful error messages with specific suggestions

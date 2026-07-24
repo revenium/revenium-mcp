@@ -122,6 +122,7 @@ def mint_jwt(test_keypair, fake_clerk):
     def _mint(**overrides):
         exp_offset = overrides.pop("_exp_offset", 300)
         issuer = overrides.pop("_issuer", fake_clerk["issuer"])
+        audience = overrides.pop("_audience", "test-client")
         claims = {
             "sub": "user_abc",
             "revenium_team_id": "team_from_jwt",
@@ -137,6 +138,7 @@ def mint_jwt(test_keypair, fake_clerk):
             issuer=issuer,
             claims=claims,
             exp_offset=exp_offset,
+            audience=audience,
         )
 
     return _mint

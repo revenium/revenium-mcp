@@ -178,7 +178,7 @@ async def test_api_key_identity_resolved_from_users_me(
 
     Setup:
       - /users/me returns defaultTeamId=team_xyz, tenantId=tenant_abc for the valid token
-      - REVENIUM_TEAM_ID=team_default (env fallback)
+      - No server-wide REVENIUM_TEAM_ID is configured
     Asserts:
       - manage_products list dispatches successfully (full auth gate ran)
       - The ApiKeyValidator cached the identity from /users/me with
@@ -190,7 +190,7 @@ async def test_api_key_identity_resolved_from_users_me(
     rev_rk_ token → /users/me → ApiKeyIdentity(team_xyz, tenant_abc) →
     AccessToken.claims → ApiKeyAuthMiddleware → TenantContext.
     """
-    from src.revenium_mcp_server.auth.api_key_validator import _cache_key, _strip_bearer
+    from revenium_mcp_server.auth.api_key_validator import _cache_key, _strip_bearer
 
     resp = await call_mcp_tool(
         mcp_http_server["base_url"],
@@ -214,8 +214,7 @@ async def test_api_key_identity_resolved_from_users_me(
     )
     assert identity.team_id == "team_xyz", (
         f"expected team_id=team_xyz (from /users/me defaultTeamId), "
-        f"got team_id={identity.team_id!r}. "
-        f"REVENIUM_TEAM_ID env fallback would be team_default."
+        f"got team_id={identity.team_id!r}."
     )
     assert identity.tenant_id == "tenant_abc", (
         f"expected tenant_id=tenant_abc (from /users/me tenantId), "

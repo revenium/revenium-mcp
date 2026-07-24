@@ -11,6 +11,7 @@ import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,16 @@ class NewApiRequiredError(RuntimeError):
 
 # Default production base URL for the new analytics API
 DEFAULT_APP_BASE_URL = "https://app.revenium.ai"
+
+# Analytics hosts paired with known API hosts. When REVENIUM_APP_BASE_URL is
+# not set, the analytics base URL is derived from REVENIUM_BASE_URL through
+# this map; unknown hosts fall back to the production default. Without the
+# pairing step, a dev configuration silently points analytics calls at the
+# production host, where the dev key is rejected. Shared with
+# client._get_app_base_url so both resolvers agree.
+KNOWN_APP_BASE_URLS: Dict[str, str] = {
+    "api.dev.hcapp.io": "https://ai.dev.hcapp.io",
+}
 
 
 @dataclass
@@ -209,6 +220,124 @@ _ENDPOINT_REGISTRY: Dict[str, EndpointConfig] = {
         new_path="/api/v2/analytics/cost-by-user-aggregated",
         mapping_status="NEW_API_ONLY",
     ),
+    # ── Aggregate transaction count (new-API only — no legacy equivalent) ──
+    # New: /api/v2/analytics/transaction-count-by-team
+    # Single team-scoped total; teamId resolved server-side from the API-key
+    # auth context, so only startDate/endDate are sent. The response's metric
+    # links are intentionally empty (no drill-down/timeseries sibling).
+    # force_new: hosted deployments do not set REVENIUM_USE_NEW_ANALYTICS_API,
+    # and there is no old-API fallback for this metric.
+    "transaction_count_by_team": EndpointConfig(
+        old_path="/api/v2/analytics/transaction-count-by-team",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/transaction-count-by-team",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    # ── Filter-options discovery (new-API only — no legacy equivalent) ─────
+    # New: /api/v2/analytics/filter-options/{dimension}
+    # Enumerates the valid filter values for a dimension (agents, models,
+    # providers, ...) so LLM callers stop guessing names. The dimension is
+    # appended as a path segment by the analyzer, so this entry stays
+    # dimension-agnostic (base path only). force_new: hosted deployments do
+    # not set REVENIUM_USE_NEW_ANALYTICS_API and there is no old-API twin.
+    "analytics_filter_options": EndpointConfig(
+        old_path="/api/v2/analytics/filter-options",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/filter-options",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    # ── Task / profitability / spend-mover analytics pack (BACK-2376) ──────
+    # New-API-only analytics endpoints on the analytics host (Bearer auth, no
+    # legacy profitstream twin). Every entry copies the transaction_count_by_team
+    # pattern: force_new=True so hosted deployments (which do not set
+    # REVENIUM_USE_NEW_ANALYTICS_API) still reach them, mapping_status
+    # NEW_API_ONLY so there is no legacy fallback, and old_path is a placeholder
+    # equal to new_path that is never routed to (force_new short-circuits it).
+    # Envelope families (verified live on dev):
+    #   A. timeseries (metric_timeseries): _embedded.items[].groups[].metrics[]
+    #   B. aggregated (metric_aggregated): _embedded.items[].{groupName,metrics[]}
+    #   C. scatter (trace-cost-distribution): top-level dataPoints[] (no _embedded)
+    "cost_by_task": EndpointConfig(
+        old_path="/api/v2/analytics/cost-by-task",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/cost-by-task",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    "cost_by_task_aggregated": EndpointConfig(
+        old_path="/api/v2/analytics/cost-by-task-aggregated",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/cost-by-task-aggregated",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    "task_completion": EndpointConfig(
+        old_path="/api/v2/analytics/task-completion",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/task-completion",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    "task_completion_aggregated": EndpointConfig(
+        old_path="/api/v2/analytics/task-completion-aggregated",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/task-completion-aggregated",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    "task_performance_by_agent": EndpointConfig(
+        old_path="/api/v2/analytics/task-performance-by-agent",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/task-performance-by-agent",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    "profit_margin_per_customer": EndpointConfig(
+        old_path="/api/v2/analytics/profit-margin-per-customer",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/profit-margin-per-customer",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    "profit_margin_per_product": EndpointConfig(
+        old_path="/api/v2/analytics/profit-margin-per-product",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/profit-margin-per-product",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    "top_movers": EndpointConfig(
+        old_path="/api/v2/analytics/top-movers",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/top-movers",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    "token_breakdown_by_type": EndpointConfig(
+        old_path="/api/v2/analytics/token-breakdown-by-type",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/token-breakdown-by-type",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    "token_vs_tool_cost": EndpointConfig(
+        old_path="/api/v2/analytics/token-vs-tool-cost",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/token-vs-tool-cost",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    "trace_cost_distribution": EndpointConfig(
+        old_path="/api/v2/analytics/trace-cost-distribution",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/trace-cost-distribution",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    # Timeseries cost-by-team (distinct from transaction_count_by_team). The
+    # registry key is suffixed _timeseries to avoid colliding with the count
+    # endpoint's key; the path is the plain cost-by-team endpoint.
+    "cost_by_team_timeseries": EndpointConfig(
+        old_path="/api/v2/analytics/cost-by-team",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/cost-by-team",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    "cost_by_vendor": EndpointConfig(
+        old_path="/api/v2/analytics/cost-by-vendor",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/cost-by-vendor",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
     # ── Status / connectivity endpoint ────────────────────────────────────
     # Old: /profitstream/v2/api/sources/metrics/ai/data-connected
     # New: /api/v2/status/connection  (BACK-718 swap #14)
@@ -240,17 +369,41 @@ def _should_use_new_path(config: "EndpointConfig") -> bool:
     return config.force_new or _use_new_api()
 
 
+def paired_app_base_url(
+    platform_base_url: Optional[str],
+    known_hosts: Optional[Dict[str, str]] = None,
+) -> str:
+    """Analytics host paired with the given platform base URL.
+
+    Matches on the hostname only — port and path are ignored, so
+    ``https://api.dev.hcapp.io:443`` pairs the same as
+    ``https://api.dev.hcapp.io``. Unknown or empty hosts fall back to the
+    production default. Single source for both ``_resolved_app_base_url``
+    here and ``client._get_app_base_url`` (which passes its patchable
+    ``_KNOWN_APP_BASE_URLS`` class attribute as ``known_hosts``).
+    """
+    mapping = KNOWN_APP_BASE_URLS if known_hosts is None else known_hosts
+    base = (platform_base_url or "").lower()
+    host = urlparse(base).hostname or (
+        base.removeprefix("https://").removeprefix("http://").split("/")[0].split(":")[0]
+    )
+    return mapping.get(host.strip("/"), DEFAULT_APP_BASE_URL)
+
+
 def _resolved_app_base_url() -> str:
-    """Return the configured new-analytics base URL, falling back to the default.
+    """Return the configured new-analytics base URL.
+
+    Resolution order (same as ``client._get_app_base_url``): explicit
+    REVENIUM_APP_BASE_URL > analytics host paired with the configured
+    REVENIUM_BASE_URL (known environments) > production default.
 
     Raises:
         ValueError: If the resolved URL does not use the HTTPS scheme, to prevent
             Bearer tokens from being forwarded to a non-HTTPS host.
     """
-    url = (
-        get_config_value("REVENIUM_APP_BASE_URL", DEFAULT_APP_BASE_URL)
-        or DEFAULT_APP_BASE_URL
-    )
+    url = get_config_value("REVENIUM_APP_BASE_URL", None)
+    if not url:
+        url = paired_app_base_url(get_config_value("REVENIUM_BASE_URL", None))
     if not url.startswith("https://"):
         raise ValueError(
             f"REVENIUM_APP_BASE_URL must use HTTPS to prevent Bearer token leakage,"

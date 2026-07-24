@@ -193,10 +193,49 @@ class SetupChecklist(ToolBase):
         # Get validation result
         validation_result = await validate_environment_variables()
 
+        # Per-pathway data-ingestion status (best-effort — never blocks the report)
+        ingestion_status = await self._fetch_data_ingestion_status()
+
         # Build system status
-        system_status_text = self._build_system_status(validation_result)
+        system_status_text = self._build_system_status(validation_result, ingestion_status)
 
         return [TextContent(type="text", text=system_status_text)]
+
+    # Ingestion pathways reported by the data-connected/sources endpoint,
+    # in display order, with the labels the platform uses for each.
+    _INGESTION_PATHWAYS = (
+        ("providerBilling", "Provider billing sync"),
+        ("sdkMetering", "SDK/API metering"),
+        ("codingAssistant", "Coding-assistant telemetry"),
+        ("traces", "Distributed traces"),
+    )
+
+    # Hard bound on the optional ingestion fetch so a hanging endpoint can
+    # never stall the whole status report past this budget.
+    _INGESTION_FETCH_TIMEOUT_SECONDS = 10.0
+
+    async def _fetch_data_ingestion_status(self) -> Dict[str, Any]:
+        """Fetch per-pathway data-connection status, degrading to an error marker.
+
+        The system-status report must render even without credentials or
+        when the endpoint is unreachable, so failures are captured instead
+        of raised. The exception detail goes to the log only; the rendered
+        reason stays generic so upstream/auth specifics never reach callers.
+        """
+        import asyncio
+
+        try:
+            client = await self.get_client()
+            return await asyncio.wait_for(
+                client.get_data_connected_sources(),
+                timeout=self._INGESTION_FETCH_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.debug("Data-ingestion status timed out")
+            return {"error": "the data-connected endpoint did not respond in time"}
+        except Exception as e:
+            logger.debug(f"Data-ingestion status unavailable: {e}")
+            return {"error": "could not reach the data-connected endpoint"}
 
     async def _handle_get_recommendations(
         self, arguments: Dict[str, Any]
@@ -232,6 +271,7 @@ class SetupChecklist(ToolBase):
 
 4. **check_system_status** - **AVAILABLE**
    - Check system connectivity and health
+   - Includes per-pathway data-ingestion status (provider billing, SDK/API metering, coding-assistant telemetry, traces)
 
 5. **get_recommendations** - **AVAILABLE**
    - Get prioritized setup recommendations
@@ -284,7 +324,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
   "action": "check_system_status"
 }
 ```
-**Purpose**: Check system connectivity and health status
+**Purpose**: Check system connectivity and health status, including which data-ingestion pathways have received data (and when they last did)
 
 ### get_recommendations
 ```json
@@ -449,12 +489,12 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             if not slack_configured:
                 checklist += f"{step_num}. Configure Slack integration for real-time updates\n"
                 step_num += 1
-            checklist += f"{step_num}. Use welcome_and_setup(action='complete_setup') when ready\n"
+            checklist += f"{step_num}. Use system_setup(action='setup_checklist') when ready\n"
         else:
             checklist += "## **Setup Complete!**\n\n"
             checklist += "Your Revenium MCP server is fully configured and ready to use!\n\n"
             checklist += "**Next Steps:**\n"
-            checklist += "- Use welcome_and_setup(action='complete_setup') to finish onboarding\n"
+            checklist += "- Use system_setup(action='setup_checklist') to finish onboarding\n"
             checklist += "- Start managing products with manage_products()\n"
             checklist += "- Set up alerts with manage_alerts()\n"
 
@@ -599,8 +639,15 @@ Comprehensive setup status verification and configuration guidance for Revenium 
 
         return optional
 
-    def _build_system_status(self, validation_result) -> str:
-        """Build system status and connectivity check."""
+    def _build_system_status(self, validation_result, ingestion_status=None) -> str:
+        """Build system status and connectivity check.
+
+        Args:
+            validation_result: Environment validation outcome
+            ingestion_status: Optional per-pathway data-connection payload
+                from get_data_connected_sources (or {"error": ...}); the
+                Data Ingestion section is omitted when None
+        """
         system = "#  **System Status & Connectivity**\n\n"
         system += f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
@@ -676,6 +723,32 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             system += f"**Error**: {error}\n"
 
         system += "\n"
+
+        # Data ingestion by pathway (which sources are actually sending data)
+        if ingestion_status is not None:
+            system += "##  **Data Ingestion by Pathway**\n\n"
+            if "error" in ingestion_status:
+                system += "⚠️ **Status**: Unavailable\n"
+                system += f"**Reason**: {ingestion_status['error']}\n"
+            else:
+                for key, label in self._INGESTION_PATHWAYS:
+                    pathway = ingestion_status.get(key)
+                    if pathway is not None and not isinstance(pathway, dict):
+                        # Defensive: an unexpected payload shape must degrade
+                        # per-pathway, not crash the whole status report.
+                        system += f"   - **{label}**: Status unavailable (unexpected format)\n"
+                        continue
+                    pathway = pathway or {}
+                    if pathway.get("connected"):
+                        last = pathway.get("lastReceived") or "unknown"
+                        system += f"[OK] **{label}**: Connected (last received {last})\n"
+                    else:
+                        system += f"   - **{label}**: No data received\n"
+                system += (
+                    "\n**Note**: 'No data received' means that pathway has never "
+                    "sent data for this tenant — expected for pathways you do not use.\n"
+                )
+            system += "\n"
 
         # Overall system health
         overall_healthy = (
@@ -792,7 +865,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             recommendations += "- Optional features are configured\n\n"
             recommendations += "**Next Steps:**\n"
             recommendations += (
-                "- Use welcome_and_setup(action='complete_setup') to finish onboarding\n"
+                "- Use system_setup(action='setup_checklist') to finish onboarding\n"
             )
             recommendations += "- Start exploring the full capabilities of your MCP server\n"
 

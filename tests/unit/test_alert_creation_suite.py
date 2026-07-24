@@ -546,45 +546,62 @@ class TestHandleCreateThresholdAlert:
     """Cover _handle_create_threshold_alert: validation, periods, persistence."""
 
     @pytest.mark.asyncio
-    async def test_happy_path_five_minutes(self):
+    async def test_happy_path_default_is_fifteen_minutes(self):
+        """The platform rejects sub-FIFTEEN_MINUTES periods, so the default
+        must be 15 and the payload must carry FIFTEEN_MINUTES."""
         tools, client = _make_tools_with_client()
         with patch.object(
             tools, "_resolve_notification_config", return_value=_notification_config()
         ):
             result = await tools._handle_create_threshold_alert(
                 client,
-                {"name": "Spike Alert", "threshold": 100, "period_minutes": 5},
+                {"name": "Spike Alert", "threshold": 100},
             )
         assert isinstance(result[0], TextContent)
         call_data = tools.anomaly_manager.create_anomaly.call_args[0][1]
         assert call_data["alertType"] == "THRESHOLD"
-        assert call_data["periodDuration"] == "FIVE_MINUTES"
+        assert call_data["periodDuration"] == "FIFTEEN_MINUTES"
 
     @pytest.mark.asyncio
-    async def test_one_minute_period(self):
+    async def test_five_minute_period_rejected(self):
         tools, client = _make_tools_with_client()
         with patch.object(
             tools, "_resolve_notification_config", return_value=_notification_config()
         ):
-            await tools._handle_create_threshold_alert(
-                client,
-                {"name": "Fast Alert", "threshold": 50, "period_minutes": 1},
-            )
-        call_data = tools.anomaly_manager.create_anomaly.call_args[0][1]
-        assert call_data["periodDuration"] == "ONE_MINUTE"
+            with pytest.raises(ToolError) as exc_info:
+                await tools._handle_create_threshold_alert(
+                    client,
+                    {"name": "Spike Alert", "threshold": 100, "period_minutes": 5},
+                )
+        assert "FIFTEEN_MINUTES" in str(exc_info.value)
+        tools.anomaly_manager.create_anomaly.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_ten_minute_period(self):
+    async def test_one_minute_period_rejected(self):
         tools, client = _make_tools_with_client()
         with patch.object(
             tools, "_resolve_notification_config", return_value=_notification_config()
         ):
-            await tools._handle_create_threshold_alert(
-                client,
-                {"name": "Ten Min", "threshold": 50, "period_minutes": 10},
-            )
-        call_data = tools.anomaly_manager.create_anomaly.call_args[0][1]
-        assert call_data["periodDuration"] == "TEN_MINUTES"
+            with pytest.raises(ToolError):
+                await tools._handle_create_threshold_alert(
+                    client,
+                    {"name": "Fast Alert", "threshold": 50, "period_minutes": 1},
+                )
+        tools.anomaly_manager.create_anomaly.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ten_minute_period_rejected(self):
+        """TEN_MINUTES does not exist in the platform enum at all."""
+        tools, client = _make_tools_with_client()
+        with patch.object(
+            tools, "_resolve_notification_config", return_value=_notification_config()
+        ):
+            with pytest.raises(ToolError):
+                await tools._handle_create_threshold_alert(
+                    client,
+                    {"name": "Ten Min", "threshold": 50, "period_minutes": 10},
+                )
+        tools.anomaly_manager.create_anomaly.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_fifteen_minute_period(self):
@@ -633,7 +650,7 @@ class TestHandleCreateThresholdAlert:
         ):
             with pytest.raises(Exception):
                 await tools._handle_create_threshold_alert(
-                    client, {"threshold": 100, "period_minutes": 5}
+                    client, {"threshold": 100, "period_minutes": 15}
                 )
 
     @pytest.mark.asyncio
@@ -644,7 +661,7 @@ class TestHandleCreateThresholdAlert:
         ):
             with pytest.raises(Exception):
                 await tools._handle_create_threshold_alert(
-                    client, {"name": "Test", "period_minutes": 5}
+                    client, {"name": "Test", "period_minutes": 15}
                 )
 
     @pytest.mark.asyncio
@@ -655,7 +672,7 @@ class TestHandleCreateThresholdAlert:
         ):
             with pytest.raises(Exception):
                 await tools._handle_create_threshold_alert(
-                    client, {"name": "Test", "threshold": -10, "period_minutes": 5}
+                    client, {"name": "Test", "threshold": -10, "period_minutes": 15}
                 )
 
     @pytest.mark.asyncio
@@ -666,7 +683,7 @@ class TestHandleCreateThresholdAlert:
         ):
             with pytest.raises(Exception):
                 await tools._handle_create_threshold_alert(
-                    client, {"name": "Test", "threshold": "abc", "period_minutes": 5}
+                    client, {"name": "Test", "threshold": "abc", "period_minutes": 15}
                 )
 
     @pytest.mark.asyncio
@@ -691,7 +708,7 @@ class TestHandleCreateThresholdAlert:
                 {
                     "name": "Persist",
                     "threshold": 100,
-                    "period_minutes": 5,
+                    "period_minutes": 15,
                     "triggerAfterPersistsDuration": "FIFTEEN_MINUTES",
                 },
             )
@@ -711,7 +728,7 @@ class TestHandleCreateThresholdAlert:
                     {
                         "name": "Test",
                         "threshold": 100,
-                        "period_minutes": 5,
+                        "period_minutes": 15,
                         "triggerAfterPersistsDuration": "INVALID",
                     },
                 )
@@ -755,7 +772,7 @@ class TestHandleCreateThresholdAlert:
             with pytest.raises(ToolError):
                 await tools._handle_create_threshold_alert(
                     client,
-                    {"name": "Test", "threshold": 100, "period_minutes": 5},
+                    {"name": "Test", "threshold": 100, "period_minutes": 15},
                 )
 
     @pytest.mark.asyncio
@@ -770,7 +787,7 @@ class TestHandleCreateThresholdAlert:
             with pytest.raises(ToolError) as exc_info:
                 await tools._handle_create_threshold_alert(
                     client,
-                    {"name": "Test", "threshold": 100, "period_minutes": 5},
+                    {"name": "Test", "threshold": 100, "period_minutes": 15},
                 )
             assert "Specific tool error" in str(exc_info.value)
 
@@ -782,7 +799,7 @@ class TestHandleCreateThresholdAlert:
         ):
             await tools._handle_create_threshold_alert(
                 client,
-                {"name": "Structure Test", "threshold": 200, "period_minutes": 10},
+                {"name": "Structure Test", "threshold": 200, "period_minutes": 15},
             )
         call_data = tools.anomaly_manager.create_anomaly.call_args[0][1]
         assert call_data["label"] == "Structure Test"
@@ -941,7 +958,7 @@ class TestSimpleParseAlertText:
     def test_unclear_text_defaults_to_threshold(self):
         result = self._parse("something weird 42")
         assert result["alertType"] == "THRESHOLD"
-        assert result["periodDuration"] == "FIVE_MINUTES"
+        assert result["periodDuration"] == "FIFTEEN_MINUTES"
 
     # --- Metric type detection ---
 
@@ -1087,7 +1104,7 @@ class TestHandleCreateSimple:
         assert call_data["name"] == "Simple Alert"
         assert call_data["metricType"] == "TOTAL_COST"
         assert call_data["threshold"] == 100.0
-        assert call_data["periodDuration"] == "FIVE_MINUTES"
+        assert call_data["periodDuration"] == "FIFTEEN_MINUTES"
         assert call_data["alertType"] == "THRESHOLD"
 
     @pytest.mark.asyncio
@@ -1176,3 +1193,160 @@ class TestHandleCreateSimple:
             )
         call_data = tools.anomaly_manager.create_anomaly.call_args[0][1]
         assert "TOKEN_COUNT" in call_data["description"]
+
+
+class TestCreateFlatFieldMerge:
+    """create must accept the flat top-level fields its own get_examples
+    documents (name/alertType/metricType/threshold/email/...), assembling
+    them into anomaly_data — nested values win over flat kwargs."""
+
+    @pytest.mark.asyncio
+    async def test_documented_flat_example_creates_alert(self):
+        tools, client = _make_tools_with_client()
+        # The exact "Cost Spike Detection" example from get_examples.
+        args = {
+            "name": "High Cost Alert",
+            "alertType": "THRESHOLD",
+            "metricType": "TOTAL_COST",
+            "threshold": 100,
+            "periodDuration": "FIFTEEN_MINUTES",
+            "email": "alerts@company.com",
+        }
+        await tools._handle_anomaly_operations(client, "create", args)
+
+        tools.anomaly_manager.create_anomaly.assert_called_once()
+        data = tools.anomaly_manager.create_anomaly.call_args[0][1]
+        assert data["name"] == "High Cost Alert"
+        assert data["alertType"] == "THRESHOLD"
+        assert data["metricType"] == "TOTAL_COST"
+        assert data["threshold"] == 100
+        assert data["periodDuration"] == "FIFTEEN_MINUTES"
+        assert data["notificationAddresses"] == ["alerts@company.com"]
+        # operatorType is nested-only in the schema, so the documented flat
+        # payload can't carry it — threshold alerts default to GREATER_THAN
+        # (the same operator the create_threshold_alert convenience hardcodes).
+        assert data["operatorType"] == "GREATER_THAN"
+
+    @pytest.mark.asyncio
+    async def test_nested_anomaly_data_wins_over_flat(self):
+        tools, client = _make_tools_with_client()
+        args = {
+            "name": "flat-name",
+            "threshold": 5,
+            "anomaly_data": {"name": "nested-name", "alertType": "THRESHOLD"},
+        }
+        await tools._handle_anomaly_operations(client, "create", args)
+
+        data = tools.anomaly_manager.create_anomaly.call_args[0][1]
+        assert data["name"] == "nested-name"
+        assert data["threshold"] == 5  # flat fills the gap nested left open
+
+    @pytest.mark.asyncio
+    async def test_flat_email_does_not_clobber_nested_notifications(self):
+        tools, client = _make_tools_with_client()
+        args = {
+            "email": "flat@company.com",
+            "anomaly_data": {
+                "name": "n",
+                "notificationAddresses": ["nested@company.com"],
+            },
+        }
+        await tools._handle_anomaly_operations(client, "create", args)
+
+        data = tools.anomaly_manager.create_anomaly.call_args[0][1]
+        assert data["notificationAddresses"] == ["nested@company.com"]
+
+    @pytest.mark.asyncio
+    async def test_create_with_no_fields_still_errors(self):
+        tools, client = _make_tools_with_client()
+        result = await tools._handle_anomaly_operations(client, "create", {})
+        tools.anomaly_manager.create_anomaly.assert_not_called()
+        assert "anomaly_data" in result[0].text
+
+
+    @pytest.mark.asyncio
+    async def test_relative_change_does_not_get_default_operator(self):
+        tools, client = _make_tools_with_client()
+        args = {
+            "anomaly_data": {
+                "name": "trend",
+                "alertType": "RELATIVE_CHANGE",
+                "metricType": "TOTAL_COST",
+                "threshold": 20,
+            }
+        }
+        await tools._handle_anomaly_operations(client, "create", args)
+
+        data = tools.anomaly_manager.create_anomaly.call_args[0][1]
+        assert "operatorType" not in data
+
+
+    @pytest.mark.asyncio
+    async def test_direct_create_rejects_banned_period_before_api(self):
+        """The platform rejects ONE_MINUTE/FIVE_MINUTES for non-cumulative
+        alerts with a message the client used to swallow — the tool must
+        reject locally with the actionable message instead."""
+        tools, client = _make_tools_with_client()
+        args = {
+            "name": "Spike",
+            "alertType": "THRESHOLD",
+            "metricType": "TOTAL_COST",
+            "threshold": 100,
+            "periodDuration": "FIVE_MINUTES",
+            "email": "a@b.io",
+        }
+        with pytest.raises(ToolError) as exc_info:
+            await tools._handle_anomaly_operations(client, "create", args)
+        assert "FIFTEEN_MINUTES" in str(exc_info.value)
+        tools.anomaly_manager.create_anomaly.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_direct_create_allows_cumulative_monthly(self):
+        tools, client = _make_tools_with_client()
+        args = {
+            "anomaly_data": {
+                "name": "Budget",
+                "alertType": "CUMULATIVE_USAGE",
+                "metricType": "TOTAL_COST",
+                "threshold": 1000,
+                "periodDuration": "MONTHLY",
+            }
+        }
+        await tools._handle_anomaly_operations(client, "create", args)
+        tools.anomaly_manager.create_anomaly.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_flat_is_percentage_reaches_payload(self):
+        """The documented Error Rate example passes isPercentage flat — dropping
+        it silently reverses the threshold semantics (5% becomes 5 absolute)."""
+        tools, client = _make_tools_with_client()
+        args = {
+            "name": "Error Rate Alert",
+            "alertType": "THRESHOLD",
+            "metricType": "ERROR_RATE",
+            "threshold": 5,
+            "isPercentage": True,
+            "periodDuration": "FIFTEEN_MINUTES",
+            "email": "engineering@company.com",
+        }
+        await tools._handle_anomaly_operations(client, "create", args)
+        data = tools.anomaly_manager.create_anomaly.call_args[0][1]
+        assert data["isPercentage"] is True
+
+    @pytest.mark.asyncio
+    async def test_direct_create_rejects_ten_minutes(self):
+        """TEN_MINUTES never existed in the platform enum — same opaque
+        failure as the banned periods, same local guard."""
+        tools, client = _make_tools_with_client()
+        args = {
+            "name": "Spike",
+            "alertType": "THRESHOLD",
+            "metricType": "TOTAL_COST",
+            "threshold": 100,
+            "periodDuration": "TEN_MINUTES",
+            "email": "a@b.io",
+        }
+        with pytest.raises(ToolError) as exc_info:
+            await tools._handle_anomaly_operations(client, "create", args)
+        assert "FIFTEEN_MINUTES" in str(exc_info.value)
+        tools.anomaly_manager.create_anomaly.assert_not_called()

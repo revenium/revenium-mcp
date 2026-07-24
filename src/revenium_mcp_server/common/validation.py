@@ -8,6 +8,8 @@ from ..validators import InputValidator
 from ..exceptions import ValidationError
 
 _SAFE_INT_MAX = 2**53
+# Public alias so per-tool validators share the same ceiling.
+SAFE_INT_MAX = _SAFE_INT_MAX
 
 # Re-export common validation functions
 __all__ = [
@@ -19,6 +21,7 @@ __all__ = [
     "preprocess_boolean_parameters",
     "validate_pagination_params",
     "validate_string_params",
+    "SAFE_INT_MAX",
 ]
 
 

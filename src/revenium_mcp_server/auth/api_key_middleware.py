@@ -5,14 +5,15 @@ Two concerns live here:
     RequireAuthMiddleware calls verify_token per request and emits 401 +
     WWW-Authenticate when it returns None.
   * ApiKeyAuthMiddleware — a post-auth on_call_tool middleware that reads the
-    verified AccessToken and populates the existing _current_tenant ContextVar.
+    verified AccessToken, applies the optional X-Revenium-Team-Id override,
+    and populates the existing _current_tenant ContextVar.
 """
 from __future__ import annotations
 
 from typing import Any
 
 from fastmcp.server.auth.auth import AccessToken, TokenVerifier
-from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.dependencies import get_access_token, get_http_headers
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from loguru import logger
 
@@ -24,6 +25,7 @@ from .api_key_validator import (
     _fingerprint,
     _strip_bearer,
 )
+from .auth_events import emit_auth_event
 from .claims_middleware import _current_tenant
 from .tenant_context import TenantContext
 
@@ -41,16 +43,30 @@ class ApiKeyTokenVerifier(TokenVerifier):
         self._validator = validator
 
     async def verify_token(self, token: str) -> AccessToken | None:
+        fingerprint = _fingerprint(_strip_bearer(token))
         try:
             identity = await self._validator.validate(token)
         except ApiKeyValidationError as exc:
             logger.info(
                 "api_key auth rejected: {} (key_fingerprint={})",
                 type(exc).__name__,
-                _fingerprint(_strip_bearer(token)),
+                fingerprint,
+            )
+            emit_auth_event(
+                outcome="failure",
+                auth_mode="api_key",
+                key_fingerprint=fingerprint,
+                reason=type(exc).__name__,
             )
             return None
 
+        emit_auth_event(
+            outcome="success",
+            auth_mode="api_key",
+            key_fingerprint=fingerprint,
+            user_id=identity.user_id,
+            tenant_id=identity.tenant_id,
+        )
         return AccessToken(
             token=_strip_bearer(token),
             client_id=identity.user_id,
@@ -58,6 +74,7 @@ class ApiKeyTokenVerifier(TokenVerifier):
             claims={
                 "tenant_id": identity.tenant_id,
                 "team_id": identity.team_id,
+                "team_ids": list(identity.team_ids),
                 "user_id": identity.user_id,
                 "scope_from_prefix": identity.scope_from_prefix,
             },
@@ -82,12 +99,39 @@ class ApiKeyAuthMiddleware(Middleware):
         claims = access.claims
         token = access.token
 
+        # Per-request team selection: an explicit X-Revenium-Team-Id header
+        # picks one of the caller's teams; absent/empty keeps the default
+        # resolved at validation time. Unknown teams fail closed.
+        headers = get_http_headers()
+        requested = (headers.get("x-revenium-team-id") or "").strip()
+        if not requested:
+            team_id = claims["team_id"]
+        elif requested in (claims.get("team_ids") or []):
+            team_id = requested
+        else:
+            logger.warning(
+                "Team override rejected for user_id={}: requested team not "
+                "available to this API key",
+                claims.get("user_id"),
+            )
+            # No raw token in scope here — post-auth claims only, so no fingerprint field.
+            emit_auth_event(
+                outcome="failure",
+                auth_mode="api_key",
+                user_id=claims.get("user_id"),
+                tenant_id=claims.get("tenant_id"),
+                reason="team_override_rejected",
+            )
+            raise PermissionError(
+                f"Team '{requested}' is not available to this API key"
+            )
+
         # api_key mode has no server-wide REVENIUM_API_KEY, so ConfigManager
         # (which requires one) cannot be used here. Resolve the downstream base
         # URL directly — honoring REVENIUM_BASE_URL when set, else the default.
         base_url = get_config_value("REVENIUM_BASE_URL") or DEFAULT_BASE_URL
         tenant_ctx = TenantContext(
-            team_id=claims["team_id"],
+            team_id=team_id,
             tenant_id=claims["tenant_id"],
             user_id=claims["user_id"],
             api_key=token,

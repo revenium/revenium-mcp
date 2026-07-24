@@ -50,187 +50,106 @@ def test_env_resolver_ignores_claims():
     assert ctx_with.team_id == ctx_without.team_id == "team_env"
 
 
-# ── ClerkTenantResolver ──────────────────────────────────────────
+# ── ClerkTenantResolver (multi-tenant) ───────────────────────────
 
-@pytest.fixture
-def mock_config_manager():
-    with patch(
-        "src.revenium_mcp_server.auth.tenant_resolver.ConfigManager"
-    ) as mock_cm:
-        mock_cfg = mock_cm.return_value.get_config.return_value
-        mock_cfg.team_id = "team_env"
-        mock_cfg.api_key = "shared_key_abcd"
-        mock_cfg.tenant_id = "tenant_expected"
-        mock_cfg.base_url = "https://api.revenium.io"
-        yield mock_cfg
+JWT = "eyJhbGciOiJSUzI1NiJ9.payload.signature"
 
 
-def test_clerk_resolver_happy_path(mock_config_manager):
-    from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-    resolver = ClerkTenantResolver()
-    claims = {
-        "revenium_team_id": "team_jwt",
-        "tenant_id": "tenant_expected",
+def _claims(**overrides):
+    base = {
         "sub": "user_abc",
-        "scope": "openid profile email",
+        "revenium_team_id": "team_from_jwt",
+        "tenant_id": "tenant_from_jwt",
     }
-    ctx = resolver.resolve(claims)
-
-    assert ctx.team_id == "team_jwt"
-    assert ctx.tenant_id == "tenant_expected"
-    assert ctx.user_id == "user_abc"
-    assert ctx.api_key == "shared_key_abcd"
-    assert ctx.base_url == "https://api.revenium.io"
-    assert ctx.scopes == ["openid", "profile", "email"]
+    base.update(overrides)
+    return base
 
 
-def test_clerk_resolver_missing_team_id(mock_config_manager):
-    from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
+class TestClerkResolverMultiTenant:
+    def test_resolves_without_env_pinning(self, monkeypatch):
+        monkeypatch.delenv("REVENIUM_TENANT_ID", raising=False)
+        monkeypatch.delenv("REVENIUM_API_KEY", raising=False)
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
+        ctx = resolver.resolve(_claims(), clerk_jwt=JWT)
+        assert ctx.tenant_id == "tenant_from_jwt"
+        assert ctx.team_id == "team_from_jwt"
+        assert ctx.user_id == "user_abc"
+        assert ctx.clerk_jwt == JWT
+        assert ctx.api_key is None
 
-    resolver = ClerkTenantResolver()
-    with pytest.raises(PermissionError, match="revenium_team_id"):
-        resolver.resolve(
-            {"tenant_id": "tenant_expected", "sub": "user_abc"}
-        )
+    def test_two_tenants_resolve_on_same_instance(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
+        a = resolver.resolve(_claims(tenant_id="tenant_a"), clerk_jwt=JWT)
+        b = resolver.resolve(_claims(tenant_id="tenant_b"), clerk_jwt=JWT)
+        assert a.tenant_id == "tenant_a"
+        assert b.tenant_id == "tenant_b"
 
+    def test_missing_claims_still_rejected(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
+        claims = _claims()
+        del claims["revenium_team_id"]
+        with pytest.raises(PermissionError, match="revenium_team_id"):
+            resolver.resolve(claims, clerk_jwt=JWT)
 
-def test_clerk_resolver_missing_tenant_id(mock_config_manager):
-    from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
+    def test_missing_jwt_rejected(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
+        with pytest.raises(PermissionError, match="access token"):
+            resolver.resolve(_claims(), clerk_jwt=None)
 
-    resolver = ClerkTenantResolver()
-    with pytest.raises(PermissionError, match=r"missing required claim\(s\): .*tenant_id"):
-        resolver.resolve(
-            {"revenium_team_id": "team_jwt", "sub": "user_abc"}
-        )
-
-
-def test_clerk_resolver_missing_sub(mock_config_manager):
-    from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-    resolver = ClerkTenantResolver()
-    with pytest.raises(PermissionError, match="sub"):
-        resolver.resolve(
-            {"revenium_team_id": "team_jwt", "tenant_id": "tenant_expected"}
-        )
-
-
-def test_clerk_resolver_tenant_mismatch(mock_config_manager):
-    from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-    resolver = ClerkTenantResolver()
-    claims = {
-        "revenium_team_id": "team_jwt",
-        "tenant_id": "tenant_wrong",
-        "sub": "user_abc",
-    }
-    with pytest.raises(PermissionError, match="does not match this deployment"):
-        resolver.resolve(claims)
-
-
-def test_clerk_resolver_init_raises_if_tenant_id_unset():
-    from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-    with patch(
-        "src.revenium_mcp_server.auth.tenant_resolver.ConfigManager"
-    ) as mock_cm:
-        mock_cfg = mock_cm.return_value.get_config.return_value
-        mock_cfg.tenant_id = None
-        with pytest.raises(RuntimeError, match="REVENIUM_TENANT_ID must be set"):
-            ClerkTenantResolver()
-
-
-def test_clerk_resolver_scope_as_list(mock_config_manager):
-    from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-    resolver = ClerkTenantResolver()
-    claims = {
-        "revenium_team_id": "team_jwt",
-        "tenant_id": "tenant_expected",
-        "sub": "user_abc",
-        "scope": ["openid", "email"],
-    }
-    ctx = resolver.resolve(claims)
-    assert ctx.scopes == ["openid", "email"]
-
-
-def test_clerk_resolver_empty_scope(mock_config_manager):
-    from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-    resolver = ClerkTenantResolver()
-    claims = {
-        "revenium_team_id": "team_jwt",
-        "tenant_id": "tenant_expected",
-        "sub": "user_abc",
-    }
-    ctx = resolver.resolve(claims)
-    assert ctx.scopes is None
-
-
-def test_clerk_resolver_filters_empty_scope_elements(mock_config_manager):
-    from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-    resolver = ClerkTenantResolver()
-    claims = {
-        "revenium_team_id": "team_jwt",
-        "tenant_id": "tenant_expected",
-        "sub": "user_abc",
-        "scope": ["", "openid", ""],
-    }
-    ctx = resolver.resolve(claims)
-    assert ctx.scopes == ["openid"]
-
-
-def test_clerk_resolver_all_empty_scope_list_becomes_none(mock_config_manager):
-    from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-    resolver = ClerkTenantResolver()
-    claims = {
-        "revenium_team_id": "team_jwt",
-        "tenant_id": "tenant_expected",
-        "sub": "user_abc",
-        "scope": ["", ""],
-    }
-    ctx = resolver.resolve(claims)
-    assert ctx.scopes is None
-
-
-def test_clerk_resolver_oidc_scope_non_iterable_returns_none(mock_config_manager):
-    """JWT 'scope' claim of unexpected type must not crash _parse_scopes."""
-    from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-    resolver = ClerkTenantResolver()
-    for bad_value in (True, 42, {"foo": "bar"}):
+    def test_resolves_tenant_claims_from_nested_private_metadata(self, monkeypatch):
+        """Clerk OAuth ID tokens nest custom claims under private_metadata."""
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
         claims = {
-            "revenium_team_id": "team_jwt",
-            "tenant_id": "tenant_expected",
             "sub": "user_abc",
-            "scope": bad_value,
+            "email": "u@example.com",
+            "private_metadata": {
+                "revenium_team_id": "team_nested",
+                "tenant_id": "tenant_nested",
+            },
         }
-        ctx = resolver.resolve(claims)
-        assert ctx.scopes is None, f"failed for value {bad_value!r}"
+        ctx = resolver.resolve(claims, clerk_jwt=JWT)
+        assert ctx.team_id == "team_nested"
+        assert ctx.tenant_id == "tenant_nested"
+        assert ctx.user_id == "user_abc"
+
+    def test_top_level_claims_take_precedence_over_nested(self, monkeypatch):
+        """A top-level claim (e.g. a session-token-shaped JWT) still wins."""
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
+        claims = {
+            "sub": "user_abc",
+            "revenium_team_id": "team_top",
+            "tenant_id": "tenant_top",
+            "private_metadata": {
+                "revenium_team_id": "team_nested",
+                "tenant_id": "tenant_nested",
+            },
+        }
+        ctx = resolver.resolve(claims, clerk_jwt=JWT)
+        assert ctx.team_id == "team_top"
+        assert ctx.tenant_id == "tenant_top"
+
+    def test_missing_nested_claim_still_rejected(self, monkeypatch):
+        """A private_metadata block missing revenium_team_id is rejected."""
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
+        claims = {
+            "sub": "user_abc",
+            "private_metadata": {"tenant_id": "tenant_nested"},
+        }
+        with pytest.raises(PermissionError, match="revenium_team_id"):
+            resolver.resolve(claims, clerk_jwt=JWT)
 
 
-def test_clerk_resolver_tenant_mismatch_does_not_leak_expected(mock_config_manager):
-    """PermissionError on tenant mismatch must not disclose the server's REVENIUM_TENANT_ID."""
+def _make_clerk_resolver():
+    """Instantiate ClerkTenantResolver without ConfigManager side-effects."""
     from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-    resolver = ClerkTenantResolver()
-    claims = {
-        "revenium_team_id": "team_jwt",
-        "tenant_id": "tenant_wrong",
-        "sub": "user_abc",
-    }
-    try:
-        resolver.resolve(claims)
-        assert False, "should have raised PermissionError"
-    except PermissionError as e:
-        # Neither the JWT-supplied tenant_id NOR the server's configured value
-        # should appear in the error message.
-        assert "tenant_wrong" not in str(e)
-        assert "tenant_expected" not in str(e)
-        # But the error class and high-level message should still be correct.
-        assert "does not match this deployment" in str(e)
+    return ClerkTenantResolver()
 
 
 # ── get_resolver() ───────────────────────────────────────────────
@@ -245,7 +164,7 @@ def test_get_resolver_defaults_to_env(monkeypatch):
     assert isinstance(get_resolver(), EnvTenantResolver)
 
 
-def test_get_resolver_returns_clerk_when_clerk(monkeypatch, mock_config_manager):
+def test_get_resolver_returns_clerk_when_clerk(monkeypatch):
     from src.revenium_mcp_server.auth.tenant_resolver import (
         ClerkTenantResolver,
         get_resolver,
@@ -270,43 +189,39 @@ class TestClerkResolverApiKeyScopes:
     def _base_claims(self):
         return {
             "revenium_team_id": "team_jwt",
-            "tenant_id": "tenant_expected",
+            "tenant_id": "tenant_from_jwt",
             "sub": "user_abc",
         }
 
-    def test_parses_string_claim(self, mock_config_manager):
-        from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-        resolver = ClerkTenantResolver()
+    def test_parses_string_claim(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
         claims = {**self._base_claims(), "revenium_api_scopes": "READ WRITE"}
-        ctx = resolver.resolve(claims)
+        ctx = resolver.resolve(claims, clerk_jwt=JWT)
         assert ctx.api_key_scopes == [APIKeyScope.READ, APIKeyScope.WRITE]
 
-    def test_parses_list_claim(self, mock_config_manager):
-        from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-        resolver = ClerkTenantResolver()
+    def test_parses_list_claim(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
         claims = {**self._base_claims(), "revenium_api_scopes": ["read", "write"]}
-        ctx = resolver.resolve(claims)
+        ctx = resolver.resolve(claims, clerk_jwt=JWT)
         assert ctx.api_key_scopes == [APIKeyScope.READ, APIKeyScope.WRITE]
 
-    def test_normalizes_case(self, mock_config_manager):
-        from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-        resolver = ClerkTenantResolver()
+    def test_normalizes_case(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
         claims = {**self._base_claims(), "revenium_api_scopes": "read metering"}
-        ctx = resolver.resolve(claims)
+        ctx = resolver.resolve(claims, clerk_jwt=JWT)
         assert ctx.api_key_scopes == [APIKeyScope.READ, APIKeyScope.METERING]
 
-    def test_drops_unknown_with_warning(self, mock_config_manager):
-        from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
+    def test_drops_unknown_with_warning(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
         # The project uses loguru; patch the module-level logger to capture
         # warnings (pytest's caplog does NOT catch loguru by default).
         with patch("src.revenium_mcp_server.auth.tenant_resolver.logger") as mock_logger:
-            resolver = ClerkTenantResolver()
+            resolver = _make_clerk_resolver()
             claims = {**self._base_claims(), "revenium_api_scopes": "READ BANANA WRITE"}
-            ctx = resolver.resolve(claims)
+            ctx = resolver.resolve(claims, clerk_jwt=JWT)
 
         assert ctx.api_key_scopes == [APIKeyScope.READ, APIKeyScope.WRITE]
         mock_logger.warning.assert_called_once()
@@ -315,66 +230,98 @@ class TestClerkResolverApiKeyScopes:
         # the exact format-string vs. positional-arg split.
         assert "BANANA" in str(mock_logger.warning.call_args)
 
-    def test_dedupes(self, mock_config_manager):
-        from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-        resolver = ClerkTenantResolver()
+    def test_dedupes(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
         claims = {**self._base_claims(), "revenium_api_scopes": "READ READ WRITE"}
-        ctx = resolver.resolve(claims)
+        ctx = resolver.resolve(claims, clerk_jwt=JWT)
         assert ctx.api_key_scopes == [APIKeyScope.READ, APIKeyScope.WRITE]
 
-    def test_all_unknown_returns_none(self, mock_config_manager):
-        from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-        resolver = ClerkTenantResolver()
+    def test_all_unknown_returns_none(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
         claims = {**self._base_claims(), "revenium_api_scopes": "BANANA APPLE"}
-        ctx = resolver.resolve(claims)
+        ctx = resolver.resolve(claims, clerk_jwt=JWT)
         assert ctx.api_key_scopes is None
 
-    def test_missing_claim_returns_none(self, mock_config_manager):
-        from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-        resolver = ClerkTenantResolver()
-        ctx = resolver.resolve(self._base_claims())
+    def test_missing_claim_returns_none(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
+        ctx = resolver.resolve(self._base_claims(), clerk_jwt=JWT)
         assert ctx.api_key_scopes is None
 
-    def test_empty_list_returns_none(self, mock_config_manager):
-        from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-        resolver = ClerkTenantResolver()
+    def test_empty_list_returns_none(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
         claims = {**self._base_claims(), "revenium_api_scopes": []}
-        ctx = resolver.resolve(claims)
+        ctx = resolver.resolve(claims, clerk_jwt=JWT)
         assert ctx.api_key_scopes is None
 
-    def test_oidc_scopes_untouched(self, mock_config_manager):
+    def test_oidc_scopes_untouched(self, monkeypatch):
         """Regression: existing ctx.scopes (OIDC) semantics preserved."""
-        from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-        resolver = ClerkTenantResolver()
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
         claims = {
             **self._base_claims(),
             "scope": "openid email",
             "revenium_api_scopes": "READ",
         }
-        ctx = resolver.resolve(claims)
+        ctx = resolver.resolve(claims, clerk_jwt=JWT)
         assert ctx.scopes == ["openid", "email"]
         assert ctx.api_key_scopes == [APIKeyScope.READ]
 
-    def test_non_iterable_claim_returns_none(self, mock_config_manager):
+    def test_non_iterable_claim_returns_none(self, monkeypatch):
         """JWT claim of unexpected type (bool / int) must not crash."""
-        from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-        resolver = ClerkTenantResolver()
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
         for bad_value in (True, 42, {"foo": "bar"}):
             claims = {**self._base_claims(), "revenium_api_scopes": bad_value}
-            ctx = resolver.resolve(claims)
+            ctx = resolver.resolve(claims, clerk_jwt=JWT)
             assert ctx.api_key_scopes is None, f"failed for value {bad_value!r}"
 
-    def test_list_with_non_string_elements_drops_them(self, mock_config_manager):
+    def test_list_with_non_string_elements_drops_them(self, monkeypatch):
         """JWT claim list containing non-string elements must skip them, not crash."""
-        from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
-
-        resolver = ClerkTenantResolver()
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
         claims = {**self._base_claims(), "revenium_api_scopes": ["READ", 42, None, "WRITE"]}
-        ctx = resolver.resolve(claims)
+        ctx = resolver.resolve(claims, clerk_jwt=JWT)
         assert ctx.api_key_scopes == [APIKeyScope.READ, APIKeyScope.WRITE]
+
+    def test_scope_as_list(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
+        claims = {
+            **self._base_claims(),
+            "scope": ["openid", "email"],
+        }
+        ctx = resolver.resolve(claims, clerk_jwt=JWT)
+        assert ctx.scopes == ["openid", "email"]
+
+    def test_empty_scope(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
+        ctx = resolver.resolve(self._base_claims(), clerk_jwt=JWT)
+        assert ctx.scopes is None
+
+    def test_filters_empty_scope_elements(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
+        claims = {**self._base_claims(), "scope": ["", "openid", ""]}
+        ctx = resolver.resolve(claims, clerk_jwt=JWT)
+        assert ctx.scopes == ["openid"]
+
+    def test_all_empty_scope_list_becomes_none(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
+        claims = {**self._base_claims(), "scope": ["", ""]}
+        ctx = resolver.resolve(claims, clerk_jwt=JWT)
+        assert ctx.scopes is None
+
+    def test_oidc_scope_non_iterable_returns_none(self, monkeypatch):
+        """JWT 'scope' claim of unexpected type must not crash _parse_scopes."""
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        resolver = _make_clerk_resolver()
+        for bad_value in (True, 42, {"foo": "bar"}):
+            claims = {**self._base_claims(), "scope": bad_value}
+            ctx = resolver.resolve(claims, clerk_jwt=JWT)
+            assert ctx.scopes is None, f"failed for value {bad_value!r}"

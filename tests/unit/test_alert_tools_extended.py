@@ -167,7 +167,9 @@ class TestHandleActionCreate:
             "dry_run": True,
             "anomaly_data": {
                 "name": "Dry Run Alert",
+                "alertType": "THRESHOLD",
                 "metricType": "TOTAL_COST",
+                "operatorType": "GREATER_THAN",
                 "threshold": 100,
             },
         })
@@ -500,7 +502,7 @@ class TestHandleActionCreateThresholdAlert:
             result = await tools.handle_action("create_threshold_alert", {
                 "name": "Cost Spike",
                 "threshold": 100,
-                "period_minutes": 5,
+                "period_minutes": 15,
                 "email": "test@example.com",
             })
         assert result[0].text == "Threshold alert created"
@@ -514,7 +516,7 @@ class TestHandleActionCreateThresholdAlert:
         }):
             with pytest.raises(Exception):
                 await tools.handle_action("create_threshold_alert", {
-                    "threshold": 100, "period_minutes": 5, "email": "a@b.com",
+                    "threshold": 100, "period_minutes": 15, "email": "a@b.com",
                 })
 
     @pytest.mark.asyncio
@@ -526,7 +528,7 @@ class TestHandleActionCreateThresholdAlert:
         }):
             with pytest.raises(Exception):
                 await tools.handle_action("create_threshold_alert", {
-                    "name": "Test", "period_minutes": 5, "email": "a@b.com",
+                    "name": "Test", "period_minutes": 15, "email": "a@b.com",
                 })
 
     @pytest.mark.asyncio
@@ -554,7 +556,7 @@ class TestHandleActionCreateThresholdAlert:
             result = await tools.handle_action("create_threshold_alert", {
                 "name": "Persist Alert",
                 "threshold": 100,
-                "period_minutes": 5,
+                "period_minutes": 15,
                 "email": "a@b.com",
                 "triggerAfterPersistsDuration": "FIFTEEN_MINUTES",
             })
@@ -571,7 +573,7 @@ class TestHandleActionCreateThresholdAlert:
                 await tools.handle_action("create_threshold_alert", {
                     "name": "Test",
                     "threshold": 100,
-                    "period_minutes": 5,
+                    "period_minutes": 15,
                     "email": "a@b.com",
                     "triggerAfterPersistsDuration": "INVALID_DURATION",
                 })

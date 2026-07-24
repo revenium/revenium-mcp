@@ -82,6 +82,10 @@ _COMPLETIONS_FILTER_PARAM_MAP: Dict[str, str] = {
     # Date range (biggest performance win — avoids full-table scans)
     "start_date": "startDate",
     "end_date": "endDate",
+    # Server-side free-text search: exact match on trace/transaction ID first,
+    # falling back to partial match across agent, model, provider, error
+    # reason and subscriber email.
+    "query": "query",
     # Identity / tracing
     "transaction_id": "transactionId",
     "trace_id": "traceId",
@@ -2064,11 +2068,15 @@ The subscriber data structure has been updated. The old individual fields are no
         max_retries: int,
         retry_interval: int,
         operation_name: str = "operation",
+        retry_on_empty: bool = True,
     ) -> Tuple[bool, Any, Dict[str, Any], Optional[Exception]]:
         """Execute operation with retry logic.
 
         Executes the provided operation with configurable retry attempts,
-        including proper timing, logging, and error handling.
+        including proper timing, logging, and error handling. With
+        ``retry_on_empty=False`` an empty result (an authoritative not-found,
+        as opposed to a raised transport error) returns immediately instead of
+        burning the remaining attempts.
         """
         last_error = None
 
@@ -2079,10 +2087,17 @@ The subscriber data structure has been updated. The old individual fields are no
             )
 
             if success:
+                metadata = dict(metadata or {})
+                metadata.setdefault("attempts_made", attempt + 1)
                 return True, result, metadata, None
 
             if error:
                 last_error = error
+
+            # An empty result with no exception is a completed search that
+            # found nothing — only keep polling when the caller asked for it.
+            if error is None and not retry_on_empty:
+                return False, None, {"attempts_made": attempt + 1}, last_error
 
             # Extract retry delay logic from lines 1647-1649 and 1656-1658
             if attempt < max_retries - 1:
@@ -2091,7 +2106,7 @@ The subscriber data structure has been updated. The old individual fields are no
                 )
                 await asyncio.sleep(retry_interval)
 
-        return False, None, {}, last_error
+        return False, None, {"attempts_made": max_retries}, last_error
 
     def _build_result_entry(
         self,
@@ -2215,6 +2230,11 @@ The subscriber data structure has been updated. The old individual fields are no
             "wait_seconds": arguments.get("wait_seconds", 30),
             "max_retries": arguments.get("max_retries", 3),
             "retry_interval": arguments.get("retry_interval", 15),
+            # Polling for a not-yet-visible transaction (the post-submit
+            # verification flow) is opt-in via the explicit retry knobs; a
+            # plain lookup of a missing id must return promptly.
+            "retry_on_empty": ("max_retries" in arguments)
+            or ("retry_interval" in arguments),
             "search_page_range": arguments.get("search_page_range", 50),
             "page_size": arguments.get("page_size", 1000),
             "early_termination": arguments.get("early_termination", True),
@@ -2271,7 +2291,7 @@ The subscriber data structure has been updated. The old individual fields are no
         success: bool,
         transaction_data: Any,
         search_metadata: Dict[str, Any],
-        max_retries: int,
+        attempts: int,
     ) -> Dict[str, Any]:
         """Build result entry for API search results."""
         if success and transaction_data:
@@ -2281,7 +2301,7 @@ The subscriber data structure has been updated. The old individual fields are no
                 source="api",
                 transaction_data=transaction_data,
                 search_metadata=search_metadata,
-                attempts=1,
+                attempts=attempts,
             )
         else:
             # Build not found entry with helpful message
@@ -2294,7 +2314,7 @@ The subscriber data structure has been updated. The old individual fields are no
                 found=False,
                 source="api",
                 search_metadata=search_metadata,
-                attempts=max_retries,
+                attempts=attempts,
                 message=message,
             )
 
@@ -2321,11 +2341,20 @@ The subscriber data structure has been updated. The old individual fields are no
                 )
 
             success, transaction_data, search_metadata, error = await self._execute_with_retry(
-                search_operation, tid, params["max_retries"], params["retry_interval"], "lookup"
+                search_operation,
+                tid,
+                params["max_retries"],
+                params["retry_interval"],
+                "lookup",
+                retry_on_empty=params.get("retry_on_empty", False),
             )
 
             result_entry = self._build_api_result_entry(
-                tid, success, transaction_data, search_metadata, params["max_retries"]
+                tid,
+                success,
+                transaction_data,
+                search_metadata,
+                search_metadata.get("attempts_made", 1),
             )
             results.append(result_entry)
 
@@ -6206,6 +6235,11 @@ Use `validate()` before submission."""
                     "type": "string",
                     "description": "Filter transactions on or before this ISO 8601 timestamp. Used with lookup_recent_transactions and analyze_recent_transactions.",
                 },
+                # Server-side free-text search
+                "query": {
+                    "type": "string",
+                    "description": "Server-side search term: matches trace/transaction ID exactly first, then falls back to partial match across agent, model, provider, error reason and subscriber email. Used with lookup_recent_transactions and analyze_recent_transactions.",
+                },
                 # Cost / performance ranges
                 "total_cost_min": {
                     "type": "number",
@@ -6471,63 +6505,79 @@ Use `validate()` before submission."""
                 "**Response**: 201 Created with transaction_id\n"
                 "**Timeout**: 30 seconds\n"
                 "**Rate Limit**: 1,000 requests/minute\n\n"
-                "### **2. Verify Transactions**\n"
+                "### **2. List / Verify Transactions**\n"
                 "```http\n"
                 # completions new_path is TBD in endpoint_registry; currently routes to legacy path
-                "GET {base_url}/profitstream/v2/api/sources/metrics/ai/completions\n"
-                "Authorization: Bearer {REVENIUM_API_KEY}\n"
+                "GET {base_url}/profitstream/v2/api/sources/metrics/ai/completions?teamId={team_id}&page=0&size=20\n"
                 "x-api-key: {REVENIUM_API_KEY}\n"
                 "```\n\n"
-                "**Purpose**: Verify transaction processing status\n"
+                "**Purpose**: List metered AI transactions (verification, audits)\n"
                 "**Query Parameters**:\n"
-                "- `transaction_ids` (optional): Comma-separated list of transaction IDs\n"
-                "- `since` (optional): ISO timestamp to check transactions since\n"
-                "- `limit` (optional): Maximum 1,000 transactions per request (auto-pagination available)\n"
-                "**Response**: 200 OK with verification results\n"
+                "- `teamId` (required): hashed team ID matching the API key's team — "
+                "discover yours via `GET /profitstream/v2/api/users/me`. The MCP injects "
+                "this automatically on its own calls; direct REST callers must supply it "
+                "(omitting it returns 400 'Missing request parameter: teamId')\n"
+                "- `page` (optional): page number, 0-based\n"
+                "- `size` (optional): page size\n"
+                "- `sort` (optional): sort specification\n"
+                "- `query` (optional): server-side search — exact trace/transaction ID "
+                "match first, then partial match across agent, model, provider, error "
+                "reason and subscriber email\n"
+                "- Optional camelCase filters: `startDate`, `endDate`, `transactionId`, "
+                "`traceId`, `agent`, `organizationName`, `subscriberEmail`, `provider`, "
+                "`model`, and more — the full set matches `lookup_transactions` filters "
+                "(see get_field_documentation)\n"
+                "**Response**: 200 OK with a paginated transaction list\n"
                 "**Timeout**: 30 seconds\n"
                 "**Rate Limit**: 100 requests/minute\n\n"
                 "### **3. Get Transaction Status**\n"
                 "```http\n"
                 # completions new_path is TBD in endpoint_registry; currently routes to legacy path
-                "GET {base_url}/profitstream/v2/api/sources/metrics/ai/completions/{transaction_id}\n"
-                "Authorization: Bearer {REVENIUM_API_KEY}\n"
+                "GET {base_url}/profitstream/v2/api/sources/metrics/ai/completions/{id}\n"
                 "x-api-key: {REVENIUM_API_KEY}\n"
                 "```\n\n"
-                "**Purpose**: Get detailed status of specific transaction\n"
-                "**Path Parameters**: `transaction_id` - Transaction identifier\n"
+                "**Purpose**: Get detailed status of a specific transaction\n"
+                "**Path Parameters**: `id` - the transaction identifier\n"
                 "**Response**: 200 OK with transaction details\n"
                 "**Timeout**: 30 seconds\n"
                 "**Rate Limit**: 100 requests/minute\n\n"
                 "## **AI Models Discovery Endpoints**\n\n"
                 "### **4. List AI Models**\n"
                 "```http\n"
-                "GET {base_url}/v1/ai-models?page=0&size=20\n"
+                "GET {base_url}/profitstream/v2/api/sources/ai/models?teamId={team_id}&page=0&size=20\n"
                 "Authorization: Bearer {REVENIUM_API_KEY}\n"
                 "x-api-key: {REVENIUM_API_KEY}\n"
                 "```\n\n"
                 "**Purpose**: Get paginated list of supported AI models\n"
                 "**Query Parameters**:\n"
+                "- `teamId` (required): Your team/organization ID\n"
                 "- `page` (optional): Page number (default: 0)\n"
                 "- `size` (optional): Page size (default: 20, max: 50)\n"
                 "**Response**: 200 OK with model list\n\n"
                 "### **5. Search AI Models**\n"
                 "```http\n"
-                "GET {base_url}/v1/ai-models/search?query={search_term}&page=0&size=20\n"
+                "GET {base_url}/profitstream/v2/api/sources/ai/models?query={search_term}&teamId={team_id}&page=0&size=20\n"
                 "Authorization: Bearer {REVENIUM_API_KEY}\n"
                 "x-api-key: {REVENIUM_API_KEY}\n"
                 "```\n\n"
                 "**Purpose**: Search for AI models by name or provider\n"
                 "**Query Parameters**:\n"
                 "- `query` (required): Search term (model name, provider, etc.)\n"
+                "- `teamId` (required): Your team/organization ID\n"
                 "- `page` (optional): Page number (default: 0)\n"
                 "- `size` (optional): Page size (default: 20, max: 50)\n"
                 "**Response**: 200 OK with matching models\n\n"
-                "## **Request Headers (All Endpoints)**\n\n"
-                "### **Required Headers**\n"
+                "## **Request Headers**\n\n"
+                "### **By Endpoint Type**\n"
+                "Analytics endpoints use `Authorization: Bearer {REVENIUM_API_KEY}`; "
+                "all other endpoints (metering, model discovery, transaction "
+                "verification) use `x-api-key: {REVENIUM_API_KEY}` — the same key "
+                "value either way. Sending both headers on every request is the "
+                "simplest approach: each endpoint reads the one it requires.\n"
                 "```http\n"
                 "Authorization: Bearer {REVENIUM_API_KEY}\n"
-                "Content-Type: application/json\n"
                 "x-api-key: {REVENIUM_API_KEY}\n"
+                "Content-Type: application/json\n"
                 "```\n\n"
                 "### **Optional Headers**\n"
                 "```http\n"
@@ -6551,7 +6601,7 @@ Use `validate()` before submission."""
                 "base_url = os.getenv('REVENIUM_BASE_URL', 'https://api.revenium.ai')\n"
                 "submit_url = f'{base_url}/meter/v2/ai/completions'\n"
                 "verify_url = f'{base_url}/profitstream/v2/api/sources/metrics/ai/completions'\n"
-                "models_url = f'{base_url}/v1/ai-models'\n"
+                "models_url = f'{base_url}/profitstream/v2/api/sources/ai/models'\n"
                 "```\n\n"
                 "## **Connection Best Practices**\n\n"
                 "### **HTTP Client Configuration**\n"
@@ -6579,11 +6629,33 @@ Use `validate()` before submission."""
                 type="text",
                 text="# **Revenium API Authentication**\n\n"
                 "## **Authentication Method**\n\n"
-                "**Type**: Bearer Token Authentication with API Key\n"
+                "Revenium uses **API-key authentication** sent via an HTTP header. "
+                "Which header authenticates depends on the endpoint:\n\n"
+                "- **Analytics endpoints** (AI Insights / analytics): "
+                "`Authorization: Bearer {REVENIUM_API_KEY}`\n"
+                "- **All other endpoints** (metering submission, model discovery, "
+                "transaction verification, etc.): `x-api-key: {REVENIUM_API_KEY}`\n\n"
+                "The **same** `REVENIUM_API_KEY` value is used for both headers. "
+                "Sending only the header the endpoint does not accept returns "
+                "**403 Forbidden** — e.g. `Authorization: Bearer` alone against a "
+                "metering endpoint fails. The simplest approach is to send **both** "
+                "headers on every request: each endpoint reads the one it requires, "
+                "so the examples below include both.\n\n"
                 "**Security**: HTTPS required for all requests\n"
                 "**Key Format**: `rev_` prefix followed by 32 alphanumeric characters\n\n"
                 "## **Required HTTP Headers**\n\n"
-                "### **Primary Authentication Headers**\n"
+                "### **By Endpoint Type**\n\n"
+                "**Analytics endpoints** (AI Insights / analytics):\n"
+                "```http\n"
+                "Authorization: Bearer {REVENIUM_API_KEY}\n"
+                "Content-Type: application/json\n"
+                "```\n\n"
+                "**All other endpoints** (metering, model discovery, verification):\n"
+                "```http\n"
+                "x-api-key: {REVENIUM_API_KEY}\n"
+                "Content-Type: application/json\n"
+                "```\n\n"
+                "### **Send Both (works for every endpoint)**\n"
                 "```http\n"
                 "Authorization: Bearer {REVENIUM_API_KEY}\n"
                 "x-api-key: {REVENIUM_API_KEY}\n"
@@ -6617,8 +6689,9 @@ Use `validate()` before submission."""
                 "REVENIUM_BASE_URL=https://api.revenium.ai\n\n"
                 "# Request timeout in seconds (OPTIONAL)\n"
                 "REVENIUM_TIMEOUT=30\n\n"
-                "# Team and Owner IDs for advanced features (OPTIONAL)\n"
+                "# Team ID — required for AI model discovery endpoints\n"
                 "REVENIUM_TEAM_ID=your_team_id\n"
+                "# Owner ID for advanced features (OPTIONAL)\n"
                 "REVENIUM_OWNER_ID=your_owner_id\n"
                 "```\n\n"
                 "## **Authentication Implementation Examples**\n\n"
@@ -6762,7 +6835,7 @@ Use `validate()` before submission."""
                 'curl -H "Authorization: Bearer $REVENIUM_API_KEY" \\\n'
                 '     -H "x-api-key: $REVENIUM_API_KEY" \\\n'
                 '     -H "Content-Type: application/json" \\\n'
-                "     https://api.revenium.ai/v1/ai-models?page=0&size=1\n"
+                '     "https://api.revenium.ai/profitstream/v2/api/sources/ai/models?teamId=$REVENIUM_TEAM_ID&page=0&size=1"\n'
                 "```\n\n"
                 "**Next Steps**: Use `get_response_formats()` to understand API responses\n\n"
                 "**Note**: Authentication requirements are current as of tool version. "
@@ -6824,7 +6897,7 @@ Use `validate()` before submission."""
                 "- `final_cost`: Actual calculated cost (may differ from estimate)\n"
                 "- `billing_status`: Billing processing status\n\n"
                 "### **200 OK - AI Models List**\n"
-                "**Endpoint**: `GET /v1/ai-models`\n\n"
+                "**Endpoint**: `GET /profitstream/v2/api/sources/ai/models`\n\n"
                 "```json\n"
                 "{\n"
                 '  "_embedded": {\n'

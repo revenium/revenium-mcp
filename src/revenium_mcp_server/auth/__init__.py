@@ -4,9 +4,9 @@ import json
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..config_store import get_config_value
 from ..constants import DEFAULT_BASE_URL
@@ -45,7 +45,19 @@ class EnvironmentType(str, Enum):
 class AuthConfig(BaseModel):
     """Authentication configuration model."""
 
-    api_key: str = Field(..., description="Revenium API key")
+    model_config = ConfigDict(frozen=True)
+
+    api_key: Optional[str] = Field(
+        None,
+        description="Revenium API key. Exactly one of api_key / clerk_jwt must be set.",
+    )
+    clerk_jwt: Optional[str] = Field(
+        None,
+        description=(
+            "Verified Clerk access token forwarded downstream as Bearer. "
+            "Exactly one of api_key / clerk_jwt must be set."
+        ),
+    )
     team_id: str = Field(..., description="Revenium team ID")
     tenant_id: Optional[str] = Field(
         None,
@@ -62,13 +74,31 @@ class AuthConfig(BaseModel):
 
     @field_validator("api_key")
     @classmethod
-    def validate_api_key(cls, v):
-        """Validate API key format."""
-        if not v or not v.strip():
+    def validate_api_key(cls, v: Optional[str]) -> Optional[str]:
+        """Validate API key format; None passes (exclusivity is model-level)."""
+        if v is None:
+            return None
+        if not v.strip():
             raise ValueError("API key cannot be empty")
         if len(v.strip()) < 10:
             raise ValueError("API key appears to be too short")
         return v.strip()
+
+    @field_validator("clerk_jwt")
+    @classmethod
+    def validate_clerk_jwt(cls, v: Optional[str]) -> Optional[str]:
+        """Reject empty/whitespace-only values; None passes."""
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("clerk_jwt cannot be empty")
+        return v.strip()
+
+    @model_validator(mode="after")
+    def _exactly_one_credential(self) -> "AuthConfig":
+        if (self.api_key is None) == (self.clerk_jwt is None):
+            raise ValueError("exactly one of api_key or clerk_jwt must be set")
+        return self
 
     @field_validator("team_id")
     @classmethod
@@ -95,8 +125,43 @@ class AuthConfig(BaseModel):
         return v.rstrip("/")
 
     def get_auth_headers(self) -> Dict[str, str]:
-        """Generate authentication headers for API requests."""
+        """Generate authentication headers for API requests.
+
+        Bearer JWT when this config carries a per-request Clerk token;
+        x-api-key otherwise (env/api_key modes unchanged).
+        """
+        if self.clerk_jwt:
+            return {**_COMMON_HEADERS, "Authorization": f"Bearer {self.clerk_jwt}"}
+        if self.api_key is None:  # unreachable: the model validator guarantees one credential
+            raise RuntimeError("AuthConfig carries no credential")
         return {**_COMMON_HEADERS, "x-api-key": self.api_key}
+
+    @property
+    def bearer_credential(self) -> str:
+        """Credential for endpoints that always use Bearer auth (analytics host)."""
+        cred = self.clerk_jwt or self.api_key
+        if cred is None:  # unreachable: the model validator guarantees one credential
+            raise RuntimeError("AuthConfig carries no credential")
+        return cred
+
+    def model_copy(
+        self,
+        *,
+        update: Optional[Mapping[str, Any]] = None,
+        deep: bool = False,
+        **kwargs: Any,
+    ) -> "AuthConfig":
+        """Copy with re-validation — a copy must not bypass the exactly-one-credential invariant.
+
+        pydantic's model_copy skips validators by design; routing the result
+        through model_validate restores them.
+
+        Any extra keyword arguments are forwarded verbatim to the base
+        implementation rather than silently dropped, so they track whatever the
+        installed pydantic actually supports (currently only ``update``/``deep``).
+        """
+        copied = super().model_copy(update=update, deep=deep, **kwargs)
+        return self.__class__.model_validate(copied.model_dump())
 
     def get_team_query_param(self) -> Dict[str, str]:
         """Get team ID as query parameter."""
@@ -171,7 +236,9 @@ class ConfigManager:
             raise ValueError(f"Invalid JSON in configuration file: {e}")
 
         # Validate required fields
-        required_fields = ["api_key", "team_id"]
+        # team_id is the only unconditionally required field; credential
+        # presence (api_key XOR clerk_jwt) is enforced by the model validator.
+        required_fields = ["team_id"]
         missing_fields = [field for field in required_fields if field not in config_data]
         if missing_fields:
             raise ValueError(f"Missing required fields in config: {missing_fields}")
@@ -211,16 +278,16 @@ def get_auth_headers() -> Dict[str, str]:
     return config.get_auth_headers()
 
 
-def get_bearer_auth_headers(api_key: str) -> Dict[str, str]:
+def get_bearer_auth_headers(credential: str) -> Dict[str, str]:
     """Get Bearer token authentication headers for new analytics API requests.
 
     Args:
-        api_key: The API key to use as Bearer token
+        credential: The credential (API key or Clerk JWT) to send as Bearer token
 
     Returns:
-        Dictionary of headers with Authorization: Bearer <key>
+        Dictionary of headers with Authorization: Bearer <credential>
     """
-    return {**_COMMON_HEADERS, "Authorization": f"Bearer {api_key}"}
+    return {**_COMMON_HEADERS, "Authorization": f"Bearer {credential}"}
 
 
 def get_team_id() -> str:

@@ -33,11 +33,9 @@ class AuthConfigFactory:
         Maps ctx fields to AuthConfig. Fields not present in TenantContext
         (timeout, environment, max_retries) take AuthConfig defaults.
         """
-        # Phase 1 limitation: user_id and ctx.scopes are not propagated to
-        # AuthConfig (Phase 2 will extend AuthConfig to model audit + scope
-        # enforcement).
         return AuthConfig(
             api_key=ctx.api_key,
+            clerk_jwt=ctx.clerk_jwt,
             team_id=ctx.team_id,
             tenant_id=ctx.tenant_id,
             base_url=ctx.base_url,

@@ -127,17 +127,33 @@ class ToolBase(ABC, MetadataProvider):
         """Get or create a Revenium API client.
 
         Args:
-            ctx: Optional tenant context. When provided, builds a fresh client
-                scoped to that context (no caching, prevents tenant leakage).
-                When None, falls back to the cached env-based client (legacy).
+            ctx: Optional tenant context. When omitted, falls back to the
+                ContextVar populated by the per-request auth middleware. With
+                a resolved context, builds a fresh client scoped to it (no
+                caching, prevents tenant leakage). Without one, clerk and
+                api_key modes fail closed; env mode falls back to the cached
+                env-based client (legacy).
 
         Returns:
             Revenium client instance.
+
+        Raises:
+            PermissionError: In clerk/api_key mode when no tenant context is
+                available (the auth middleware did not run).
         """
+        if ctx is None:
+            ctx = current_tenant_context()
         if ctx is not None:
             config = AuthConfigFactory.from_tenant_context(ctx)
             return ReveniumClient(auth_config=config)
-
+        if read_auth_mode() in ("clerk", "api_key"):
+            # Fail closed: without per-request tenant context we would
+            # silently use the env-based cached client and leak
+            # cross-tenant data.
+            raise PermissionError(
+                "Tenant context unavailable — TenantContextMiddleware (clerk) "
+                "or ApiKeyAuthMiddleware (api_key) did not run"
+            )
         if self.client is None:
             self.client = ReveniumClient()
         return self.client

@@ -36,6 +36,51 @@ from ..introspection.metadata import (
 from .unified_tool_base import ToolBase
 
 
+def _validate_lookup_email(email: Any, action: str) -> str:
+    """Validate that *email* is present and roughly email-shaped for a lookup action.
+
+    The lookup-by-email API returns 404 for both unknown AND malformed emails, so a
+    malformed address is indistinguishable from a genuine not-found. We therefore reject
+    obviously non-email input client-side before making any request, producing a clear
+    structured error instead of a misleading "not found".
+
+    Returns the trimmed email on success; raises ToolError otherwise. The shape check is
+    intentionally permissive (a single "@" with non-empty local and domain parts) — it is
+    a boundary guard, not RFC 5322 validation.
+    """
+    if not isinstance(email, str) or not email.strip():
+        raise create_structured_missing_parameter_error(
+            parameter_name="email",
+            action=action,
+            examples={
+                "usage": f"{action}(email='user@company.com')",
+                "valid_formats": ["email should be a valid email address"],
+                "example_values": ["joao@acme.com", "admin@company.com"],
+            },
+        )
+
+    candidate: str = email.strip()
+    local, sep, domain = candidate.partition("@")
+    # partition splits on the FIRST @ only — a second @ would hide in `domain`,
+    # so the single-@ claim needs an explicit count check.
+    if not sep or not local or not domain or "@" in domain:
+        raise create_structured_validation_error(
+            message=f"Invalid email format: {candidate}",
+            field="email",
+            value=candidate,
+            suggestions=[
+                "Provide a valid email address with a local and domain part (e.g., 'joao@acme.com')",
+                f"Use list(resource_type='...') to discover valid emails, then {action}(email=...)",
+            ],
+            examples={
+                "usage": f"{action}(email='user@company.com')",
+                "example_values": ["joao@acme.com", "admin@company.com"],
+            },
+        )
+
+    return candidate
+
+
 class BaseManager:
     """Base class for customer resource managers with shared functionality."""
 
@@ -166,6 +211,32 @@ class UserManager(BaseManager):
                     "example_values": ["user_123", "admin@company.com"],
                 },
             )
+
+    async def lookup_user(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Look up a user by exact email match (lookup-by-email endpoint)."""
+        email = _validate_lookup_email(arguments.get("email"), action="lookup_user")
+
+        try:
+            user = await self.client.lookup_user_by_email(email)
+        except ReveniumAPIError as e:
+            if e.status_code == 404:
+                raise ToolError(
+                    message=f"User not found for email: {email}",
+                    error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+                    field="email",
+                    value=email,
+                    suggestions=[
+                        "Verify the email is correct and belongs to a user (platform admin)",
+                        "Use list(resource_type='users') to browse existing users",
+                        "If you meant an API consumer, try lookup_subscriber(email=...) instead",
+                    ],
+                )
+            # 5xx and other API errors propagate unchanged
+            raise
+
+        # Fix undefined values in callCountElementDefinition structure
+        self._populate_call_count_element_definition(user)
+        return user
 
     async def create_user(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Create new user with Context7 auto-generation support."""
@@ -378,6 +449,33 @@ class SubscriberManager(BaseManager):
                     "example_values": ["sub_123", "subscriber@company.com"],
                 },
             )
+
+    async def lookup_subscriber(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Look up a subscriber by exact email match (lookup-by-email endpoint)."""
+        email = _validate_lookup_email(arguments.get("email"), action="lookup_subscriber")
+
+        try:
+            subscriber = await self.client.lookup_subscriber_by_email(email)
+        except ReveniumAPIError as e:
+            if e.status_code == 404:
+                raise ToolError(
+                    message=f"Subscriber not found for email: {email}",
+                    error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+                    field="email",
+                    value=email,
+                    suggestions=[
+                        "Verify the email is correct and belongs to a subscriber (API consumer)",
+                        "Use list(resource_type='subscribers') to browse existing subscribers",
+                        "If you meant a platform admin, try lookup_user(email=...) instead",
+                    ],
+                )
+            # 5xx and other API errors propagate unchanged
+            raise
+
+        # Fix undefined values in callCountElementDefinition structure
+        self._populate_call_count_element_definition(subscriber)
+        # Enhance response to show enforced role for transparency
+        return self._enhance_subscriber_response(subscriber)
 
     async def create_subscriber(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Create new subscriber."""
@@ -1573,6 +1671,26 @@ class CustomerManagement(ToolBase):
                     )
                 ]
 
+            elif action == "lookup_user":
+                result = await user_manager.lookup_user(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"User details for {str(arguments.get('email') or '').strip()}:\n\n"
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "lookup_subscriber":
+                result = await subscriber_manager.lookup_subscriber(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Subscriber details for {str(arguments.get('email') or '').strip()}:\n\n"
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
             elif action == "create":
                 # Handle unified resource_data container pattern
                 resource_data = arguments.get("resource_data", {})
@@ -1885,6 +2003,7 @@ class CustomerManagement(ToolBase):
                     ],
                     examples={
                         "basic_actions": ["list", "get", "create", "update", "delete"],
+                        "lookup_actions": ["lookup_user", "lookup_subscriber"],
                         "analysis_actions": ["analyze", "get_relationships"],
                         "discovery_actions": [
                             "get_capabilities",
@@ -1898,6 +2017,8 @@ class CustomerManagement(ToolBase):
                             "list_organizations": "list(resource_type='organizations')",
                             "create_organization": "create(resource_type='organizations', organization_data={...})",
                             "get_subscriber": "get(resource_type='subscribers', subscriber_id='sub_123')",
+                            "lookup_subscriber": "lookup_subscriber(email='joao@acme.com')",
+                            "lookup_user": "lookup_user(email='admin@acme.com')",
                         },
                     },
                 )
@@ -2257,6 +2378,11 @@ class CustomerManagement(ToolBase):
                 "example": "create(resource_type='teams', team_data={'name': 'Dev Team', 'organizationId': 'org_123'})",
             },
             {
+                "title": "Look Up a Person by Email",
+                "description": "Resolve an email to a subscriber/user, then filter costs by the returned subscriber to answer 'what did joao@acme.com spend'",
+                "example": "lookup_subscriber(email='joao@acme.com')",
+            },
+            {
                 "title": "Customer Analytics",
                 "description": "Analyze customer data and activity patterns",
                 "example": "analyze(resource_type='users', filters={'status': 'active'})",
@@ -2330,6 +2456,28 @@ class CustomerManagement(ToolBase):
                     "Requires valid API authentication",
                     "Some operations require specific roles",
                     "Deletion may affect related resources",
+                ],
+            ),
+            ToolCapability(
+                name="Lookup by Email",
+                description=(
+                    "Resolve a person to their user or subscriber record by exact email match. "
+                    "Common workflow: resolve the email first with lookup_subscriber, then filter "
+                    "costs by the returned subscriber id/organization (e.g., business_analytics or "
+                    "manage_metering) to answer 'what did joao@acme.com spend'."
+                ),
+                parameters={
+                    "lookup_user": {"email": "str (required)"},
+                    "lookup_subscriber": {"email": "str (required)"},
+                },
+                examples=[
+                    "lookup_subscriber(email='joao@acme.com')",
+                    "lookup_user(email='admin@acme.com')",
+                ],
+                limitations=[
+                    "email must be a valid email address (validated before the API call)",
+                    "Exact match only — no partial/fuzzy matching; use list to browse",
+                    "Unknown email returns a structured not-found naming the email",
                 ],
             ),
             ToolCapability(
@@ -2429,6 +2577,8 @@ class CustomerManagement(ToolBase):
         return [
             "list",
             "get",
+            "lookup_user",
+            "lookup_subscriber",
             "create",
             "update",
             "delete",

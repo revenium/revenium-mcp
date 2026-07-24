@@ -35,7 +35,7 @@ scripts/
 .github/
 
 # Dev / repo tooling (not needed in build)
-uv.lock
+# uv.lock is NOT ignored — the image installs the locked dependency set
 requirements.txt
 run_server.py
 run_server_dev.py

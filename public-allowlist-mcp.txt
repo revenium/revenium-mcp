@@ -21,3 +21,8 @@ DEVELOPMENT.md
 !.claude/commands/mcp-functional-testing*
 !.claude/commands/mcp-test-coverage-matrix.yaml
 public-allowlist-mcp.txt
+!scripts/check-arch-doc-paths.sh
+!scripts/check-architecture-docs.sh
+!.claude/commands/mcp-api-drift.md
+!.claude/commands/mcp-api-drift/
+uv.lock

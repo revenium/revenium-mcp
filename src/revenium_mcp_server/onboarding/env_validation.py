@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 from loguru import logger
 
 # Import existing configuration infrastructure - REUSE EXISTING
+from ..auth.auth_mode import read_auth_mode
 from ..config_store import get_config_value
 from ..endpoint_registry import _resolved_app_base_url, _use_new_api, get_endpoint_path
 
@@ -426,8 +427,8 @@ class EnvironmentVariableValidator:
                     "has_api_key": bool(auth_config.api_key),
                     "api_key_preview": (
                         f"SET ({auth_config.api_key[:4]}...{auth_config.api_key[-4:]})"
-                        if len(auth_config.api_key) > 8
-                        else "SET"
+                        if auth_config.api_key and len(auth_config.api_key) > 8
+                        else ("SET" if auth_config.api_key else "NOT_SET")
                     ),
                 },
             }
@@ -531,10 +532,26 @@ class EnvironmentVariableValidator:
                 auto_discoverable=auto_discoverable,
             )
 
-        # Overall status is based on core functionality: API key + API connectivity
-        # Auto-discovery and team configuration are enhancements, not requirements
+        # Overall status depends on the auth mode. In clerk/OAuth mode there is no
+        # static API key (auth is per-request via the Clerk JWT), so health is based
+        # on the OAuth configuration being present — not REVENIUM_API_KEY/connectivity,
+        # which are expected to be absent and would otherwise report a false failure.
         api_key_available = env_vars_dict.get("REVENIUM_API_KEY", "NOT SET") != "NOT SET"
-        core_functional = api_key_available and api_works
+        auth_mode = read_auth_mode()
+        required_clerk_envs = (
+            "CLERK_DOMAIN",
+            "CLERK_OAUTH_CLIENT_ID",
+            "CLERK_OAUTH_CLIENT_SECRET",
+            "MCP_SERVER_BASE_URL",
+        )
+        clerk_configured = all((os.getenv(name) or "").strip() for name in required_clerk_envs)
+        if auth_mode == "clerk":
+            core_functional = clerk_configured
+            # The auth probe requires REVENIUM_API_KEY, absent by design in clerk mode —
+            # base the flag on the OAuth config instead of a probe that always fails.
+            auth_config_works = clerk_configured
+        else:
+            core_functional = api_key_available and api_works
 
         summary = {
             "api_key_available": api_key_available,
@@ -548,7 +565,9 @@ class EnvironmentVariableValidator:
             "email_discovered": bool(discovered_config.get("values", {}).get("default_email")),
             "direct_api_works": api_works,
             "auth_config_works": auth_config_works,
-            "overall_status": core_functional,  # System is functional if API key + API connectivity work
+            "auth_mode": auth_mode,
+            "clerk_configured": clerk_configured,
+            "overall_status": core_functional,  # api_key mode: key + connectivity; clerk mode: OAuth config present
             "configuration_method": (
                 "Auto-Discovery (Simplified)"
                 if auto_discovery_works
