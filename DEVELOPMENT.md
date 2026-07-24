@@ -77,26 +77,21 @@ python -m revenium_mcp_server
 
 **Expected Output:**
 ```
-Revenium MCP Server v0.2.11 ready with 7 tools
+Revenium MCP Server v<current version> ready with 7 tools
 FastMCP 3.2.0
-Server name: Revenium MCP Server v0.2.11
+Server name: Revenium MCP Server v<current version>
 Transport: STDIO
 ```
 
-The tool count reflects the active `TOOL_PROFILE`: the default `starter` profile registers 7 tools; `business` registers 18.
+The tool count reflects the active `TOOL_PROFILE`: the default `starter` profile registers 7 tools; `business` registers 20. The version string comes from `pyproject.toml`.
 
 **Known Startup Warnings (can be ignored):**
-- `DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated` - Will be fixed in next release
+- `DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated` - known and safe to ignore
 - `WARNING: Auto-discovery failed: API key lacks required permissions` - Normal for dev environment
 
 ### Unit Testing
 
-**Current Status:** Some tests require additional dependencies not yet in pyproject.toml
-
 ```bash
-# Install missing test dependencies (temporary workaround)
-pip install psutil
-
 # Run all tests
 pytest
 
@@ -104,16 +99,14 @@ pytest
 pytest --cov=src/revenium_mcp_server --cov-report=html
 
 # Run specific test file
-pytest tests/test_auth.py
+pytest tests/unit/test_auth.py
 
 # Run with verbose output
 pytest -v
 
 # Run specific test
-pytest tests/test_auth.py::test_auth_config_validation
+pytest tests/unit/test_auth.py::TestAuthConfig
 ```
-
-**Note:** If pytest fails with `ModuleNotFoundError: No module named 'psutil'`, install it manually as shown above. This will be added to dev dependencies in the next release.
 
 ### Testing AI Routing (Optional Feature)
 
@@ -143,32 +136,19 @@ python -m revenium_mcp_server
 
 ### Code Formatting
 
-**Note:** The current codebase is in the process of being formatted. Many files may not yet pass black checks.
+Linting and style are enforced with `ruff` (configured in `pyproject.toml` under `[tool.ruff]`):
 
 ```bash
-# Format code with black (applies formatting)
-black src/ tests/
-
-# Check formatting without making changes
-black --check src/ tests/
-
-# Sort imports
-isort src/ tests/
+# Check style/lint (the command CI runs)
+ruff check src/ tests/
 ```
 
-**For new code:**
-- Always run `black` before committing
-- Ensure your changes pass `black --check`
-
-**For existing code:**
-- Large formatting changes should be separate PRs
-- Focus on formatting only the files you're modifying
+**For existing code:** large mechanical style changes should be separate PRs — focus on the files you are modifying.
 
 ### Linting
 
 ```bash
 # Style/lint
-flake8 src/
 ruff check src/ tests/
 
 # Mypy regression gate (the type-check command CI runs)
@@ -206,12 +186,13 @@ resolution and similar) and does **not** validate types.
 src/revenium_mcp_server/
 ├── __init__.py
 ├── enhanced_server.py     # Main MCP server entry point
-├── auth.py                # Authentication configuration
+├── auth/                  # Authentication (api_key and clerk modes, tenant context)
 ├── client.py              # Revenium API client
 ├── constants.py           # Centralized constants
+├── core/                  # Shared infrastructure (caching, helpers)
 ├── tools_decomposed/      # Individual MCP tools
 ├── capability_manager/    # Tool capability discovery
-└── ai_routing/           # Optional AI query routing
+└── ai_routing/            # Optional AI query routing
 ```
 
 ### Key Principles
@@ -366,12 +347,7 @@ git commit -m "docs(README): clarify AI routing optional feature"
 
 3. **Run Quality Checks**
    ```bash
-   # Format your changes
-   black src/ tests/
-   isort src/ tests/
-
    # Style/lint
-   flake8 src/
    ruff check src/ tests/
 
    # Mypy regression gate (raw `mypy src/` is expected to fail until the
@@ -413,7 +389,7 @@ How these changes were tested
 ## Checklist
 - [ ] Tests added/updated
 - [ ] Documentation updated
-- [ ] Code formatted with black
+- [ ] ruff check passes
 - [ ] No breaking changes (or documented)
 ```
 
@@ -437,22 +413,12 @@ python -m revenium_mcp_server
 pip install -e .
 ```
 
-**Issue: ModuleNotFoundError: No module named 'psutil'**
-```bash
-# Install missing dependency (temporary workaround)
-pip install psutil
-```
-
 **Issue: API Authentication Fails**
 ```bash
 # Verify .env file exists and has API key
 cat .env | grep REVENIUM_API_KEY
 
 # Test API connection
-# For development environment:
-curl -H "x-api-key: YOUR_KEY_FROM_ENV" https://api.revenium.ai/profitstream/v2/api/sources/ai/anomaly
-
-# For production environment:
 curl -H "x-api-key: YOUR_KEY_FROM_ENV" https://api.revenium.ai/profitstream/v2/api/sources/ai/anomaly
 ```
 
@@ -463,9 +429,7 @@ curl -H "x-api-key: YOUR_KEY_FROM_ENV" https://api.revenium.ai/profitstream/v2/a
 - Check that .env file is in project root
 
 **Issue: Server shows deprecation warnings**
-- Known issue - warnings can be safely ignored for now
-- Will be fixed in upcoming release
-- Does not affect functionality
+- Known issue - warnings can be safely ignored and do not affect functionality
 
 ## MCP Specification Compliance
 
@@ -473,8 +437,8 @@ This server implements [MCP Specification 2025-06-18](https://modelcontextprotoc
 
 ### Key Requirements
 
-- **Framework**: FastMCP 2.10.0+
-- **Transport**: stdio (standard input/output)
+- **Framework**: FastMCP (pinned exactly in `pyproject.toml` — see the inline comment there for why)
+- **Transports**: stdio (default) and streamable HTTP (`TRANSPORT_MODE=http`, used by the Docker image)
 - **Protocol**: JSON-RPC 2.0
 - **Logging**: All logs to stderr (stdout reserved for JSON-RPC)
 
@@ -490,13 +454,7 @@ pip show fastmcp
 
 ## API Endpoints
 
-### Development Environment
-- **Base URL**: `https://api.revenium.ai`
-- **Use for**: Testing, development, staging
-
-### Production Environment
-- **Base URL**: `https://api.revenium.ai`
-- **Use for**: Production deployments, released versions
+- **Base URL**: `https://api.revenium.ai` (the default — override with `REVENIUM_BASE_URL` only if Revenium support directs you to a different endpoint)
 
 ### Testing Endpoints
 
@@ -515,8 +473,8 @@ curl -H "x-api-key: YOUR_KEY" \
 ### Version Bumping
 
 1. Update version in `pyproject.toml`
-2. Update `CHANGELOG.md` with changes
-3. Update version in `src/revenium_mcp_server/version.py`
+2. Run `uv lock` so the lockfile records the new version (the Docker build's `uv sync --locked` fails otherwise)
+3. Update `CHANGELOG.md` with changes (the runtime version is read dynamically from package metadata — never edit it in code)
 4. Create release commit:
    ```bash
    git commit -m "chore: bump version to X.Y.Z"

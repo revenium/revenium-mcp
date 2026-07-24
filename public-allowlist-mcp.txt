@@ -25,3 +25,4 @@ public-allowlist-mcp.txt
 !scripts/check-architecture-docs.sh
 !.claude/commands/mcp-api-drift.md
 !.claude/commands/mcp-api-drift/
+uv.lock
