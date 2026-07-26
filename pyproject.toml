@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "revenium-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "Model Context Protocol (MCP) server for Revenium API monitoring, analytics, and AI spending management"
 readme = "README.md"
 license = "MIT"
@@ -44,7 +44,6 @@ dependencies = [
     "structlog>=23.0.0",
     "python-dotenv>=1.0.0",
     "openai>=1.0.0",
-    "revenium-middleware-openai>=0.4.6",
     "matplotlib>=3.7.0",
     # numpy 2.5 stubs use Python 3.12-only syntax, while mypy checks this
     # project as Python 3.11. Keep the lint baseline deterministic until the
