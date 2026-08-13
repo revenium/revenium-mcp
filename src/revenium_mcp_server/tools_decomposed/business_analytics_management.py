@@ -58,7 +58,7 @@ class BusinessAnalyticsManagement(ToolBase):
 
     tool_name: ClassVar[str] = "business_analytics_management"
     tool_description: ClassVar[str] = (
-        "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_user_costs, get_tool_costs, get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider, get_transaction_count, get_filter_options, get_unpaid_invoice_totals, list_invoices, list_refunds, list_period_charges, get_task_costs, get_task_completion, get_task_performance, get_profit_margins, get_top_movers, get_token_breakdown, get_team_costs, get_vendor_costs, get_token_vs_tool_cost, get_trace_cost_distribution, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_filter_options(dimension=...) to discover valid filter values. Use get_examples() for parameter guidance and get_capabilities() for status."
+        "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_user_costs, get_tool_costs, get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider, get_transaction_count, get_filter_options, get_unpaid_invoice_totals, list_invoices, list_refunds, list_period_charges, list_skills, get_skill, get_task_costs, get_task_completion, get_task_performance, get_profit_margins, get_top_movers, get_token_breakdown, get_team_costs, get_vendor_costs, get_token_vs_tool_cost, get_trace_cost_distribution, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_filter_options(dimension=...) to discover valid filter values. Use get_examples() for parameter guidance and get_capabilities() for status."
     )
     business_category: ClassVar[str] = "Metering and Analytics Tools"
     tool_type: ClassVar[ToolType] = ToolType.ANALYTICS
@@ -236,6 +236,10 @@ class BusinessAnalyticsManagement(ToolBase):
                 return await self._handle_list_refunds(arguments, ctx=ctx)
             elif action == "list_period_charges":
                 return await self._handle_list_period_charges(arguments, ctx=ctx)
+            elif action == "list_skills":
+                return await self._handle_list_skills(arguments, ctx=ctx)
+            elif action == "get_skill":
+                return await self._handle_get_skill(arguments, ctx=ctx)
             elif action == "get_cost_summary":
                 return await self._handle_get_cost_summary(arguments, ctx=ctx)
             elif action == "analyze_cost_anomalies":
@@ -372,6 +376,12 @@ If you're seeing this error, please report it as it indicates a reliability issu
 6c. **list_invoices / list_refunds / list_period_charges**
    - Read-only billing listings; numeric-honest amounts (missing → 'n/a', never a fabricated 0)
    - list_invoices / list_refunds: page-numbered; list_period_charges: cursor/keyset (no page param)
+
+6d. **list_skills / get_skill**
+   - Cost by skill: the skill catalog and its usage (cost, calls, traces) in one paged listing
+   - list_skills sorts by totalCost,DESC by default; get_skill takes skill_id and adds first/last seen
+   - period also accepts NINETY_DAYS and SIX_MONTHS here, which the cost-analysis actions do not
+   - Requires skill attribution to be enabled for the team; both actions answer 403 until it is
 
 7. **get_cost_summary**
    - Generate a summary report of recent AI spending (includes all dimensions)
@@ -632,7 +642,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 ```
 **Purpose**: Enumerate the valid filter values for a dimension (agents, models, providers, ...) so you use real names in the cost endpoints' `filters` arguments instead of guessing
 **Parameters**:
-- `dimension` (required): agents, api-keys, customers, models, organizations, products, providers, teams, tool-providers, tools, users, vendors
+- `dimension` (required): agents, api-keys, customers, model-sources, models, organizations, products, providers, task-types, teams, tool-providers, tools, users, vendors
 - `period` (optional, defaults to THIRTY_DAYS): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 
 ### get_unpaid_invoice_totals
@@ -795,6 +805,32 @@ If you're seeing this error, please report it as it indicates a reliability issu
 ```
 **Purpose**: List period charges. Uses cursor/keyset pagination — there is NO page parameter. When more results exist the response ends with a line telling you the `cursor` value to pass next.
 **Parameters** (all optional): `size`, `invoice_id`, `start_date`, `end_date`, `cursor`
+
+### list_skills
+```json
+{
+  "action": "list_skills",
+  "period": "THIRTY_DAYS",
+  "size": 20
+}
+```
+**Purpose**: Cost by skill — the skill catalog and its aggregated usage (cost, call count, trace count) in one page, sorted costliest-first. Counts and costs are numeric-honest: a missing value renders `n/a`, never a fabricated `0`.
+**Parameters** (all optional): `page`, `size`, `period`, `sort` (defaults to `totalCost,DESC`)
+- `period`: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, NINETY_DAYS, SIX_MONTHS, TWELVE_MONTHS — note NINETY_DAYS and SIX_MONTHS are accepted here but not by the cost-analysis actions
+
+### get_skill
+```json
+{
+  "action": "get_skill",
+  "skill_id": "JMwX9g4",
+  "period": "SEVEN_DAYS"
+}
+```
+**Purpose**: Usage detail for one skill (cost, calls, traces, provenance, first/last seen). Use `list_skills` to discover ids.
+**Parameters**:
+- `skill_id` (required): the skill identifier
+- `period` (optional, defaults to THIRTY_DAYS): same enum as `list_skills`
+**Note**: a skill with no recorded usage inside the window reports an empty result, not a failure — widen `period` before concluding the id is wrong.
 
 ### get_cost_summary
 ```json
@@ -1052,7 +1088,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Try a different time period if no values are available
 
 **Supported Parameters:**
-- **dimension** (required): agents, api-keys, customers, models, organizations, products, providers, teams, tool-providers, tools, users, vendors
+- **dimension** (required): agents, api-keys, customers, model-sources, models, organizations, products, providers, task-types, teams, tool-providers, tools, users, vendors
 - **period** (optional, defaults to THIRTY_DAYS): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 
 **For Help:**
@@ -1706,6 +1742,262 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 - Optional filters: invoice_id, start_date, end_date
 - Pagination is cursor-based: pass cursor='<value>' from the previous response (there is no page parameter)
 - Verify your API key can view the team's billing data
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+""")]
+
+    # ── Skill usage reads ──────────────────────────────────────────────────
+    # Arg allowlists in the _map_billing_filters sense; the mapping is identity
+    # because period/sort are already the API's own parameter names. The maps
+    # still earn their keep by dropping reserved keys (action/page/size) and
+    # by keeping sort off the detail endpoint, which does not accept it.
+    _SKILL_FILTER_MAP: ClassVar[Dict[str, str]] = {
+        "period": "period",
+        "sort": "sort",
+    }
+    _SKILL_DETAIL_FILTER_MAP: ClassVar[Dict[str, str]] = {
+        "period": "period",
+    }
+    # The skills endpoints accept a wider period enum than the cost-analysis
+    # actions: NINETY_DAYS and SIX_MONTHS are valid here and nowhere else in
+    # this tool, which is why the enum is not shared with those actions.
+    _SKILL_PERIODS: ClassVar[List[str]] = [
+        "HOUR",
+        "EIGHT_HOURS",
+        "TWENTY_FOUR_HOURS",
+        "SEVEN_DAYS",
+        "THIRTY_DAYS",
+        "NINETY_DAYS",
+        "SIX_MONTHS",
+        "TWELVE_MONTHS",
+    ]
+    # Sent explicitly rather than relying on the endpoint's own default, so the
+    # listing reads as a cost report even if that server-side default changes.
+    _SKILL_DEFAULT_SORT: ClassVar[str] = "totalCost,DESC"
+
+    def _validate_skill_period(self, arguments: Dict[str, Any], action: str) -> None:
+        """Reject an out-of-enum period before the request reaches the API.
+
+        Pre-flight only: this MUST run outside the handlers' try/except, whose
+        bare `except Exception` renders failures as guidance text and would
+        swallow the structured ToolError envelope.
+        """
+        period = arguments.get("period")
+        if period is None:
+            return
+        if not isinstance(period, str) or period.upper() not in self._SKILL_PERIODS:
+            raise create_structured_validation_error(
+                message=f"Unsupported period for {action}: {period!r}",
+                field="period",
+                value=period,
+                suggestions=[
+                    "Use one of: " + ", ".join(self._SKILL_PERIODS),
+                    "NINETY_DAYS and SIX_MONTHS are accepted here but not by the cost-analysis actions",
+                    "Omit period to use the endpoint default of THIRTY_DAYS",
+                ],
+                examples={
+                    "correct_usage": {"action": action, "period": "THIRTY_DAYS"},
+                    "valid_periods": self._SKILL_PERIODS,
+                },
+            )
+
+    @staticmethod
+    def _render_count(value: Any) -> str:
+        """Render an integer counter, or ``n/a`` when it is absent.
+
+        Numeric honesty, as with _render_money: a missing or non-integer
+        counter must not read as a real zero. Bools are ints in Python, so
+        they are excluded explicitly.
+        """
+        if isinstance(value, bool) or not isinstance(value, int):
+            return "n/a"
+        return str(value)
+
+    @staticmethod
+    def _is_skill_api_gated(error: Exception) -> bool:
+        """True when a skills call was refused with 403.
+
+        Both skills operations are gated per tenant behind the platform's
+        skill-attribution feature flag, which is off by default and answers
+        403 while it is off. The generic failure guidance would blame
+        page/size/period/sort or the API key, none of which can change a 403.
+        """
+        return isinstance(error, ReveniumAPIError) and error.status_code == 403
+
+    @staticmethod
+    def _is_skill_missing(error: Exception) -> bool:
+        """True when a skills call answered 404."""
+        return isinstance(error, ReveniumAPIError) and error.status_code == 404
+
+    def _render_skill_api_gated(
+        self, action: str, error: Exception
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Render the 403 refusal as a tenant-enablement problem, not a bad call."""
+        error_details = self._format_api_error_details(error)
+        return [TextContent(type="text", text=f"""**Skill Usage API Not Enabled for This Team**
+
+{error_details}
+
+**Likely cause**: the skills API is gated per tenant behind the skill-attribution feature flag; ask an admin to enable it for this team.
+
+**Notes:**
+- No combination of page, size, period or sort changes a 403 — the request shape is fine
+- Other cost dimensions still work while the flag is off: get_tool_costs, get_agent_costs, get_model_costs
+- If the flag is already enabled, verify your API key can view this team's skill usage
+
+**For Help:**
+- Use `get_capabilities()` to check current status ({action} is listed there)
+""")]
+
+    async def _handle_list_skills(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """List skills with usage — the cost-by-skill report, costliest first."""
+        self._validate_skill_period(arguments, "list_skills")
+        try:
+            logger.info("Processing list_skills request")
+            client = await self.get_client(ctx=ctx)
+            page = int(arguments.get("page", 0))
+            size = int(arguments.get("size", 20))
+            filters = self._map_billing_filters(arguments, self._SKILL_FILTER_MAP)
+            if "period" in filters:
+                filters["period"] = str(filters["period"]).upper()
+            filters.setdefault("sort", self._SKILL_DEFAULT_SORT)
+
+            response = await client.get_skills(page=page, size=size, **filters)
+            skills = client._extract_embedded_data(response)
+            page_info = client._extract_pagination_info(response)
+
+            if not skills:
+                return [TextContent(type="text", text="**Skills by Cost**\n\nNo skills found for the given filters.")]
+
+            total = page_info.get("totalElements")
+            header = "**Skills by Cost**"
+            if isinstance(total, int) and not isinstance(total, bool):
+                header += f" (page {page + 1}, {total} total)"
+            cap = 50
+            lines = [header, ""]
+            for skill in skills[:cap]:
+                # `or "n/a"`: every provenance field is explicitly nullable in
+                # the response schema — .get(key, default) misses those nulls.
+                name = skill.get("name") or "n/a"
+                skill_id = skill.get("id") or "n/a"
+                origin = skill.get("originCategory") or "n/a"
+                source = skill.get("source") or "n/a"
+                cost = self._render_money(skill.get("totalCost"), None)
+                calls = self._render_count(skill.get("callCount"))
+                traces = self._render_count(skill.get("traceCount"))
+                lines.append(
+                    f"- {name} ({skill_id}) | {origin} | {source} | "
+                    f"{cost} | {calls} calls | {traces} traces"
+                )
+            if len(skills) > cap:
+                lines.append("")
+                lines.append(f"… {len(skills) - cap} more not shown (page size {size}).")
+
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            if self._is_skill_api_gated(e):
+                logger.warning("list_skills refused with 403 (skill attribution likely disabled)")
+                return self._render_skill_api_gated("list_skills", e)
+            logger.error(f"Error in list_skills: {e}")
+            error_details = self._format_api_error_details(e)
+            return [TextContent(type="text", text=f"""**List Skills Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- Optional parameters: page, size, period, sort (defaults to {self._SKILL_DEFAULT_SORT})
+- Supported periods: {", ".join(self._SKILL_PERIODS)}
+- Verify your API key can view the team's skill usage
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+""")]
+
+    async def _handle_get_skill(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Get usage detail for a single skill."""
+        skill_id = arguments.get("skill_id")
+        if not skill_id:
+            raise create_structured_missing_parameter_error(
+                parameter_name="skill_id",
+                action="get_skill",
+                examples={
+                    "basic_usage": {"action": "get_skill", "skill_id": "JMwX9g4"},
+                    "with_period": {
+                        "action": "get_skill",
+                        "skill_id": "JMwX9g4",
+                        "period": "SEVEN_DAYS",
+                    },
+                    "discovery": "Use list_skills to find skill ids",
+                },
+            )
+        self._validate_skill_period(arguments, "get_skill")
+
+        try:
+            logger.info("Processing get_skill request")
+            client = await self.get_client(ctx=ctx)
+            filters = self._map_billing_filters(arguments, self._SKILL_DETAIL_FILTER_MAP)
+            if "period" in filters:
+                filters["period"] = str(filters["period"]).upper()
+
+            skill = await client.get_skill_by_id(str(skill_id), **filters)
+            if not isinstance(skill, dict) or not skill:
+                return [TextContent(type="text", text=f"**Skill Detail**\n\nNo usage detail returned for skill '{skill_id}'.")]
+
+            lines = [
+                f"**Skill: {skill.get('name') or 'n/a'}**",
+                "",
+                f"- **ID**: {skill.get('id') or 'n/a'}",
+                f"- **Origin**: {skill.get('originCategory') or 'n/a'}",
+                f"- **Source**: {skill.get('source') or 'n/a'}",
+                f"- **Kind**: {skill.get('kind') or 'n/a'}",
+                f"- **Plugin**: {skill.get('pluginName') or 'n/a'}",
+                f"- **Marketplace**: {skill.get('marketplaceName') or 'n/a'}",
+                f"- **Total cost**: {self._render_money(skill.get('totalCost'), None)}",
+                f"- **Calls**: {self._render_count(skill.get('callCount'))}",
+                f"- **Traces**: {self._render_count(skill.get('traceCount'))}",
+                f"- **First seen**: {skill.get('firstSeen') or 'n/a'}",
+                f"- **Last seen**: {skill.get('lastSeen') or 'n/a'}",
+            ]
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            if self._is_skill_api_gated(e):
+                logger.warning("get_skill refused with 403 (skill attribution likely disabled)")
+                return self._render_skill_api_gated("get_skill", e)
+            if self._is_skill_missing(e):
+                # The detail endpoint answers 404 — not an empty body — for a
+                # known skill with no attributed usage in the requested window,
+                # so 404 is the empty state and not evidence of a bad skill_id.
+                logger.info("get_skill returned 404 (no usage in the requested period)")
+                requested = str(arguments.get("period") or "THIRTY_DAYS").upper()
+                return [TextContent(type="text", text=f"""**Skill Detail**
+
+No usage recorded for skill '{skill_id}' in the requested period ({requested}).
+
+**Next steps:**
+- Try a wider period (e.g. THIRTY_DAYS, NINETY_DAYS) — usage is only reported for the window you ask for
+- Use `list_skills` at the same period to see which skills did record usage
+""")]
+            logger.error(f"Error in get_skill: {e}")
+            error_details = self._format_api_error_details(e)
+            return [TextContent(type="text", text=f"""**Get Skill Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- `skill_id` is required — use `list_skills` to discover valid ids
+- Optional parameter: period (supported: {", ".join(self._SKILL_PERIODS)})
+- Verify your API key can view the team's skill usage
 
 **For Help:**
 - Use `get_capabilities()` to check current status
@@ -2577,6 +2869,8 @@ If you're seeing this error, please report it as it indicates a reliability issu
             "list_invoices",
             "list_refunds",
             "list_period_charges",
+            "list_skills",
+            "get_skill",
             "get_cost_summary",
             "analyze_cost_anomalies",
         ])
@@ -2714,6 +3008,27 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "list_invoices(page=0, size=20, states=['FINALIZED'])",
                     "list_refunds(query='acme')",
                     "list_period_charges(size=20, invoice_id='inv_1')",
+                ],
+            ),
+            ToolCapability(
+                name="Skill Cost Analysis",
+                description="Cost by skill: the skill catalog with aggregated cost, call and trace counts per period, plus per-skill detail (numeric-honest — missing costs and counts render 'n/a', never a fabricated 0)",
+                parameters={
+                    "list_skills": {
+                        "page": "int",
+                        "size": "int",
+                        "period": "str",
+                        "sort": "str",
+                    },
+                    "get_skill": {
+                        "skill_id": "str",
+                        "period": "str",
+                    },
+                },
+                examples=[
+                    "list_skills(period='THIRTY_DAYS')",
+                    "list_skills(page=0, size=20, sort='callCount,DESC')",
+                    "get_skill(skill_id='JMwX9g4', period='SEVEN_DAYS')",
                 ],
             ),
             ToolCapability(

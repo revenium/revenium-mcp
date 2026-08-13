@@ -1022,6 +1022,60 @@ class TestPeriodChargesListAPIMethod:
 
 
 # ===========================================================================
+# API convenience methods — Skills usage
+# ===========================================================================
+
+class TestSkillsUsageAPIMethods:
+    """get_skills / get_skill_by_id — teamId is required on both operations."""
+
+    def setup_method(self):
+        self.client = _make_client()
+        self.client.get = AsyncMock(
+            return_value={"_embedded": {"skillUsageResourceList": []}}
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_skills_path_pagination_and_team(self):
+        await self.client.get_skills(page=2, size=5)
+        assert self.client.get.call_args[0][0] == "/profitstream/v2/api/skills"
+        params = self.client.get.call_args.kwargs.get("params")
+        assert params["page"] == 2
+        assert params["size"] == 5
+        assert params["teamId"] == "team_abc"
+
+    @pytest.mark.asyncio
+    async def test_get_skills_defaults(self):
+        await self.client.get_skills()
+        params = self.client.get.call_args.kwargs.get("params")
+        assert params["page"] == 0
+        assert params["size"] == 20
+
+    @pytest.mark.asyncio
+    async def test_get_skills_forwards_period_and_sort(self):
+        await self.client.get_skills(period="NINETY_DAYS", sort="totalCost,DESC")
+        params = self.client.get.call_args.kwargs.get("params")
+        assert params["period"] == "NINETY_DAYS"
+        assert params["sort"] == "totalCost,DESC"
+
+    @pytest.mark.asyncio
+    async def test_get_skill_by_id_path_and_team(self):
+        self.client.get = AsyncMock(return_value={"id": "JMwX9g4"})
+        await self.client.get_skill_by_id("JMwX9g4")
+        assert self.client.get.call_args[0][0] == "/profitstream/v2/api/skills/JMwX9g4"
+        params = self.client.get.call_args.kwargs.get("params")
+        assert params["teamId"] == "team_abc"
+
+    @pytest.mark.asyncio
+    async def test_get_skill_by_id_forwards_period_and_never_pages(self):
+        self.client.get = AsyncMock(return_value={"id": "JMwX9g4"})
+        await self.client.get_skill_by_id("JMwX9g4", period="SIX_MONTHS")
+        params = self.client.get.call_args.kwargs.get("params")
+        assert params["period"] == "SIX_MONTHS"
+        assert "page" not in params
+        assert "size" not in params
+
+
+# ===========================================================================
 # API convenience methods — Subscription billed-amount / quota-consumed
 # ===========================================================================
 

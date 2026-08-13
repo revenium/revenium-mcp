@@ -23,6 +23,5 @@ DEVELOPMENT.md
 public-allowlist-mcp.txt
 !scripts/check-arch-doc-paths.sh
 !scripts/check-architecture-docs.sh
-!.claude/commands/mcp-api-drift.md
-!.claude/commands/mcp-api-drift/
+!.claude/commands/mcp-api-drift-local.md
 uv.lock

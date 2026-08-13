@@ -183,3 +183,11 @@ docs/*credentials*
 .revvie-task-instructions.md
 .revvie-ci-fix-*.md
 .revvie/
+
+# Serena MCP (not in use in this repo)
+.serena/
+
+# Drift-detection engine, materialized locally from revvie-sdlc/drift-engine/
+# (BACK-2524) via /mcp-api-drift-local — regenerated on demand, never tracked.
+.claude/commands/mcp-api-drift.md
+.claude/commands/mcp-api-drift/

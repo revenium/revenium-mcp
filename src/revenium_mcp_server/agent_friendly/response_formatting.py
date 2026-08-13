@@ -99,6 +99,8 @@ class StandardResponse:
         total_items: Optional[int] = None,
         action: str = "list",
         timing_ms: Optional[float] = None,
+        pagination_extra: Optional[Dict[str, Any]] = None,
+        notes: Optional[List[str]] = None,
     ) -> List[TextContent]:
         """Create standardized list response with pagination.
 
@@ -111,6 +113,12 @@ class StandardResponse:
             total_items: Total number of items (if known)
             action: Action that generated this response
             timing_ms: Response time in milliseconds
+            pagination_extra: Extra keys merged into the pagination block, for
+                callers whose result set carries qualifiers the standard counts
+                cannot express (e.g. a bounded scan that may have stopped short)
+            notes: Caveats rendered with the results. Rendered in both the empty
+                and non-empty branches, because a caveat about completeness
+                matters most when the result set came back empty.
 
         Returns:
             Formatted list response
@@ -153,6 +161,7 @@ class StandardResponse:
                     "total_items": total_items,
                     "has_next": page + 1 < total_pages,
                     "has_previous": page > 0,
+                    **(pagination_extra or {}),
                 },
                 "metadata": {
                     "timestamp": datetime.now().isoformat(),
@@ -169,6 +178,10 @@ class StandardResponse:
                     content_parts.append(f"• Previous page: page={page - 1}")
                 if page + 1 < total_pages:
                     content_parts.append(f"• Next page: page={page + 1}")
+
+        if notes:
+            content_parts.append("")
+            content_parts.extend(f"**Note:** {note}" for note in notes)
 
         return [TextContent(type="text", text="\n".join(content_parts))]
 

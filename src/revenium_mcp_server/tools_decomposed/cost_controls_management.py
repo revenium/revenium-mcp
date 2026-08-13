@@ -233,6 +233,12 @@ class CostControlsManager:
         The team id is the path parameter (from the client's configured
         team_id); the response is the compiled ruleset, e.g.
         {"rules": [...], "compiledAt": ...}.
+
+        The compiled payload is returned unmodified. Read-only response fields
+        such as ``groupBreakdown`` (shape documented on the Enforcement
+        Visibility capability) are never synthesized when the API omits them: a
+        missing or null groupBreakdown means the rule is pooled, which is not
+        the same thing as a grouped rule with zero groups.
         """
         return await self.client.get_enforcement_rules()
 
@@ -435,7 +441,16 @@ class CostControlsManagement(ToolBase):
             ),
             ToolCapability(
                 name="Enforcement Visibility",
-                description="Read-only view of enforcement events fired and the compiled rule set",
+                # This description is the single authoritative spelling of the
+                # groupBreakdown response shape; the limitations below and the
+                # CostControlsManager.get_enforcement_rules docstring point at
+                # it instead of restating the entry fields.
+                description=(
+                    "Read-only view of enforcement events fired and the compiled rule set. "
+                    "Rules in that set carry a groupBreakdown array of per-group balances "
+                    "(groupValue, displayName, currentValue, usagePercent, breached) when the "
+                    "rule is subscriber-grouped, and a null groupBreakdown when it is pooled"
+                ),
                 parameters={
                     "list_enforcement_events": {
                         "page": "int (optional)",
@@ -453,6 +468,8 @@ class CostControlsManagement(ToolBase):
                 limitations=[
                     "Both actions are read-only",
                     "get_enforcement_rules returns the compiled ruleset for the configured team only",
+                    "groupBreakdown (see this capability's description) is a response field, never "
+                    "an input, and is populated on API reads only",
                 ],
             ),
         ]
@@ -545,7 +562,8 @@ class CostControlsManagement(ToolBase):
 
             elif action == "delete":
                 result = await manager.delete_cost_control(arguments)
-                return [TextContent(type="text", text=f"Cost control deleted:\n{json.dumps(result, indent=2)}")]
+                deleted_control_id = arguments.get("control_id", "")
+                return [TextContent(type="text", text=f"Cost control {deleted_control_id} deleted:\n{json.dumps(result, indent=2)}")]
 
             elif action == "list_enforcement_events":
                 result = await manager.list_enforcement_events(arguments)

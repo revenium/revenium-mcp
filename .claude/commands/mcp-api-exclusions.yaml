@@ -1,0 +1,17 @@
+# Declared API-surface exclusions (BACK-2584).
+#
+# Surfaces of the Revenium platform API that this repo has DELIBERATELY
+# decided not to cover with MCP tools. The drift pipeline filters items under
+# these surfaces at diff time and reports them under "Excluded by declaration"
+# in the run report — decided once here, in a PR-reviewed file, never
+# re-flagged run by run. This file is about intent, not implementation order:
+# an endpoint we simply have not adopted YET does not belong here.
+#
+# Schema per entry:
+#   - path_prefix: /v2/api/example      # required; segment-aligned prefix
+#     methods: [DELETE]                 # optional; restricts the exclusion
+#     reason: "why we choose not to cover this"   # required
+#     decided_by: name                  # who made the call
+#     decided_on: YYYY-MM-DD
+#     revisit: "condition under which to reconsider"   # optional
+exclusions: []

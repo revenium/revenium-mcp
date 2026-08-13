@@ -191,6 +191,209 @@ async def test_list_runs_rejects_nonpositive_max_results():
 
 
 @pytest.mark.asyncio
+async def test_list_feedback_server_capped_page_is_flagged_ambiguous():
+    """A cursorless page at the documented server cap (100) is ambiguous even
+    when it is smaller than the requested limit: the backend may have capped
+    the page, and comparing against the requested limit alone would declare
+    the capped case provably complete."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    mock = AsyncMock(return_value={"data": [{"id": f"f{i}"} for i in range(100)], "next_cursor": None})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_recommendation_feedback",
+        new=mock,
+    ):
+        result = await tool.handle_action("list_feedback", {"run_id": "r1", "max_results": 250})
+
+    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    assert '"possibly_truncated": true' in text
+    assert "may exist" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_list_feedback_small_partial_page_is_provably_complete():
+    """Below both the requested limit and the documented cap, the page is
+    provably complete and carries no ambiguity flag."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    mock = AsyncMock(return_value={"data": [{"id": f"f{i}"} for i in range(40)], "next_cursor": None})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_recommendation_feedback",
+        new=mock,
+    ):
+        result = await tool.handle_action("list_feedback", {"run_id": "r1", "max_results": 250})
+
+    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    assert '"possibly_truncated": false' in text
+    assert "may exist" not in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_list_feedback_stale_cursor_break_is_flagged_ambiguous():
+    """A backend that repeats the same cursor strands the remaining items —
+    that exit is ambiguous, not provably complete."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    pages = [
+        {"data": [{"id": "f1"}], "next_cursor": "same"},
+        {"data": [{"id": "f2"}], "next_cursor": "same"},
+    ]
+    mock = AsyncMock(side_effect=pages)
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_recommendation_feedback",
+        new=mock,
+    ):
+        result = await tool.handle_action("list_feedback", {"run_id": "r1", "max_results": 250})
+
+    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    assert '"possibly_truncated": true' in text
+
+
+@pytest.mark.asyncio
+async def test_list_feedback_empty_page_after_a_cursor_is_end_of_results():
+    """Resuming with a cursor onto an empty page means the listing ended, not
+    that the run has no feedback — reporting "0 feedback items" there would be
+    false for a run whose earlier pages returned items, and must not spend a
+    run-existence lookup either."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    feedback = AsyncMock(return_value={"data": [], "next_cursor": None})
+    run_lookup = AsyncMock(return_value={"id": "r1"})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_recommendation_feedback",
+        new=feedback,
+    ), patch(
+        "src.revenium_mcp_server.client.ReveniumClient.get_recommendation_run",
+        new=run_lookup,
+    ):
+        result = await tool.handle_action(
+            "list_feedback", {"run_id": "r1", "cursor": "cont-123"}
+        )
+
+    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    assert "has 0 feedback items" not in text
+    assert "no further" in text.lower() or "end of" in text.lower()
+    run_lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_list_feedback_resumes_from_a_supplied_cursor():
+    """The next_cursor handed back on a budget stop must be consumable: the
+    handler seeds the loop from an incoming cursor so a follow-up call
+    resumes instead of silently restarting from the first page."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    mock = AsyncMock(return_value={"data": [{"id": "f9"}], "next_cursor": None})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_recommendation_feedback",
+        new=mock,
+    ):
+        await tool.handle_action(
+            "list_feedback", {"run_id": "r1", "max_results": 5, "cursor": "cont-123"}
+        )
+
+    assert mock.await_args.kwargs["cursor"] == "cont-123"
+
+
+@pytest.mark.asyncio
+async def test_list_feedback_budget_stop_exposes_next_cursor():
+    """When the loop stops because max_results is reached while the backend
+    still offers a cursor, the caller gets that cursor for continuation
+    instead of an invisible cliff."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    mock = AsyncMock(return_value={"data": [{"id": f"f{i}"} for i in range(5)], "next_cursor": "cont-123"})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_recommendation_feedback",
+        new=mock,
+    ):
+        result = await tool.handle_action("list_feedback", {"run_id": "r1", "max_results": 5})
+
+    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    assert "cont-123" in text
+
+
+@pytest.mark.asyncio
+async def test_list_feedback_full_page_renders_truncation_caveat():
+    """A cursorless page that comes back exactly at the requested limit is
+    ambiguous — either the run has exactly that many items or the backend
+    capped the page and dropped the tail with no cursor to recover it. The
+    render must say so instead of presenting the count as complete."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    mock = AsyncMock(return_value={"data": [{"id": f"f{i}"} for i in range(10)], "next_cursor": None})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_recommendation_feedback",
+        new=mock,
+    ):
+        result = await tool.handle_action("list_feedback", {"run_id": "r1", "max_results": 10})
+
+    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    assert "may exist" in text.lower() or "truncat" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_list_feedback_partial_page_has_no_truncation_caveat():
+    """A page smaller than the requested limit is provably complete."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    mock = AsyncMock(return_value={"data": [{"id": "f1"}], "next_cursor": None})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_recommendation_feedback",
+        new=mock,
+    ):
+        result = await tool.handle_action("list_feedback", {"run_id": "r1", "max_results": 10})
+
+    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    assert "may exist" not in text.lower()
+    assert '"possibly_truncated": false' in text
+
+
+@pytest.mark.asyncio
+async def test_list_feedback_requests_full_remaining_limit():
+    """The feedback endpoint is cursorless in practice (bare array), so the
+    caller's max_results must reach it in the first request — capping at the
+    100-item page size would silently truncate larger runs."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    mock = AsyncMock(return_value={"data": [{"id": "f1"}], "next_cursor": None})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_recommendation_feedback",
+        new=mock,
+    ):
+        await tool.handle_action("list_feedback", {"run_id": "r1", "max_results": 250})
+
+    assert mock.await_args.kwargs["limit"] == 250
+
+
+@pytest.mark.asyncio
 async def test_list_feedback_auto_paginates_for_a_run():
     from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
         AIInsightsManagement,
@@ -211,6 +414,135 @@ async def test_list_feedback_auto_paginates_for_a_run():
     assert mock.await_count == 2
     for call in mock.await_args_list:
         assert call.args == ("r1",)
+
+
+@pytest.mark.asyncio
+async def test_list_feedback_survives_bare_array_wire_shape():
+    """End-to-end through the real client method: the endpoint answers with a bare
+    JSON array, which used to reach the handler's page.get("data", []) and raise
+    AttributeError: 'list' object has no attribute 'get' for every run_id."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.get",
+        new=AsyncMock(return_value=[{"id": "f1", "action": "implemented"}]),
+    ):
+        result = await tool.handle_action("list_feedback", {"run_id": "r1"})
+
+    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    assert "f1" in text
+    assert "1 feedback item" in text
+
+
+@pytest.mark.asyncio
+async def test_list_feedback_single_page_stops_after_one_request():
+    """A bare-array wire is inherently single-page (next_cursor always None); the
+    pagination loop must terminate on the first response, not spin."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    feedback_mock = AsyncMock(return_value={
+        "data": [{"id": "f1"}, {"id": "f2"}], "next_cursor": None,
+    })
+    run_mock = AsyncMock(return_value={"id": "r1"})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_recommendation_feedback",
+        new=feedback_mock,
+    ), patch(
+        "src.revenium_mcp_server.client.ReveniumClient.get_recommendation_run",
+        new=run_mock,
+    ):
+        result = await tool.handle_action("list_feedback", {"run_id": "r1"})
+
+    assert feedback_mock.await_count == 1
+    # Non-empty result: no existence check needed, so no extra upstream call.
+    run_mock.assert_not_awaited()
+    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    assert "f1" in text and "f2" in text
+
+
+@pytest.mark.asyncio
+async def test_list_feedback_empty_confirms_run_exists_before_reporting_zero():
+    """The endpoint returns 200 [] for an unknown run too, so an empty page alone
+    cannot be reported as 'no feedback' — the run's existence is confirmed first."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    feedback_mock = AsyncMock(return_value={"data": [], "next_cursor": None})
+    run_mock = AsyncMock(return_value={"id": "r1", "status": "completed"})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_recommendation_feedback",
+        new=feedback_mock,
+    ), patch(
+        "src.revenium_mcp_server.client.ReveniumClient.get_recommendation_run",
+        new=run_mock,
+    ):
+        result = await tool.handle_action("list_feedback", {"run_id": "r1"})
+
+    run_mock.assert_awaited_once()
+    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    assert "exists" in text.lower()
+    assert "0 feedback items" in text
+    assert "r1" in text
+
+
+@pytest.mark.asyncio
+async def test_list_feedback_empty_for_unknown_run_renders_not_found():
+    """Unknown run: the existence check surfaces the not-found instead of the
+    misleading '0 feedback items' success render."""
+    from src.revenium_mcp_server.client import ReveniumAPIError
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    feedback_mock = AsyncMock(return_value={"data": [], "next_cursor": None})
+    err = ReveniumAPIError("run not found", status_code=404, code="NOT_FOUND")
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_recommendation_feedback",
+        new=feedback_mock,
+    ), patch(
+        "src.revenium_mcp_server.client.ReveniumClient.get_recommendation_run",
+        new=AsyncMock(side_effect=err),
+    ):
+        result = await tool.handle_action("list_feedback", {"run_id": "no-such-run"})
+
+    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    assert "not found" in text.lower()
+    assert "no-such-run" in text
+    assert "0 feedback items" not in text
+
+
+@pytest.mark.asyncio
+async def test_list_feedback_empty_existence_check_reraises_non_not_found_error():
+    """A non-not-found failure of the existence probe (e.g. auth) must not be
+    laundered into an empty-result render — it propagates for isError:true."""
+    from src.revenium_mcp_server.client import ReveniumAPIError
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    feedback_mock = AsyncMock(return_value={"data": [], "next_cursor": None})
+    err = ReveniumAPIError("Unauthorized", status_code=401)
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.list_recommendation_feedback",
+        new=feedback_mock,
+    ), patch(
+        "src.revenium_mcp_server.client.ReveniumClient.get_recommendation_run",
+        new=AsyncMock(side_effect=err),
+    ):
+        with pytest.raises(ReveniumAPIError) as exc:
+            await tool.handle_action("list_feedback", {"run_id": "r1"})
+
+    assert exc.value.status_code == 401
 
 
 @pytest.mark.asyncio

@@ -630,3 +630,646 @@ class TestProductsPaginationSafeInteger:
         msg = str(exc_info.value)
         assert "exceeds safe integer range" in msg
         assert str(corrupted) not in msg
+
+
+class TestProductListSearchContract:
+    """The list action's search surface must be honest.
+
+    The upstream products endpoint ignores arbitrary query params, so the
+    advertised free-form `filters` dict was a silent no-op: every unmatched
+    filter still returned the whole catalogue. The contract is now narrow —
+    `query` is the server-side search, `filters` supports `name` only (exact,
+    case-sensitive, applied to the returned page), and any other filter key is
+    rejected instead of forwarded.
+    """
+
+    THREE_PRODUCTS = [
+        {"id": "p1", "name": "Alpha"},
+        {"id": "p2", "name": "Alpha Plus"},
+        {"id": "p3", "name": "Beta"},
+    ]
+
+    @staticmethod
+    def _rendered_text(response):
+        assert len(response) == 1
+        assert isinstance(response[0], TextContent)
+        return response[0].text
+
+    @pytest.mark.asyncio
+    async def test_query_forwarded_as_server_side_search(
+        self, product_manager, mock_client
+    ):
+        """A top-level query is passed to the endpoint's `query` param."""
+        mock_client._extract_embedded_data.return_value = [{"id": "p1", "name": "Alpha"}]
+        mock_client._extract_pagination_info.return_value = {
+            "totalPages": 1,
+            "totalElements": 1,
+        }
+
+        await product_manager.list_products({"page": 0, "size": 20, "query": "Alpha"})
+
+        mock_client.get_products.assert_called_once_with(page=0, size=20, query="Alpha")
+
+    @pytest.mark.asyncio
+    async def test_filters_name_narrows_server_side_and_matches_exactly(
+        self, product_manager, mock_client, product_mgmt
+    ):
+        """filters={'name': X} sends query=X upstream AND keeps only the exact
+        name match from the returned page — the render must count the survivor,
+        not the whole page."""
+        mock_client._extract_embedded_data.return_value = list(self.THREE_PRODUCTS)
+        mock_client._extract_pagination_info.return_value = {
+            "totalPages": 1,
+            "totalElements": 3,
+        }
+
+        arguments = {"page": 0, "size": 20, "filters": {"name": "Alpha"}}
+        response = await product_mgmt._handle_standard_crud_actions(
+            "list", arguments, product_manager
+        )
+
+        mock_client.get_products.assert_called_once_with(page=0, size=20, query="Alpha")
+
+        text = self._rendered_text(response)
+        assert "Found 1 of 1 items" in text, text
+        assert "Alpha Plus" not in text, text
+        assert "Beta" not in text, text
+        assert '"id": "p1"' in text, text
+
+    @pytest.mark.asyncio
+    async def test_filters_name_with_no_match_renders_empty_honestly(
+        self, product_manager, mock_client, product_mgmt
+    ):
+        """A name nothing matches must render zero items even when the upstream
+        response still carries the whole catalogue."""
+        mock_client._extract_embedded_data.return_value = list(self.THREE_PRODUCTS)
+        mock_client._extract_pagination_info.return_value = {
+            "totalPages": 1,
+            "totalElements": 3,
+        }
+
+        arguments = {"page": 0, "size": 20, "filters": {"name": "zzz-no-such-product"}}
+        response = await product_mgmt._handle_standard_crud_actions(
+            "list", arguments, product_manager
+        )
+
+        text = self._rendered_text(response)
+        assert "Found 0 of 0 items" in text, text
+        assert "No items found." in text, text
+        assert "Alpha" not in text, text
+
+    @pytest.mark.asyncio
+    async def test_filters_name_match_is_case_sensitive(
+        self, product_manager, mock_client
+    ):
+        """Exact means exact — a casing variant is not a match."""
+        mock_client._extract_embedded_data.return_value = list(self.THREE_PRODUCTS)
+        mock_client._extract_pagination_info.return_value = {
+            "totalPages": 1,
+            "totalElements": 3,
+        }
+
+        result = await product_manager.list_products(
+            {"page": 0, "size": 20, "filters": {"name": "alpha"}}
+        )
+
+        assert result["data"] == []
+        assert result["pagination"]["total_items"] == 0
+
+    @pytest.mark.asyncio
+    async def test_unknown_filter_key_raises_structured_error(
+        self, product_manager, mock_client
+    ):
+        """Unsupported filter keys are rejected, never forwarded — forwarding is
+        what made the old filter a silent no-op."""
+        mock_client._extract_embedded_data.return_value = list(self.THREE_PRODUCTS)
+        mock_client._extract_pagination_info.return_value = {
+            "totalPages": 1,
+            "totalElements": 3,
+        }
+
+        with pytest.raises(ToolError) as exc_info:
+            await product_manager.list_products(
+                {"page": 0, "size": 20, "filters": {"description": "anything"}}
+            )
+
+        err = exc_info.value
+        assert err.field == "filters"
+        assert "description" in str(err)
+        assert "name" in str(err)
+        assert "query" in str(err)
+        mock_client.get_products.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unknown_filter_key_rejected_alongside_supported_key(
+        self, product_manager, mock_client
+    ):
+        """A valid `name` does not license an unknown sibling key."""
+        mock_client._extract_embedded_data.return_value = list(self.THREE_PRODUCTS)
+        mock_client._extract_pagination_info.return_value = {
+            "totalPages": 1,
+            "totalElements": 3,
+        }
+
+        with pytest.raises(ToolError):
+            await product_manager.list_products(
+                {"page": 0, "size": 20, "filters": {"name": "Alpha", "status": "ACTIVE"}}
+            )
+
+        mock_client.get_products.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_conflicting_query_and_filters_name_raises(
+        self, product_manager, mock_client
+    ):
+        """Two different search terms is ambiguous intent, not a merge."""
+        mock_client._extract_embedded_data.return_value = list(self.THREE_PRODUCTS)
+        mock_client._extract_pagination_info.return_value = {
+            "totalPages": 1,
+            "totalElements": 3,
+        }
+
+        with pytest.raises(ToolError) as exc_info:
+            await product_manager.list_products(
+                {"page": 0, "size": 20, "query": "Alpha", "filters": {"name": "Beta"}}
+            )
+
+        err = exc_info.value
+        assert err.field == "query"
+        assert "Alpha" in str(err)
+        assert "Beta" in str(err)
+        mock_client.get_products.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_matching_query_and_filters_name_allowed(
+        self, product_manager, mock_client
+    ):
+        """Same term in both places is redundant but unambiguous."""
+        mock_client._extract_embedded_data.return_value = list(self.THREE_PRODUCTS)
+        mock_client._extract_pagination_info.return_value = {
+            "totalPages": 1,
+            "totalElements": 3,
+        }
+
+        result = await product_manager.list_products(
+            {"page": 0, "size": 20, "query": "Alpha", "filters": {"name": "Alpha"}}
+        )
+
+        mock_client.get_products.assert_called_once_with(page=0, size=20, query="Alpha")
+        assert [p["id"] for p in result["data"]] == ["p1"]
+
+    @pytest.mark.asyncio
+    async def test_no_search_terms_sends_no_query_param(
+        self, product_manager, mock_client
+    ):
+        """An unfiltered list must not invent a query param."""
+        mock_client._extract_embedded_data.return_value = list(self.THREE_PRODUCTS)
+        mock_client._extract_pagination_info.return_value = {
+            "totalPages": 1,
+            "totalElements": 3,
+        }
+
+        result = await product_manager.list_products({"page": 0, "size": 20})
+
+        mock_client.get_products.assert_called_once_with(page=0, size=20)
+        assert len(result["data"]) == 3
+        assert result["pagination"]["total_items"] == 3
+
+    @pytest.mark.asyncio
+    async def test_non_dict_filters_raises_structured_error(
+        self, product_manager, mock_client
+    ):
+        """filters must be a mapping; a string would previously explode in **kwargs."""
+        with pytest.raises(ToolError) as exc_info:
+            await product_manager.list_products(
+                {"page": 0, "size": 20, "filters": "name=Alpha"}
+            )
+
+        assert exc_info.value.field == "filters"
+        mock_client.get_products.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_string_filters_name_raises_structured_error(
+        self, product_manager, mock_client
+    ):
+        """filters is a free-form dict with no schema behind it, so the name
+        value's type is checked here rather than leaking upstream."""
+        with pytest.raises(ToolError) as exc_info:
+            await product_manager.list_products(
+                {"page": 0, "size": 20, "filters": {"name": 123}}
+            )
+
+        assert exc_info.value.field == "filters.name"
+        mock_client.get_products.assert_not_called()
+
+
+def _program_pages(mock_client, pages, total_pages=None):
+    """Drive the mock client through a sequence of server pages.
+
+    ``pages`` is a list of per-page product lists. ``total_pages`` defaults to
+    len(pages) and can be raised above it to simulate a server result set that
+    continues past the pages the mock actually serves.
+    """
+    reported_total = len(pages) if total_pages is None else total_pages
+    mock_client.get_products.side_effect = [
+        {"_page": index} for index in range(len(pages))
+    ]
+    mock_client._extract_embedded_data.side_effect = list(pages)
+    mock_client._extract_pagination_info.side_effect = [
+        {"totalPages": reported_total, "totalElements": sum(len(p) for p in pages)}
+        for _ in pages
+    ]
+
+
+class TestProductListExactNameCrossPageScan:
+    """filters.name is an exact-lookup intent, not a page-scoped filter.
+
+    The server-side `query` match is loose, so the exact name can legitimately
+    land on any page of the loose result set. Applying the exact match only to
+    the page the caller happened to request reports "no match" for a product
+    that demonstrably exists — the same false-negative class the honest-filter
+    work set out to remove. The scan therefore drains the query's pages and
+    renders the exact-match set as one logical page.
+    """
+
+    @pytest.mark.asyncio
+    async def test_exact_match_on_a_later_page_is_found(self, product_manager, mock_client):
+        """The exact match sits on server page 1; page 0 holds only loose hits."""
+        _program_pages(
+            mock_client,
+            [
+                [{"id": "p1", "name": "Alpha Plus"}, {"id": "p2", "name": "Alpha Max"}],
+                [{"id": "p3", "name": "Alpha"}, {"id": "p4", "name": "Alpha Mini"}],
+            ],
+        )
+
+        result = await product_manager.list_products(
+            {"page": 0, "size": 2, "filters": {"name": "Alpha"}}
+        )
+
+        assert [p["id"] for p in result["data"]] == ["p3"]
+        assert result["pagination"]["total_items"] == 1
+
+    @pytest.mark.asyncio
+    async def test_scan_starts_at_page_zero_regardless_of_requested_page(
+        self, product_manager, mock_client
+    ):
+        """In exact-lookup mode the caller's page does not select a server page:
+        the exact-match set is the logical result, so the scan always starts at 0."""
+        _program_pages(
+            mock_client,
+            [
+                [{"id": "p1", "name": "Alpha"}],
+                [{"id": "p2", "name": "Alpha Plus"}],
+            ],
+        )
+
+        result = await product_manager.list_products(
+            {"page": 5, "size": 1, "filters": {"name": "Alpha"}}
+        )
+
+        scanned = [call.kwargs["page"] for call in mock_client.get_products.call_args_list]
+        assert scanned == [0, 1]
+        assert [p["id"] for p in result["data"]] == ["p1"]
+        assert result["pagination"]["page"] == 0
+
+    @pytest.mark.asyncio
+    async def test_matches_collected_across_every_scanned_page(
+        self, product_manager, mock_client
+    ):
+        """Duplicate names across pages all survive the scan."""
+        _program_pages(
+            mock_client,
+            [
+                [{"id": "p1", "name": "Alpha"}, {"id": "p2", "name": "Alpha Plus"}],
+                [{"id": "p3", "name": "Beta"}, {"id": "p4", "name": "Alpha"}],
+                [{"id": "p5", "name": "Alpha"}],
+            ],
+        )
+
+        result = await product_manager.list_products(
+            {"page": 0, "size": 20, "filters": {"name": "Alpha"}}
+        )
+
+        assert [p["id"] for p in result["data"]] == ["p1", "p4", "p5"]
+
+    @pytest.mark.asyncio
+    async def test_scan_stops_early_on_an_empty_page(self, product_manager, mock_client):
+        """A short server result set must not be paged past its end."""
+        _program_pages(mock_client, [[{"id": "p1", "name": "Alpha"}], []], total_pages=9)
+
+        await product_manager.list_products(
+            {"page": 0, "size": 20, "filters": {"name": "Alpha"}}
+        )
+
+        assert mock_client.get_products.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_plain_query_still_uses_server_pagination(
+        self, product_manager, mock_client
+    ):
+        """Without filters.name the server's own paging is correct — one request
+        for the requested page, no scan."""
+        mock_client._extract_embedded_data.return_value = [{"id": "p1", "name": "Alpha"}]
+        mock_client._extract_pagination_info.return_value = {
+            "totalPages": 4,
+            "totalElements": 40,
+        }
+
+        result = await product_manager.list_products({"page": 2, "size": 10, "query": "Alpha"})
+
+        mock_client.get_products.assert_called_once_with(page=2, size=10, query="Alpha")
+        assert result["pagination"]["page"] == 2
+        assert result["pagination"]["total_pages"] == 4
+        assert result["pagination"]["has_next"] is True
+
+
+class TestProductListNarrowedPaginationCoherence:
+    """A narrowed render must not borrow the loose query's pagination.
+
+    Reporting the survivor count as total_items while total_pages/has_next still
+    describe the server's loose result set produces "Found 1 of 1 items (page 1
+    of 3)" and a has_next that points at pages of non-matches.
+    """
+
+    @pytest.mark.asyncio
+    async def test_narrowed_result_is_a_single_logical_page(
+        self, product_manager, mock_client
+    ):
+        _program_pages(
+            mock_client,
+            [
+                [{"id": "p1", "name": "Alpha"}, {"id": "p2", "name": "Alpha Plus"}],
+                [{"id": "p3", "name": "Alpha Max"}],
+                [{"id": "p4", "name": "Alpha Mini"}],
+            ],
+        )
+
+        result = await product_manager.list_products(
+            {"page": 0, "size": 20, "filters": {"name": "Alpha"}}
+        )
+
+        pagination = result["pagination"]
+        assert pagination["total_items"] == 1
+        assert pagination["total_pages"] == 1
+        assert pagination["page"] == 0
+        assert pagination["has_next"] is False
+        assert pagination["has_previous"] is False
+
+    @pytest.mark.asyncio
+    async def test_narrowed_render_header_is_coherent(
+        self, product_manager, mock_client, product_mgmt
+    ):
+        """The rendered header must not claim page 1 of 3 for a one-page result."""
+        _program_pages(
+            mock_client,
+            [
+                [{"id": "p1", "name": "Alpha"}],
+                [{"id": "p2", "name": "Alpha Plus"}],
+                [{"id": "p3", "name": "Alpha Max"}],
+            ],
+        )
+
+        response = await product_mgmt._handle_standard_crud_actions(
+            "list", {"page": 0, "size": 20, "filters": {"name": "Alpha"}}, product_manager
+        )
+
+        text = response[0].text
+        assert "Found 1 of 1 items (page 1 of 1)" in text, text
+        assert "Next page" not in text, text
+
+    @pytest.mark.asyncio
+    async def test_empty_narrowed_result_reports_zero_of_zero(
+        self, product_manager, mock_client
+    ):
+        _program_pages(
+            mock_client,
+            [
+                [{"id": "p1", "name": "Alpha Plus"}],
+                [{"id": "p2", "name": "Alpha Max"}],
+            ],
+        )
+
+        result = await product_manager.list_products(
+            {"page": 0, "size": 20, "filters": {"name": "zzz-no-such-product"}}
+        )
+
+        assert result["data"] == []
+        assert result["pagination"]["total_items"] == 0
+        assert result["pagination"]["total_pages"] == 1
+        assert result["pagination"]["has_next"] is False
+
+    @pytest.mark.asyncio
+    async def test_matches_beyond_size_page_the_exact_match_set(
+        self, product_manager, mock_client
+    ):
+        """When the exact-match set itself exceeds size, total_pages/has_next
+        describe that set — never the loose query's pagination."""
+        _program_pages(
+            mock_client,
+            [
+                [{"id": "p1", "name": "Alpha"}, {"id": "p2", "name": "Alpha"}],
+                [{"id": "p3", "name": "Alpha"}, {"id": "p4", "name": "Alpha"}],
+                [{"id": "p5", "name": "Alpha"}],
+            ],
+        )
+
+        result = await product_manager.list_products(
+            {"page": 0, "size": 2, "filters": {"name": "Alpha"}}
+        )
+
+        assert [p["id"] for p in result["data"]] == ["p1", "p2"]
+        assert result["pagination"]["total_items"] == 5
+        assert result["pagination"]["total_pages"] == 3
+        assert result["pagination"]["has_next"] is True
+
+    @pytest.mark.asyncio
+    async def test_page_indexes_the_exact_match_set(self, product_manager, mock_client):
+        """has_next may only advertise a page the caller can actually reach, so
+        `page` indexes the match set — an unreachable next page would be the same
+        class of lie as borrowing the loose query's totals."""
+        _program_pages(
+            mock_client,
+            [
+                [{"id": "p1", "name": "Alpha"}, {"id": "p2", "name": "Alpha"}],
+                [{"id": "p3", "name": "Alpha"}, {"id": "p4", "name": "Alpha"}],
+                [{"id": "p5", "name": "Alpha"}],
+            ],
+        )
+
+        result = await product_manager.list_products(
+            {"page": 1, "size": 2, "filters": {"name": "Alpha"}}
+        )
+
+        assert [p["id"] for p in result["data"]] == ["p3", "p4"]
+        assert result["pagination"]["page"] == 1
+        assert result["pagination"]["has_previous"] is True
+        assert result["pagination"]["has_next"] is True
+
+    @pytest.mark.asyncio
+    async def test_page_past_the_match_set_is_clamped_not_stranded(
+        self, product_manager, mock_client
+    ):
+        """A leftover page from a browse loop must not hide a found product."""
+        _program_pages(
+            mock_client,
+            [[{"id": "p1", "name": "Alpha"}], [{"id": "p2", "name": "Alpha Plus"}]],
+        )
+
+        result = await product_manager.list_products(
+            {"page": 7, "size": 20, "filters": {"name": "Alpha"}}
+        )
+
+        assert [p["id"] for p in result["data"]] == ["p1"]
+        assert result["pagination"]["page"] == 0
+        assert result["pagination"]["has_next"] is False
+        assert result["pagination"]["has_previous"] is False
+
+
+class TestProductListScanBoundHonesty:
+    """A bounded scan that stops short must say so.
+
+    Silently returning "no match" after scanning only part of the loose result
+    set would recreate the false negative behind a different mechanism.
+    """
+
+    @pytest.mark.asyncio
+    async def test_scan_bound_sets_possibly_incomplete(self, product_manager, mock_client):
+        from src.revenium_mcp_server.tools_decomposed.product_management import (
+            _NAME_FILTER_SCAN_MAX_PAGES,
+        )
+
+        pages = [
+            [{"id": f"p{index}", "name": "Alpha Plus"}]
+            for index in range(_NAME_FILTER_SCAN_MAX_PAGES)
+        ]
+        _program_pages(mock_client, pages, total_pages=_NAME_FILTER_SCAN_MAX_PAGES + 5)
+
+        result = await product_manager.list_products(
+            {"page": 0, "size": 20, "filters": {"name": "Alpha"}}
+        )
+
+        assert mock_client.get_products.call_count == _NAME_FILTER_SCAN_MAX_PAGES
+        assert result["pagination"]["possibly_incomplete"] is True
+
+    @pytest.mark.asyncio
+    async def test_exhausted_scan_is_not_flagged_incomplete(
+        self, product_manager, mock_client
+    ):
+        """Draining every page of the loose result set is a complete answer."""
+        _program_pages(
+            mock_client,
+            [
+                [{"id": "p1", "name": "Alpha Plus"}],
+                [{"id": "p2", "name": "Alpha"}],
+            ],
+        )
+
+        result = await product_manager.list_products(
+            {"page": 0, "size": 20, "filters": {"name": "Alpha"}}
+        )
+
+        assert result["pagination"]["possibly_incomplete"] is False
+
+    @pytest.mark.asyncio
+    async def test_bounded_empty_result_renders_the_caveat(
+        self, product_manager, mock_client, product_mgmt
+    ):
+        """The most dangerous case: zero matches after a truncated scan must not
+        read as a confident "this product does not exist"."""
+        from src.revenium_mcp_server.tools_decomposed.product_management import (
+            _NAME_FILTER_SCAN_MAX_PAGES,
+        )
+
+        pages = [
+            [{"id": f"p{index}", "name": "Alpha Plus"}]
+            for index in range(_NAME_FILTER_SCAN_MAX_PAGES)
+        ]
+        _program_pages(mock_client, pages, total_pages=_NAME_FILTER_SCAN_MAX_PAGES + 5)
+
+        response = await product_mgmt._handle_standard_crud_actions(
+            "list", {"page": 0, "size": 20, "filters": {"name": "Alpha"}}, product_manager
+        )
+
+        text = response[0].text
+        assert str(_NAME_FILTER_SCAN_MAX_PAGES) in text, text
+        assert "more may exist" in text, text
+        assert "continue the search with query=" in text.lower(), text
+
+    @pytest.mark.asyncio
+    async def test_bounded_nonempty_result_carries_the_flag_in_the_payload(
+        self, product_manager, mock_client, product_mgmt
+    ):
+        from src.revenium_mcp_server.tools_decomposed.product_management import (
+            _NAME_FILTER_SCAN_MAX_PAGES,
+        )
+
+        pages = [[{"id": "p0", "name": "Alpha"}]] + [
+            [{"id": f"p{index}", "name": "Alpha Plus"}]
+            for index in range(1, _NAME_FILTER_SCAN_MAX_PAGES)
+        ]
+        _program_pages(mock_client, pages, total_pages=_NAME_FILTER_SCAN_MAX_PAGES + 5)
+
+        response = await product_mgmt._handle_standard_crud_actions(
+            "list", {"page": 0, "size": 20, "filters": {"name": "Alpha"}}, product_manager
+        )
+
+        text = response[0].text
+        assert '"possibly_incomplete": true' in text, text
+        assert "more may exist" in text, text
+        # The caveat must offer a reachable continuation: query mode has full
+        # server-side pagination, so the caller can walk the remaining pages
+        # even when the product id is unknown.
+        assert "continue the search with query=" in text.lower(), text
+
+    @pytest.mark.asyncio
+    async def test_complete_scan_renders_no_caveat(
+        self, product_manager, mock_client, product_mgmt
+    ):
+        _program_pages(
+            mock_client,
+            [[{"id": "p1", "name": "Alpha"}], [{"id": "p2", "name": "Alpha Plus"}]],
+        )
+
+        response = await product_mgmt._handle_standard_crud_actions(
+            "list", {"page": 0, "size": 20, "filters": {"name": "Alpha"}}, product_manager
+        )
+
+        text = response[0].text
+        assert "more may exist" not in text, text
+        assert '"possibly_incomplete": false' in text, text
+
+
+class TestProductInputSchemaSearchSurface:
+    """Introspection metadata must advertise the parameters the tool accepts."""
+
+    @pytest.mark.asyncio
+    async def test_input_schema_advertises_query(self, product_mgmt):
+        schema = await product_mgmt._get_input_schema()
+
+        assert "query" in schema["properties"], schema["properties"]
+        assert schema["properties"]["query"]["type"] == "string"
+
+    @pytest.mark.asyncio
+    async def test_input_schema_query_description_matches_the_contract(self, product_mgmt):
+        description = (await product_mgmt._get_input_schema())["properties"]["query"][
+            "description"
+        ]
+
+        assert "server-side" in description.lower(), description
+
+    @pytest.mark.asyncio
+    async def test_input_schema_describes_filters_as_name_only(self, product_mgmt):
+        properties = (await product_mgmt._get_input_schema())["properties"]
+
+        assert "filters" in properties, properties
+        description = properties["filters"]["description"]
+        assert "name" in description, description
+        assert "exact" in description.lower(), description
+
+    @pytest.mark.asyncio
+    async def test_input_schema_does_not_make_search_required(self, product_mgmt):
+        schema = await product_mgmt._get_input_schema()
+
+        assert "query" not in schema["required"]
+        assert "filters" not in schema["required"]

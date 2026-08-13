@@ -657,6 +657,69 @@ class TestBusinessAnalyticsDimensionForwarding:
 
 
 # ---------------------------------------------------------------------------
+# manage_metering closure — ticket/skill attribution forwarding
+# ---------------------------------------------------------------------------
+
+class TestManageMeteringAttributionForwarding:
+    """The registered MCP boundary must declare and forward the ticket and
+    skill attribution fields — handler support beneath an undeclared
+    parameter is unreachable for every MCP client (FastMCP builds the tool
+    schema from the closure signature and rejects unknown parameters)."""
+
+    ATTRIBUTION = {
+        "ticket_id": "JIRA-42",
+        "skill_name": "portfolio-analyzer",
+        "skill_source": "plugin",
+        "skill_kind": "workflow",
+        "skill_plugin_name": "finance-pack",
+        "skill_marketplace_name": "acme-marketplace",
+        "skill_invocation_trigger": "user-slash",
+    }
+
+    @pytest.mark.asyncio
+    async def test_attribution_fields_forwarded_to_execution(self):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_metering")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="submit_ai_transaction", **self.ATTRIBUTION)
+
+        for key, value in self.ATTRIBUTION.items():
+            assert captured_args.get(key) == value, key
+
+    @pytest.mark.asyncio
+    async def test_attribution_fields_omitted_when_absent(self):
+        """Absent attribution fields are stripped with the other None values —
+        the payload builder's omit-if-unset contract starts at the boundary."""
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_metering")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="get_capabilities")
+
+        for key in self.ATTRIBUTION:
+            assert key not in captured_args
+
+
+# ---------------------------------------------------------------------------
 # JSON preprocessing — manage_workflows (context, workflow_data)
 # ---------------------------------------------------------------------------
 
@@ -830,6 +893,61 @@ class TestManageProductsJsonPreprocessing:
 
         assert isinstance(captured_args.get("product_data"), dict)
         assert captured_args["product_data"]["name"] == "Prod1"
+
+
+# ---------------------------------------------------------------------------
+# manage_products create_simple convenience params (name / description)
+# ---------------------------------------------------------------------------
+
+class TestManageProductsCreateSimpleParams:
+    """The documented create_simple(name=..., description=...) shape must reach the handler."""
+
+    @pytest.mark.asyncio
+    async def test_create_simple_name_and_description_forwarded_through_closure(self):
+        """Top-level name/description ride the closure into arguments for create_simple."""
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_products")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(
+                action="create_simple",
+                name="My AI Product",
+                description="Premium API access",
+            )
+
+        assert captured_args["action"] == "create_simple"
+        assert captured_args["name"] == "My AI Product"
+        assert captured_args["description"] == "Premium API access"
+
+    @pytest.mark.asyncio
+    async def test_create_simple_omitted_description_is_dropped_for_handler_default(self):
+        """name alone is enough; an omitted description is stripped so the handler default applies."""
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_products")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="create_simple", name="My AI Product")
+
+        assert captured_args["name"] == "My AI Product"
+        assert "description" not in captured_args
 
 
 # ---------------------------------------------------------------------------
@@ -1987,6 +2105,61 @@ class TestBusinessAnalyticsBillingReadClosure:
             assert key not in captured
 
 
+class TestBusinessAnalyticsSkillReadClosure:
+    """The closure signature is the tool's public schema — a handler reading
+    arguments["skill_id"] is unreachable unless the parameter is declared."""
+
+    async def _run(self, **kwargs):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(
+            registry, "_register_business_analytics_management"
+        )
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(**kwargs)
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_signature_declares_skill_id_and_sort(self):
+        import inspect
+
+        registry = _make_registry()
+        fn = await _get_registered_closure(
+            registry, "_register_business_analytics_management"
+        )
+        params = inspect.signature(fn).parameters
+        assert "skill_id" in params
+        assert "sort" in params
+
+    @pytest.mark.asyncio
+    async def test_skill_params_forwarded(self):
+        captured = await self._run(
+            action="list_skills", period="NINETY_DAYS", sort="totalCost,DESC"
+        )
+        assert captured["period"] == "NINETY_DAYS"
+        assert captured["sort"] == "totalCost,DESC"
+
+    @pytest.mark.asyncio
+    async def test_skill_id_forwarded(self):
+        captured = await self._run(action="get_skill", skill_id="JMwX9g4")
+        assert captured["action"] == "get_skill"
+        assert captured["skill_id"] == "JMwX9g4"
+
+    @pytest.mark.asyncio
+    async def test_none_skill_params_stripped(self):
+        captured = await self._run(action="list_skills")
+        assert "skill_id" not in captured
+        assert "sort" not in captured
+
+
 class TestManageSubscriptionsBillingReadClosure:
     async def _run(self, **kwargs):
         registry = _make_registry()
@@ -2045,3 +2218,89 @@ class TestBillingClosureDateAndQueryParams:
         ):
             await registered_fn(action="list_invoices", **{param: value})
         assert captured[param] == value
+
+
+class TestManageAiInsightsCursorParameter:
+    """The continuation cursor must be reachable through the MCP boundary —
+    the closure signature is the tool's public schema, so a handler that reads
+    arguments["cursor"] is unreachable without the parameter declared here."""
+
+    @pytest.mark.asyncio
+    async def test_cursor_forwarded_through_closure(self):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_ai_insights")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="list_feedback", run_id="r1", cursor="cont-123")
+
+        assert captured_args["cursor"] == "cont-123"
+
+
+class TestManageProductsQueryParameter:
+    """manage_products advertises free-text search; the closure must declare
+    `query` so FastMCP binds it and forwards it to the handler. Without the
+    parameter the only search surface was the `filters` dict, whose contents
+    the upstream products endpoint silently ignored.
+    """
+
+    @pytest.mark.asyncio
+    async def test_signature_declares_query(self):
+        """`query` must be in the registered signature — FastMCP builds its
+        Pydantic model from it, so an undeclared kwarg is a hard framework
+        error for the caller."""
+        import inspect
+
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_products")
+
+        assert "query" in inspect.signature(fn).parameters
+
+    @pytest.mark.asyncio
+    async def test_query_forwarded_to_execution(self):
+        """query='API' rides through the closure into the handler arguments."""
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_products")
+
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await fn(action="list", query="API")
+
+        assert captured.get("query") == "API"
+
+    @pytest.mark.asyncio
+    async def test_query_omitted_when_not_supplied(self):
+        """No query means no key in arguments — the handler must not receive a
+        None that would become a `query=None` upstream param."""
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_products")
+
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await fn(action="list")
+
+        assert "query" not in captured

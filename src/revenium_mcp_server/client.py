@@ -1698,6 +1698,50 @@ class ReveniumClient:
             "/profitstream/v2/api/period-charges", params=params
         ))
 
+    # Skills usage API methods
+    async def get_skills(
+        self, page: int = 0, size: int = 20, **filters: Any
+    ) -> Dict[str, Any]:
+        """List the team's skills with their aggregated usage.
+
+        Doubles as the skill catalog and the cost-by-skill report: each entry
+        carries totalCost / callCount / traceCount for the requested window.
+
+        Args:
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Additional query params forwarded as-is (``period``,
+                ``sort``)
+
+        Returns:
+            Paginated HAL response; items live under
+            ``_embedded.skillUsageResourceList``.
+        """
+        params: Dict[str, Any] = {"page": page, "size": size}
+        params.update(filters)
+        # teamId is a required query parameter on both skills operations —
+        # omitting it is a 400, not an unscoped read.
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/skills", params=params
+        ))
+
+    async def get_skill_by_id(self, skill_id: str, **filters: Any) -> Dict[str, Any]:
+        """Get usage detail for a single skill.
+
+        Args:
+            skill_id: The skill identifier (Revenium hashid)
+            **filters: Additional query params forwarded as-is (``period``)
+
+        Returns:
+            Flat skill-usage resource (no HAL envelope around the single item).
+        """
+        params: Dict[str, Any] = {**filters}
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/skills/{skill_id}", params=params
+        ))
+
     # Tenant ingestion diagnostics API methods
     def _require_tenant_id(self) -> str:
         """Return the tenant id from auth config, or fail with guidance.
@@ -2335,6 +2379,48 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/teams/{team_id}/tags", params=params))
+
+    async def get_team_marketplace_settings(self, team_id: str) -> Dict[str, Any]:
+        """Get the team's internal (company-owned) plugin marketplace settings.
+
+        Args:
+            team_id: The team ID
+
+        Returns:
+            Marketplace settings data carrying an internalMarketplaceNames array
+        """
+        params = self._add_tenant_id_to_params()
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/teams/{team_id}/settings/marketplaces", params=params
+        ))
+
+    async def update_team_marketplace_settings(
+        self, team_id: str, settings: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Replace the team's internal plugin marketplace settings.
+
+        The endpoint is a full replacement of internalMarketplaceNames, not a merge:
+        any name absent from *settings* is dropped, and the API then re-classifies
+        plugin-sourced skills from the dropped marketplaces from ORGANIZATION back to
+        THIRD_PARTY. Callers must send the complete intended list.
+
+        The resource exposes no version or ETag, so a read-merge-write around it is not
+        atomic; the only conflict signal the endpoint documents is a 409.
+
+        Args:
+            team_id: The team ID
+            settings: Full settings payload, e.g. {"internalMarketplaceNames": [...]}
+
+        Returns:
+            Updated marketplace settings data
+        """
+        params = self._add_tenant_id_to_params()
+        return cast(Dict[str, Any], await self.put(
+            f"/profitstream/v2/api/teams/{team_id}/settings/marketplaces",
+            data=settings,
+            params=params,
+        ))
+
     # AI Anomaly and Alert Management API methods
 
     # AI Anomaly API methods
@@ -2652,6 +2738,23 @@ class ReveniumClient:
         params.update(filters)
         params = self._add_team_id_to_params(params)
         return cast(Dict[str, Any], await self.get("/profitstream/v2/api/sources/ai/models", params=params))
+    async def get_ai_model_providers(self, model_type: Optional[str] = None) -> List[str]:
+        """Get the distinct provider names across the AI models available to the team.
+
+        Args:
+            model_type: GLOBAL or CUSTOM to restrict to one catalog; omitted
+                covers both the global catalog and the team's custom models
+
+        Returns:
+            Sorted list of provider names. This endpoint answers with a bare JSON
+            array rather than a HAL page, so the result carries no ``_embedded``
+            envelope and no pagination metadata.
+        """
+        params: Dict[str, Any] = {}
+        if model_type is not None:
+            params["modelType"] = model_type
+        params = self._add_team_id_to_params(params)
+        return cast(List[str], await self.get("/profitstream/v2/api/sources/ai/models/providers", params=params))
     # Note: Individual AI model endpoint has ID format issues
     # Use search_ai_models() or get_ai_models() to find specific models by ID
 
@@ -2902,7 +3005,11 @@ class ReveniumClient:
 
         Args:
             job_id: The job identifier
-            outcome_data: Outcome data to report
+            outcome_data: Outcome data to report. Forwarded verbatim as the request
+                body so callers keep full control of the field set (executionStatus,
+                outcomeType, outcomeValue, outcomeCurrency, metadata, outcomeReason,
+                reportedBy). Never filter keys here — a field the API adds must reach
+                it without a client release.
 
         Returns:
             Response from the API
@@ -2911,7 +3018,12 @@ class ReveniumClient:
             ReveniumAPIError: With status_code 409 if outcome already reported
         """
         params = self._add_team_id_to_params({})
-        return cast(Dict[str, Any], await self.post(f"/profitstream/v2/api/jobs/{job_id}/outcomes", data=outcome_data, params=params))
+        # The path segment is singular. Both published platform OpenAPI documents
+        # (release and snapshot) define only POST /v2/api/jobs/{agenticJobId}/outcome;
+        # the plural "/outcomes" spelling this once used came from narrative docs and
+        # appears in no machine-readable contract. Re-verify against the generated
+        # spec, not prose, before changing it again.
+        return cast(Dict[str, Any], await self.post(f"/profitstream/v2/api/jobs/{job_id}/outcome", data=outcome_data, params=params))
     # Tool Registry API methods
     async def list_tools(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of tools with pagination.
@@ -3367,6 +3479,43 @@ class ReveniumClient:
         )
         return cast(Dict[str, Any], result)
 
+    @staticmethod
+    def _as_cursor_envelope(payload: Any, *, context: str) -> Dict[str, Any]:
+        """Normalize a cursor-list response to ``{"data": [...], "next_cursor": ...}``.
+
+        A bare JSON array is wrapped as a single page (an array carries no
+        cursor, so ``next_cursor`` is None) and a dict is already the documented
+        envelope and passes through untouched. Any other shape raises: degrading
+        to an empty envelope would let upstream schema breakage render as a
+        confident "0 items" success, which is a false negative the caller cannot
+        detect.
+
+        Args:
+            payload: Parsed response body — array, envelope dict, or anything else.
+            context: Caller label named in the raised error for an unrecognized shape.
+
+        Returns:
+            The cursor envelope every caller of these list endpoints expects.
+        """
+        if isinstance(payload, list):
+            return {"data": payload, "next_cursor": None}
+        if isinstance(payload, dict):
+            # An envelope must carry a list-valued data field — passing a
+            # malformed dict through would let callers read a missing/null
+            # data key as an empty page and report zero items for a real run.
+            if isinstance(payload.get("data"), list):
+                return payload
+            raise ReveniumAPIError(
+                f"{context}: envelope is missing a list-valued 'data' field "
+                f"(got {type(payload.get('data')).__name__})",
+                status_code=None,
+            )
+        raise ReveniumAPIError(
+            f"{context}: unexpected response shape {type(payload).__name__} "
+            "(expected a JSON array or a data/next_cursor envelope)",
+            status_code=None,
+        )
+
     async def list_recommendation_feedback(
         self,
         run_id: str,
@@ -3378,11 +3527,21 @@ class ReveniumClient:
 
         Args:
             run_id: ID of the recommendation run.
-            limit: page size (backend caps at 100).
+            limit: requested page size (the backend may cap it server-side; the handler surfaces possible truncation when a cursorless page comes back full).
             cursor: opaque next-page token from prior response.
 
         Returns:
             {"data": [...], "next_cursor": str | None}
+
+        Notes:
+            The endpoint currently answers with a BARE JSON ARRAY rather than the
+            envelope above, and it answers 200 with ``[]`` for an unknown run_id.
+            The array shape is normalized here — the client owns the wire, so
+            callers get the documented envelope regardless of which shape the
+            backend sends. A dict is passed through untouched so that adopting the
+            envelope backend-side is a no-op here; any other shape raises a
+            structured ``ReveniumAPIError`` naming this caller.
+            A bare array is inherently single-page, hence ``next_cursor=None``.
         """
         params: Dict[str, Any] = {"limit": limit}
         if cursor:
@@ -3394,7 +3553,9 @@ class ReveniumClient:
             use_bearer=True,
             unwrap_hal_embedded=False,
         )
-        return cast(Dict[str, Any], result)
+        return self._as_cursor_envelope(
+            result, context=f"list_recommendation_feedback(run_id={run_id})",
+        )
 
     async def trigger_recommendation_run(
         self,

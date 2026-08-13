@@ -327,16 +327,19 @@ class TestValidateStringFields:
 
 
 # ===========================================================================
-# BACK-1139 — provider enum enforced on the submit write path
+# BACK-1139 — provider allowlist enforced on the submit write path
 # ===========================================================================
 
 
 class TestValidateStringFieldsProviderEnum:
     """Regression for BACK-1139 — submit_ai_transaction previously accepted
     any string as ``provider`` and persisted it (e.g. ``INVALID_PROVIDER_XYZ``).
-    The MCP layer now rejects values outside the documented enum so the
+    The MCP layer now rejects values outside the accepted set so the
     write path matches the analytics-side contract (BACK-1025 concerns the
-    READ path)."""
+    READ path). The accepted set was later widened to the union of a static
+    baseline and the platform's AI-model catalog — see
+    test_metering_provider_catalog.py — but the historically documented names
+    below must keep passing and garbage must keep being rejected."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -362,8 +365,14 @@ class TestValidateStringFieldsProviderEnum:
         errors = await mgr._validate_string_fields(
             {**VALID_TX, "provider": "INVALID_PROVIDER_XYZ"}
         )
-        assert any("Invalid provider" in e for e in errors)
-        assert any("OPENAI" in e for e in errors)
+        rejections = [e for e in errors if "Invalid provider" in e]
+        assert rejections
+        # The rejection is structured: it names the offending value, offers
+        # examples, and steers to the action that lists the live set rather
+        # than hardcoding an enum that drifts from the catalog.
+        assert "INVALID_PROVIDER_XYZ" in rejections[0]
+        assert "openai" in rejections[0]
+        assert "get_supported_providers()" in rejections[0]
 
     @pytest.mark.asyncio
     async def test_typo_provider_rejected(self):

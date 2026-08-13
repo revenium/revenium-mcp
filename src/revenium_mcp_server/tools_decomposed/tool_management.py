@@ -1160,7 +1160,8 @@ class ToolManagement(ToolBase):
 
             elif action == "delete":
                 result = await manager.delete_tool(arguments)
-                return [TextContent(type="text", text=f"Tool deleted:\n{json.dumps(result, indent=2)}")]
+                deleted_tool_id = arguments.get("tool_id", "")
+                return [TextContent(type="text", text=f"Tool {deleted_tool_id} deleted:\n{json.dumps(result, indent=2)}")]
 
             elif action == "restore":
                 result = await manager.restore_tool(arguments)

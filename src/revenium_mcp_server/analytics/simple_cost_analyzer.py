@@ -15,7 +15,7 @@ from .validation import ValidationError
 
 logger = logging.getLogger(__name__)
 
-# Published filter-options dimensions (from the prod OpenAPI doc). Used as a
+# Published filter-options dimensions (from the analytics OpenAPI doc). Used as a
 # client-side allowlist for get_analytics_filter_options: an unknown dimension
 # 404s upstream with a poor (HTML/problem) body, so we reject it before the
 # API call and hand the caller the valid list instead. Canonical form is
@@ -25,10 +25,12 @@ _FILTER_OPTION_DIMENSIONS = frozenset(
         "agents",
         "api-keys",
         "customers",
+        "model-sources",
         "models",
         "organizations",
         "products",
         "providers",
+        "task-types",
         "teams",
         "tool-providers",
         "tools",
