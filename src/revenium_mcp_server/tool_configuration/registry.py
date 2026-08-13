@@ -232,7 +232,10 @@ class ToolConfigurationRegistry:
             invoice_id: Optional[str] = None,
             start_date: Optional[str] = None,
             end_date: Optional[str] = None,
-            query: Optional[str] = None
+            query: Optional[str] = None,
+            # Skill usage reads: list_skills / get_skill
+            skill_id: Optional[str] = None,
+            sort: Optional[str] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
 
             arguments = {
@@ -268,7 +271,10 @@ class ToolConfigurationRegistry:
                 "minimum": minimum,
                 "maximum": maximum,
                 "cursor": cursor,
-                "invoice_id": invoice_id
+                "invoice_id": invoice_id,
+                # Skill usage reads
+                "skill_id": skill_id,
+                "sort": sort
             }
 
             # NUMERIC PREPROCESSING: Convert string numeric parameters to appropriate types
@@ -489,6 +495,7 @@ class ToolConfigurationRegistry:
             since: Optional[str] = None,
             until: Optional[str] = None,
             triggered_by: Optional[str] = None,
+            cursor: Optional[str] = None,
             dismissal_reason: Optional[str] = None,
             confidence_rating: Optional[int] = None,
             realized_savings: Optional[Union[str, float, int]] = None,
@@ -518,6 +525,7 @@ class ToolConfigurationRegistry:
                 "since": since,
                 "until": until,
                 "triggered_by": triggered_by,
+                "cursor": cursor,
                 "dismissal_reason": dismissal_reason,
                 "confidence_rating": confidence_rating,
                 "realized_savings": realized_savings,
@@ -732,7 +740,18 @@ class ToolConfigurationRegistry:
             is_streamed: Optional[Union[bool, str]] = None,
             response_quality_score: Optional[Union[float, str]] = None,
             stop_reason: Optional[str] = None,
-            time_to_first_token: Optional[Union[int, str]] = None
+            time_to_first_token: Optional[Union[int, str]] = None,
+            # Ticket + skill attribution parameters (submission only). These
+            # must be declared here: FastMCP builds the tool schema from this
+            # signature, so handler support beneath an undeclared parameter is
+            # unreachable for every MCP client.
+            ticket_id: Optional[str] = None,
+            skill_name: Optional[str] = None,
+            skill_source: Optional[str] = None,
+            skill_kind: Optional[str] = None,
+            skill_plugin_name: Optional[str] = None,
+            skill_marketplace_name: Optional[str] = None,
+            skill_invocation_trigger: Optional[str] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
             # Map arguments
             arguments = {
@@ -774,7 +793,15 @@ class ToolConfigurationRegistry:
                 "is_streamed": is_streamed,
                 "response_quality_score": response_quality_score,
                 "stop_reason": stop_reason,
-                "time_to_first_token": time_to_first_token
+                "time_to_first_token": time_to_first_token,
+                # Ticket + skill attribution parameters
+                "ticket_id": ticket_id,
+                "skill_name": skill_name,
+                "skill_source": skill_source,
+                "skill_kind": skill_kind,
+                "skill_plugin_name": skill_plugin_name,
+                "skill_marketplace_name": skill_marketplace_name,
+                "skill_invocation_trigger": skill_invocation_trigger
             }
 
             # NUMERIC PREPROCESSING: Convert string numeric parameters to appropriate types
@@ -1115,8 +1142,11 @@ class ToolConfigurationRegistry:
             product_id: Optional[str] = None,
             resource_data: Optional[Union[dict, str]] = None,
             product_data: Optional[Union[dict, str]] = None,
+            name: Optional[str] = None,
+            description: Optional[str] = None,
             page: Union[int, str] = 0,
             size: Union[int, str] = 20,
+            query: Optional[str] = None,
             filters: Optional[dict] = None,
             auto_generate: Union[bool, str] = True,
             dry_run: Optional[Union[bool, str]] = None,
@@ -1128,8 +1158,13 @@ class ToolConfigurationRegistry:
                 "product_id": product_id,
                 "resource_data": resource_data,
                 "product_data": product_data,
+                "name": name,
+                "description": description,
                 "page": page,
                 "size": size,
+                # Server-side free-text search on list; filters is the narrow
+                # client-side surface (name only) resolved by the handler.
+                "query": query,
                 "filters": filters or {},
                 "auto_generate": auto_generate,
                 "dry_run": dry_run,
@@ -1235,6 +1270,9 @@ class ToolConfigurationRegistry:
             user_id: Optional[str] = None,
             subscriber_id: Optional[str] = None,
             team_id: Optional[str] = None,
+            # Team internal-marketplace settings actions
+            marketplace_names: Optional[Union[List[str], str]] = None,
+            operation: Optional[str] = None,
             page: Union[int, str] = 0,
             size: Union[int, str] = 20,
             filters: Optional[dict] = None,
@@ -1252,6 +1290,8 @@ class ToolConfigurationRegistry:
                 "user_id": user_id,
                 "subscriber_id": subscriber_id,
                 "team_id": team_id,
+                "marketplace_names": marketplace_names,
+                "operation": operation,
                 "page": page,
                 "size": size,
                 "filters": filters or {},
@@ -1331,6 +1371,10 @@ class ToolConfigurationRegistry:
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
             boolean_params = ["auto_generate", "dry_run"]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
+
+            # ARRAY PREPROCESSING: Convert string array parameters to actual Python lists.
+            # A non-array string is left as-is so the tool raises its own structured error.
+            arguments = preprocess_array_parameters(arguments, ["marketplace_names"])
 
             # Remove None values
             arguments = {k: v for k, v in arguments.items() if v is not None}

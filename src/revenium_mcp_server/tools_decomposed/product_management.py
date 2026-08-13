@@ -11,7 +11,7 @@ the dual-layer delegation pattern.
 import json
 import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, NoReturn, Optional, Tuple, Union, cast
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -53,6 +53,104 @@ _MAX_PRODUCTS_PAGE = 1_000_000
 
 # Upper bound on the size parameter (matches PaginationPerformanceManager.MAXIMUM_LIMIT).
 _MAX_PRODUCTS_SIZE = 100
+
+# The only key the list action's `filters` dict understands. The products endpoint
+# ignores query params it does not recognise, so anything forwarded blindly came
+# back as the unfiltered catalogue while looking like a successful filter. Unknown
+# keys are therefore rejected rather than passed upstream. Free-text search is the
+# top-level `query` parameter, which the endpoint does honour server-side.
+SUPPORTED_PRODUCT_FILTER_KEYS = ("name",)
+
+# How many pages of the server-side search an exact-name lookup will drain before
+# giving up. The server search is a loose match, so the exact name can sit on any
+# of its pages; scanning only the caller's page reports "no match" for a product
+# that exists. The bound keeps a pathological search (a term matching the whole
+# catalogue) from turning one list call into unbounded paging — when it is hit
+# with pages still outstanding, the result is flagged rather than presented as
+# complete.
+_NAME_FILTER_SCAN_MAX_PAGES = 10
+
+_PRODUCT_SEARCH_EXAMPLES = {
+    "server_side_search": "list(query='API')",
+    "exact_name_match": "list(filters={'name': 'My Product'})",
+    "supported_filter_keys": list(SUPPORTED_PRODUCT_FILTER_KEYS),
+}
+
+
+def _resolve_product_search_terms(arguments: Dict[str, Any]) -> tuple:
+    """Validate the list search surface and resolve it to concrete terms.
+
+    Returns ``(server_query, exact_name)``:
+
+    * ``server_query`` goes upstream as the endpoint's ``query`` param — a
+      server-side search that narrows the candidate set across every page.
+    * ``exact_name`` (from ``filters['name']``) additionally pins an exact,
+      case-sensitive name match, because the server-side search is a looser
+      substring-style match. It is resolved against every page of that search
+      rather than a single one -- see ``_list_exact_name_matches``.
+
+    Any other filter key raises instead of being forwarded: a filter the API
+    silently drops is worse than no filter at all.
+    """
+    filters = arguments.get("filters") or {}
+    if not isinstance(filters, dict):
+        raise create_structured_validation_error(
+            message=f"filters must be an object (got {type(filters).__name__})",
+            field="filters",
+            value=filters,
+            suggestions=[
+                "Pass filters as an object, e.g. filters={'name': 'My Product'}",
+                "Use the top-level query parameter for free-text search",
+            ],
+            examples=_PRODUCT_SEARCH_EXAMPLES,
+        )
+
+    unsupported = sorted(str(key) for key in filters if key not in SUPPORTED_PRODUCT_FILTER_KEYS)
+    if unsupported:
+        raise create_structured_validation_error(
+            message=(
+                f"Unsupported filter key(s): {', '.join(unsupported)}. "
+                f"Supported filter keys: {', '.join(SUPPORTED_PRODUCT_FILTER_KEYS)}. "
+                "Use the top-level query parameter for free-text search."
+            ),
+            field="filters",
+            value=filters,
+            suggestions=[
+                "filters supports 'name' only, matched exactly and case-sensitively",
+                "Use the top-level query parameter for free-text search, e.g. query='API'",
+                "Use get(product_id=...) when the product id is already known",
+            ],
+            examples=_PRODUCT_SEARCH_EXAMPLES,
+        )
+
+    exact_name = filters.get("name")
+    if exact_name is not None and not isinstance(exact_name, str):
+        raise create_structured_validation_error(
+            message=f"filters.name must be a string (got {type(exact_name).__name__})",
+            field="filters.name",
+            value=exact_name,
+            suggestions=["Pass the product name as a string, e.g. filters={'name': 'My Product'}"],
+            examples=_PRODUCT_SEARCH_EXAMPLES,
+        )
+
+    query = arguments.get("query")
+    if query is not None and exact_name is not None and query != exact_name:
+        raise create_structured_validation_error(
+            message=(
+                f"Conflicting search terms: query={query!r} and "
+                f"filters.name={exact_name!r} request different products"
+            ),
+            field="query",
+            value=query,
+            suggestions=[
+                "Use query alone for a server-side search across product names",
+                "Use filters={'name': ...} alone for an exact, case-sensitive match",
+                "Pass the same value in both only if the redundancy is intentional",
+            ],
+            examples=_PRODUCT_SEARCH_EXAMPLES,
+        )
+
+    return (query if query is not None else exact_name), exact_name
 
 
 def _validate_products_pagination(page: Any, size: Any) -> None:
@@ -131,6 +229,45 @@ def _validate_products_pagination(page: Any, size: Any) -> None:
         )
 
 
+_ID_SCAN_PAGE_SIZE = 20
+_ID_SCAN_MAX_PAGES = 5
+
+
+async def _first_id_bearing_entry_id(
+    fetch_page: Callable[..., Awaitable[Any]],
+    extract: Callable[[Any], List[Dict[str, Any]]],
+) -> Tuple[Optional[str], bool]:
+    """Return (entry_id, scan_truncated) from a bounded id-bearing page scan.
+
+    Upstream relaxed ``id`` to optional, so a page may legally contain
+    id-less entries. A full page of them does not prove the listing is
+    exhausted — the scan continues to the next page, bounded so a default
+    lookup never walks an entire tenant. A partial page ends the scan.
+    scan_truncated is True only when the scan gave up at the page budget
+    with every seen entry id-less — absence was NOT proven, and callers
+    must not report it as "no entries exist".
+    """
+    for page in range(_ID_SCAN_MAX_PAGES):
+        response = await fetch_page(page=page, size=_ID_SCAN_PAGE_SIZE)
+        entries = extract(response)
+        if not entries and isinstance(response, dict):
+            # These listings also ship as a top-level "data" list (the shape
+            # the metering-elements consumer supports); the HAL extractor
+            # maps that to [], which must not read as proven absence.
+            data_list = response.get("data")
+            if isinstance(data_list, list):
+                entries = data_list
+        if not entries:
+            return None, False
+        for entry in entries:
+            entry_id = entry.get("id")
+            if entry_id:
+                return str(entry_id), False
+        if len(entries) < _ID_SCAN_PAGE_SIZE:
+            return None, False
+    return None, True
+
+
 class ProductManager:
     """Internal manager for product CRUD operations."""
 
@@ -144,10 +281,9 @@ class ProductManager:
         self.update_config_factory = UpdateConfigFactory(self.client)
 
     async def list_products(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """List products with pagination and performance monitoring."""
+        """List products with pagination, server-side search, and exact name filtering."""
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = arguments.get("filters", {})
 
         # Validate type/sign/upper-bound first so wrong-type values surface as a
         # structured ToolError instead of crashing inside the perf-tier helper.
@@ -156,9 +292,21 @@ class ProductManager:
         # Validate pagination with performance guidance
         validate_pagination_with_performance(page, size, "Product Management")
 
-        response = await self.client.get_products(page=page, size=size, **filters)
+        server_query, exact_name = _resolve_product_search_terms(arguments)
+
+        search_params: Dict[str, Any] = {}
+        if server_query is not None:
+            search_params["query"] = server_query
+
+        if exact_name is not None:
+            return await self._list_exact_name_matches(exact_name, page, size, search_params)
+
+        response = await self.client.get_products(page=page, size=size, **search_params)
         products = self.client._extract_embedded_data(response)
         page_info = self.client._extract_pagination_info(response)
+
+        total_pages = page_info.get("totalPages", 1)
+        total_items = page_info.get("totalElements", len(products))
 
         return {
             "action": "list",
@@ -166,13 +314,81 @@ class ProductManager:
             "pagination": {
                 "page": page,
                 "size": size,
-                "total_pages": page_info.get("totalPages", 1),
-                "total_items": page_info.get("totalElements", len(products)),
-                "has_next": page < page_info.get("totalPages", 1) - 1,
+                "total_pages": total_pages,
+                "total_items": total_items,
+                "has_next": page < total_pages - 1,
                 "has_previous": page > 0,
+                "possibly_incomplete": False,
             },
             "metadata": {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+
+    async def _list_exact_name_matches(
+        self, exact_name: str, page: int, size: int, search_params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Resolve filters.name against the whole server-side search, not one page.
+
+        `filters.name` expresses an exact-lookup intent, so the exact-match set --
+        not any page of the loose server search -- is the logical result. The scan
+        therefore always starts at the search's first page and drains it, and the
+        caller's `page` indexes the match set rather than a server page: borrowing
+        the loose search's `total_pages` / `has_next` would advertise pages made
+        entirely of non-matches. An exact match set almost always fits in one page,
+        which renders as page 0 of 1 with `has_next` false; a `page` past the end of
+        the set is clamped rather than stranding the lookup on an empty render.
+        """
+        matches: List[Dict[str, Any]] = []
+        scanned_pages = 0
+        server_total_pages = 1
+        bound_reached = True
+
+        for page_index in range(_NAME_FILTER_SCAN_MAX_PAGES):
+            response = await self.client.get_products(
+                page=page_index, size=size, **search_params
+            )
+            page_products = self.client._extract_embedded_data(response)
+            page_info = self.client._extract_pagination_info(response)
+            server_total_pages = page_info.get("totalPages", 1)
+            scanned_pages = page_index + 1
+
+            matches.extend(
+                product
+                for product in page_products
+                if isinstance(product, dict) and product.get("name") == exact_name
+            )
+
+            # An empty page means the search is spent regardless of the total the
+            # server advertises.
+            if not page_products or scanned_pages >= server_total_pages:
+                bound_reached = False
+                break
+
+        possibly_incomplete = bound_reached and scanned_pages < server_total_pages
+
+        total_items = len(matches)
+        total_pages = max(1, -(-total_items // size))
+        # Clamp rather than strand: `page` is usually a leftover from a browse
+        # loop, and an exact lookup that found its product must still show it.
+        effective_page = min(page, total_pages - 1)
+        rendered = matches[effective_page * size : (effective_page + 1) * size]
+
+        return {
+            "action": "list",
+            "data": rendered,
+            "pagination": {
+                "page": effective_page,
+                "size": size,
+                "total_pages": total_pages,
+                "total_items": total_items,
+                "has_next": effective_page + 1 < total_pages,
+                "has_previous": effective_page > 0,
+                "possibly_incomplete": possibly_incomplete,
+            },
+            "metadata": {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "scanned_pages": scanned_pages,
             },
         }
 
@@ -373,13 +589,19 @@ class ProductManager:
         # This is required for subscription creation to work - products without sources cause "List is empty" errors
         if "sourceIds" not in product_data or not product_data["sourceIds"]:
             try:
-                sources_response = await self.client.get_sources(page=0, size=1)
-                sources = self.client._extract_embedded_data(sources_response)
-                if sources:
-                    default_source_id = sources[0]["id"]
+                default_source_id, source_scan_truncated = await _first_id_bearing_entry_id(
+                    self.client.get_sources, self.client._extract_embedded_data
+                )
+                if default_source_id:
                     product_data["sourceIds"] = [default_source_id]
                     logger.info(
                         f"Assigned default source {default_source_id} to make product subscription-ready"
+                    )
+                elif source_scan_truncated:
+                    logger.warning(
+                        "No id-bearing source in the first "
+                        f"{_ID_SCAN_PAGE_SIZE * _ID_SCAN_MAX_PAGES} entries scanned; "
+                        "more sources exist - pass sourceIds explicitly"
                     )
                 else:
                     logger.warning("No sources available - product may not be subscription-ready")
@@ -932,12 +1154,18 @@ class ProductEnhancementProcessor:
 
         # CRITICAL FIX: Assign default source to make product subscription-ready
         try:
-            sources_response = await self.client.get_sources(page=0, size=1)
-            sources = self.client._extract_embedded_data(sources_response)
-            if sources:
-                default_source_id = sources[0]["id"]
+            default_source_id, source_scan_truncated = await _first_id_bearing_entry_id(
+                self.client.get_sources, self.client._extract_embedded_data
+            )
+            if default_source_id:
                 product_config["sourceIds"] = [default_source_id]
                 logger.info(f"Assigned default source {default_source_id} to product")
+            elif source_scan_truncated:
+                logger.warning(
+                    "No id-bearing source in the first "
+                    f"{_ID_SCAN_PAGE_SIZE * _ID_SCAN_MAX_PAGES} entries scanned; "
+                    "more sources exist - pass sourceIds explicitly"
+                )
             else:
                 logger.warning("No sources available - product may not be subscription-ready")
         except Exception as e:
@@ -1137,13 +1365,19 @@ class ProductEnhancementProcessor:
 
         # CRITICAL FIX: Assign default source to make product subscription-ready
         try:
-            sources_response = await self.client.get_sources(page=0, size=1)
-            sources = self.client._extract_embedded_data(sources_response)
-            if sources:
-                default_source_id = sources[0]["id"]
+            default_source_id, source_scan_truncated = await _first_id_bearing_entry_id(
+                self.client.get_sources, self.client._extract_embedded_data
+            )
+            if default_source_id:
                 product_data["sourceIds"] = [default_source_id]
                 logger.info(
                     f"Assigned default source {default_source_id} to product from create_from_description"
+                )
+            elif source_scan_truncated:
+                logger.warning(
+                    "No id-bearing source in the first "
+                    f"{_ID_SCAN_PAGE_SIZE * _ID_SCAN_MAX_PAGES} entries scanned; "
+                    "more sources exist - pass sourceIds explicitly"
                 )
             else:
                 logger.warning("No sources available - product may not be subscription-ready")
@@ -1907,11 +2141,26 @@ class ProductHierarchyManager:
 
         # Get available sources dynamically (account-specific)
         try:
-            sources_response = await self.client.get_sources(page=0, size=1)
-            sources = self.client._extract_embedded_data(sources_response)
-            if sources:
-                default_source_id = sources[0]["id"]
+            default_source_id, source_scan_truncated = await _first_id_bearing_entry_id(
+                self.client.get_sources, self.client._extract_embedded_data
+            )
+            if default_source_id:
                 logger.info(f"Found default source: {default_source_id}")
+            elif source_scan_truncated:
+                raise ToolError(
+                    message=(
+                        "No id-bearing source in the first "
+                        f"{_ID_SCAN_PAGE_SIZE * _ID_SCAN_MAX_PAGES} entries scanned"
+                        " - more sources exist beyond the scan budget"
+                    ),
+                    error_code=ErrorCodes.API_ERROR,
+                    field="sources",
+                    value="scan_truncated",
+                    suggestions=[
+                        "Pass sourceIds explicitly in product_data",
+                        "Narrow the account's sources so an id-bearing one appears earlier",
+                    ],
+                )
             else:
                 raise ToolError(
                     message="No sources available for subscription-ready product creation",
@@ -1924,6 +2173,8 @@ class ProductHierarchyManager:
                         "Contact support if sources should be available",
                     ],
                 )
+        except ToolError:
+            raise
         except Exception as e:
             logger.error(f"Failed to get sources: {e}")
             raise ToolError(
@@ -1950,17 +2201,24 @@ class ProductHierarchyManager:
         ):
             # Get available metering elements dynamically
             try:
-                elements_response = await self.client.get_metering_element_definitions(page=0, size=1)
-                elements = self.client._extract_embedded_data(elements_response)
-                if elements:
-                    default_element_id = elements[0]["id"]
+                default_element_id, element_scan_truncated = await _first_id_bearing_entry_id(
+                    self.client.get_metering_element_definitions,
+                    self.client._extract_embedded_data,
+                )
+                if default_element_id:
                     logger.info(f"Found default metering element: {default_element_id}")
                 else:
                     # Fallback to known totalCost element if available
                     default_element_id = "jM73gVB"
-                    logger.warning(
-                        "Using fallback metering element ID - may not work in all accounts"
-                    )
+                    if element_scan_truncated:
+                        logger.warning(
+                            "No id-bearing metering element in the scanned pages "
+                            "(more exist); using the fallback element ID"
+                        )
+                    else:
+                        logger.warning(
+                            "Using fallback metering element ID - may not work in all accounts"
+                        )
             except Exception:
                 # Fallback to known totalCost element
                 default_element_id = "jM73gVB"
@@ -2173,13 +2431,30 @@ class ProductManagement(ToolBase):
         """Handle standard CRUD actions: list, get, create, update, delete."""
         if action == "list":
             result = await product_manager.list_products(arguments)
+            pagination = result["pagination"]
+            notes = None
+            if pagination.get("possibly_incomplete"):
+                # Zero matches after a truncated scan must not read as a
+                # confident "no such product" — say what was actually searched.
+                notes = [
+                    f"Scanned the first {result['metadata']['scanned_pages']} pages of the "
+                    f"server-side search for this name; the search reports more pages, so "
+                    f"more may exist beyond what was scanned. Continue the search with "
+                    f"query=<name> and page={result['metadata']['scanned_pages']} onward to "
+                    f"walk the remaining server pages directly, narrow the name, or use "
+                    f"get(product_id=...) if the id is known."
+                ]
             return self.formatter.format_list_response(
                 items=result["data"],
                 action="list",
-                page=result["pagination"]["page"],
-                size=result["pagination"]["size"],
-                total_pages=result["pagination"]["total_pages"],
-                total_items=result["pagination"]["total_items"],
+                page=pagination["page"],
+                size=pagination["size"],
+                total_pages=pagination["total_pages"],
+                total_items=pagination["total_items"],
+                pagination_extra={
+                    "possibly_incomplete": pagination.get("possibly_incomplete", False)
+                },
+                notes=notes,
             )
 
         elif action == "get":
@@ -2571,20 +2846,39 @@ class ProductManagement(ToolBase):
         # Return error for unhandled hierarchy actions
         return [TextContent(type="text", text=json.dumps({"error": "No hierarchy action specified"}, indent=2))]
 
+    @staticmethod
+    def _raise_missing_creation_id(
+        product_id: Optional[str], subscription_id: Optional[str]
+    ) -> NoReturn:
+        """Fail loudly when a create response omits an id needed downstream."""
+        raise ToolError(
+            message="Product and subscription were created but the response carried no id",
+            error_code=ErrorCodes.API_ERROR,
+            field="id",
+            value={"product_id": product_id, "subscription_id": subscription_id},
+            suggestions=[
+                "Verify the product with manage_products(action='list')",
+                "Verify the subscription with manage_subscriptions(action='list')",
+            ],
+        )
+
     async def _format_create_with_subscription_response(
         self, result: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Format create_with_subscription response."""
         product = result["result"]["product"]
         subscription = result["result"]["subscription"]
-        product_id = product["id"]
-        subscription_id = subscription["id"]
+        product_id = product.get("id")
+        subscription_id = subscription.get("id")
+        if not product_id or not subscription_id:
+            self._raise_missing_creation_id(product_id, subscription_id)
 
         # Analyze what was automatically configured
         auto_configured = []
         if "sources" in product and product["sources"]:
-            source_id = product["sources"][0]["id"]
-            auto_configured.append(f"Source assignment: {source_id} (dynamically resolved)")
+            source_id = product["sources"][0].get("id")
+            if source_id:
+                auto_configured.append(f"Source assignment: {source_id} (dynamically resolved)")
 
         if (
             "plan" in product
@@ -2993,14 +3287,17 @@ class ProductManagement(ToolBase):
                 # Extract key information for enhanced output
                 product = result["result"]["product"]
                 subscription = result["result"]["subscription"]
-                product_id = product["id"]
-                subscription_id = subscription["id"]
+                product_id = product.get("id")
+                subscription_id = subscription.get("id")
+                if not product_id or not subscription_id:
+                    self._raise_missing_creation_id(product_id, subscription_id)
 
                 # Analyze what was automatically configured
                 auto_configured = []
                 if "sources" in product and product["sources"]:
-                    source_id = product["sources"][0]["id"]
-                    auto_configured.append(f"Source assignment: {source_id} (dynamically resolved)")
+                    source_id = product["sources"][0].get("id")
+                    if source_id:
+                        auto_configured.append(f"Source assignment: {source_id} (dynamically resolved)")
 
                 if (
                     "plan" in product
@@ -3171,9 +3468,18 @@ class ProductManagement(ToolBase):
 ### **Discover Products**
 ```bash
 list()                                          # View all products
+list(query="API")                              # Server-side search across products
+list(filters={"name": "My Product"})           # Exact, case-sensitive name match
 get(product_id="prod_123")                     # Get specific product details
 get_examples()                                 # See working templates
 ```
+
+**Search contract for `list`**
+- `query` is a server-side search: the API narrows the result set before paging, so matches on later pages are still found.
+- `filters` supports one key, `name`. It sends the same server-side search AND keeps only products whose name matches exactly (case-sensitive).
+- `filters.name` is an exact lookup, not a page filter: it scans the search's pages from the first one and returns every exact match, so the reported totals describe the match set rather than the loose search (normally a single page). Very large searches stop at a bounded number of pages and say so (`possibly_incomplete`).
+- Passing both `query` and `filters.name` with different values is rejected as ambiguous; identical values are accepted.
+- Any other `filters` key is rejected. The products endpoint ignores query params it does not recognise, so an unsupported filter would silently return the full catalogue.
 
 ### **Create Products - Unified Progressive Complexity**
 ```bash
@@ -3192,7 +3498,7 @@ create(resource_data={"name": "Custom"}, description="Enterprise features")
 get_capabilities()                            # Understand requirements
 validate(product_data={...}, dry_run=True)    # Test before creating
 create_simple(name="My AI Product")           # Quick creation example
-create_simple(name="Usage-based Product", pricing_model="usage_based", per_unit_price=0.01)  # Usage-based
+create_simple(name="My AI Product", description="Premium API access")  # With description
 ```
 
 ### **Usage-Based Billing Workflow**
@@ -3697,7 +4003,7 @@ Comprehensive product lifecycle management for the Revenium platform. Handle cre
 1. Start with get_capabilities() to understand product types and requirements
 2. Use get_examples() to see working product templates
 3. Validate configurations with validate(product_data={...}, dry_run=True)
-4. Create products with create(product_data={...}) or create_simple(name='...', type='...')
+4. Create products with create(product_data={...}) or create_simple(name='...', description='...')
 5. Monitor and manage with list(), get(), update(), and delete() actions
 
 **Common Use Cases:**
@@ -3724,7 +4030,7 @@ Comprehensive product lifecycle management for the Revenium platform. Handle cre
                 name="Product CRUD Operations",
                 description="Complete lifecycle management for products",
                 parameters={
-                    "list": {"page": "int", "size": "int", "filters": "dict"},
+                    "list": {"page": "int", "size": "int", "query": "str", "filters": "dict"},
                     "get": {"product_id": "str"},
                     "create": {"product_data": "dict"},
                     "update": {"product_id": "str", "product_data": "dict"},
@@ -3732,6 +4038,8 @@ Comprehensive product lifecycle management for the Revenium platform. Handle cre
                 },
                 examples=[
                     "list(page=0, size=10)",
+                    "list(query='API')  # server-side search across products",
+                    "list(filters={'name': 'My Product'})  # exact, case-sensitive name match",
                     "get(product_id='prod_123')",
                     "create(product_data={'name': 'My Product', 'plan': {'type': 'SUBSCRIPTION', 'currency': 'USD'}})",
                     "VALID plan.type: SUBSCRIPTION (CHARGE is deprecated)",
@@ -3770,21 +4078,15 @@ Comprehensive product lifecycle management for the Revenium platform. Handle cre
                     },
                     "create_simple": {
                         "name": "str (required)",
-                        "type": "str (optional)",
                         "description": "str (optional)",
-                        "pricing_model": "str (optional: 'subscription' or 'usage_based')",
-                        "per_unit_price": "number (optional: for usage_based pricing)",
-                        "monthly_price": "number (optional: for subscription pricing)",
-                        "setup_fee": "number (optional: one-time setup fee)",
                     },
                 },
                 examples=[
                     "create(resource_data={'name': 'API', 'plan': {...}})",
                     "create(description='Premium API access plan with 10000 requests per month for $99')",
                     "create(resource_data={'name': 'Custom'}, description='Enterprise features')",
-                    "create_simple(name='My API', type='api')",
-                    "create_simple(name='Usage API', pricing_model='usage_based', per_unit_price=0.01)",
-                    "create_simple(name='Monthly Service', pricing_model='subscription', monthly_price=29.99)",
+                    "create_simple(name='My API')",
+                    "create_simple(name='My API', description='Premium API access')",
                 ],
             ),
         ]
@@ -3821,6 +4123,28 @@ Comprehensive product lifecycle management for the Revenium platform. Handle cre
                 "name": {
                     "type": "string",
                     "description": "Product name - the only field users need to provide",
+                },
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Free-text search for action='list'. Runs server-side, so "
+                        "matches on later pages are found too."
+                    ),
+                },
+                "filters": {
+                    "type": "object",
+                    "description": (
+                        "Filters for action='list'. Supports one key, 'name', which "
+                        "matches exactly and case-sensitively across the whole "
+                        "server-side search. Any other key is rejected."
+                    ),
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Exact, case-sensitive product name to match",
+                        },
+                    },
+                    "additionalProperties": False,
                 },
                 # Note: description, version auto-generated
                 # Note: ownerId, teamId system-managed
@@ -3916,7 +4240,7 @@ Comprehensive product lifecycle management for the Revenium platform. Handle cre
             "Start with get_capabilities() to understand product types and requirements",
             "Use get_examples() to see working product templates",
             "Validate configurations with validate(product_data={...}, dry_run=True)",
-            "Create products with create(product_data={...}) or create_simple(name='...', type='...')",
+            "Create products with create(product_data={...}) or create_simple(name='...', description='...')",
             "Monitor and manage with list(), get(), update(), and delete() actions",
         ]
 

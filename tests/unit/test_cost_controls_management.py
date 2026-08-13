@@ -6,6 +6,8 @@ the enforcement-visibility actions (list_enforcement_events,
 get_enforcement_rules), and the introspection actions.
 """
 
+import json
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -59,6 +61,37 @@ def _valid_control_data():
         "hardLimit": 1000,
         "windowType": "CALENDAR_MONTH",
         "action": "BLOCK",
+    }
+
+
+def _grouped_compiled_rule():
+    """A compiled rule as the API returns it for a subscriber-grouped control."""
+    return {
+        "ruleId": 42,
+        "teamId": 7,
+        "name": "Per-subscriber monthly cap",
+        "metricType": "TOTAL_COST",
+        "threshold": 100.0,
+        "currentValue": 130.0,
+        "percentUsed": 1.3,
+        "breached": True,
+        "groupBy": "SUBSCRIBER",
+        "groupBreakdown": [
+            {
+                "groupValue": "sub_1",
+                "displayName": "sub_1",
+                "currentValue": 120.5,
+                "usagePercent": 1.205,
+                "breached": True,
+            },
+            {
+                "groupValue": "unattributed",
+                "displayName": "Unattributed",
+                "currentValue": 9.5,
+                "usagePercent": 0.095,
+                "breached": False,
+            },
+        ],
     }
 
 
@@ -317,6 +350,36 @@ class TestCostControlsManagerEnforcementRules:
         assert result["rules"][0]["id"] == "cc_1"
         assert result["compiledAt"] == "2026-01-01T00:00:00Z"
 
+    @pytest.mark.asyncio
+    async def test_rules_pass_group_breakdown_through_untouched(self, cc_manager, mock_client):
+        """Per-group balances on a subscriber-grouped rule survive verbatim.
+
+        Guards against a future formatter or field allowlist silently dropping
+        the array or reshaping its entries."""
+        expected = _grouped_compiled_rule()["groupBreakdown"]
+        mock_client.get_enforcement_rules.return_value = {
+            "rules": [_grouped_compiled_rule()],
+            "compiledAt": "2026-08-11T00:00:00Z",
+        }
+
+        result = await cc_manager.get_enforcement_rules({})
+
+        assert result["rules"][0]["groupBreakdown"] == expected
+
+    @pytest.mark.asyncio
+    async def test_rules_keep_null_group_breakdown_for_pooled_rules(self, cc_manager, mock_client):
+        """A null groupBreakdown means the rule is pooled, which is semantically
+        different from a grouped rule with zero groups, so it is never
+        normalised into an empty list."""
+        mock_client.get_enforcement_rules.return_value = {
+            "rules": [{"ruleId": 7, "groupBy": None, "groupBreakdown": None}],
+            "compiledAt": "2026-08-11T00:00:00Z",
+        }
+
+        result = await cc_manager.get_enforcement_rules({})
+
+        assert result["rules"][0]["groupBreakdown"] is None
+
 
 # ===========================================================================
 # CostControlsManagement (top-level tool) Tests
@@ -372,6 +435,52 @@ class TestCostControlsManagementMetadata:
         ):
             assert action in documented
 
+    @pytest.mark.asyncio
+    async def test_capabilities_document_group_breakdown(self, cc_mgmt):
+        """The per-group balances are additive and read-only, so the capability
+        description is the only thing that tells an agent they exist."""
+        caps = await cc_mgmt._get_tool_capabilities()
+        enforcement = next(c for c in caps if "get_enforcement_rules" in c.parameters)
+
+        assert "groupBreakdown" in enforcement.description
+        for entry_field in (
+            "groupValue",
+            "displayName",
+            "currentValue",
+            "usagePercent",
+            "breached",
+        ):
+            assert entry_field in enforcement.description
+        assert "pooled" in enforcement.description
+
+    @pytest.mark.asyncio
+    async def test_group_breakdown_stays_out_of_the_input_parameters(self, cc_mgmt):
+        """parameters is an input map everywhere else in this tool, so a response
+        field listed there would read to an agent as an argument to send."""
+        caps = await cc_mgmt._get_tool_capabilities()
+        enforcement = next(c for c in caps if "get_enforcement_rules" in c.parameters)
+
+        assert enforcement.parameters["get_enforcement_rules"] == {}
+        assert "groupBreakdown" not in json.dumps(enforcement.parameters)
+
+    @pytest.mark.asyncio
+    async def test_group_breakdown_entry_fields_spelled_once(self, cc_mgmt):
+        """One authoritative spelling of the entry shape: duplicates in the
+        examples or limitations are what drift from the API contract."""
+        caps = await cc_mgmt._get_tool_capabilities()
+        enforcement = next(c for c in caps if "get_enforcement_rules" in c.parameters)
+        rendered = json.dumps(
+            {
+                "description": enforcement.description,
+                "parameters": enforcement.parameters,
+                "examples": enforcement.examples,
+                "limitations": enforcement.limitations,
+            }
+        )
+
+        assert rendered.count("usagePercent") == 1
+        assert rendered.count("groupValue") == 1
+
 
 class TestCostControlsManagementActions:
     """handle_action dispatch."""
@@ -412,6 +521,23 @@ class TestCostControlsManagementActions:
         result = await cc_mgmt.handle_action("get_enforcement_rules", {})
 
         assert isinstance(result[0], TextContent)
+
+    @pytest.mark.asyncio
+    async def test_get_enforcement_rules_action_preserves_group_breakdown(
+        self, cc_mgmt, mock_client
+    ):
+        """The rendered action result carries the per-group balances unmodified."""
+        expected = _grouped_compiled_rule()["groupBreakdown"]
+        mock_client.get_enforcement_rules.return_value = {
+            "rules": [_grouped_compiled_rule()],
+            "compiledAt": "2026-08-11T00:00:00Z",
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_rules", {})
+
+        payload = json.loads(result[0].text.split("\n\n", 1)[1])
+        assert payload["rules"][0]["groupBreakdown"] == expected
 
     @pytest.mark.asyncio
     async def test_tool_error_propagates(self, cc_mgmt, mock_client):

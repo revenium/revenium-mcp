@@ -9,6 +9,10 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.tools_decomposed.customer_management import (
+    MARKETPLACE_CONCURRENCY_NOTE,
+    MARKETPLACE_DIVERGENCE_NOTE,
+    MARKETPLACE_RECLASSIFICATION_NOTE,
+    MARKETPLACE_SETTINGS_EXAMPLE,
     BaseManager,
     CustomerAnalytics,
     CustomerManagement,
@@ -19,7 +23,7 @@ from src.revenium_mcp_server.tools_decomposed.customer_management import (
     UserManager,
 )
 from src.revenium_mcp_server.client import ReveniumAPIError
-from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from src.revenium_mcp_server.common.update_configs import UpdateConfigs
 from mcp.types import TextContent
 
@@ -69,6 +73,12 @@ def mock_client():
     client.create_team = AsyncMock()
     client.update_team = AsyncMock()
     client.delete_team = AsyncMock()
+    client.get_team_marketplace_settings = AsyncMock(
+        return_value={"internalMarketplaceNames": []}
+    )
+    client.update_team_marketplace_settings = AsyncMock(
+        return_value={"internalMarketplaceNames": []}
+    )
 
     # Helpers
     client._extract_embedded_data = MagicMock(return_value=[])
@@ -1005,6 +1015,443 @@ class TestTeamManagerDelete:
         mock_client.delete_team.assert_called_once_with("t_del")
 
 
+class TestTeamMarketplaceSettingsRead:
+    """TeamManager.get_marketplace_settings."""
+
+    @pytest.mark.asyncio
+    async def test_missing_team_id_raises_without_api_call(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_marketplace_settings({})
+        assert exc.value.field == "team_id"
+        mock_client.get_team_marketplace_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_current_names(self, team_manager, mock_client):
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["acme-internal", "revenium-tools"]
+        }
+        result = await team_manager.get_marketplace_settings({"team_id": "jR2kmLs"})
+        assert result["team_id"] == "jR2kmLs"
+        assert result["internalMarketplaceNames"] == ["acme-internal", "revenium-tools"]
+        assert result["total_found"] == 2
+        mock_client.get_team_marketplace_settings.assert_called_once_with("jR2kmLs")
+
+    @pytest.mark.asyncio
+    async def test_missing_field_normalizes_to_empty_list(self, team_manager, mock_client):
+        """The read schema marks the array required, but an unconfigured team can omit it."""
+        mock_client.get_team_marketplace_settings.return_value = {}
+        result = await team_manager.get_marketplace_settings({"team_id": "jR2kmLs"})
+        assert result["internalMarketplaceNames"] == []
+        assert result["total_found"] == 0
+
+    @pytest.mark.asyncio
+    async def test_403_maps_to_authorization_error(self, team_manager, mock_client):
+        mock_client.get_team_marketplace_settings.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_marketplace_settings({"team_id": "jR2kmLs"})
+        assert exc.value.error_code == ErrorCodes.API_AUTHORIZATION
+
+    @pytest.mark.asyncio
+    async def test_404_maps_to_not_found(self, team_manager, mock_client):
+        mock_client.get_team_marketplace_settings.side_effect = ReveniumAPIError(
+            "Not found", status_code=404
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_marketplace_settings({"team_id": "bad"})
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_409_maps_to_conflict_error(self, team_manager, mock_client):
+        """The only concurrency signal the endpoint documents must stay actionable."""
+        mock_client.get_team_marketplace_settings.side_effect = ReveniumAPIError(
+            "Conflict", status_code=409
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_marketplace_settings({"team_id": "jR2kmLs"})
+        assert exc.value.error_code == ErrorCodes.RESOURCE_CONFLICT
+        assert "changed concurrently" in exc.value.message
+        assert "get_marketplace_settings(team_id='jR2kmLs')" in exc.value.suggestions[0]
+
+    @pytest.mark.asyncio
+    async def test_500_reraises(self, team_manager, mock_client):
+        mock_client.get_team_marketplace_settings.side_effect = ReveniumAPIError(
+            "Boom", status_code=500
+        )
+        with pytest.raises(ReveniumAPIError):
+            await team_manager.get_marketplace_settings({"team_id": "jR2kmLs"})
+
+    @pytest.mark.asyncio
+    async def test_empty_echo_and_omitted_field_read_the_same(self, team_manager, mock_client):
+        """On a read there is no difference: neither shape names an internal marketplace."""
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": []
+        }
+        from_empty = await team_manager.get_marketplace_settings({"team_id": "jR2kmLs"})
+
+        mock_client.get_team_marketplace_settings.return_value = {}
+        from_omitted = await team_manager.get_marketplace_settings({"team_id": "jR2kmLs"})
+
+        assert from_empty["internalMarketplaceNames"] == []
+        assert from_omitted["internalMarketplaceNames"] == []
+
+
+class TestTeamMarketplaceSettingsUpdate:
+    """TeamManager.update_marketplace_settings — the read-then-merge write path."""
+
+    @pytest.mark.asyncio
+    async def test_missing_team_id_raises_without_api_call(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_marketplace_settings(
+                {"marketplace_names": ["acme-internal"]}
+            )
+        assert exc.value.field == "team_id"
+        mock_client.get_team_marketplace_settings.assert_not_called()
+        mock_client.update_team_marketplace_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_names_raises_without_api_call(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_marketplace_settings({"team_id": "jR2kmLs"})
+        assert exc.value.field == "marketplace_names"
+        mock_client.get_team_marketplace_settings.assert_not_called()
+        mock_client.update_team_marketplace_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_names", ["acme-internal", {"name": "acme"}, 7])
+    async def test_non_list_names_rejected(self, team_manager, mock_client, bad_names):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_marketplace_settings(
+                {"team_id": "jR2kmLs", "marketplace_names": bad_names}
+            )
+        assert exc.value.field == "marketplace_names"
+        mock_client.update_team_marketplace_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_blank_entry_rejected(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_marketplace_settings(
+                {"team_id": "jR2kmLs", "marketplace_names": ["acme-internal", "  "]}
+            )
+        assert exc.value.field == "marketplace_names"
+        mock_client.update_team_marketplace_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_list_rejected_for_add(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_marketplace_settings(
+                {"team_id": "jR2kmLs", "marketplace_names": []}
+            )
+        assert exc.value.field == "marketplace_names"
+        mock_client.update_team_marketplace_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unknown_operation_rejected(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_marketplace_settings({
+                "team_id": "jR2kmLs",
+                "marketplace_names": ["acme-internal"],
+                "operation": "merge",
+            })
+        assert exc.value.field == "operation"
+        mock_client.update_team_marketplace_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_add_merges_with_current_list(self, team_manager, mock_client):
+        """A bare PUT would drop the existing names, so add must send the union."""
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["revenium-tools"]
+        }
+        mock_client.update_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["revenium-tools", "acme-internal"]
+        }
+
+        result = await team_manager.update_marketplace_settings({
+            "team_id": "jR2kmLs",
+            "marketplace_names": ["acme-internal"],
+        })
+
+        mock_client.get_team_marketplace_settings.assert_called_once_with("jR2kmLs")
+        sent_team_id, sent_payload = mock_client.update_team_marketplace_settings.call_args[0]
+        assert sent_team_id == "jR2kmLs"
+        assert sent_payload == {
+            "internalMarketplaceNames": ["revenium-tools", "acme-internal"]
+        }
+        assert result["operation"] == "add"
+        assert result["previous_internalMarketplaceNames"] == ["revenium-tools"]
+        assert result["added"] == ["acme-internal"]
+        assert result["removed"] == []
+
+    @pytest.mark.asyncio
+    async def test_add_is_idempotent(self, team_manager, mock_client):
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["acme-internal"]
+        }
+        mock_client.update_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["acme-internal"]
+        }
+
+        result = await team_manager.update_marketplace_settings({
+            "team_id": "jR2kmLs",
+            "marketplace_names": ["acme-internal"],
+        })
+
+        sent_payload = mock_client.update_team_marketplace_settings.call_args[0][1]
+        assert sent_payload == {"internalMarketplaceNames": ["acme-internal"]}
+        assert result["added"] == []
+        assert result["removed"] == []
+
+    @pytest.mark.asyncio
+    async def test_remove_subtracts_from_current_list(self, team_manager, mock_client):
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["acme-internal", "revenium-tools"]
+        }
+        mock_client.update_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["revenium-tools"]
+        }
+
+        result = await team_manager.update_marketplace_settings({
+            "team_id": "jR2kmLs",
+            "marketplace_names": ["acme-internal"],
+            "operation": "remove",
+        })
+
+        sent_payload = mock_client.update_team_marketplace_settings.call_args[0][1]
+        assert sent_payload == {"internalMarketplaceNames": ["revenium-tools"]}
+        assert result["removed"] == ["acme-internal"]
+        assert result["added"] == []
+
+    @pytest.mark.asyncio
+    async def test_replace_overwrites_and_reports_losses(self, team_manager, mock_client):
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["acme-internal", "revenium-tools"]
+        }
+        mock_client.update_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["only-this"]
+        }
+
+        result = await team_manager.update_marketplace_settings({
+            "team_id": "jR2kmLs",
+            "marketplace_names": ["only-this"],
+            "operation": "replace",
+        })
+
+        sent_payload = mock_client.update_team_marketplace_settings.call_args[0][1]
+        assert sent_payload == {"internalMarketplaceNames": ["only-this"]}
+        assert result["added"] == ["only-this"]
+        assert set(result["removed"]) == {"acme-internal", "revenium-tools"}
+
+    @pytest.mark.asyncio
+    async def test_replace_allows_clearing_the_list(self, team_manager, mock_client):
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["acme-internal"]
+        }
+        mock_client.update_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": []
+        }
+
+        result = await team_manager.update_marketplace_settings({
+            "team_id": "jR2kmLs",
+            "marketplace_names": [],
+            "operation": "replace",
+        })
+
+        sent_payload = mock_client.update_team_marketplace_settings.call_args[0][1]
+        assert sent_payload == {"internalMarketplaceNames": []}
+        assert result["internalMarketplaceNames"] == []
+        assert result["removed"] == ["acme-internal"]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_names_deduped_before_put(self, team_manager, mock_client):
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": []
+        }
+        mock_client.update_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["acme-internal"]
+        }
+
+        await team_manager.update_marketplace_settings({
+            "team_id": "jR2kmLs",
+            "marketplace_names": ["acme-internal", "acme-internal"],
+            "operation": "replace",
+        })
+
+        sent_payload = mock_client.update_team_marketplace_settings.call_args[0][1]
+        assert sent_payload == {"internalMarketplaceNames": ["acme-internal"]}
+
+    @pytest.mark.asyncio
+    async def test_response_surfaces_reclassification_warning(self, team_manager, mock_client):
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": []
+        }
+        mock_client.update_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["acme-internal"]
+        }
+
+        result = await team_manager.update_marketplace_settings({
+            "team_id": "jR2kmLs",
+            "marketplace_names": ["acme-internal"],
+        })
+
+        assert result["reclassification_warning"] == MARKETPLACE_RECLASSIFICATION_NOTE
+        assert "THIRD_PARTY" in result["reclassification_warning"]
+
+    @pytest.mark.asyncio
+    async def test_put_403_maps_to_authorization_error(self, team_manager, mock_client):
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": []
+        }
+        mock_client.update_team_marketplace_settings.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_marketplace_settings({
+                "team_id": "jR2kmLs",
+                "marketplace_names": ["acme-internal"],
+            })
+
+        assert exc.value.error_code == ErrorCodes.API_AUTHORIZATION
+        assert exc.value.field == "team_id"
+
+    @pytest.mark.asyncio
+    async def test_put_500_reraises(self, team_manager, mock_client):
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": []
+        }
+        mock_client.update_team_marketplace_settings.side_effect = ReveniumAPIError(
+            "Boom", status_code=500
+        )
+
+        with pytest.raises(ReveniumAPIError):
+            await team_manager.update_marketplace_settings({
+                "team_id": "jR2kmLs",
+                "marketplace_names": ["acme-internal"],
+            })
+
+    @pytest.mark.asyncio
+    async def test_put_409_maps_to_conflict_error(self, team_manager, mock_client):
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": []
+        }
+        mock_client.update_team_marketplace_settings.side_effect = ReveniumAPIError(
+            "Conflict", status_code=409
+        )
+
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_marketplace_settings({
+                "team_id": "jR2kmLs",
+                "marketplace_names": ["acme-internal"],
+            })
+
+        assert exc.value.error_code == ErrorCodes.RESOURCE_CONFLICT
+        assert "re-read" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_sent_list_when_response_omits_it(
+        self, team_manager, mock_client
+    ):
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": []
+        }
+        mock_client.update_team_marketplace_settings.return_value = {}
+
+        result = await team_manager.update_marketplace_settings({
+            "team_id": "jR2kmLs",
+            "marketplace_names": ["acme-internal"],
+        })
+
+        assert result["internalMarketplaceNames"] == ["acme-internal"]
+        # An absent field says nothing about the stored state, so it is not a divergence.
+        assert "divergence_warning" not in result
+
+    @pytest.mark.asyncio
+    async def test_empty_echo_is_reported_instead_of_the_sent_list(
+        self, team_manager, mock_client
+    ):
+        """An echoed empty list is a real end state, not a missing field to paper over."""
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["revenium-tools"]
+        }
+        mock_client.update_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": []
+        }
+
+        result = await team_manager.update_marketplace_settings({
+            "team_id": "jR2kmLs",
+            "marketplace_names": ["acme-internal"],
+        })
+
+        assert result["requested_internalMarketplaceNames"] == [
+            "revenium-tools",
+            "acme-internal",
+        ]
+        assert result["internalMarketplaceNames"] == []
+        assert result["divergence_warning"] == MARKETPLACE_DIVERGENCE_NOTE
+        assert result["unexpectedly_absent"] == ["revenium-tools", "acme-internal"]
+        assert result["unexpectedly_present"] == []
+
+    @pytest.mark.asyncio
+    async def test_divergent_echo_surfaces_the_interleaved_names(
+        self, team_manager, mock_client
+    ):
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": []
+        }
+        mock_client.update_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["acme-internal", "added-elsewhere"]
+        }
+
+        result = await team_manager.update_marketplace_settings({
+            "team_id": "jR2kmLs",
+            "marketplace_names": ["acme-internal"],
+        })
+
+        assert result["internalMarketplaceNames"] == ["acme-internal", "added-elsewhere"]
+        assert result["divergence_warning"] == MARKETPLACE_DIVERGENCE_NOTE
+        assert result["unexpectedly_present"] == ["added-elsewhere"]
+        assert result["unexpectedly_absent"] == []
+
+    @pytest.mark.asyncio
+    async def test_reordered_echo_is_not_a_divergence(self, team_manager, mock_client):
+        """The upstream array is a set, so ordering alone is not evidence of a lost update."""
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["acme-internal", "revenium-tools"]
+        }
+        mock_client.update_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["revenium-tools", "acme-internal"]
+        }
+
+        result = await team_manager.update_marketplace_settings({
+            "team_id": "jR2kmLs",
+            "marketplace_names": ["acme-internal", "revenium-tools"],
+            "operation": "replace",
+        })
+
+        assert "divergence_warning" not in result
+
+    @pytest.mark.asyncio
+    async def test_matching_echo_still_carries_the_concurrency_note(
+        self, team_manager, mock_client
+    ):
+        """The endpoint has no version or ETag, so the caveat rides on every response."""
+        mock_client.get_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": []
+        }
+        mock_client.update_team_marketplace_settings.return_value = {
+            "internalMarketplaceNames": ["acme-internal"]
+        }
+
+        result = await team_manager.update_marketplace_settings({
+            "team_id": "jR2kmLs",
+            "marketplace_names": ["acme-internal"],
+        })
+
+        assert result["concurrency_note"] == MARKETPLACE_CONCURRENCY_NOTE
+        assert "divergence_warning" not in result
+
+
 # ===========================================================================
 # CustomerValidator Tests
 # ===========================================================================
@@ -1070,7 +1517,15 @@ class TestCustomerValidator:
         validator.schema_discovery = None
         result = validator.get_examples()
         assert "examples" in result
-        assert len(result["examples"]) == 4  # users, subscribers, organizations, teams
+        # users, subscribers, organizations, teams + team marketplace settings
+        assert len(result["examples"]) == 5
+
+    def test_get_examples_for_teams_includes_marketplace_settings(self):
+        validator = CustomerValidator()
+        validator.schema_discovery = None
+        result = validator.get_examples(resource_type="teams")
+        names = [example["name"] for example in result["examples"]]
+        assert "Update Team Internal-Marketplace Settings" in names
 
     def test_get_examples_for_specific_resource_type(self):
         validator = CustomerValidator()
@@ -1078,6 +1533,47 @@ class TestCustomerValidator:
         result = validator.get_examples(resource_type="users")
         assert "examples" in result
         assert len(result["examples"]) == 1
+        assert MARKETPLACE_SETTINGS_EXAMPLE not in result["examples"]
+
+    def test_get_examples_for_unknown_resource_type_excludes_marketplace_settings(self):
+        """The catch-all must honour the same guard as the teams branch."""
+        validator = CustomerValidator()
+        validator.schema_discovery = None
+        result = validator.get_examples(resource_type="products")
+        names = [example["name"] for example in result["examples"]]
+        assert "Update Team Internal-Marketplace Settings" not in names
+
+    def test_get_examples_schema_discovery_teams_includes_marketplace_settings(self):
+        mock_schema = MagicMock()
+        mock_schema.get_customer_examples.return_value = {
+            "examples": [{"name": "Create Team", "template": {"name": "Dev"}}]
+        }
+        validator = CustomerValidator()
+        validator.schema_discovery = mock_schema
+        result = validator.get_examples(resource_type="teams")
+        names = [example["name"] for example in result["examples"]]
+        assert "Update Team Internal-Marketplace Settings" in names
+
+    def test_get_examples_schema_discovery_other_type_excludes_marketplace_settings(self):
+        mock_schema = MagicMock()
+        mock_schema.get_customer_examples.return_value = {
+            "examples": [{"name": "Create Product", "template": {"name": "Plan"}}]
+        }
+        validator = CustomerValidator()
+        validator.schema_discovery = mock_schema
+        result = validator.get_examples(resource_type="products")
+        names = [example["name"] for example in result["examples"]]
+        assert "Update Team Internal-Marketplace Settings" not in names
+
+    def test_get_examples_injects_the_marketplace_example_once(self):
+        """Repeated calls share the module-level example, so the guard must not stack it."""
+        validator = CustomerValidator()
+        validator.schema_discovery = None
+        first = validator.get_examples(resource_type="teams")
+        second = validator.get_examples(resource_type="teams")
+        for result in (first, second):
+            names = [example["name"] for example in result["examples"]]
+            assert names.count("Update Team Internal-Marketplace Settings") == 1
 
     def test_get_roles_returns_structure(self):
         validator = CustomerValidator()
@@ -1439,6 +1935,126 @@ class TestCustomerManagementHandleAction:
         actions = await customer_mgmt._get_supported_actions()
         assert "lookup_user" in actions
         assert "lookup_subscriber" in actions
+
+    @pytest.mark.asyncio
+    async def test_get_marketplace_settings_action_routes_to_team_manager(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.get_team_marketplace_settings = AsyncMock(
+                return_value={"internalMarketplaceNames": ["acme-internal"]}
+            )
+
+            result = await customer_mgmt.handle_action(
+                "get_marketplace_settings", {"team_id": "jR2kmLs"}
+            )
+
+            assert isinstance(result[0], TextContent)
+            assert "acme-internal" in result[0].text
+            mock_client.get_team_marketplace_settings.assert_called_once_with("jR2kmLs")
+
+    @pytest.mark.asyncio
+    async def test_update_marketplace_settings_action_reads_then_writes(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.get_team_marketplace_settings = AsyncMock(
+                return_value={"internalMarketplaceNames": ["revenium-tools"]}
+            )
+            mock_client.update_team_marketplace_settings = AsyncMock(
+                return_value={
+                    "internalMarketplaceNames": ["revenium-tools", "acme-internal"]
+                }
+            )
+
+            result = await customer_mgmt.handle_action(
+                "update_marketplace_settings",
+                {"team_id": "jR2kmLs", "marketplace_names": ["acme-internal"]},
+            )
+
+            mock_client.get_team_marketplace_settings.assert_called_once_with("jR2kmLs")
+            sent_payload = mock_client.update_team_marketplace_settings.call_args[0][1]
+            assert sent_payload == {
+                "internalMarketplaceNames": ["revenium-tools", "acme-internal"]
+            }
+            assert isinstance(result[0], TextContent)
+            assert "THIRD_PARTY" in result[0].text
+            assert "WARNING" not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_update_marketplace_settings_renders_divergence_warning(self, customer_mgmt):
+        """A stored list that disagrees with the sent list must lead the rendered text."""
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.get_team_marketplace_settings = AsyncMock(
+                return_value={"internalMarketplaceNames": []}
+            )
+            mock_client.update_team_marketplace_settings = AsyncMock(
+                return_value={"internalMarketplaceNames": ["added-elsewhere"]}
+            )
+
+            result = await customer_mgmt.handle_action(
+                "update_marketplace_settings",
+                {"team_id": "jR2kmLs", "marketplace_names": ["acme-internal"]},
+            )
+
+            assert "WARNING" in result[0].text
+            assert MARKETPLACE_DIVERGENCE_NOTE in result[0].text
+            assert "added-elsewhere" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_update_marketplace_settings_missing_names_makes_no_api_call(
+        self, customer_mgmt
+    ):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.get_team_marketplace_settings = AsyncMock()
+            mock_client.update_team_marketplace_settings = AsyncMock()
+
+            with pytest.raises(ToolError):
+                await customer_mgmt.handle_action(
+                    "update_marketplace_settings", {"team_id": "jR2kmLs"}
+                )
+
+            mock_client.get_team_marketplace_settings.assert_not_called()
+            mock_client.update_team_marketplace_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_marketplace_actions_in_supported_actions(self, customer_mgmt):
+        actions = await customer_mgmt._get_supported_actions()
+        assert "get_marketplace_settings" in actions
+        assert "update_marketplace_settings" in actions
+
+    @pytest.mark.asyncio
+    async def test_capabilities_text_documents_marketplace_settings(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = MagicMock()
+            result = await customer_mgmt.handle_action("get_capabilities", {})
+
+        text = result[0].text
+        assert "get_marketplace_settings" in text
+        assert "update_marketplace_settings" in text
+        assert "THIRD_PARTY" in text
+        assert MARKETPLACE_CONCURRENCY_NOTE in text
+
+    @pytest.mark.asyncio
+    async def test_marketplace_capability_advertised_in_metadata(self, customer_mgmt):
+        capabilities = await customer_mgmt._get_tool_capabilities()
+        names = [c.name for c in capabilities]
+        assert "Team Internal-Marketplace Settings" in names
+
+    @pytest.mark.asyncio
+    async def test_marketplace_capability_states_the_concurrency_limitation(
+        self, customer_mgmt
+    ):
+        """The read-merge-PUT cannot be made atomic, so the limitation is advertised."""
+        capabilities = await customer_mgmt._get_tool_capabilities()
+        marketplace = next(
+            c for c in capabilities if c.name == "Team Internal-Marketplace Settings"
+        )
+        assert MARKETPLACE_CONCURRENCY_NOTE in marketplace.limitations
 
 
 class TestCustomerManagementAutoGeneration:

@@ -353,6 +353,136 @@ async def test_list_recommendation_feedback_hits_nested_path(monkeypatch):
     assert captured["params"] == {"limit": 50, "cursor": "c2"}
 
 
+@pytest.mark.asyncio
+async def test_list_recommendation_feedback_wraps_bare_array_wire_shape(monkeypatch):
+    """The live endpoint answers with a BARE JSON ARRAY, not the documented
+    {"data": [...], "next_cursor": ...} envelope. The client owns the wire, so it
+    normalizes here and the documented return contract stays true for callers."""
+    from src.revenium_mcp_server.client import ReveniumClient
+
+    monkeypatch.setenv("REVENIUM_API_KEY", "hak_test_abcd1234")
+    monkeypatch.setenv("REVENIUM_BASE_URL", "https://example.invalid")
+    monkeypatch.setenv("REVENIUM_TEAM_ID", "team_1")
+
+    client = ReveniumClient()
+    wire = [{"id": "f1", "action": "implemented"}, {"id": "f2", "action": "dismissed"}]
+
+    async def fake_get(endpoint, **kwargs):
+        return wire
+
+    monkeypatch.setattr(client, "get", fake_get)
+
+    result = await client.list_recommendation_feedback("r1")
+
+    assert isinstance(result, dict), f"expected an envelope dict, got {type(result).__name__}"
+    assert result["data"] == wire
+    assert result["next_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_recommendation_feedback_wraps_empty_bare_array(monkeypatch):
+    """The common live answer is a bare `[]`; it must normalize to an empty
+    envelope rather than reach the caller as a list."""
+    from src.revenium_mcp_server.client import ReveniumClient
+
+    monkeypatch.setenv("REVENIUM_API_KEY", "hak_test_abcd1234")
+    monkeypatch.setenv("REVENIUM_BASE_URL", "https://example.invalid")
+    monkeypatch.setenv("REVENIUM_TEAM_ID", "team_1")
+
+    client = ReveniumClient()
+
+    async def fake_get(endpoint, **kwargs):
+        return []
+
+    monkeypatch.setattr(client, "get", fake_get)
+
+    result = await client.list_recommendation_feedback("r1")
+
+    assert isinstance(result, dict), f"expected an envelope dict, got {type(result).__name__}"
+    assert result == {"data": [], "next_cursor": None}
+
+
+@pytest.mark.asyncio
+async def test_list_recommendation_feedback_passes_dict_envelope_through(monkeypatch):
+    """If the backend ever adopts the documented envelope, normalization must be a
+    no-op — cursor pagination keeps working unchanged."""
+    from src.revenium_mcp_server.client import ReveniumClient
+
+    monkeypatch.setenv("REVENIUM_API_KEY", "hak_test_abcd1234")
+    monkeypatch.setenv("REVENIUM_BASE_URL", "https://example.invalid")
+    monkeypatch.setenv("REVENIUM_TEAM_ID", "team_1")
+
+    client = ReveniumClient()
+    envelope = {"data": [{"id": "f1"}], "next_cursor": "c2"}
+
+    async def fake_get(endpoint, **kwargs):
+        return envelope
+
+    monkeypatch.setattr(client, "get", fake_get)
+
+    result = await client.list_recommendation_feedback("r1")
+
+    assert result == envelope
+    assert result["next_cursor"] == "c2"
+
+
+@pytest.mark.asyncio
+async def test_list_recommendation_feedback_raises_on_envelope_without_list_data(
+    monkeypatch,
+):
+    """A dict envelope whose data field is missing or not a list is upstream
+    schema breakage too — passing it through would let the handler read
+    page.get("data", []) as an empty page and report zero feedback for an
+    existing run."""
+    import pytest as _pytest
+
+    from src.revenium_mcp_server.client import ReveniumAPIError, ReveniumClient
+
+    monkeypatch.setenv("REVENIUM_API_KEY", "hak_test_abcd1234")
+    monkeypatch.setenv("REVENIUM_BASE_URL", "https://example.invalid")
+    monkeypatch.setenv("REVENIUM_TEAM_ID", "team_1")
+
+    client = ReveniumClient()
+
+    for bad in ({"error": "oops"}, {"data": None}, {"data": "not-a-list"}):
+        async def fake_get(endpoint, **kwargs):
+            return bad
+
+        monkeypatch.setattr(client, "get", fake_get)
+        with _pytest.raises(ReveniumAPIError) as exc:
+            await client.list_recommendation_feedback("r1")
+        assert "list_recommendation_feedback" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_list_recommendation_feedback_raises_on_unknown_shape(
+    monkeypatch,
+):
+    """Any third shape (string, number, null) raises a structured API error —
+    degrading to an empty envelope would render a confident "0 feedback items"
+    success for what is actually upstream schema breakage."""
+    import pytest as _pytest
+
+    from src.revenium_mcp_server.client import ReveniumAPIError, ReveniumClient
+
+    monkeypatch.setenv("REVENIUM_API_KEY", "hak_test_abcd1234")
+    monkeypatch.setenv("REVENIUM_BASE_URL", "https://example.invalid")
+    monkeypatch.setenv("REVENIUM_TEAM_ID", "team_1")
+
+    client = ReveniumClient()
+
+    async def fake_get(endpoint, **kwargs):
+        return "unexpected"
+
+    monkeypatch.setattr(client, "get", fake_get)
+
+    with _pytest.raises(ReveniumAPIError) as exc:
+        await client.list_recommendation_feedback("r1")
+
+    assert "list_recommendation_feedback" in str(exc.value)
+    assert "unexpected" in str(exc.value).lower() or "shape" in str(exc.value).lower()
+
+
 import uuid as _uuid_test
 
 

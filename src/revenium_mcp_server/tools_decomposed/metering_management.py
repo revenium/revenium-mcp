@@ -8,9 +8,23 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, Tuple, Callable, Awaitable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    FrozenSet,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    cast,
+)
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -44,21 +58,310 @@ from ..trace_fields import extract_trace_fields
 # Prometheus metrics removed - infrastructure monitoring handled externally
 
 
-# BACK-1139: Canonical provider enum enforced on the submit_ai_transaction
-# write path. Mirrors the list used by analytics_registry.validate_request,
-# so a transaction that satisfies the metering enum will also satisfy the
-# read-side analytics filters. Compared case-insensitively (the API persists
-# upper-case but several examples in the docs use lower-case).
-_VALID_PROVIDERS = (
-    "OPENAI",
-    "ANTHROPIC",
-    "GOOGLE",
-    "AZURE",
-    "COHERE",
-    "MISTRAL",
-    "TOGETHER",
-    "GROQ",
+# Provider allowlist enforced on the submit_ai_transaction write path. It
+# exists so arbitrary strings (typos included) cannot be persisted and then
+# silently dropped by downstream analytics aggregation.
+#
+# The accepted set is the union of this static baseline and the provider names
+# the platform's own AI-model catalog reports for the calling tenant (resolved
+# by _prime_provider_validation), so the write path can never be narrower than
+# what get_supported_providers advertises or what _handle_validate_model_provider
+# greenlights. The baseline is also the fallback whenever the catalog cannot be
+# fetched, which is why it enumerates the catalog names known at authoring time
+# alongside the original documented enum rather than relying on the live fetch
+# alone.
+#
+# Names are stored lower-case; every comparison uses provider.strip().lower()
+# (the API persists upper-case but the docs and the catalog use lower-case).
+_STATIC_PROVIDER_BASELINE: FrozenSet[str] = frozenset(
+    {
+        # Originally documented enum — kept for backward compatibility even
+        # though several of these do not appear in the catalog today.
+        "anthropic",
+        "azure",
+        "cohere",
+        "google",
+        "groq",
+        "mistral",
+        "openai",
+        "together",
+        # Provider names reported by the AI-model catalog.
+        "azure_ai",
+        "bedrock",
+        "bedrock_mantle",
+        "chatgpt",
+        "databricks",
+        "dataforseo",
+        "exa_ai",
+        "fal_ai",
+        "gemini",
+        "gmi",
+        "google_pse",
+        "novita",
+        "openrouter",
+        "parallel_ai",
+        "perplexity",
+        "serper",
+        "tavily",
+        "tencent",
+        "vertex_ai",
+        "vertex_ai-language-models",
+        "vertex_ai-mistral_models",
+        "watsonx",
+    }
 )
+
+# A handful of representative names for rejection messages. The message must
+# not enumerate the accepted set: it changes with the catalog, and steering the
+# caller to the live listing action keeps the two from drifting apart again.
+_PROVIDER_MESSAGE_EXAMPLES = ("openai", "anthropic", "bedrock", "gemini", "vertex_ai")
+
+# Actions whose validation consults the provider allowlist. Only these refresh
+# the catalog cache, so read-only actions never pay for the extra call.
+_PROVIDER_VALIDATING_ACTIONS: FrozenSet[str] = frozenset({"submit_ai_transaction", "validate"})
+
+_PROVIDER_CATALOG_TTL_SECONDS = 600
+
+# Size of the model-listing scan _fetch_catalog_providers falls back to when the
+# catalog's providers endpoint is unavailable. The listing endpoint truncates
+# every page to roughly 100 models no matter how large a size is requested, so
+# that scan only ever observes the first page. Providers beyond it are covered by
+# _STATIC_PROVIDER_BASELINE and, for anything the platform added later, by the
+# on-miss targeted lookup in _provider_priced_by_catalog — which filters
+# server-side and therefore does not depend on where a provider's models happen
+# to fall in the listing.
+_PROVIDER_CATALOG_PAGE_SIZE = 1000
+
+# The catalog is fetched with the caller's own credentials and scoped to the
+# caller's team, so the cache is keyed per tenant: one worker process serves
+# many tenants in hosted mode and a process-wide entry would hand the first
+# caller's catalog to everyone else inside the TTL window. The key is derived
+# from the client rather than from the calling instance — an instance-identity
+# key is a shape this repo has already paid for once (see the key-derivation
+# notes in core/response_cache.py).
+_ProviderCatalogKey = Tuple[str, str]
+_provider_catalog_cache: Dict[_ProviderCatalogKey, Dict[str, Any]] = {}
+_provider_catalog_lock = asyncio.Lock()
+
+# The membership tests below are synchronous and have no client in hand, so the
+# refresh binds the current request's cache key here for them to read. Each MCP
+# request runs in its own task and therefore its own context copy, which is what
+# keeps one request from reading another tenant's binding.
+_provider_catalog_key_var: ContextVar[Optional[_ProviderCatalogKey]] = ContextVar(
+    "metering_provider_catalog_key", default=None
+)
+
+
+def _provider_catalog_key(client: ReveniumClient) -> _ProviderCatalogKey:
+    """Cache identity for a client: the upstream it talks to, and who it talks as.
+
+    ``team_id`` is the discriminator that actually varies per tenant — the
+    catalog request carries it as a query parameter, so two teams can legitimately
+    see different model listings. ``base_url`` is paired with it because the same
+    team id in two deployments is two unrelated catalogs. Neither the credential
+    nor the user is part of the key: they do not change what the catalog returns,
+    and keeping them out means one tenant's repeat callers still share a fetch.
+    """
+
+    def _attr(name: str) -> str:
+        try:
+            value = getattr(client, name)
+        except Exception:
+            return ""
+        return str(value) if value is not None else ""
+
+    return (_attr("base_url"), _attr("team_id"))
+
+
+async def _fetch_catalog_providers(client: ReveniumClient) -> FrozenSet[str]:
+    """Read the provider names the platform's AI-model catalog reports.
+
+    The catalog's providers endpoint answers this authoritatively in a single
+    call, so it is tried first; the one-page model scan below remains as the
+    fallback for an upstream that does not serve that path yet.
+
+    Returns an empty set when neither read works — the caller falls back to
+    _STATIC_PROVIDER_BASELINE, so a catalog outage can never reject a
+    transaction that would otherwise have been accepted.
+    """
+    try:
+        # Typed as the wire shape rather than the client's annotation: a bare JSON
+        # array is what the endpoint documents, but anything else (a HAL page, a
+        # problem document) would contribute its keys as provider names, so an
+        # unexpected shape is treated as unusable and handed to the scan below.
+        provider_names: Any = await client.get_ai_model_providers()
+        if isinstance(provider_names, (list, tuple)):
+            return frozenset(
+                name.strip().lower()
+                for name in provider_names
+                if isinstance(name, str) and name.strip()
+            )
+        logger.warning(
+            "AI model provider list came back as "
+            f"{type(provider_names).__name__}, expected an array"
+        )
+    except Exception as exc:
+        logger.warning(f"Could not read the AI model provider list: {exc}")
+
+    try:
+        response = await client.get_ai_models(page=0, size=_PROVIDER_CATALOG_PAGE_SIZE)
+        models = response.get("_embedded", {}).get("aIModelResourceList", [])
+        providers = {
+            model["provider"].strip().lower()
+            for model in models
+            if isinstance(model, dict)
+            and isinstance(model.get("provider"), str)
+            and model["provider"].strip()
+        }
+        return frozenset(providers)
+    except Exception as exc:
+        logger.warning(f"Could not read providers from the AI model catalog: {exc}")
+        return frozenset()
+
+
+def _prune_expired_catalog_entries(now: float) -> None:
+    """Drop entries past their TTL so the per-tenant key space cannot grow unbounded."""
+    for key in [
+        key
+        for key, entry in _provider_catalog_cache.items()
+        if (now - entry["fetched_at"]) >= _PROVIDER_CATALOG_TTL_SECONDS
+    ]:
+        del _provider_catalog_cache[key]
+
+
+async def _refresh_provider_catalog(client: ReveniumClient) -> FrozenSet[str]:
+    """Refresh this client's catalog-provider cache entry, honoring the TTL.
+
+    Also binds the entry's key for the synchronous membership tests, so callers
+    must reach the accepted set through here (or through
+    _prime_provider_validation) rather than reading the cache directly.
+
+    A fetch that yields nothing (failure or an empty catalog) stamps the entry so
+    the next caller does not retry immediately, but leaves any previously fetched
+    names in place — one transient error must not narrow the accepted set
+    mid-session.
+    """
+    key = _provider_catalog_key(client)
+    _provider_catalog_key_var.set(key)
+    async with _provider_catalog_lock:
+        now = time.monotonic()
+        entry = _provider_catalog_cache.get(key)
+        if entry is not None and (now - entry["fetched_at"]) < _PROVIDER_CATALOG_TTL_SECONDS:
+            return cast(FrozenSet[str], entry["providers"])
+
+        previous = cast(FrozenSet[str], entry["providers"]) if entry is not None else frozenset()
+        providers = await _fetch_catalog_providers(client)
+        _prune_expired_catalog_entries(now)
+        _provider_catalog_cache[key] = {
+            "fetched_at": now,
+            "providers": providers or previous,
+        }
+        return cast(FrozenSet[str], _provider_catalog_cache[key]["providers"])
+
+
+def _cached_catalog_providers() -> FrozenSet[str]:
+    """Catalog names cached for the tenant bound to the current request context.
+
+    Deliberately does not re-check the TTL: the refresh at the top of the request
+    already guaranteed freshness, and expiring mid-request would silently narrow
+    the accepted set and reject a transaction that was valid moments earlier.
+    """
+    key = _provider_catalog_key_var.get()
+    if key is None:
+        return frozenset()
+    entry = _provider_catalog_cache.get(key)
+    if entry is None:
+        return frozenset()
+    return cast(FrozenSet[str], entry["providers"])
+
+
+def _accepted_providers() -> FrozenSet[str]:
+    """Provider names accepted on the write path, lower-case."""
+    return _STATIC_PROVIDER_BASELINE | _cached_catalog_providers()
+
+
+def _is_accepted_provider(provider: str) -> bool:
+    """Case- and whitespace-insensitive membership test for the write path.
+
+    Synchronous, so it can serve both validation paths. It answers from the
+    baseline plus whatever _prime_provider_validation already resolved for this
+    request — including a provider confirmed by the targeted lookup — and never
+    performs I/O of its own.
+    """
+    return provider.strip().lower() in _accepted_providers()
+
+
+def _remember_catalog_provider(key: _ProviderCatalogKey, provider: str) -> None:
+    """Record a provider the catalog confirmed, for this tenant only.
+
+    Only hits are recorded. Caching a miss would keep rejecting a provider for
+    the rest of the TTL window even after the platform started pricing it.
+    """
+    entry = _provider_catalog_cache.get(key)
+    if entry is None:
+        _provider_catalog_cache[key] = {
+            "fetched_at": time.monotonic(),
+            "providers": frozenset({provider}),
+        }
+        return
+    entry["providers"] = cast(FrozenSet[str], entry["providers"]) | {provider}
+
+
+async def _provider_priced_by_catalog(client: ReveniumClient, provider: str) -> bool:
+    """Ask the catalog directly whether it prices any model for this provider.
+
+    The provider list the write path validates against can lag the catalog: the
+    fallback scan only ever sees the first page (see _PROVIDER_CATALOG_PAGE_SIZE),
+    and either read is at most one TTL window old. Without this lookup a provider
+    the catalog prices would be rejected on the write path. The listing endpoint
+    filters by provider server-side, so a single one-model page settles the
+    question no matter where those models fall in the unfiltered listing.
+
+    Returns False on any failure — the caller then falls back to the structured
+    rejection, which is the behaviour that existed before this lookup.
+    """
+    try:
+        response = await client.get_ai_models(page=0, size=1, provider=provider)
+        models = response.get("_embedded", {}).get("aIModelResourceList", []) or []
+        if models:
+            return True
+        total = response.get("page", {}).get("totalElements", 0)
+        return isinstance(total, int) and total > 0
+    except Exception as exc:
+        logger.warning(f"Provider lookup against the AI model catalog failed: {exc}")
+        return False
+
+
+async def _prime_provider_validation(client: ReveniumClient, provider: Any) -> None:
+    """Resolve the accepted provider set for this request, before any validator runs.
+
+    Both validation paths (the async pipeline and the synchronous fast path) test
+    membership without a client in hand, so the one place that has one does the
+    I/O up front: refresh the tenant's catalog entry, and — only when the
+    submitted value is not already accepted — confirm it with a targeted lookup.
+    A confirmed provider is remembered for the tenant, so the validators reach
+    the same verdict whichever path they take and no rejection is emitted before
+    the catalog has had its say.
+    """
+    await _refresh_provider_catalog(client)
+    if not isinstance(provider, str) or not provider.strip():
+        return
+    if _is_accepted_provider(provider):
+        return
+    normalized = provider.strip().lower()
+    if await _provider_priced_by_catalog(client, normalized):
+        _remember_catalog_provider(_provider_catalog_key(client), normalized)
+
+
+def _invalid_provider_message(provider: str) -> str:
+    """Rejection text: a few examples plus the steer to the live listing."""
+    return (
+        f"Invalid provider '{provider}'. Examples: "
+        f"{', '.join(_PROVIDER_MESSAGE_EXAMPLES)}. "
+        "Use get_supported_providers() to list valid providers."
+    )
+
+
 PROMETHEUS_METRICS_AVAILABLE = False
 
 # Accepted transaction_id formats. The backend silently drops ids it does not
@@ -151,6 +454,73 @@ def _extract_completions_filters(arguments: Dict[str, Any]) -> Dict[str, Any]:
         for arg_key, api_key in _COMPLETIONS_FILTER_PARAM_MAP.items()
         if arguments.get(arg_key) is not None and arguments.get(arg_key) != ""
     }
+
+
+# Per-field length caps for the optional string fields. The generic limit is a
+# local anti-injection guard; the named overrides are contract limits the
+# platform enforces and must therefore be the values every validation path
+# uses, or `validate` greenlights payloads that `submit_ai_transaction` rejects.
+#   - ticket_id: metering spec AICompletionMetadataResource.ticketId maxLength
+#   - skill_invocation_trigger: width of the column the platform persists it in;
+#     an overlong value fails the whole metric at persistence, not just the field
+#   - skill_name / skill_plugin_name / skill_marketplace_name: width of the
+#     shared skill-catalog columns they are persisted in. The persistence step
+#     runs fail-open, so an overlong value is not rejected — the catalog insert
+#     fails silently and the transaction loses its skill attribution forever.
+_OPTIONAL_STRING_MAX_LENGTH = 500
+_OPTIONAL_STRING_MAX_LENGTH_OVERRIDES: Dict[str, int] = {
+    "ticket_id": 256,
+    "skill_invocation_trigger": 32,
+    "skill_name": 256,
+    "skill_plugin_name": 256,
+    "skill_marketplace_name": 256,
+}
+
+# Closed vocabularies. skill_source and skill_kind land in a shared skill
+# catalog row that is written once from whichever submission arrives first and
+# is never rewritten by later ones, so an unlisted value is not a rejected
+# transaction — it is a permanently wrong catalog entry for every tenant.
+_SKILL_SOURCE_VALUES: Tuple[str, ...] = (
+    "bundled",
+    "projectSettings",
+    "userSettings",
+    "plugin",
+)
+_SKILL_KIND_VALUES: Tuple[str, ...] = ("workflow",)
+
+# skill_invocation_trigger is free text upstream, but these are the labels the
+# agent tooling emits — a different label simply never groups with them.
+_SKILL_INVOCATION_TRIGGER_EXAMPLES: Tuple[str, ...] = (
+    "user-slash",
+    "claude-proactive",
+    "nested-skill",
+)
+
+_SKILL_VOCABULARIES: Dict[str, Tuple[str, ...]] = {
+    "skill_source": _SKILL_SOURCE_VALUES,
+    "skill_kind": _SKILL_KIND_VALUES,
+}
+
+
+def _optional_string_max_length(field: str) -> int:
+    """Length cap for an optional string field, honoring contract overrides."""
+    return _OPTIONAL_STRING_MAX_LENGTH_OVERRIDES.get(field, _OPTIONAL_STRING_MAX_LENGTH)
+
+
+def _skill_vocabulary_errors(arguments: Dict[str, Any]) -> List[str]:
+    """Closed-vocabulary errors for the skill attribution fields.
+
+    Shared by every validation path so the standalone `validate` action reaches
+    the same verdict as the submit path's structured pre-flight checks.
+    """
+    errors = []
+    for field, accepted in _SKILL_VOCABULARIES.items():
+        value = arguments.get(field)
+        if isinstance(value, str) and value not in accepted:
+            errors.append(
+                f"• {field}: Invalid value '{value}', must be one of: {', '.join(accepted)}"
+            )
+    return errors
 
 
 class MeteringTransactionManager:
@@ -485,19 +855,15 @@ class MeteringTransactionManager:
                         logger.warning(f"Potentially malicious {field}: {value}")
                         return False
 
-            # BACK-1139: mirror the provider enum check performed in the async
-            # pipeline's _validate_string_fields (see lines ~802-811). The two
-            # validation paths exist in parallel today (async pipeline for the
-            # real submit path, sync method for the fast/test path), and must
-            # stay in lock-step — lifting the _VALID_PROVIDERS tuple to module
-            # scope is the cheap part; mirroring the check here is the rest.
+            # Mirror the provider check performed in the async pipeline's
+            # _validate_string_fields. The two validation paths exist in
+            # parallel today (async pipeline for the real submit path, sync
+            # method for the fast/test path) and must stay in lock-step, which
+            # is why both resolve the accepted set through _is_accepted_provider.
             provider_value = arguments.get("provider")
             if isinstance(provider_value, str) and provider_value.strip():
-                if provider_value.strip().upper() not in _VALID_PROVIDERS:
-                    logger.warning(
-                        f"Invalid provider '{provider_value}'. Must be one of: "
-                        f"{', '.join(_VALID_PROVIDERS)}"
-                    )
+                if not _is_accepted_provider(provider_value):
+                    logger.warning(_invalid_provider_message(provider_value))
                     return False
 
             # Validate optional fields
@@ -507,6 +873,13 @@ class MeteringTransactionManager:
                 "agent",
                 "stop_reason",
                 "trace_id",
+                "ticket_id",
+                "skill_name",
+                "skill_source",
+                "skill_kind",
+                "skill_plugin_name",
+                "skill_marketplace_name",
+                "skill_invocation_trigger",
             ]
             for field in optional_string_fields:
                 if field in arguments and arguments[field] is not None:
@@ -515,9 +888,16 @@ class MeteringTransactionManager:
                         logger.warning(f"Invalid type for {field}: {type(value)}")
                         return False
                     # Security: Prevent injection and limit length
-                    if len(value) > 500 or any(char in value for char in ["<", ">", '"', "'", "&"]):
+                    if len(value) > _optional_string_max_length(field) or any(
+                        char in value for char in ["<", ">", '"', "'", "&"]
+                    ):
                         logger.warning(f"Potentially malicious {field}: {value}")
                         return False
+
+            vocabulary_errors = _skill_vocabulary_errors(arguments)
+            if vocabulary_errors:
+                logger.warning(f"Rejected skill attribution: {'; '.join(vocabulary_errors)}")
+                return False
 
             # Validate subscriber object if provided
             if "subscriber" in arguments and arguments["subscriber"] is not None:
@@ -889,16 +1269,13 @@ The subscriber data structure has been updated. The old individual fields are no
                     errors.append(f"• {field}: Contains invalid characters")
                     continue
 
-        # BACK-1139: enforce the documented provider enum on the write path.
-        # Without this, arbitrary strings (including typos) were persisted
-        # silently and corrupted downstream analytics aggregation.
+        # Enforce the provider allowlist on the write path. Without this,
+        # arbitrary strings (including typos) were persisted silently and
+        # corrupted downstream analytics aggregation.
         provider_value = arguments.get("provider")
         if isinstance(provider_value, str) and provider_value.strip():
-            if provider_value.strip().upper() not in _VALID_PROVIDERS:
-                errors.append(
-                    f"• provider: Invalid provider '{provider_value}'. Must be one of: "
-                    f"{', '.join(_VALID_PROVIDERS)}"
-                )
+            if not _is_accepted_provider(provider_value):
+                errors.append(f"• provider: {_invalid_provider_message(provider_value)}")
 
         return errors
 
@@ -919,6 +1296,13 @@ The subscriber data structure has been updated. The old individual fields are no
             "product_name",
             "subscription_id",
             "error_reason",
+            "ticket_id",
+            "skill_name",
+            "skill_source",
+            "skill_kind",
+            "skill_plugin_name",
+            "skill_marketplace_name",
+            "skill_invocation_trigger",
         ]
         for field in optional_string_fields:
             if field in arguments and arguments[field] is not None:
@@ -930,12 +1314,17 @@ The subscriber data structure has been updated. The old individual fields are no
                     errors.append(f"• {field}: Cannot be empty")
                     continue
                 # Security: Prevent injection and limit length
-                if len(value) > 500:
-                    errors.append(f"• {field}: Too long (max 500 characters), got {len(value)}")
+                max_length = _optional_string_max_length(field)
+                if len(value) > max_length:
+                    errors.append(
+                        f"• {field}: Too long (max {max_length} characters), got {len(value)}"
+                    )
                     continue
                 if any(char in value for char in ["<", ">", '"', "'", "&"]):
                     errors.append(f"• {field}: Contains invalid characters (<, >, \", ', &)")
                     continue
+
+        errors.extend(_skill_vocabulary_errors(arguments))
 
         # Validate trace string fields from BOTH top-level AND usage_metadata
         # These fields support both snake_case and camelCase aliases
@@ -1414,6 +1803,13 @@ The subscriber data structure has been updated. The old individual fields are no
                 "product_name",
                 "subscription_id",
                 "error_reason",
+                "ticket_id",
+                "skill_name",
+                "skill_source",
+                "skill_kind",
+                "skill_plugin_name",
+                "skill_marketplace_name",
+                "skill_invocation_trigger",
             ]
             for field in optional_string_fields:
                 if field in arguments and arguments[field] is not None:
@@ -1425,12 +1821,17 @@ The subscriber data structure has been updated. The old individual fields are no
                         errors.append(f"• {field}: Cannot be empty")
                         continue
                     # Security: Prevent injection and limit length
-                    if len(value) > 500:
-                        errors.append(f"• {field}: Too long (max 500 characters), got {len(value)}")
+                    max_length = _optional_string_max_length(field)
+                    if len(value) > max_length:
+                        errors.append(
+                            f"• {field}: Too long (max {max_length} characters), got {len(value)}"
+                        )
                         continue
                     if any(char in value for char in ["<", ">", '"', "'", "&"]):
                         errors.append(f"• {field}: Contains invalid characters (<, >, \", ', &)")
                         continue
+
+            errors.extend(_skill_vocabulary_errors(arguments))
 
             # Validate response_quality_score (critical missing validation!)
             if (
@@ -1780,6 +2181,102 @@ The subscriber data structure has been updated. The old individual fields are no
             time_to_first_token = int(arguments["duration_ms"]) // 10
             logger.debug(f"Auto-calculated time_to_first_token: {time_to_first_token}ms")
 
+        # ticketId is capped by the API (metering spec
+        # AICompletionMetadataResource.ticketId maxLength, mirrored in
+        # _OPTIONAL_STRING_MAX_LENGTH_OVERRIDES) — reject client-side so agents
+        # get a structured pre-flight error instead of an API 400.
+        ticket_id_max = _optional_string_max_length("ticket_id")
+        ticket_id_value = arguments.get("ticket_id")
+        if isinstance(ticket_id_value, str) and len(ticket_id_value) > ticket_id_max:
+            raise create_structured_validation_error(
+                message=(
+                    f"ticket_id too long: {len(ticket_id_value)} characters "
+                    f"(max {ticket_id_max})"
+                ),
+                field="ticket_id",
+                value=f"{ticket_id_value[:32]}... ({len(ticket_id_value)} chars)",
+                suggestions=[
+                    "Provide the ticket identifier only (e.g. 'JIRA-1234'), not a description",
+                    f"Trim the value to at most {ticket_id_max} characters",
+                    "Or omit ticket_id if no ticket applies to this transaction",
+                ],
+                examples={"valid_format": "JIRA-1234", "max_length": ticket_id_max},
+            )
+
+        # skillInvocationTrigger is persisted in a much narrower column than the
+        # rest of the attribution fields. An overlong value does not fail just
+        # the field — the write of the whole metric fails downstream, well after
+        # this call has reported success — so it has to be caught here.
+        trigger_max = _optional_string_max_length("skill_invocation_trigger")
+        trigger_value = arguments.get("skill_invocation_trigger")
+        if isinstance(trigger_value, str) and len(trigger_value) > trigger_max:
+            raise create_structured_validation_error(
+                message=(
+                    f"skill_invocation_trigger too long: {len(trigger_value)} characters "
+                    f"(max {trigger_max})"
+                ),
+                field="skill_invocation_trigger",
+                value=f"{trigger_value[:32]}... ({len(trigger_value)} chars)",
+                suggestions=[
+                    "Use a short trigger label, not a description of the invocation",
+                    f"Trim the value to at most {trigger_max} characters",
+                    "Or omit skill_invocation_trigger when the trigger is unknown",
+                ],
+                examples={
+                    "common_values": list(_SKILL_INVOCATION_TRIGGER_EXAMPLES),
+                    "max_length": trigger_max,
+                },
+            )
+
+        # skillName, skillPluginName and skillMarketplaceName are persisted in
+        # 256-character skill-catalog columns, and the catalog write runs
+        # fail-open downstream: an overlong value is never rejected — the
+        # insert fails silently and the transaction loses its skill attribution
+        # permanently while this call still reports success. Reject it here.
+        for catalog_field in ("skill_name", "skill_plugin_name", "skill_marketplace_name"):
+            catalog_max = _optional_string_max_length(catalog_field)
+            catalog_value = arguments.get(catalog_field)
+            if isinstance(catalog_value, str) and len(catalog_value) > catalog_max:
+                raise create_structured_validation_error(
+                    message=(
+                        f"{catalog_field} too long: {len(catalog_value)} characters "
+                        f"(max {catalog_max})"
+                    ),
+                    field=catalog_field,
+                    value=f"{catalog_value[:32]}... ({len(catalog_value)} chars)",
+                    suggestions=[
+                        "Use the short name only, not a description",
+                        f"Trim the value to at most {catalog_max} characters",
+                        f"Or omit {catalog_field} if it does not apply to this transaction",
+                    ],
+                    examples={"valid_format": "portfolio-analyzer", "max_length": catalog_max},
+                )
+
+        # skillSource and skillKind feed a shared skill catalog row that is
+        # written once from the first submission naming the skill and is never
+        # rewritten, so an unlisted value here is not a rejected transaction —
+        # it is a permanently wrong catalog entry.
+        for skill_field, accepted_values in _SKILL_VOCABULARIES.items():
+            skill_value = arguments.get(skill_field)
+            if isinstance(skill_value, str) and skill_value not in accepted_values:
+                raise create_structured_validation_error(
+                    message=(
+                        f"Invalid {skill_field}: '{skill_value}' is not an accepted value, "
+                        f"must be one of: {', '.join(accepted_values)}"
+                    ),
+                    field=skill_field,
+                    value=skill_value,
+                    suggestions=[
+                        f"Use one of the accepted values: {', '.join(accepted_values)}",
+                        "Values are case-sensitive and are not free text",
+                        f"Or omit {skill_field} when the value is unknown",
+                    ],
+                    examples={
+                        "accepted_values": list(accepted_values),
+                        "valid_format": accepted_values[0],
+                    },
+                )
+
         # Build payload matching EXACT Revenium API requirements
         payload = {
             "transactionId": transaction_id,
@@ -1812,6 +2309,18 @@ The subscriber data structure has been updated. The old individual fields are no
             "traceId": arguments.get("trace_id"),
             "subscriptionId": arguments.get("subscription_id"),
             "responseQualityScore": arguments.get("response_quality_score"),
+            # Ticket + skill attribution (nullable, optional — omitted when
+            # absent so existing submissions keep byte-identical payloads).
+            # Deliberately NOT routed through trace_fields.extract_trace_fields:
+            # that helper applies env-var fallbacks, and skill attribution must
+            # stay per-call opt-in or every transaction inherits a stale skill.
+            "ticketId": arguments.get("ticket_id"),
+            "skillName": arguments.get("skill_name"),
+            "skillSource": arguments.get("skill_source"),
+            "skillKind": arguments.get("skill_kind"),
+            "skillPluginName": arguments.get("skill_plugin_name"),
+            "skillMarketplaceName": arguments.get("skill_marketplace_name"),
+            "skillInvocationTrigger": arguments.get("skill_invocation_trigger"),
         }
 
         # Add non-None optional fields
@@ -2650,6 +3159,13 @@ class MeteringManagement(ToolBase):
 
             client = await self.get_client(ctx=ctx)
 
+            # Provider validation derives from the platform's AI-model catalog.
+            # Resolve it here, with this request's client, so the validators
+            # deeper in the call chain stay synchronous and need no client
+            # plumbed through them.
+            if action in _PROVIDER_VALIDATING_ACTIONS:
+                await _prime_provider_validation(client, arguments.get("provider"))
+
             # Route to appropriate handler
             if action == "submit_ai_transaction":
                 # Handle dry_run mode for transaction submission
@@ -2684,6 +3200,13 @@ class MeteringManagement(ToolBase):
                             ("agent", "Agent"),
                             ("trace_id", "Trace ID"),
                             ("error_reason", "Error Reason"),
+                            ("ticket_id", "Ticket ID"),
+                            ("skill_name", "Skill Name"),
+                            ("skill_source", "Skill Source"),
+                            ("skill_kind", "Skill Kind"),
+                            ("skill_plugin_name", "Skill Plugin Name"),
+                            ("skill_marketplace_name", "Skill Marketplace Name"),
+                            ("skill_invocation_trigger", "Skill Invocation Trigger"),
                         ]
 
                         for field_key, field_label in optional_fields_display:
@@ -3484,6 +4007,13 @@ class MeteringManagement(ToolBase):
                 "productName",
                 "subscriptionId",
                 "responseQualityScore",
+                "ticketId",
+                "skillName",
+                "skillSource",
+                "skillKind",
+                "skillPluginName",
+                "skillMarketplaceName",
+                "skillInvocationTrigger",
                 "isStreamed",
                 "stopReason",
                 "requestTime",
@@ -3796,6 +4326,13 @@ get_field_documentation()
 - `error_reason` (optional) - Error description if request failed
 - `is_streamed` (optional) - Whether response was streamed
 - `subscriber` (object) - Subscriber information with nested structure
+- `ticket_id` (optional) - External ticket/issue ID for cost attribution
+- `skill_name` (optional) - Agent skill that produced the request
+- `skill_source` (optional) - Where the skill was loaded from (closed set)
+- `skill_kind` (optional) - Kind of skill invoked (closed set)
+- `skill_plugin_name` (optional) - Plugin providing the skill
+- `skill_marketplace_name` (optional) - Marketplace the skill came from
+- `skill_invocation_trigger` (optional) - What triggered the invocation
 
 ### **Field Validation Rules**
 
@@ -3811,6 +4348,11 @@ get_field_documentation()
   - Type: String
   - Length: 1-500 characters
   - Invalid chars: `<`, `>`, `"`, `'`, `&`
+- `ticket_id`: String, 1-256 characters (e.g. `JIRA-1234`)
+- `skill_name`, `skill_plugin_name`, `skill_marketplace_name`: String, 1-256 characters
+- `skill_invocation_trigger`: String, 1-32 characters — commonly `user-slash`, `claude-proactive`, `nested-skill`
+- `skill_source`: One of `bundled`, `projectSettings`, `userSettings`, `plugin` (case-sensitive)
+- `skill_kind`: `workflow`, or omitted
 - `response_quality_score`: Float between 0.0 and 1.0 (inclusive)
 - `is_streamed`: Boolean (true/false, accepts string conversion)
 - `time_to_first_token`: Positive integer in milliseconds (≤ 60,000ms)
@@ -3846,7 +4388,14 @@ validate(model="<model>", provider="<provider>", input_tokens=3000, output_token
   },
   "product_name": "trading_platform_v2",
   "subscription_id": "sub_enterprise_trading",
-  "response_quality_score": 0.94
+  "response_quality_score": 0.94,
+  "ticket_id": "JIRA-1234",
+  "skill_name": "portfolio-analyzer",
+  "skill_source": "plugin",
+  "skill_kind": "workflow",
+  "skill_plugin_name": "quant-tools",
+  "skill_marketplace_name": "internal-catalog",
+  "skill_invocation_trigger": "user-slash"
 }
 ```
 
@@ -4179,6 +4728,8 @@ main();
 ### **Optional Fields**
 - **String fields**: `organization_name`, `task_type`, `agent`, `trace_id`, `product_name`, `subscription_id`, `stop_reason`
   - Length: 1-500 chars, no `<>\"'&`
+- **Capped string fields**: `ticket_id` (1-256 chars), `skill_name` / `skill_plugin_name` / `skill_marketplace_name` (1-256 chars), `skill_invocation_trigger` (1-32 chars)
+- **Closed-vocabulary fields**: `skill_source` (`bundled`, `projectSettings`, `userSettings`, `plugin`), `skill_kind` (`workflow`)
 - **Numeric fields**: `response_quality_score` (float 0.0-1.0), `time_to_first_token` (integer ≤ 60,000ms)
 - **Boolean fields**: `is_streamed` (true/false, string conversion supported)
 
@@ -4254,6 +4805,11 @@ list_ai_models()                       # List all models
 
 ## **Optional Fields**
 - `organization_name`, `task_type`, `agent`, `trace_id`, `product_name`, `subscription_id`, `stop_reason`, `error_reason` (string, 1-500 chars, no `< > " ' &`)
+- `ticket_id` (string, 1-256 chars) - external ticket/issue ID, e.g. `JIRA-1234`
+- `skill_name`, `skill_plugin_name`, `skill_marketplace_name` (string, 1-256 chars)
+- `skill_invocation_trigger` (string, 1-32 chars) - commonly `user-slash`, `claude-proactive`, `nested-skill`
+- `skill_source` (string) - one of `bundled`, `projectSettings`, `userSettings`, `plugin`
+- `skill_kind` (string) - `workflow`, or omitted
 - `response_quality_score` (float, 0.0-1.0)
 - `is_streamed` (boolean)
 - `time_to_first_token` (integer, ≤ 60,000ms)
@@ -4285,6 +4841,7 @@ list_ai_models()                       # List all models
 - **Quality**: + `response_quality_score`, `is_streamed`, `stop_reason`, `error_reason`
 - **Session**: + `trace_id`
 - **Billing**: + `product_name`, `subscription_id`, `subscriber`
+- **Ticket / Skill**: + `ticket_id`, `skill_name`, `skill_source`, `skill_kind`, `skill_plugin_name`, `skill_marketplace_name`, `skill_invocation_trigger`
 - **Timestamps**: + `request_time`, `response_time`, `completion_start_time`
 
 ## **Validation**
@@ -4634,7 +5191,18 @@ Use `validate()` before submission."""
 
             client = await self.get_client(ctx=ctx)
 
-            response = await client.search_ai_models(query=model, page=0, size=100)
+            # exactMatch makes the server compare the whole model name
+            # case-insensitively instead of running a substring search. The
+            # provider is still compared below: the name alone matching would
+            # greenlight a gpt-4o/ANTHROPIC pairing the catalog never prices.
+            response = await client.search_ai_models(
+                query=model, page=0, size=100, exactMatch=True
+            )
+            embedded = response.get("_embedded") if isinstance(response, dict) else None
+            if not (isinstance(embedded, dict) and embedded.get("aIModelResourceList")):
+                # No model carries that exact name. Re-run as a substring search
+                # so the "did you mean" branch below still has candidates.
+                response = await client.search_ai_models(query=model, page=0, size=100)
 
             if "_embedded" in response and "aIModelResourceList" in response["_embedded"]:
                 models = response["_embedded"]["aIModelResourceList"]
@@ -6146,6 +6714,36 @@ Use `validate()` before submission."""
                 "task_type": {
                     "type": "string",
                     "description": "Classification of AI operation for reporting and analytics. Also used as a search filter for lookup_recent_transactions.",
+                },
+                # Ticket + Skill Attribution Fields (optional, submission only —
+                # the completions search endpoint exposes no ticket/skill filters)
+                "ticket_id": {
+                    "type": "string",
+                    "description": f"External ticket or issue ID for cost attribution (e.g. 'JIRA-123', 'LINEAR-456'). Max {_optional_string_max_length('ticket_id')} characters. Submission field for submit_ai_transaction.",
+                },
+                "skill_name": {
+                    "type": "string",
+                    "description": f"Name of the agent skill that produced the request (e.g. 'portfolio-analyzer'). Max {_optional_string_max_length('skill_name')} characters. Submission field for submit_ai_transaction.",
+                },
+                "skill_source": {
+                    "type": "string",
+                    "description": f"Where the skill was loaded from. Accepted values only: {', '.join(_SKILL_SOURCE_VALUES)}. Case-sensitive - the value is persisted in a shared skill catalog, so an unlisted value is rejected.",
+                },
+                "skill_kind": {
+                    "type": "string",
+                    "description": f"Kind of skill invoked. Accepted values only: {', '.join(_SKILL_KIND_VALUES)}. Omit when the skill is not a workflow.",
+                },
+                "skill_plugin_name": {
+                    "type": "string",
+                    "description": f"Name of the plugin providing the skill - applies when skill_source is 'plugin'. Max {_optional_string_max_length('skill_plugin_name')} characters.",
+                },
+                "skill_marketplace_name": {
+                    "type": "string",
+                    "description": f"Name of the marketplace the skill or plugin was obtained from. Max {_optional_string_max_length('skill_marketplace_name')} characters.",
+                },
+                "skill_invocation_trigger": {
+                    "type": "string",
+                    "description": f"What triggered the skill invocation. Max {_optional_string_max_length('skill_invocation_trigger')} characters; common values: {', '.join(_SKILL_INVOCATION_TRIGGER_EXAMPLES)}.",
                 },
                 # Pagination and Search Control Parameters
                 "search_page_range": {

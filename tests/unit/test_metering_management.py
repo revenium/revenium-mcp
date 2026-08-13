@@ -716,6 +716,126 @@ class TestMeteringManagementHandleAction:
 
 
 # ===========================================================================
+# MeteringManagement — validate_model_provider catalog lookup
+# ===========================================================================
+
+
+CATALOG_MODELS = [
+    {
+        "id": "model_gpt4o_openai",
+        "name": "gpt-4o",
+        "provider": "OPENAI",
+        "inputCostPerToken": 0.0000025,
+        "outputCostPerToken": 0.00001,
+    },
+    {"id": "model_gpt4o_azure", "name": "gpt-4o", "provider": "AZURE"},
+    {"id": "model_gpt4o_mini", "name": "gpt-4o-mini", "provider": "OPENAI"},
+]
+
+
+def make_model_catalog_client(models=None):
+    """Client whose search_ai_models honours exactMatch the way the API does.
+
+    Without exactMatch the query is a substring match on the model name; with it
+    the whole name must match, case-insensitively.
+    """
+    catalog = CATALOG_MODELS if models is None else models
+    client = make_client()
+
+    async def _search(query, page=0, size=20, **filters):
+        if filters.get("exactMatch"):
+            matches = [m for m in catalog if m["name"].lower() == query.lower()]
+        else:
+            matches = [m for m in catalog if query.lower() in m["name"].lower()]
+        return {"_embedded": {"aIModelResourceList": matches}}
+
+    client.search_ai_models = AsyncMock(side_effect=_search)
+    return client
+
+
+class TestValidateModelProviderUsesExactMatch:
+    """validate_model_provider asks the server for the exact name match."""
+
+    @pytest.fixture
+    def mgmt(self):
+        return MeteringManagement()
+
+    @pytest.mark.asyncio
+    async def test_valid_pair_needs_one_exact_lookup(self, mgmt):
+        client = make_model_catalog_client()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            result = await mgmt.handle_action(
+                "validate_model_provider", {"model": "gpt-4o", "provider": "openai"}
+            )
+
+        text = result[0].text
+        assert "Valid Model/Provider Combination" in text, text
+        assert "model_gpt4o_openai" in text
+        client.search_ai_models.assert_called_once_with(
+            query="gpt-4o", page=0, size=100, exactMatch=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_provider_is_still_compared_client_side(self, mgmt):
+        """A name-only match must not greenlight a pairing the catalog lacks."""
+        client = make_model_catalog_client()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            result = await mgmt.handle_action(
+                "validate_model_provider", {"model": "gpt-4o", "provider": "anthropic"}
+            )
+
+        text = result[0].text
+        assert "Invalid Model/Provider Combination" in text, text
+        assert "Did you mean" in text
+        assert "OPENAI" in text and "AZURE" in text
+
+    @pytest.mark.asyncio
+    async def test_unknown_name_falls_back_to_the_substring_search(self, mgmt):
+        """The 'did you mean' list needs the partial matches exactMatch filters out."""
+        client = make_model_catalog_client()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            result = await mgmt.handle_action(
+                "validate_model_provider", {"model": "gpt-4", "provider": "openai"}
+            )
+
+        text = result[0].text
+        assert "Did you mean" in text, text
+        assert "gpt-4o" in text
+        assert client.search_ai_models.call_count == 2
+        assert client.search_ai_models.call_args_list[1].kwargs == {
+            "query": "gpt-4",
+            "page": 0,
+            "size": 100,
+        }
+
+    @pytest.mark.asyncio
+    async def test_no_candidate_at_all_reports_not_found(self, mgmt):
+        client = make_model_catalog_client()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            result = await mgmt.handle_action(
+                "validate_model_provider",
+                {"model": "no-such-model", "provider": "openai"},
+            )
+
+        text = result[0].text
+        assert "Model/Provider Not Found" in text, text
+        assert client.search_ai_models.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_empty_page_without_an_embedded_envelope_is_survivable(self, mgmt):
+        """An empty HAL page may omit _embedded entirely; both reads must be tried."""
+        client = make_client()
+        client.search_ai_models = AsyncMock(return_value={"page": {"totalElements": 0}})
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            result = await mgmt.handle_action(
+                "validate_model_provider", {"model": "gpt-4o", "provider": "openai"}
+            )
+
+        assert isinstance(result[0], TextContent)
+        assert client.search_ai_models.call_count == 2
+
+
+# ===========================================================================
 # MeteringManagement — _normalize_return_data_parameter (top-level tool)
 # ===========================================================================
 

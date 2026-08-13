@@ -98,6 +98,25 @@ class TestHandleActionRouting:
         assert exc.value.field == "page"
 
     @pytest.mark.asyncio
+    async def test_skill_actions_are_routed(self, analytics_tool):
+        """list_skills / get_skill reach their own handlers rather than falling
+        through to the unsupported-action branch."""
+        analytics_tool._handle_list_skills = AsyncMock(return_value=[])
+        analytics_tool._handle_get_skill = AsyncMock(return_value=[])
+        await analytics_tool.handle_action("list_skills", {})
+        await analytics_tool.handle_action("get_skill", {"skill_id": "JMwX9g4"})
+        analytics_tool._handle_list_skills.assert_awaited_once()
+        analytics_tool._handle_get_skill.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_skill_period_outside_enum_rejected(self, analytics_tool):
+        """The skills period enum is validated pre-flight, so a bad value never
+        reaches the API and the structured envelope is not turned into text."""
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("list_skills", {"period": "LAST_WEEK"})
+        assert exc.value.field == "period"
+
+    @pytest.mark.asyncio
     async def test_valid_page_passes_validation(self, analytics_tool):
         """A correctly-typed page does not trip validation; the action proceeds
         normally and any downstream behaviour is unchanged."""

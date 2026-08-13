@@ -414,6 +414,91 @@ class TestJobManagerReportOutcome:
         assert "job_id" in str(exc_info.value).lower()
 
 
+class TestReportOutcomeReason:
+    """outcomeReason has to survive the tool boundary and be discoverable.
+
+    The field only reaches the API if the caller sends it, and callers only send
+    what the tool documents — so both the passthrough and the agent-facing text
+    are asserted here.
+    """
+
+    @pytest.mark.asyncio
+    async def test_outcome_reason_forwarded_verbatim(self, job_manager, mock_client):
+        """outcome_data reaches the client unchanged, outcomeReason included."""
+        mock_client.report_job_outcome.return_value = {"id": "o1"}
+        outcome_data = {
+            "executionStatus": "FAILED",
+            "outcomeType": "UNSUCCESSFUL",
+            "outcomeReason": "Upstream agent timed out after 300s",
+        }
+
+        await job_manager.report_outcome({"job_id": "j1", "outcome_data": outcome_data})
+
+        sent = mock_client.report_job_outcome.call_args[0][1]
+        assert sent == outcome_data
+        assert sent["outcomeReason"] == "Upstream agent timed out after 300s"
+
+    @pytest.mark.asyncio
+    async def test_unrecognised_keys_are_not_filtered(self, job_manager, mock_client):
+        """No allowlist sits between the tool and the client, so fields the API
+        gains later work without a release here."""
+        mock_client.report_job_outcome.return_value = {"id": "o1"}
+        outcome_data = {"executionStatus": "SUCCESS", "someFutureField": "keep me"}
+
+        await job_manager.report_outcome({"job_id": "j1", "outcome_data": outcome_data})
+
+        assert mock_client.report_job_outcome.call_args[0][1] == outcome_data
+
+    @pytest.mark.asyncio
+    async def test_missing_outcome_data_error_documents_outcome_reason(self, job_manager):
+        """The pre-flight error teaches outcomeReason in both examples and suggestions."""
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.report_outcome({"job_id": "j1"})
+
+        err = exc_info.value
+        assert err.field == "outcome_data"
+        assert "outcomeReason" in json.dumps(err.examples)
+        assert any("outcomeReason" in suggestion for suggestion in err.suggestions)
+        # camelCase only — a snake_case alias would be dropped upstream silently
+        assert "outcome_reason" not in json.dumps(err.examples)
+
+    @pytest.mark.asyncio
+    async def test_capabilities_document_outcome_reason(self, job_mgmt, mock_mgmt_client):
+        """get_capabilities names outcomeReason on the write action and on the reads."""
+        result = await job_mgmt.handle_action("get_capabilities", {})
+        parameters = json.loads(result[0].text)["parameters"]
+
+        assert "outcomeReason" in json.dumps(parameters["report_outcome"])
+        assert "outcomeReason" in json.dumps(parameters["list_jobs"])
+        assert "outcomeReason" in json.dumps(parameters["get_job"])
+
+    @pytest.mark.asyncio
+    async def test_capabilities_scope_outcome_reason_to_outcome_data(
+        self, job_mgmt, mock_mgmt_client
+    ):
+        """report_outcome reads only job_id and outcome_data from the call, so the
+        schema must not advertise outcomeReason as a sibling of them — a value put
+        there would be dropped without an error."""
+        result = await job_mgmt.handle_action("get_capabilities", {})
+        report_outcome = json.loads(result[0].text)["parameters"]["report_outcome"]
+
+        assert set(report_outcome) == {"job_id", "outcome_data"}
+        assert "outcomeReason" in report_outcome["outcome_data"]
+
+    @pytest.mark.asyncio
+    async def test_examples_use_api_field_names(self, job_mgmt, mock_mgmt_client):
+        """The templates agents copy carry the request-body spelling of every key."""
+        result = await job_mgmt.handle_action("get_examples", {})
+        parsed = json.loads(result[0].text)
+        report = parsed["report_outcome"]
+
+        assert report["example_converted"]["outcome_data"]["executionStatus"] == "SUCCESS"
+        assert report["example_converted"]["outcome_data"]["outcomeType"] == "CONVERTED"
+        assert "outcomeReason" in report["example_failed"]["outcome_data"]
+        assert "outcomeReason" in parsed["list_jobs"]["description"]
+        assert "outcomeReason" in parsed["get_job"]["description"]
+
+
 # ===========================================================================
 # JobManagement handle_action routing tests (meta-actions)
 # ===========================================================================

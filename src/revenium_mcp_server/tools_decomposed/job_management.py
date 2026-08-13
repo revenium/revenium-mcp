@@ -324,9 +324,33 @@ class JobManager:
                 message="outcome_data is required for report_outcome action",
                 error_code=ErrorCodes.VALIDATION_ERROR,
                 field="outcome_data",
-                examples={"report_outcome": {"outcome": "CONVERTED", "revenue": 99.99}},
-                suggestions=["Provide a dict with 'outcome' (CONVERTED or UNSUCCESSFUL), 'revenue', and optional 'notes'"],
+                examples={
+                    "report_outcome_converted": {
+                        "executionStatus": "SUCCESS",
+                        "outcomeType": "CONVERTED",
+                        "outcomeValue": 99.99,
+                        "outcomeCurrency": "USD",
+                    },
+                    "report_outcome_failed": {
+                        "executionStatus": "FAILED",
+                        "outcomeType": "UNSUCCESSFUL",
+                        "outcomeReason": "Upstream agent timed out after 300s",
+                    },
+                },
+                suggestions=[
+                    "Provide a dict with 'executionStatus' (SUCCESS, FAILED, or CANCELLED) "
+                    "plus optional 'outcomeType' (CONVERTED, ESCALATED, DEFLECTED, "
+                    "UNSUCCESSFUL, or CUSTOM), 'outcomeValue', and 'outcomeCurrency'",
+                    "When executionStatus is FAILED or CANCELLED, explain why in "
+                    "'outcomeReason' — a human-readable string; do not bury the reason "
+                    "inside 'metadata'",
+                    "Keys are camelCase and are sent to the API exactly as given; a "
+                    "snake_case or invented key is silently ignored upstream",
+                ],
             )
+        # outcome_data is forwarded verbatim so that fields added to the outcome
+        # contract (outcomeReason was the most recent) reach the API without a
+        # release here. Do not introduce key filtering or renaming on this path.
         try:
             result = await self.client.report_job_outcome(job_id, outcome_data)
             return {"action": "report_outcome", "job_id": job_id, "data": _strip_links(result)}
@@ -407,8 +431,19 @@ class JobManagement(ToolBase):
                                 "outcomeType (CONVERTED|ESCALATED|DEFLECTED|UNSUCCESSFUL|CUSTOM|PENDING), "
                                 "startDate (ISO 8601), endDate (ISO 8601), sort"
                             ),
+                            "returns": (
+                                "job records carrying outcomeReason — the human-readable "
+                                "explanation of why a job failed or was cancelled (null "
+                                "until an outcome with a reason is reported)"
+                            ),
                         },
-                        "get_job": {"job_id": "str (required)"},
+                        "get_job": {
+                            "job_id": "str (required)",
+                            "returns": (
+                                "a job record carrying outcomeReason — read it instead of "
+                                "parsing a reason out of outcomeMetadata"
+                            ),
+                        },
                         "get_job_transactions": {
                             "job_id": "str (required)",
                             "page": "int (default 0)",
@@ -431,7 +466,18 @@ class JobManagement(ToolBase):
                         },
                         "report_outcome": {
                             "job_id": "str (required)",
-                            "outcome_data": "dict (required)",
+                            "outcome_data": (
+                                "dict (required), camelCase keys forwarded verbatim: "
+                                "executionStatus (SUCCESS|FAILED|CANCELLED, required), "
+                                "outcomeType (CONVERTED|ESCALATED|DEFLECTED|UNSUCCESSFUL|CUSTOM), "
+                                "outcomeValue (number), outcomeCurrency (ISO 4217, defaults to USD), "
+                                "metadata (JSON string), "
+                                "outcomeReason (str — human-readable explanation of why the "
+                                "job failed or was cancelled). "
+                                "outcomeReason is a key of this dict; only job_id and "
+                                "outcome_data are read from the call, so a sibling argument "
+                                "of any other name is dropped"
+                            ),
                         },
                     },
                 }
@@ -440,7 +486,11 @@ class JobManagement(ToolBase):
             elif action == "get_examples":
                 examples = {
                     "list_jobs": {
-                        "description": "List all jobs with pagination",
+                        "description": (
+                            "List all jobs with pagination. Each job record carries "
+                            "outcomeReason, the human-readable explanation of a failed or "
+                            "cancelled outcome"
+                        ),
                         "example": {"action": "list_jobs", "page": 0, "size": 20},
                         "with_filters": {
                             "action": "list_jobs",
@@ -450,7 +500,10 @@ class JobManagement(ToolBase):
                         },
                     },
                     "get_job": {
-                        "description": "Get a specific job by ID",
+                        "description": (
+                            "Get a specific job by ID. The record carries outcomeReason "
+                            "alongside outcomeType, outcomeValue and outcomeMetadata"
+                        ),
                         "example": {"action": "get_job", "job_id": "job_123"},
                     },
                     "get_job_transactions": {
@@ -487,23 +540,44 @@ class JobManagement(ToolBase):
                         },
                     },
                     "report_outcome": {
-                        "description": "Report an outcome for a job (409 = duplicate, already reported)",
-                        "outcome_types": ["CONVERTED", "UNSUCCESSFUL"],
+                        "description": (
+                            "Report an outcome for a job (409 = duplicate, already reported). "
+                            "outcome_data keys are sent to the API verbatim, so use the "
+                            "camelCase spellings below"
+                        ),
+                        "execution_statuses": ["SUCCESS", "FAILED", "CANCELLED"],
+                        "outcome_types": [
+                            "CONVERTED",
+                            "ESCALATED",
+                            "DEFLECTED",
+                            "UNSUCCESSFUL",
+                            "CUSTOM",
+                        ],
                         "example_converted": {
                             "action": "report_outcome",
                             "job_id": "job_123",
                             "outcome_data": {
-                                "outcome": "CONVERTED",
-                                "revenue": 99.99,
-                                "notes": "Customer purchased premium plan",
+                                "executionStatus": "SUCCESS",
+                                "outcomeType": "CONVERTED",
+                                "outcomeValue": 99.99,
+                                "outcomeCurrency": "USD",
                             },
                         },
                         "example_unsuccessful": {
                             "action": "report_outcome",
                             "job_id": "job_456",
                             "outcome_data": {
-                                "outcome": "UNSUCCESSFUL",
-                                "notes": "Customer declined after trial period",
+                                "executionStatus": "SUCCESS",
+                                "outcomeType": "UNSUCCESSFUL",
+                                "outcomeReason": "Customer declined after the trial period",
+                            },
+                        },
+                        "example_failed": {
+                            "action": "report_outcome",
+                            "job_id": "job_789",
+                            "outcome_data": {
+                                "executionStatus": "FAILED",
+                                "outcomeReason": "Upstream agent timed out after 300s",
                             },
                         },
                     },
@@ -642,7 +716,10 @@ class JobManagement(ToolBase):
         return [
             ToolCapability(
                 name="Job Listing and Retrieval",
-                description="List and retrieve job details with pagination support",
+                description=(
+                    "List and retrieve job details with pagination support; job records "
+                    "carry outcomeReason for failed or cancelled outcomes"
+                ),
                 parameters={
                     "list_jobs": {"page": "int", "size": "int", "filters": "dict"},
                     "get_job": {"job_id": "str"},
@@ -675,7 +752,10 @@ class JobManagement(ToolBase):
                 },
                 examples=[
                     "get_job_types()",
-                    "report_outcome(job_id='job_123', outcome_data={'outcome': 'CONVERTED'})",
+                    "report_outcome(job_id='job_123', outcome_data={'executionStatus': "
+                    "'SUCCESS', 'outcomeType': 'CONVERTED', 'outcomeValue': 99.99})",
+                    "report_outcome(job_id='job_789', outcome_data={'executionStatus': "
+                    "'FAILED', 'outcomeReason': 'Upstream agent timed out after 300s'})",
                 ],
             ),
         ]
@@ -743,13 +823,14 @@ Track and analyze job performance in the Revenium Jobs & Outcomes system.
 
 **Key Actions:**
 • list_jobs — List all jobs with pagination
-• get_job — Get job details by ID
+• get_job — Get job details by ID, including outcomeReason for failed or cancelled jobs
 • get_job_transactions — View transactions for a job
 • get_job_roi — Get ROI metrics for a job
 • get_job_types — List available job types
 • get_conversion_funnel — View conversion funnel data
 • get_roi_summary — Aggregated ROI across all job types (orchestrates types + funnels)
-• report_outcome — Report a job outcome (CONVERTED or UNSUCCESSFUL; 409 = already reported)
+• report_outcome — Report a job outcome (executionStatus plus optional outcomeType and
+  outcomeReason; 409 = already reported)
 
 **Quick Start:**
 1. Call get_capabilities() to explore all parameters

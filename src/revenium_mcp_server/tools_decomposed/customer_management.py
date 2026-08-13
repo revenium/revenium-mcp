@@ -5,7 +5,7 @@ tool with internal composition, following the proven alert/source management tem
 """
 
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -79,6 +79,238 @@ def _validate_lookup_email(email: Any, action: str) -> str:
         )
 
     return candidate
+
+
+# Marketplace-settings support -------------------------------------------------
+
+MARKETPLACE_OPERATIONS = ("add", "remove", "replace")
+
+# Stated on every mutating response because this is not a passive setting: the
+# API rewrites the provenance of already-recorded plugin skill usage to match
+# the new list, so an accidental omission silently rewrites history.
+MARKETPLACE_RECLASSIFICATION_NOTE = (
+    "Changing this setting re-classifies existing plugin-sourced skill usage records: "
+    "skills from marketplaces now listed as internal become ORGANIZATION, and skills "
+    "from marketplaces no longer listed revert to THIRD_PARTY."
+)
+
+# The resource carries no version or ETag, so add/remove cannot make their read and
+# their PUT atomic. Stated on every mutating response rather than hidden in the docs
+# because the failure mode is silent: the losing writer's names simply disappear.
+MARKETPLACE_CONCURRENCY_NOTE = (
+    "The upstream settings resource offers no version or ETag, so the read-then-PUT this "
+    "action performs is not atomic: a concurrent update can interleave and the last full "
+    "PUT wins. Re-read with get_marketplace_settings to confirm the stored list."
+)
+
+# Raised into the response when the API's echoed list disagrees with what was sent,
+# which is the only in-band evidence of a lost update this endpoint can give.
+MARKETPLACE_DIVERGENCE_NOTE = (
+    "The list the API stored differs from the list this action sent, so another update "
+    "landed between the read and the write. The stored list is authoritative; re-read the "
+    "settings and re-apply the intended change if it is still needed."
+)
+
+
+def _extract_marketplace_names(settings: Any) -> Optional[List[str]]:
+    """Read internalMarketplaceNames out of a marketplace-settings payload.
+
+    Returns None when the payload carries no usable array and the list itself when it
+    does, keeping "the field was absent" separate from "the field was an empty list":
+    an empty list is a legitimate state here (no marketplace is internal), so callers
+    that need a fallback must branch on None rather than on falsiness.
+    """
+    if isinstance(settings, dict):
+        names = settings.get("internalMarketplaceNames")
+        if isinstance(names, list):
+            return [str(name) for name in names]
+    return None
+
+
+# Not a create template: schema discovery only knows the create payloads, so the
+# marketplace-settings action is injected alongside the teams examples by hand.
+MARKETPLACE_SETTINGS_EXAMPLE = {
+    "name": "Update Team Internal-Marketplace Settings",
+    "description": "Mark Claude Code plugin marketplaces as internal (company-owned) for a team",
+    "template": {
+        "action": "update_marketplace_settings",
+        "team_id": "jR2kmLs",
+        "marketplace_names": ["acme-internal"],
+        "operation": "add",
+    },
+    "note": MARKETPLACE_RECLASSIFICATION_NOTE,
+}
+
+# The example belongs to teams only, so an unfiltered request or an explicit teams
+# request gets it and anything else does not.
+MARKETPLACE_EXAMPLE_RESOURCE_TYPES = (None, "", "teams")
+
+
+def _with_marketplace_example(
+    payload: Dict[str, Any], resource_type: Optional[str]
+) -> Dict[str, Any]:
+    """Append the marketplace-settings example to *payload* when the filter allows it.
+
+    Single guard for every return path of CustomerValidator.get_examples so an
+    unrecognized resource_type cannot collect the teams-only example.
+    """
+    if resource_type not in MARKETPLACE_EXAMPLE_RESOURCE_TYPES:
+        return payload
+    examples = payload.setdefault("examples", [])
+    if not isinstance(examples, list):
+        return payload
+    if MARKETPLACE_SETTINGS_EXAMPLE not in examples:
+        examples.append(dict(MARKETPLACE_SETTINGS_EXAMPLE))
+    return payload
+
+
+def _dedupe_marketplace_names(names: List[str]) -> List[str]:
+    """Drop duplicates while preserving first-seen order (the array is a set upstream)."""
+    return list(dict.fromkeys(names))
+
+
+def _validate_marketplace_names(value: Any, *, allow_empty: bool) -> List[str]:
+    """Validate the marketplace_names argument and return the trimmed names."""
+    if value is None:
+        raise create_structured_missing_parameter_error(
+            parameter_name="marketplace_names",
+            action="update_marketplace_settings",
+            examples={
+                "usage": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'])",
+                "valid_formats": ["marketplace_names must be a list of marketplace name strings"],
+                "example_values": [["acme-internal"], ["acme-internal", "revenium-tools"]],
+                "operations": "operation='add' (default) merges into the current list, 'remove' subtracts, 'replace' overwrites it",
+                "side_effect": MARKETPLACE_RECLASSIFICATION_NOTE,
+            },
+        )
+
+    if not isinstance(value, list):
+        raise create_structured_validation_error(
+            message="marketplace_names must be a list of marketplace name strings",
+            field="marketplace_names",
+            value=value,
+            suggestions=[
+                "Pass a list even for a single marketplace, e.g. marketplace_names=['acme-internal']",
+                "Use get_marketplace_settings(team_id=...) to see the current list first",
+            ],
+            examples={
+                "usage": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'])",
+                "example_values": [["acme-internal"], ["acme-internal", "revenium-tools"]],
+            },
+        )
+
+    if not value and not allow_empty:
+        raise create_structured_validation_error(
+            message="marketplace_names must name at least one marketplace",
+            field="marketplace_names",
+            value=value,
+            suggestions=[
+                "Name the marketplaces to add or remove",
+                "To clear every internal marketplace, use operation='replace' with marketplace_names=[]",
+            ],
+            examples={
+                "usage": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'], operation='add')",
+                "clear_all": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=[], operation='replace')",
+            },
+        )
+
+    cleaned: List[str] = []
+    for name in value:
+        if not isinstance(name, str) or not name.strip():
+            raise create_structured_validation_error(
+                message="marketplace_names entries must be non-empty marketplace name strings",
+                field="marketplace_names",
+                value=value,
+                suggestions=[
+                    "Remove empty or non-string entries from marketplace_names",
+                    "Marketplace names are the Claude Code plugin marketplace identifiers",
+                ],
+                examples={
+                    "usage": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'])",
+                    "example_values": [["acme-internal", "revenium-tools"]],
+                },
+            )
+        cleaned.append(name.strip())
+
+    return _dedupe_marketplace_names(cleaned)
+
+
+def _validate_marketplace_operation(value: Any) -> str:
+    """Validate the optional operation argument, defaulting to the non-destructive merge."""
+    if value is None:
+        return "add"
+    if not isinstance(value, str) or value.strip().lower() not in MARKETPLACE_OPERATIONS:
+        raise create_structured_validation_error(
+            message=f"Unknown marketplace settings operation: {value}",
+            field="operation",
+            value=value,
+            suggestions=[
+                "Use operation='add' to merge names into the current list (default)",
+                "Use operation='remove' to subtract names from the current list",
+                "Use operation='replace' only when sending the complete intended list",
+            ],
+            examples={
+                "valid_operations": list(MARKETPLACE_OPERATIONS),
+                "usage": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'], operation='add')",
+            },
+        )
+    return value.strip().lower()
+
+
+def _raise_marketplace_settings_error(
+    error: ReveniumAPIError, team_id: str, action: str
+) -> NoReturn:
+    """Translate the marketplace-settings failures an agent can act on; re-raise the rest."""
+    if error.status_code == 403:
+        raise ToolError(
+            message=f"Insufficient permissions to manage marketplace settings for team {team_id}",
+            error_code=ErrorCodes.API_AUTHORIZATION,
+            field="team_id",
+            value=team_id,
+            suggestions=[
+                "Marketplace settings require team-management permissions on the target team",
+                "Ask a team administrator to run the change, or request team-management access",
+                "Confirm the API key is scoped to the team you are targeting",
+            ],
+            examples={
+                "usage": f"{action}(team_id='jR2kmLs')",
+                "discover_teams": "list(resource_type='teams')",
+            },
+        )
+    if error.status_code == 404:
+        raise ToolError(
+            message=f"Team not found for id: {team_id}",
+            error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+            field="team_id",
+            value=team_id,
+            suggestions=[
+                "Verify the team ID exists using list(resource_type='teams')",
+                "Check if the team was recently deleted",
+            ],
+            examples={"usage": f"{action}(team_id='jR2kmLs')"},
+        )
+    if error.status_code == 409:
+        # The only concurrency signal the endpoint documents; without it a lost update
+        # would surface as a generic API failure the caller cannot act on.
+        raise ToolError(
+            message=(
+                f"Marketplace settings for team {team_id} changed concurrently - "
+                "re-read the settings and retry"
+            ),
+            error_code=ErrorCodes.RESOURCE_CONFLICT,
+            field="team_id",
+            value=team_id,
+            suggestions=[
+                f"Re-read the current list with get_marketplace_settings(team_id='{team_id}')",
+                "Re-apply the intended change against the list you just read",
+                MARKETPLACE_CONCURRENCY_NOTE,
+            ],
+            examples={
+                "usage": f"{action}(team_id='jR2kmLs')",
+                "re_read": f"get_marketplace_settings(team_id='{team_id}')",
+            },
+        )
+    raise error
 
 
 class BaseManager:
@@ -1072,6 +1304,110 @@ class TeamManager(BaseManager):
         result = await self.client.delete_team(team_id)
         return result
 
+    def _require_team_id(self, arguments: Dict[str, Any], action: str) -> str:
+        """Return the team_id required by the marketplace-settings actions."""
+        team_id = arguments.get("team_id")
+        if not isinstance(team_id, str) or not team_id.strip():
+            raise create_structured_missing_parameter_error(
+                parameter_name="team_id",
+                action=action,
+                examples={
+                    "usage": f"{action}(team_id='jR2kmLs')",
+                    "valid_format": "Team ID should be a Revenium hashid string",
+                    "discover_teams": "list(resource_type='teams')",
+                },
+            )
+        return team_id.strip()
+
+    async def _read_marketplace_names(self, team_id: str, action: str) -> List[str]:
+        """Read the team's current internal-marketplace list."""
+        try:
+            settings = await self.client.get_team_marketplace_settings(team_id)
+        except ReveniumAPIError as e:
+            _raise_marketplace_settings_error(e, team_id, action)
+        names = _extract_marketplace_names(settings)
+        # The read schema marks the array required, but a team that has never configured
+        # marketplaces can answer without it; on a read both shapes mean "nothing internal".
+        return [] if names is None else names
+
+    async def get_marketplace_settings(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Get the team's internal (company-owned) plugin marketplace settings."""
+        action = "get_marketplace_settings"
+        team_id = self._require_team_id(arguments, action)
+
+        names = await self._read_marketplace_names(team_id, action)
+
+        return {
+            "action": action,
+            "resource_type": "teams",
+            "team_id": team_id,
+            "internalMarketplaceNames": names,
+            "total_found": len(names),
+            "classification": "Plugin-sourced skills from these marketplaces classify as ORGANIZATION; skills from any other marketplace classify as THIRD_PARTY.",
+        }
+
+    async def update_marketplace_settings(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Change the team's internal (company-owned) plugin marketplace settings.
+
+        The upstream PUT replaces internalMarketplaceNames wholesale, so every operation
+        reads the current list first and sends the merged result: a bare PUT carrying one
+        name would drop the rest and re-classify their skills.
+        """
+        action = "update_marketplace_settings"
+        team_id = self._require_team_id(arguments, action)
+        operation = _validate_marketplace_operation(arguments.get("operation"))
+        names = _validate_marketplace_names(
+            arguments.get("marketplace_names"), allow_empty=operation == "replace"
+        )
+
+        current = await self._read_marketplace_names(team_id, action)
+
+        if operation == "add":
+            merged = current + [name for name in names if name not in current]
+        elif operation == "remove":
+            merged = [name for name in current if name not in names]
+        else:
+            merged = names
+
+        try:
+            updated = await self.client.update_team_marketplace_settings(
+                team_id, {"internalMarketplaceNames": merged}
+            )
+        except ReveniumAPIError as e:
+            _raise_marketplace_settings_error(e, team_id, action)
+
+        # The API echoes the stored resource. An echoed empty list is a real end state,
+        # so only an absent field falls back to the list we sent.
+        echoed = _extract_marketplace_names(updated)
+        applied = merged if echoed is None else echoed
+
+        result: Dict[str, Any] = {
+            "action": action,
+            "resource_type": "teams",
+            "team_id": team_id,
+            "operation": operation,
+            "previous_internalMarketplaceNames": current,
+            "requested_internalMarketplaceNames": merged,
+            "internalMarketplaceNames": applied,
+            "added": [name for name in applied if name not in current],
+            "removed": [name for name in current if name not in applied],
+            "reclassification_warning": MARKETPLACE_RECLASSIFICATION_NOTE,
+            "concurrency_note": MARKETPLACE_CONCURRENCY_NOTE,
+        }
+
+        # Membership, not order: the upstream array is a set, so only a difference in
+        # which names are stored evidences an interleaved write.
+        if echoed is not None and set(echoed) != set(merged):
+            result["divergence_warning"] = MARKETPLACE_DIVERGENCE_NOTE
+            result["unexpectedly_present"] = [
+                name for name in applied if name not in merged
+            ]
+            result["unexpectedly_absent"] = [
+                name for name in merged if name not in applied
+            ]
+
+        return result
+
 
 class CustomerValidator:
     """Internal manager for customer validation and schema discovery with UCM integration."""
@@ -1243,16 +1579,20 @@ class CustomerValidator:
                         if not has_proper_subscriber:
                             # Insert our subscriber example at the beginning for visibility
                             schema_examples["examples"].insert(0, static_examples["subscribers"])
-                    return schema_examples
+                    return _with_marketplace_example(schema_examples, resource_type)
             except Exception:
                 # Fall back to static examples if schema discovery fails
                 pass
 
         # Use static examples as fallback
         if resource_type and resource_type in static_examples:
-            return {"examples": [static_examples[resource_type]]}
+            return _with_marketplace_example(
+                {"examples": [static_examples[resource_type]]}, resource_type
+            )
 
-        return {"examples": list(static_examples.values())}
+        return _with_marketplace_example(
+            {"examples": list(static_examples.values())}, resource_type
+        )
 
     async def validate_configuration(
         self, resource_type: str, resource_data: Dict[str, Any], dry_run: bool = True
@@ -1913,6 +2253,34 @@ class CustomerManagement(ToolBase):
                     )
                 ]
 
+            # Team internal-marketplace settings (a sub-resource of teams)
+            elif action == "get_marketplace_settings":
+                result = await team_manager.get_marketplace_settings(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Internal marketplace settings for team {result['team_id']}:\n\n"
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "update_marketplace_settings":
+                result = await team_manager.update_marketplace_settings(arguments)
+                # A divergence between the sent and the stored list is a lost-update
+                # signal, so it leads the rendered text instead of sitting in the JSON.
+                divergence = result.get("divergence_warning")
+                text = f"Internal marketplace settings updated for team {result['team_id']}:\n\n"
+                if divergence:
+                    text += f"WARNING: {divergence}\n\n"
+                return [
+                    TextContent(
+                        type="text",
+                        text=text
+                        + json.dumps(result, indent=2)
+                        + f"\n\n{MARKETPLACE_RECLASSIFICATION_NOTE}",
+                    )
+                ]
+
             # Analytics and relationship operations
             elif action == "analyze":
                 result = await analytics_processor.analyze_customers(arguments)
@@ -2004,6 +2372,10 @@ class CustomerManagement(ToolBase):
                     examples={
                         "basic_actions": ["list", "get", "create", "update", "delete"],
                         "lookup_actions": ["lookup_user", "lookup_subscriber"],
+                        "team_settings_actions": [
+                            "get_marketplace_settings",
+                            "update_marketplace_settings",
+                        ],
                         "analysis_actions": ["analyze", "get_relationships"],
                         "discovery_actions": [
                             "get_capabilities",
@@ -2019,6 +2391,8 @@ class CustomerManagement(ToolBase):
                             "get_subscriber": "get(resource_type='subscribers', subscriber_id='sub_123')",
                             "lookup_subscriber": "lookup_subscriber(email='joao@acme.com')",
                             "lookup_user": "lookup_user(email='admin@acme.com')",
+                            "get_marketplace_settings": "get_marketplace_settings(team_id='jR2kmLs')",
+                            "update_marketplace_settings": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'], operation='add')",
                         },
                     },
                 )
@@ -2123,6 +2497,14 @@ class CustomerManagement(ToolBase):
                     for field in field_config.get("optional", []):
                         result_text += f"- `{field}`\n"
                     result_text += "\n"
+
+        result_text += "## **Team Internal-Marketplace Settings**\n"
+        result_text += "Which Claude Code plugin marketplaces a team treats as internal (company-owned).\n\n"
+        result_text += "- `get_marketplace_settings(team_id='jR2kmLs')` - read the current `internalMarketplaceNames` list\n"
+        result_text += "- `update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'], operation='add')` - `add` (default) merges into the current list, `remove` subtracts, `replace` overwrites\n"
+        result_text += f"- **Side effect**: {MARKETPLACE_RECLASSIFICATION_NOTE}\n"
+        result_text += "- Updates require team-management permissions on the target team\n"
+        result_text += f"- **Limitation**: {MARKETPLACE_CONCURRENCY_NOTE}\n\n"
 
         result_text += "## **Business Rules**\n"
         for rule in capabilities.get("business_rules", []):
@@ -2383,6 +2765,11 @@ class CustomerManagement(ToolBase):
                 "example": "lookup_subscriber(email='joao@acme.com')",
             },
             {
+                "title": "Mark a Plugin Marketplace as Internal",
+                "description": "Add a Claude Code plugin marketplace to a team's internal list so its skills classify as ORGANIZATION instead of THIRD_PARTY",
+                "example": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'], operation='add')",
+            },
+            {
                 "title": "Customer Analytics",
                 "description": "Analyze customer data and activity patterns",
                 "example": "analyze(resource_type='users', filters={'status': 'active'})",
@@ -2478,6 +2865,35 @@ class CustomerManagement(ToolBase):
                     "email must be a valid email address (validated before the API call)",
                     "Exact match only — no partial/fuzzy matching; use list to browse",
                     "Unknown email returns a structured not-found naming the email",
+                ],
+            ),
+            ToolCapability(
+                name="Team Internal-Marketplace Settings",
+                description=(
+                    "Read and change which Claude Code plugin marketplaces a team treats as "
+                    "internal (company-owned). Plugin-sourced skills from those marketplaces "
+                    "classify as ORGANIZATION rather than THIRD_PARTY, so the update action "
+                    "re-classifies existing skill usage records to match the new list."
+                ),
+                parameters={
+                    "get_marketplace_settings": {"team_id": "str (required)"},
+                    "update_marketplace_settings": {
+                        "team_id": "str (required)",
+                        "marketplace_names": "list[str] (required)",
+                        "operation": "str (add | remove | replace, default add)",
+                    },
+                },
+                examples=[
+                    "get_marketplace_settings(team_id='jR2kmLs')",
+                    "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'], operation='add')",
+                    "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['old-marketplace'], operation='remove')",
+                ],
+                limitations=[
+                    "Updates require team-management permissions on the target team",
+                    "The upstream PUT is a full replacement, so add/remove read the current list and send the merged result",
+                    "operation='replace' overwrites the whole list — omitted names lose their ORGANIZATION classification",
+                    MARKETPLACE_CONCURRENCY_NOTE,
+                    "When the stored list comes back different from the list sent, the response carries divergence_warning naming what the interleaved write changed",
                 ],
             ),
             ToolCapability(
@@ -2582,6 +2998,8 @@ class CustomerManagement(ToolBase):
             "create",
             "update",
             "delete",
+            "get_marketplace_settings",
+            "update_marketplace_settings",
             "analyze",
             "get_capabilities",
             "get_examples",

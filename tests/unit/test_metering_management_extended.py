@@ -163,6 +163,313 @@ class TestHandleActionSubmitTransaction:
 
 
 # ===========================================================================
+# handle_action — submit_ai_transaction: ticket + skill attribution
+# ===========================================================================
+
+
+class TestSubmitTicketAndSkillAttribution:
+    """The seven ticket/skill attribution fields ride the payload opt-in only."""
+
+    SKILL_ARGS = {
+        "ticket_id": "JIRA-1234",
+        "skill_name": "portfolio-analyzer",
+        "skill_source": "plugin",
+        "skill_kind": "workflow",
+        "skill_plugin_name": "quant-tools",
+        "skill_marketplace_name": "internal-catalog",
+        "skill_invocation_trigger": "user-slash",
+    }
+    PAYLOAD_KEYS = [
+        "ticketId",
+        "skillName",
+        "skillSource",
+        "skillKind",
+        "skillPluginName",
+        "skillMarketplaceName",
+        "skillInvocationTrigger",
+    ]
+
+    def _patched(self, mgmt):
+        return patch.object(
+            mgmt.transaction_manager,
+            "_validate_transaction_inputs_async",
+            new_callable=AsyncMock,
+            return_value={"valid": True, "message": "ok"},
+        )
+
+    @staticmethod
+    def _payload_from(client):
+        call_args = client.post.call_args
+        return call_args[1]["data"] if "data" in (call_args[1] or {}) else call_args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_submit_carries_ticket_and_skill_fields(self):
+        mgmt, client = _make_mgmt_with_client()
+        args = {**VALID_TX, **self.SKILL_ARGS}
+        with self._patched(mgmt):
+            with patch(
+                "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+            ) as rc:
+                rc.clear_request_cache = MagicMock()
+                rc.get_cached_response = AsyncMock(return_value=None)
+                rc.set_cached_response = AsyncMock()
+                await mgmt.handle_action("submit_ai_transaction", args)
+        payload = self._payload_from(client)
+        assert payload["ticketId"] == "JIRA-1234"
+        assert payload["skillName"] == "portfolio-analyzer"
+        assert payload["skillSource"] == "plugin"
+        assert payload["skillKind"] == "workflow"
+        assert payload["skillPluginName"] == "quant-tools"
+        assert payload["skillMarketplaceName"] == "internal-catalog"
+        assert payload["skillInvocationTrigger"] == "user-slash"
+
+    @pytest.mark.asyncio
+    async def test_submit_omits_absent_ticket_and_skill_fields(self):
+        """No new keys appear when the arguments are absent — existing
+        submissions keep byte-identical payloads."""
+        mgmt, client = _make_mgmt_with_client()
+        with self._patched(mgmt):
+            with patch(
+                "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+            ) as rc:
+                rc.clear_request_cache = MagicMock()
+                rc.get_cached_response = AsyncMock(return_value=None)
+                rc.set_cached_response = AsyncMock()
+                await mgmt.handle_action("submit_ai_transaction", VALID_TX.copy())
+        payload = self._payload_from(client)
+        for key in self.PAYLOAD_KEYS:
+            assert key not in payload
+
+    @pytest.mark.asyncio
+    async def test_submit_rejects_overlong_ticket_id(self):
+        """ticketId is capped at 256 chars by the API — pre-flight rejection."""
+        mgmt, client = _make_mgmt_with_client()
+        args = {**VALID_TX, "ticket_id": "T" * 257}
+        with self._patched(mgmt):
+            with patch(
+                "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+            ) as rc:
+                rc.clear_request_cache = MagicMock()
+                rc.get_cached_response = AsyncMock(return_value=None)
+                rc.set_cached_response = AsyncMock()
+                with pytest.raises(Exception) as exc_info:
+                    await mgmt.handle_action("submit_ai_transaction", args)
+        assert "ticket_id" in str(exc_info.value).lower()
+        client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_accepts_256_char_ticket_id(self):
+        """Boundary: exactly 256 characters is valid."""
+        mgmt, client = _make_mgmt_with_client()
+        args = {**VALID_TX, "ticket_id": "T" * 256}
+        with self._patched(mgmt):
+            with patch(
+                "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+            ) as rc:
+                rc.clear_request_cache = MagicMock()
+                rc.get_cached_response = AsyncMock(return_value=None)
+                rc.set_cached_response = AsyncMock()
+                await mgmt.handle_action("submit_ai_transaction", args)
+        assert self._payload_from(client)["ticketId"] == "T" * 256
+
+    async def _submit(self, mgmt, args):
+        with self._patched(mgmt):
+            with patch(
+                "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+            ) as rc:
+                rc.clear_request_cache = MagicMock()
+                rc.get_cached_response = AsyncMock(return_value=None)
+                rc.set_cached_response = AsyncMock()
+                return await mgmt.handle_action("submit_ai_transaction", args)
+
+    @pytest.mark.asyncio
+    async def test_submit_rejects_overlong_invocation_trigger(self):
+        """The trigger is persisted in a 32-character column upstream; an
+        overlong value fails the whole metric there, so it is rejected here."""
+        mgmt, client = _make_mgmt_with_client()
+        args = {**VALID_TX, "skill_invocation_trigger": "t" * 33}
+        with pytest.raises(Exception) as exc_info:
+            await self._submit(mgmt, args)
+        assert "skill_invocation_trigger" in str(exc_info.value).lower()
+        client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_accepts_32_char_invocation_trigger(self):
+        """Boundary: exactly 32 characters is valid."""
+        mgmt, client = _make_mgmt_with_client()
+        args = {**VALID_TX, "skill_invocation_trigger": "t" * 32}
+        await self._submit(mgmt, args)
+        assert self._payload_from(client)["skillInvocationTrigger"] == "t" * 32
+
+    @pytest.mark.parametrize(
+        "field, payload_key",
+        [
+            ("skill_name", "skillName"),
+            ("skill_plugin_name", "skillPluginName"),
+            ("skill_marketplace_name", "skillMarketplaceName"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_submit_rejects_overlong_skill_catalog_field(self, field, payload_key):
+        """These land in 256-character skill-catalog columns upstream, behind a
+        fail-open persistence step — an overlong value silently loses the
+        transaction's skill attribution, so it must be rejected client-side."""
+        mgmt, client = _make_mgmt_with_client()
+        args = {**VALID_TX, field: "s" * 257}
+        with pytest.raises(Exception) as exc_info:
+            await self._submit(mgmt, args)
+        message = str(exc_info.value)
+        assert field in message
+        assert "256" in message
+        client.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "field, payload_key",
+        [
+            ("skill_name", "skillName"),
+            ("skill_plugin_name", "skillPluginName"),
+            ("skill_marketplace_name", "skillMarketplaceName"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_submit_accepts_256_char_skill_catalog_field(self, field, payload_key):
+        """Boundary: exactly 256 characters is valid."""
+        mgmt, client = _make_mgmt_with_client()
+        args = {**VALID_TX, field: "s" * 256}
+        await self._submit(mgmt, args)
+        assert self._payload_from(client)[payload_key] == "s" * 256
+
+    @pytest.mark.asyncio
+    async def test_submit_rejects_unlisted_skill_source(self):
+        """skill_source is a closed vocabulary and the error names all of it."""
+        mgmt, client = _make_mgmt_with_client()
+        args = {**VALID_TX, "skill_source": "marketplace"}
+        with pytest.raises(Exception) as exc_info:
+            await self._submit(mgmt, args)
+        message = str(exc_info.value)
+        assert "skill_source" in message
+        for accepted in ("bundled", "projectSettings", "userSettings", "plugin"):
+            assert accepted in message
+        client.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "skill_source", ["bundled", "projectSettings", "userSettings", "plugin"]
+    )
+    @pytest.mark.asyncio
+    async def test_submit_accepts_every_listed_skill_source(self, skill_source):
+        mgmt, client = _make_mgmt_with_client()
+        args = {**VALID_TX, "skill_source": skill_source}
+        await self._submit(mgmt, args)
+        assert self._payload_from(client)["skillSource"] == skill_source
+
+    @pytest.mark.asyncio
+    async def test_submit_rejects_unlisted_skill_kind(self):
+        mgmt, client = _make_mgmt_with_client()
+        args = {**VALID_TX, "skill_kind": "analysis"}
+        with pytest.raises(Exception) as exc_info:
+            await self._submit(mgmt, args)
+        message = str(exc_info.value)
+        assert "skill_kind" in message
+        assert "workflow" in message
+        client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_accepts_workflow_skill_kind(self):
+        mgmt, client = _make_mgmt_with_client()
+        args = {**VALID_TX, "skill_kind": "workflow"}
+        await self._submit(mgmt, args)
+        assert self._payload_from(client)["skillKind"] == "workflow"
+
+    @pytest.mark.asyncio
+    async def test_input_schema_declares_ticket_and_skill_fields(self):
+        """Agents only discover the fields if the schema advertises them."""
+        mgmt, _ = _make_mgmt_with_client()
+        schema = await mgmt._get_input_schema()
+        properties = schema["properties"]
+        for field in [
+            "ticket_id",
+            "skill_name",
+            "skill_source",
+            "skill_kind",
+            "skill_plugin_name",
+            "skill_marketplace_name",
+            "skill_invocation_trigger",
+        ]:
+            assert properties[field]["type"] == "string"
+            assert properties[field]["description"]
+        assert "256" in properties["ticket_id"]["description"]
+        assert "32" in properties["skill_invocation_trigger"]["description"]
+        for accepted in ("bundled", "projectSettings", "userSettings", "plugin"):
+            assert accepted in properties["skill_source"]["description"]
+        assert "workflow" in properties["skill_kind"]["description"]
+
+
+# ===========================================================================
+# validate action — the standalone pipeline agrees with the submit path
+# ===========================================================================
+
+
+class TestValidateActionTicketAndSkillFields:
+    """The validate action must reach the same verdict as submit_ai_transaction,
+    otherwise agents get a green light on payloads the submit path rejects."""
+
+    @staticmethod
+    async def _validate(args):
+        mgmt, _ = _make_mgmt_with_client()
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+        ) as rc:
+            rc.clear_request_cache = MagicMock()
+            rc.get_cached_response = AsyncMock(return_value=None)
+            rc.set_cached_response = AsyncMock()
+            result = await mgmt.handle_action("validate", args)
+        return result[0].text
+
+    @pytest.mark.asyncio
+    async def test_validate_rejects_overlong_ticket_id(self):
+        text = await self._validate({**VALID_TX, "ticket_id": "T" * 257})
+        assert "Validation Failed" in text
+        assert "ticket_id" in text
+        assert "256" in text
+
+    @pytest.mark.asyncio
+    async def test_validate_accepts_256_char_ticket_id(self):
+        text = await self._validate({**VALID_TX, "ticket_id": "T" * 256})
+        assert "Validation Successful" in text
+
+    @pytest.mark.asyncio
+    async def test_validate_rejects_overlong_invocation_trigger(self):
+        text = await self._validate({**VALID_TX, "skill_invocation_trigger": "t" * 33})
+        assert "Validation Failed" in text
+        assert "skill_invocation_trigger" in text
+        assert "32" in text
+
+    @pytest.mark.parametrize(
+        "field", ["skill_name", "skill_plugin_name", "skill_marketplace_name"]
+    )
+    @pytest.mark.asyncio
+    async def test_validate_rejects_overlong_skill_catalog_field(self, field):
+        text = await self._validate({**VALID_TX, field: "s" * 257})
+        assert "Validation Failed" in text
+        assert field in text
+        assert "256" in text
+
+    @pytest.mark.parametrize(
+        "field", ["skill_name", "skill_plugin_name", "skill_marketplace_name"]
+    )
+    @pytest.mark.asyncio
+    async def test_validate_accepts_256_char_skill_catalog_field(self, field):
+        text = await self._validate({**VALID_TX, field: "s" * 256})
+        assert "Validation Successful" in text
+
+    @pytest.mark.asyncio
+    async def test_validate_rejects_unlisted_skill_source(self):
+        text = await self._validate({**VALID_TX, "skill_source": "marketplace"})
+        assert "Validation Failed" in text
+        assert "skill_source" in text
+
+
+# ===========================================================================
 # handle_action — get_transaction_status (found path)
 # ===========================================================================
 

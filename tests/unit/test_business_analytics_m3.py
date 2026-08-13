@@ -1704,6 +1704,404 @@ class TestBillingReadsNullHonesty:
         assert "None" not in text
         assert "n/a" in text
 
+# ────────────────────────────────────────────────────────────────────────────
+# list_skills / get_skill (cost by skill)
+# ────────────────────────────────────────────────────────────────────────────
+
+_SKILL = {
+    "id": "JMwX9g4",
+    "resourceType": "skill",
+    "name": "code-review",
+    "originCategory": "VENDOR",
+    "source": "bundled",
+    "kind": "workflow",
+    "pluginName": "revenium-tools",
+    "marketplaceName": "anthropics",
+    "totalCost": 12.47,
+    "callCount": 342,
+    "traceCount": 57,
+    "firstSeen": "2026-06-01T12:00:00Z",
+    "lastSeen": "2026-06-29T18:30:00Z",
+}
+
+
+class TestHandleListSkills:
+    def _client(self, items, page_info=None):
+        c = MagicMock()
+        c.get_skills = AsyncMock(
+            return_value={"_embedded": {"skillUsageResourceList": items}}
+        )
+        c._extract_embedded_data = MagicMock(return_value=items)
+        c._extract_pagination_info = MagicMock(return_value=page_info or {})
+        return c
+
+    @pytest.mark.asyncio
+    async def test_success_renders_compact_line(self, tool):
+        tool.get_client = AsyncMock(return_value=self._client([_SKILL]))
+        result = await tool._handle_list_skills({})
+        text = result[0].text
+        assert "code-review" in text
+        assert "JMwX9g4" in text
+        assert "VENDOR" in text
+        assert "bundled" in text
+        assert "12.47" in text
+        assert "342 calls" in text
+        assert "57 traces" in text
+        # no invented currency symbol
+        assert "$" not in text
+
+    @pytest.mark.asyncio
+    async def test_default_sort_is_cost_descending(self, tool):
+        client = self._client([])
+        tool.get_client = AsyncMock(return_value=client)
+        await tool._handle_list_skills({})
+        assert client.get_skills.call_args.kwargs["sort"] == "totalCost,DESC"
+
+    @pytest.mark.asyncio
+    async def test_explicit_sort_overrides_default(self, tool):
+        client = self._client([])
+        tool.get_client = AsyncMock(return_value=client)
+        await tool._handle_list_skills({"sort": "callCount,DESC"})
+        assert client.get_skills.call_args.kwargs["sort"] == "callCount,DESC"
+
+    @pytest.mark.asyncio
+    async def test_period_forwarded_uppercased(self, tool):
+        client = self._client([])
+        tool.get_client = AsyncMock(return_value=client)
+        await tool._handle_list_skills({"period": "ninety_days"})
+        assert client.get_skills.call_args.kwargs["period"] == "NINETY_DAYS"
+
+    @pytest.mark.asyncio
+    async def test_pagination_forwarded(self, tool):
+        client = self._client([])
+        tool.get_client = AsyncMock(return_value=client)
+        await tool._handle_list_skills({"page": 2, "size": 5})
+        kwargs = client.get_skills.call_args.kwargs
+        assert kwargs["page"] == 2
+        assert kwargs["size"] == 5
+
+    @pytest.mark.asyncio
+    async def test_unknown_keys_not_forwarded(self, tool):
+        client = self._client([])
+        tool.get_client = AsyncMock(return_value=client)
+        await tool._handle_list_skills({"bogus": "x", "action": "list_skills"})
+        kwargs = client.get_skills.call_args.kwargs
+        assert "bogus" not in kwargs
+        assert "action" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_total_elements_rendered_in_header(self, tool):
+        tool.get_client = AsyncMock(
+            return_value=self._client([_SKILL], {"totalElements": 137})
+        )
+        result = await tool._handle_list_skills({})
+        assert "137 total" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_null_cost_and_counts_render_na_not_zero(self, tool):
+        item = dict(_SKILL, totalCost=None, callCount=None, traceCount=None,
+                    originCategory=None, source=None)
+        tool.get_client = AsyncMock(return_value=self._client([item]))
+        text = (await tool._handle_list_skills({}))[0].text
+        assert "n/a" in text
+        assert "None" not in text
+        assert "0 calls" not in text
+
+    @pytest.mark.asyncio
+    async def test_empty_state_message(self, tool):
+        tool.get_client = AsyncMock(return_value=self._client([]))
+        result = await tool._handle_list_skills({})
+        assert "No skills" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_overflow_cap_at_50(self, tool):
+        items = [dict(_SKILL, name=f"skill-{i}") for i in range(60)]
+        tool.get_client = AsyncMock(return_value=self._client(items))
+        text = (await tool._handle_list_skills({}))[0].text
+        assert "skill-49" in text
+        assert "skill-50 " not in text
+        assert "10 more" in text
+
+    @pytest.mark.asyncio
+    async def test_invalid_period_raises_structured_error(self, tool):
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_list_skills({"period": "LAST_90_DAYS"})
+        assert exc.value.field == "period"
+
+    @pytest.mark.asyncio
+    async def test_invalid_period_escapes_handle_action_unwrapped(self, tool):
+        """The pre-flight validation runs outside the try/except, so the
+        structured envelope reaches the caller instead of guidance text."""
+        with pytest.raises(ToolError) as exc:
+            await tool.handle_action("list_skills", {"period": "YESTERDAY"})
+        assert exc.value.field == "period"
+
+    @pytest.mark.asyncio
+    async def test_wider_period_enum_accepted(self, tool):
+        client = self._client([])
+        tool.get_client = AsyncMock(return_value=client)
+        for period in ("NINETY_DAYS", "SIX_MONTHS"):
+            await tool._handle_list_skills({"period": period})
+            assert client.get_skills.call_args.kwargs["period"] == period
+
+    @pytest.mark.asyncio
+    async def test_authentication_error_reraised(self, tool):
+        from src.revenium_mcp_server.auth import AuthenticationError
+        client = MagicMock()
+        client.get_skills = AsyncMock(side_effect=AuthenticationError("no creds"))
+        tool.get_client = AsyncMock(return_value=client)
+        with pytest.raises(AuthenticationError):
+            await tool._handle_list_skills({})
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_text(self, tool):
+        client = MagicMock()
+        client.get_skills = AsyncMock(side_effect=Exception("boom"))
+        tool.get_client = AsyncMock(return_value=client)
+        result = await tool._handle_list_skills({})
+        assert "Failed" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_routed_via_handle_action(self, tool):
+        tool.get_client = AsyncMock(return_value=self._client([_SKILL]))
+        result = await tool.handle_action("list_skills", {})
+        assert "code-review" in result[0].text
+
+
+class TestHandleGetSkill:
+    def _client(self, detail):
+        c = MagicMock()
+        c.get_skill_by_id = AsyncMock(return_value=detail)
+        return c
+
+    @pytest.mark.asyncio
+    async def test_success_renders_detail_block(self, tool):
+        tool.get_client = AsyncMock(return_value=self._client(_SKILL))
+        text = (await tool._handle_get_skill({"skill_id": "JMwX9g4"}))[0].text
+        assert "code-review" in text
+        assert "workflow" in text
+        assert "revenium-tools" in text
+        assert "anthropics" in text
+        assert "12.47" in text
+        assert "342" in text
+        assert "2026-06-01T12:00:00Z" in text
+        assert "2026-06-29T18:30:00Z" in text
+
+    @pytest.mark.asyncio
+    async def test_skill_id_forwarded_to_client(self, tool):
+        client = self._client(_SKILL)
+        tool.get_client = AsyncMock(return_value=client)
+        await tool._handle_get_skill({"skill_id": "JMwX9g4", "period": "seven_days"})
+        assert client.get_skill_by_id.call_args[0][0] == "JMwX9g4"
+        assert client.get_skill_by_id.call_args.kwargs["period"] == "SEVEN_DAYS"
+
+    @pytest.mark.asyncio
+    async def test_sort_not_forwarded_to_detail(self, tool):
+        client = self._client(_SKILL)
+        tool.get_client = AsyncMock(return_value=client)
+        await tool._handle_get_skill({"skill_id": "JMwX9g4", "sort": "totalCost,DESC"})
+        assert "sort" not in client.get_skill_by_id.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_missing_skill_id_raises_structured_error(self, tool):
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_skill({})
+        assert exc.value.field == "skill_id"
+
+    @pytest.mark.asyncio
+    async def test_missing_skill_id_escapes_handle_action_unwrapped(self, tool):
+        with pytest.raises(ToolError) as exc:
+            await tool.handle_action("get_skill", {})
+        assert exc.value.field == "skill_id"
+
+    @pytest.mark.asyncio
+    async def test_invalid_period_raises_structured_error(self, tool):
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_skill({"skill_id": "JMwX9g4", "period": "FOREVER"})
+        assert exc.value.field == "period"
+
+    @pytest.mark.asyncio
+    async def test_nulls_render_na(self, tool):
+        detail = dict(_SKILL, kind=None, pluginName=None, marketplaceName=None,
+                      totalCost=None, callCount=None, firstSeen=None)
+        tool.get_client = AsyncMock(return_value=self._client(detail))
+        text = (await tool._handle_get_skill({"skill_id": "JMwX9g4"}))[0].text
+        assert "n/a" in text
+        assert "None" not in text
+
+    @pytest.mark.asyncio
+    async def test_empty_response_reports_no_detail(self, tool):
+        tool.get_client = AsyncMock(return_value=self._client({}))
+        text = (await tool._handle_get_skill({"skill_id": "JMwX9g4"}))[0].text
+        assert "No usage detail" in text
+
+    @pytest.mark.asyncio
+    async def test_authentication_error_reraised(self, tool):
+        from src.revenium_mcp_server.auth import AuthenticationError
+        client = MagicMock()
+        client.get_skill_by_id = AsyncMock(side_effect=AuthenticationError("no creds"))
+        tool.get_client = AsyncMock(return_value=client)
+        with pytest.raises(AuthenticationError):
+            await tool._handle_get_skill({"skill_id": "JMwX9g4"})
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_text(self, tool):
+        client = MagicMock()
+        client.get_skill_by_id = AsyncMock(side_effect=Exception("boom"))
+        tool.get_client = AsyncMock(return_value=client)
+        result = await tool._handle_get_skill({"skill_id": "JMwX9g4"})
+        assert "Failed" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_routed_via_handle_action(self, tool):
+        tool.get_client = AsyncMock(return_value=self._client(_SKILL))
+        result = await tool.handle_action("get_skill", {"skill_id": "JMwX9g4"})
+        assert "code-review" in result[0].text
+
+
+class TestSkillActionDiscoveryMembership:
+    @pytest.mark.asyncio
+    async def test_both_in_supported_actions(self, tool):
+        actions = await tool._get_supported_actions()
+        for a in ("list_skills", "get_skill"):
+            assert a in actions
+
+    @pytest.mark.asyncio
+    async def test_both_in_structured_capabilities(self, tool):
+        caps = await tool._get_tool_capabilities()
+        all_params = {k for c in caps for k in c.parameters}
+        for a in ("list_skills", "get_skill"):
+            assert a in all_params
+
+    @pytest.mark.asyncio
+    async def test_documented_in_capabilities_and_examples(self, tool):
+        caps_text = (await tool._handle_get_capabilities())[0].text
+        examples_text = (await tool._handle_get_examples({}))[0].text
+        for a in ("list_skills", "get_skill"):
+            assert a in caps_text
+            assert a in examples_text
+        # the wider period enum must be discoverable, not folklore
+        assert "NINETY_DAYS" in caps_text
+        assert "SIX_MONTHS" in examples_text
+
+    def test_named_in_tool_description(self, tool):
+        assert "list_skills" in tool.tool_description
+        assert "get_skill" in tool.tool_description
+
+
+class TestSkillApiFeatureGate:
+    """403 means the team lacks skill attribution, not a malformed request."""
+
+    def _gated_client(self, method):
+        c = MagicMock()
+        setattr(
+            c,
+            method,
+            AsyncMock(side_effect=ReveniumAPIError("Forbidden", status_code=403)),
+        )
+        return c
+
+    @pytest.mark.asyncio
+    async def test_list_skills_403_names_the_feature_flag(self, tool):
+        tool.get_client = AsyncMock(return_value=self._gated_client("get_skills"))
+        text = (await tool._handle_list_skills({}))[0].text
+        assert "skill-attribution" in text
+        assert "feature flag" in text
+        assert "enable it for this team" in text
+
+    @pytest.mark.asyncio
+    async def test_get_skill_403_names_the_feature_flag(self, tool):
+        tool.get_client = AsyncMock(return_value=self._gated_client("get_skill_by_id"))
+        text = (await tool._handle_get_skill({"skill_id": "JMwX9g4"}))[0].text
+        assert "skill-attribution" in text
+        assert "feature flag" in text
+        assert "enable it for this team" in text
+
+    @pytest.mark.asyncio
+    async def test_403_does_not_blame_request_parameters(self, tool):
+        """The old generic text sent callers chasing page/size/period/sort."""
+        tool.get_client = AsyncMock(return_value=self._gated_client("get_skills"))
+        text = (await tool._handle_list_skills({}))[0].text
+        assert "Optional parameters: page, size, period, sort" not in text
+        assert "Supported periods:" not in text
+
+    @pytest.mark.asyncio
+    async def test_403_keeps_the_api_status_visible(self, tool):
+        tool.get_client = AsyncMock(return_value=self._gated_client("get_skills"))
+        text = (await tool._handle_list_skills({}))[0].text
+        assert "403" in text
+
+    @pytest.mark.asyncio
+    async def test_gate_predicate_only_matches_403(self, tool):
+        assert tool._is_skill_api_gated(ReveniumAPIError("no", status_code=403))
+        assert not tool._is_skill_api_gated(ReveniumAPIError("no", status_code=401))
+        assert not tool._is_skill_api_gated(Exception("403"))
+
+
+class TestGetSkillNotFoundIsEmptyPeriod:
+    """A known skill with no usage in the window answers 404, not an empty body."""
+
+    def _missing_client(self):
+        c = MagicMock()
+        c.get_skill_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("Not Found", status_code=404)
+        )
+        return c
+
+    @pytest.mark.asyncio
+    async def test_404_renders_empty_period_not_failure(self, tool):
+        tool.get_client = AsyncMock(return_value=self._missing_client())
+        text = (await tool._handle_get_skill(
+            {"skill_id": "JMwX9g4", "period": "SEVEN_DAYS"}
+        ))[0].text
+        assert "Failed" not in text
+        assert "No usage recorded" in text
+        assert "JMwX9g4" in text
+
+    @pytest.mark.asyncio
+    async def test_404_names_the_requested_period_and_suggests_widening(self, tool):
+        tool.get_client = AsyncMock(return_value=self._missing_client())
+        text = (await tool._handle_get_skill(
+            {"skill_id": "JMwX9g4", "period": "seven_days"}
+        ))[0].text
+        assert "SEVEN_DAYS" in text
+        assert "THIRTY_DAYS" in text
+
+    @pytest.mark.asyncio
+    async def test_404_without_explicit_period_reports_the_default(self, tool):
+        tool.get_client = AsyncMock(return_value=self._missing_client())
+        text = (await tool._handle_get_skill({"skill_id": "JMwX9g4"}))[0].text
+        assert "THIRTY_DAYS" in text
+
+    @pytest.mark.asyncio
+    async def test_404_does_not_blame_the_skill_id(self, tool):
+        tool.get_client = AsyncMock(return_value=self._missing_client())
+        text = (await tool._handle_get_skill({"skill_id": "JMwX9g4"}))[0].text
+        assert "`skill_id` is required" not in text
+
+    @pytest.mark.asyncio
+    async def test_genuine_failures_still_use_the_failure_path(self, tool):
+        for status in (401, 422, 500, 503):
+            client = MagicMock()
+            client.get_skill_by_id = AsyncMock(
+                side_effect=ReveniumAPIError("nope", status_code=status)
+            )
+            tool.get_client = AsyncMock(return_value=client)
+            text = (await tool._handle_get_skill({"skill_id": "JMwX9g4"}))[0].text
+            assert "Get Skill Failed" in text, status
+
+    @pytest.mark.asyncio
+    async def test_list_skills_404_stays_on_the_failure_path(self, tool):
+        """Only the detail endpoint treats 404 as an empty window."""
+        client = MagicMock()
+        client.get_skills = AsyncMock(
+            side_effect=ReveniumAPIError("Not Found", status_code=404)
+        )
+        tool.get_client = AsyncMock(return_value=client)
+        text = (await tool._handle_list_skills({}))[0].text
+        assert "List Skills Failed" in text
+
+
 class TestPeriodChargesCursorHint:
     """Review: hasMore without a usable cursor must not suggest cursor='None'."""
 

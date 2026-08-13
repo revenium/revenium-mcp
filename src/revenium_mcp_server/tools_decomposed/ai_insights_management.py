@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
+    from ..client import ReveniumClient
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -44,6 +45,11 @@ class AIInsightsManagement(ToolBase):
     DEFAULT_MAX_RESULTS = 100
     HARD_CAP_MAX_RESULTS = 1000
     BACKEND_PAGE_LIMIT = 100
+    # The documented per-page cap of the feedback endpoint. It cannot be
+    # verified client-side (a bare-array response carries no page metadata),
+    # so a cursorless page at or above this size is treated as possibly
+    # capped rather than provably complete.
+    _FEEDBACK_DOCUMENTED_PAGE_CAP = 100
 
     def __init__(self, ucm_helper: Any = None) -> None:
         super().__init__(ucm_helper)
@@ -233,10 +239,18 @@ class AIInsightsManagement(ToolBase):
         # because client.list_recommendation_feedback(run_id, *, limit, cursor)
         # doesn't fit the (limit, cursor, **kwargs) shape _autopaginate expects.
         collected: List[Dict[str, Any]] = []
-        cursor: Optional[str] = None
+        # Seed from a caller-supplied cursor so a next_cursor handed back on a
+        # budget stop is actually consumable — resuming, not restarting.
+        cursor_argument: Optional[str] = arguments.get("cursor")
+        cursor: Optional[str] = cursor_argument
+        possibly_truncated = False
+        continuation_cursor: Optional[str] = None
         while len(collected) < max_results:
             remaining = max_results - len(collected)
-            page_limit = min(self.BACKEND_PAGE_LIMIT, remaining)
+            # The feedback endpoint is cursorless in practice (bare array), so
+            # the caller's budget must reach it in the first request — a 100-item
+            # page cap would silently truncate larger runs with no cursor to recover.
+            page_limit = remaining
             page = await client.list_recommendation_feedback(
                 run_id, limit=page_limit, cursor=cursor,
             )
@@ -246,14 +260,104 @@ class AIInsightsManagement(ToolBase):
             collected.extend(page_data)
             new_cursor = page.get("next_cursor")
             if new_cursor is None:
+                # A cursorless page is provably complete only when it is
+                # smaller than BOTH bounds: the requested limit AND the
+                # backend's documented per-page cap. A page at either bound
+                # is ambiguous — the run may have exactly that many items,
+                # or the server capped the page and dropped the tail with
+                # no cursor to recover it.
+                possibly_truncated = len(page_data) >= min(
+                    page_limit, self._FEEDBACK_DOCUMENTED_PAGE_CAP
+                )
                 break
             if new_cursor == cursor:
-                break  # backend did not advance the cursor
+                # The backend repeated the cursor: remaining items are
+                # stranded, so the result cannot be presented as complete.
+                possibly_truncated = True
+                break
             cursor = new_cursor
+        else:
+            # Budget reached with the backend still offering a cursor —
+            # expose it so the caller has a continuation instead of an
+            # invisible cliff.
+            continuation_cursor = cursor
+
+        if not collected:
+            if cursor_argument is not None:
+                # Resumed past the end of the listing. The run's total is
+                # unknown from here (earlier pages may have returned items),
+                # so this is end-of-results — not a zero-feedback run, and
+                # not worth a run-existence lookup.
+                return self.formatter.format_success_response(
+                    message=(
+                        f"No further feedback items for run {run_id} beyond the"
+                        " supplied cursor (end of results)"
+                    ),
+                    data={"feedback": [], "count": 0, "end_of_results": True},
+                    action="list_feedback",
+                )
+            return await self._render_empty_feedback(client, cast(str, run_id))
+
+        message = f"Retrieved {len(collected)} feedback items for run {run_id}"
+        if possibly_truncated:
+            message += (
+                " (the response may have been capped by the server and the"
+                " endpoint returned no usable cursor — more items may exist)"
+            )
+
+        data: Dict[str, Any] = {
+            "feedback": collected,
+            "count": len(collected),
+            "possibly_truncated": possibly_truncated,
+        }
+        if continuation_cursor is not None:
+            data["next_cursor"] = continuation_cursor
 
         return self.formatter.format_success_response(
-            message=f"Retrieved {len(collected)} feedback items for run {run_id}",
-            data={"feedback": collected, "count": len(collected)},
+            message=message,
+            data=data,
+            action="list_feedback",
+        )
+
+    @staticmethod
+    def _is_not_found(error: ReveniumAPIError) -> bool:
+        """True for the not-found family, matching _format_api_error's NOT_FOUND
+        branch and covering 404s that arrive without an RFC 7807 code."""
+        return (
+            getattr(error, "code", None) == "NOT_FOUND"
+            or getattr(error, "status_code", None) == 404
+        )
+
+    async def _render_empty_feedback(
+        self,
+        client: "ReveniumClient",
+        run_id: str,
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Resolve what an empty feedback list actually means before reporting it.
+
+        The feedback endpoint answers 200 with an empty body for an unknown run as
+        well as for a real run with no feedback, so the empty page is ambiguous on
+        its own and reporting "0 items" for a typo'd run_id would be a false
+        negative. One extra read of the run disambiguates: a not-found there means
+        the run_id is wrong and gets the same structured not-found the get_run
+        action produces, now naming the run_id; any other failure propagates
+        untouched so the envelope stays isError:true.
+        """
+        try:
+            await client.get_recommendation_run(run_id, slim=True)
+        except ReveniumAPIError as error:
+            if not self._is_not_found(error):
+                raise
+            return self.formatter.format_error_response(
+                message=f"Run '{run_id}' was not found.",
+                error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+                suggestions=[
+                    "Confirm the run_id / recommendation_id from list_runs or trigger_run",
+                ],
+            )
+        return self.formatter.format_success_response(
+            message=f"Run {run_id} exists and has 0 feedback items",
+            data={"feedback": [], "count": 0, "run_id": run_id, "run_exists": True},
             action="list_feedback",
         )
 

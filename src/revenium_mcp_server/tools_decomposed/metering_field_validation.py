@@ -564,6 +564,15 @@ class FieldMappingAnalyzer:
             "trace_id": "traceId",
             "subscription_id": "subscriptionId",
             "operation_type": "operationType",
+            # Ticket + skill attribution (preview metering spec:
+            # AICompletionMetadataResource — nullable, optional)
+            "ticket_id": "ticketId",
+            "skill_name": "skillName",
+            "skill_source": "skillSource",
+            "skill_kind": "skillKind",
+            "skill_plugin_name": "skillPluginName",
+            "skill_marketplace_name": "skillMarketplaceName",
+            "skill_invocation_trigger": "skillInvocationTrigger",
             # Note: Subscriber data now passed as subscriber object, not separate fields
             # Model and provider details
             "model_source": "modelSource",

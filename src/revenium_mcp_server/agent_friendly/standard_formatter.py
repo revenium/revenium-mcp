@@ -48,6 +48,8 @@ class UnifiedResponseFormatter:
         total_pages: int = 1,
         total_items: Optional[int] = None,
         filters: Optional[Dict[str, Any]] = None,
+        pagination_extra: Optional[Dict[str, Any]] = None,
+        notes: Optional[List[str]] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Format a standardized list response.
 
@@ -59,6 +61,8 @@ class UnifiedResponseFormatter:
             total_pages: Total number of pages
             total_items: Total number of items (if known)
             filters: Applied filters (if any)
+            pagination_extra: Extra keys merged into the rendered pagination block
+            notes: Caveats about the result set, rendered alongside the results
 
         Returns:
             Standardized list response
@@ -74,6 +78,8 @@ class UnifiedResponseFormatter:
             total_items=total_items,
             action=action,
             timing_ms=self._get_timing_ms(),
+            pagination_extra=pagination_extra,
+            notes=notes,
         )
 
     def format_item_response(

@@ -792,7 +792,8 @@ class AgentManagement(ToolBase):
 
             elif action == "delete":
                 result = await manager.delete_agent(arguments)
-                return [TextContent(type="text", text=f"Agent deleted:\n{json.dumps(result, indent=2)}")]
+                deleted_agent_id = arguments.get("agent_id", "")
+                return [TextContent(type="text", text=f"Agent {deleted_agent_id} deleted:\n{json.dumps(result, indent=2)}")]
 
             elif action == "list_discovered":
                 result = await manager.list_discovered(arguments)

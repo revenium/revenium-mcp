@@ -5,6 +5,31 @@ All notable changes to the Revenium MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-13
+
+### Added
+- `manage_metering`: ticket and skill attribution on AI transaction submissions — `ticket_id` plus `skill_name`, `skill_source`, `skill_kind`, `skill_plugin_name`, `skill_marketplace_name` and `skill_invocation_trigger`, validated client-side against the platform's real column caps and closed vocabularies so agents get structured errors instead of silent attribution loss
+- `manage_jobs`: outcomeReason on outcome reporting, distinguishing why the job failed from why a revision was recorded
+- `business_analytics_management`: cost-by-skill analytics (list_skills, get_skill), with the feature-flag 403 and empty-window 404 explained instead of surfaced as raw errors
+- `manage_customers`: team internal-marketplace settings (get_marketplace_settings, update_marketplace_settings with add/remove/replace)
+- Business analytics: model-sources and task-types filter dimensions
+
+### Changed
+- `manage_metering`: accepted providers derive from the platform's model catalog (tenant-keyed cache) instead of a hardcoded enum; model validation uses the catalog's exact-match lookup and the new distinct-providers endpoint
+- `manage_cost_controls`: get_enforcement_rules documents per-group balances (groupBreakdown)
+- `manage_products`: list filtering is honest — real server-side query, exact filters.name matching across pages, unknown filter keys rejected, bounded scans say so when truncated
+
+### Fixed
+- `manage_ai_insights` list_feedback: parses the endpoint's bare-array wire shape; pagination is honest end to end (consumable continuation cursors, explicit end-of-results, truncation flags)
+- `manage_products`: create_simple's documented name/description parameters are reachable through the MCP boundary; responses tolerate entries missing the now-optional id field
+- Delete confirmations echo the request id across all tools
+- Update actions preserve unspecified fields (merge semantics pinned across every widened write endpoint)
+
+## [0.3.1] - 2026-07-26
+
+### Changed
+- Removed the unused revenium-middleware-openai dependency
+
 ## [0.3.0] - 2026-07-24
 
 ### Added

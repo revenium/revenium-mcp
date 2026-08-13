@@ -99,16 +99,18 @@ def _envelope(items):
 
 
 class TestFilterOptionDimensionsConstant:
-    def test_twelve_published_dimensions(self):
+    def test_fourteen_published_dimensions(self):
         assert _FILTER_OPTION_DIMENSIONS == frozenset(
             {
                 "agents",
                 "api-keys",
                 "customers",
+                "model-sources",
                 "models",
                 "organizations",
                 "products",
                 "providers",
+                "task-types",
                 "teams",
                 "tool-providers",
                 "tools",
@@ -212,6 +214,61 @@ class TestGetAnalyticsFilterOptions:
         result = await analyzer.get_analytics_filter_options("models", "THIRTY_DAYS")
 
         assert result == ["Claude Haiku", "only-id", "already-a-string"]
+
+
+class TestNewlyPublishedDimensions:
+    """model-sources and task-types are served by the analytics API and must
+    not be rejected by the client-side allowlist before the HTTP call."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dimension", ["model-sources", "task-types"])
+    async def test_new_dimension_is_accepted_and_reaches_the_api(
+        self, flag_off, dimension
+    ):
+        analyzer, client = _make_analyzer(get_return=_envelope(["value-1"]))
+
+        result = await analyzer.get_analytics_filter_options(dimension, "THIRTY_DAYS")
+
+        assert result == ["value-1"]
+        called_path = client.get.call_args[0][0]
+        assert called_path == f"/api/v2/analytics/filter-options/{dimension}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "alias,expected_segment",
+        [
+            ("model_sources", "model-sources"),
+            ("task_types", "task-types"),
+            ("MODEL-SOURCES", "model-sources"),
+            ("  task-types  ", "task-types"),
+        ],
+    )
+    async def test_new_dimension_aliases_normalize(
+        self, flag_off, alias, expected_segment
+    ):
+        analyzer, client = _make_analyzer(get_return=_envelope(["x"]))
+
+        await analyzer.get_analytics_filter_options(alias, "THIRTY_DAYS")
+
+        called_path = client.get.call_args[0][0]
+        assert called_path == f"/api/v2/analytics/filter-options/{expected_segment}"
+
+    @pytest.mark.asyncio
+    async def test_unknown_dimension_still_raises_and_lists_the_new_names(
+        self, flag_off
+    ):
+        """An unknown dimension is still rejected client-side, and the valid
+        list handed back (derived from the allowlist) names both new
+        dimensions so a caller can discover them from the error alone."""
+        analyzer, client = _make_analyzer(get_return=_envelope([]))
+
+        with pytest.raises(ValidationError) as exc_info:
+            await analyzer.get_analytics_filter_options("widgets", "THIRTY_DAYS")
+
+        suggestions_text = " ".join(exc_info.value.suggestions)
+        assert "model-sources" in suggestions_text
+        assert "task-types" in suggestions_text
+        client.get.assert_not_called()
 
 
 class TestFilterOptionsReviewHardening:
