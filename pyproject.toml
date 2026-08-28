@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "revenium-mcp"
-version = "0.4.0"
+version = "0.5.0"
 description = "Model Context Protocol (MCP) server for Revenium API monitoring, analytics, and AI spending management"
 readme = "README.md"
 license = "MIT"
@@ -33,11 +33,17 @@ classifiers = [
 requires-python = ">=3.11"
 dependencies = [
     # Exact pin: Docker images resolve dependencies at build time, so this
-    # must match uv.lock (the version CI tests). fastmcp >= 3.4.3 enables
-    # host-header validation by default, which rejects every hosted request
-    # with 421 unless FASTMCP_HTTP_ALLOWED_HOSTS is configured — upgrade
-    # deliberately, with that allowlist set per environment.
-    "fastmcp==3.2.0",
+    # must match uv.lock (the version CI tests). fastmcp 3.4.3 turned the
+    # streamable-HTTP Host/Origin guard on by default, which rejected every
+    # hosted request with 421 unless FASTMCP_HTTP_ALLOWED_HOSTS was set;
+    # 3.4.4 reverted that default for the 3.x line, so hosted traffic is
+    # accepted again and the allowlist is opt-in hardening. From 3.3.0 the
+    # code ships in the fastmcp-slim distribution and `fastmcp` is a
+    # meta-package over it — see the pip recovery note in the CI workflow.
+    # The 3.x line pins mcp<2.0, so it speaks MCP protocol revisions up to
+    # LATEST_PROTOCOL_VERSION in mcp.types; the 2026-07-28 revision needs
+    # mcp 2.x, which only fastmcp 4.x depends on (prerelease at this pin).
+    "fastmcp==3.4.7",
     "httpx>=0.25.0",
     "pydantic>=2.0.0",
     "loguru>=0.7.0",
@@ -56,7 +62,7 @@ dependencies = [
     # Direct dependency: auth/client_storage.py imports key_value.aio for the
     # OAuth proxy's shared Redis store. Floor 0.4.5: earlier RedisStore drops
     # the rediss:// scheme (no TLS), which hangs every storage call against
-    # the TLS-required ElastiCache. Ceiling matches fastmcp 3.2.0's pin.
+    # the TLS-required ElastiCache. Ceiling matches the pinned fastmcp's pin.
     "py-key-value-aio>=0.4.5,<0.5.0",
 ]
 

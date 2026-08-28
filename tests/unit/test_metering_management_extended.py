@@ -470,6 +470,224 @@ class TestValidateActionTicketAndSkillFields:
 
 
 # ===========================================================================
+# handle_action — submit_ai_transaction: completion provenance fields
+# ===========================================================================
+
+
+class TestSubmitCompletionProvenanceFields:
+    """effort, model_host and subscriber_email_source ride the payload opt-in only.
+
+    They are the write-side provenance fields the OTLP path already carries;
+    without them an agent-metered transaction lands in the unattributed-host
+    bucket while an OTLP-ingested one for the same tenant does not.
+    """
+
+    PROVENANCE_ARGS = {
+        "effort": "high",
+        "model_host": "bedrock",
+        "subscriber_email_source": "jwt",
+    }
+    PAYLOAD_KEYS = ["effort", "modelHost", "subscriberEmailSource"]
+
+    @staticmethod
+    def _payload_from(client):
+        call_args = client.post.call_args
+        return call_args[1]["data"] if "data" in (call_args[1] or {}) else call_args[0][1]
+
+    async def _submit(self, mgmt, args):
+        with patch.object(
+            mgmt.transaction_manager,
+            "_validate_transaction_inputs_async",
+            new_callable=AsyncMock,
+            return_value={"valid": True, "message": "ok"},
+        ):
+            with patch(
+                "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+            ) as rc:
+                rc.clear_request_cache = MagicMock()
+                rc.get_cached_response = AsyncMock(return_value=None)
+                rc.set_cached_response = AsyncMock()
+                return await mgmt.handle_action("submit_ai_transaction", args)
+
+    @pytest.mark.asyncio
+    async def test_submit_carries_provenance_fields(self):
+        mgmt, client = _make_mgmt_with_client()
+        await self._submit(mgmt, {**VALID_TX, **self.PROVENANCE_ARGS})
+        payload = self._payload_from(client)
+        assert payload["effort"] == "high"
+        assert payload["modelHost"] == "bedrock"
+        assert payload["subscriberEmailSource"] == "jwt"
+
+    @pytest.mark.asyncio
+    async def test_submit_omits_absent_provenance_fields(self):
+        """An unset field is absent from the payload, never null — existing
+        submissions keep byte-identical payloads."""
+        mgmt, client = _make_mgmt_with_client()
+        await self._submit(mgmt, VALID_TX.copy())
+        payload = self._payload_from(client)
+        for key in self.PAYLOAD_KEYS:
+            assert key not in payload
+
+    @pytest.mark.parametrize(
+        "field, payload_key, max_length",
+        [
+            ("effort", "effort", 16),
+            ("model_host", "modelHost", 50),
+            ("subscriber_email_source", "subscriberEmailSource", 20),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_submit_rejects_overlong_provenance_field(self, field, payload_key, max_length):
+        """Each cap is the spec's maxLength — over it the API 400s, so the
+        rejection happens here with a structured, actionable error."""
+        mgmt, client = _make_mgmt_with_client()
+        args = {**VALID_TX, field: "a" * (max_length + 1)}
+        with pytest.raises(Exception) as exc_info:
+            await self._submit(mgmt, args)
+        message = str(exc_info.value)
+        assert field in message
+        assert str(max_length) in message
+        client.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "field, payload_key, max_length",
+        [
+            ("effort", "effort", 16),
+            ("model_host", "modelHost", 50),
+            ("subscriber_email_source", "subscriberEmailSource", 20),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_submit_accepts_provenance_field_at_the_cap(self, field, payload_key, max_length):
+        """Boundary: exactly maxLength characters is valid."""
+        mgmt, client = _make_mgmt_with_client()
+        await self._submit(mgmt, {**VALID_TX, field: "a" * max_length})
+        assert self._payload_from(client)[payload_key] == "a" * max_length
+
+    @pytest.mark.parametrize("effort", ["high", "very_high", "low-ish", "Effort2", "ULTRA9"])
+    @pytest.mark.asyncio
+    async def test_submit_accepts_any_well_formed_effort(self, effort):
+        """The effort vocabulary is deliberately open: vendor levels differ and
+        evolve, and an unrecognised but well-formed value is stored verbatim.
+        Underscore and hyphen are inside the accepted character class."""
+        mgmt, client = _make_mgmt_with_client()
+        await self._submit(mgmt, {**VALID_TX, "effort": effort})
+        assert self._payload_from(client)["effort"] == effort
+
+    @pytest.mark.parametrize("effort", ["very high", "high!", "high.effort", "high/low", ""])
+    @pytest.mark.asyncio
+    async def test_submit_rejects_malformed_effort(self, effort):
+        """Shape is enforced even though the vocabulary is not."""
+        mgmt, client = _make_mgmt_with_client()
+        with pytest.raises(Exception) as exc_info:
+            await self._submit(mgmt, {**VALID_TX, "effort": effort})
+        assert "effort" in str(exc_info.value)
+        client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_model_host_is_not_the_model_source_filter(self):
+        """model_host is a NEW write-side field: the billing infrastructure
+        (bedrock, vertex, anthropic). It must not be conflated with the
+        read-side model_source filter (the routing layer: LITELLM, OPENROUTER),
+        which stays out of the submission payload."""
+        from src.revenium_mcp_server.tools_decomposed.metering_management import (
+            _COMPLETIONS_FILTER_PARAM_MAP,
+        )
+
+        assert "model_source" in _COMPLETIONS_FILTER_PARAM_MAP
+        assert "model_host" not in _COMPLETIONS_FILTER_PARAM_MAP
+
+        mgmt, client = _make_mgmt_with_client()
+        await self._submit(mgmt, {**VALID_TX, "model_host": "vertex"})
+        payload = self._payload_from(client)
+        assert payload["modelHost"] == "vertex"
+        assert "modelSource" not in payload
+
+    @pytest.mark.asyncio
+    async def test_input_schema_declares_provenance_fields(self):
+        """Agents only discover the fields if the schema advertises them."""
+        mgmt, _ = _make_mgmt_with_client()
+        schema = await mgmt._get_input_schema()
+        properties = schema["properties"]
+        for field in ["effort", "model_host", "subscriber_email_source"]:
+            assert properties[field]["type"] == "string"
+            assert properties[field]["description"]
+        assert "16" in properties["effort"]["description"]
+        assert "50" in properties["model_host"]["description"]
+        assert "20" in properties["subscriber_email_source"]["description"]
+
+
+class TestValidateActionCompletionProvenanceFields:
+    """The validate action must reach the same verdict as submit_ai_transaction."""
+
+    @staticmethod
+    async def _validate(args):
+        mgmt, _ = _make_mgmt_with_client()
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+        ) as rc:
+            rc.clear_request_cache = MagicMock()
+            rc.get_cached_response = AsyncMock(return_value=None)
+            rc.set_cached_response = AsyncMock()
+            result = await mgmt.handle_action("validate", args)
+        return result[0].text
+
+    @pytest.mark.parametrize(
+        "field, max_length",
+        [("effort", 16), ("model_host", 50), ("subscriber_email_source", 20)],
+    )
+    @pytest.mark.asyncio
+    async def test_validate_rejects_overlong_provenance_field(self, field, max_length):
+        text = await self._validate({**VALID_TX, field: "a" * (max_length + 1)})
+        assert "Validation Failed" in text
+        assert field in text
+        assert str(max_length) in text
+
+    @pytest.mark.parametrize(
+        "field, max_length",
+        [("effort", 16), ("model_host", 50), ("subscriber_email_source", 20)],
+    )
+    @pytest.mark.asyncio
+    async def test_validate_accepts_provenance_field_at_the_cap(self, field, max_length):
+        text = await self._validate({**VALID_TX, field: "a" * max_length})
+        assert "Validation Successful" in text
+
+    @pytest.mark.asyncio
+    async def test_validate_rejects_malformed_effort(self):
+        text = await self._validate({**VALID_TX, "effort": "very high"})
+        assert "Validation Failed" in text
+        assert "effort" in text
+
+    @pytest.mark.asyncio
+    async def test_validate_accepts_unrecognised_well_formed_effort(self):
+        text = await self._validate({**VALID_TX, "effort": "ultra_9"})
+        assert "Validation Successful" in text
+
+    @pytest.mark.parametrize(
+        "args, expected",
+        [
+            ({"effort": "ultra_9"}, True),
+            ({"effort": "very high"}, False),
+            ({"effort": "e" * 17}, False),
+            ({"model_host": "h" * 50}, True),
+            ({"model_host": "h" * 51}, False),
+            ({"subscriber_email_source": "s" * 20}, True),
+            ({"subscriber_email_source": "s" * 21}, False),
+        ],
+    )
+    def test_fast_validation_path_agrees_on_provenance_fields(self, args, expected):
+        """The sync fast path and the async pipeline stay in lock-step.
+
+        The verdicts are per-payload: _get_cache_key covers the complete
+        validated argument set, so these variants no longer share a cache
+        entry — see TestValidationCacheKeyCoversValidatedFields, which asserts
+        that on one manager.
+        """
+        mgmt, _ = _make_mgmt_with_client()
+        assert mgmt.transaction_manager._validate_transaction_inputs({**VALID_TX, **args}) is expected
+
+
+# ===========================================================================
 # handle_action — get_transaction_status (found path)
 # ===========================================================================
 
@@ -1419,3 +1637,242 @@ class TestBuildIntegrationCapabilitiesContent:
         assert "requestDuration" in integration_content, (
             "Integration guide should use camelCase field 'requestDuration'"
         )
+
+
+# ===========================================================================
+# Completion provenance — review follow-ups (BACK-2758)
+# ===========================================================================
+
+
+class TestEffortPatternFullMatch:
+    """`^...$` + re.match is not a full-string gate.
+
+    Two traps compound: re.match only anchors the start, and Python's `$`
+    also matches immediately before a single trailing newline. "high\\n"
+    therefore satisfied the old gate, sailed past the tool boundary and got
+    a 400 back from the metering API.
+    """
+
+    @staticmethod
+    async def _validate(args):
+        mgmt, _ = _make_mgmt_with_client()
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+        ) as rc:
+            rc.clear_request_cache = MagicMock()
+            rc.get_cached_response = AsyncMock(return_value=None)
+            rc.set_cached_response = AsyncMock()
+            result = await mgmt.handle_action("validate", args)
+        return result[0].text
+
+    @pytest.mark.parametrize("effort", ["high\n", "high\nx", "\nhigh", "high\r\n"])
+    def test_effort_format_errors_rejects_embedded_newlines(self, effort):
+        from src.revenium_mcp_server.tools_decomposed.metering_management import (
+            _effort_format_errors,
+        )
+
+        assert _effort_format_errors({"effort": effort}) != []
+
+    @pytest.mark.parametrize("effort", ["high\n", "high\nx"])
+    @pytest.mark.asyncio
+    async def test_submit_rejects_effort_with_trailing_newline(self, effort):
+        mgmt, client = _make_mgmt_with_client()
+        with patch.object(
+            mgmt.transaction_manager,
+            "_validate_transaction_inputs_async",
+            new_callable=AsyncMock,
+            return_value={"valid": True, "message": "ok"},
+        ):
+            with patch(
+                "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+            ) as rc:
+                rc.clear_request_cache = MagicMock()
+                rc.get_cached_response = AsyncMock(return_value=None)
+                rc.set_cached_response = AsyncMock()
+                with pytest.raises(Exception) as exc_info:
+                    await mgmt.handle_action(
+                        "submit_ai_transaction", {**VALID_TX, "effort": effort}
+                    )
+        assert "effort" in str(exc_info.value)
+        client.post.assert_not_called()
+
+    @pytest.mark.parametrize("effort", ["high\n", "high\nx"])
+    @pytest.mark.asyncio
+    async def test_validate_rejects_effort_with_trailing_newline(self, effort):
+        text = await self._validate({**VALID_TX, "effort": effort})
+        assert "Validation Failed" in text
+        assert "effort" in text
+
+    @pytest.mark.parametrize("effort", ["high\n", "high\nx"])
+    def test_fast_path_rejects_effort_with_trailing_newline(self, effort):
+        mgmt, _ = _make_mgmt_with_client()
+        assert (
+            mgmt.transaction_manager._validate_transaction_inputs(
+                {**VALID_TX, "effort": effort}
+            )
+            is False
+        )
+
+
+class TestOptionalStringViolationLogsAreValueFree:
+    """Rejected optional strings are caller data — the log must not echo them.
+
+    subscriber_email_source caps at 20 characters and wants a source label
+    ('jwt', 'git'), so the normal misuse is passing the actual address: the
+    field name, the reason and the length are enough to act on, and the
+    value would put a subscriber's email in WARNING logs.
+    """
+
+    @staticmethod
+    def _warnings_for(arguments):
+        from loguru import logger
+
+        records = []
+        sink_id = logger.add(lambda msg: records.append(msg.record), level="DEBUG")
+        try:
+            mgmt, _ = _make_mgmt_with_client()
+            verdict = mgmt.transaction_manager._validate_transaction_inputs(arguments)
+        finally:
+            logger.remove(sink_id)
+        messages = [r["message"] for r in records if r["level"].name == "WARNING"]
+        return verdict, messages
+
+    def test_overlong_subscriber_email_source_log_omits_the_value(self):
+        email = "someone.private@example.com"
+        assert len(email) > 20
+        verdict, messages = self._warnings_for({**VALID_TX, "subscriber_email_source": email})
+
+        assert verdict is False
+        assert messages, "the rejection must still be logged"
+        joined = "\n".join(messages)
+        assert email not in joined
+        assert "someone.private" not in joined
+        assert "example.com" not in joined
+        # Still actionable without the value.
+        assert "subscriber_email_source" in joined
+        assert "20" in joined
+        assert str(len(email)) in joined
+
+    def test_injection_character_log_omits_the_value(self):
+        value = "<script>alert('pii@example.com')</script>"
+        verdict, messages = self._warnings_for({**VALID_TX, "agent": value})
+
+        assert verdict is False
+        joined = "\n".join(messages)
+        assert "pii@example.com" not in joined
+        assert "<script>" not in joined
+        assert "agent" in joined
+
+
+class TestValidationCacheKeyCoversValidatedFields:
+    """A cache key built from the five core fields reused a verdict across
+    payloads that differ exactly where the validator disagrees: a valid
+    transaction warmed the cache and every provenance variant of it inherited
+    that 'valid' verdict without being looked at."""
+
+    def test_same_manager_evaluates_provenance_variants_independently(self):
+        mgmt, _ = _make_mgmt_with_client()
+        manager = mgmt.transaction_manager
+
+        assert manager._validate_transaction_inputs(VALID_TX.copy()) is True
+
+        assert manager._validate_transaction_inputs({**VALID_TX, "effort": "very high"}) is False
+        assert manager._validate_transaction_inputs({**VALID_TX, "effort": "e" * 17}) is False
+        assert manager._validate_transaction_inputs({**VALID_TX, "effort": "high\n"}) is False
+        assert manager._validate_transaction_inputs({**VALID_TX, "model_host": "h" * 51}) is False
+        assert (
+            manager._validate_transaction_inputs(
+                {**VALID_TX, "subscriber_email_source": "s" * 21}
+            )
+            is False
+        )
+
+        # And a well-formed variant is still accepted afterwards, so the fix is
+        # not "never cache anything valid".
+        assert (
+            manager._validate_transaction_inputs(
+                {**VALID_TX, "effort": "high", "model_host": "bedrock"}
+            )
+            is True
+        )
+        assert manager._validate_transaction_inputs(VALID_TX.copy()) is True
+
+    def test_cache_still_hits_for_an_identical_payload(self):
+        """The key must stay stable across equal payloads or the cache is dead
+        weight — dict ordering must not change the key either."""
+        mgmt, _ = _make_mgmt_with_client()
+        manager = mgmt.transaction_manager
+
+        manager._validate_transaction_inputs({**VALID_TX, "effort": "high"})
+        size_after_first = len(manager._validation_cache)
+
+        reordered = {
+            "effort": "high",
+            "duration_ms": VALID_TX["duration_ms"],
+            "output_tokens": VALID_TX["output_tokens"],
+            "input_tokens": VALID_TX["input_tokens"],
+            "provider": VALID_TX["provider"],
+            "model": VALID_TX["model"],
+        }
+        assert manager._get_cached_validation(reordered) is True
+        assert len(manager._validation_cache) == size_after_first
+
+    def test_key_covers_every_field_the_validator_inspects(self):
+        """Guards the drift the original key had: a field the validator checks
+        but the key ignores is a silently reusable wrong verdict."""
+        from src.revenium_mcp_server.tools_decomposed.metering_management import (
+            _SYNC_VALIDATED_OPTIONAL_STRING_FIELDS,
+            _VALIDATION_CACHE_FIELDS,
+        )
+
+        for field in _SYNC_VALIDATED_OPTIONAL_STRING_FIELDS:
+            assert field in _VALIDATION_CACHE_FIELDS, field
+        for field in [
+            "model",
+            "provider",
+            "input_tokens",
+            "output_tokens",
+            "duration_ms",
+            "subscriber",
+            "is_streamed",
+        ]:
+            assert field in _VALIDATION_CACHE_FIELDS, field
+
+
+class TestEmailAddressRejectedAsProvenance(TestSubmitCompletionProvenanceFields):
+    """PR #326 round 2 (Greptile P1/security): a SHORT address fits the 20-char
+    cap, so the cap cannot catch it — the '@' gate must, on every path, with
+    the value withheld from the error (it IS the PII)."""
+
+    @pytest.mark.asyncio
+    async def test_submit_rejects_short_email_address_value_withheld(self):
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        mgmt, client = _make_mgmt_with_client()
+        with pytest.raises(ToolError) as excinfo:
+            await self._submit(
+                mgmt, {**VALID_TX, "subscriber_email_source": "a@b.co"}
+            )
+        err = excinfo.value
+        text = str(getattr(err, "message", "")) + " ".join(getattr(err, "suggestions", None) or [])
+        assert "a@b.co" not in text
+        assert "never the address" in text
+        client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_shared_validator_rejects_email_and_withholds_value(self):
+        from src.revenium_mcp_server.tools_decomposed.metering_management import (
+            _email_source_shape_errors,
+        )
+        errors = _email_source_shape_errors({"subscriber_email_source": "user@example.com"})
+        assert len(errors) == 1
+        assert "user@example.com" not in errors[0]
+        assert "email address" in errors[0]
+
+    @pytest.mark.asyncio
+    async def test_source_labels_still_accepted_by_the_shared_validator(self):
+        from src.revenium_mcp_server.tools_decomposed.metering_management import (
+            _email_source_shape_errors,
+        )
+        for label in ("git", "env", "cli-flag", "custom-env"):
+            assert _email_source_shape_errors({"subscriber_email_source": label}) == []

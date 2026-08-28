@@ -951,8 +951,8 @@ class TestAnalyzeSummaryMetrics:
         client = MagicMock()
         fetch_data = _summary_data()
         with patch.object(processor, "_fetch_summary_data", new_callable=AsyncMock, return_value=fetch_data) as mock_fetch:
-            await processor.analyze_summary_metrics(client, "team-1", "THIRTY_DAYS", "MEAN")
-            mock_fetch.assert_called_once_with(client, "team-1", "THIRTY_DAYS", "MEAN")
+            await processor.analyze_summary_metrics(client, "team-1", "THIRTY_DAYS", "TOTAL")
+            mock_fetch.assert_called_once_with(client, "team-1", "THIRTY_DAYS", "TOTAL")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

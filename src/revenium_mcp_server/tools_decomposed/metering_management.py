@@ -381,6 +381,12 @@ _TX_ID_UUID_BARE_RE = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
 
 # Mapping from MCP argument names (snake_case) to completions API filter param names (camelCase).
 # Used to build API query params for all three completions call sites.
+# Verified 2026-08-28 against hypercurrent origin/develop
+# AICompletionMetricController.list ("/completions"), which binds query, teamId,
+# type, a Pageable and an AICompletionSearchParams @ParameterObject. Every name
+# below is a field of that params class except operation_type -> operationType,
+# which the endpoint does not yet declare; that is a gap on the API side, tracked
+# by BACK-2782, not a name invented here.
 _COMPLETIONS_FILTER_PARAM_MAP: Dict[str, str] = {
     # Date range (biggest performance win — avoids full-table scans)
     "start_date": "startDate",
@@ -444,16 +450,98 @@ _COMPLETIONS_FILTER_PARAM_MAP: Dict[str, str] = {
     "operation_type": "operationType",
     "environment": "environment",
     "error_reason": "errorReason",
+    # Scope of coding-assistant records (Claude Code, Gemini CLI, and similar).
+    # See _DEFAULT_INCLUDE_CODING_ASSISTANTS for the default and its reasoning.
+    "include_coding_assistants": "includeCodingAssistants",
 }
+
+# DECISION (BACK-2785) - do not flip this back without reading the reasoning.
+#
+# The completions read actions (lookup_transactions, lookup_recent_transactions,
+# analyze_recent_transactions) INCLUDE coding-assistant records by default, even
+# though the backend's own default is the opposite: AICompletionSearchParams
+# .includeCodingAssistants is declared `Boolean = false` and documented as
+# "When false (default), coding assistant records are excluded from results."
+#
+# Why include:
+#   - These actions are the ingestion-verification surface. They are what someone
+#     reaches for to answer "did my Claude Code data actually arrive?", which is
+#     exactly the moment a false negative is most expensive: a filtered view
+#     reports "no transactions" for data that landed perfectly well.
+#   - The insights path already includes them (ai_insights_management sends
+#     filterIncludeCodingAssistants=True), so the same server used to answer the
+#     same question two opposite ways depending on which tool was asked.
+#   - Cost analytics in business_analytics is deliberately NOT changed by this.
+#     It queries different endpoints that exclude attributed coding-assistant
+#     cost from spend figures on purpose; that exclusion stays.
+#
+# Why send it explicitly rather than leaning on the backend default: the scope of
+# the MCP's answer must not be inherited silently. Sending the value on every
+# request means a backend-side default change cannot move the MCP's answer, and
+# the scope is visible in the request instead of implied by its absence.
+_DEFAULT_INCLUDE_CODING_ASSISTANTS = True
+
+# String spellings accepted for the boolean, mirroring preprocess_boolean_parameters
+# so a direct (non-registry) call site behaves the same as an MCP client call.
+_INCLUDE_CODING_ASSISTANTS_TRUE_STRINGS = frozenset(
+    {"true", "1", "yes", "on", "enabled"}
+)
+_INCLUDE_CODING_ASSISTANTS_FALSE_STRINGS = frozenset(
+    {"false", "0", "no", "off", "disabled"}
+)
+
+
+def _resolve_include_coding_assistants(arguments: Dict[str, Any]) -> bool:
+    """Resolve the include_coding_assistants argument to an explicit boolean.
+
+    Only an absent/None argument means "unset" - an explicit False is a real
+    caller choice and must be forwarded as false, so this is never truthiness
+    gated. An unrecognized value falls back to the default rather than being
+    read as "exclude", because silently excluding is the failure mode this
+    parameter exists to prevent.
+    """
+    raw = arguments.get("include_coding_assistants")
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in _INCLUDE_CODING_ASSISTANTS_TRUE_STRINGS:
+            return True
+        if normalized in _INCLUDE_CODING_ASSISTANTS_FALSE_STRINGS:
+            return False
+    return _DEFAULT_INCLUDE_CODING_ASSISTANTS
+
+
+def _coding_assistant_scope_note(include_coding_assistants: bool) -> str:
+    """One-line statement of which records the response covers.
+
+    A user reading the response on its own must be able to tell whether
+    coding-assistant records were in scope.
+    """
+    if include_coding_assistants:
+        return (
+            "**Scope**: coding-assistant records (Claude Code, Gemini CLI, and similar) "
+            "are INCLUDED. Pass include_coding_assistants=false to exclude them.\n"
+        )
+    return (
+        "**Scope**: coding-assistant records (Claude Code, Gemini CLI, and similar) "
+        "are EXCLUDED. Pass include_coding_assistants=true to include them.\n"
+    )
 
 
 def _extract_completions_filters(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Build completions API filter params from MCP arguments, omitting absent/None/empty values."""
-    return {
+    """Build completions API filter params from MCP arguments, omitting absent/None/empty values.
+
+    includeCodingAssistants is the deliberate exception: it is always sent, using
+    _DEFAULT_INCLUDE_CODING_ASSISTANTS when the caller did not choose a view.
+    """
+    filters = {
         api_key: arguments[arg_key]
         for arg_key, api_key in _COMPLETIONS_FILTER_PARAM_MAP.items()
         if arguments.get(arg_key) is not None and arguments.get(arg_key) != ""
     }
+    filters["includeCodingAssistants"] = _resolve_include_coding_assistants(arguments)
+    return filters
 
 
 # Per-field length caps for the optional string fields. The generic limit is a
@@ -467,6 +555,9 @@ def _extract_completions_filters(arguments: Dict[str, Any]) -> Dict[str, Any]:
 #     shared skill-catalog columns they are persisted in. The persistence step
 #     runs fail-open, so an overlong value is not rejected — the catalog insert
 #     fails silently and the transaction loses its skill attribution forever.
+#   - effort / model_host / subscriber_email_source: metering spec
+#     AICompletionMetadataResource.effort / .modelHost / .subscriberEmailSource
+#     maxLength — the API rejects the whole submission over them
 _OPTIONAL_STRING_MAX_LENGTH = 500
 _OPTIONAL_STRING_MAX_LENGTH_OVERRIDES: Dict[str, int] = {
     "ticket_id": 256,
@@ -474,7 +565,32 @@ _OPTIONAL_STRING_MAX_LENGTH_OVERRIDES: Dict[str, int] = {
     "skill_name": 256,
     "skill_plugin_name": 256,
     "skill_marketplace_name": 256,
+    "effort": 16,
+    "model_host": 50,
+    "subscriber_email_source": 20,
 }
+
+# Completion provenance fields (metering spec AICompletionMetadataResource,
+# submission only). They are what the OTLP ingestion path already carries as
+# resource attributes; without them an agent-metered transaction lands in the
+# unattributed-host bucket while an OTLP-ingested one for the same tenant does
+# not. modelHost is the billing infrastructure (bedrock, vertex, anthropic) and
+# is deliberately NOT the read-side model_source filter in
+# _COMPLETIONS_FILTER_PARAM_MAP, which names the routing/aggregation layer
+# (LITELLM, OPENROUTER). Values map to one canonical example each, reused by the
+# pre-flight errors and the input schema descriptions.
+_COMPLETION_PROVENANCE_EXAMPLES: Dict[str, str] = {
+    "effort": "high",
+    "model_host": "bedrock",
+    "subscriber_email_source": "jwt",
+}
+
+# effort carries the vendor's reasoning-effort level. The vocabulary is
+# deliberately open — vendor vocabularies differ and evolve, and an
+# unrecognised but well-formed value is stored verbatim — so only the shape the
+# platform enforces is checked here (hypercurrent AICompletionMetadataResource),
+# never an allow-list, which would reject valid new levels.
+_EFFORT_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # Closed vocabularies. skill_source and skill_kind land in a shared skill
 # catalog row that is written once from whichever submission arrives first and
@@ -502,9 +618,87 @@ _SKILL_VOCABULARIES: Dict[str, Tuple[str, ...]] = {
 }
 
 
+# Optional string fields inspected by the sync fast-path validator
+# (MeteringTransactionManager._validate_transaction_inputs). Named here because
+# the validation cache key is derived from the same list: a field the validator
+# checks but the key ignores is a verdict that can be reused for a payload the
+# validator would have rejected.
+_SYNC_VALIDATED_OPTIONAL_STRING_FIELDS: Tuple[str, ...] = (
+    "organization_name",
+    "task_type",
+    "agent",
+    "stop_reason",
+    "trace_id",
+    "ticket_id",
+    "skill_name",
+    "skill_source",
+    "skill_kind",
+    "skill_plugin_name",
+    "skill_marketplace_name",
+    "skill_invocation_trigger",
+    "effort",
+    "model_host",
+    "subscriber_email_source",
+)
+
+# Every field the sync fast-path validator reads. The validation cache key is
+# built from exactly these, so a cached verdict can only be reused for a payload
+# the validator would have judged identically.
+_VALIDATION_CACHE_FIELDS: Tuple[str, ...] = (
+    "model",
+    "provider",
+    "input_tokens",
+    "output_tokens",
+    "duration_ms",
+    "subscriber",
+    "is_streamed",
+    *_SYNC_VALIDATED_OPTIONAL_STRING_FIELDS,
+)
+
+
 def _optional_string_max_length(field: str) -> int:
     """Length cap for an optional string field, honoring contract overrides."""
     return _OPTIONAL_STRING_MAX_LENGTH_OVERRIDES.get(field, _OPTIONAL_STRING_MAX_LENGTH)
+
+
+def _effort_format_errors(arguments: Dict[str, Any]) -> List[str]:
+    """Shape errors for `effort`.
+
+    Shared by every validation path so the standalone `validate` action reaches
+    the same verdict as the submit path's structured pre-flight check. Only the
+    shape is checked: the vocabulary is open by design.
+    """
+    value = arguments.get("effort")
+    # fullmatch, never match: two traps compound in a `.match()` + `$` gate.
+    # re.match only anchors the START of the string, and Python's `$` also
+    # matches immediately before a single trailing newline — so "high\n" would
+    # be accepted here and 400'd by the metering API. (Same bug, same fix:
+    # revenium-python-sdk-internal#100.)
+    if isinstance(value, str) and not _EFFORT_PATTERN.fullmatch(value):
+        return [
+            f"• effort: Invalid format '{value}', must match {_EFFORT_PATTERN.pattern} "
+            "(letters, digits, underscore and hyphen only)"
+        ]
+    return []
+
+
+def _email_source_shape_errors(arguments: Dict[str, Any]) -> List[str]:
+    """Reject an email address supplied as `subscriber_email_source`.
+
+    The field records HOW the subscriber email was resolved (git, env,
+    cli-flag), never the address itself — an address here persists PII into
+    provenance metadata that is not treated as PII downstream. A short address
+    like a@b.co fits the 20-char cap, so the cap alone cannot catch it; the
+    '@' is the tell. Value withheld from the message (it is the PII).
+    """
+    value = arguments.get("subscriber_email_source")
+    if isinstance(value, str) and "@" in value:
+        return [
+            "• subscriber_email_source: looks like an email address (contains '@'); "
+            "this field records how the email was resolved — use a source label "
+            "like 'git', 'env' or 'cli-flag', never the address itself"
+        ]
+    return []
 
 
 def _skill_vocabulary_errors(arguments: Dict[str, Any]) -> List[str]:
@@ -783,13 +977,24 @@ class MeteringTransactionManager:
                 self._operation_times[op_category] = self._operation_times[op_category][-50:]
 
     def _get_cache_key(self, data: Dict[str, Any]) -> str:
-        """Generate cache key for validation results."""
-        # Create a deterministic key from the data
-        key_parts = []
-        for field in ["model", "provider", "input_tokens", "output_tokens", "duration_ms"]:
-            if field in data:
-                key_parts.append(f"{field}:{data[field]}")
-        return "|".join(key_parts)
+        """Generate cache key for validation results.
+
+        The key covers the COMPLETE validated argument set
+        (_VALIDATION_CACHE_FIELDS), not just the core five: a key built from a
+        subset hands a cached verdict to a payload that differs exactly where
+        the validator would have disagreed — one valid transaction warmed the
+        cache and every provenance variant of it inherited "valid" without
+        being looked at.
+
+        Canonical JSON of the field/value pairs sorted by field name, hashed so
+        the key stays short and bounded regardless of value sizes. Sorting by
+        name (which is unique) never compares values, so unorderable types are
+        safe; `default=repr` keeps anything JSON cannot encode from raising.
+        """
+        items = [(field, data[field]) for field in _VALIDATION_CACHE_FIELDS if field in data]
+        items.sort(key=lambda item: item[0])
+        canonical = json.dumps(items, sort_keys=True, default=repr)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def _cache_validation_result(self, data: Dict[str, Any], result: bool) -> None:
         """Cache validation result for performance."""
@@ -867,36 +1072,44 @@ class MeteringTransactionManager:
                     return False
 
             # Validate optional fields
-            optional_string_fields = [
-                "organization_name",
-                "task_type",
-                "agent",
-                "stop_reason",
-                "trace_id",
-                "ticket_id",
-                "skill_name",
-                "skill_source",
-                "skill_kind",
-                "skill_plugin_name",
-                "skill_marketplace_name",
-                "skill_invocation_trigger",
-            ]
-            for field in optional_string_fields:
+            for field in _SYNC_VALIDATED_OPTIONAL_STRING_FIELDS:
                 if field in arguments and arguments[field] is not None:
                     value = arguments[field]
                     if not isinstance(value, str):
                         logger.warning(f"Invalid type for {field}: {type(value)}")
                         return False
-                    # Security: Prevent injection and limit length
-                    if len(value) > _optional_string_max_length(field) or any(
-                        char in value for char in ["<", ">", '"', "'", "&"]
-                    ):
-                        logger.warning(f"Potentially malicious {field}: {value}")
+                    # Security: Prevent injection and limit length.
+                    #
+                    # These logs stay VALUE-FREE for every field. The values are
+                    # caller-supplied and can be personal data — the plainest
+                    # case is subscriber_email_source, which wants a source
+                    # label ('jwt', 'git') and caps at 20 characters, so the
+                    # ordinary misuse is passing the subscriber's actual email
+                    # address, which a value-echoing log would then write to
+                    # WARNING. Field name, reason and length are what an
+                    # operator needs to act; the value is not.
+                    max_length = _optional_string_max_length(field)
+                    if len(value) > max_length:
+                        logger.warning(
+                            f"Rejected {field}: too long (max {max_length} characters, "
+                            f"got {len(value)}); value withheld"
+                        )
+                        return False
+                    if any(char in value for char in ["<", ">", '"', "'", "&"]):
+                        logger.warning(
+                            f"Rejected {field}: contains forbidden characters "
+                            f"(<, >, \", ', &) (length {len(value)}); value withheld"
+                        )
                         return False
 
             vocabulary_errors = _skill_vocabulary_errors(arguments)
             if vocabulary_errors:
                 logger.warning(f"Rejected skill attribution: {'; '.join(vocabulary_errors)}")
+                return False
+
+            effort_errors = _effort_format_errors(arguments) + _email_source_shape_errors(arguments)
+            if effort_errors:
+                logger.warning(f"Rejected completion provenance: {'; '.join(effort_errors)}")
                 return False
 
             # Validate subscriber object if provided
@@ -1303,6 +1516,9 @@ The subscriber data structure has been updated. The old individual fields are no
             "skill_plugin_name",
             "skill_marketplace_name",
             "skill_invocation_trigger",
+            "effort",
+            "model_host",
+            "subscriber_email_source",
         ]
         for field in optional_string_fields:
             if field in arguments and arguments[field] is not None:
@@ -1325,6 +1541,8 @@ The subscriber data structure has been updated. The old individual fields are no
                     continue
 
         errors.extend(_skill_vocabulary_errors(arguments))
+        errors.extend(_effort_format_errors(arguments))
+        errors.extend(_email_source_shape_errors(arguments))
 
         # Validate trace string fields from BOTH top-level AND usage_metadata
         # These fields support both snake_case and camelCase aliases
@@ -1810,6 +2028,9 @@ The subscriber data structure has been updated. The old individual fields are no
                 "skill_plugin_name",
                 "skill_marketplace_name",
                 "skill_invocation_trigger",
+                "effort",
+                "model_host",
+                "subscriber_email_source",
             ]
             for field in optional_string_fields:
                 if field in arguments and arguments[field] is not None:
@@ -1832,6 +2053,8 @@ The subscriber data structure has been updated. The old individual fields are no
                         continue
 
             errors.extend(_skill_vocabulary_errors(arguments))
+            errors.extend(_effort_format_errors(arguments))
+            errors.extend(_email_source_shape_errors(arguments))
 
             # Validate response_quality_score (critical missing validation!)
             if (
@@ -2277,6 +2500,83 @@ The subscriber data structure has been updated. The old individual fields are no
                     },
                 )
 
+        # effort, modelHost and subscriberEmailSource are capped by the metering
+        # spec (AICompletionMetadataResource maxLength, mirrored in
+        # _OPTIONAL_STRING_MAX_LENGTH_OVERRIDES) — reject client-side so agents
+        # get a structured pre-flight error instead of an API 400.
+        email_source_value = arguments.get("subscriber_email_source")
+        if isinstance(email_source_value, str) and "@" in email_source_value:
+            # PII gate before the length gate: a short address (a@b.co) fits the
+            # cap, so the cap alone cannot catch it. Value withheld — it IS the PII.
+            raise create_structured_validation_error(
+                message=(
+                    "subscriber_email_source looks like an email address "
+                    "(contains '@'); value withheld"
+                ),
+                field="subscriber_email_source",
+                value="(withheld: value contains '@')",
+                suggestions=[
+                    "Record how the email was resolved, never the address itself",
+                    "Use a short source label such as 'git', 'env' or 'cli-flag'",
+                    "Or omit subscriber_email_source when provenance is unknown",
+                ],
+                examples={"valid_format": _COMPLETION_PROVENANCE_EXAMPLES["subscriber_email_source"]},
+            )
+        for provenance_field, provenance_example in _COMPLETION_PROVENANCE_EXAMPLES.items():
+            provenance_max = _optional_string_max_length(provenance_field)
+            provenance_value = arguments.get(provenance_field)
+            if isinstance(provenance_value, str) and len(provenance_value) > provenance_max:
+                suggestions = [
+                    f"Use the short {provenance_field} label only "
+                    f"(e.g. '{provenance_example}'), not a description",
+                    f"Trim the value to at most {provenance_max} characters",
+                    f"Or omit {provenance_field} when it does not apply to this transaction",
+                ]
+                if provenance_field == "subscriber_email_source":
+                    # It records how the email was resolved, never an address:
+                    # an address both breaks the cap and leaks PII into a
+                    # field that is not treated as PII downstream.
+                    suggestions.insert(
+                        1, "Record how the email was resolved, never the address itself"
+                    )
+                raise create_structured_validation_error(
+                    message=(
+                        f"{provenance_field} too long: {len(provenance_value)} characters "
+                        f"(max {provenance_max})"
+                    ),
+                    field=provenance_field,
+                    value=f"{provenance_value[:32]}... ({len(provenance_value)} chars)",
+                    suggestions=suggestions,
+                    examples={
+                        "valid_format": provenance_example,
+                        "max_length": provenance_max,
+                    },
+                )
+
+        # The effort vocabulary is open, but its shape is not: the platform
+        # enforces _EFFORT_PATTERN, so a value carrying spaces or punctuation is
+        # rejected upstream after this call has reported success.
+        if _effort_format_errors(arguments) or _email_source_shape_errors(arguments):
+            raise create_structured_validation_error(
+                message=(
+                    f"Invalid effort: '{arguments.get('effort')}' must match "
+                    f"{_EFFORT_PATTERN.pattern}"
+                ),
+                field="effort",
+                value=arguments.get("effort"),
+                suggestions=[
+                    "Use letters, digits, underscore or hyphen only - no spaces or punctuation",
+                    "Any well-formed value is accepted: vendor effort vocabularies differ "
+                    "and unrecognised levels are stored verbatim",
+                    "Or omit effort when the model reports no reasoning effort",
+                ],
+                examples={
+                    "valid_format": _COMPLETION_PROVENANCE_EXAMPLES["effort"],
+                    "pattern": _EFFORT_PATTERN.pattern,
+                    "max_length": _optional_string_max_length("effort"),
+                },
+            )
+
         # Build payload matching EXACT Revenium API requirements
         payload = {
             "transactionId": transaction_id,
@@ -2321,6 +2621,13 @@ The subscriber data structure has been updated. The old individual fields are no
             "skillPluginName": arguments.get("skill_plugin_name"),
             "skillMarketplaceName": arguments.get("skill_marketplace_name"),
             "skillInvocationTrigger": arguments.get("skill_invocation_trigger"),
+            # Completion provenance (nullable, optional). Same opt-in contract
+            # as the ticket/skill fields and for the same reason: these vary per
+            # call, so an env-var fallback would stamp a stale host or effort on
+            # every subsequent transaction.
+            "effort": arguments.get("effort"),
+            "modelHost": arguments.get("model_host"),
+            "subscriberEmailSource": arguments.get("subscriber_email_source"),
         }
 
         # Add non-None optional fields
@@ -3207,6 +3514,9 @@ class MeteringManagement(ToolBase):
                             ("skill_plugin_name", "Skill Plugin Name"),
                             ("skill_marketplace_name", "Skill Marketplace Name"),
                             ("skill_invocation_trigger", "Skill Invocation Trigger"),
+                            ("effort", "Effort"),
+                            ("model_host", "Model Host"),
+                            ("subscriber_email_source", "Subscriber Email Source"),
                         ]
 
                         for field_key, field_label in optional_fields_display:
@@ -3329,8 +3639,12 @@ class MeteringManagement(ToolBase):
                 )
                 response_text += (
                     f"**Sources**: {result['summary']['sources']['session']} session, "
-                    f"{result['summary']['sources']['api']} API\n\n"
+                    f"{result['summary']['sources']['api']} API\n"
                 )
+                response_text += _coding_assistant_scope_note(
+                    _resolve_include_coding_assistants(arguments)
+                )
+                response_text += "\n"
 
                 # Extract and normalize return_transaction_data parameter
                 return_transaction_data = self._normalize_return_data_parameter(arguments)
@@ -3530,6 +3844,9 @@ class MeteringManagement(ToolBase):
         response_text += f"**Found**: {pagination_info['total_found']} transactions\n"
         if pagination_info.get('has_more'):
             response_text += f"**More Available**: Use page={pagination_info['page'] + 1} for next page\n"
+        response_text += _coding_assistant_scope_note(
+            bool(filters.get("includeCodingAssistants"))
+        )
         response_text += "\n"
 
         # Display transaction data based on detail level
@@ -3633,6 +3950,7 @@ class MeteringManagement(ToolBase):
 
         # Add each section using dedicated helper methods
         details += self._format_cost_breakdown(data)
+        details += self._format_model_execution(data)
         details += self._format_performance_metrics(data)
         details += self._format_attribution_details(data)
         details += self._format_session_tracking(data)
@@ -3642,27 +3960,78 @@ class MeteringManagement(ToolBase):
         return details
 
     def _format_cost_breakdown(self, data: Dict[str, Any]) -> str:
-        """Format cost breakdown section with rate calculations."""
-        cost_fields = ['inputTokenCost', 'outputTokenCost', 'totalCost']
-        if not any(data.get(field) for field in cost_fields):
+        """Format cost breakdown section with rate calculations.
+
+        Every gate here is an explicit `is not None` check rather than a
+        truthiness test. A cost of exactly 0.0 is a real, meaningful value on
+        this endpoint - the platform stores it when a transaction was re-rated
+        to free - and a truthy gate would silently drop the whole section for
+        exactly the transactions a user is asking about.
+        """
+        cost_fields = ['inputTokenCost', 'outputTokenCost', 'totalCost', 'clientReportedCost']
+        if not any(data.get(field) is not None for field in cost_fields):
             return ""
 
         details = "- **Cost Breakdown**:\n"
 
-        if data.get('inputTokenCost'):
-            input_tokens = data.get('inputTokenCount', 0)
-            input_cost = data.get('inputTokenCost')
+        input_cost = data.get('inputTokenCost')
+        if input_cost is not None:
+            # `or 0`, not a .get default: the API can carry an explicit null
+            # tokenCount next to a 0.0 cost, and None > 0 is a TypeError — a
+            # nullable zero-cost row must render, not abort the whole detail.
+            input_tokens = data.get('inputTokenCount') or 0
             rate = input_cost / input_tokens if input_tokens > 0 else 0
             details += f"  - **Input Cost**: ${input_cost:.6f} ({input_tokens} tokens × ${rate:.8f}/token)\n"
 
-        if data.get('outputTokenCost'):
-            output_tokens = data.get('outputTokenCount', 0)
-            output_cost = data.get('outputTokenCost')
+        output_cost = data.get('outputTokenCost')
+        if output_cost is not None:
+            output_tokens = data.get('outputTokenCount') or 0
             rate = output_cost / output_tokens if output_tokens > 0 else 0
             details += f"  - **Output Cost**: ${output_cost:.6f} ({output_tokens} tokens × ${rate:.8f}/token)\n"
 
-        if data.get('totalCost'):
+        if data.get('totalCost') is not None:
             details += f"  - **Total Cost**: ${data.get('totalCost'):.6f}\n"
+
+        # clientReportedCost is populated only when the platform re-rated the
+        # transaction against the tenant's own rate card, replacing what the
+        # client sent. It is the answer to "why does this cost differ from what
+        # my coding assistant reported", so it is labelled as the superseded
+        # figure and never presented as a peer of the billed total. No
+        # difference or discount is derived: a null clientReportedCost means
+        # "not re-rated", not "zero delta", so the arithmetic would mislabel
+        # the majority of transactions.
+        client_reported_cost = data.get('clientReportedCost')
+        if client_reported_cost is not None:
+            details += (
+                f"  - **Client-Reported Cost**: ${client_reported_cost:.6f} "
+                "(reported by the client before the platform re-rated this "
+                "transaction; Total Cost above is the billed figure)\n"
+            )
+
+        return details
+
+    def _format_model_execution(self, data: Dict[str, Any]) -> str:
+        """Format where the model actually ran and how hard it was asked to think.
+
+        modelHost is the billing infrastructure that served the call (bedrock,
+        vertex, anthropic) and is distinct from `provider`, which names the
+        model vendor - the two differ whenever a model is resold. effort is the
+        reasoning level the model was asked for; its vocabulary is open, so the
+        value is rendered verbatim rather than mapped to a fixed set.
+
+        Both are nullable, so both are gated on `is not None`.
+        """
+        execution_fields = ['modelHost', 'effort']
+        if not any(data.get(field) is not None for field in execution_fields):
+            return ""
+
+        details = "- **Model Execution**:\n"
+
+        if data.get('modelHost') is not None:
+            details += f"  - **Model Host**: {data.get('modelHost')}\n"
+
+        if data.get('effort') is not None:
+            details += f"  - **Reasoning Effort**: {data.get('effort')}\n"
 
         return details
 
@@ -3691,7 +4060,12 @@ class MeteringManagement(ToolBase):
         attr_fields = ['taskType', 'agent', 'organization', 'product', 'subscriptionId']
         subscriber_fields = ['subscriberEmail', 'subscriberId', 'subscriberCredential', 'subscriber']
 
-        if not any(data.get(field) for field in attr_fields + subscriber_fields):
+        # subscriberEmailSource joins the gate on an explicit `is not None`
+        # check: it records how the email was resolved and is populated on
+        # transactions whose subscriberEmail itself is null, so it must be able
+        # to open this section on its own.
+        has_attribution = any(data.get(field) for field in attr_fields + subscriber_fields)
+        if not has_attribution and data.get('subscriberEmailSource') is None:
             return ""
 
         details = "- **Attribution**:\n"
@@ -3732,6 +4106,14 @@ class MeteringManagement(ToolBase):
         if subscriber_email:
             details += f"  - **Subscriber Email**: {subscriber_email}\n"
             subscriber_added = True
+
+        # Rendered independently of subscriberEmail, and deliberately without
+        # setting subscriber_added: the source names a resolution mechanism
+        # (never an address), so it must not suppress the nested-subscriber
+        # fallback below when it is the only flat field present.
+        subscriber_email_source = data.get('subscriberEmailSource')
+        if subscriber_email_source is not None:
+            details += f"  - **Subscriber Email Source**: {subscriber_email_source}\n"
 
         if subscriber_id:
             details += f"  - **Subscriber ID**: {subscriber_id}\n"
@@ -3961,16 +4343,26 @@ class MeteringManagement(ToolBase):
             # request construction, filter application, and response-structure parsing.
             endpoint = get_endpoint_path("completions")  # Retained for report output below
             filters = _extract_completions_filters(arguments)
+            scope_note = _coding_assistant_scope_note(
+                bool(filters.get("includeCodingAssistants"))
+            )
             transactions, _ = await self._fetch_recent_transactions_paginated(
                 client, page=0, page_size=limit, filters=filters or None
             )
             total_found = len(transactions)
 
             if total_found == 0:
+                # The scope line matters most here: an empty result is the answer
+                # a user is most likely to misread as "my data never arrived".
                 return [
                     TextContent(
                         type="text",
-                        text="📊 **No Recent Transactions**\n\nNo transactions found in the reporting API. Submit some test transactions first using `submit_ai_transaction()`.",
+                        text=(
+                            "📊 **No Recent Transactions**\n\n"
+                            + scope_note
+                            + "\nNo transactions found in the reporting API. "
+                            "Submit some test transactions first using `submit_ai_transaction()`."
+                        ),
                     )
                 ]
 
@@ -4014,6 +4406,9 @@ class MeteringManagement(ToolBase):
                 "skillPluginName",
                 "skillMarketplaceName",
                 "skillInvocationTrigger",
+                "effort",
+                "modelHost",
+                "subscriberEmailSource",
                 "isStreamed",
                 "stopReason",
                 "requestTime",
@@ -4079,7 +4474,8 @@ class MeteringManagement(ToolBase):
             report = "# **Recent Transactions Field Analysis**\n\n"
             report += f"**Analysis Date:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
             report += f"**Transactions Analyzed:** {total_found}\n"
-            report += f"**API Endpoint:** `{endpoint}`\n\n"
+            report += f"**API Endpoint:** `{endpoint}`\n"
+            report += scope_note + "\n"
 
             # Field presence summary
             report += "## **Field Presence Summary**\n\n"
@@ -4333,6 +4729,9 @@ get_field_documentation()
 - `skill_plugin_name` (optional) - Plugin providing the skill
 - `skill_marketplace_name` (optional) - Marketplace the skill came from
 - `skill_invocation_trigger` (optional) - What triggered the invocation
+- `effort` (optional) - Reasoning effort the model was asked for
+- `model_host` (optional) - Billing infrastructure hosting the model
+- `subscriber_email_source` (optional) - How the subscriber email was resolved
 
 ### **Field Validation Rules**
 
@@ -4353,6 +4752,9 @@ get_field_documentation()
 - `skill_invocation_trigger`: String, 1-32 characters — commonly `user-slash`, `claude-proactive`, `nested-skill`
 - `skill_source`: One of `bundled`, `projectSettings`, `userSettings`, `plugin` (case-sensitive)
 - `skill_kind`: `workflow`, or omitted
+- `effort`: String, 1-16 characters matching `^[A-Za-z0-9_-]+$` (e.g. `high`) — open vocabulary, any well-formed value is stored verbatim
+- `model_host`: String, 1-50 characters (e.g. `bedrock`, `vertex`, `anthropic`)
+- `subscriber_email_source`: String, 1-20 characters — how the email was resolved (e.g. `jwt`), never an email address
 - `response_quality_score`: Float between 0.0 and 1.0 (inclusive)
 - `is_streamed`: Boolean (true/false, accepts string conversion)
 - `time_to_first_token`: Positive integer in milliseconds (≤ 60,000ms)
@@ -4395,7 +4797,10 @@ validate(model="<model>", provider="<provider>", input_tokens=3000, output_token
   "skill_kind": "workflow",
   "skill_plugin_name": "quant-tools",
   "skill_marketplace_name": "internal-catalog",
-  "skill_invocation_trigger": "user-slash"
+  "skill_invocation_trigger": "user-slash",
+  "effort": "high",
+  "model_host": "bedrock",
+  "subscriber_email_source": "jwt"
 }
 ```
 
@@ -4531,6 +4936,14 @@ Browse recent transactions without needing specific transaction IDs. Perfect for
 - `page` (optional): Page number (0-based, default: 0)
 - `page_size` (optional): Transactions per page (1-50, default: 20)
 - `return_transaction_data` (optional): Detail level - "no", "summary", "full" (default: "summary")
+- `include_coding_assistants` (optional): Include coding-assistant records such as Claude Code and Gemini CLI (default: true)
+
+### **Coding-Assistant Scope**
+`lookup_transactions`, `lookup_recent_transactions` and `analyze_recent_transactions` INCLUDE
+coding-assistant records (Claude Code, Gemini CLI, and similar) by default, matching what the
+AI insights tool returns, so a check of whether coding-assistant data arrived cannot answer "no"
+for data that landed. Pass `include_coding_assistants=false` for the excluded view. Every
+response from these actions states which records were in scope.
 
 ## **Next Steps**
 1. Use `lookup_transactions()` to find and verify transactions
@@ -4730,6 +5143,7 @@ main();
   - Length: 1-500 chars, no `<>\"'&`
 - **Capped string fields**: `ticket_id` (1-256 chars), `skill_name` / `skill_plugin_name` / `skill_marketplace_name` (1-256 chars), `skill_invocation_trigger` (1-32 chars)
 - **Closed-vocabulary fields**: `skill_source` (`bundled`, `projectSettings`, `userSettings`, `plugin`), `skill_kind` (`workflow`)
+- **Completion provenance fields**: `effort` (1-16 chars, `^[A-Za-z0-9_-]+$`, open vocabulary), `model_host` (1-50 chars, e.g. `bedrock`), `subscriber_email_source` (1-20 chars, how the email was resolved — never an address)
 - **Numeric fields**: `response_quality_score` (float 0.0-1.0), `time_to_first_token` (integer ≤ 60,000ms)
 - **Boolean fields**: `is_streamed` (true/false, string conversion supported)
 
@@ -4810,6 +5224,9 @@ list_ai_models()                       # List all models
 - `skill_invocation_trigger` (string, 1-32 chars) - commonly `user-slash`, `claude-proactive`, `nested-skill`
 - `skill_source` (string) - one of `bundled`, `projectSettings`, `userSettings`, `plugin`
 - `skill_kind` (string) - `workflow`, or omitted
+- `effort` (string, 1-16 chars, `^[A-Za-z0-9_-]+$`) - reasoning effort asked for, e.g. `high`; open vocabulary
+- `model_host` (string, 1-50 chars) - billing infrastructure, e.g. `bedrock`, `vertex`, `anthropic`
+- `subscriber_email_source` (string, 1-20 chars) - how the subscriber email was resolved, e.g. `jwt`; never an email address
 - `response_quality_score` (float, 0.0-1.0)
 - `is_streamed` (boolean)
 - `time_to_first_token` (integer, ≤ 60,000ms)
@@ -4842,6 +5259,7 @@ list_ai_models()                       # List all models
 - **Session**: + `trace_id`
 - **Billing**: + `product_name`, `subscription_id`, `subscriber`
 - **Ticket / Skill**: + `ticket_id`, `skill_name`, `skill_source`, `skill_kind`, `skill_plugin_name`, `skill_marketplace_name`, `skill_invocation_trigger`
+- **Completion provenance**: + `effort`, `model_host`, `subscriber_email_source`
 - **Timestamps**: + `request_time`, `response_time`, `completion_start_time`
 
 ## **Validation**
@@ -6600,11 +7018,13 @@ Use `validate()` before submission."""
                     "search_page_range": "int|array (optional) - Pages to search (default: 50)",
                     "page_size": "int (optional) - Transactions per page (default: 1000)",
                     "early_termination": "bool (optional) - Stop when found (default: true)",
+                    "include_coding_assistants": "bool (optional) - Include coding-assistant records such as Claude Code and Gemini CLI (default: true)",
                 },
                 examples=[
                     "lookup_transactions(transaction_ids=['tx_abc123'])  # Single transaction lookup",
                     "lookup_transactions(transaction_ids=['tx_abc123', 'tx_def456'])  # Batch lookup",
                     "lookup_transactions(transaction_ids=['tx_abc123'], max_retries=5)  # With custom retries",
+                    "lookup_transactions(transaction_ids=['tx_abc123'], include_coding_assistants=False)  # Exclude coding assistants",
                 ],
             ),
             ToolCapability(
@@ -6614,11 +7034,13 @@ Use `validate()` before submission."""
                     "page": "int (optional) - Page number for pagination (0-based, default: 0)",
                     "page_size": "int (optional) - Number of transactions per page (1-50, default: 20)",
                     "return_transaction_data": "str (optional) - Detail level: 'no', 'summary', 'full' (default: 'summary')",
+                    "include_coding_assistants": "bool (optional) - Include coding-assistant records such as Claude Code and Gemini CLI (default: true)",
                 },
                 examples=[
                     "lookup_recent_transactions()  # Get first 20 recent transactions",
                     "lookup_recent_transactions(page=1, page_size=10)  # Get next 10 transactions",
                     "lookup_recent_transactions(return_transaction_data='full')  # Get detailed transaction data",
+                    "lookup_recent_transactions(include_coding_assistants=False)  # Exclude coding assistants",
                 ],
             ),
             ToolCapability(
@@ -6745,6 +7167,20 @@ Use `validate()` before submission."""
                     "type": "string",
                     "description": f"What triggered the skill invocation. Max {_optional_string_max_length('skill_invocation_trigger')} characters; common values: {', '.join(_SKILL_INVOCATION_TRIGGER_EXAMPLES)}.",
                 },
+                # Completion provenance fields (optional, submission only —
+                # the completions search endpoint exposes no filters for them)
+                "effort": {
+                    "type": "string",
+                    "description": f"Reasoning effort the model was asked for (e.g. '{_COMPLETION_PROVENANCE_EXAMPLES['effort']}'). Max {_optional_string_max_length('effort')} characters, must match {_EFFORT_PATTERN.pattern}. The vocabulary is open - vendor levels differ and any well-formed value is stored verbatim. Submission field for submit_ai_transaction.",
+                },
+                "model_host": {
+                    "type": "string",
+                    "description": f"Billing infrastructure hosting the model (e.g. '{_COMPLETION_PROVENANCE_EXAMPLES['model_host']}', 'vertex', 'anthropic') - what separates spend for the same model name. Max {_optional_string_max_length('model_host')} characters. Submission field for submit_ai_transaction; distinct from the model_source search filter, which names the routing layer.",
+                },
+                "subscriber_email_source": {
+                    "type": "string",
+                    "description": f"How the subscriber email was resolved (e.g. '{_COMPLETION_PROVENANCE_EXAMPLES['subscriber_email_source']}'), never an email address. Max {_optional_string_max_length('subscriber_email_source')} characters. Submission field for submit_ai_transaction.",
+                },
                 # Pagination and Search Control Parameters
                 "search_page_range": {
                     "type": ["integer", "array"],
@@ -6837,6 +7273,11 @@ Use `validate()` before submission."""
                 "query": {
                     "type": "string",
                     "description": "Server-side search term: matches trace/transaction ID exactly first, then falls back to partial match across agent, model, provider, error reason and subscriber email. Used with lookup_recent_transactions and analyze_recent_transactions.",
+                },
+                # Coding-assistant scope
+                "include_coding_assistants": {
+                    "type": "boolean",
+                    "description": "Whether coding-assistant records (Claude Code, Gemini CLI, and similar) are in scope. Default: true - this MCP includes them so transaction lookups agree with the AI insights tool. Pass false to exclude them, matching the raw API default. Used with lookup_transactions, lookup_recent_transactions and analyze_recent_transactions.",
                 },
                 # Cost / performance ranges
                 "total_cost_min": {
@@ -7125,6 +7566,10 @@ Use `validate()` before submission."""
                 "`traceId`, `agent`, `organizationName`, `subscriberEmail`, `provider`, "
                 "`model`, and more — the full set matches `lookup_transactions` filters "
                 "(see get_field_documentation)\n"
+                "- `includeCodingAssistants` (optional): the API defaults this to false, "
+                "which drops Claude Code / Gemini CLI records. The MCP always sends it "
+                "explicitly and defaults it to true; direct REST callers must set it "
+                "themselves to see the same records\n"
                 "**Response**: 200 OK with a paginated transaction list\n"
                 "**Timeout**: 30 seconds\n"
                 "**Rate Limit**: 100 requests/minute\n\n"

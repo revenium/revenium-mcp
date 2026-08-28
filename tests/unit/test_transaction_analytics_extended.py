@@ -415,12 +415,29 @@ class TestFetchAgentData:
 
     @pytest.mark.asyncio
     async def test_fetch_agent_data_with_group(self, processor, mock_client):
-        """Non-TOTAL group param is included."""
+        """Non-TOTAL group reaches only the reports that declare it (BACK-2783).
+
+        call-count-metrics-by-agents has no `group` request param upstream, so
+        sending one produced TOTAL-shaped counts labelled DAILY.
+        """
         mock_client._request_with_retry = AsyncMock(return_value=[])
         await processor._fetch_agent_data(mock_client, "team-1", "MONTH", "DAILY")
+
+        groups_by_path = {}
         for call in mock_client._request_with_retry.call_args_list:
-            params = call[1].get("params", call[0][2] if len(call[0]) > 2 else {})
-            assert params.get("group") == "DAILY"
+            path = call[0][1]
+            params = call[1].get("params", {})
+            groups_by_path[path] = params.get("group")
+
+        call_count_paths = [p for p in groups_by_path if "call-count-metrics-by-agents" in p]
+        assert call_count_paths, groups_by_path
+        for path in call_count_paths:
+            assert groups_by_path[path] is None
+
+        other_paths = [p for p in groups_by_path if p not in call_count_paths]
+        assert other_paths, groups_by_path
+        for path in other_paths:
+            assert groups_by_path[path] == "DAILY"
 
     @pytest.mark.asyncio
     async def test_fetch_agent_data_partial_failure(self, processor, mock_client):

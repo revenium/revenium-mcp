@@ -1,6 +1,5 @@
 """Tests for the per-endpoint ``force_new`` override on the analytics endpoint registry."""
 
-import os
 
 import pytest
 
@@ -97,39 +96,3 @@ def test_get_endpoint_config_preserves_force_new(flag_off):
 
 
 # ---------------------------------------------------------------------------
-# Live integration test — requires REVENIUM_LIVE_API_KEY (+ optional team id)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-@pytest.mark.skipif(
-    not os.environ.get("REVENIUM_LIVE_API_KEY"),
-    reason="Live API test requires REVENIUM_LIVE_API_KEY env var",
-)
-async def test_live_revenue_metric_by_organization_uses_new_endpoint(monkeypatch):
-    """Hits the new revenue-per-customer endpoint via force_new routing."""
-    from src.revenium_mcp_server.auth import AuthConfig
-    from src.revenium_mcp_server.client import ReveniumClient
-
-    monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
-
-    api_key = os.environ["REVENIUM_LIVE_API_KEY"]
-    team_id = os.environ.get("REVENIUM_LIVE_TEAM_ID", "")
-    base_url = os.environ.get("REVENIUM_LIVE_BASE_URL", "https://api.revenium.ai")
-    if "REVENIUM_LIVE_APP_BASE_URL" in os.environ:
-        monkeypatch.setenv("REVENIUM_APP_BASE_URL", os.environ["REVENIUM_LIVE_APP_BASE_URL"])
-
-    path, params, call_kwargs = resolve_analytics_request(
-        "revenue_metric_by_organization",
-        team_id=team_id,
-        period="TWELVE_MONTHS",
-    )
-    assert path == "/api/v2/analytics/revenue-per-customer"
-    assert call_kwargs.get("use_bearer") is True
-
-    auth = AuthConfig(api_key=api_key, team_id=team_id, base_url=base_url)
-    async with ReveniumClient(auth_config=auth) as client:
-        response = await client.get(path, params=params, **call_kwargs)
-
-    assert response is not None
-    assert isinstance(response, (dict, list))

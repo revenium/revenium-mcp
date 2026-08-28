@@ -236,22 +236,35 @@ class TestListElements:
         mock_client.get_metering_element_definitions.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_list_forwards_name_filter(self, manager, mock_client):
-        mock_client.get_metering_element_definitions.return_value = {"data": []}
-        await manager.list_elements(mock_client, {"name": "shipping"})
-        mock_client.get_metering_element_definitions.assert_called_once_with(
-            page=0, size=20, name="shipping",
-        )
+    async def test_list_rejects_name_filter(self, manager, mock_client):
+        """BACK-2783: /metering-element-definitions has no name parameter.
+
+        Sending one returned the full unfiltered list, which reads as "no
+        element by that name exists" only if you already knew the filter was
+        ignored.
+        """
+        with pytest.raises(ToolError) as exc:
+            await manager.list_elements(mock_client, {"name": "shipping"})
+        assert exc.value.field == "name"
+        mock_client.get_metering_element_definitions.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_list_name_does_not_override_explicit_filters(self, manager, mock_client):
+    async def test_list_rejects_name_inside_filters(self, manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await manager.list_elements(mock_client, {"filters": {"name": "from-filters"}})
+        assert "name" in str(exc.value)
+        assert "source_ids" in str(exc.value)
+        mock_client.get_metering_element_definitions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_forwards_declared_filters(self, manager, mock_client):
+        """Allowlisted keys reach the API under their camelCase names."""
         mock_client.get_metering_element_definitions.return_value = {"data": []}
-        await manager.list_elements(mock_client, {
-            "name": "top-level",
-            "filters": {"name": "from-filters"},
-        })
+        await manager.list_elements(
+            mock_client, {"filters": {"type": "NUMBER", "source_ids": "src_1"}}
+        )
         mock_client.get_metering_element_definitions.assert_called_once_with(
-            page=0, size=20, name="from-filters",
+            page=0, size=20, type="NUMBER", sourceIds="src_1",
         )
 
 

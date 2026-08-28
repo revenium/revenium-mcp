@@ -8,6 +8,8 @@ This tool provides business analytics capabilities including:
 - Cost summary reports
 """
 
+import math
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
@@ -22,7 +24,7 @@ from ..analytics.simple_analytics_engine import SimpleAnalyticsEngine
 from ..analytics.simple_cost_analyzer import SimpleCostAnalyzer
 from ..analytics.validation import ValidationError
 from ..auth import AuthenticationError
-from ..client import ReveniumAPIError
+from ..client import SEAT_UTILIZATION_MAX_RANGE_DAYS, ReveniumAPIError
 from ..endpoint_registry import NewApiRequiredError, _use_new_api
 from ..introspection.metadata import ToolCapability
 from .unified_tool_base import ToolBase
@@ -58,7 +60,7 @@ class BusinessAnalyticsManagement(ToolBase):
 
     tool_name: ClassVar[str] = "business_analytics_management"
     tool_description: ClassVar[str] = (
-        "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_user_costs, get_tool_costs, get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider, get_transaction_count, get_filter_options, get_unpaid_invoice_totals, list_invoices, list_refunds, list_period_charges, list_skills, get_skill, get_task_costs, get_task_completion, get_task_performance, get_profit_margins, get_top_movers, get_token_breakdown, get_team_costs, get_vendor_costs, get_token_vs_tool_cost, get_trace_cost_distribution, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_filter_options(dimension=...) to discover valid filter values. Use get_examples() for parameter guidance and get_capabilities() for status."
+        "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_user_costs, get_tool_costs, get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider, get_transaction_count, get_filter_options, get_unpaid_invoice_totals, get_seat_utilization, list_invoices, list_refunds, list_period_charges, list_skills, get_skill, get_pr_health, get_coverage_ratio, get_task_costs, get_task_completion, get_task_performance, get_profit_margins, get_top_movers, get_token_breakdown, get_team_costs, get_vendor_costs, get_token_vs_tool_cost, get_trace_cost_distribution, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_filter_options(dimension=...) to discover valid filter values. Use get_examples() for parameter guidance and get_capabilities() for status."
     )
     business_category: ClassVar[str] = "Metering and Analytics Tools"
     tool_type: ClassVar[ToolType] = ToolType.ANALYTICS
@@ -210,6 +212,8 @@ class BusinessAnalyticsManagement(ToolBase):
                 return await self._handle_get_filter_options(arguments, ctx=ctx)
             elif action == "get_unpaid_invoice_totals":
                 return await self._handle_get_unpaid_invoice_totals(arguments, ctx=ctx)
+            elif action == "get_seat_utilization":
+                return await self._handle_get_seat_utilization(arguments, ctx=ctx)
             elif action == "get_task_costs":
                 return await self._handle_get_task_costs(arguments, ctx=ctx)
             elif action == "get_task_completion":
@@ -240,6 +244,10 @@ class BusinessAnalyticsManagement(ToolBase):
                 return await self._handle_list_skills(arguments, ctx=ctx)
             elif action == "get_skill":
                 return await self._handle_get_skill(arguments, ctx=ctx)
+            elif action == "get_pr_health":
+                return await self._handle_get_pr_health(arguments, ctx=ctx)
+            elif action == "get_coverage_ratio":
+                return await self._handle_get_coverage_ratio(arguments, ctx=ctx)
             elif action == "get_cost_summary":
                 return await self._handle_get_cost_summary(arguments, ctx=ctx)
             elif action == "analyze_cost_anomalies":
@@ -368,10 +376,20 @@ If you're seeing this error, please report it as it indicates a reliability issu
 6a. **get_transaction_count**
    - Total transaction volume for your team over a period (real count, not derived from cost)
    - Single aggregate number; same universe as the cost endpoints (coding-assistant transactions excluded)
+   - Deliberately narrower than manage_metering's transaction lookups, which include coding-assistant
+     records by default; use those to verify whether Claude Code / Gemini CLI data arrived
 
 6b. **get_unpaid_invoice_totals**
    - Count and total outstanding amount of unpaid invoices (server-side aggregate)
    - UNPAID invoices count in full; PARTIALLY_PAID contribute their remaining balance
+
+6b1. **get_seat_utilization**
+   - Daily Claude Enterprise seat census: seats assigned, pending invites, and distinct active people over the vendor's daily / weekly / 30-day windows
+   - Requires from_date and to_date (ISO yyyy-MM-dd); the range may not exceed 366 days and from_date must not be after to_date
+   - team_id is optional and defaults to the team on your credentials
+   - Adoption rate is seatsUsed (the trailing 30-day active count) / seatsPaid — never dailyActive / seatsPaid
+   - Withheld counts render as 'unavailable (withheld by vendor)', never 0; a day missing either adoption input shows no rate
+   - An empty census means no Claude Enterprise connection for the team, which is reported as such rather than as zero seats
 
 6c. **list_invoices / list_refunds / list_period_charges**
    - Read-only billing listings; numeric-honest amounts (missing → 'n/a', never a fabricated 0)
@@ -382,6 +400,24 @@ If you're seeing this error, please report it as it indicates a reliability issu
    - list_skills sorts by totalCost,DESC by default; get_skill takes skill_id and adds first/last seen
    - period also accepts NINETY_DAYS and SIX_MONTHS here, which the cost-analysis actions do not
    - Requires skill attribution to be enabled for the team; both actions answer 403 until it is
+
+6e. **get_pr_health**
+   - Aging/rotting open pull requests and closed-without-merge waste, per engineer
+   - Covers YOUR OWN organization (resolved from your credentials); it takes no team parameter
+   - Aging/rotting classify by INACTIVITY (days since the PR's last provider-side activity), not by age
+   - Drafts are counted separately and excluded; at-risk (rotting, still open) and wasted (closed unmerged) stay separate
+   - Requires source (github|gitlab), start_date and end_date; the window must span fewer than 366 days
+   - Dollar figures are client-side ESTIMATES (count x avgCostPerMergedPr), never billed amounts
+   - Thresholds come from the team settings and are echoed in the report; change them with manage_customers update_pr_health_settings
+
+6f. **get_coverage_ratio**
+   - How much of the providers' billed spend Revenium actually metered, plus the hidden (unmetered) spend
+   - period picks the comparison window (24h, 7d, 30d, 90d, custom + start_date/end_date; default 30d); optional provider filter
+   - A null coverage ratio is NOT zero coverage: state carries NO_INTEGRATION / ZERO_SPEND_PERIOD / DATA_UNAVAILABLE
+   - trend is a signed percentage-point delta vs. the previous window; 0.0 pp is a real answer, only null means no prior period
+   - Per-provider rows report that provider's SHARE of total billed spend plus its metered/billed amounts — the share is not a per-provider coverage
+   - Coding-assistant usage is a yes/no PRESENCE FLAG, never an amount; 'no' does not prove absence
+   - Requires the coding-assistant-separation-active feature: without it the platform answers 403, not a reduced report
 
 7. **get_cost_summary**
    - Generate a summary report of recent AI spending (includes all dimensions)
@@ -654,6 +690,21 @@ If you're seeing this error, please report it as it indicates a reliability issu
 **Purpose**: Count and total outstanding amount of unpaid invoices for your team (UNPAID in full, PARTIALLY_PAID by remaining balance), aggregated server-side
 **Parameters**: none — the team comes from your credentials
 
+### get_seat_utilization
+```json
+{
+  "action": "get_seat_utilization",
+  "from_date": "2026-08-01",
+  "to_date": "2026-08-22"
+}
+```
+**Purpose**: Daily Claude Enterprise seat census — seats assigned, pending invites, and distinct active people over the vendor's daily / weekly / 30-day windows, so you can tell whether the organization is over-provisioned
+**Parameters**:
+- `from_date` (required): first UTC day, inclusive, ISO yyyy-MM-dd
+- `to_date` (required): last UTC day, inclusive, ISO yyyy-MM-dd; the range may not exceed 366 days
+- `team_id` (optional): team hashid; defaults to the team on your credentials
+**Reading the output**: adoption rate is seatsUsed / seatsPaid, where seatsUsed is the trailing 30-day active count (the basis Anthropic's own console uses). A count the vendor withheld renders as 'unavailable (withheld by vendor)', never 0, and its day shows no adoption rate. An empty census reports no Claude Enterprise connection — a different problem from a withheld count.
+
 ### get_task_costs
 ```json
 {
@@ -831,6 +882,47 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - `skill_id` (required): the skill identifier
 - `period` (optional, defaults to THIRTY_DAYS): same enum as `list_skills`
 **Note**: a skill with no recorded usage inside the window reports an empty result, not a failure — widen `period` before concluding the id is wrong.
+
+### get_pr_health
+```json
+{
+  "action": "get_pr_health",
+  "source": "github",
+  "start_date": "2026-05-17",
+  "end_date": "2026-08-17"
+}
+```
+**Purpose**: PR health for your own organization — aging/rotting open pull requests and closed-without-merge waste, with a per-engineer breakdown and the most inactive open PRs.
+**Parameters** (all required):
+- `source`: `github` or `gitlab`
+- `start_date` / `end_date`: ISO `yyyy-MM-dd`; the window must span fewer than 366 days and `start_date` must not be after `end_date`
+**Scope**: the organization is resolved from your credentials — there is no team parameter. The aging/rotting thresholds are team-addressed and live on `manage_customers` (`get_pr_health_settings` / `update_pr_health_settings`); the report echoes the pair it used.
+**Reading the numbers**:
+- aging and rotting classify by INACTIVITY (days since the PR's last provider-side activity), not by age; `ageDays` and `inactiveDays` are reported separately
+- draft PRs are counted separately and excluded from the aging/rotting figures
+- at-risk (rotting, still open) and wasted (closed without merge) are separate figures — adding them double-counts open work as waste
+- only `avgCostPerMergedPr` comes from the platform; every dollar figure is a client-side ESTIMATE (count x that average) and is labelled as one
+- the window scopes the closed/merged counts and the cost basis; the open-PR figures reflect the current synced state
+
+### get_coverage_ratio
+```json
+{
+  "action": "get_coverage_ratio",
+  "provider": "ANTHROPIC"
+}
+```
+**Purpose**: Provider metering coverage — how much of the providers' billed spend Revenium actually metered, the hidden (unmetered) spend, and the per-provider breakdown.
+**Parameters**:
+- `provider` (optional): a single provider name; omit to cover every connected provider
+**Scope**: the team is resolved from your credentials. `period` picks the comparison window — `24h`, `7d`, `30d` (default), `90d`, or `custom` with `start_date`/`end_date` as ISO instants. The value is passed through verbatim, so a newer platform period also works.
+**Reading the numbers**:
+- a coverage ratio of `n/a` is NOT zero coverage — `state` says which of `NO_INTEGRATION`, `ZERO_SPEND_PERIOD` or `DATA_UNAVAILABLE` produced it
+- `hiddenSpend` is billed-but-not-metered spend, so it is the gap to close, not additional cost
+- `trend` is a signed PERCENTAGE-POINT delta against the previous window (current ratio minus previous), so `0.0 pp` means coverage held steady and is a real answer; only a null means there was no prior period
+- each `byProvider` row's ratio is that provider's SHARE of total billed spend, not its coverage — compare the row's `metered` against its `billing` to see one provider's gap; a row `state` of `no-data` means it reported nothing to compare
+- no amount carries a currency code: the report does not send one, so figures print bare rather than under an invented denomination
+- coding-assistant usage is a yes/no PRESENCE FLAG, never a dollar figure; `no` does not prove there was none, because a probe that cannot complete also reports `no`
+- the endpoint requires the coding-assistant-separation-active feature: teams without it get a 403 (a feature-availability answer, not a permissions problem)
 
 ### get_cost_summary
 ```json
@@ -1145,6 +1237,349 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 **Troubleshooting:**
 - This action takes no parameters — the team comes from your credentials
 - Verify your API key can view the team's billing data
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+"""
+            return [TextContent(type="text", text=error_response)]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Claude Enterprise seat census (BACK-2762)
+    #
+    # A flat SeatUtilizationResponse — one days[] array, no HAL envelope, no
+    # pagination. Two absences that look alike on the wire mean different
+    # things and are rendered differently on purpose:
+    #   - days[] empty      -> the organization has no Claude Enterprise
+    #                          credential at all; there is no census to show.
+    #   - a null count      -> the vendor withheld that one figure (it does
+    #                          this for RBAC-group-scoped queries). Printing 0
+    #                          would read as "no seats assigned".
+    # ──────────────────────────────────────────────────────────────────────
+    _SEAT_MAX_DAY_ROWS: ClassVar[int] = 60
+    _SEAT_NO_CONNECTION_MESSAGE: ClassVar[str] = (
+        "No Claude Enterprise connection found for this team. The platform returned a "
+        "seat census with no days in it, which is what an organization that has never "
+        "connected a Claude Enterprise credential looks like — not a withheld figure and "
+        "not an empty date range. Connect Claude Enterprise to start collecting the daily "
+        "seat census, then re-run this action."
+    )
+    _SEAT_WITHHELD_LABEL: ClassVar[str] = "unavailable (withheld by vendor)"
+    # Wire contract of SeatUtilizationDay: an ISO calendar date plus six
+    # nullable integer counts. Validated per entry so malformed data cannot
+    # masquerade as an unknown date or a vendor-withheld count.
+    _SEAT_COUNT_FIELDS: ClassVar[tuple] = (
+        "seatsPaid", "seatsUsed", "pendingInvites",
+        "dailyActive", "weeklyActive", "monthlyActive",
+    )
+    _SEAT_ADOPTION_NOTE: ClassVar[str] = (
+        "Adoption rate is seatsUsed / seatsPaid — seatsUsed is the vendor's TRAILING 30-DAY "
+        "active count, the same basis Anthropic's own console divides by. It is never computed "
+        "from dailyActive, which would understate adoption and fail to reconcile with the "
+        "vendor's number. A day missing either figure shows no rate at all rather than a "
+        "rate derived from a substituted zero."
+    )
+
+    @staticmethod
+    def _is_iso_calendar_date(value: Any) -> bool:
+        """True only for a real ISO calendar date, not merely a digit-dash shape.
+
+        A regex accepts impossible dates like 2026-13-45; strptime enforces the
+        calendar. The round-trip equality additionally forces the zero-padded
+        canonical form — strptime alone accepts "2026-8-1", which would break
+        the lexicographic date sort this handler relies on.
+        """
+        if not isinstance(value, str):
+            return False
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            return False
+        return parsed.strftime("%Y-%m-%d") == value
+
+    @staticmethod
+    def _render_seat_count(value: Any) -> str:
+        """Render one nullable seat count, or say it was withheld.
+
+        Numeric honesty with a sharper label than the generic n/a: every count
+        on a seat-census day is nullable because Anthropic withholds seat and
+        invite figures for RBAC-group-scoped queries, and a withheld figure
+        printed as 0 reads as "no seats assigned".
+        """
+        if isinstance(value, bool) or not isinstance(value, int):
+            return BusinessAnalyticsManagement._SEAT_WITHHELD_LABEL
+        return f"{value:,}"
+
+    @staticmethod
+    def _render_seat_adoption(seats_used: Any, seats_paid: Any) -> Optional[str]:
+        """Adoption rate for one day, or None when it cannot be computed honestly.
+
+        Returns None — the caller omits the line entirely — whenever either
+        input is withheld or the paid seat count is zero. seats_used is the
+        trailing-30-day active count, never dailyActive.
+        """
+        if isinstance(seats_used, bool) or not isinstance(seats_used, int):
+            return None
+        if isinstance(seats_paid, bool) or not isinstance(seats_paid, int):
+            return None
+        if seats_paid <= 0:
+            return None
+        return f"{(seats_used / seats_paid) * 100:.1f}%"
+
+    @staticmethod
+    def _parse_seat_date(value: Any, field: str) -> "datetime":
+        """Parse one ISO yyyy-MM-dd bound, or raise a structured error naming it."""
+        if value is None or (isinstance(value, str) and not value.strip()):
+            raise create_structured_missing_parameter_error(
+                parameter_name=field,
+                action="get_seat_utilization",
+                examples={
+                    "usage": "get_seat_utilization(from_date='2026-08-01', to_date='2026-08-22')",
+                    "format": "ISO calendar date, yyyy-MM-dd",
+                },
+            )
+        if not isinstance(value, str):
+            raise create_structured_validation_error(
+                message=f"{field} must be an ISO date string (yyyy-MM-dd)",
+                field=field,
+                value=value,
+                suggestions=[f"Pass the date as a string, e.g. {field}='2026-08-01'"],
+                examples={"correct_usage": {field: "2026-08-01"}},
+            )
+        try:
+            # strptime, not date.fromisoformat: 3.11+ widened fromisoformat to accept
+            # compact forms like '20260801', which the API would then reject.
+            return datetime.strptime(value.strip(), "%Y-%m-%d")
+        except ValueError:
+            raise create_structured_validation_error(
+                message=f"{field} is not an ISO calendar date (yyyy-MM-dd): {value!r}",
+                field=field,
+                value=value,
+                suggestions=[
+                    "Use the ISO form with four-digit year, e.g. '2026-08-01'",
+                    "Day-first and slash-separated dates are not accepted",
+                ],
+                examples={"correct_usage": {field: "2026-08-01"}},
+            )
+
+    def _validate_seat_utilization_request(self, arguments: Dict[str, Any]) -> "tuple[str, str]":
+        """Reject the two ranges the platform 400s on, before the call is made.
+
+        Pre-flight only: this MUST run outside the handler's try/except, whose
+        bare `except Exception` renders failures as guidance text and would
+        swallow the structured ToolError envelope.
+        """
+        start = self._parse_seat_date(arguments.get("from_date"), "from_date")
+        end = self._parse_seat_date(arguments.get("to_date"), "to_date")
+
+        if start > end:
+            raise create_structured_validation_error(
+                message=f"from_date ({start.date()}) must not be after to_date ({end.date()})",
+                field="from_date",
+                value=arguments.get("from_date"),
+                suggestions=["Swap the two dates, or widen to_date"],
+                examples={
+                    "correct_usage": {
+                        "action": "get_seat_utilization",
+                        "from_date": "2026-08-01",
+                        "to_date": "2026-08-22",
+                    }
+                },
+            )
+
+        span = (end - start).days
+        # The upstream bound is INCLUSIVE (`> MAX_RANGE_DAYS` upstream), unlike
+        # the PR-health window's exclusive one — a 366-day span is legal here.
+        if span > SEAT_UTILIZATION_MAX_RANGE_DAYS:
+            raise create_structured_validation_error(
+                message=(
+                    f"The seat-utilization range may not exceed "
+                    f"{SEAT_UTILIZATION_MAX_RANGE_DAYS} days; the requested range spans {span}"
+                ),
+                field="to_date",
+                value=arguments.get("to_date"),
+                suggestions=[
+                    f"Narrow the range to at most {SEAT_UTILIZATION_MAX_RANGE_DAYS} days "
+                    "between from_date and to_date",
+                    "Seat counts are a daily census, so a shorter window loses no history "
+                    "you can reach with a second call",
+                ],
+                examples={
+                    "widest_range": {
+                        "from_date": "2025-08-19",
+                        "to_date": "2026-08-20",
+                    }
+                },
+            )
+
+        return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+    async def _handle_get_seat_utilization(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_seat_utilization — the daily Claude Enterprise seat census.
+
+        Mirrors _handle_get_unpaid_invoice_totals: build the client, make one
+        flat platform read, re-raise AuthenticationError so the MCP envelope
+        sets isError=true, and turn any other failure into troubleshooting text.
+        """
+        from_date, to_date = self._validate_seat_utilization_request(arguments)
+        team_id = arguments.get("team_id")
+        try:
+            logger.info("Processing get_seat_utilization request")
+
+            client = await self.get_client(ctx=ctx)
+            census = await client.get_seat_utilization(
+                from_date, to_date, team_id=team_id if isinstance(team_id, str) else None
+            )
+
+            raw_days = census.get("days")
+            # The no-connection reading is reserved for a response that
+            # explicitly says so: a present, genuinely empty days list. An
+            # absent/non-list days, or a list holding no census objects at
+            # all, is a contract failure — reporting it as "no connection"
+            # would hand the caller a confident wrong diagnosis.
+            if not isinstance(raw_days, list):
+                raise ToolError(
+                    message=(
+                        "Unexpected seat-utilization response shape: the 'days' "
+                        f"field is {type(raw_days).__name__}, expected a list"
+                    ),
+                    error_code=ErrorCodes.API_ERROR,
+                    field="days",
+                    value=str(raw_days)[:80],
+                    suggestions=[
+                        "Retry the request; if the shape persists, the platform "
+                        "contract has changed and this tool needs updating",
+                    ],
+                )
+            days: List[Dict[str, Any]] = [
+                day for day in raw_days if isinstance(day, dict)
+            ]
+            if len(days) != len(raw_days):
+                # A mixed list would silently drop the malformed entries and
+                # present the survivors as a complete census. Every entry is a
+                # SeatUtilizationDay by contract, so any non-object entry is
+                # the same contract failure as a non-list days.
+                raise ToolError(
+                    message=(
+                        "Unexpected seat-utilization response shape: 'days' has "
+                        f"{len(raw_days)} entries but only {len(days)} are "
+                        "census objects"
+                    ),
+                    error_code=ErrorCodes.API_ERROR,
+                    field="days",
+                    value=str(raw_days)[:80],
+                    suggestions=[
+                        "Retry the request; if the shape persists, the platform "
+                        "contract has changed and this tool needs updating",
+                    ],
+                )
+            # Field-level contract check: a census object with a missing or
+            # non-ISO date, or a count that is neither an integer nor null,
+            # would otherwise render as "unknown date" / "withheld by vendor" —
+            # malformed data disguised as vendor behaviour.
+            for day in days:
+                date_ok = self._is_iso_calendar_date(day.get("date"))
+                counts_ok = all(
+                    day.get(field) is None
+                    or (isinstance(day.get(field), int) and not isinstance(day.get(field), bool))
+                    for field in self._SEAT_COUNT_FIELDS
+                )
+                if not date_ok or not counts_ok:
+                    raise ToolError(
+                        message=(
+                            "Unexpected seat-utilization response shape: a census "
+                            "entry carries a malformed date or a non-integer count"
+                        ),
+                        error_code=ErrorCodes.API_ERROR,
+                        field="days",
+                        value=str(day)[:80],
+                        suggestions=[
+                            "Retry the request; if the shape persists, the platform "
+                            "contract has changed and this tool needs updating",
+                        ],
+                    )
+            # The platform orders days by date ascending today, but that is not
+            # a documented wire guarantee; the truncation boundary below names
+            # specific dates, so the rendering must not depend on positions.
+            # ISO yyyy-MM-dd sorts correctly as text.
+            days.sort(key=lambda day: str(day.get("date") or ""))
+
+            header = f"**Claude Enterprise Seat Utilization — {from_date} to {to_date}**"
+            if not days:
+                # Distinct from a withheld count: there is no census at all.
+                return [TextContent(
+                    type="text",
+                    text=f"{header}\n\n{self._SEAT_NO_CONNECTION_MESSAGE}",
+                )]
+
+            lines = [header, "", self._SEAT_ADOPTION_NOTE, "", "**Daily census**"]
+            for day in days[: self._SEAT_MAX_DAY_ROWS]:
+                date_text = day.get("date") or "unknown date"
+                seats_paid = day.get("seatsPaid")
+                seats_used = day.get("seatsUsed")
+                lines.append(
+                    f"- **{date_text}** | seats assigned: {self._render_seat_count(seats_paid)} "
+                    f"| seats used (30-day active): {self._render_seat_count(seats_used)} "
+                    f"| pending invites: {self._render_seat_count(day.get('pendingInvites'))}"
+                )
+                lines.append(
+                    f"  active people — daily: {self._render_seat_count(day.get('dailyActive'))}, "
+                    f"weekly: {self._render_seat_count(day.get('weeklyActive'))}, "
+                    f"30-day: {self._render_seat_count(day.get('monthlyActive'))}"
+                )
+                adoption = self._render_seat_adoption(seats_used, seats_paid)
+                if adoption is not None:
+                    lines.append(f"  adoption rate: {adoption}")
+
+            overflow = len(days) - self._SEAT_MAX_DAY_ROWS
+            if overflow > 0:
+                # Name the omitted boundary: the endpoint has no pagination, so
+                # the caller's only way to the rest is a follow-up date range,
+                # and that needs to start at a known date.
+                last_shown = days[self._SEAT_MAX_DAY_ROWS - 1].get("date")
+                first_omitted = days[self._SEAT_MAX_DAY_ROWS].get("date")
+                last_omitted = days[-1].get("date")
+                omitted_range = (
+                    f" ({first_omitted} through {last_omitted})"
+                    if first_omitted and last_omitted
+                    else ""
+                )
+                shown_note = f" (through {last_shown})" if last_shown else ""
+                lines.append("")
+                lines.append(
+                    f"_…and {overflow} more days not shown{omitted_range}. Showing "
+                    f"the first {self._SEAT_MAX_DAY_ROWS}{shown_note}; re-run with "
+                    f"a narrower from_date/to_date to retrieve the remainder._"
+                )
+
+            logger.info("Seat utilization retrieved successfully")
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            raise
+        except ToolError:
+            # The malformed-census errors above must escape as errors, not be
+            # rewrapped into a success-shaped troubleshooting message.
+            raise
+        except PermissionError:
+            # get_client raises PermissionError when the request carries no
+            # tenant context (Clerk/API-key modes). That must fail closed, not
+            # come back as a success-shaped report.
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_seat_utilization: {e}")
+            error_details = self._format_api_error_details(e)
+            error_response = f"""**Seat Utilization Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- `from_date` and `to_date` are both required, in ISO yyyy-MM-dd form
+- The range may not exceed {SEAT_UTILIZATION_MAX_RANGE_DAYS} days and from_date must not be after to_date
+- `team_id` is optional — it defaults to the team on your credentials; pass it only to read another team you can view
+- A 404 means the team hashid does not resolve; verify your API key can view that team's billing data
 
 **For Help:**
 - Use `get_capabilities()` to check current status
@@ -1524,6 +1959,11 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
             ]
     # ── Billing reads ──────────────────────────────────────────────────────
     # snake_case arg → camelCase API param allowlists, per endpoint.
+    # Verified 2026-08-28 against hypercurrent origin/develop: every name below
+    # is a field of the @ParameterObject each controller binds —
+    # InvoiceController.list -> InvoiceSearchParams, RefundController.list ->
+    # RefundSearchParams, PeriodChargeController.list -> its own @RequestParam
+    # set (teamId, invoiceId, startDate, endDate, cursor, size).
     _INVOICE_FILTER_MAP: ClassVar[Dict[str, str]] = {
         "invoice_number": "invoiceNumber",
         "start_date": "startDate",
@@ -1752,6 +2192,10 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
     # because period/sort are already the API's own parameter names. The maps
     # still earn their keep by dropping reserved keys (action/page/size) and
     # by keeping sort off the detail endpoint, which does not accept it.
+    # Verified 2026-08-28 against hypercurrent origin/develop
+    # SkillController.list (@RequestParam teamId / period plus a Pageable, whose
+    # sort this map forwards) and .getDetail (@RequestParam teamId / period, no
+    # Pageable and therefore no sort).
     _SKILL_FILTER_MAP: ClassVar[Dict[str, str]] = {
         "period": "period",
         "sort": "sort",
@@ -1998,6 +2442,609 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
 - `skill_id` is required — use `list_skills` to discover valid ids
 - Optional parameter: period (supported: {", ".join(self._SKILL_PERIODS)})
 - Verify your API key can view the team's skill usage
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+""")]
+
+    # ── Developer PR-health report ─────────────────────────────────────────
+    # A flat report, not a HAL collection: the response carries totals,
+    # engineers[] and oldest[] inline, so no page/size/cursor applies.
+    _PR_HEALTH_SOURCES: ClassVar[List[str]] = ["github", "gitlab"]
+    # PrHealthConstants.MAX_WINDOW_DAYS upstream. The server rejects a span of
+    # this many days *or more*, so the widest legal window is one day narrower.
+    _PR_HEALTH_MAX_WINDOW_DAYS: ClassVar[int] = 366
+    _PR_HEALTH_MAX_ENGINEER_ROWS: ClassVar[int] = 50
+    # The report resolves the organization from the caller's own principal and
+    # accepts no team parameter — unlike the team-addressed threshold settings on
+    # manage_customers. A caller who can pass team_id to one would otherwise
+    # assume this report was filtered by it.
+    _PR_HEALTH_SCOPE_NOTE: ClassVar[str] = (
+        "Scope: your own organization. The report resolves the organization from your "
+        "credentials and takes no team parameter (the thresholds below are team-addressed "
+        "and are read/changed with manage_customers get_pr_health_settings)."
+    )
+    # Every dollar figure below is derived, not billed. Stated on the report itself
+    # because the platform returns only avgCostPerMergedPr as a cost basis.
+    _PR_HEALTH_ESTIMATE_NOTE: ClassVar[str] = (
+        "These are ESTIMATES computed here as count x avgCostPerMergedPr, an org-average "
+        "basis — not billed amounts. Never add them to billed cost, and never add at-risk "
+        "and wasted together: rotting PRs are still open work, closed-unmerged PRs are "
+        "already spent."
+    )
+
+    @staticmethod
+    def _parse_pr_health_date(value: Any, field: str) -> "datetime":
+        """Parse one ISO yyyy-MM-dd bound, or raise a structured error naming it."""
+        if value is None or (isinstance(value, str) and not value.strip()):
+            raise create_structured_missing_parameter_error(
+                parameter_name=field,
+                action="get_pr_health",
+                examples={
+                    "usage": "get_pr_health(source='github', start_date='2026-05-17', end_date='2026-08-17')",
+                    "format": "ISO calendar date, yyyy-MM-dd",
+                },
+            )
+        if not isinstance(value, str):
+            raise create_structured_validation_error(
+                message=f"{field} must be an ISO date string (yyyy-MM-dd)",
+                field=field,
+                value=value,
+                suggestions=["Pass the date as a string, e.g. start_date='2026-05-17'"],
+                examples={"correct_usage": {field: "2026-05-17"}},
+            )
+        try:
+            # strptime, not date.fromisoformat: 3.11+ widened fromisoformat to accept
+            # compact forms like '20260517', which the API would then reject.
+            return datetime.strptime(value.strip(), "%Y-%m-%d")
+        except ValueError:
+            raise create_structured_validation_error(
+                message=f"{field} is not an ISO calendar date (yyyy-MM-dd): {value!r}",
+                field=field,
+                value=value,
+                suggestions=[
+                    "Use the ISO form with four-digit year, e.g. '2026-05-17'",
+                    "Day-first and slash-separated dates are not accepted",
+                ],
+                examples={"correct_usage": {field: "2026-05-17"}},
+            )
+
+    def _validate_pr_health_request(self, arguments: Dict[str, Any]) -> "tuple[str, str, str]":
+        """Reject the request shapes the platform 400s on, before the call is made.
+
+        Pre-flight only: this MUST run outside the handler's try/except, whose
+        bare `except Exception` renders failures as guidance text and would
+        swallow the structured ToolError envelope.
+        """
+        source = arguments.get("source")
+        if source is None or (isinstance(source, str) and not source.strip()):
+            raise create_structured_missing_parameter_error(
+                parameter_name="source",
+                action="get_pr_health",
+                examples={
+                    "usage": "get_pr_health(source='github', start_date='2026-05-17', end_date='2026-08-17')",
+                    "valid_sources": self._PR_HEALTH_SOURCES,
+                },
+            )
+        if not isinstance(source, str) or source.strip().lower() not in self._PR_HEALTH_SOURCES:
+            raise create_structured_validation_error(
+                message=f"Unsupported VCS source for get_pr_health: {source!r}",
+                field="source",
+                value=source,
+                suggestions=["Use one of: " + ", ".join(self._PR_HEALTH_SOURCES)],
+                examples={
+                    "correct_usage": {"action": "get_pr_health", "source": "github"},
+                    "valid_sources": self._PR_HEALTH_SOURCES,
+                },
+            )
+
+        start = self._parse_pr_health_date(arguments.get("start_date"), "start_date")
+        end = self._parse_pr_health_date(arguments.get("end_date"), "end_date")
+
+        if start > end:
+            raise create_structured_validation_error(
+                message=f"start_date ({start.date()}) must not be after end_date ({end.date()})",
+                field="start_date",
+                value=arguments.get("start_date"),
+                suggestions=["Swap the two dates, or widen end_date"],
+                examples={
+                    "correct_usage": {
+                        "action": "get_pr_health",
+                        "source": "github",
+                        "start_date": "2026-05-17",
+                        "end_date": "2026-08-17",
+                    }
+                },
+            )
+
+        span = (end - start).days
+        if span >= self._PR_HEALTH_MAX_WINDOW_DAYS:
+            raise create_structured_validation_error(
+                message=(
+                    f"The PR-health window may span fewer than {self._PR_HEALTH_MAX_WINDOW_DAYS} "
+                    f"days; the requested window spans {span}"
+                ),
+                field="end_date",
+                value=arguments.get("end_date"),
+                suggestions=[
+                    f"Narrow the window to at most {self._PR_HEALTH_MAX_WINDOW_DAYS - 1} days between start_date and end_date",
+                    "Only the closed/merged counts and the cost basis are windowed — the open-PR "
+                    "figures reflect the current synced state regardless of the window",
+                ],
+                examples={
+                    "widest_window": {
+                        "start_date": "2025-01-01",
+                        "end_date": "2026-01-01",
+                    }
+                },
+            )
+
+        return source.strip().lower(), start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+    def _render_pr_health_estimate(self, count: Any, basis: Any) -> str:
+        """Render one client-side dollar estimate, or n/a when either input is missing.
+
+        Numeric honesty: without a cost basis (nothing merged in the window) there
+        is no estimate to give, and a fabricated 0 would read as "no money at risk".
+        """
+        if isinstance(count, bool) or not isinstance(count, int):
+            return "n/a"
+        if isinstance(basis, bool) or not isinstance(basis, (int, float)):
+            return "n/a"
+        return f"~{count * float(basis):,.2f} (estimate)"
+
+    async def _handle_get_pr_health(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_pr_health — aging/rotting open PRs and closed-unmerged waste."""
+        source, start_date, end_date = self._validate_pr_health_request(arguments)
+        try:
+            logger.info("Processing get_pr_health request")
+            client = await self.get_client(ctx=ctx)
+            report = await client.get_vcs_pr_health(source, start_date, end_date)
+
+            raw_totals = report.get("totals")
+            totals: Dict[str, Any] = raw_totals if isinstance(raw_totals, dict) else {}
+            aging_days = report.get("agingDays")
+            rotting_days = report.get("rottingDays")
+            basis = totals.get("avgCostPerMergedPr")
+
+            lines = [
+                f"**PR Health — {report.get('source') or source}, "
+                f"{report.get('startDate') or start_date} to {report.get('endDate') or end_date}**",
+                "",
+                self._PR_HEALTH_SCOPE_NOTE,
+                "",
+                # Echoed, not assumed: the thresholds are team-configurable and the
+                # report tells you which pair produced these counts.
+                f"**Thresholds used**: aging at {self._render_count(aging_days)}+ days inactive, "
+                f"rotting at {self._render_count(rotting_days)}+ days inactive. "
+                "Aging and rotting classify by INACTIVITY — days since the pull request's last "
+                "provider-side activity — not by how old it is.",
+                "",
+                "**Totals**",
+                f"- Open PRs (drafts excluded): {self._render_count(totals.get('openPrs'))}",
+                f"- Draft PRs (counted separately, excluded from aging/rotting): {self._render_count(totals.get('draftPrs'))}",
+                f"- Aging: {self._render_count(totals.get('agingPrs'))}",
+                f"- At risk (rotting, still open): {self._render_count(totals.get('rottingPrs'))} "
+                f"({self._render_count(totals.get('rottingPrsAssisted'))} AI-assisted)",
+                f"- Wasted (closed without merge in the window): {self._render_count(totals.get('closedUnmerged'))} "
+                f"({self._render_count(totals.get('closedUnmergedAssisted'))} AI-assisted)",
+                f"- avgCostPerMergedPr (the only cost figure the platform returns): "
+                f"{self._render_money(basis, None)}",
+            ]
+            last_synced = totals.get("lastSyncedAt")
+            if last_synced:
+                lines.append(f"- Last synced: {last_synced}")
+
+            lines.extend([
+                "",
+                "**Cost estimates (computed here, not billed)**",
+                f"- At risk (rotting, AI-assisted): "
+                f"{self._render_pr_health_estimate(totals.get('rottingPrsAssisted'), basis)}",
+                f"- Wasted (closed unmerged, AI-assisted): "
+                f"{self._render_pr_health_estimate(totals.get('closedUnmergedAssisted'), basis)}",
+                self._PR_HEALTH_ESTIMATE_NOTE,
+            ])
+
+            raw_engineers = report.get("engineers")
+            engineers: List[Dict[str, Any]] = raw_engineers if isinstance(raw_engineers, list) else []
+            lines.extend(["", "**By engineer**"])
+            if not engineers:
+                lines.append("- No engineer had an open or closed-unmerged PR in this window.")
+            for engineer in engineers[: self._PR_HEALTH_MAX_ENGINEER_ROWS]:
+                login = engineer.get("authorLogin") or "unknown"
+                email = engineer.get("mappedEmail")
+                label = f"{login} ({email})" if email else login
+                # oldestInactiveDays is omitted for an engineer with no open PR;
+                # "n/a days" would read as a measured value, so drop the unit too.
+                idle = self._render_count(engineer.get("oldestInactiveDays"))
+                idle_text = "n/a" if idle == "n/a" else f"{idle} days"
+                lines.append(
+                    f"- {label} | open={self._render_count(engineer.get('openPrs'))} "
+                    f"aging={self._render_count(engineer.get('agingPrs'))} "
+                    f"at-risk={self._render_count(engineer.get('rottingPrs'))} "
+                    f"wasted={self._render_count(engineer.get('closedUnmerged'))} "
+                    f"| longest inactivity: {idle_text}"
+                )
+            if len(engineers) > self._PR_HEALTH_MAX_ENGINEER_ROWS:
+                lines.append(
+                    f"… {len(engineers) - self._PR_HEALTH_MAX_ENGINEER_ROWS} more engineers not shown."
+                )
+
+            raw_oldest = report.get("oldest")
+            oldest: List[Dict[str, Any]] = raw_oldest if isinstance(raw_oldest, list) else []
+            if oldest:
+                lines.extend(["", "**Most inactive open PRs**"])
+                for pull in oldest:
+                    repo = pull.get("repoName") or "unknown"
+                    number = pull.get("prNumber")
+                    number_text = number if isinstance(number, int) and not isinstance(number, bool) else "?"
+                    author = pull.get("authorLogin") or "unknown"
+                    review = pull.get("reviewDecision") or "no review decision"
+                    # age and inactivity are different measurements and are never
+                    # collapsed into one number: an old but active PR is healthy.
+                    lines.append(
+                        f"- {repo}#{number_text} by {author} | "
+                        f"inactive {self._render_count(pull.get('inactiveDays'))} days, "
+                        f"age {self._render_count(pull.get('ageDays'))} days | {review}"
+                    )
+                    url = pull.get("url")
+                    title = pull.get("title")
+                    if title or url:
+                        lines.append(f"  {title or ''} {url or ''}".rstrip())
+
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_pr_health: {e}")
+            error_details = self._format_api_error_details(e)
+            return [TextContent(type="text", text=f"""**PR Health Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- `source`, `start_date` and `end_date` are all required; source is one of {", ".join(self._PR_HEALTH_SOURCES)}
+- The window must span fewer than {self._PR_HEALTH_MAX_WINDOW_DAYS} days and start_date must not be after end_date
+- The report covers your own organization and takes no team parameter
+- Verify your API key can view the organization's VCS data
+
+**For Help:**
+- Use `get_capabilities()` to check current status
+""")]
+
+    # Provider metering-coverage report: how much of what the providers billed
+    # the platform actually saw metered. A flat report, not a HAL collection.
+    _COVERAGE_MAX_PROVIDER_ROWS: ClassVar[int] = 50
+    # period is required upstream (non-nullable binding); the action defaults
+    # it rather than forcing every caller to pick a window.
+    _COVERAGE_DEFAULT_PERIOD: ClassVar[str] = "30d"
+    # state is the only field that distinguishes "no integration configured"
+    # from "integration present, nothing spent" from "the probe could not
+    # complete" — the ratio is null in all three, so it is never read alone.
+    _COVERAGE_STATE_NOTES: ClassVar[Dict[str, str]] = {
+        "NO_INTEGRATION": (
+            "No provider billing integration is connected, so there is nothing to compare "
+            "metered usage against. This is not a coverage of zero."
+        ),
+        "ZERO_SPEND_PERIOD": (
+            "The integration is connected but the provider billed nothing in the compared "
+            "window, so a ratio would divide by zero. This is not a coverage of zero."
+        ),
+        "DATA_UNAVAILABLE": (
+            "The coverage probe could not complete, so no ratio could be computed. Absent "
+            "numbers here mean unknown, not zero."
+        ),
+    }
+    # The coding-assistant field this release removed was a dollar figure; its
+    # replacement is a boolean, and a false can also mean "the probe could not
+    # confirm" — so it is never rendered as an amount and never as a certain no.
+    _COVERAGE_PRESENCE_NOTE: ClassVar[str] = (
+        "Coding-assistant usage is reported as a PRESENCE FLAG, not an amount. 'no' does "
+        "not prove there was no coding-assistant usage — a probe that cannot complete "
+        "also reports no."
+    )
+
+    # Each row's ratio is that provider's slice of the billed total — the rows sum
+    # toward 1.0 across providers. It answers "who did we spend it with", not
+    # "how much of it did we meter", which is the aggregate figure above.
+    _COVERAGE_ROW_SHARE_NOTE: ClassVar[str] = (
+        "Each row's share is that provider's portion of TOTAL billed spend, not its "
+        "coverage. Compare metered against billed within a row to see that provider's "
+        "gap. A row state of no-data means the provider reported nothing to compare."
+    )
+
+    @staticmethod
+    def _render_presence_flag(value: Any) -> str:
+        """Render a boolean presence flag as yes/no, or ``unknown`` when absent.
+
+        Numeric honesty applied to booleans: a missing or non-boolean flag is
+        ``unknown``, never a confident ``no``. Never render this as an amount —
+        it replaced a currency field and reusing that label would report a
+        boolean as dollars.
+        """
+        if not isinstance(value, bool):
+            return "unknown"
+        return "yes" if value else "no"
+
+    @staticmethod
+    def _render_ratio(value: Any) -> str:
+        """Render a 0..1 ratio as a percentage, or ``n/a`` when it is null.
+
+        Gates on type rather than truthiness so a real 0.0 renders as ``0.0%``.
+        A null ratio is NOT zero: for the aggregate, the accompanying state says
+        which of no-integration / zero-spend / data-unavailable produced it.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return "n/a"
+        if not math.isfinite(value):
+            # isinstance admits float('nan')/float('inf'); rendering them would
+            # print 'nan%' to the user. Same finiteness guard as
+            # common/numeric_param_validator (BACK-1270).
+            return "n/a"
+        return f"{float(value) * 100:.1f}%"
+
+    @staticmethod
+    def _render_trend(value: Any) -> str:
+        """Render the trend as a signed percentage-point delta, or ``n/a``.
+
+        Upstream computes trend as (current aggregateRatio - previous
+        aggregateRatio) — a difference of two 0..1 ratios, so the unit is
+        percentage POINTS, not a percentage of anything. It is null only when
+        there is no prior period to compare against.
+
+        Gated on type, never on truthiness: 0.0 is a real answer (coverage
+        unchanged since the previous window) and must not collapse into the
+        no-prior-data case the way ``value or 'n/a'`` would make it.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return "n/a (no prior-period data)"
+        if not math.isfinite(value):
+            # Same finiteness guard as _render_ratio: NaN/Inf pass isinstance
+            # and would render as 'nan pp' / 'inf pp'.
+            return "n/a (no prior-period data)"
+        points = float(value) * 100
+        # Sign only where there is a direction to signal. A "+0.0 pp" reads as a
+        # rounded-down gain; unchanged (and anything rounding to it) is unsigned.
+        if f"{points:.1f}" in ("0.0", "-0.0"):
+            return "0.0 pp (unchanged)"
+        return f"{points:+.1f} pp"
+
+    @staticmethod
+    def _render_coverage_amount(value: Any) -> str:
+        """Render a coverage amount without rounding real sub-cent spend to 0.
+
+        AI metering routinely produces sub-cent amounts (live dev returned
+        metered=0.0003784), and two fixed decimals would print that as ``0`` —
+        a real measurement disguised as no metering. A true zero still renders
+        ``0``; a non-zero amount that would round away keeps enough precision
+        to stay visibly non-zero. Null/absent stays ``n/a``, never zero.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return "n/a"
+        if not math.isfinite(value):
+            return "n/a"
+        if value == 0:
+            return "0"
+        text = f"{value:.2f}".rstrip("0").rstrip(".")
+        if text in ("0", "-0"):
+            text = f"{value:.8f}".rstrip("0").rstrip(".")
+            if text in ("0", "-0", ""):
+                # Smaller than 1e-8: shortest-repr keeps it visibly non-zero
+                # (e.g. 4e-09) instead of a bare "0." artifact.
+                return repr(value)
+        return text
+
+    async def _handle_get_coverage_ratio(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_coverage_ratio — metered vs. provider-billed spend and hidden spend."""
+        provider = arguments.get("provider")
+        if isinstance(provider, str):
+            provider = provider.strip() or None
+        elif provider is not None:
+            raise create_structured_validation_error(
+                message=f"provider must be a provider name string: {provider!r}",
+                field="provider",
+                value=provider,
+                suggestions=[
+                    "Omit provider to cover every connected provider",
+                    "Use get_filter_options(dimension='providers') to discover valid names",
+                ],
+                examples={"correct_usage": {"action": "get_coverage_ratio", "provider": "ANTHROPIC"}},
+            )
+        period = arguments.get("period")
+        if period is None:
+            period = self._COVERAGE_DEFAULT_PERIOD
+        elif not isinstance(period, str) or not period.strip():
+            raise create_structured_validation_error(
+                message=f"period must be a period name string: {period!r}",
+                field="period",
+                value=period,
+                suggestions=[
+                    f"Omit period to use the default ({self._COVERAGE_DEFAULT_PERIOD})",
+                    "Documented values: 24h, 7d, 30d, 90d, custom (custom also "
+                    "needs start_date and end_date); the value is passed through, "
+                    "so a newer platform period also works",
+                ],
+                examples={"correct_usage": {"action": "get_coverage_ratio", "period": "7d"}},
+            )
+        else:
+            period = period.strip()
+        start_date = arguments.get("start_date")
+        end_date = arguments.get("end_date")
+        for date_field, date_value in (("start_date", start_date), ("end_date", end_date)):
+            if date_value is not None and (
+                not isinstance(date_value, str) or not date_value.strip()
+            ):
+                raise create_structured_validation_error(
+                    message=f"{date_field} must be an ISO-8601 instant string: {date_value!r}",
+                    field=date_field,
+                    value=date_value,
+                    suggestions=[
+                        "Pass an ISO-8601 instant, e.g. '2026-08-01T00:00:00Z'",
+                        "start_date/end_date only apply when period='custom'",
+                    ],
+                    examples={
+                        "correct_usage": {
+                            "action": "get_coverage_ratio",
+                            "period": "custom",
+                            "start_date": "2026-08-01T00:00:00Z",
+                            "end_date": "2026-08-27T00:00:00Z",
+                        }
+                    },
+                )
+        if period.lower() == "custom" and not (start_date and end_date):
+            raise create_structured_validation_error(
+                message="period='custom' requires both start_date and end_date",
+                field="period",
+                value=period,
+                suggestions=[
+                    "Pass ISO-8601 instants, e.g. start_date='2026-08-01T00:00:00Z' "
+                    "and end_date='2026-08-27T00:00:00Z'",
+                    "Or use a named window: 24h, 7d, 30d, 90d",
+                ],
+                examples={
+                    "correct_usage": {
+                        "action": "get_coverage_ratio",
+                        "period": "custom",
+                        "start_date": "2026-08-01T00:00:00Z",
+                        "end_date": "2026-08-27T00:00:00Z",
+                    }
+                },
+            )
+        try:
+            logger.info("Processing get_coverage_ratio request")
+            client = await self.get_client(ctx=ctx)
+            report = await client.get_provider_coverage(
+                period=period,
+                provider=provider,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+            state = report.get("state")
+            state_text = state if isinstance(state, str) and state.strip() else "unknown"
+            scope = f" — {provider}" if provider else " — all providers"
+
+            lines = [
+                f"**Provider Metering Coverage{scope}**",
+                "",
+                "How much of what the providers billed was actually metered by Revenium. "
+                f"Comparison window: {period}.",
+                "",
+                f"**State**: {state_text}",
+            ]
+            note = self._COVERAGE_STATE_NOTES.get(state_text)
+            if note:
+                lines.append(f"- {note}")
+
+            aggregate_ratio = self._render_ratio(report.get("aggregateRatio"))
+            lines.extend([
+                "",
+                "**Aggregate**",
+                f"- Coverage ratio: {aggregate_ratio}",
+                # currency is None on purpose: the report carries no currency
+                # code, and inventing one would assert a denomination the
+                # platform never sent.
+                f"- Hidden spend (billed but not metered): "
+                f"{self._render_coverage_amount(report.get('hiddenSpend'))}",
+                f"- Trend vs. the previous window: {self._render_trend(report.get('trend'))}",
+                f"- Confidence: {report.get('confidence') or 'n/a'}",
+            ])
+            if aggregate_ratio == "n/a":
+                # Said only when it applies, so it reads as an explanation of this
+                # report rather than boilerplate the caller learns to skip.
+                # Live dev evidence: state can be VALID while the ratio is null
+                # (aggregateRatioAvailable=false, e.g. no provider billing in the
+                # window) — so only point at the state when it actually explains.
+                if state_text in self._COVERAGE_STATE_NOTES:
+                    why = "The state above says why."
+                else:
+                    why = (
+                        "The platform reports aggregateRatioAvailable="
+                        f"{report.get('aggregateRatioAvailable')} — it could not "
+                        "compute a ratio for this window (for example, no provider "
+                        "billing in the period)."
+                    )
+                lines.extend([
+                    "",
+                    f"This n/a is NOT zero coverage — no ratio could be computed at all. {why}",
+                ])
+
+            # Upstream serializes this boolean on every 200 (flag-off tenants
+            # get a 403 instead, since the endpoint is feature-gated). The
+            # membership check stays as defense against older payloads only.
+            if "codingAssistantUsagePresent" in report:
+                lines.extend([
+                    "",
+                    "**Coding-assistant usage**",
+                    f"- Present: {self._render_presence_flag(report.get('codingAssistantUsagePresent'))}",
+                    self._COVERAGE_PRESENCE_NOTE,
+                ])
+
+            raw_rows = report.get("byProvider")
+            # List[Any], not List[Dict]: the rows come off the wire, so each one is
+            # re-checked below rather than trusted to be a dict.
+            rows: List[Any] = raw_rows if isinstance(raw_rows, list) else []
+            lines.extend(["", "**By provider**"])
+            if not rows:
+                # The share note explains columns that are not about to be printed.
+                lines.append("- No per-provider rows were returned for this report.")
+            else:
+                lines.append(self._COVERAGE_ROW_SHARE_NOTE)
+            for row in rows[: self._COVERAGE_MAX_PROVIDER_ROWS]:
+                if not isinstance(row, dict):
+                    continue
+                name = row.get("provider") or "unknown"
+                row_state = row.get("state")
+                row_state_text = (
+                    row_state if isinstance(row_state, str) and row_state.strip() else "unknown"
+                )
+                parts = [
+                    # ratio is this provider's share of TOTAL billed spend, not its
+                    # coverage — labelling it "coverage" would invert its meaning.
+                    f"- {name} [{row_state_text}] | share of billed spend="
+                    f"{self._render_ratio(row.get('ratio'))}",
+                    f"metered={self._render_coverage_amount(row.get('metered'))}",
+                    f"billed={self._render_coverage_amount(row.get('billing'))}",
+                ]
+                if "codingAssistantUsagePresent" in row:
+                    parts.append(
+                        "coding-assistant usage: "
+                        f"{self._render_presence_flag(row.get('codingAssistantUsagePresent'))}"
+                    )
+                lines.append(" ".join(parts))
+            if len(rows) > self._COVERAGE_MAX_PROVIDER_ROWS:
+                lines.append(
+                    f"… {len(rows) - self._COVERAGE_MAX_PROVIDER_ROWS} more providers not shown."
+                )
+
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        except AuthenticationError:
+            # Auth-config errors must escape so the MCP envelope sets isError=true.
+            raise
+        except PermissionError:
+            # get_client raises PermissionError when the request carries no
+            # tenant context (Clerk/API-key modes). That must fail closed, not
+            # come back as a success-shaped report.
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_coverage_ratio: {e}")
+            error_details = self._format_api_error_details(e)
+            return [TextContent(type="text", text=f"""**Provider Metering Coverage Failed**
+
+{error_details}
+
+**Troubleshooting:**
+- `period` is required upstream (24h, 7d, 30d, 90d, or custom with start_date/end_date); this action defaults it to 30d
+- The team is resolved from your credentials — no team parameter is needed
+- Use `get_filter_options(dimension='providers')` to check the provider name you passed
+- A 403 usually means the coding-assistant-separation-active feature is not enabled for this environment — the whole report is gated on it; with the feature on, any member who can view the organization may read it
 
 **For Help:**
 - Use `get_capabilities()` to check current status
@@ -2855,6 +3902,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
             "get_transaction_count",
             "get_filter_options",
             "get_unpaid_invoice_totals",
+            "get_seat_utilization",
             # BACK-2376 task / profitability / spend-mover analytics pack
             "get_task_costs",
             "get_task_completion",
@@ -2871,6 +3919,8 @@ If you're seeing this error, please report it as it indicates a reliability issu
             "list_period_charges",
             "list_skills",
             "get_skill",
+            "get_pr_health",
+            "get_coverage_ratio",
             "get_cost_summary",
             "analyze_cost_anomalies",
         ])
@@ -3011,6 +4061,29 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 ],
             ),
             ToolCapability(
+                name="Claude Enterprise Seat Utilization",
+                description=(
+                    "Daily seat census for a Claude Enterprise organization: seats assigned, "
+                    "pending invites, and distinct active people over the vendor's daily, weekly "
+                    "and 30-day windows. Adoption rate is seatsUsed (the trailing 30-day active "
+                    "count) divided by seatsPaid, never dailyActive. Numeric-honest: a count the "
+                    "vendor withheld renders as 'unavailable (withheld by vendor)' and suppresses "
+                    "that day's adoption rate, never a fabricated 0; an empty census reports 'no "
+                    "Claude Enterprise connection found' rather than zero seats"
+                ),
+                parameters={
+                    "get_seat_utilization": {
+                        "from_date": "str",
+                        "to_date": "str",
+                        "team_id": "str",
+                    },
+                },
+                examples=[
+                    "get_seat_utilization(from_date='2026-08-01', to_date='2026-08-22')",
+                    "get_seat_utilization(from_date='2026-08-01', to_date='2026-08-22', team_id='JMwaj9y')",
+                ],
+            ),
+            ToolCapability(
                 name="Skill Cost Analysis",
                 description="Cost by skill: the skill catalog with aggregated cost, call and trace counts per period, plus per-skill detail (numeric-honest — missing costs and counts render 'n/a', never a fabricated 0)",
                 parameters={
@@ -3029,6 +4102,67 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "list_skills(period='THIRTY_DAYS')",
                     "list_skills(page=0, size=20, sort='callCount,DESC')",
                     "get_skill(skill_id='JMwX9g4', period='SEVEN_DAYS')",
+                ],
+            ),
+            ToolCapability(
+                name="Developer PR Health",
+                description=(
+                    "Aging/rotting open pull requests and closed-without-merge waste per engineer "
+                    "for the caller's own organization. Aging and rotting classify by INACTIVITY, "
+                    "not age; drafts are excluded and counted separately; at-risk and wasted stay "
+                    "separate figures; dollar amounts are client-side estimates from "
+                    "avgCostPerMergedPr, never billed cost."
+                ),
+                parameters={
+                    "get_pr_health": {
+                        "source": "str (required, github|gitlab)",
+                        "start_date": "str (required, yyyy-MM-dd)",
+                        "end_date": "str (required, yyyy-MM-dd)",
+                    },
+                },
+                examples=[
+                    "get_pr_health(source='github', start_date='2026-05-17', end_date='2026-08-17')",
+                    "get_pr_health(source='gitlab', start_date='2026-08-01', end_date='2026-08-26')",
+                ],
+                limitations=[
+                    "Covers the caller's own organization only — the report takes no team parameter",
+                    "All three parameters are required; the window must span fewer than 366 days and start_date must not be after end_date",
+                    "The aging/rotting thresholds are team-addressed and changed with manage_customers update_pr_health_settings",
+                    "Flat report — there is no pagination on the engineer or oldest-PR lists",
+                    "Every dollar figure is an estimate (count x avgCostPerMergedPr, an org average), not a billed amount",
+                ],
+            ),
+            ToolCapability(
+                name="Provider Metering Coverage",
+                description=(
+                    "How much of the providers' billed spend Revenium actually metered, the "
+                    "hidden (unmetered) spend, the trend and confidence, and the per-provider "
+                    "breakdown. Coding-assistant usage is a yes/no presence flag, never an "
+                    "amount, and a null coverage ratio is not zero coverage — state carries "
+                    "NO_INTEGRATION / ZERO_SPEND_PERIOD / DATA_UNAVAILABLE separately. Trend is "
+                    "a signed percentage-point delta against the previous window, and each "
+                    "per-provider row reports that provider's share of total billed spend "
+                    "alongside its metered and billed amounts."
+                ),
+                parameters={
+                    "get_coverage_ratio": {
+                        "provider": "str (optional, single provider filter)",
+                    },
+                },
+                examples=[
+                    "get_coverage_ratio()",
+                    "get_coverage_ratio(provider='ANTHROPIC')",
+                ],
+                limitations=[
+                    "period picks the comparison window (24h/7d/30d/90d/custom, default 30d); custom needs start_date/end_date",
+                    "The team is resolved from your credentials; there is no team parameter",
+                    "A null aggregateRatio is not zero coverage — read state before concluding anything",
+                    "trend is a percentage-point delta, not a percentage: 0.0 pp means unchanged, null means no prior period",
+                    "A per-provider ratio is a share of total billed spend, not that provider's coverage",
+                    "No figure carries a currency code — the report does not send one",
+                    "codingAssistantUsagePresent is a presence flag: 'no' also covers a probe that could not complete",
+                    "The coding-assistant flag is absent for teams without coding-assistant separation enabled",
+                    "Flat report — there is no pagination on the per-provider rows",
                 ],
             ),
             ToolCapability(

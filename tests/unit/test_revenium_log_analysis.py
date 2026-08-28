@@ -334,7 +334,7 @@ class TestSetStrictIngestionMode:
         )
         text = result[0].text
         assert "enabled" in text.lower()
-        client.set_strict_ingestion_mode.assert_awaited_once_with(True)
+        client.set_strict_ingestion_mode.assert_awaited_once_with(True, allow_ticket_jobs=None)
 
     @pytest.mark.asyncio
     async def test_missing_enabled_raises(self, log_tool):
@@ -435,3 +435,171 @@ class TestIngestionTotalResponseBound:
         assert "truncated" in text.lower() or "more entries" in text.lower()
         # Guidance for narrowing must be present when output is cut
         assert "size" in text or "error_code" in text
+
+
+class TestStrictModeTicketJobsOptIn:
+    """BACK-2770: the ticket-grain-Jobs sub-flag rides along with the toggle.
+
+    Enabling strict mode suppresses the coding-assistant enricher's
+    ticket-grain Jobs unless the caller opts in; disabling strict mode
+    force-clears any existing opt-in server-side.
+    """
+
+    @pytest.mark.asyncio
+    async def test_omitted_opt_in_is_not_sent_to_the_client(self, log_tool):
+        """Omission means leave-unchanged — the handler must not invent a value."""
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+        )
+        client.set_strict_ingestion_mode.assert_awaited_once_with(
+            True, allow_ticket_jobs=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_opt_in_forwarded_when_enabling(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        await log_tool.handle_action(
+            "set_strict_ingestion_mode",
+            {"enabled": True, "allow_ticket_jobs": True, "confirm": True},
+        )
+        client.set_strict_ingestion_mode.assert_awaited_once_with(
+            True, allow_ticket_jobs=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_enable_preview_tells_the_truth_per_opt_in_value(self, log_tool):
+        """PR #328 review: the preview must not claim Jobs stop when they will not."""
+        # Opting in: Jobs continue.
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True, "allow_ticket_jobs": True}
+        )
+        text = result[0].text
+        assert "KEEP being" in text and "STOP being" not in text
+
+        # Omitted: depends on the tenant's existing opt-in, left unchanged.
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True}
+        )
+        text = result[0].text
+        assert "EXISTING opt-in" in text and "leaves unchanged" in text
+        assert "STOP being" not in text
+
+        # Explicit false: suppression is certain.
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True, "allow_ticket_jobs": False}
+        )
+        assert "STOP being" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_opt_in_true_with_strict_mode_off_is_rejected_locally(self, log_tool):
+        """The API refuses this exact pair — explain it before the round trip."""
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        with pytest.raises(ToolError) as excinfo:
+            await log_tool.handle_action(
+                "set_strict_ingestion_mode",
+                {"enabled": False, "allow_ticket_jobs": True, "confirm": True},
+            )
+        assert excinfo.value.field == "allow_ticket_jobs"
+        client.set_strict_ingestion_mode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_opt_in_false_with_strict_mode_off_is_allowed(self, log_tool):
+        """Only true+false is refused by the platform; false+false is legal."""
+        client = _ingestion_client(
+            strict_result={
+                "id": "ten_1",
+                "strictIngestionMode": False,
+                "strictIngestionAllowTicketJobs": False,
+            }
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        await log_tool.handle_action(
+            "set_strict_ingestion_mode",
+            {"enabled": False, "allow_ticket_jobs": False, "confirm": True},
+        )
+        client.set_strict_ingestion_mode.assert_awaited_once_with(
+            False, allow_ticket_jobs=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_boolean_opt_in_is_rejected(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        with pytest.raises(ToolError):
+            await log_tool.handle_action(
+                "set_strict_ingestion_mode",
+                {"enabled": True, "allow_ticket_jobs": "yes", "confirm": True},
+            )
+        client.set_strict_ingestion_mode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_enable_preview_states_ticket_job_suppression_and_opt_out(
+        self, log_tool
+    ):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True}
+        )
+        text = result[0].text
+        assert "ticket" in text.lower()
+        assert "allow_ticket_jobs=true" in text
+        client.set_strict_ingestion_mode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_disable_preview_states_the_opt_in_is_cleared(self, log_tool):
+        """Disabling force-clears the opt-in server-side — say so before it happens."""
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": False}
+        )
+        text = result[0].text.lower()
+        assert "ticket" in text
+        assert "clear" in text
+        assert "re-enable" in text or "re-state" in text
+        client.set_strict_ingestion_mode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_confirmed_opt_in_state_is_read_back_from_the_response(self, log_tool):
+        client = _ingestion_client(
+            strict_result={
+                "id": "ten_1",
+                "strictIngestionMode": True,
+                "strictIngestionAllowTicketJobs": True,
+            }
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode",
+            {"enabled": True, "allow_ticket_jobs": True, "confirm": True},
+        )
+        text = result[0].text
+        assert "Ticket-grain Jobs" in text
+        assert "allowed" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_absent_opt_in_state_is_not_echoed_back(self, log_tool):
+        """Same honesty rule as strictIngestionMode: no field, no claim."""
+        client = _ingestion_client(
+            strict_result={"id": "ten_1", "strictIngestionMode": True}
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode",
+            {"enabled": True, "allow_ticket_jobs": True, "confirm": True},
+        )
+        assert "Ticket-grain Jobs" not in result[0].text

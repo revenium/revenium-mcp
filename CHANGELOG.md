@@ -5,6 +5,35 @@ All notable changes to the Revenium MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-28
+
+### Added
+- `manage_customers`: org-unit (department) lookup (list_org_units) — the source of ids for every ORG_UNIT filter
+- `manage_customers`: team attribution identity policy and verified domains (get/update_attribution_identity_policy, list/add/remove_verified_domain), with per-privilege 403 messages — adding a domain is platform-operator-only and says so
+- `manage_customers`: per-team PR-health thresholds (get/update_pr_health_settings, read-merge-write)
+- `business_analytics_management`: developer PR-health report (get_pr_health) — aging/rotting by inactivity, drafts separate, estimates labeled
+- `business_analytics_management`: Claude Enterprise seat census (get_seat_utilization) — vendor-withheld counts render as unavailable (never 0), an empty census reports no connection
+- `business_analytics_management`: provider metering-coverage report (get_coverage_ratio) — hidden spend, trend as a signed pp delta, coding-assistant presence flag
+- `manage_metering`: effort, model_host and subscriber_email_source on submitted transactions; transaction detail shows model execution and re-rated cost provenance (clientReportedCost)
+- `manage_ai_insights`: scope a run to one department (filter_org_unit_id, filter_include_descendants)
+- `manage_cost_controls`: department guardrails — ORG_UNIT dimension, preview_org_unit_group, and a per-email blocked summary
+- `manage_tools`: agenticJobId on tool usage events, joining tool cost to its job
+- Strict ingestion mode: allow_ticket_jobs opt-out
+- OAuth (clerk mode): RFC 9207 iss validation on authorization responses
+
+### Changed
+- Every list tool bounds its filter keys to what the endpoint declares; an unknown key is rejected naming the valid set instead of silently returning unfiltered data
+- `manage_metering` transaction lookups include coding-assistant records by default and state the scope in every response (include_coding_assistants switches the view)
+- Aggregations a report cannot honour are rejected with a clear message instead of returning mislabeled totals
+- fastmcp 3.2.0 -> 3.4.7, mcp 1.25.0 -> 1.29.0
+
+### Fixed
+- `manage_customers`: the introspection schema describes the real create requirements per resource type
+- `manage_metering`: transaction detail renders null token counts beside zero costs instead of failing
+- `manage_alerts`: natural-language queries no longer send filter parameters the endpoint discards
+- api_key mode: unknown or malformed API keys are classified as invalid tokens with a clear message instead of a generic validation error
+- Analytics: the Foundry provider label is normalized consistently
+
 ## [0.4.0] - 2026-08-13
 
 ### Added
@@ -277,3 +306,5 @@ No functional changes. Changelog formatting update only.
 [0.2.1]: https://github.com/revenium/revenium-mcp/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/revenium/revenium-mcp/compare/v0.1.27...v0.2.0
 [0.1.27]: https://github.com/revenium/revenium-mcp/releases/tag/v0.1.27
+
+[0.5.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.5.0

@@ -378,9 +378,16 @@ class JSONSchemaValidator:
                     "maximum": 100,
                     "description": "Number of items per page",
                 },
+                # Bounded by SUPPORTED_PRODUCT_FILTER_KEYS in
+                # tools_decomposed/product_management.py.
                 "filters": {
                     "type": "object",
-                    "description": "Additional filters for list operations",
+                    "description": (
+                        "Filters for list. Supports 'name' only, matched exactly and "
+                        "case-sensitively. Any other key is rejected rather than "
+                        "silently ignored; use the top-level query parameter for "
+                        "free-text search."
+                    ),
                 },
                 "description": {
                     "type": "string",
@@ -596,7 +603,15 @@ class JSONSchemaValidator:
                     "maximum": 100,
                     "description": "Number of items per page",
                 },
-                "filters": {"type": "object", "description": "Additional filters"},
+                # Bounded by _SUBSCRIPTION_FILTER_MAP in
+                # tools_decomposed/subscription_management.py.
+                "filters": {
+                    "type": "object",
+                    "description": (
+                        "Filters for list and get_metrics. Valid keys: query, sort, "
+                        "type. Any other key is rejected rather than silently ignored."
+                    ),
+                },
                 "text": {
                     "type": "string",
                     "minLength": 1,
@@ -735,9 +750,14 @@ class JSONSchemaValidator:
                     "maximum": 100,
                     "description": "Number of items per page",
                 },
+                # Bounded by _SOURCE_FILTER_MAP in
+                # tools_decomposed/source_management.py.
                 "filters": {
                     "type": "object",
-                    "description": "Additional filters for list operations",
+                    "description": (
+                        "Filters for list. Valid keys: query, sort, type. Any other "
+                        "key is rejected rather than silently ignored."
+                    ),
                 },
                 # Natural language creation
                 "text": {
@@ -850,7 +870,16 @@ class JSONSchemaValidator:
                     "maximum": 100,
                     "description": "Number of items per page",
                 },
-                "filters": {"type": "object", "description": "Additional filters"},
+                # Bounded by _CUSTOMER_FILTER_MAPS in
+                # tools_decomposed/customer_management.py.
+                "filters": {
+                    "type": "object",
+                    "description": (
+                        "Filters for list and analyze, for every resource_type. "
+                        "Valid keys: query, sort, type. Any other key is rejected "
+                        "rather than silently ignored."
+                    ),
+                },
             },
             "required": ["action"],
         }

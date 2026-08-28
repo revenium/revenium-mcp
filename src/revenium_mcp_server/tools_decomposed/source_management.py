@@ -22,7 +22,7 @@ from ..common.error_handling import (
     create_structured_validation_error,
 )
 from ..common.pagination_performance import validate_pagination_with_performance
-from ..common.validation import validate_pagination_params
+from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.ucm_config import log_ucm_status, should_suppress_ucm_warnings
 from ..common.update_configs import UpdateConfigFactory
@@ -40,6 +40,17 @@ from .unified_tool_base import ToolBase
 
 # The only source types the backend accepts (mirrored in get_capabilities).
 VALID_SOURCE_TYPES = ("API", "STREAM", "AI")
+
+# snake_case filter name -> camelCase query parameter, bounded to what the
+# endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
+# SourceController.list: @RequestParam query / teamId / type plus a Pageable
+# (page, size, sort). teamId and page/size are set by the client, so what
+# remains is the caller-settable set.
+_SOURCE_FILTER_MAP: Dict[str, str] = {
+    "query": "query",
+    "type": "type",
+    "sort": "sort",
+}
 
 
 class SourceManager:
@@ -75,7 +86,9 @@ class SourceManager:
         arguments = validate_pagination_params(arguments, action="list_sources")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = arguments.get("filters", {})
+        filters = apply_filter_allowlist(
+            arguments.get("filters"), _SOURCE_FILTER_MAP, action="list_sources"
+        )
 
         # Validate pagination with performance guidance
         validate_pagination_with_performance(page, size, "Source Management")
@@ -694,7 +707,12 @@ class SourceManagement(ToolBase):
                 },
                 "filters": {
                     "type": "object",
-                    "description": "Additional filters for list operations",
+                    "description": (
+                        "Filters for list operations. Only the keys the sources endpoint "
+                        "declares are accepted: "
+                        + ", ".join(sorted(_SOURCE_FILTER_MAP))
+                        + ". Any other key is rejected rather than silently ignored."
+                    ),
                 },
                 # Utility parameters
                 "text": {
@@ -1458,9 +1476,9 @@ class SourceManagement(ToolBase):
                 "example": "create(source_data={'name':'Data Stream', 'type':'stream', 'url':'wss://stream.example.com'})",
             },
             {
-                "title": "List Active Sources",
-                "description": "View all configured data sources with status",
-                "example": "list(filters={'status': 'active'}, page=0, size=10)",
+                "title": "List AI Sources",
+                "description": "View configured data sources of one type",
+                "example": "list(filters={'type': 'AI'}, page=0, size=10)",
             },
             {
                 "title": "Search Sources",
@@ -1601,7 +1619,7 @@ class SourceManagement(ToolBase):
                 description="Explore existing data sources and their status",
                 frequency=0.8,
                 typical_sequence=["list", "get"],
-                common_parameters={"page": 0, "size": 20, "filters": {"status": "active"}},
+                common_parameters={"page": 0, "size": 20, "filters": {"type": "AI"}},
                 success_indicators=["Sources listed successfully", "Source details retrieved"],
             ),
             UsagePattern(

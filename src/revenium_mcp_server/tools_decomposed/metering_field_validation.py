@@ -548,6 +548,12 @@ class FieldMappingAnalyzer:
             "output_token_cost": "outputTokenCost",
             "total_cost": "totalCost",
             "cost_type": "costType",
+            # Response-only: the platform writes clientReportedCost when it
+            # re-rates a transaction against the tenant's rate card, preserving
+            # the figure the client sent. Nothing submits it, so the
+            # submitted-vs-retrieved comparison never fires on it; the mapping
+            # exists so the field-presence analysis stops reporting it absent.
+            "client_reported_cost": "clientReportedCost",
             # Performance and quality fields
             "response_quality_score": "responseQualityScore",
             "is_streamed": "isStreamed",
@@ -573,6 +579,13 @@ class FieldMappingAnalyzer:
             "skill_plugin_name": "skillPluginName",
             "skill_marketplace_name": "skillMarketplaceName",
             "skill_invocation_trigger": "skillInvocationTrigger",
+            # Completion provenance (preview metering spec:
+            # AICompletionMetadataResource — nullable, optional). model_host is
+            # the billing infrastructure and is distinct from the model_source
+            # entry below, which names the routing/aggregation layer.
+            "effort": "effort",
+            "model_host": "modelHost",
+            "subscriber_email_source": "subscriberEmailSource",
             # Note: Subscriber data now passed as subscriber object, not separate fields
             # Model and provider details
             "model_source": "modelSource",

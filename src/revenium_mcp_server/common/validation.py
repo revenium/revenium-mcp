@@ -3,7 +3,7 @@
 This module provides shared validation functions used across the MCP server.
 """
 
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Tuple
 from ..validators import InputValidator
 from ..exceptions import ValidationError
 
@@ -21,6 +21,7 @@ __all__ = [
     "preprocess_boolean_parameters",
     "validate_pagination_params",
     "validate_string_params",
+    "apply_filter_allowlist",
     "SAFE_INT_MAX",
 ]
 
@@ -325,3 +326,107 @@ def preprocess_array_parameters(
             # If it's already a list, keep it as-is
 
     return processed_args
+
+
+# Pagination reaches every list client method as explicit `page` / `size`
+# arguments, so the same names inside a `filters` object are duplicates rather
+# than unrecognised filters: the endpoint does accept them, the explicit
+# arguments already carry them, and forwarding both is a TypeError. On a
+# PAGINATED caller they are dropped, preserving the behaviour the per-tool
+# strips had before this allowlist existed. A non-paginated caller has no
+# explicit arguments shadowing them, so there the silent drop would be a
+# silent no-op — those callers pass paginated=False and the keys are rejected
+# like any other unknown name. `sort` is different — Spring's Pageable binds
+# it as a real query parameter with no explicit argument shadowing it, so
+# per-endpoint allowlists may declare it.
+_RESERVED_FILTER_KEYS: Tuple[str, ...] = ("page", "size")
+
+
+def apply_filter_allowlist(
+    filters: Any,
+    allowlist: Mapping[str, str],
+    *,
+    action: str,
+    paginated: bool = True,
+) -> Dict[str, Any]:
+    """Bound a caller-supplied filter object to an endpoint's declared parameters.
+
+    ``allowlist`` maps the snake_case name a caller may pass to the camelCase
+    query parameter the backend declares for that endpoint. Both spellings are
+    accepted on input (agents and older callers already write camelCase), and
+    the camelCase form is always what leaves this function.
+
+    Any other key raises instead of being forwarded. A filter key the API does
+    not recognise is worse than no filter at all: today the API discards it and
+    the caller gets a confidently wrong unfiltered answer, and once strict
+    parameter checking is switched on the same key becomes a 400 whose cause is
+    a word the model chose.
+
+    Args:
+        filters: The raw ``filters`` value from tool arguments (may be None)
+        allowlist: snake_case argument name -> camelCase API query parameter
+        action: Action name used in the error text
+
+    Returns:
+        A dict of camelCase query parameters, with None values omitted.
+
+    Raises:
+        ToolError: when ``filters`` is not an object, or carries a key the
+            target endpoint does not declare.
+    """
+    # Local import to avoid a circular dependency at module import time.
+    from .error_handling import ErrorCodes, ToolError
+
+    if filters is None:
+        return {}
+
+    keys_hint = (
+        f"Valid filter keys for '{action}': {', '.join(sorted(allowlist))}"
+        if allowlist
+        else f"'{action}' does not accept any filter keys"
+    )
+
+    if not isinstance(filters, Mapping):
+        raise ToolError(
+            message=f"filters must be an object (got {type(filters).__name__})",
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="filters",
+            value=filters,
+            suggestions=[keys_hint],
+        )
+
+    api_names = set(allowlist.values())
+    mapped: Dict[str, Any] = {}
+    unknown: List[str] = []
+
+    for key, value in filters.items():
+        if paginated and key in _RESERVED_FILTER_KEYS:
+            continue
+        if key in allowlist:
+            if value is not None:
+                mapped[allowlist[key]] = value
+        elif key in api_names:
+            if value is not None:
+                mapped[str(key)] = value
+        else:
+            unknown.append(str(key))
+
+    if unknown:
+        names = ", ".join(f"'{k}'" for k in sorted(unknown))
+        plural = "keys" if len(unknown) > 1 else "key"
+        suggestions = [keys_hint]
+        if "query" in allowlist:
+            suggestions.append("Free-text search on this endpoint is the 'query' filter")
+        raise ToolError(
+            message=(
+                f"Unknown filter {plural} {names} for '{action}'. "
+                f"The API does not accept {'them' if len(unknown) > 1 else 'it'}, "
+                f"so the results would be unfiltered rather than filtered. {keys_hint}"
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="filters",
+            value=sorted(unknown),
+            suggestions=suggestions,
+        )
+
+    return mapped

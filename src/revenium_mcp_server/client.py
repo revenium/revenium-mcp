@@ -12,6 +12,7 @@ import json
 import os
 import re
 import uuid as _uuid
+from datetime import datetime
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 from urllib.parse import urljoin
@@ -26,6 +27,13 @@ from .endpoint_registry import DEFAULT_APP_BASE_URL, KNOWN_APP_BASE_URLS, paired
 from .exceptions import AlertToolsError
 from .log_context import redact_headers
 from .logging_config import async_operation_context
+
+
+# SeatUtilizationService.MAX_RANGE_DAYS upstream. The server rejects a span of
+# MORE than this many days, so a 366-day window is still legal (unlike the
+# PR-health window, whose bound is exclusive). Shared with the tool layer so the
+# pre-flight check and the client guard cannot drift apart.
+SEAT_UTILIZATION_MAX_RANGE_DAYS = 366
 
 
 def _new_idempotency_key() -> str:
@@ -1557,6 +1565,38 @@ class ReveniumClient:
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.post("/profitstream/v2/api/ai/cost-controls", data=control_data, params=params))
 
+    async def preview_org_unit_group(self, parent_org_unit_id: int) -> Dict[str, Any]:
+        """Preview the per-department fan-out of an ORG_UNIT-grouped cost control.
+
+        Read-only: the endpoint counts the org units a guardrail grouped by
+        ORG_UNIT under ``parent_org_unit_id`` would produce a cap for. It
+        creates nothing, and it is never called implicitly from create/update.
+
+        ``teamId`` travels in the request BODY, not the query string. The
+        upstream request object declares it ``@NotBlank`` and authorization
+        reads the team off the payload, so ``_add_team_id_to_params()`` alone
+        is not enough — verified against dev on 2026-08-26, where sending the
+        team only as a query parameter answers
+        ``400 {"teamId": "teamId is required"}``.
+
+        Args:
+            parent_org_unit_id: Raw numeric org-unit id (NOT a hashid) whose
+                descendants are counted. ``manage_customers(action=
+                'list_org_units')`` is the lookup that yields these ids.
+
+        Returns:
+            ``{"targetCount": int, "targets": [ResourceMetadata]}``
+
+        Raises:
+            ReveniumAPIError: 403/422 when the tenant lacks the org-unit budget
+                feature; the tool boundary translates that into an explanation.
+        """
+        body = {"teamId": self.team_id, "parentOrgUnitId": parent_org_unit_id}
+        return cast(
+            Dict[str, Any],
+            await self.post("/profitstream/v2/api/ai/cost-controls/org-unit-group-preview", data=body),
+        )
+
     async def update_cost_control(self, control_id: str, control_data: Dict[str, Any]) -> Dict[str, Any]:
         """Update an existing cost control.
 
@@ -1629,6 +1669,75 @@ class ReveniumClient:
         return cast(Dict[str, Any], await self.get(
             "/profitstream/v2/api/invoices/unpaid-totals", params=params
         ))
+
+    # Claude Enterprise seat census (BillingAnalyticsController)
+    async def get_seat_utilization(
+        self, from_date: str, to_date: str, team_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Get the daily Claude Enterprise seat census for a team.
+
+        All three query parameters are required by the endpoint, but teamId is
+        a hashid no caller can guess, so it defaults from the client's ambient
+        auth context via ``_add_team_id_to_params`` — the same resolution
+        ``get_unpaid_invoice_totals`` uses. An explicit ``team_id`` overrides
+        it; it is last in the signature precisely because it is the optional
+        one, even though the wire contract marks it required.
+
+        The response is a flat SeatUtilizationResponse — a single ``days``
+        array of SeatUtilizationDay objects — with no HAL ``_embedded``
+        envelope and no pagination. Every count on a day is nullable: the
+        vendor withholds the seat and invite figures for an RBAC-group-scoped
+        query, so an absent count is not a zero. An organization with no
+        Claude Enterprise credential answers 200 with an EMPTY ``days`` array
+        rather than an error.
+
+        The endpoint answers 400 when fromDate is after toDate and when the
+        span exceeds SEAT_UTILIZATION_MAX_RANGE_DAYS; both are re-checked here
+        so a direct client caller gets the constraint instead of an opaque
+        upstream failure (the tool layer pre-checks the same two rules and
+        raises a structured error first).
+
+        Args:
+            from_date: First UTC day to return, inclusive (ISO ``yyyy-MM-dd``)
+            to_date: Last UTC day to return, inclusive (ISO ``yyyy-MM-dd``)
+            team_id: Optional team hashid overriding the ambient team
+
+        Returns:
+            Flat seat-census payload: ``{"days": [...]}``
+        """
+        self._validate_seat_utilization_range(from_date, to_date)
+        params: Dict[str, Any] = {"fromDate": from_date, "toDate": to_date}
+        # Ambient team first, explicit override second: _add_team_id_to_params
+        # uses dict.update and would otherwise clobber the caller's choice.
+        params = self._add_team_id_to_params(params)
+        if team_id:
+            params["teamId"] = team_id
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/billing/seats", params=params
+        ))
+
+    @staticmethod
+    def _validate_seat_utilization_range(from_date: str, to_date: str) -> None:
+        """Raise ValueError for the two ranges the seat endpoint 400s on.
+
+        Silently skips validation when either bound is not an ISO calendar
+        date: the shape complaint belongs to whichever layer parsed it, and
+        the API will name the offending parameter itself.
+        """
+        try:
+            # strptime, not date.fromisoformat: 3.11+ widened fromisoformat to
+            # accept compact forms like '20260817' that the API then rejects.
+            start = datetime.strptime(from_date, "%Y-%m-%d").date()
+            end = datetime.strptime(to_date, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return
+        if start > end:
+            raise ValueError(f"fromDate ({start}) must not be after toDate ({end})")
+        if (end - start).days > SEAT_UTILIZATION_MAX_RANGE_DAYS:
+            raise ValueError(
+                f"The requested seat-utilization range must not exceed "
+                f"{SEAT_UTILIZATION_MAX_RANGE_DAYS} days"
+            )
 
     async def get_invoices(
         self, page: int = 0, size: int = 20, **filters: Any
@@ -1742,6 +1851,97 @@ class ReveniumClient:
             f"/profitstream/v2/api/skills/{skill_id}", params=params
         ))
 
+    # Developer PR-health report API methods
+    async def get_vcs_pr_health(
+        self, source: str, start_date: str, end_date: str
+    ) -> Dict[str, Any]:
+        """Get the PR-health report for the caller's own organization.
+
+        All three query parameters are required by the endpoint. The report is
+        principal-scoped: the platform resolves the organization from the
+        authenticated caller and accepts no team or tenant identifier, which is
+        why no team/tenant scope is attached to the request.
+
+        The response is a flat VcsPrHealthResponse (source, startDate, endDate,
+        the echoed agingDays/rottingDays, totals, engineers, oldest) - there is
+        no HAL ``_embedded`` envelope and no pagination.
+
+        The endpoint answers 400 when startDate is after endDate and when the
+        window spans 366 days or more; both are pre-checked at the tool layer so
+        the caller gets the constraint rather than an opaque upstream failure.
+
+        Args:
+            source: VCS source - ``github`` or ``gitlab``
+            start_date: Start of the closed/merged window (ISO ``yyyy-MM-dd``)
+            end_date: End of the closed/merged window, inclusive (ISO ``yyyy-MM-dd``)
+
+        Returns:
+            Flat PR-health report payload
+        """
+        params: Dict[str, Any] = {
+            "source": source,
+            "startDate": start_date,
+            "endDate": end_date,
+        }
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/billing/users/vcs-pr-health", params=params
+        ))
+
+    # Provider metering-coverage report API methods
+    async def get_provider_coverage(
+        self,
+        period: str = "30d",
+        provider: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        team_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get the provider metering-coverage report (metered vs. provider-billed spend).
+
+        Required upstream: ``teamId`` (supplied by ``_add_team_id_to_params``
+        unless overridden) and ``period`` — the endpoint binds it as a
+        non-nullable field, so a request without one fails during argument
+        resolution before the service runs. The documented values are ``24h``,
+        ``7d``, ``30d``, ``90d`` and ``custom`` (compared lowercased); the value
+        is sent verbatim rather than gated on a local enum so a new period the
+        platform adds is immediately usable. ``custom`` requires ``startDate``
+        and ``endDate`` as ISO instants; the other periods ignore them.
+        ``provider`` optionally narrows the report to one provider. The bound
+        search object also carries usageType/minCost/maxCost, but the coverage
+        service never reads them, so they are not exposed here.
+
+        The response is a flat coverage report (state, aggregateRatio,
+        hiddenSpend, trend, confidence, byProvider[]) with no HAL ``_embedded``
+        envelope and no pagination. ``codingAssistantUsagePresent`` is a
+        non-nullable boolean upstream and is serialized on every 200; tenants
+        without the coding-assistant-separation feature flag do not get a
+        response without the field — they get a 403, because the whole endpoint
+        is gated on that flag.
+
+        Args:
+            period: Comparison window (required upstream; default ``30d``)
+            provider: Optional provider filter (e.g. ``anthropic``); omit for all providers
+            start_date: First instant of a ``custom`` period (ISO-8601)
+            end_date: Last instant of a ``custom`` period (ISO-8601)
+            team_id: Optional explicit team override; defaults to the auth context's team
+
+        Returns:
+            Flat coverage-report payload, returned unchanged
+        """
+        params: Dict[str, Any] = self._add_team_id_to_params()
+        if team_id is not None:
+            params["teamId"] = team_id
+        params["period"] = period
+        if provider is not None:
+            params["provider"] = provider
+        if start_date is not None:
+            params["startDate"] = start_date
+        if end_date is not None:
+            params["endDate"] = end_date
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/billing/coverage", params=params
+        ))
+
     # Tenant ingestion diagnostics API methods
     def _require_tenant_id(self) -> str:
         """Return the tenant id from auth config, or fail with guidance.
@@ -1781,24 +1981,37 @@ class ReveniumClient:
             f"/profitstream/v2/api/tenants/{tenant_id}/ingestion-failures", params=params
         ))
 
-    async def set_strict_ingestion_mode(self, enabled: bool) -> Dict[str, Any]:
+    async def set_strict_ingestion_mode(
+        self, enabled: bool, allow_ticket_jobs: Optional[bool] = None
+    ) -> Dict[str, Any]:
         """Toggle strict ingestion mode for the current tenant.
 
         When enabled, AI ingestion rejects transactions that reference
         entities (Product, Subscriber, Credential, Consuming Organization)
         which do not already exist for the tenant, instead of auto-creating
-        them.
+        them. Strict mode also suppresses the coding-assistant enricher's
+        ticket-grain Jobs unless the tenant opts back in.
 
         Args:
             enabled: Desired strict-ingestion-mode state
+            allow_ticket_jobs: Whether ticket-grain Job creation stays on
+                while strict mode is enabled. None omits the field, which the
+                API reads as "leave the tenant's current setting unchanged" —
+                an explicit False would overwrite an existing opt-in. The
+                server refuses True together with enabled=False, and clears
+                the stored opt-in whenever strict mode is turned off.
 
         Returns:
-            The updated tenant resource (includes strictIngestionMode)
+            The updated tenant resource (includes strictIngestionMode and
+            strictIngestionAllowTicketJobs)
         """
         tenant_id = self._require_tenant_id()
+        body: Dict[str, Any] = {"strictIngestionMode": enabled}
+        if allow_ticket_jobs is not None:
+            body["allowTicketJobs"] = allow_ticket_jobs
         return cast(Dict[str, Any], await self.patch(
             f"/profitstream/v2/api/tenants/{tenant_id}/strict-ingestion-mode",
-            data={"strictIngestionMode": enabled},
+            data=body,
         ))
 
     # Squads API methods
@@ -2421,6 +2634,223 @@ class ReveniumClient:
             params=params,
         ))
 
+    async def get_team_pr_health_settings(self, team_id: str) -> Dict[str, Any]:
+        """Get the team's PR-health aging/rotting inactivity thresholds.
+
+        The response carries the *effective* values: the platform substitutes its
+        own defaults when the team has never configured them, so this never
+        answers with a missing field.
+
+        Args:
+            team_id: The team ID
+
+        Returns:
+            Settings data carrying agingDays and rottingDays
+        """
+        params = self._add_tenant_id_to_params()
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/teams/{team_id}/settings/pr-health", params=params
+        ))
+
+    async def update_team_pr_health_settings(
+        self, team_id: str, settings: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Replace the team's PR-health aging/rotting thresholds.
+
+        The endpoint is a full replacement, not a merge: both agingDays and
+        rottingDays are non-nullable with no server-side defaults, so a body
+        carrying only one of them fails deserialization and the API answers 400.
+        Nothing is silently reset — the write simply does not land. Callers must
+        send the complete pair, read-merged from a prior GET when they only mean
+        to change one.
+
+        The server also enforces agingDays < rottingDays and clamps both fields
+        to 1..365; violating either is a 400.
+
+        The resource exposes no version or ETag, so a read-merge-write around it
+        is not atomic. Callers can only detect a lost update after the fact, by
+        comparing the echoed pair against the pair they sent; a write that
+        interleaves between the read and this PUT is still overwritten. Closing
+        that window needs a server-side precondition — an ETag with
+        If-Match, or a version field the PUT rejects when stale — which the
+        endpoint does not offer today and which is out of scope for this client.
+
+        Args:
+            team_id: The team ID
+            settings: Full settings payload, i.e. {"agingDays": int, "rottingDays": int}
+
+        Returns:
+            Updated PR-health settings data
+        """
+        params = self._add_tenant_id_to_params()
+        return cast(Dict[str, Any], await self.put(
+            f"/profitstream/v2/api/teams/{team_id}/settings/pr-health",
+            data=settings,
+            params=params,
+        ))
+    async def get_team_attribution_identity_policy(self, team_id: str) -> Dict[str, Any]:
+        """Get the team's coding-assistant attribution identity policy.
+
+        The response carries the *effective* policy: the platform substitutes the
+        strict VERIFIED_DOMAIN_ONLY when the team has never stored a choice, so an
+        unconfigured team is indistinguishable from a deliberately strict one on
+        the wire. Callers that report the value must say "effective", not
+        "configured".
+
+        Requires organization-management permissions upstream; a caller without
+        them gets a 403 rather than a redacted read.
+
+        Args:
+            team_id: The team ID (a path parameter - no ambient organization
+                context is used to resolve it)
+
+        Returns:
+            Policy data carrying a single ``policy`` field
+        """
+        params = self._add_tenant_id_to_params()
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/teams/{team_id}/settings/attribution-identity-policy",
+            params=params,
+        ))
+
+    async def update_team_attribution_identity_policy(
+        self, team_id: str, policy: str
+    ) -> Dict[str, Any]:
+        """Set the team's coding-assistant attribution identity policy.
+
+        The resource is a single required field, so this PUT is a complete body by
+        construction: there is nothing else for a partial write to drop.
+
+        *policy* is sent verbatim. The accepted values today are
+        VERIFIED_DOMAIN_ONLY and ALLOW_SELF_ASSERTED_UNVERIFIED, but this client
+        deliberately keeps no local copy of that enum - a hard-coded list is what
+        blocks a caller from reaching the next value the platform adds, and the
+        API already rejects an unknown value with a 400 naming it.
+
+        Requires organization-management permissions upstream.
+
+        Args:
+            team_id: The team ID
+            policy: The policy value to store
+
+        Returns:
+            Updated policy data
+        """
+        params = self._add_tenant_id_to_params()
+        return cast(Dict[str, Any], await self.put(
+            f"/profitstream/v2/api/teams/{team_id}/settings/attribution-identity-policy",
+            data={"policy": policy},
+            params=params,
+        ))
+
+    async def list_team_verified_domains(self, team_id: str) -> List[Dict[str, Any]]:
+        """List the email domains the team has verified for identity attribution.
+
+        The endpoint answers with a bare JSON array of VerifiedDomainResource
+        rather than a HAL page, so the result carries no ``_embedded`` envelope and
+        no pagination metadata. The array survives untouched because ``_request``
+        only routes dict responses through ``_extract_embedded_data``.
+
+        The read itself is admin-gated: it requires tenant domain-settings
+        permissions, so a 403 here is a permissions answer, not an empty list.
+
+        Args:
+            team_id: The team ID
+
+        Returns:
+            List of verified domains, each ``{domain, source, joinPolicy}``
+        """
+        params = self._add_tenant_id_to_params()
+        return cast(
+            List[Dict[str, Any]],
+            await self.get(
+                f"/profitstream/v2/api/teams/{team_id}/settings/verified-domains",
+                params=params,
+            ),
+        )
+
+    async def add_team_verified_domain(self, team_id: str, domain: str) -> Dict[str, Any]:
+        """Add one verified domain to the team.
+
+        Unlike the marketplace-settings PUT this shape resembles, the body is a
+        single {"domain": ...} VerifiedDomainRequest and the call ADDS that domain:
+        it is not a replacement of the list, and sending an array would be
+        rejected. Removal is the separate DELETE below.
+
+        The endpoint is platform-administrator-only by design (hypercurrent #6055):
+        an unverified add can claim any unclaimed business domain and route future
+        signups to the claiming tenant, so a tenant or organization administrator
+        is always answered with a 403 - it is not a permission they can be granted.
+        The API also fixes the new mapping's source to ADMIN and its joinPolicy to
+        REQUEST, which is why neither is a parameter here.
+
+        Args:
+            team_id: The team ID
+            domain: The single email domain to add
+
+        Returns:
+            The added verified domain resource
+        """
+        params = self._add_tenant_id_to_params()
+        return cast(Dict[str, Any], await self.put(
+            f"/profitstream/v2/api/teams/{team_id}/settings/verified-domains",
+            data={"domain": domain},
+            params=params,
+        ))
+
+    async def remove_team_verified_domain(self, team_id: str, domain: str) -> Dict[str, Any]:
+        """Remove one verified domain from the team.
+
+        The domain travels as a required query parameter, not in a body, because
+        DELETE carries none.
+
+        Requires tenant domain-settings permissions upstream - the same privilege
+        the listing needs, and a lesser one than the platform-admin add.
+
+        Args:
+            team_id: The team ID
+            domain: The email domain to remove
+
+        Returns:
+            Delete response data
+        """
+        params = self._add_tenant_id_to_params({"domain": domain})
+        return cast(Dict[str, Any], await self.delete(
+            f"/profitstream/v2/api/teams/{team_id}/settings/verified-domains",
+            params=params,
+        ))
+
+    # Organizational Unit (department) API methods
+    async def get_org_units(self, team_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get the active organizational units (departments) for a team.
+
+        Read-only lookup used to resolve a department name to the id the ORG_UNIT
+        dimension expects (insight-run filters, cost-control scopes, group previews).
+
+        The endpoint answers with a bare JSON array rather than a HAL page, so the
+        result carries no ``_embedded`` envelope and no pagination metadata. The
+        array survives untouched because ``_request`` only routes dict responses
+        through ``_extract_embedded_data`` when ``use_bearer`` is True, and this
+        call uses the default x-api-key host.
+
+        Args:
+            team_id: Restrict the listing to one team. When omitted the ambient
+                team from the auth config is sent; the API itself also falls back
+                to the caller's own organization when no teamId reaches it.
+
+        Returns:
+            List of org units, each ``{id, name, parentId, path, source, externalRef}``
+            where ``path`` is the materialized ancestor-id path including the unit
+            itself (e.g. ``/12/40/173/``) and ``id``/``parentId`` are JSON numbers.
+        """
+        params: Dict[str, Any] = (
+            {"teamId": team_id} if team_id else self._add_team_id_to_params()
+        )
+        return cast(
+            List[Dict[str, Any]],
+            await self.get("/profitstream/v2/api/org-units", params=params),
+        )
+
     # AI Anomaly and Alert Management API methods
 
     # AI Anomaly API methods
@@ -2652,7 +3082,11 @@ class ReveniumClient:
         Returns:
             Response containing alerts data and pagination info
         """
-        params = {"paged": "true", "page": page, "size": size}
+        # BACK-2783: no `paged` param. Spring binds a Pageable from
+        # page/size/sort; `paged` is a read-only property of the resulting
+        # Pageable, not an input, so AIAlertController.find discarded it — and
+        # would 400 on it once strict parameter checking is enabled.
+        params: Dict[str, Any] = {"page": page, "size": size}
 
         # Add date range parameters if provided
         if start:
@@ -2772,7 +3206,10 @@ class ReveniumClient:
         Returns:
             Response containing metering element definitions data and pagination info
         """
-        params = {"page": page, "size": size, "paged": "true"}
+        # BACK-2783: no `paged` param — see the note in get_alerts.
+        # MeteringElementDefinitionController.find binds teamId, type, sourceIds
+        # and a Pageable; `paged` is not part of that contract.
+        params: Dict[str, Any] = {"page": page, "size": size}
         params.update(filters)
         params = self._add_team_id_to_params(params)
         return cast(Dict[str, Any], await self.get("/profitstream/v2/api/metering-element-definitions", params=params))
@@ -3165,6 +3602,10 @@ class ReveniumClient:
     async def get_tool_events(self, tool_id: str, page: int = 0, size: int = 20) -> Dict[str, Any]:
         """Get events for a specific tool via the global tool events log endpoint.
 
+        Scoped read over the same list endpoint `list_tool_events` uses — the
+        upstream tool-event surface has no per-tool sub-resource, so the tool is
+        applied as a `toolId` filter.
+
         Args:
             tool_id: The tool ID to filter by
             page: Page number (0-based)
@@ -3178,6 +3619,16 @@ class ReveniumClient:
         return cast(Dict[str, Any], await self.get("/profitstream/v2/api/sources/metrics/tool/events", params=params))
     async def list_tool_events(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """List tool event logs via global filterable endpoint.
+
+        This list read is the ONLY callable operation on the upstream tool-event
+        surface, and it is the whole of this repo's adoption of it. The same
+        controller declares a per-event read and inherits create/update/delete
+        from the shared CRUD interface, but the per-event read is hidden from the
+        API document, gated by ``denyAll()`` and returns 501, and the write verbs
+        carry no request mapping at all — so there is nothing else to wrap here.
+        Both decisions are recorded in ``.claude/commands/mcp-api-exclusions.yaml``
+        so a coverage audit does not re-open them. Recording new usage is a
+        different surface entirely (``meter_tool_event`` / ``record_tool_event``).
 
         Args:
             page: Page number (0-based)
@@ -3567,6 +4018,8 @@ class ReveniumClient:
         filter_trace_type: Optional[List[str]] = None,
         filter_consuming_org_id: Optional[List[str]] = None,
         filter_environment: str = "",
+        filter_org_unit_id: str = "",
+        filter_include_descendants: bool = True,
         filter_include_coding_assistants: bool = True,
         filter_include_coding_assistants_for_cost_detectors: bool = False,
         exclude_investigator_ids: Optional[List[str]] = None,
@@ -3577,6 +4030,12 @@ class ReveniumClient:
             period_start, period_end: ISO 8601 strings. Backend enforces
                 ``period_end > period_start`` and a 90-day max span.
             filter_*: optional whitelist/scoping arrays — empty list = unfiltered.
+            filter_org_unit_id: single org-unit (department) id — "" = tenant-wide.
+                Single-valued, unlike the neighbouring filter arrays; resolve the
+                id with manage_customers' ``list_org_units``.
+            filter_include_descendants: include the org unit's sub-units. Always
+                sent, defaulting to the backend's own default of True — sending
+                False would narrow the run to the department's own rows.
             exclude_investigator_ids: skip specific detectors; None = run all.
 
         Returns:
@@ -3599,6 +4058,8 @@ class ReveniumClient:
             "filterTraceType": filter_trace_type or [],
             "filterConsumingOrgId": filter_consuming_org_id or [],
             "filterEnvironment": filter_environment,
+            "filterOrgUnitId": filter_org_unit_id,
+            "filterIncludeDescendants": filter_include_descendants,
             "filterIncludeCodingAssistants": filter_include_coding_assistants,
             "filterIncludeCodingAssistantsForCostDetectors":
                 filter_include_coding_assistants_for_cost_detectors,

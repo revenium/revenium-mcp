@@ -203,9 +203,11 @@ the "First-time TLS" note above for the browser equivalent.
 
 ## MCP Specification
 
-Implements [Model Context Protocol](https://modelcontextprotocol.io/specification/2025-06-18) version **2025-06-18**.
+Implements [Model Context Protocol](https://modelcontextprotocol.io/specification/2025-11-25) revision
+**2025-11-25** — the `LATEST_PROTOCOL_VERSION` of the pinned `mcp` SDK, which is what the server
+negotiates. Earlier revisions (including `2025-06-18`) are still served to older clients.
 
-- **Framework:** FastMCP (pinned to `fastmcp==3.2.0`)
+- **Framework:** FastMCP (pinned to `fastmcp==3.4.7`)
 - **Transport:** stdio (default) and HTTP (set `TRANSPORT_MODE=http`)
 - **Protocol:** JSON-RPC 2.0
 

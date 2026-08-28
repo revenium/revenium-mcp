@@ -235,7 +235,21 @@ class ToolConfigurationRegistry:
             query: Optional[str] = None,
             # Skill usage reads: list_skills / get_skill
             skill_id: Optional[str] = None,
-            sort: Optional[str] = None
+            sort: Optional[str] = None,
+            # PR-health report: get_pr_health (start_date/end_date are declared above,
+            # shared with the billing reads)
+            source: Optional[str] = None,
+            # Provider metering-coverage report: get_coverage_ratio
+            provider: Optional[str] = None,
+            # Claude Enterprise seat census: get_seat_utilization. Named
+            # from_date/to_date rather than reusing start_date/end_date because the
+            # endpoint's own parameters are fromDate/toDate and its bounds are whole
+            # UTC days, inclusive on both ends — not the timestamp windows the billing
+            # listings filter by. team_id is an optional override; it defaults to the
+            # team on the caller's credentials.
+            from_date: Optional[str] = None,
+            to_date: Optional[str] = None,
+            team_id: Optional[str] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
 
             arguments = {
@@ -274,7 +288,15 @@ class ToolConfigurationRegistry:
                 "invoice_id": invoice_id,
                 # Skill usage reads
                 "skill_id": skill_id,
-                "sort": sort
+                "sort": sort,
+                # PR-health report
+                "source": source,
+                # Provider metering-coverage report
+                "provider": provider,
+                # Claude Enterprise seat census
+                "from_date": from_date,
+                "to_date": to_date,
+                "team_id": team_id
             }
 
             # NUMERIC PREPROCESSING: Convert string numeric parameters to appropriate types
@@ -486,6 +508,8 @@ class ToolConfigurationRegistry:
             filter_trace_type: Optional[List[str]] = None,
             filter_consuming_org_id: Optional[List[str]] = None,
             filter_environment: Optional[str] = None,
+            filter_org_unit_id: Optional[str] = None,
+            filter_include_descendants: Optional[bool] = None,
             filter_include_coding_assistants: Optional[bool] = None,
             filter_include_coding_assistants_for_cost_detectors: Optional[bool] = None,
             exclude_investigator_ids: Optional[List[str]] = None,
@@ -515,6 +539,11 @@ class ToolConfigurationRegistry:
                 "filter_trace_type": filter_trace_type,
                 "filter_consuming_org_id": filter_consuming_org_id,
                 "filter_environment": filter_environment,
+                # BACK-2757: FastMCP builds this tool's accepted arguments from
+                # the signature above, so both org-unit filters have to be
+                # declared there or the handler's reads are unreachable.
+                "filter_org_unit_id": filter_org_unit_id,
+                "filter_include_descendants": filter_include_descendants,
                 "filter_include_coding_assistants": filter_include_coding_assistants,
                 "filter_include_coding_assistants_for_cost_detectors":
                     filter_include_coding_assistants_for_cost_detectors,
@@ -657,7 +686,13 @@ class ToolConfigurationRegistry:
             pages: Optional[int] = None,
             search_all_pages: Optional[Union[bool, str]] = None,
             search_term: Optional[str] = None,
-            status_filter: Optional[str] = None
+            status_filter: Optional[str] = None,
+            # set_strict_ingestion_mode: the closure signature is this tool's
+            # public schema, so the toggle's arguments must be declared here
+            # for FastMCP to bind them at all.
+            enabled: Optional[Union[bool, str]] = None,
+            allow_ticket_jobs: Optional[Union[bool, str]] = None,
+            confirm: Optional[Union[bool, str]] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
 
             arguments = {
@@ -673,12 +708,18 @@ class ToolConfigurationRegistry:
                 "pages": pages,
                 "search_all_pages": search_all_pages,
                 "search_term": search_term,
-                "status_filter": status_filter
+                "status_filter": status_filter,
+                "enabled": enabled,
+                "allow_ticket_jobs": allow_ticket_jobs,
+                "confirm": confirm
             }
 
-            # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
+            # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values.
+            # "confirm" is deliberately excluded: set_strict_ingestion_mode applies the change
+            # only for a literal boolean True, so a loosely typed confirm must stay a preview.
             boolean_params = [
-                "include_recommendations", "include_sensitive", "show_detailed_analysis", "search_all_pages"
+                "include_recommendations", "include_sensitive", "show_detailed_analysis",
+                "search_all_pages", "enabled", "allow_ticket_jobs"
             ]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
 
@@ -751,7 +792,20 @@ class ToolConfigurationRegistry:
             skill_kind: Optional[str] = None,
             skill_plugin_name: Optional[str] = None,
             skill_marketplace_name: Optional[str] = None,
-            skill_invocation_trigger: Optional[str] = None
+            skill_invocation_trigger: Optional[str] = None,
+            # Completion provenance parameters (submission only). Same reason
+            # as the attribution block above: FastMCP derives this tool's
+            # accepted arguments from the closure signature, so the submit
+            # path's support for these fields is unreachable until they are
+            # declared here.
+            effort: Optional[str] = None,
+            model_host: Optional[str] = None,
+            subscriber_email_source: Optional[str] = None,
+            # Scope switch for the completions read actions. None means "use the
+            # MCP default" (include - see _DEFAULT_INCLUDE_CODING_ASSISTANTS in
+            # tools_decomposed/metering_management.py); an explicit False is a
+            # real caller choice and is forwarded as false.
+            include_coding_assistants: Optional[Union[bool, str]] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
             # Map arguments
             arguments = {
@@ -801,7 +855,13 @@ class ToolConfigurationRegistry:
                 "skill_kind": skill_kind,
                 "skill_plugin_name": skill_plugin_name,
                 "skill_marketplace_name": skill_marketplace_name,
-                "skill_invocation_trigger": skill_invocation_trigger
+                "skill_invocation_trigger": skill_invocation_trigger,
+                # Completion provenance parameters
+                "effort": effort,
+                "model_host": model_host,
+                "subscriber_email_source": subscriber_email_source,
+                # Scope switch for the completions read actions
+                "include_coding_assistants": include_coding_assistants
             }
 
             # NUMERIC PREPROCESSING: Convert string numeric parameters to appropriate types
@@ -821,7 +881,13 @@ class ToolConfigurationRegistry:
             arguments = preprocess_numeric_parameters(arguments, numeric_params)
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
-            boolean_params = ["dry_run", "return_transaction_data", "early_termination", "is_streamed"]
+            boolean_params = [
+                "dry_run",
+                "return_transaction_data",
+                "early_termination",
+                "is_streamed",
+                "include_coding_assistants",
+            ]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
 
             # ARRAY PREPROCESSING: Convert string array parameters to actual Python lists
@@ -1273,6 +1339,12 @@ class ToolConfigurationRegistry:
             # Team internal-marketplace settings actions
             marketplace_names: Optional[Union[List[str], str]] = None,
             operation: Optional[str] = None,
+            # Team PR-health threshold settings actions
+            aging_days: Optional[Union[int, str]] = None,
+            rotting_days: Optional[Union[int, str]] = None,
+            # Team attribution-identity-policy and verified-domain actions
+            policy: Optional[str] = None,
+            domain: Optional[str] = None,
             page: Union[int, str] = 0,
             size: Union[int, str] = 20,
             filters: Optional[dict] = None,
@@ -1292,6 +1364,10 @@ class ToolConfigurationRegistry:
                 "team_id": team_id,
                 "marketplace_names": marketplace_names,
                 "operation": operation,
+                "aging_days": aging_days,
+                "rotting_days": rotting_days,
+                "policy": policy,
+                "domain": domain,
                 "page": page,
                 "size": size,
                 "filters": filters or {},
@@ -1365,7 +1441,15 @@ class ToolConfigurationRegistry:
                     )]
 
             # NUMERIC PREPROCESSING: Convert string numeric parameters to appropriate types
-            numeric_params = {'page': int, 'size': int}
+            # The PR-health thresholds are whole days and the tool rejects anything that is
+            # not a plain int, so a string an agent serialized is coerced here; a value that
+            # will not parse is left alone for the tool's structured error to name.
+            numeric_params = {
+                'page': int,
+                'size': int,
+                'aging_days': int,
+                'rotting_days': int,
+            }
             arguments = preprocess_numeric_parameters(arguments, numeric_params)
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
@@ -1869,6 +1953,7 @@ class ToolConfigurationRegistry:
             action: _JSONScalar = "get_capabilities",
             control_id: Optional[_JSONScalar] = None,
             control_data: Optional[Union[dict, str]] = None,
+            parent_org_unit_id: Optional[Union[int, str]] = None,
             rule_id: Optional[_JSONScalar] = None,
             since: Optional[_JSONScalar] = None,
             page: Union[int, str] = 0,
@@ -1879,6 +1964,11 @@ class ToolConfigurationRegistry:
                 "action": action,
                 "control_id": control_id,
                 "control_data": control_data,
+                # Raw numeric org-unit id for preview_org_unit_group. Kept out
+                # of string_fields below because both an int and a digit string
+                # are legitimate here (the org-unit listing hands out strings,
+                # the raw API returns JSON numbers); the tool coerces in-body.
+                "parent_org_unit_id": parent_org_unit_id,
                 "rule_id": rule_id,
                 "since": since,
                 "page": page,

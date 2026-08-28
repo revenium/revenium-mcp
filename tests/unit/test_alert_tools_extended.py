@@ -346,7 +346,7 @@ class TestHandleActionQuery:
             return_value=[TextContent(type="text", text="Query anomalies")]
         )
         result = await tools.handle_action("query", {
-            "resource_type": "anomalies", "filters": {"enabled": True},
+            "resource_type": "anomalies", "filters": {"query": "budget"},
         })
         assert result[0].text == "Query anomalies"
 

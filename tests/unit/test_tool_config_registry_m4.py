@@ -1971,6 +1971,62 @@ class TestManageCostControlsNumericPreprocessing:
         assert captured_args["size"] == 5
 
 
+class TestManageCostControlsOrgUnitPreviewForwarding:
+    """parent_org_unit_id must be declared on the closure or FastMCP rejects it
+    before the tool ever sees it (the signature, not get_schema(), is the model)."""
+
+    @pytest.mark.asyncio
+    async def test_signature_declares_parent_org_unit_id(self):
+        import inspect
+
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
+
+        assert "parent_org_unit_id" in inspect.signature(registered_fn).parameters
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [173, "173"])
+    async def test_parent_org_unit_id_forwarded_unchanged(self, value):
+        """Both an int and a digit string are legitimate, so the closure must
+        forward the value as sent and leave coercion to the tool."""
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="preview_org_unit_group", parent_org_unit_id=value)
+
+        assert captured_args["parent_org_unit_id"] == value
+
+    @pytest.mark.asyncio
+    async def test_parent_org_unit_id_none_is_stripped(self):
+        """An unset optional must not reach the tool as an explicit None."""
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="list")
+
+        assert "parent_org_unit_id" not in captured_args
+
+
 class TestBusinessAnalyticsAggregationForwarding:
     """The new aggregation closure param is forwarded (and None-stripped)."""
 
@@ -2160,6 +2216,62 @@ class TestBusinessAnalyticsSkillReadClosure:
         assert "sort" not in captured
 
 
+class TestBusinessAnalyticsSeatUtilizationClosure:
+    """get_seat_utilization is undrivable unless its parameters are declared on
+    the closure — FastMCP builds the tool schema from the signature."""
+
+    async def _run(self, **kwargs):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(
+            registry, "_register_business_analytics_management"
+        )
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(**kwargs)
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_signature_declares_the_seat_params(self):
+        import inspect
+
+        registry = _make_registry()
+        fn = await _get_registered_closure(
+            registry, "_register_business_analytics_management"
+        )
+        params = inspect.signature(fn).parameters
+        assert "from_date" in params
+        assert "to_date" in params
+        assert "team_id" in params
+
+    @pytest.mark.asyncio
+    async def test_seat_params_forwarded(self):
+        captured = await self._run(
+            action="get_seat_utilization",
+            from_date="2026-08-01",
+            to_date="2026-08-22",
+            team_id="JMwaj9y",
+        )
+        assert captured["action"] == "get_seat_utilization"
+        assert captured["from_date"] == "2026-08-01"
+        assert captured["to_date"] == "2026-08-22"
+        assert captured["team_id"] == "JMwaj9y"
+
+    @pytest.mark.asyncio
+    async def test_omitted_team_id_is_stripped_so_the_client_resolves_it(self):
+        captured = await self._run(
+            action="get_seat_utilization", from_date="2026-08-01", to_date="2026-08-22"
+        )
+        assert "team_id" not in captured
+
+
 class TestManageSubscriptionsBillingReadClosure:
     async def _run(self, **kwargs):
         registry = _make_registry()
@@ -2304,3 +2416,372 @@ class TestManageProductsQueryParameter:
             await fn(action="list")
 
         assert "query" not in captured
+
+
+class TestManageAiInsightsOrgUnitParameters:
+    """BACK-2757: the org-unit filters must be reachable through the MCP boundary.
+
+    FastMCP derives the tool's accepted arguments from this closure's
+    signature, so a handler reading arguments["filter_org_unit_id"] is dead
+    code until the parameter is declared here — the caller gets a binding
+    error instead of a department-scoped run.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "param", ["filter_org_unit_id", "filter_include_descendants"],
+    )
+    async def test_signature_declares_param(self, param):
+        import inspect
+
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_ai_insights")
+
+        assert param in inspect.signature(fn).parameters
+
+    @pytest.mark.asyncio
+    async def test_org_unit_filters_forwarded_through_closure(self):
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_ai_insights")
+
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await fn(
+                action="trigger_run",
+                period_start="2026-01-01T00:00:00Z",
+                period_end="2026-01-31T23:59:59Z",
+                filter_org_unit_id="173",
+                filter_include_descendants=False,
+            )
+
+        assert captured["filter_org_unit_id"] == "173"
+        assert captured["filter_include_descendants"] is False
+
+    @pytest.mark.asyncio
+    async def test_include_descendants_false_survives_the_none_filter(self):
+        """The closure drops None-valued arguments; False must not be dropped
+        with them, or opting out of descendants would silently do nothing."""
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_ai_insights")
+
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await fn(action="trigger_run", filter_include_descendants=False)
+
+        assert captured["filter_include_descendants"] is False
+
+
+# ---------------------------------------------------------------------------
+# manage_metering closure — completion provenance forwarding
+# ---------------------------------------------------------------------------
+
+class TestManageMeteringProvenanceForwarding:
+    """BACK-2758: the closure signature IS manage_metering's public schema.
+
+    effort, model_host and subscriber_email_source are read out of the
+    arguments dict by the submit path, so leaving them undeclared here does
+    not merely hide them — FastMCP never binds them and no MCP client can
+    send them at all.
+    """
+
+    PROVENANCE = {
+        "effort": "high",
+        "model_host": "bedrock",
+        "subscriber_email_source": "jwt",
+    }
+
+    @pytest.mark.asyncio
+    async def test_signature_declares_provenance_parameters(self):
+        import inspect
+
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_metering")
+        params = inspect.signature(registered_fn).parameters
+        for key in self.PROVENANCE:
+            assert key in params, key
+
+    @pytest.mark.asyncio
+    async def test_provenance_fields_forwarded_to_execution(self):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_metering")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="submit_ai_transaction", **self.PROVENANCE)
+
+        for key, value in self.PROVENANCE.items():
+            assert captured_args.get(key) == value, key
+
+    @pytest.mark.asyncio
+    async def test_provenance_fields_omitted_when_absent(self):
+        """An unset field is stripped with the other Nones, so it never reaches
+        the payload builder as an explicit null."""
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_metering")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="submit_ai_transaction", effort="high")
+
+        assert captured_args["effort"] == "high"
+        assert "model_host" not in captured_args
+        assert "subscriber_email_source" not in captured_args
+
+
+class TestSystemDiagnosticsStrictIngestionClosure:
+    """BACK-2770: the closure signature is system_diagnostics' public schema.
+
+    set_strict_ingestion_mode reads enabled/confirm/allow_ticket_jobs out of
+    the arguments dict, so an undeclared parameter is not merely undocumented
+    — FastMCP never binds it and the action cannot be driven at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_signature_declares_strict_ingestion_parameters(self):
+        import inspect
+
+        registry = _make_registry()
+        fn = await _get_registered_closure(registry, "_register_system_diagnostics")
+        params = inspect.signature(fn).parameters
+        assert "enabled" in params
+        assert "confirm" in params
+        assert "allow_ticket_jobs" in params
+
+    @pytest.mark.asyncio
+    async def test_strict_ingestion_parameters_forwarded(self):
+        registry = _make_registry()
+        fn = await _get_registered_closure(registry, "_register_system_diagnostics")
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await fn(
+                action="set_strict_ingestion_mode",
+                enabled=True,
+                allow_ticket_jobs=True,
+                confirm=True,
+            )
+        assert captured["enabled"] is True
+        assert captured["allow_ticket_jobs"] is True
+        assert captured["confirm"] is True
+
+    @pytest.mark.asyncio
+    async def test_omitted_opt_in_is_dropped_from_arguments(self):
+        """None means leave-unchanged; it must not reach the handler as a value."""
+        registry = _make_registry()
+        fn = await _get_registered_closure(registry, "_register_system_diagnostics")
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await fn(action="set_strict_ingestion_mode", enabled=False, confirm=True)
+        assert "allow_ticket_jobs" not in captured
+
+    @pytest.mark.asyncio
+    async def test_string_booleans_are_preprocessed_except_confirm(self):
+        """enabled/allow_ticket_jobs accept loose string booleans; confirm does
+        not, so the handler's literal-True guard keeps its meaning."""
+        registry = _make_registry()
+        fn = await _get_registered_closure(registry, "_register_system_diagnostics")
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await fn(
+                action="set_strict_ingestion_mode",
+                enabled="true",
+                allow_ticket_jobs="true",
+                confirm="true",
+            )
+        assert captured["enabled"] is True
+        assert captured["allow_ticket_jobs"] is True
+        assert captured["confirm"] == "true"
+
+
+# ---------------------------------------------------------------------------
+# manage_metering closure — completion provenance forwarding
+# ---------------------------------------------------------------------------
+
+
+class TestPrHealthClosureParameters:
+    """BACK-2768 review: FastMCP derives each tool's accepted arguments from the
+    registered closure's signature, so an action whose parameters the closure
+    never declares is unreachable — the framework rejects the call before the
+    handler that reads them ever runs."""
+
+    @staticmethod
+    async def _run(registry_method: str, **kwargs) -> dict:
+        registry = _make_registry(profile="business")
+        registered_fn = await _get_registered_closure(registry, registry_method)
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(**kwargs)
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_analytics_signature_declares_get_pr_health_params(self):
+        """get_pr_health requires source, start_date and end_date — all three must
+        be bindable through the business_analytics_management schema."""
+        import inspect
+
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(
+            registry, "_register_business_analytics_management"
+        )
+        params = inspect.signature(fn).parameters
+        assert "source" in params
+        assert "start_date" in params
+        assert "end_date" in params
+
+    @pytest.mark.asyncio
+    async def test_get_pr_health_params_forwarded(self):
+        captured = await self._run(
+            "_register_business_analytics_management",
+            action="get_pr_health",
+            source="github",
+            start_date="2026-05-17",
+            end_date="2026-08-17",
+        )
+        assert captured["action"] == "get_pr_health"
+        assert captured["source"] == "github"
+        assert captured["start_date"] == "2026-05-17"
+        assert captured["end_date"] == "2026-08-17"
+
+    @pytest.mark.asyncio
+    async def test_source_omitted_when_not_supplied(self):
+        """An omitted source must not reach the handler as None — the validator
+        distinguishes a missing source from a rejected one."""
+        captured = await self._run(
+            "_register_business_analytics_management", action="get_provider_costs"
+        )
+        assert "source" not in captured
+
+    @pytest.mark.asyncio
+    async def test_customers_signature_declares_threshold_params(self):
+        """update_pr_health_settings reads aging_days/rotting_days out of the
+        arguments dict, so the manage_customers closure must declare them."""
+        import inspect
+
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_customers")
+        params = inspect.signature(fn).parameters
+        assert "team_id" in params
+        assert "aging_days" in params
+        assert "rotting_days" in params
+
+    @pytest.mark.asyncio
+    async def test_threshold_params_forwarded(self):
+        captured = await self._run(
+            "_register_manage_customers",
+            action="update_pr_health_settings",
+            team_id="jR2kmLs",
+            aging_days=14,
+            rotting_days=30,
+        )
+        assert captured["action"] == "update_pr_health_settings"
+        assert captured["team_id"] == "jR2kmLs"
+        assert captured["aging_days"] == 14
+        assert captured["rotting_days"] == 30
+
+    @pytest.mark.asyncio
+    async def test_string_thresholds_coerced_to_int(self):
+        """Agents serialize numbers as strings; the tool's bounds check rejects
+        anything that is not a plain int, so the closure coerces first."""
+        captured = await self._run(
+            "_register_manage_customers",
+            action="update_pr_health_settings",
+            team_id="jR2kmLs",
+            aging_days="7",
+            rotting_days="21",
+        )
+        assert captured["aging_days"] == 7
+        assert captured["rotting_days"] == 21
+
+    @pytest.mark.asyncio
+    async def test_unparseable_threshold_left_for_the_tool_to_reject(self):
+        """A non-numeric string stays a string so the tool answers with its own
+        structured error instead of the closure swallowing the value."""
+        captured = await self._run(
+            "_register_manage_customers",
+            action="update_pr_health_settings",
+            team_id="jR2kmLs",
+            aging_days="soon",
+        )
+        assert captured["aging_days"] == "soon"
+
+    @pytest.mark.asyncio
+    async def test_thresholds_omitted_when_not_supplied(self):
+        """A one-field update must leave the other key absent — a None would look
+        like a supplied value to the read-merge path."""
+        captured = await self._run(
+            "_register_manage_customers",
+            action="update_pr_health_settings",
+            team_id="jR2kmLs",
+            aging_days=7,
+        )
+        assert captured["aging_days"] == 7
+        assert "rotting_days" not in captured
+
+
+# ---------------------------------------------------------------------------
+# manage_metering closure — completion provenance forwarding
+# ---------------------------------------------------------------------------
+

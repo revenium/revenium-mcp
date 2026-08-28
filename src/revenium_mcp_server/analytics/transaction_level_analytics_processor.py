@@ -21,6 +21,72 @@ from ..endpoint_registry import get_unit_multiplier, resolve_analytics_request
 from .transaction_level_validation import TransactionLevelParameterValidator
 
 
+# BACK-2783: analytics reports whose backend contract does not declare the
+# `group` (aggregation) query parameter. Verified 2026-08-28 against
+# hypercurrent origin/develop AICompletionMetricController —
+# getTotalCostByProviderOverTime, getTokensPerMinuteByProvider and
+# getCallCountMetricsOfAgents declare only teamId / period / startDate /
+# endDate / providers|agents (plus tokenType on the tokens report). Eleven
+# sibling reports on the same controller do declare `group`, which is why
+# sending it here read as correct — it was discarded upstream, so a MEAN or
+# MAXIMUM request came back TOTAL-shaped and was labelled with the aggregation
+# the caller asked for.
+# The values are the report names used in the error a caller sees.
+_REPORTS_WITHOUT_GROUP: Dict[str, str] = {
+    "total_cost_by_provider_over_time": "total cost by provider over time",
+    "tokens_per_minute_by_provider": "tokens per minute by provider",
+    "call_count_metrics_by_agents": "call count by agent",
+}
+
+# The aggregation those three reports do produce.
+_ONLY_SUPPORTED_GROUP = "TOTAL"
+
+
+def _group_extra(report_key: str, group: str) -> Dict[str, Any]:
+    """Return the `group` query param for a report, or nothing if it has none.
+
+    A report the backend does not declare `group` on never receives it, so the
+    server is not asked to honour a parameter it will throw away.
+    """
+    if group == _ONLY_SUPPORTED_GROUP or report_key in _REPORTS_WITHOUT_GROUP:
+        return {}
+    return {"group": group}
+
+
+def _reject_unsupported_group(report_keys: List[str], group: str, analysis: str) -> None:
+    """Raise when a caller's aggregation cannot be honoured by a report.
+
+    ``group`` reaches here from plain English — nlp_business_processor turns
+    "average" into MEAN, "max" into MAXIMUM, "median" into MEDIAN — so the
+    message has to make sense to someone who only ever said "average".
+    """
+    if group == _ONLY_SUPPORTED_GROUP:
+        return
+    unsupported = [_REPORTS_WITHOUT_GROUP[k] for k in report_keys if k in _REPORTS_WITHOUT_GROUP]
+    if not unsupported:
+        return
+    names = ", ".join(unsupported)
+    plural = "reports do" if len(unsupported) > 1 else "report does"
+    raise ToolError(
+        message=(
+            f"The {names} {plural} not support the {group} aggregation — "
+            f"only totals are available for {'them' if len(unsupported) > 1 else 'it'}. "
+            "Asking for an average or a maximum here would return totals "
+            "presented as something else."
+        ),
+        error_code=ErrorCodes.VALIDATION_ERROR,
+        field="aggregation",
+        value=group,
+        suggestions=[
+            f"Ask for totals instead, e.g. 'total cost by provider' rather than "
+            f"'{group.lower()} cost by provider'",
+            "Per-transaction averages are available on the cost-by-provider, "
+            "cost-by-model and agent-cost reports",
+        ],
+        context={"analysis": analysis, "reports_without_aggregation": unsupported},
+    )
+
+
 @dataclass
 class TransactionLevelData:
     """Transaction-level analysis data structure."""
@@ -130,19 +196,30 @@ class TransactionLevelAnalyticsProcessor:
             client: Revenium API client
             team_id: Team identifier
             period: Time period for analysis
-            group: Aggregation type (TOTAL, MEAN, etc.)
+            group: Aggregation type. Only TOTAL is available for this report
+                set — two of its five reports have no aggregation parameter
+                (see _REPORTS_WITHOUT_GROUP).
 
         Returns:
             Comprehensive summary transaction analysis data
 
         Raises:
-            ToolError: If API calls fail or data processing errors occur
+            ToolError: If the aggregation is unsupported, or API calls fail
         """
         logger.info(f"Analyzing summary transaction metrics for team {team_id}, period: {period}")
 
         # Validate parameters using transaction-level validator
         query_params = {"teamId": team_id, "period": period, "group": group}
         self.validator.validate_transaction_level_query("summary_analytics", query_params)
+
+        # The caller's aggregation is checked here, where it arrives, rather
+        # than in the fetcher: the fetchers are also driven by fixed-purpose
+        # internal calls that read only the reports they apply to.
+        _reject_unsupported_group(
+            ["total_cost_by_provider_over_time", "tokens_per_minute_by_provider"],
+            group,
+            "summary analytics",
+        )
 
         try:
             # Fetch summary data from multiple endpoints concurrently
@@ -385,7 +462,7 @@ class TransactionLevelAnalyticsProcessor:
 
     # Agent Analytics Methods (3 endpoints)
     async def analyze_agent_transactions(
-        self, client: ReveniumClient, team_id: str, period: str = "SEVEN_DAYS", group: str = "MEAN"
+        self, client: ReveniumClient, team_id: str, period: str = "SEVEN_DAYS", group: str = "TOTAL"
     ) -> Dict[str, Any]:
         """Analyze agent-specific transaction metrics following existing agent data processing patterns.
 
@@ -393,10 +470,16 @@ class TransactionLevelAnalyticsProcessor:
             client: Revenium API client
             team_id: Team identifier
             period: Time period for analysis
-            group: Aggregation type (MEAN, MAXIMUM, MINIMUM)
+            group: Aggregation type. Only TOTAL is available for this report
+                set — the call-count report has no aggregation parameter (see
+                _REPORTS_WITHOUT_GROUP), and the combined result is labelled
+                with this value, so anything else would mislabel it.
 
         Returns:
             Agent transaction analysis data
+
+        Raises:
+            ToolError: If the aggregation is unsupported, or API calls fail
         """
         logger.info(
             f"Analyzing agent transaction metrics for team {team_id}, period: {period}, group: {group}"
@@ -406,6 +489,8 @@ class TransactionLevelAnalyticsProcessor:
         self.validator.validate_transaction_level_query(
             "agent_analytics", {"teamId": team_id, "period": period, "group": group}
         )
+
+        _reject_unsupported_group(["call_count_metrics_by_agents"], group, "agent analytics")
 
         try:
             # Fetch agent data from all 3 Agent Analytics endpoints concurrently
@@ -455,8 +540,16 @@ class TransactionLevelAnalyticsProcessor:
         logger.info(f"Analyzing agent performance for team {team_id}, top {top_n}")
 
         try:
-            # Fetch agent data using existing method
-            agent_data = await self._fetch_agent_data(client, team_id, period, "MEAN")
+            # TOTAL, not MEAN: _process_agent_performance SUMS metricResult
+            # across time buckets for all three reports, so only TOTAL buckets
+            # produce well-defined sums (total cost, total calls, total time).
+            # MEAN buckets summed gave a bucket-count-dependent number, and the
+            # derived cost_per_call divided that pseudo-cost by true total
+            # calls - mixed aggregation semantics with no meaning. The
+            # call-count report has no aggregation parameter at all
+            # (_REPORTS_WITHOUT_GROUP), so TOTAL is also the only value the
+            # whole report set can honour.
+            agent_data = await self._fetch_agent_data(client, team_id, period, "TOTAL")
 
             # Process agent performance
             agent_performance = self._process_agent_performance(agent_data, top_n)
@@ -594,7 +687,13 @@ class TransactionLevelAnalyticsProcessor:
         self, client: ReveniumClient, team_id: str, period: str, group: str
     ) -> Dict[str, Any]:
         """Fetch summary data from multiple endpoints concurrently following CostAnalyticsProcessor patterns."""
-        extra_old_params = {"group": group} if group != "TOTAL" else None
+        report_keys = [
+            "total_cost_by_provider_over_time",
+            "cost_metric_by_provider_over_time",
+            "total_cost_by_model",
+            "cost_metrics_by_subscriber_credential",
+            "tokens_per_minute_by_provider",
+        ]
 
         def _make_call(key: str, extra: Any = None, extra_new: Any = None) -> Any:
             path, params, call_kwargs = resolve_analytics_request(
@@ -602,26 +701,20 @@ class TransactionLevelAnalyticsProcessor:
             )
             return client._request_with_retry("GET", path, params=params, **call_kwargs)
 
-        # Create concurrent API calls using resolve_analytics_request for correct host/auth routing
-        tasks = {
-            "total_cost_by_provider_over_time": _make_call(
-                "total_cost_by_provider_over_time", extra=extra_old_params
-            ),
-            "cost_metric_by_provider_over_time": _make_call(
-                "cost_metric_by_provider_over_time", extra=extra_old_params
-            ),
-            "total_cost_by_model": _make_call(
-                "total_cost_by_model", extra=extra_old_params
-            ),
-            "cost_metrics_by_subscriber_credential": _make_call(
-                "cost_metrics_by_subscriber_credential", extra=extra_old_params
-            ),
-            "tokens_per_minute_by_provider": _make_call(
-                "tokens_per_minute_by_provider",
-                extra={**(extra_old_params or {}), "tokenType": "TOTAL"},
-                extra_new={"tokenType": "TOTAL"},
-            ),
-        }
+        # Create concurrent API calls using resolve_analytics_request for correct
+        # host/auth routing. `group` is added per report rather than to all of
+        # them, because two of these five do not declare it.
+        tasks = {}
+        for key in report_keys:
+            extra = _group_extra(key, group)
+            if key == "tokens_per_minute_by_provider":
+                tasks[key] = _make_call(
+                    key,
+                    extra={**extra, "tokenType": "TOTAL"},
+                    extra_new={"tokenType": "TOTAL"},
+                )
+            else:
+                tasks[key] = _make_call(key, extra=extra)
 
         # Execute all API calls concurrently following existing patterns
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -1526,11 +1619,9 @@ class TransactionLevelAnalyticsProcessor:
         """Fetch agent data from all 3 Agent Analytics endpoints following existing patterns."""
         logger.info(f"Fetching agent data for team {team_id}, period {period}, group {group}")
 
-        extra_old_params = {"group": group} if group != "TOTAL" else None
-
         def _make_call(key: str) -> Any:
             path, params, call_kwargs = resolve_analytics_request(
-                key, team_id, period, extra_old_params=extra_old_params
+                key, team_id, period, extra_old_params=_group_extra(key, group)
             )
             return client._request_with_retry("GET", path, params=params, **call_kwargs)
 

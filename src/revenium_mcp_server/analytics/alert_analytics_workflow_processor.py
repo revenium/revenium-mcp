@@ -435,10 +435,13 @@ class AlertAnalyticsWorkflowProcessor:
             # Get transaction-level metrics for the analysis window
             period = analysis_window["period"]
 
-            # Agent transaction analysis
+            # Agent transaction analysis. TOTAL, not MEAN: the agent report set
+            # includes call-count, which has no aggregation parameter upstream
+            # (_REPORTS_WITHOUT_GROUP), so analyze_agent_transactions rejects
+            # any other value rather than mislabelling the combined result.
             try:
                 agent_data = await self.transaction_processor.analyze_agent_transactions(
-                    client, alert_context.team_id, period, "MEAN"
+                    client, alert_context.team_id, period, "TOTAL"
                 )
                 transaction_analysis["agent_metrics"] = {
                     "transaction_data": agent_data,

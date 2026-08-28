@@ -27,7 +27,7 @@ from ..common.error_handling import (
 )
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.update_configs import UpdateConfigFactory
-from ..common.validation import SAFE_INT_MAX
+from ..common.validation import SAFE_INT_MAX, apply_filter_allowlist
 from ..config_store import get_config_value
 from ..exceptions import ValidationError
 from ..hierarchy import (
@@ -44,6 +44,18 @@ from ..introspection.metadata import (
     UsagePattern,
 )
 from .unified_tool_base import ToolBase
+
+
+# snake_case filter name -> camelCase query parameter, bounded to what the
+# endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
+# SubscriptionController.list: @RequestParam query / teamId / type plus a
+# Pageable (page, size, sort). teamId and page/size are set by the client, so
+# what remains is the caller-settable set.
+_SUBSCRIPTION_FILTER_MAP: Dict[str, str] = {
+    "query": "query",
+    "type": "type",
+    "sort": "sort",
+}
 
 
 # Upper bound on the page parameter. Without this, page=2147483647 (32-bit
@@ -354,7 +366,9 @@ class SubscriptionManager:
         """List subscriptions with pagination."""
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = arguments.get("filters", {})
+        filters = apply_filter_allowlist(
+            arguments.get("filters"), _SUBSCRIPTION_FILTER_MAP, action="list_subscriptions"
+        )
         _validate_subscriptions_pagination(page, size)
 
         response = await self.client.get_subscriptions(page=page, size=size, **filters)
@@ -1753,7 +1767,9 @@ class SubscriptionAnalytics:
         """Get subscription metrics and analytics."""
         page = arguments.get("page", 0)
         size = arguments.get("size", 100)  # Get more for analysis
-        filters = arguments.get("filters", {})
+        filters = apply_filter_allowlist(
+            arguments.get("filters"), _SUBSCRIPTION_FILTER_MAP, action="get_metrics"
+        )
         _validate_subscriptions_pagination(page, size)
 
         response = await self.client.get_subscriptions(page=page, size=size, **filters)
@@ -3003,7 +3019,7 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
             {
                 "title": "List Active Subscriptions",
                 "description": "View all active subscriptions with pagination",
-                "example": "list(filters={'status': 'active'}, page=0, size=10)",
+                "example": "list(filters={'query': 'enterprise'}, page=0, size=10)",
             },
             {
                 "title": "Update Subscription Details",
@@ -3018,7 +3034,7 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
             {
                 "title": "Subscription Analytics",
                 "description": "Analyze subscription metrics and performance",
-                "example": "get_metrics(filters={'status': 'active'})",
+                "example": "get_metrics(filters={'query': 'enterprise'})",
             },
         ]
 
@@ -3078,7 +3094,7 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
                 description="Subscription metrics and performance analysis",
                 parameters={"get_metrics": {"filters": "dict", "date_range": "dict"}},
                 examples=[
-                    "get_metrics(filters={'status': 'active'})",
+                    "get_metrics(filters={'query': 'enterprise'})",
                     "get_metrics(date_range={'start': '2024-01-01', 'end': '2024-12-31'})",
                 ],
             ),
@@ -3214,7 +3230,7 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
                 description="Explore existing subscriptions and their status",
                 frequency=0.9,
                 typical_sequence=["list", "get"],
-                common_parameters={"page": 0, "size": 20, "filters": {"status": "active"}},
+                common_parameters={"page": 0, "size": 20, "filters": {"query": "enterprise"}},
                 success_indicators=[
                     "Subscriptions listed successfully",
                     "Subscription details retrieved",
@@ -3241,7 +3257,7 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
                 description="Analyze subscription metrics and performance",
                 frequency=0.6,
                 typical_sequence=["get_metrics", "list"],
-                common_parameters={"filters": {"status": "active"}},
+                common_parameters={"filters": {"query": "enterprise"}},
                 success_indicators=["Metrics retrieved successfully", "Analytics data available"],
             ),
         ]

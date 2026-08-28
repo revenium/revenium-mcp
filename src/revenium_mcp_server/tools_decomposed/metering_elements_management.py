@@ -23,7 +23,7 @@ from ..common.error_handling import (
 )
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.update_configs import UpdateConfigFactory
-from ..common.validation import validate_pagination_params
+from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..introspection.metadata import (
     DependencyType,
     ToolCapability,
@@ -31,6 +31,19 @@ from ..introspection.metadata import (
     ToolType,
 )
 from .unified_tool_base import ToolBase
+
+# snake_case filter name -> camelCase query parameter, bounded to what the
+# endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
+# MeteringElementDefinitionController.find: @RequestParam teamId / type /
+# sourceIds plus a Pageable (page, size, sort). teamId and page/size are set by
+# the client. Notably absent: `name` — the endpoint has no name filter, so a
+# name passed to list was being discarded upstream and the caller got an
+# unfiltered list back.
+_METERING_ELEMENT_FILTER_MAP: Dict[str, str] = {
+    "type": "type",
+    "source_ids": "sourceIds",
+    "sort": "sort",
+}
 
 # Module-level — must stay in sync with the canonical Revenium element-type set.
 _ELEMENT_TYPE_DESCRIPTIONS = {
@@ -79,10 +92,25 @@ class MeteringElementsManager:
         arguments = validate_pagination_params(arguments, action="list metering elements")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = arguments.get("filters", {}).copy()
-        name = arguments.get("name")
-        if name is not None and "name" not in filters:
-            filters["name"] = name
+        filters = apply_filter_allowlist(
+            arguments.get("filters"), _METERING_ELEMENT_FILTER_MAP, action="list"
+        )
+        if arguments.get("name") is not None:
+            raise create_structured_validation_error(
+                message=(
+                    "Metering element definitions cannot be filtered by name — the "
+                    "endpoint has no name parameter, so passing one returns every "
+                    "element rather than the one you asked for."
+                ),
+                field="name",
+                value=arguments.get("name"),
+                suggestions=[
+                    "Narrow the list with filters={'type': 'NUMBER'} or "
+                    "filters={'source_ids': 'src_123'}",
+                    "Fetch a known element directly with get(element_id='elem_123')",
+                    "List without a name filter and match the name in the results",
+                ],
+            )
 
         response = await client.get_metering_element_definitions(page=page, size=size, **filters)
 

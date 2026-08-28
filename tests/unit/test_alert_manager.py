@@ -421,33 +421,36 @@ class TestCalculateDuration:
 
 
 class TestParseNaturalLanguageQuery:
-    def test_severity_critical(self, manager):
-        filters = manager._parse_natural_language_query("show critical alerts")
-        assert filters.get("severity") == "critical"
+    """BACK-2783: only names GET /sources/ai/alert declares may be produced.
 
-    def test_severity_high(self, manager):
-        filters = manager._parse_natural_language_query("high severity alerts")
-        assert filters.get("severity") == "high"
+    The endpoint has no severity and no status parameter, so the words that
+    used to become `severity=`/`status=` query params must not reach the API —
+    they never filtered anything, they just made an unfiltered list look
+    filtered.
+    """
 
-    def test_severity_medium(self, manager):
-        filters = manager._parse_natural_language_query("medium priority alerts")
-        assert filters.get("severity") == "medium"
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "show critical alerts",
+            "high severity alerts",
+            "medium priority alerts",
+            "low alerts",
+            "open alerts",
+            "acknowledged alerts",
+            "investigating alerts",
+        ],
+    )
+    def test_no_undeclared_keys(self, manager, query):
+        filters = manager._parse_natural_language_query(query)
+        assert "severity" not in filters
+        assert "status" not in filters
+        assert set(filters) <= {"start", "end"}
 
-    def test_severity_low(self, manager):
-        filters = manager._parse_natural_language_query("low alerts")
-        assert filters.get("severity") == "low"
-
-    def test_status_open(self, manager):
-        filters = manager._parse_natural_language_query("open alerts")
-        assert filters.get("status") == "open"
-
-    def test_status_acknowledged(self, manager):
-        filters = manager._parse_natural_language_query("acknowledged alerts")
-        assert filters.get("status") == "acknowledged"
-
-    def test_status_investigating(self, manager):
-        filters = manager._parse_natural_language_query("investigating alerts")
-        assert filters.get("status") == "investigating"
+    def test_date_range_still_parsed(self, manager):
+        filters = manager._parse_natural_language_query("critical alerts in the last 24 hours")
+        assert filters.get("start")
+        assert filters.get("end")
 
     def test_empty_query(self, manager):
         filters = manager._parse_natural_language_query("")
@@ -561,11 +564,14 @@ class TestListAlerts:
         client._extract_embedded_data = MagicMock(return_value=[])
         client._extract_pagination_info = MagicMock(return_value={})
 
-        await manager.list_alerts(client, filters={"custom": "val"}, query="critical alerts")
-        # Should not crash; the merged filters are passed to get_alerts
+        await manager.list_alerts(client, filters={"resolved": False}, query="last 24 hours")
+        # The caller's filters survive, and the NL parse contributes only the
+        # date range the endpoint declares (BACK-2783).
         call_kwargs = client.get_alerts.call_args[1]
-        assert call_kwargs.get("severity") == "critical"
-        assert call_kwargs.get("custom") == "val"
+        assert call_kwargs.get("resolved") is False
+        assert call_kwargs.get("start")
+        assert call_kwargs.get("end")
+        assert "severity" not in call_kwargs
 
 
 class TestGetAlert:

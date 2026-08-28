@@ -36,7 +36,7 @@ from ..common.error_handling import (
     format_structured_error,
 )
 from ..common.pagination_performance import validate_pagination_with_performance
-from ..common.validation import validate_pagination_params
+from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..common.ucm_config import log_ucm_status
 from ..exceptions import ValidationError
 from ..introspection.metadata import (
@@ -51,6 +51,33 @@ from ..mixins.slack_prompting_mixin import SlackPromptingMixin
 from ..models import AlertType, MetricType, OperatorType
 from ..schema.alert_schema import get_alert_metrics_capabilities
 from .unified_tool_base import ToolBase
+
+
+# snake_case filter name -> camelCase query parameter, bounded to what the
+# endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
+# AIAlertController.find: @RequestParam teamId / type / start / end /
+# anomalyId / ownerId / resolved plus a Pageable (page, size, sort). teamId and
+# page/size are set by the client. There is no `severity` and no `status` on
+# this endpoint — both were being sent by the natural-language path and
+# discarded upstream.
+_ALERT_FILTER_MAP: Dict[str, str] = {
+    "type": "type",
+    "start": "start",
+    "end": "end",
+    "anomaly_id": "anomalyId",
+    "owner_id": "ownerId",
+    "resolved": "resolved",
+    "sort": "sort",
+}
+
+# Verified 2026-08-28 against hypercurrent origin/develop
+# AIAnomalyController.list: @RequestParam query / teamId / type plus a Pageable
+# (page, size, sort). teamId and page/size are set by the client.
+_ANOMALY_FILTER_MAP: Dict[str, str] = {
+    "query": "query",
+    "type": "type",
+    "sort": "sort",
+}
 
 
 # Module-level — must stay in sync with AlertType enum members.
@@ -303,15 +330,21 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                 parameters={
                     "resource_type": "str (alerts)",
                     "query": "str (natural language)",
-                    "filters": "dict (date ranges, severity)",
+                    "filters": (
+                        "dict - accepted keys: type, start, end, anomaly_id, "
+                        "owner_id, resolved, sort (the endpoint declares no "
+                        "severity or status filter)"
+                    ),
                 },
                 examples=[
                     "query(resource_type='alerts', query='show high cost alerts from last week')",
-                    "list(resource_type='alerts', filters={'severity': 'HIGH'})",
+                    "list(resource_type='alerts', filters={'resolved': False})",
                 ],
                 limitations=[
                     "Natural language parsing is best-effort",
                     "Complex queries may need manual filters",
+                    "Severity is not a filter the alerts endpoint declares - "
+                    "narrow by type or date instead",
                 ],
             ),
             ToolCapability(
@@ -617,7 +650,9 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                 # Extract and validate pagination parameters with performance guidance
                 page = arguments.get("page", 0)
                 size = arguments.get("size", 20)
-                filters = arguments.get("filters", {})
+                filters = apply_filter_allowlist(
+                    arguments.get("filters"), _ALERT_FILTER_MAP, action="list alerts"
+                )
                 query = arguments.get("query")
 
                 # Validate pagination with performance guidance
@@ -1034,7 +1069,9 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
             arguments = validate_pagination_params(arguments, action="list_anomalies")
             page = arguments.get("page", 0)
             size = arguments.get("size", 20)
-            filters = arguments.get("filters", {})
+            filters = apply_filter_allowlist(
+                arguments.get("filters"), _ANOMALY_FILTER_MAP, action="list anomalies"
+            )
 
             # Validate pagination with performance guidance
             validate_pagination_with_performance(page, size, "Alert Management")
@@ -1218,7 +1255,9 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
             return await self.anomaly_manager.get_anomaly_metrics(client, anomaly_id)
 
         elif action == "query":
-            filters = arguments.get("filters", {})
+            filters = apply_filter_allowlist(
+                arguments.get("filters"), _ANOMALY_FILTER_MAP, action="query anomalies"
+            )
             # Use list with filters for query functionality
             return await self.anomaly_manager.list_anomalies(client, 0, 20, filters)
 
@@ -1333,7 +1372,9 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
 
         elif action == "query":
             query = arguments.get("query")
-            filters = arguments.get("filters", {})
+            filters = apply_filter_allowlist(
+                arguments.get("filters"), _ALERT_FILTER_MAP, action="query alerts"
+            )
             # Use list with query parameter for natural language search
             return await self.alert_manager.list_alerts(client, 0, 20, filters, query)
 
@@ -4135,7 +4176,13 @@ create(resource_type="anomalies", anomaly_data={
         """Map the tool-level ``include_trend``/``now`` args to API query params.
 
         Only forwards params the caller actually supplied so the controller
-        applies its own defaults for the rest.
+        applies its own defaults for the rest. Already bounded: the two names
+        are built here rather than splatted from a caller dict. Verified
+        2026-08-28 against hypercurrent origin/develop
+        AIAnomalyProgressController.getBudgetPortfolio / .getBudgetProgress /
+        .getBudgetProgressBulk — all three declare exactly @RequestParam now and
+        includeTrend (plus ids on the bulk endpoint and a Pageable on the
+        portfolio one).
         """
         filters: Dict[str, Any] = {}
         if "include_trend" in arguments and arguments["include_trend"] is not None:

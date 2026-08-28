@@ -1,6 +1,7 @@
 src/revenium_mcp_server/
 tests/
 scripts/
+.github/workflows/secret-scan.yml
 pyproject.toml
 .env.example
 .gitignore
@@ -23,5 +24,7 @@ DEVELOPMENT.md
 public-allowlist-mcp.txt
 !scripts/check-arch-doc-paths.sh
 !scripts/check-architecture-docs.sh
+!tests/unit/test_public_export_allowlist.py
 !.claude/commands/mcp-api-drift-local.md
+!.claude/commands/mcp-api-exclusions.yaml
 uv.lock

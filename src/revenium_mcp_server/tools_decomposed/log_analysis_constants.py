@@ -39,6 +39,8 @@ CAPABILITIES_TEXT = """
 5b. **set_strict_ingestion_mode** - ✅ **AVAILABLE**
    - Toggle the tenant's strict ingestion mode (requires confirm=true)
    - Strict mode rejects transactions referencing unknown entities instead of auto-creating them
+   - Optional allow_ticket_jobs keeps ticket-grain Job creation on while strict mode is enabled
+     (omit it to leave the tenant's current setting unchanged; disabling strict mode clears it)
 
 6. **get_capabilities** - ✅ **AVAILABLE**
    - Shows current implementation status
@@ -139,10 +141,11 @@ EXAMPLES_TEXT = """
 {
   "action": "set_strict_ingestion_mode",
   "enabled": true,
+  "allow_ticket_jobs": true,
   "confirm": true
 }
 ```
-**Purpose**: Toggle strict ingestion mode for the tenant. Without confirm=true the call returns a consequences preview and changes nothing.
+**Purpose**: Toggle strict ingestion mode for the tenant. Without confirm=true the call returns a consequences preview and changes nothing. allow_ticket_jobs is optional: it keeps the coding-assistant enricher creating ticket-grain Jobs under strict mode (platform default is off), omitting it leaves the tenant's current setting unchanged, and it cannot be true while enabled is false. Disabling strict mode clears the opt-in server-side, so it must be re-stated the next time strict mode is enabled.
 
 ### get_recent_logs
 ```json
@@ -263,7 +266,7 @@ UNSUPPORTED_ACTION_TEMPLATE = """
 - search_logs (advanced filtering)
 - analyze_operations (operation pattern analysis)
 - get_ingestion_failures (strict-ingestion rejections)
-- set_strict_ingestion_mode (guarded strict-mode toggle)
+- set_strict_ingestion_mode (guarded strict-mode toggle, optional allow_ticket_jobs opt-in)
 
 Use `get_capabilities()` for current status.
 """

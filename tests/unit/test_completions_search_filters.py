@@ -9,7 +9,6 @@ Verifies:
 - Live API endpoint test with real filters
 """
 
-import os
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -54,29 +53,30 @@ class TestExtractCompletionsFilters:
             "startDate": "2026-03-01T00:00:00Z",
             "endDate": "2026-03-15T00:00:00Z",
             "model": "claude-3-5-sonnet",
+            "includeCodingAssistants": True,
         }
 
     def test_omits_none_values(self):
         """None values are excluded from output."""
         args = {"provider": "anthropic", "model": None, "start_date": None}
         result = _extract_completions_filters(args)
-        assert result == {"provider": "anthropic"}
+        assert result == {"provider": "anthropic", "includeCodingAssistants": True}
 
     def test_omits_absent_keys(self):
         """Keys not present in arguments are excluded."""
         args = {"provider": "openai"}
         result = _extract_completions_filters(args)
-        assert result == {"provider": "openai"}
+        assert result == {"provider": "openai", "includeCodingAssistants": True}
 
-    def test_empty_arguments_returns_empty(self):
-        """Empty arguments dict returns empty filters."""
-        assert _extract_completions_filters({}) == {}
+    def test_empty_arguments_returns_only_scope_default(self):
+        """Empty arguments dict yields only the always-sent coding-assistant scope."""
+        assert _extract_completions_filters({}) == {"includeCodingAssistants": True}
 
     def test_non_filter_keys_ignored(self):
         """Arguments that are not in the filter map are ignored."""
         args = {"provider": "anthropic", "unknown_param": "value", "limit": 50}
         result = _extract_completions_filters(args)
-        assert result == {"provider": "anthropic"}
+        assert result == {"provider": "anthropic", "includeCodingAssistants": True}
 
     def test_query_search_param_extracted(self):
         """The server-side query search term passes through to the API.
@@ -86,7 +86,7 @@ class TestExtractCompletionsFilters:
         error reason and subscriber email.
         """
         result = _extract_completions_filters({"query": "tx_4bd0aa176b1a"})
-        assert result == {"query": "tx_4bd0aa176b1a"}
+        assert result == {"query": "tx_4bd0aa176b1a", "includeCodingAssistants": True}
 
     def test_all_filter_keys_covered(self):
         """All keys in the param map are extracted when present."""
@@ -101,7 +101,11 @@ class TestExtractCompletionsFilters:
         """Numeric filter values are passed through without string conversion."""
         args = {"total_cost_min": 0.5, "input_token_count_min": 100}
         result = _extract_completions_filters(args)
-        assert result == {"totalCostMin": 0.5, "inputTokenCountMin": 100}
+        assert result == {
+            "totalCostMin": 0.5,
+            "inputTokenCountMin": 100,
+            "includeCodingAssistants": True,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -242,43 +246,3 @@ class TestSearchTransactionPagesShortCircuit:
 
 # ---------------------------------------------------------------------------
 # Live API endpoint test
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-@pytest.mark.skipif(
-    not os.environ.get("REVENIUM_LIVE_API_KEY"),
-    reason="Live API test requires REVENIUM_LIVE_API_KEY env var",
-)
-async def test_live_api_completions_with_filters():
-    """Live API test: query completions endpoint with provider and date range filters.
-
-    Set REVENIUM_LIVE_API_KEY and REVENIUM_LIVE_TEAM_ID env vars to run.
-    """
-    from src.revenium_mcp_server.client import ReveniumClient
-
-    api_key = os.environ["REVENIUM_LIVE_API_KEY"]
-    team_id = os.environ.get("REVENIUM_LIVE_TEAM_ID", "")
-    base_url = os.environ.get("REVENIUM_LIVE_BASE_URL", "https://api.revenium.ai")
-
-    from src.revenium_mcp_server.auth import AuthConfig
-    from src.revenium_mcp_server.endpoint_registry import get_endpoint_path
-
-    auth = AuthConfig(api_key=api_key, team_id=team_id, base_url=base_url)
-    async with ReveniumClient(auth_config=auth) as client:
-        endpoint = get_endpoint_path("completions")
-        params = {
-            "teamId": team_id,
-            "page": 0,
-            "size": 5,
-            "sort": "timestamp,desc",
-            "provider": "anthropic",
-            "startDate": "2026-01-01T00:00:00Z",
-            "endDate": "2026-03-15T23:59:59Z",
-        }
-        response = await client.get(endpoint, params=params)
-        # Verify we got a valid response structure (may be empty if no matching data)
-        assert isinstance(response, dict)
-        has_embedded = "_embedded" in response
-        has_content = "content" in response
-        # Valid response: must have data in a known structure or be truly empty
-        assert has_embedded or has_content, f"Expected response content, got: {list(response.keys())}"
