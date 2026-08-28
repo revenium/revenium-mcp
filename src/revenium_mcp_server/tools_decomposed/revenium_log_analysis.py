@@ -428,6 +428,10 @@ No log entries found for analysis. This may be expected for integration logs.
 
         try:
             client = await self.get_client(ctx=ctx)
+            # Built here rather than splatted from a caller dict, so there is
+            # no allowlist to apply. Verified 2026-08-28 against hypercurrent
+            # origin/develop TenantController.listIngestionFailures, whose only
+            # declared query parameter is errorCode (plus a Pageable).
             filters = {"errorCode": error_code} if error_code else {}
             response = await client.get_ingestion_failures(page=page, size=size, **filters)
             failures = client._extract_embedded_data(response)
@@ -517,6 +521,11 @@ No log entries found for analysis. This may be expected for integration logs.
         Strict mode changes ingestion behavior for the whole tenant, so the
         toggle requires an explicit confirm=true; without it the handler
         returns a preview of the consequences and makes no API call.
+
+        The optional allow_ticket_jobs sub-flag decides whether the
+        coding-assistant enricher keeps creating ticket-grain Jobs while
+        strict mode is on. Omitting it leaves the tenant's current setting
+        untouched.
         """
         enabled = arguments.get("enabled")
         if not isinstance(enabled, bool):
@@ -531,19 +540,81 @@ No log entries found for analysis. This may be expected for integration logs.
                 ],
             )
 
+        allow_ticket_jobs = arguments.get("allow_ticket_jobs")
+        if allow_ticket_jobs is not None and not isinstance(allow_ticket_jobs, bool):
+            raise ToolError(
+                message="set_strict_ingestion_mode requires 'allow_ticket_jobs' to be a boolean when provided",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="allow_ticket_jobs",
+                value=allow_ticket_jobs,
+                suggestions=[
+                    "Pass allow_ticket_jobs=true to keep ticket-grain Job creation on under strict mode",
+                    "Omit allow_ticket_jobs to leave the tenant's current setting unchanged",
+                ],
+            )
+
+        # The API refuses exactly this pair: the sub-flag has no meaning while
+        # strict ingestion is off. allow_ticket_jobs=false with enabled=false
+        # is a legal call and must pass through.
+        if allow_ticket_jobs is True and enabled is False:
+            raise ToolError(
+                message="allow_ticket_jobs=true requires strict ingestion mode to be enabled",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="allow_ticket_jobs",
+                value=allow_ticket_jobs,
+                suggestions=[
+                    "Pass enabled=true with allow_ticket_jobs=true to keep ticket-grain Jobs under strict mode",
+                    "Omit allow_ticket_jobs when disabling strict mode — the server clears the opt-in anyway",
+                ],
+            )
+
         # Only the boolean True applies the change — loosely typed MCP
         # arguments (confirm="false", confirm=1) must not bypass the guard.
         if arguments.get("confirm") is not True:
             state = "ENABLE" if enabled else "DISABLE"
+            # The ticket-jobs consequence depends on the opt-in actually being
+            # sent: claiming Jobs "STOP" when the caller passes
+            # allow_ticket_jobs=true (or when omission leaves an existing tenant
+            # opt-in untouched) would make the confirmation preview lie.
+            if allow_ticket_jobs is True:
+                ticket_jobs_effect = (
+                    "Ticket-grain Jobs from the coding-assistant enricher KEEP being "
+                    "created: this call opts the tenant in with "
+                    "allow_ticket_jobs=true."
+                )
+            elif allow_ticket_jobs is None:
+                ticket_jobs_effect = (
+                    "Ticket-grain Jobs follow the tenant's EXISTING opt-in, which "
+                    "this call leaves unchanged (allow_ticket_jobs omitted): if the "
+                    "tenant has never opted in (the platform default), they stop "
+                    "being created; if a previous enable opted in, they continue. "
+                    "Pass allow_ticket_jobs=true to opt in explicitly."
+                )
+            else:
+                ticket_jobs_effect = (
+                    "Ticket-grain Jobs from the coding-assistant enricher STOP being "
+                    "created for this tenant (allow_ticket_jobs=false). To keep "
+                    "them, opt in with allow_ticket_jobs=true."
+                )
             effect = (
                 "AI ingestion will REJECT transactions that reference entities "
                 "(Product, Subscriber, Credential, Consuming Organization) which do "
                 "not already exist for the tenant, instead of auto-creating them. "
-                "Rejections are listed by get_ingestion_failures."
+                "Rejections are listed by get_ingestion_failures.\n\n"
+                + ticket_jobs_effect
                 if enabled
                 else "AI ingestion will resume AUTO-CREATING unknown referenced "
                 "entities (Product, Subscriber, Credential, Consuming Organization) "
-                "instead of rejecting those transactions."
+                "instead of rejecting those transactions.\n\n"
+                "Any existing ticket-grain Jobs opt-in is CLEARED by the server when "
+                "strict mode goes off (allow_ticket_jobs is forced back to false). "
+                "It is not remembered: you must re-state allow_ticket_jobs=true the "
+                "next time you re-enable strict mode."
+            )
+            opt_in_arg = (
+                f", allow_ticket_jobs={str(allow_ticket_jobs).lower()}"
+                if allow_ticket_jobs is not None
+                else ""
             )
             return [
                 TextContent(
@@ -552,15 +623,18 @@ No log entries found for analysis. This may be expected for integration logs.
                         f"**Confirmation Required — {state} strict ingestion mode**\n\n"
                         f"This changes ingestion behavior for the entire tenant:\n\n{effect}\n\n"
                         f"To apply, repeat the call with confirm=true:\n"
-                        f'`set_strict_ingestion_mode(enabled={str(enabled).lower()}, confirm=true)`'
+                        f'`set_strict_ingestion_mode(enabled={str(enabled).lower()}{opt_in_arg}, confirm=true)`'
                     ),
                 )
             ]
 
         try:
             client = await self.get_client(ctx=ctx)
-            result = await client.set_strict_ingestion_mode(enabled)
+            result = await client.set_strict_ingestion_mode(
+                enabled, allow_ticket_jobs=allow_ticket_jobs
+            )
             new_state = result.get("strictIngestionMode")
+            new_allow_ticket_jobs = result.get("strictIngestionAllowTicketJobs")
             if not isinstance(new_state, bool):
                 # The PATCH succeeded but the response did not carry the
                 # field — report that honestly instead of echoing the
@@ -576,19 +650,31 @@ No log entries found for analysis. This may be expected for integration logs.
                         ),
                     )
                 ]
+            # Same honesty rule as strictIngestionMode: only report the
+            # ticket-jobs opt-in when the server actually echoed it back.
+            ticket_jobs_line = (
+                f"- **Ticket-grain Jobs**: "
+                f"{'allowed' if new_allow_ticket_jobs else 'suppressed'}\n"
+                if isinstance(new_allow_ticket_jobs, bool)
+                else ""
+            )
+            follow_up = (
+                "Transactions referencing unknown entities will now be "
+                "rejected — monitor them with get_ingestion_failures."
+                if new_state
+                else "Unknown referenced entities will now be auto-created again. "
+                "Any ticket-grain Jobs opt-in has been cleared; re-state "
+                "allow_ticket_jobs=true when you re-enable strict mode."
+            )
             return [
                 TextContent(
                     type="text",
                     text=(
                         f"**Strict Ingestion Mode Updated**\n\n"
                         f"- **State**: {'enabled' if new_state else 'disabled'}\n"
+                        f"{ticket_jobs_line}"
                         f"- **Tenant**: {result.get('id', 'current')}\n\n"
-                        + (
-                            "Transactions referencing unknown entities will now be "
-                            "rejected — monitor them with get_ingestion_failures."
-                            if new_state
-                            else "Unknown referenced entities will now be auto-created again."
-                        )
+                        + follow_up
                     ),
                 )
             ]

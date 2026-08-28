@@ -71,6 +71,8 @@ class CostAnalyticsProcessor:
                 "AZURE": "Azure",
                 "aws": "AWS",
                 "AWS": "AWS",
+                "foundry": "Foundry",
+                "FOUNDRY": "Foundry",
             }
 
             # Check for exact matches first

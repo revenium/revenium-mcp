@@ -79,9 +79,9 @@ class TestHandleList:
         """Pagination params are forwarded to alert_manager.list_alerts."""
         expected = [TextContent(type="text", text="ok")]
         alert_mgmt.alert_manager.list_alerts = AsyncMock(return_value=expected)
-        args = {"resource_type": "alerts", "page": 2, "size": 10, "filters": {"severity": "high"}, "query": "cost"}
+        args = {"resource_type": "alerts", "page": 2, "size": 10, "filters": {"resolved": False}, "query": "cost"}
         await alert_mgmt._handle_list(mock_client, args)
-        alert_mgmt.alert_manager.list_alerts.assert_called_once_with(mock_client, 2, 10, {"severity": "high"}, "cost")
+        alert_mgmt.alert_manager.list_alerts.assert_called_once_with(mock_client, 2, 10, {"resolved": False}, "cost")
 
     @pytest.mark.asyncio
     async def test_list_alerts_defaults_pagination(self, alert_mgmt, mock_client):

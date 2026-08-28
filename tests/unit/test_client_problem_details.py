@@ -673,3 +673,80 @@ async def test_submit_recommendation_feedback_includes_realized_savings_measured
     )
 
     assert captured["body"]["realizedSavingsMeasuredAt"] == "2026-05-01T00:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_trigger_recommendation_run_sends_org_unit_filter(monkeypatch):
+    """BACK-2757: the org-unit scope rides on the wire as a bare string.
+
+    filterOrgUnitId is single-valued, unlike the neighbouring filterAgent /
+    filterProductId arrays — wrapping it in a list would not match the
+    documented type and the backend would run unscoped.
+    """
+    from src.revenium_mcp_server.client import ReveniumClient
+
+    monkeypatch.setenv("REVENIUM_API_KEY", "hak_test_abcd1234")
+    monkeypatch.setenv("REVENIUM_BASE_URL", "https://example.invalid")
+    monkeypatch.setenv("REVENIUM_TEAM_ID", "team_1")
+
+    client = ReveniumClient()
+    captured = {}
+
+    async def fake_request(method, url, params=None, json=None, headers=None):
+        captured["body"] = json
+        resp = MagicMock()
+        resp.status_code = 202
+        resp.content = b'{"runId":"r1","status":"running"}'
+        resp.json = MagicMock(return_value={"runId": "r1", "status": "running"})
+        resp.is_success = True
+        resp.headers = {"content-type": "application/json"}
+        return resp
+
+    monkeypatch.setattr(client.client, "request", fake_request)
+
+    await client.trigger_recommendation_run(
+        period_start="2026-01-01T00:00:00Z",
+        period_end="2026-01-31T23:59:59Z",
+        filter_org_unit_id="173",
+        filter_include_descendants=False,
+    )
+
+    assert captured["body"]["filterOrgUnitId"] == "173"
+    assert captured["body"]["filterIncludeDescendants"] is False
+
+
+@pytest.mark.asyncio
+async def test_trigger_recommendation_run_defaults_include_descendants_true(monkeypatch):
+    """Both org-unit fields are always sent, with descendants included by default.
+
+    Defaulting filterIncludeDescendants to false would silently narrow every
+    org-unit-scoped run to the department's own rows, excluding its sub-units.
+    """
+    from src.revenium_mcp_server.client import ReveniumClient
+
+    monkeypatch.setenv("REVENIUM_API_KEY", "hak_test_abcd1234")
+    monkeypatch.setenv("REVENIUM_BASE_URL", "https://example.invalid")
+    monkeypatch.setenv("REVENIUM_TEAM_ID", "team_1")
+
+    client = ReveniumClient()
+    captured = {}
+
+    async def fake_request(method, url, params=None, json=None, headers=None):
+        captured["body"] = json
+        resp = MagicMock()
+        resp.status_code = 202
+        resp.content = b'{"runId":"r1","status":"running"}'
+        resp.json = MagicMock(return_value={"runId": "r1", "status": "running"})
+        resp.is_success = True
+        resp.headers = {"content-type": "application/json"}
+        return resp
+
+    monkeypatch.setattr(client.client, "request", fake_request)
+
+    await client.trigger_recommendation_run(
+        period_start="2026-01-01T00:00:00Z",
+        period_end="2026-01-02T00:00:00Z",
+    )
+
+    assert captured["body"]["filterOrgUnitId"] == ""
+    assert captured["body"]["filterIncludeDescendants"] is True

@@ -881,3 +881,93 @@ async def test_register_single_tool_dispatches_to_ai_insights_handler(monkeypatc
     from unittest.mock import MagicMock
     await registry._register_single_tool(MagicMock(), "manage_ai_insights")
     assert called.get("yes") is True
+
+
+@pytest.mark.asyncio
+async def test_trigger_run_forwards_org_unit_filter():
+    """BACK-2757: a department-scoped run reaches the client as the two org-unit kwargs."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    mock = AsyncMock(return_value={"runId": "r1", "status": "running"})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.trigger_recommendation_run",
+        new=mock,
+    ):
+        await tool.handle_action("trigger_run", {
+            "period_start": "2026-01-01T00:00:00Z",
+            "period_end":   "2026-01-31T23:59:59Z",
+            "filter_org_unit_id": "173",
+            "filter_include_descendants": False,
+        })
+
+    call_kwargs = mock.await_args.kwargs
+    assert call_kwargs["filter_org_unit_id"] == "173"
+    assert call_kwargs["filter_include_descendants"] is False
+
+
+@pytest.mark.asyncio
+async def test_trigger_run_org_unit_defaults_match_the_backend_contract():
+    """Omitting the org-unit filter runs tenant-wide, and descendants stay included."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    mock = AsyncMock(return_value={"runId": "r1", "status": "running"})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.trigger_recommendation_run",
+        new=mock,
+    ):
+        await tool.handle_action("trigger_run", {
+            "period_start": "2026-01-01T00:00:00Z",
+            "period_end":   "2026-01-31T23:59:59Z",
+        })
+
+    call_kwargs = mock.await_args.kwargs
+    assert call_kwargs["filter_org_unit_id"] == ""
+    assert call_kwargs["filter_include_descendants"] is True
+
+
+@pytest.mark.asyncio
+async def test_input_schema_declares_org_unit_filter_types():
+    """The schema must type filter_org_unit_id as a string, not an array.
+
+    Agents copy the neighbouring array-typed filters; an array here would be
+    rejected by the backend contract.
+    """
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    schema = await AIInsightsManagement()._get_input_schema()
+    props = schema["properties"]
+    assert props["filter_org_unit_id"]["type"] == "string"
+    assert props["filter_include_descendants"]["type"] == "boolean"
+
+
+@pytest.mark.asyncio
+async def test_input_schema_points_at_the_org_unit_lookup():
+    """The id is not guessable, so the schema names the tool that resolves it."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    schema = await AIInsightsManagement()._get_input_schema()
+    description = schema["properties"]["filter_org_unit_id"]["description"]
+    assert "list_org_units" in description
+
+
+@pytest.mark.asyncio
+async def test_get_examples_documents_the_org_unit_scoped_run():
+    """A department-scoped run is only discoverable if the examples show it."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    result = await AIInsightsManagement().handle_action("get_examples", {})
+    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    assert "filter_org_unit_id" in text
+    assert "list_org_units" in text

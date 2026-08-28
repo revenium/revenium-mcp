@@ -21,12 +21,46 @@ from ..common.error_handling import (
     create_structured_missing_parameter_error,
     create_structured_validation_error,
 )
-from ..common.validation import validate_pagination_params
+from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..introspection.metadata import (
     ToolCapability,
     ToolType,
 )
 from .unified_tool_base import ToolBase
+
+# snake_case filter name -> camelCase query parameter, bounded to what the
+# endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
+# ToolController.list: @RequestParam query / teamId / type plus a Pageable
+# (page, size, sort). teamId and page/size are set by the client. `query` and
+# `type` are declared but not yet applied server-side ("reserved for future
+# use" in the controller), so they are accepted here without being advertised
+# as working filters.
+_TOOL_FILTER_MAP: Dict[str, str] = {
+    "query": "query",
+    "type": "type",
+    "sort": "sort",
+}
+
+# Verified 2026-08-28 against hypercurrent origin/develop
+# ToolEventController.list ("/events"): @RequestParam query / teamId / type,
+# a Pageable (page, size, sort) and a ToolEventSearchRequest @ParameterObject
+# whose fields are the remaining names below
+# (model/repository/specification/ToolEventSearchRequest.kt).
+_TOOL_EVENT_FILTER_MAP: Dict[str, str] = {
+    "query": "query",
+    "type": "type",
+    "sort": "sort",
+    "start_date": "startDate",
+    "end_date": "endDate",
+    "tool_id": "toolId",
+    "tool_name": "toolName",
+    "tool_type": "toolType",
+    "operation": "operation",
+    "transaction_id": "transactionId",
+    "product_id": "productId",
+    "charge_min": "chargeMin",
+    "charge_max": "chargeMax",
+}
 
 
 class ToolManager:
@@ -41,9 +75,9 @@ class ToolManager:
         arguments = validate_pagination_params(arguments, action="list tools")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = arguments.get("filters", {})
-        # Strip reserved keys to prevent TypeError from duplicate keyword args
-        filters = {k: v for k, v in filters.items() if k not in ("page", "size")}
+        filters = apply_filter_allowlist(
+            arguments.get("filters"), _TOOL_FILTER_MAP, action="list"
+        )
         response = await self.client.list_tools(page=page, size=size, **filters)
         tools = self.client._extract_embedded_data(response)
         page_info = self.client._extract_pagination_info(response)
@@ -284,9 +318,9 @@ class ToolManager:
         arguments = validate_pagination_params(arguments, action="list tool events")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = arguments.get("filters", {})
-        # Strip reserved keys to prevent TypeError from duplicate keyword args
-        filters = {k: v for k, v in filters.items() if k not in ("page", "size")}
+        filters = apply_filter_allowlist(
+            arguments.get("filters"), _TOOL_EVENT_FILTER_MAP, action="list_events"
+        )
         return await self.client.list_tool_events(page=page, size=size, **filters)
 
     # Analytics-relevant params — only these are forwarded to analytics client methods.
@@ -649,7 +683,10 @@ class ToolManagement(ToolBase):
         "meter_event, list_events, record_event, get_events, "
         "get_cost_breakdown, get_cost_aggregated, get_top_tools, get_success_rate, get_latency, "
         "get_cost_by_agent, get_agent_breakdown, get_cost_by_provider, get_cost_by_provider_aggregated, "
-        "get_filter_options, get_pricing_help. Use get_capabilities for full action list."
+        "get_filter_options, get_pricing_help. "
+        "Usage events are read-only once logged: list_events and get_events read the log, "
+        "meter_event and record_event add to it, and no action edits or removes an entry. "
+        "Use get_capabilities for full action list."
     )
     business_category = "Core Business Management Tools"
     tool_type = ToolType.CRUD
@@ -756,6 +793,28 @@ class ToolManagement(ToolBase):
                         "costUsd": {"type": "number", "description": "Pre-calculated cost in USD (optional)"},
                         "agent": {"type": "string", "description": "Agent identifier (optional)"},
                         "transactionId": {"type": "string", "description": "Transaction ID for correlation (optional)"},
+                        # Declared for discoverability only: the payload stays a
+                        # pass-through and this path is synchronous, so a value the
+                        # server rejects (HTTP 400) reaches the calling agent as a
+                        # structured validation error carrying the server's message
+                        # (standardized_tool_execution formats ReveniumAPIError via
+                        # _format_api_validation_error rather than re-raising it).
+                        # No "pattern" keyword and no client-side check — gating
+                        # here would reject values the server accepts.
+                        "agenticJobId": {
+                            "type": "string",
+                            "description": (
+                                "Agentic job instance this tool call belongs to (optional). Use the "
+                                "same identifier reported on the job's AI completion events and read "
+                                "back through manage_jobs (get_job, get_job_roi), so the tool cost "
+                                "attributes to the job that incurred it. Server contract: "
+                                "^(?!types$|conversion-funnel$)[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$ — "
+                                "agenticJobId must start with an alphanumeric character and contain "
+                                "only alphanumeric, dot, underscore and dash characters; reserved "
+                                "words (types, conversion-funnel) are not allowed. Not validated "
+                                "here: a rejected value returns an HTTP 400 from the server."
+                            ),
+                        },
                     },
                 },
                 "event_type": {
@@ -804,7 +863,18 @@ class ToolManagement(ToolBase):
                 },
                 "filters": {
                     "type": "object",
-                    "description": "Additional filters for list and metering operations",
+                    "description": (
+                        "Filters for list operations. Only keys the target endpoint "
+                        "declares are accepted; anything else is rejected rather than "
+                        "silently ignored. list: "
+                        + ", ".join(sorted(_TOOL_FILTER_MAP))
+                        + " (note: the backend declares query and type on this "
+                        "endpoint but does not apply them yet - reserved for "
+                        "future use, so they will not narrow results today)"
+                        + ". list_events: "
+                        + ", ".join(sorted(_TOOL_EVENT_FILTER_MAP))
+                        + "."
+                    ),
                 },
                 "start_date": {
                     "type": "string",
@@ -921,9 +991,62 @@ class ToolManagement(ToolBase):
             ),
             ToolCapability(
                 name="Event Metering",
-                description="Record and query tool usage events for billing and analytics",
+                description=(
+                    "Record tool usage events through the metering ingest path so they become "
+                    "billable and analyzable. Recording only — reading the resulting log is the "
+                    "Tool Usage Events capability."
+                ),
                 parameters={
-                    "meter_event": {"event_data": "dict (toolId, durationMs, success, timestamp optional)"},
+                    "meter_event": {
+                        "event_data": (
+                            "dict (toolId, durationMs, success, timestamp optional; "
+                            "agenticJobId optional — links the cost to an agentic job)"
+                        )
+                    },
+                    "record_event": {
+                        "tool_id": "str",
+                        "event_data": (
+                            "dict (durationMs, success, timestamp optional; toolId is taken "
+                            "from tool_id; agenticJobId optional — links the cost to an "
+                            "agentic job)"
+                        ),
+                    },
+                },
+                examples=[
+                    "meter_event(event_data={'toolId': 'tool_123', 'durationMs': 1500, 'success': True})",
+                    "meter_event(event_data={'toolId': 'tool_123', 'durationMs': 1500, 'success': True, "
+                    "'agenticJobId': 'job-abc-123'})",
+                    "record_event(tool_id='tool_123', event_data={'durationMs': 150, 'success': True})",
+                    "record_event(tool_id='tool_123', event_data={'durationMs': 150, 'agenticJobId': 'job-abc-123'})",
+                ],
+                limitations=[
+                    "Events are append-only and cannot be modified after creation",
+                    "Timestamp defaults to server time if not provided",
+                    "Subscriber-credential attribution is not supported on meter_event — "
+                    "use manage_metering (e.g. submit_ai_transaction) when attribution to a "
+                    "specific subscriber credential is required",
+                    # Payoff caveat, stated so an agent does not promise a report that
+                    # does not exist yet: ingest carries the field onto the tool-event
+                    # record, but the ROI rollup of tool cost into jobs is still open
+                    # backend work (BACK-780, BACK-803, BACK-2552).
+                    "agenticJobId is optional and links a tool event to the agentic job that "
+                    "incurred it; omit it and the cost cannot be attributed to any job. The "
+                    "value is carried through ingest today, but the rollup of tool cost into "
+                    "job ROI and conversion-funnel reporting is still pending backend work — "
+                    "sending it is necessary but not yet sufficient for those reports",
+                    "agenticJobId is not validated client-side: a value the server rejects "
+                    "(leading non-alphanumeric character, or the reserved words types / "
+                    "conversion-funnel) comes back as an HTTP 400",
+                ],
+            ),
+            ToolCapability(
+                name="Tool Usage Events",
+                description=(
+                    "Read-only access to the tool usage event log — the metered tool and function "
+                    "calls that back the platform's tool usage view. Reads only: no action here "
+                    "creates, updates or deletes a logged usage event."
+                ),
+                parameters={
                     "list_events": {
                         "page": "int (optional)",
                         "size": "int (optional)",
@@ -933,18 +1056,28 @@ class ToolManagement(ToolBase):
                             "partial match across tool name, tool ID and resource/operation"
                         ),
                     },
+                    "get_events": {
+                        "tool_id": "str",
+                        "page": "int (optional)",
+                        "size": "int (optional)",
+                    },
                 },
                 examples=[
-                    "meter_event(event_data={'toolId': 'tool_123', 'durationMs': 1500, 'success': True})",
-                    "list_events(page=0, size=20, filters={'toolId': 'tool_123'})",
+                    "list_events(page=0, size=20)",
+                    "list_events(filters={'toolId': 'tool_123'})",
                     "list_events(filters={'query': 'vector-search'})",
+                    "get_events(tool_id='tool_123', page=0, size=20)",
                 ],
                 limitations=[
-                    "Events are append-only and cannot be modified after creation",
-                    "Timestamp defaults to server time if not provided",
-                    "Subscriber-credential attribution is not supported on meter_event — "
-                    "use manage_metering (e.g. submit_ai_transaction) when attribution to a "
-                    "specific subscriber credential is required",
+                    "Read-only by design — creating, updating or deleting a logged usage event is "
+                    "deliberately not exposed, so an agent cannot rewrite billing history. "
+                    "Recording new usage goes through the metering ingest actions instead "
+                    "(meter_event, record_event).",
+                    "There is no read of a single usage event by its own event ID: the upstream "
+                    "log offers the list read only. Narrow with list_events(filters={...}) or "
+                    "scope to one tool with get_events(tool_id='...').",
+                    "Results come back newest first and only exist once events have been metered; "
+                    "a tool with no metered calls returns an empty page.",
                 ],
             ),
             ToolCapability(
@@ -1034,6 +1167,11 @@ class ToolManagement(ToolBase):
             "create requires a pricing.elements array; use create_simple for a shortcut",
             "If delete returns success but the tool still appears, it was soft-deleted; use restore to recover",
             "Analytics return empty results when no events have been metered for the tool",
+            "Tool cost that does not attribute to an agentic job was metered without "
+            "agenticJobId in event_data; pass the same identifier the job reports on its "
+            "AI completion events (manage_jobs get_job / get_job_roi)",
+            "The usage event log is read-only: list_events / get_events read it, meter_event / "
+            "record_event add to it, and no action edits or removes a logged event",
             "Ensure tool_data includes 'name' and 'toolType' when using create",
             "replace is an alias for update; both perform partial updates via the upstream PUT endpoint",
         ]
@@ -1086,13 +1224,19 @@ class ToolManagement(ToolBase):
                                 "durationMs": 1500,
                                 "success": True,
                                 "timestamp": "2025-01-15T12:00:00Z",
+                                "agenticJobId": "job-abc-123",
                             },
                         },
                         "list_events": {"action": "list_events", "page": 0, "size": 20},
                         "record_event": {
                             "action": "record_event",
                             "tool_id": "tool_123",
-                            "event_data": {"type": "invocation", "durationMs": 150, "success": True},
+                            "event_data": {
+                                "type": "invocation",
+                                "durationMs": 150,
+                                "success": True,
+                                "agenticJobId": "job-abc-123",
+                            },
                         },
                         "get_events": {"action": "get_events", "tool_id": "tool_123", "page": 0, "size": 20},
                         "get_cost_breakdown": {"action": "get_cost_breakdown"},

@@ -226,14 +226,22 @@ class TestTrackOperationTime:
 
 
 class TestGetCacheKey:
-    """Verify deterministic cache key generation."""
+    """Verify deterministic cache key generation.
+
+    The key is a hash of the validated argument set, so these assert the
+    contract (same payload -> same key, differing validated field -> different
+    key) rather than a literal serialization format.
+    """
 
     def test_basic_key_generation(self):
         mgr = make_mgr()
         data = {"model": "gpt-4", "provider": "OPENAI", "input_tokens": 100}
         key = mgr._get_cache_key(data)
-        assert "model:gpt-4" in key
-        assert "input_tokens:100" in key
+        assert isinstance(key, str) and key
+        # Every validated field participates: changing any one of them moves
+        # the key, which is what stops a stale verdict being reused.
+        for field in ["model", "provider", "input_tokens"]:
+            assert mgr._get_cache_key({**data, field: "different"}) != key
 
     def test_deterministic_same_data(self):
         mgr = make_mgr()
@@ -246,29 +254,39 @@ class TestGetCacheKey:
         data2 = {"model": "gpt-3.5", "input_tokens": 100}
         assert mgr._get_cache_key(data1) != mgr._get_cache_key(data2)
 
-    def test_empty_data_returns_empty_key(self):
+    def test_empty_data_has_its_own_stable_key(self):
         mgr = make_mgr()
         key = mgr._get_cache_key({})
-        assert key == ""
+        assert key == mgr._get_cache_key({})
+        assert key != mgr._get_cache_key({"model": "gpt-4"})
 
-    def test_pipe_delimited(self):
+    def test_key_does_not_embed_raw_values(self):
+        """A bounded hash, not a concatenation: the key length stays fixed and
+        caller data (which can be personal) is not carried in cache keys."""
         mgr = make_mgr()
-        data = {"model": "gpt-4", "provider": "OPENAI"}
-        key = mgr._get_cache_key(data)
-        assert key == "model:gpt-4|provider:OPENAI"
+        short = mgr._get_cache_key({"model": "gpt-4"})
+        long = mgr._get_cache_key({"model": "gpt-4", "agent": "a" * 400})
+        assert len(short) == len(long)
+        assert "gpt-4" not in short
 
-    def test_only_known_fields_used(self):
+    def test_field_order_does_not_change_the_key(self):
         mgr = make_mgr()
-        data = {"model": "gpt-4", "extra_field": "ignored"}
-        key = mgr._get_cache_key(data)
-        assert "extra_field" not in key
-        assert "model:gpt-4" in key
+        assert mgr._get_cache_key({"model": "gpt-4", "provider": "OPENAI"}) == mgr._get_cache_key(
+            {"provider": "OPENAI", "model": "gpt-4"}
+        )
+
+    def test_only_validated_fields_used(self):
+        """A field the validator never reads cannot change the verdict, so it
+        must not fragment the cache either."""
+        mgr = make_mgr()
+        assert mgr._get_cache_key({"model": "gpt-4", "extra_field": "ignored"}) == mgr._get_cache_key(
+            {"model": "gpt-4"}
+        )
 
     def test_duration_ms_included(self):
         mgr = make_mgr()
-        data = {"duration_ms": 500}
-        key = mgr._get_cache_key(data)
-        assert key == "duration_ms:500"
+        assert mgr._get_cache_key({"duration_ms": 500}) != mgr._get_cache_key({"duration_ms": 501})
+        assert mgr._get_cache_key({"duration_ms": 500}) != mgr._get_cache_key({})
 
 
 # ===========================================================================

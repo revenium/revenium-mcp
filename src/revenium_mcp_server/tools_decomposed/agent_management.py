@@ -25,7 +25,7 @@ from ..common.error_handling import (
     ToolError,
     create_structured_missing_parameter_error,
 )
-from ..common.validation import validate_pagination_params
+from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..introspection.metadata import (
     ToolCapability,
     ToolType,
@@ -41,6 +41,26 @@ DEFAULT_DISCOVERY_PERIOD = "THIRTY_DAYS"
 # rendered inline; the rest are summarised as an overflow line so a squad
 # with hundreds of trace events cannot produce an unbounded payload.
 INLINE_LIST_CAP = 50
+
+# snake_case filter name -> camelCase query parameter, bounded to what the
+# endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
+# AgentController.list: @RequestParam query / teamId / type plus a Pageable
+# (page, size, sort). teamId and page/size are set by the client, so what
+# remains is the caller-settable set.
+_AGENT_FILTER_MAP: Dict[str, str] = {
+    "query": "query",
+    "type": "type",
+    "sort": "sort",
+}
+
+# The squad actions below build their query params from named arguments rather
+# than from a caller-supplied dict, so they need no allowlist — but the names
+# they build still have to exist upstream. Verified 2026-08-28 against
+# hypercurrent origin/develop SquadController: listSquads ("/entities") and
+# listExecutionsBySquad ("/entities/{squadId}/executions") declare teamId and
+# period; list ("(root)") additionally declares squadName and status;
+# getDetail ("/{squadId}") and getTimeline ("/{squadId}/timeline") declare
+# teamId and period only.
 
 
 def _format_cost(value: Any) -> str:
@@ -84,9 +104,9 @@ class AgentManager:
         arguments = validate_pagination_params(arguments, action="list agents")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = arguments.get("filters", {})
-        # Strip reserved keys to prevent TypeError from duplicate keyword args
-        filters = {k: v for k, v in filters.items() if k not in ("page", "size")}
+        filters = apply_filter_allowlist(
+            arguments.get("filters"), _AGENT_FILTER_MAP, action="list_agents"
+        )
         response = await self.client.get_agents(page=page, size=size, **filters)
         agents = self.client._extract_embedded_data(response)
         page_info = self.client._extract_pagination_info(response)
@@ -578,9 +598,11 @@ class AgentManagement(ToolBase):
                 "filters": {
                     "type": "object",
                     "description": (
-                        "Optional filters for list. Supports 'query' for server-side search: "
-                        "matches agents whose name contains the term, whose externalId equals "
-                        "it, or whose owning organization's name contains it (case-insensitive)."
+                        "Optional filters for list. Valid keys: query, sort, type. "
+                        "'query' is a server-side search: it matches agents whose name "
+                        "contains the term, whose externalId equals it, or whose owning "
+                        "organization's name contains it (case-insensitive). Any other "
+                        "key is rejected rather than silently ignored."
                     ),
                 },
             },

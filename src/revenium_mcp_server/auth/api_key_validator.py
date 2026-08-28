@@ -20,6 +20,10 @@ from ..client import get_shared_http_client
 DEFAULT_CACHE_TTL_SECONDS = 30
 _CACHE_MAXSIZE = 10_000
 _USERS_ME_PATH = "/profitstream/v2/api/users/me"
+# Single message for every "the platform does not accept this key" outcome, so
+# the 403 (live semantics) and 401 (defensive) branches are indistinguishable to
+# callers and never reflect the upstream body back to them.
+_INVALID_KEY_MESSAGE = "API key is invalid, revoked, or unknown"
 
 
 class ApiKeyValidationError(Exception):
@@ -27,7 +31,13 @@ class ApiKeyValidationError(Exception):
 
 
 class InvalidTokenError(ApiKeyValidationError):
-    """401 from /users/me: key unknown, revoked, or soft-deleted."""
+    """Key unknown, revoked, or soft-deleted.
+
+    Raised for a generic (non-suspended, non-expired, non-scope) 403 from
+    /users/me — the live platform's answer for every key it does not recognize —
+    and also for a 401, which is kept as a defensive branch in case the backend
+    ever moves to the conventional status.
+    """
 
 
 class KeySuspendedError(ApiKeyValidationError):
@@ -207,8 +217,12 @@ class ApiKeyValidator:
                     "Malformed /users/me response from platform"
                 ) from exc
         if status == 401:
+            # Defensive branch: the live platform rejects unrecognized keys with
+            # 403 (see below), never 401. Classifying 401 identically means the
+            # classification does not regress if the backend ever switches to
+            # the conventional status.
             logger.info("API-key validation 401 for key_fingerprint={}", fp)
-            raise InvalidTokenError("API key is invalid, revoked, or unknown")
+            raise InvalidTokenError(_INVALID_KEY_MESSAGE)
         if status == 403:
             body = resp.text.lower()
             # Cap the reflected body so an oversized or sensitive 403 payload
@@ -221,7 +235,13 @@ class ApiKeyValidator:
                 raise KeyExpiredError(detail)
             if "scope" in body:
                 raise InsufficientScopeError(detail)
-            raise ApiKeyValidationError(f"Forbidden: {detail}")
+            # Live-pinned semantics: the platform answers malformed,
+            # well-formed-but-unknown, metering-format and empty keys alike with
+            # a generic 403 "Forbidden" envelope. A 403 carrying none of the
+            # specific reasons above is therefore an unrecognized key, not a
+            # distinct authorization failure — classify it as such instead of
+            # surfacing the opaque upstream body.
+            raise InvalidTokenError(_INVALID_KEY_MESSAGE)
         logger.warning(
             "API-key validation unexpected status={} for key_fingerprint={}",
             status,

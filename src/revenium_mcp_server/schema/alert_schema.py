@@ -152,6 +152,12 @@ class AlertSchemaDiscovery(BaseSchemaDiscovery):
                 ],
                 "tracking_period": ["DAILY", "WEEKLY", "MONTHLY", "QUARTERLY"],
             },
+            # ORG_UNIT is deliberately absent and must stay absent. The
+            # dimension exists only on the cost-control surface (see
+            # ORG_UNIT_DIMENSION_SCOPE_NOTE in
+            # tools_decomposed/cost_controls_management.py); the anomaly API
+            # throws when an alert is given ORG_UNIT, which BACK-2760 closed as
+            # intended behaviour rather than a gap to fill here.
             "filter_dimensions": {
                 "ORGANIZATION": {
                     "description": "Filter by customer/business organization",

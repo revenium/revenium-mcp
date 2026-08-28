@@ -764,6 +764,32 @@ class TestTenantIngestionAPIMethods:
         assert client.patch.call_args.kwargs.get("data") == {"strictIngestionMode": True}
 
     @pytest.mark.asyncio
+    async def test_set_strict_ingestion_mode_omits_ticket_jobs_when_unset(self):
+        """Omission is the API's leave-unchanged signal — never send a default."""
+        client = self._client_with_tenant()
+        await client.set_strict_ingestion_mode(True)
+        assert "allowTicketJobs" not in client.patch.call_args.kwargs.get("data")
+
+    @pytest.mark.asyncio
+    async def test_set_strict_ingestion_mode_sends_ticket_jobs_opt_in(self):
+        client = self._client_with_tenant()
+        await client.set_strict_ingestion_mode(True, allow_ticket_jobs=True)
+        assert client.patch.call_args.kwargs.get("data") == {
+            "strictIngestionMode": True,
+            "allowTicketJobs": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_set_strict_ingestion_mode_sends_explicit_false_opt_in(self):
+        """An explicit false is a real value, not an omission."""
+        client = self._client_with_tenant()
+        await client.set_strict_ingestion_mode(False, allow_ticket_jobs=False)
+        assert client.patch.call_args.kwargs.get("data") == {
+            "strictIngestionMode": False,
+            "allowTicketJobs": False,
+        }
+
+    @pytest.mark.asyncio
     async def test_set_strict_ingestion_mode_requires_tenant_id(self):
         client = _make_client()
         client.patch = AsyncMock(return_value={})
@@ -1154,3 +1180,68 @@ class TestLookupByEmailAPIMethods:
     async def test_lookup_subscriber_by_email_returns_payload(self):
         result = await self.client.lookup_subscriber_by_email("bob@example.com")
         assert result["id"] == "x1"
+
+
+# ===========================================================================
+# API convenience methods — Tool usage event log (read-only surface)
+# ===========================================================================
+
+class TestToolEventLogAPIMethods:
+    """Both tool-event reads share one list endpoint, and nothing writes to it.
+
+    The upstream tool-event controller exposes a single callable operation: the
+    list read. Its per-event read-by-id is hidden from the published API
+    documents, gated by denyAll() and returns 501, and the create/update/delete
+    it inherits carry no request mapping -- so the client deliberately wraps the
+    list read only, and get_tool_events is that same read with a toolId filter
+    rather than a per-tool sub-resource.
+    """
+
+    TOOL_EVENTS_PATH = "/profitstream/v2/api/sources/metrics/tool/events"
+
+    def setup_method(self):
+        self.client = _make_client()
+        self.client.get = AsyncMock(return_value={})
+
+    @pytest.mark.asyncio
+    async def test_list_tool_events_path_pagination_and_team(self):
+        await self.client.list_tool_events(page=2, size=50)
+        assert self.client.get.call_args[0][0] == self.TOOL_EVENTS_PATH
+        params = self.client.get.call_args.kwargs.get("params")
+        assert params["page"] == 2
+        assert params["size"] == 50
+        assert params["teamId"] == "team_abc"
+
+    @pytest.mark.asyncio
+    async def test_list_tool_events_forwards_arbitrary_filters(self):
+        await self.client.list_tool_events(query="vector-search", toolId="tool_123")
+        params = self.client.get.call_args.kwargs.get("params")
+        assert params["query"] == "vector-search"
+        assert params["toolId"] == "tool_123"
+
+    @pytest.mark.asyncio
+    async def test_get_tool_events_uses_the_same_list_path(self):
+        await self.client.get_tool_events("tool_123")
+        assert self.client.get.call_args[0][0] == self.TOOL_EVENTS_PATH
+
+    @pytest.mark.asyncio
+    async def test_get_tool_events_pins_the_tool_id_filter(self):
+        await self.client.get_tool_events("tool_123", page=1, size=5)
+        params = self.client.get.call_args.kwargs.get("params")
+        assert params["toolId"] == "tool_123"
+        assert params["page"] == 1
+        assert params["size"] == 5
+        assert params["teamId"] == "team_abc"
+
+    def test_no_client_method_writes_or_reads_a_single_tool_event(self):
+        """Guard the declared exclusion: no wrapper for the deny-all verbs."""
+        for absent in (
+            "get_tool_event",
+            "create_tool_event",
+            "update_tool_event",
+            "delete_tool_event",
+        ):
+            assert not hasattr(self.client, absent), (
+                f"{absent} wraps an upstream operation that is not callable; "
+                "see .claude/commands/mcp-api-exclusions.yaml"
+            )

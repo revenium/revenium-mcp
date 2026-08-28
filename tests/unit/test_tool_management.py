@@ -1323,3 +1323,238 @@ class TestGetExamplesAction:
 
         tool = ToolManagement()
         assert "get_examples" in await tool._get_supported_actions()
+
+
+# ===========================================================================
+# Tool Usage Events read-only scope
+# ===========================================================================
+
+
+class TestToolUsageEventsReadOnlyScope:
+    """The usage event log is exposed read-only, and the capabilities say so.
+
+    The upstream tool-event controller offers exactly one callable operation --
+    the list read behind list_events / get_events. It also declares a per-event
+    read-by-id that is hidden from the published API documents, gated by
+    denyAll() and returns 501, and inherits create/update/delete that carry no
+    request mapping. None of those are adopted, so the tool must not imply a
+    write or a by-event-id read exists.
+    """
+
+    @staticmethod
+    def _capability(capabilities, name):
+        return next(c for c in capabilities if c.name == name)
+
+    @pytest.mark.asyncio
+    async def test_usage_events_capability_covers_exactly_the_two_reads(self, tool_mgmt):
+        capabilities = await tool_mgmt._get_tool_capabilities()
+        usage_events = self._capability(capabilities, "Tool Usage Events")
+        assert set(usage_events.parameters) == {"list_events", "get_events"}
+
+    @pytest.mark.asyncio
+    async def test_usage_events_capability_states_read_only_scope(self, tool_mgmt):
+        """Read-only is stated, and the excluded verbs are named explicitly."""
+        capabilities = await tool_mgmt._get_tool_capabilities()
+        usage_events = self._capability(capabilities, "Tool Usage Events")
+        joined = " ".join(usage_events.limitations).lower()
+        assert "read-only" in joined
+        for verb in ("creating", "updating", "deleting"):
+            assert verb in joined, f"read-only scope does not name {verb}"
+
+    @pytest.mark.asyncio
+    async def test_usage_events_capability_denies_a_by_event_id_read(self, tool_mgmt):
+        """No per-event read exists upstream, so callers are steered to the filters."""
+        capabilities = await tool_mgmt._get_tool_capabilities()
+        usage_events = self._capability(capabilities, "Tool Usage Events")
+        joined = " ".join(usage_events.limitations)
+        assert "event ID" in joined
+        assert "list_events" in joined
+        assert "get_events" in joined
+
+    @pytest.mark.asyncio
+    async def test_usage_events_capability_points_writes_at_the_ingest_actions(self, tool_mgmt):
+        capabilities = await tool_mgmt._get_tool_capabilities()
+        usage_events = self._capability(capabilities, "Tool Usage Events")
+        joined = " ".join(usage_events.limitations)
+        assert "meter_event" in joined
+        assert "record_event" in joined
+
+    @pytest.mark.asyncio
+    async def test_event_metering_capability_keeps_only_the_recording_actions(self, tool_mgmt):
+        """Recording and reading are separate capabilities so the split is legible."""
+        capabilities = await tool_mgmt._get_tool_capabilities()
+        metering = self._capability(capabilities, "Event Metering")
+        assert set(metering.parameters) == {"meter_event", "record_event"}
+
+    def test_tool_description_states_the_read_only_scope(self, tool_mgmt):
+        """tools/list is the only text some agents read before planning a call."""
+        assert "read-only once logged" in tool_mgmt.tool_description
+
+    @pytest.mark.asyncio
+    async def test_troubleshooting_tips_state_the_read_only_scope(self, tool_mgmt):
+        tips = " ".join(await tool_mgmt._get_troubleshooting_tips())
+        assert "read-only" in tips
+        assert "list_events" in tips
+
+    @pytest.mark.asyncio
+    async def test_read_only_scope_reaches_get_tool_metadata_output(self, tool_mgmt):
+        """An agent that asks for metadata sees the scope, not only a human reader."""
+        result = await tool_mgmt.handle_action("get_tool_metadata", {})
+        assert len(result) == 1
+        assert isinstance(result[0], TextContent)
+        assert "Tool Usage Events" in result[0].text
+        assert "Read-only by design" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_no_write_action_targets_the_usage_event_log(self, tool_mgmt):
+        """Guard against a later 'complete the CRUD set' change on this surface."""
+        actions = await tool_mgmt._get_supported_actions()
+        for forbidden in ("create_event", "update_event", "delete_event", "get_event"):
+            assert forbidden not in actions
+
+
+# ===========================================================================
+# BACK-2759: agenticJobId discoverability on the metering ingest actions
+# ===========================================================================
+
+
+AGENTIC_JOB_ID_PATTERN = r"^(?!types$|conversion-funnel$)[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$"
+AGENTIC_JOB_ID_MESSAGE = (
+    "agenticJobId must start with an alphanumeric character and contain only "
+    "alphanumeric, dot, underscore and dash characters; reserved words "
+    "(types, conversion-funnel) are not allowed"
+)
+
+
+class TestAgenticJobIdIsDiscoverable:
+    """The job link must be visible on the tool surface, not only in the API doc.
+
+    POST /meter/v2/tool/events accepts agenticJobId, which is what ties a tool
+    cost back to the agentic job that incurred it. The payload has always been
+    forwarded verbatim, so the gap was discoverability: an agent reading the
+    schema or get_capabilities had no way to learn the field exists.
+    """
+
+    @pytest.mark.asyncio
+    async def test_event_data_schema_declares_agentic_job_id(self, tool_mgmt):
+        schema = await tool_mgmt._get_input_schema()
+        properties = schema["properties"]["event_data"]["properties"]
+        assert "agenticJobId" in properties
+        assert properties["agenticJobId"]["type"] == "string"
+
+    @pytest.mark.asyncio
+    async def test_schema_states_the_exact_server_contract(self, tool_mgmt):
+        """The first character must be alphanumeric — a leading dash 400s."""
+        schema = await tool_mgmt._get_input_schema()
+        description = schema["properties"]["event_data"]["properties"]["agenticJobId"]["description"]
+        assert AGENTIC_JOB_ID_PATTERN in description
+        assert AGENTIC_JOB_ID_MESSAGE in description
+
+    @pytest.mark.asyncio
+    async def test_schema_points_at_the_job_side_of_the_same_identifier(self, tool_mgmt):
+        """Same value as the job's AI completion events, readable via manage_jobs."""
+        schema = await tool_mgmt._get_input_schema()
+        description = schema["properties"]["event_data"]["properties"]["agenticJobId"]["description"]
+        assert "AI completion events" in description
+        assert "manage_jobs" in description
+
+    @pytest.mark.asyncio
+    async def test_event_metering_capability_names_the_field_on_both_actions(self, tool_mgmt):
+        capabilities = await tool_mgmt._get_tool_capabilities()
+        metering = next(c for c in capabilities if c.name == "Event Metering")
+        assert "agenticJobId" in metering.parameters["meter_event"]["event_data"]
+        assert "agenticJobId" in metering.parameters["record_event"]["event_data"]
+
+    @pytest.mark.asyncio
+    async def test_event_metering_examples_show_the_job_link(self, tool_mgmt):
+        capabilities = await tool_mgmt._get_tool_capabilities()
+        metering = next(c for c in capabilities if c.name == "Event Metering")
+        assert any("agenticJobId" in example for example in metering.examples)
+
+    @pytest.mark.asyncio
+    async def test_get_capabilities_example_payload_carries_the_field(self, tool_mgmt):
+        """get_capabilities output is what an agent copies into its first call."""
+        result = await tool_mgmt.handle_action("get_capabilities", {})
+        assert "agenticJobId" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_rollup_caveat_is_stated_so_agents_do_not_over_promise(self, tool_mgmt):
+        """Ingest carries the field, but the ROI rollup is still open backend work."""
+        capabilities = await tool_mgmt._get_tool_capabilities()
+        metering = next(c for c in capabilities if c.name == "Event Metering")
+        joined = " ".join(metering.limitations)
+        assert "agenticJobId" in joined
+        assert "rollup" in joined.lower()
+
+
+class TestAgenticJobIdIsNotGatedClientSide:
+    """The MCP deliberately adds no client-side validation of agenticJobId.
+
+    Unlike the fire-and-forget SDK dispatch, this path is synchronous: a server
+    400 comes back to the agent as a structured error response, which is the
+    correct surface. Guards against a later "improvement" that adds a regex,
+    reserved-word or length check and starts rejecting values the server accepts.
+    """
+
+    @pytest.mark.asyncio
+    async def test_meter_event_forwards_the_payload_verbatim(self, tool_manager, mock_client):
+        event_data = {"toolId": "tool_123", "durationMs": 10, "agenticJobId": "job-abc.1"}
+        await tool_manager.meter_event({"event_data": event_data})
+        mock_client.meter_tool_event.assert_called_once_with(event_data)
+
+    @pytest.mark.asyncio
+    async def test_meter_event_does_not_reject_a_server_invalid_value(self, tool_manager, mock_client):
+        """A leading dash and a reserved word both 400 upstream — not here."""
+        for value in ("-leading-dash", "types", "conversion-funnel"):
+            mock_client.meter_tool_event.reset_mock()
+            event_data = {"toolId": "tool_123", "agenticJobId": value}
+            await tool_manager.meter_event({"event_data": event_data})
+            mock_client.meter_tool_event.assert_called_once_with(event_data)
+
+    @pytest.mark.asyncio
+    async def test_record_event_preserves_the_job_link(self, tool_manager, mock_client):
+        event_data = {"durationMs": 150, "agenticJobId": "job_123"}
+        await tool_manager.record_event({"tool_id": "tool_123", "event_data": event_data})
+        mock_client.record_tool_event.assert_called_once_with("tool_123", event_data)
+
+    @pytest.mark.asyncio
+    async def test_server_rejection_reaches_the_agent(self, tool_manager, mock_client):
+        """The 400 is the validation surface, so it must not be swallowed."""
+        mock_client.meter_tool_event.side_effect = ReveniumAPIError(
+            message="agenticJobId must start with an alphanumeric character",
+            status_code=400,
+        )
+        with pytest.raises(ReveniumAPIError):
+            await tool_manager.meter_event({"event_data": {"agenticJobId": "-bad"}})
+
+
+class TestAgenticJobIdRejectionThroughTheRegisteredPath:
+    """PR #327 review: pin what the AGENT actually sees on a server rejection.
+
+    The registered execution path (standardized_tool_execution) catches the
+    ReveniumAPIError and formats it via _format_api_validation_error — the
+    agent receives a structured validation error carrying the server's
+    message, not the raw exception. This test goes through the formatter the
+    execution path uses, so the documented contract and the real surface
+    cannot drift apart silently.
+    """
+
+    def test_server_rejection_formats_with_the_validation_message(self):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+        from src.revenium_mcp_server.common.error_handling import format_error_response
+
+        server_message = (
+            "agenticJobId must start with an alphanumeric character and contain "
+            "only alphanumeric, dot, underscore and dash characters; reserved "
+            "words (types, conversion-funnel) are not allowed"
+        )
+        error = ReveniumAPIError(server_message, status_code=400)
+
+        result = format_error_response(error, "manage_tools.meter_event")
+
+        assert len(result) == 1
+        text = result[0].text
+        assert "alphanumeric" in text
+        assert "reserved" in text
+        # The agent-facing surface is a formatted error, not a raised exception.
+        assert "ReveniumAPIError" not in text or "400" in text

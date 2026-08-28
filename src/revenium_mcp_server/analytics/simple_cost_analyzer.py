@@ -91,6 +91,8 @@ class SimpleCostAnalyzer:
             "AWS": "AWS",
             "litellm": "LiteLLM",
             "LITELLM": "LiteLLM",
+            "foundry": "Foundry",
+            "FOUNDRY": "Foundry",
         }
 
         # Check for exact matches first

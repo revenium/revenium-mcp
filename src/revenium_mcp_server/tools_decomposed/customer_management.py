@@ -23,7 +23,7 @@ from ..common.error_handling import (
 )
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.update_configs import UpdateConfigFactory
-from ..common.validation import validate_pagination_params
+from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..config_store import get_config_value
 from ..introspection.metadata import (
     DependencyType,
@@ -34,6 +34,23 @@ from ..introspection.metadata import (
     UsagePattern,
 )
 from .unified_tool_base import ToolBase
+
+
+# snake_case filter name -> camelCase query parameter, per customer resource
+# type. Verified 2026-08-28 against hypercurrent origin/develop
+# UserController.list, SubscriberController.list, OrganizationController.list
+# and TeamController.list: each declares query / type plus the tenancy id
+# (teamId for users and subscribers, tenantId for organizations and teams) and
+# a Pageable (page, size, sort). The tenancy id and page/size are set by the
+# client, so what remains is the caller-settable set — identical across the
+# four endpoints today, but kept keyed by resource type so a divergence on one
+# controller can be recorded without touching the others.
+_CUSTOMER_FILTER_MAPS: Dict[str, Dict[str, str]] = {
+    "users": {"query": "query", "type": "type", "sort": "sort"},
+    "subscribers": {"query": "query", "type": "type", "sort": "sort"},
+    "organizations": {"query": "query", "type": "type", "sort": "sort"},
+    "teams": {"query": "query", "type": "type", "sort": "sort"},
+}
 
 
 def _validate_lookup_email(email: Any, action: str) -> str:
@@ -257,18 +274,24 @@ def _validate_marketplace_operation(value: Any) -> str:
     return value.strip().lower()
 
 
-def _raise_marketplace_settings_error(
-    error: ReveniumAPIError, team_id: str, action: str
-) -> NoReturn:
-    """Translate the marketplace-settings failures an agent can act on; re-raise the rest."""
+def _raise_team_settings_permission_error(
+    error: ReveniumAPIError, team_id: str, action: str, *, settings_label: str
+) -> None:
+    """Translate the 403/404 every team-settings sub-resource answers the same way.
+
+    Returns without raising for any other status so each caller keeps control of the
+    failures that are specific to its own sub-resource.
+    """
     if error.status_code == 403:
         raise ToolError(
-            message=f"Insufficient permissions to manage marketplace settings for team {team_id}",
+            message=f"Insufficient permissions to manage {settings_label} for team {team_id}",
             error_code=ErrorCodes.API_AUTHORIZATION,
             field="team_id",
             value=team_id,
             suggestions=[
-                "Marketplace settings require team-management permissions on the target team",
+                # Not .capitalize(): that would lowercase the rest and turn "PR" into "Pr".
+                f"{settings_label[0].upper()}{settings_label[1:]} require team-management "
+                "permissions on the target team",
                 "Ask a team administrator to run the change, or request team-management access",
                 "Confirm the API key is scoped to the team you are targeting",
             ],
@@ -289,6 +312,15 @@ def _raise_marketplace_settings_error(
             ],
             examples={"usage": f"{action}(team_id='jR2kmLs')"},
         )
+
+
+def _raise_marketplace_settings_error(
+    error: ReveniumAPIError, team_id: str, action: str
+) -> NoReturn:
+    """Translate the marketplace-settings failures an agent can act on; re-raise the rest."""
+    _raise_team_settings_permission_error(
+        error, team_id, action, settings_label="marketplace settings"
+    )
     if error.status_code == 409:
         # The only concurrency signal the endpoint documents; without it a lost update
         # would surface as a generic API failure the caller cannot act on.
@@ -311,6 +343,600 @@ def _raise_marketplace_settings_error(
             },
         )
     raise error
+
+
+# PR-health settings support ---------------------------------------------------
+
+# Mirrors the platform's @Min/@Max on both threshold fields. Catching an out-of-range
+# value here gives the caller the actual constraint instead of an opaque upstream 400.
+PR_HEALTH_MIN_THRESHOLD_DAYS = 1
+PR_HEALTH_MAX_THRESHOLD_DAYS = 365
+
+# snake_case tool argument -> camelCase API field, in the order the API declares them.
+PR_HEALTH_THRESHOLD_FIELDS = (("aging_days", "agingDays"), ("rotting_days", "rottingDays"))
+
+# Stated on every PR-health settings response because the two words invert the signal
+# if read as age: the platform classifies by days since the PR's last provider-side
+# activity, so an old but actively-updated PR is neither aging nor rotting.
+PR_HEALTH_SEMANTICS_NOTE = (
+    "agingDays and rottingDays count days of INACTIVITY - days since the pull request's "
+    "last provider-side activity - not the age of the pull request. An old but actively "
+    "updated PR is neither aging nor rotting. Draft PRs are counted separately and "
+    "excluded from both."
+)
+
+# Why the update action reads before it writes. The failure mode is a rejected write,
+# not a silent reset: both fields are non-nullable with no server-side defaults.
+PR_HEALTH_FULL_REPLACEMENT_NOTE = (
+    "The upstream PUT takes both thresholds or neither: agingDays and rottingDays are "
+    "non-nullable with no server-side defaults, so a body carrying only one of them fails "
+    "deserialization and the API answers 400. This action therefore reads the current pair "
+    "first and sends the complete merged pair."
+)
+
+# The same gap the marketplace settings have: the resource carries no version or
+# ETag, so the read the merge depends on and the PUT that follows it cannot be made
+# atomic. Stated on every mutating response rather than buried in the docs because
+# the failure mode is silent - the losing writer sees a threshold it never sent.
+PR_HEALTH_CONCURRENCY_NOTE = (
+    "The upstream settings resource offers no version or ETag, so the read-then-PUT this "
+    "action performs is not atomic: a concurrent update can interleave and the last full "
+    "PUT wins. Re-read with get_pr_health_settings to confirm the stored thresholds."
+)
+
+# Raised into the response when the API's echoed pair disagrees with the pair that was
+# sent, which is the only in-band evidence of a lost update this endpoint can give.
+PR_HEALTH_DIVERGENCE_NOTE = (
+    "The thresholds the API stored differ from the pair this action sent, so another "
+    "update landed between the read and the write. The stored pair is authoritative; "
+    "re-read the settings and re-apply the intended change if it is still needed."
+)
+
+# The settings are not inert - they reshape every count in the report.
+PR_HEALTH_REPORT_NOTE = (
+    "These thresholds reshape every figure in the PR-health report; run "
+    "business_analytics_management get_pr_health afterwards to see the new classification "
+    "(the report echoes the thresholds it used)."
+)
+
+
+def _extract_pr_health_thresholds(settings: Any) -> Dict[str, Optional[int]]:
+    """Read agingDays/rottingDays out of a PR-health settings payload.
+
+    A field that is absent or not a plain int comes back as None rather than as the
+    platform's 14/30 defaults: those defaults are the server's to apply, and inventing
+    them here would report a threshold the platform never confirmed - and, on the write
+    path, silently rewrite a threshold the caller never named. Bools are ints in Python,
+    so they are excluded explicitly.
+    """
+    thresholds: Dict[str, Optional[int]] = {}
+    payload = settings if isinstance(settings, dict) else {}
+    for _, camel in PR_HEALTH_THRESHOLD_FIELDS:
+        value = payload.get(camel)
+        thresholds[camel] = None if isinstance(value, bool) or not isinstance(value, int) else value
+    return thresholds
+
+
+def _validate_pr_health_threshold(value: Any, *, snake: str, action: str) -> int:
+    """Validate one threshold against the server's @Min(1)/@Max(365) bounds."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise create_structured_validation_error(
+            message=f"{snake} must be a whole number of days",
+            field=snake,
+            value=value,
+            suggestions=[
+                f"Pass an integer between {PR_HEALTH_MIN_THRESHOLD_DAYS} and {PR_HEALTH_MAX_THRESHOLD_DAYS}",
+                "Thresholds are counted in whole days of inactivity, so fractions and strings are rejected",
+            ],
+            examples={
+                "usage": f"{action}(team_id='jR2kmLs', aging_days=14, rotting_days=30)",
+                "valid_range": f"{PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS} days",
+            },
+        )
+    if not PR_HEALTH_MIN_THRESHOLD_DAYS <= value <= PR_HEALTH_MAX_THRESHOLD_DAYS:
+        raise create_structured_validation_error(
+            message=(
+                f"{snake} must be between {PR_HEALTH_MIN_THRESHOLD_DAYS} and "
+                f"{PR_HEALTH_MAX_THRESHOLD_DAYS} days"
+            ),
+            field=snake,
+            value=value,
+            suggestions=[
+                f"The platform enforces {PR_HEALTH_MIN_THRESHOLD_DAYS} <= {snake} <= {PR_HEALTH_MAX_THRESHOLD_DAYS}",
+                "Use get_pr_health_settings(team_id=...) to see the thresholds in force",
+            ],
+            examples={
+                "usage": f"{action}(team_id='jR2kmLs', aging_days=14, rotting_days=30)",
+                "valid_range": f"{PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS} days",
+            },
+        )
+    # int(): the guards above already prove this is a plain int, but they do not
+    # narrow the Any the caller handed in.
+    return int(value)
+
+
+def _raise_pr_health_settings_error(
+    error: ReveniumAPIError, team_id: str, action: str
+) -> NoReturn:
+    """Translate the PR-health settings failures an agent can act on; re-raise the rest."""
+    _raise_team_settings_permission_error(
+        error, team_id, action, settings_label="PR health settings"
+    )
+    raise error
+# Attribution identity policy and verified domains ------------------------------
+
+# The strict policy the platform substitutes when a team has never stored a choice.
+# Named rather than inlined so the "is this a real choice or the default?" test has
+# exactly one definition.
+ATTRIBUTION_POLICY_STRICT_DEFAULT = "VERIFIED_DOMAIN_ONLY"
+
+# Documentation only - deliberately NOT a validation gate. A client-side copy of an
+# upstream enum is what keeps ORG_UNIT unreachable on the alert surface today; the
+# policy value is sent verbatim and the API rejects an unknown one with a 400 that
+# names it.
+ATTRIBUTION_POLICY_KNOWN_VALUES = (
+    "VERIFIED_DOMAIN_ONLY",
+    "ALLOW_SELF_ASSERTED_UNVERIFIED",
+)
+
+ATTRIBUTION_POLICY_MEANINGS = {
+    "VERIFIED_DOMAIN_ONLY": (
+        "Coding-assistant identity assertions are honoured only when the asserted email "
+        "domain is on the team's verified-domain list; an assertion from any other "
+        "domain is not attributed to that identity."
+    ),
+    "ALLOW_SELF_ASSERTED_UNVERIFIED": (
+        "Coding-assistant identity assertions are honoured from any domain, verified or "
+        "not, so usage attributes to the asserted identity with no domain check."
+    ),
+}
+
+# Stated on every read because the wire cannot distinguish the two cases: the platform
+# answers with the strict policy when nothing is stored, so a value read here can be a
+# default nobody chose rather than a decision somebody made.
+ATTRIBUTION_POLICY_EFFECTIVE_NOTE = (
+    "This is the EFFECTIVE policy - the rule in force right now - not proof that anyone "
+    "configured it. The platform substitutes the strict "
+    f"{ATTRIBUTION_POLICY_STRICT_DEFAULT} when the team has never stored a choice, and "
+    "the response is identical either way. Record the decision explicitly with "
+    "update_attribution_identity_policy(team_id=..., policy=...) if it matters that it "
+    "was made."
+)
+
+# The policy is checked against the verified-domain list, so neither half is readable
+# on its own: a strict policy with an empty list rejects every assertion.
+ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE = (
+    f"Under {ATTRIBUTION_POLICY_STRICT_DEFAULT} the accepted domains are exactly the "
+    "ones list_verified_domains reports, so a strict policy over an empty list rejects "
+    "every coding-assistant identity assertion. Read both together."
+)
+
+# Sent through verbatim, so the response says what actually left this tool.
+ATTRIBUTION_POLICY_VERBATIM_NOTE = (
+    "The policy value is sent to the platform verbatim: this tool keeps no local copy of "
+    "the accepted values, so a value the platform adds later works here without a client "
+    "change, and an unrecognized value is rejected upstream rather than here."
+)
+
+ATTRIBUTION_POLICY_PRIVILEGE_NOTE = (
+    "Reading and changing the attribution identity policy both require an ORGANIZATION "
+    "administrator on the target team - the platform gates the GET and the PUT on the "
+    "same organization-management privilege."
+)
+
+VERIFIED_DOMAIN_TENANT_PRIVILEGE_NOTE = (
+    "Listing and removing verified domains require a TENANT administrator. The read is "
+    "gated as well as the write, so a 403 on the listing is a permissions answer, never "
+    "an empty domain list."
+)
+
+# The asymmetry that a generic permissions message would hide: this one privilege is
+# not grantable to a customer at all, so telling an org admin to "ask for access"
+# would send them after something that does not exist for them.
+VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE = (
+    "Adding a verified domain requires a PLATFORM administrator (Revenium operations). A "
+    "tenant or organization administrator is always denied, and no tenant-side "
+    "permission grant changes that - this is by design, not a misconfiguration. The "
+    "platform does not verify domain ownership, so an unverified add could claim any "
+    "unclaimed business domain and route that domain's future signups to the claiming "
+    "tenant. Ask Revenium operations to add the domain."
+)
+
+# PUT here adds one domain; the marketplace-settings PUT it resembles replaces a list.
+VERIFIED_DOMAIN_ADD_SEMANTICS_NOTE = (
+    "This adds a single domain. Unlike the internal-marketplace settings, the "
+    "verified-domain PUT is not a list replacement - existing domains are untouched, and "
+    "removing one is a separate remove_verified_domain call."
+)
+
+# Why source/joinPolicy are reported but not accepted.
+VERIFIED_DOMAIN_FIXED_FIELDS_NOTE = (
+    "source and joinPolicy are set by the platform, not by the caller: an "
+    "administrator-created mapping is recorded with source ADMIN and joinPolicy REQUEST. "
+    "They are reported on reads and cannot be passed to add_verified_domain."
+)
+
+# Surfaced when the endpoint answers with something other than the documented bare
+# array, so an empty result is never mistaken for "no verified domains".
+VERIFIED_DOMAIN_UNEXPECTED_SHAPE_NOTE = (
+    "The verified-domains endpoint answered with an unexpected payload shape instead of "
+    "the documented JSON array, so no domains could be read. Retry, and report the "
+    "tenant if it persists - this is an upstream contract change, not an empty list."
+)
+
+
+def _describe_attribution_policy(policy: Optional[str]) -> str:
+    """Explain a policy value in plain language, without gating on the known set."""
+    if policy is None:
+        return (
+            "The platform did not report a policy value, so the rule in force is unknown; "
+            "retry the read before acting on it."
+        )
+    known = ATTRIBUTION_POLICY_MEANINGS.get(policy)
+    if known:
+        return known
+    return (
+        f"'{policy}' is not a value this tool has a description for - the platform "
+        "accepted or returned it, so treat the platform documentation as authoritative."
+    )
+
+
+def _extract_attribution_policy(payload: Any) -> Optional[str]:
+    """Read the policy field out of an attribution-identity-policy payload.
+
+    Returns None when the field is absent or not a non-empty string, keeping "the
+    platform did not say" separate from any particular value - inventing the strict
+    default here would report a rule the platform never confirmed.
+    """
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("policy")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
+def _validate_policy_value(value: Any, action: str) -> str:
+    """Validate the policy argument as a non-empty string and return it unchanged.
+
+    Shape only: the accepted VALUES are the platform's to police. A local enum check
+    would turn every future policy value into an MCP-side outage.
+    """
+    if value is None:
+        raise create_structured_missing_parameter_error(
+            parameter_name="policy",
+            action=action,
+            examples={
+                "usage": f"{action}(team_id='jR2kmLs', policy='{ATTRIBUTION_POLICY_STRICT_DEFAULT}')",
+                "known_values": list(ATTRIBUTION_POLICY_KNOWN_VALUES),
+                "meanings": dict(ATTRIBUTION_POLICY_MEANINGS),
+                "verbatim": ATTRIBUTION_POLICY_VERBATIM_NOTE,
+            },
+        )
+    if not isinstance(value, str) or not value.strip():
+        raise create_structured_validation_error(
+            message="policy must be a non-empty policy name string",
+            field="policy",
+            value=value,
+            suggestions=[
+                "Pass the policy name as a string, e.g. "
+                f"policy='{ATTRIBUTION_POLICY_STRICT_DEFAULT}'",
+                "Read the policy in force first with get_attribution_identity_policy(team_id=...)",
+                ATTRIBUTION_POLICY_VERBATIM_NOTE,
+            ],
+            examples={
+                "usage": f"{action}(team_id='jR2kmLs', policy='{ATTRIBUTION_POLICY_STRICT_DEFAULT}')",
+                "known_values": list(ATTRIBUTION_POLICY_KNOWN_VALUES),
+            },
+        )
+    return value.strip()
+
+
+def _validate_verified_domain(value: Any, action: str) -> str:
+    """Validate the domain argument for the verified-domain actions.
+
+    A boundary guard, not domain-name validation: the platform owns the format rules.
+    What is rejected here is input that cannot be a domain at all - a non-string, a
+    blank, an address with a local part, or embedded whitespace - because each of
+    those would otherwise reach the API as a silently wrong identifier.
+    """
+    if value is None:
+        raise create_structured_missing_parameter_error(
+            parameter_name="domain",
+            action=action,
+            examples={
+                "usage": f"{action}(team_id='jR2kmLs', domain='acme.com')",
+                "valid_formats": ["domain is a bare email domain, without a local part or an @"],
+                "example_values": ["acme.com", "engineering.acme.com"],
+                "discover_domains": "list_verified_domains(team_id='jR2kmLs')",
+            },
+        )
+    candidate = value.strip() if isinstance(value, str) else value
+    if not isinstance(candidate, str) or not candidate:
+        raise create_structured_validation_error(
+            message="domain must be a non-empty email domain string",
+            field="domain",
+            value=value,
+            suggestions=[
+                "Pass the bare domain, e.g. domain='acme.com'",
+                "Use list_verified_domains(team_id=...) to see the domains already recorded",
+            ],
+            examples={
+                "usage": f"{action}(team_id='jR2kmLs', domain='acme.com')",
+                "example_values": ["acme.com", "engineering.acme.com"],
+            },
+        )
+    if "@" in candidate or any(character.isspace() for character in candidate):
+        raise create_structured_validation_error(
+            message=f"domain must be a bare email domain, not an address: {candidate}",
+            field="domain",
+            value=candidate,
+            suggestions=[
+                "Drop the local part and the @ - 'joao@acme.com' is recorded as 'acme.com'",
+                "Domains carry no whitespace",
+            ],
+            examples={
+                "usage": f"{action}(team_id='jR2kmLs', domain='acme.com')",
+                "example_values": ["acme.com", "engineering.acme.com"],
+            },
+        )
+    return candidate
+
+
+def _normalize_verified_domain(entry: Any) -> Optional[Dict[str, Any]]:
+    """Project one upstream verified-domain entry onto the three fields it carries.
+
+    Returns None for anything that is not a JSON object carrying a usable domain, so a
+    malformed entry is skipped rather than crashing the whole listing.
+    """
+    if not isinstance(entry, dict):
+        return None
+    domain = entry.get("domain")
+    if not isinstance(domain, str) or not domain.strip():
+        return None
+    return {
+        "domain": domain.strip(),
+        # Absent is reported as unknown rather than guessed: ADMIN is only the default
+        # for administrator-created mappings, and the list can carry others.
+        "source": entry.get("source") if isinstance(entry.get("source"), str) else "unknown",
+        "joinPolicy": (
+            entry.get("joinPolicy") if isinstance(entry.get("joinPolicy"), str) else "unknown"
+        ),
+    }
+
+
+def _raise_team_settings_privileged_error(
+    error: ReveniumAPIError,
+    team_id: str,
+    action: str,
+    *,
+    settings_label: str,
+    privilege_summary: str,
+    suggestions: List[str],
+) -> None:
+    """Map a 403 to the privilege THIS action actually needs, then fall through.
+
+    The team-settings sub-resources do not share one privilege: the policy pair is
+    organization-gated, the verified-domain listing and removal are tenant-gated, and
+    the verified-domain add is platform-gated and ungrantable to a customer. A single
+    "you lack permission" would hide which of the three is missing - and, for the add,
+    whether the caller could ever obtain it. The 404 mapping IS shared, so it is
+    delegated rather than restated.
+    """
+    if error.status_code == 403:
+        raise ToolError(
+            message=f"{privilege_summary} is required to {settings_label} for team {team_id}",
+            error_code=ErrorCodes.API_AUTHORIZATION,
+            field="team_id",
+            value=team_id,
+            suggestions=suggestions,
+            examples={
+                "usage": f"{action}(team_id='{team_id}')",
+                "discover_teams": "list(resource_type='teams')",
+            },
+        )
+    _raise_team_settings_permission_error(
+        error, team_id, action, settings_label=settings_label
+    )
+
+
+def _raise_attribution_policy_error(
+    error: ReveniumAPIError, team_id: str, action: str
+) -> NoReturn:
+    """Translate the attribution-policy failures an agent can act on; re-raise the rest."""
+    _raise_team_settings_privileged_error(
+        error,
+        team_id,
+        action,
+        settings_label="manage the attribution identity policy",
+        privilege_summary="An organization administrator",
+        suggestions=[
+            ATTRIBUTION_POLICY_PRIVILEGE_NOTE,
+            "Ask an organization administrator to run the call, or request "
+            "organization-management access on this team",
+            "Confirm the API key is scoped to the team you are targeting",
+        ],
+    )
+    raise error
+
+
+def _raise_verified_domain_error(
+    error: ReveniumAPIError, team_id: str, action: str, domain: Optional[str] = None
+) -> NoReturn:
+    """Translate the verified-domain failures an agent can act on; re-raise the rest.
+
+    add_verified_domain is split out because its 403 is not a missing grant: the
+    privilege belongs to Revenium operations and a customer administrator cannot be
+    given it, so the message has to name the escalation path rather than an access
+    request.
+    """
+    if action == "add_verified_domain":
+        _raise_team_settings_privileged_error(
+            error,
+            team_id,
+            action,
+            settings_label="add a verified domain",
+            privilege_summary="A Revenium platform administrator",
+            suggestions=[
+                VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE,
+                "Do not request this permission from your tenant or organization "
+                "administrator - it is not theirs to grant; open a request with Revenium "
+                "operations instead",
+                "list_verified_domains and remove_verified_domain need only a tenant "
+                "administrator, so a 403 on those is a different, grantable problem",
+            ],
+        )
+    else:
+        # The DELETE's 404 is ambiguous: the shared team-settings mapping reads
+        # every 404 as "team not found", but removing a domain that is not on
+        # the list also answers 404 - with a body that says which it was
+        # ("Verified domain not found"). Reporting that as a missing TEAM sends
+        # the caller to verify an id that is fine (live-caught on dev,
+        # 2026-08-28). Only the upstream's own wording routes here, so a real
+        # missing team still maps below.
+        # str(error) IS error.message: ReveniumAPIError always sets it and
+        # passes it to Exception.__init__.
+        if action == "remove_verified_domain" and error.status_code == 404 and (
+            "verified domain" in str(error).lower()
+        ):
+            domain_text = f"'{domain}' " if domain else ""
+            raise ToolError(
+                message=(
+                    f"Domain {domain_text}is not on team {team_id}'s verified-domain "
+                    "list, so there is nothing to remove"
+                ),
+                error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+                field="domain",
+                value=domain,
+                suggestions=[
+                    "Use list_verified_domains(team_id=...) to see the domains "
+                    "currently recorded",
+                    "Domains are matched exactly as stored - check for a typo or "
+                    "a subdomain difference",
+                ],
+                examples={
+                    "usage": f"list_verified_domains(team_id='{team_id}')",
+                },
+            )
+        _raise_team_settings_privileged_error(
+            error,
+            team_id,
+            action,
+            settings_label="manage the team's verified domains",
+            privilege_summary="A tenant administrator",
+            suggestions=[
+                VERIFIED_DOMAIN_TENANT_PRIVILEGE_NOTE,
+                "Ask a tenant administrator to run the call, or request tenant "
+                "domain-settings access",
+                "Confirm the API key is scoped to the team you are targeting",
+            ],
+        )
+    raise error
+
+
+# Org-unit (department) lookup -------------------------------------------------
+
+# BACK-2767 one-place rule: the upstream OrgUnitResponse carries `id` and `parentId`
+# as JSON numbers, but every ORG_UNIT consumer downstream (insight-run filters,
+# department cost controls, group previews) sends the value as a STRING. The
+# number-to-string conversion is defined here and nowhere else, so every consumer
+# inherits one rule instead of each re-deriving its own.
+ORG_UNIT_ID_STRING_NOTE = (
+    "org unit ids are returned as strings because that is the form the ORG_UNIT "
+    "dimension expects wherever it is filtered on (insights, cost controls, groups); "
+    "the upstream API stores them as numbers."
+)
+
+# Surfaced on the response when the endpoint answers with something other than the
+# documented flat array, so an empty result is never mistaken for "no departments".
+ORG_UNIT_UNEXPECTED_SHAPE_NOTE = (
+    "The org-units endpoint answered with an unexpected payload shape instead of the "
+    "documented JSON array, so no units could be read. Retry, and report the tenant if "
+    "it persists - this is an upstream contract change, not an empty organization."
+)
+ORG_UNIT_FEATURE_FLAG_NOTE = (
+    "Org units are gated by the per-tenant org-unit-attribution-enabled feature "
+    "flag, which is OFF by default. A 403 from this listing means the flag is not "
+    "enabled for the tenant — the whole ORG_UNIT dimension family (department "
+    "cost controls, insight-run filters, group previews) is unavailable until "
+    "Revenium enables it. This is a tenant-configuration state, not a "
+    "permissions problem with your key."
+)
+
+
+def org_unit_id_to_filter_value(unit_id: Any) -> Optional[str]:
+    """Convert an upstream org-unit id to the string an ORG_UNIT filter expects.
+
+    Single definition of BACK-2767's number-to-string rule (see ORG_UNIT_ID_STRING_NOTE).
+    Returns None for a missing id, which is a legitimate value for `parentId` on a
+    root unit.
+    """
+    if unit_id is None or isinstance(unit_id, bool):
+        # bool is an int subclass; a boolean is never an id, so it is not "converted".
+        return None
+    if isinstance(unit_id, float) and unit_id.is_integer():
+        # JSON numbers can decode as floats; 173.0 is the id 173, not "173.0".
+        return str(int(unit_id))
+    text = str(unit_id).strip()
+    return text or None
+
+
+def _normalize_org_unit(unit: Any) -> Optional[Dict[str, Any]]:
+    """Project one upstream org unit onto the fields name-to-id resolution needs.
+
+    Returns None for anything that is not a JSON object so a malformed entry is
+    skipped rather than crashing the whole listing.
+    """
+    if not isinstance(unit, dict):
+        return None
+    unit_id = org_unit_id_to_filter_value(unit.get("id"))
+    # The whole point of this listing is handing an agent a value it can paste
+    # into an ORG_UNIT filter. The server contract types id as a number, so an
+    # entry whose id is missing or does not read as one is malformed — rendering
+    # it (as id=None or an arbitrary string) would invite copying an unusable
+    # value. parentId stays permissive: None is legitimate on a root unit.
+    if unit_id is None or not unit_id.isdigit():
+        return None
+    return {
+        "name": unit.get("name"),
+        "id": unit_id,
+        "parentId": org_unit_id_to_filter_value(unit.get("parentId")),
+        "path": unit.get("path"),
+        "source": unit.get("source"),
+        "externalRef": unit.get("externalRef"),
+    }
+
+
+def _format_org_units_text(result: Dict[str, Any]) -> str:
+    """Render the org-unit listing so a name can be grepped straight to its id."""
+    units: List[Dict[str, Any]] = result.get("org_units") or []
+    team_id = result.get("team_id")
+    scope = f" for team {team_id}" if team_id else ""
+
+    if not units:
+        text = f"No org units (departments) found{scope}.\n\n"
+        if result.get("warning"):
+            text += f"WARNING: {result['warning']}\n\n"
+        else:
+            text += (
+                "An organization with no departments defined answers this way. Org units "
+                "are created in the Revenium UI or imported there; this action is "
+                "read-only and cannot create them.\n\n"
+            )
+        return text + json.dumps(result, indent=2)
+
+    text = f"Found {len(units)} org unit(s){scope}:\n\n"
+    if result.get("warning"):
+        text = f"WARNING: {result['warning']}\n\n" + text
+    # One line per unit, name first, so `list_org_units` output greps by department name.
+    for unit in units:
+        text += (
+            f"- {unit.get('name')} | id={unit.get('id')} | "
+            f"parentId={unit.get('parentId')} | path={unit.get('path')} | "
+            f"source={unit.get('source')}\n"
+        )
+    text += f"\nNote: {ORG_UNIT_ID_STRING_NOTE}\n\n"
+    return text + json.dumps(result, indent=2)
 
 
 class BaseManager:
@@ -366,7 +992,9 @@ class UserManager(BaseManager):
         arguments = validate_pagination_params(arguments, action="list users")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = arguments.get("filters", {})
+        filters = apply_filter_allowlist(
+            arguments.get("filters"), _CUSTOMER_FILTER_MAPS["users"], action="list_users"
+        )
 
         response = await self.client.get_users(page=page, size=size, **filters)
         users = self.client._extract_embedded_data(response)
@@ -599,7 +1227,9 @@ class SubscriberManager(BaseManager):
         arguments = validate_pagination_params(arguments, action="list subscribers")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = arguments.get("filters", {})
+        filters = apply_filter_allowlist(
+            arguments.get("filters"), _CUSTOMER_FILTER_MAPS["subscribers"], action="list_subscribers"
+        )
 
         response = await self.client.get_subscribers(page=page, size=size, **filters)
         subscribers = self.client._extract_embedded_data(response)
@@ -961,7 +1591,9 @@ class OrganizationManager(BaseManager):
         arguments = validate_pagination_params(arguments, action="list organizations")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = arguments.get("filters", {})
+        filters = apply_filter_allowlist(
+            arguments.get("filters"), _CUSTOMER_FILTER_MAPS["organizations"], action="list_organizations"
+        )
 
         response = await self.client.get_organizations(page=page, size=size, **filters)
         organizations = self.client._extract_embedded_data(response)
@@ -1140,7 +1772,9 @@ class TeamManager(BaseManager):
         arguments = validate_pagination_params(arguments, action="list teams")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = arguments.get("filters", {})
+        filters = apply_filter_allowlist(
+            arguments.get("filters"), _CUSTOMER_FILTER_MAPS["teams"], action="list_teams"
+        )
 
         response = await self.client.get_teams(page=page, size=size, **filters)
         teams = self.client._extract_embedded_data(response)
@@ -1305,7 +1939,7 @@ class TeamManager(BaseManager):
         return result
 
     def _require_team_id(self, arguments: Dict[str, Any], action: str) -> str:
-        """Return the team_id required by the marketplace-settings actions."""
+        """Return the team_id required by the team-settings actions."""
         team_id = arguments.get("team_id")
         if not isinstance(team_id, str) or not team_id.strip():
             raise create_structured_missing_parameter_error(
@@ -1406,6 +2040,454 @@ class TeamManager(BaseManager):
                 name for name in merged if name not in applied
             ]
 
+        return result
+
+    async def _read_pr_health_thresholds(
+        self, team_id: str, action: str
+    ) -> Dict[str, Optional[int]]:
+        """Read the team's current PR-health thresholds."""
+        try:
+            settings = await self.client.get_team_pr_health_settings(team_id)
+        except ReveniumAPIError as e:
+            _raise_pr_health_settings_error(e, team_id, action)
+        return _extract_pr_health_thresholds(settings)
+
+    async def get_pr_health_settings(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Get the team's PR-health aging/rotting inactivity thresholds."""
+        action = "get_pr_health_settings"
+        team_id = self._require_team_id(arguments, action)
+
+        thresholds = await self._read_pr_health_thresholds(team_id, action)
+
+        return {
+            "action": action,
+            "resource_type": "teams",
+            "team_id": team_id,
+            "agingDays": thresholds["agingDays"],
+            "rottingDays": thresholds["rottingDays"],
+            "threshold_bounds": (
+                f"{PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS} days, "
+                "with agingDays lower than rottingDays"
+            ),
+            "semantics": PR_HEALTH_SEMANTICS_NOTE,
+            "report_impact": PR_HEALTH_REPORT_NOTE,
+        }
+
+    async def update_pr_health_settings(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Change the team's PR-health aging/rotting inactivity thresholds.
+
+        The upstream PUT deserializes both fields or none, so a caller who names only
+        one threshold gets the other read-merged from the current settings; the local
+        bounds and ordering checks run before the write so the platform's constraints
+        arrive as guidance rather than as an upstream 400.
+
+        The read and the PUT cannot be made atomic - the resource carries no version or
+        ETag - so the response states that (PR_HEALTH_CONCURRENCY_NOTE) and compares the
+        echoed pair against the pair sent, raising divergence_warning and naming the
+        fields that came back different. Neither prevents an interleaving between the
+        read and the write; they make one visible after the fact.
+        """
+        action = "update_pr_health_settings"
+        team_id = self._require_team_id(arguments, action)
+
+        supplied: Dict[str, int] = {}
+        for snake, camel in PR_HEALTH_THRESHOLD_FIELDS:
+            if arguments.get(snake) is not None:
+                supplied[camel] = _validate_pr_health_threshold(
+                    arguments.get(snake), snake=snake, action=action
+                )
+
+        if not supplied:
+            raise create_structured_missing_parameter_error(
+                parameter_name="aging_days",
+                action=action,
+                examples={
+                    "usage": f"{action}(team_id='jR2kmLs', aging_days=14, rotting_days=30)",
+                    "valid_formats": [
+                        "aging_days and rotting_days are whole days of inactivity, "
+                        f"{PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS}"
+                    ],
+                    "partial_update": "Name just one of them and the other is read-merged from the current settings",
+                    "ordering": "aging_days must be lower than rotting_days",
+                    "semantics": PR_HEALTH_SEMANTICS_NOTE,
+                },
+            )
+
+        current = await self._read_pr_health_thresholds(team_id, action)
+        merged: Dict[str, int] = {}
+        for snake, camel in PR_HEALTH_THRESHOLD_FIELDS:
+            value = supplied.get(camel, current[camel])
+            if value is None:
+                # The read could not supply the half the caller left out. Substituting the
+                # platform's default here would rewrite a threshold nobody asked to change.
+                raise create_structured_missing_parameter_error(
+                    parameter_name=snake,
+                    action=action,
+                    examples={
+                        "usage": f"{action}(team_id='jR2kmLs', aging_days=14, rotting_days=30)",
+                        "why": (
+                            f"The current {camel} could not be read from the team's settings, "
+                            "so it cannot be carried over - send both thresholds"
+                        ),
+                        "full_replacement": PR_HEALTH_FULL_REPLACEMENT_NOTE,
+                    },
+                )
+            merged[camel] = value
+
+        if merged["agingDays"] >= merged["rottingDays"]:
+            raise create_structured_validation_error(
+                message=(
+                    f"aging_days ({merged['agingDays']}) must be lower than "
+                    f"rotting_days ({merged['rottingDays']})"
+                ),
+                field="aging_days",
+                value=merged["agingDays"],
+                suggestions=[
+                    "A PR becomes aging first and rotting later, so the aging threshold is the smaller number",
+                    "The ordering applies to the merged pair, not only to the values you passed - "
+                    "check the stored threshold with get_pr_health_settings(team_id=...)",
+                    "Send both thresholds together when you need to cross the current values",
+                ],
+                examples={
+                    "usage": f"{action}(team_id='jR2kmLs', aging_days=14, rotting_days=30)",
+                    "current_pair": dict(current),
+                    "rejected_pair": dict(merged),
+                },
+            )
+
+        try:
+            updated = await self.client.update_team_pr_health_settings(team_id, merged)
+        except ReveniumAPIError as e:
+            _raise_pr_health_settings_error(e, team_id, action)
+
+        # The API echoes the stored resource; that is what actually landed. A field the
+        # echo omits falls back to the value sent rather than to a fabricated default.
+        echoed = _extract_pr_health_thresholds(updated)
+        applied = {
+            camel: merged[camel] if echoed[camel] is None else echoed[camel]
+            for _, camel in PR_HEALTH_THRESHOLD_FIELDS
+        }
+
+        result: Dict[str, Any] = {
+            "action": action,
+            "resource_type": "teams",
+            "team_id": team_id,
+            "previous_agingDays": current["agingDays"],
+            "previous_rottingDays": current["rottingDays"],
+            "requested_agingDays": merged["agingDays"],
+            "requested_rottingDays": merged["rottingDays"],
+            "agingDays": applied["agingDays"],
+            "rottingDays": applied["rottingDays"],
+            "read_merged": sorted(
+                camel for _, camel in PR_HEALTH_THRESHOLD_FIELDS if camel not in supplied
+            ),
+            "full_replacement_note": PR_HEALTH_FULL_REPLACEMENT_NOTE,
+            "concurrency_note": PR_HEALTH_CONCURRENCY_NOTE,
+            "semantics": PR_HEALTH_SEMANTICS_NOTE,
+            "report_impact": PR_HEALTH_REPORT_NOTE,
+        }
+
+        # Per field, because either half can be the one an interleaved write moved: the
+        # read-merged half is the obvious casualty, but a supplied half can be overwritten
+        # too. An absent echo is unknown rather than changed, so it is not divergence.
+        diverged = [
+            camel
+            for _, camel in PR_HEALTH_THRESHOLD_FIELDS
+            if echoed[camel] is not None and echoed[camel] != merged[camel]
+        ]
+        if diverged:
+            result["divergence_warning"] = PR_HEALTH_DIVERGENCE_NOTE
+            result["diverged_fields"] = diverged
+            result["divergence_detail"] = {
+                camel: {"sent": merged[camel], "stored": applied[camel]}
+                for camel in diverged
+            }
+
+        return result
+
+
+    async def get_attribution_identity_policy(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Read the policy in force for coding-assistant identity assertions.
+
+        Reported as the EFFECTIVE policy rather than a configured one: the platform
+        answers with the strict default when the team has never stored a choice, and
+        the two are identical on the wire (ATTRIBUTION_POLICY_EFFECTIVE_NOTE).
+        """
+        action = "get_attribution_identity_policy"
+        team_id = self._require_team_id(arguments, action)
+
+        try:
+            payload = await self.client.get_team_attribution_identity_policy(team_id)
+        except ReveniumAPIError as e:
+            _raise_attribution_policy_error(e, team_id, action)
+
+        policy = _extract_attribution_policy(payload)
+
+        return {
+            "action": action,
+            "resource_type": "teams",
+            "team_id": team_id,
+            "effective_policy": policy,
+            "policy_meaning": _describe_attribution_policy(policy),
+            "effective_policy_note": ATTRIBUTION_POLICY_EFFECTIVE_NOTE,
+            "set_explicitly": (
+                f"update_attribution_identity_policy(team_id='{team_id}', "
+                f"policy='{ATTRIBUTION_POLICY_STRICT_DEFAULT}')"
+            ),
+            "verified_domains_link": ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE,
+            "permissions": ATTRIBUTION_POLICY_PRIVILEGE_NOTE,
+        }
+
+    async def update_attribution_identity_policy(
+        self, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Set the policy for coding-assistant identity assertions.
+
+        The resource is a single required field, so there is nothing to read-merge:
+        the PUT is complete by construction. The value is sent verbatim and the
+        platform, not this tool, decides whether it is acceptable.
+        """
+        action = "update_attribution_identity_policy"
+        team_id = self._require_team_id(arguments, action)
+        policy = _validate_policy_value(arguments.get("policy"), action)
+
+        try:
+            updated = await self.client.update_team_attribution_identity_policy(
+                team_id, policy
+            )
+        except ReveniumAPIError as e:
+            _raise_attribution_policy_error(e, team_id, action)
+
+        # The API echoes the stored resource; that is what actually landed. An echo
+        # that carries no usable policy falls back to the value sent rather than to a
+        # fabricated default.
+        echoed = _extract_attribution_policy(updated)
+        applied = policy if echoed is None else echoed
+
+        result: Dict[str, Any] = {
+            "action": action,
+            "resource_type": "teams",
+            "team_id": team_id,
+            "requested_policy": policy,
+            "policy": applied,
+            "policy_meaning": _describe_attribution_policy(applied),
+            "verbatim_note": ATTRIBUTION_POLICY_VERBATIM_NOTE,
+            "verified_domains_link": ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE,
+            "permissions": ATTRIBUTION_POLICY_PRIVILEGE_NOTE,
+        }
+
+        # An echoed value different from the one sent is the only in-band evidence the
+        # write did not land as asked, so it is surfaced instead of being smoothed over.
+        if echoed is not None and echoed != policy:
+            result["divergence_warning"] = (
+                f"The platform stored '{echoed}', not the '{policy}' this action sent. "
+                "The stored value is authoritative; re-read with "
+                "get_attribution_identity_policy before relying on the change."
+            )
+
+        return result
+
+    async def list_verified_domains(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """List the email domains this team has recorded as verified."""
+        action = "list_verified_domains"
+        team_id = self._require_team_id(arguments, action)
+
+        # Typed as Any on purpose: the client's return annotation promises a list, but
+        # that promise is a cast over an untyped JSON body, so the shape check below is
+        # a real runtime guard rather than dead code.
+        try:
+            response: Any = await self.client.list_team_verified_domains(team_id)
+        except ReveniumAPIError as e:
+            _raise_verified_domain_error(e, team_id, action)
+
+        warning: Optional[str] = None
+        if isinstance(response, list):
+            raw_domains: List[Any] = response
+        else:
+            # The endpoint is documented as a bare array - not a HAL page - so anything
+            # else is an upstream contract change, and reporting it beats rendering a
+            # silent empty list.
+            raw_domains = []
+            warning = VERIFIED_DOMAIN_UNEXPECTED_SHAPE_NOTE
+
+        domains: List[Dict[str, Any]] = []
+        skipped = 0
+        for raw in raw_domains:
+            normalized = _normalize_verified_domain(raw)
+            if normalized is None:
+                skipped += 1
+                continue
+            domains.append(normalized)
+
+        # A response where every entry was malformed is an upstream contract or data
+        # failure, not a team without verified domains - and the difference matters,
+        # because an empty list under the strict policy rejects every assertion.
+        if skipped and not warning:
+            warning = (
+                f"{skipped} of {len(raw_domains)} entries in the verified-domains "
+                "response were malformed (not an object, or no usable domain) and were "
+                "skipped. "
+            ) + (
+                "No valid domains remained - treat this as an upstream data or contract "
+                "problem, not as a team without verified domains."
+                if not domains
+                else "The listing below covers only the well-formed entries."
+            )
+
+        result: Dict[str, Any] = {
+            "action": action,
+            "resource_type": "teams",
+            "team_id": team_id,
+            "verified_domains": domains,
+            "total_found": len(domains),
+            "fixed_fields": VERIFIED_DOMAIN_FIXED_FIELDS_NOTE,
+            "policy_link": ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE,
+            "add_permissions": VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE,
+            "permissions": VERIFIED_DOMAIN_TENANT_PRIVILEGE_NOTE,
+        }
+        if warning:
+            result["warning"] = warning
+        if skipped:
+            result["skipped_malformed_entries"] = skipped
+        return result
+
+    async def add_verified_domain(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Add one email domain to the team's verified-domain list.
+
+        Platform-administrator-only upstream; a tenant or organization administrator
+        gets a 403 that says so rather than a generic permissions message
+        (VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE).
+        """
+        action = "add_verified_domain"
+        team_id = self._require_team_id(arguments, action)
+        domain = _validate_verified_domain(arguments.get("domain"), action)
+
+        try:
+            added = await self.client.add_team_verified_domain(team_id, domain)
+        except ReveniumAPIError as e:
+            _raise_verified_domain_error(e, team_id, action)
+
+        # The API echoes the stored resource, which is where source/joinPolicy come
+        # from; when it echoes nothing usable, only the domain that was sent is known.
+        normalized = _normalize_verified_domain(added)
+
+        return {
+            "action": action,
+            "resource_type": "teams",
+            "team_id": team_id,
+            "domain": domain,
+            "verified_domain": normalized,
+            "add_semantics": VERIFIED_DOMAIN_ADD_SEMANTICS_NOTE,
+            "fixed_fields": VERIFIED_DOMAIN_FIXED_FIELDS_NOTE,
+            "policy_link": ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE,
+            "permissions": VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE,
+        }
+
+    async def remove_verified_domain(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove one email domain from the team's verified-domain list."""
+        action = "remove_verified_domain"
+        team_id = self._require_team_id(arguments, action)
+        domain = _validate_verified_domain(arguments.get("domain"), action)
+
+        try:
+            await self.client.remove_team_verified_domain(team_id, domain)
+        except ReveniumAPIError as e:
+            _raise_verified_domain_error(e, team_id, action, domain=domain)
+
+        return {
+            "action": action,
+            "resource_type": "teams",
+            "team_id": team_id,
+            "domain": domain,
+            "removed": True,
+            "re_add_warning": VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE,
+            "policy_link": ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE,
+            "permissions": VERIFIED_DOMAIN_TENANT_PRIVILEGE_NOTE,
+        }
+
+
+class OrgUnitManager(BaseManager):
+    """Internal manager for org-unit (department) lookups.
+
+    Read-only by design: org units are created and imported in the Revenium UI, and
+    BACK-2767 exposes only the listing the ORG_UNIT dimension needs to resolve a
+    department name to an id.
+    """
+
+    async def list_org_units(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """List the active org units, optionally scoped to one team."""
+        team_id = arguments.get("team_id")
+        team_id = team_id.strip() if isinstance(team_id, str) and team_id.strip() else None
+
+        # Typed as Any on purpose: the client's return annotation promises a list, but
+        # that promise is a cast over an untyped JSON body, so the shape check below is
+        # a real runtime guard rather than dead code.
+        try:
+            response: Any = await self.client.get_org_units(team_id)
+        except ReveniumAPIError as e:
+            # The whole OrgUnitController is behind the default-OFF
+            # org-unit-attribution-enabled feature flag, so a 403 here usually
+            # means "not enabled for this tenant", not "bad credentials" —
+            # surface that instead of a raw permission error.
+            if e.status_code == 403:
+                raise ToolError(
+                    message="Org units are not enabled for this tenant",
+                    error_code=ErrorCodes.API_AUTHORIZATION,
+                    field="team_id",
+                    value=team_id or "(ambient team)",
+                    suggestions=[
+                        ORG_UNIT_FEATURE_FLAG_NOTE,
+                        "Ask Revenium to enable org-unit attribution for this "
+                        "tenant, then retry list_org_units.",
+                    ],
+                )
+            raise
+
+        warning: Optional[str] = None
+        if isinstance(response, list):
+            raw_units: List[Any] = response
+        else:
+            # The endpoint is documented as a flat array; anything else is an upstream
+            # contract change, and reporting it beats rendering a silent empty list.
+            raw_units = []
+            warning = ORG_UNIT_UNEXPECTED_SHAPE_NOTE
+
+        units: List[Dict[str, Any]] = []
+        skipped = 0
+        for raw in raw_units:
+            normalized = _normalize_org_unit(raw)
+            if normalized is None:
+                skipped += 1
+                continue
+            units.append(normalized)
+
+        # A response where every entry was malformed is an upstream contract or
+        # data failure, not an organization without departments — the legitimate
+        # -empty explanation must never conceal it.
+        if skipped and not warning:
+            warning = (
+                f"{skipped} of {len(raw_units)} entries in the org-unit response "
+                "were malformed (not an object, or no usable numeric id) and were "
+                "skipped. "
+            ) + (
+                "No valid org units remained — treat this as an upstream data or "
+                "contract problem, not as an organization without departments."
+                if not units
+                else "The listing below covers only the well-formed entries."
+            )
+
+        result: Dict[str, Any] = {
+            "action": "list_org_units",
+            "resource_type": "org_units",
+            "team_id": team_id,
+            "org_units": units,
+            "total_found": len(units),
+            "id_type_note": ORG_UNIT_ID_STRING_NOTE,
+        }
+        if warning:
+            result["warning"] = warning
+        if skipped:
+            result["skipped_malformed_entries"] = skipped
         return result
 
 
@@ -1705,7 +2787,16 @@ class CustomerAnalytics:
         resource_type = arguments.get("resource_type", "organizations")
         page = arguments.get("page", 0)
         size = arguments.get("size", 100)  # Get more for analysis
-        filters = arguments.get("filters", {})
+        # An unknown resource_type falls through to the branch below, which
+        # names it; validating its filters first would bury that message.
+        allowlist = _CUSTOMER_FILTER_MAPS.get(str(resource_type))
+        filters = (
+            apply_filter_allowlist(
+                arguments.get("filters"), allowlist, action=f"analyze {resource_type}"
+            )
+            if allowlist is not None
+            else {}
+        )
 
         if resource_type == "users":
             response = await self.client.get_users(page=page, size=size, **filters)
@@ -1910,6 +3001,7 @@ class CustomerManagement(ToolBase):
             subscriber_manager = SubscriberManager(client)
             organization_manager = OrganizationManager(client)
             team_manager = TeamManager(client)
+            org_unit_manager = OrgUnitManager(client)
             analytics_processor = CustomerAnalytics(client)
 
             # Handle introspection actions
@@ -1948,6 +3040,7 @@ class CustomerManagement(ToolBase):
                                 "teams",
                             ],
                             "usage": "list(resource_type='organizations')",
+                            "org_units": "Org units (departments) have their own read-only action: list_org_units()",
                             "example_calls": [
                                 "list(resource_type='organizations')",
                                 "list(resource_type='subscribers')",
@@ -2281,6 +3374,128 @@ class CustomerManagement(ToolBase):
                     )
                 ]
 
+            # Team PR-health threshold settings (a sub-resource of teams)
+            elif action == "get_pr_health_settings":
+                result = await team_manager.get_pr_health_settings(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"PR health settings for team {result['team_id']}:\n\n"
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "update_pr_health_settings":
+                result = await team_manager.update_pr_health_settings(arguments)
+                text = f"PR health settings updated for team {result['team_id']}:\n\n"
+                # A divergence between the pair sent and the pair stored is a lost-update
+                # signal, so it leads the rendered text instead of sitting in the JSON.
+                pr_divergence = result.get("divergence_warning")
+                if pr_divergence:
+                    text += f"WARNING: {pr_divergence}\n\n"
+                if result.get("read_merged"):
+                    # Naming what was carried over keeps the write auditable: the caller
+                    # sent one threshold but a complete pair reached the API.
+                    text += (
+                        "Read-merged from the current settings (the PUT takes both fields): "
+                        + ", ".join(result["read_merged"])
+                        + "\n\n"
+                    )
+                return [
+                    TextContent(
+                        type="text",
+                        text=text
+                        + json.dumps(result, indent=2)
+                        + f"\n\n{PR_HEALTH_REPORT_NOTE}",
+                    )
+                ]
+            # Team attribution identity policy (a sub-resource of teams)
+            elif action == "get_attribution_identity_policy":
+                result = await team_manager.get_attribution_identity_policy(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            "Effective attribution identity policy for team "
+                            f"{result['team_id']}:\n\n"
+                        )
+                        + json.dumps(result, indent=2)
+                        + f"\n\n{ATTRIBUTION_POLICY_EFFECTIVE_NOTE}",
+                    )
+                ]
+
+            elif action == "update_attribution_identity_policy":
+                result = await team_manager.update_attribution_identity_policy(arguments)
+                text = (
+                    "Attribution identity policy updated for team "
+                    f"{result['team_id']}:\n\n"
+                )
+                # A stored value different from the value sent means the write did not
+                # land as asked, so it leads the rendered text instead of sitting in
+                # the JSON.
+                policy_divergence = result.get("divergence_warning")
+                if policy_divergence:
+                    text += f"WARNING: {policy_divergence}\n\n"
+                return [
+                    TextContent(
+                        type="text",
+                        text=text
+                        + json.dumps(result, indent=2)
+                        + f"\n\n{ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE}",
+                    )
+                ]
+
+            # Team verified domains (a sub-resource of teams)
+            elif action == "list_verified_domains":
+                result = await team_manager.list_verified_domains(arguments)
+                text = f"Verified domains for team {result['team_id']}:\n\n"
+                # An unreadable listing must not be mistaken for an empty one - under
+                # the strict policy the two have opposite consequences.
+                domain_warning = result.get("warning")
+                if domain_warning:
+                    text += f"WARNING: {domain_warning}\n\n"
+                return [
+                    TextContent(
+                        type="text",
+                        text=text
+                        + json.dumps(result, indent=2)
+                        + f"\n\n{ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE}",
+                    )
+                ]
+
+            elif action == "add_verified_domain":
+                result = await team_manager.add_verified_domain(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            f"Verified domain {result['domain']} added to team "
+                            f"{result['team_id']}:\n\n"
+                        )
+                        + json.dumps(result, indent=2)
+                        + f"\n\n{VERIFIED_DOMAIN_ADD_SEMANTICS_NOTE}",
+                    )
+                ]
+
+            elif action == "remove_verified_domain":
+                result = await team_manager.remove_verified_domain(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            f"Verified domain {result['domain']} removed from team "
+                            f"{result['team_id']}:\n\n"
+                        )
+                        + json.dumps(result, indent=2)
+                        + f"\n\n{VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE}",
+                    )
+                ]
+
+            # Org-unit (department) lookup - read-only
+            elif action == "list_org_units":
+                result = await org_unit_manager.list_org_units(arguments)
+                return [TextContent(type="text", text=_format_org_units_text(result))]
+
             # Analytics and relationship operations
             elif action == "analyze":
                 result = await analytics_processor.analyze_customers(arguments)
@@ -2375,7 +3590,15 @@ class CustomerManagement(ToolBase):
                         "team_settings_actions": [
                             "get_marketplace_settings",
                             "update_marketplace_settings",
+                            "get_pr_health_settings",
+                            "update_pr_health_settings",
+                            "get_attribution_identity_policy",
+                            "update_attribution_identity_policy",
+                            "list_verified_domains",
+                            "add_verified_domain",
+                            "remove_verified_domain",
                         ],
+                        "org_unit_actions": ["list_org_units"],
                         "analysis_actions": ["analyze", "get_relationships"],
                         "discovery_actions": [
                             "get_capabilities",
@@ -2391,8 +3614,16 @@ class CustomerManagement(ToolBase):
                             "get_subscriber": "get(resource_type='subscribers', subscriber_id='sub_123')",
                             "lookup_subscriber": "lookup_subscriber(email='joao@acme.com')",
                             "lookup_user": "lookup_user(email='admin@acme.com')",
+                            "list_org_units": "list_org_units()",
                             "get_marketplace_settings": "get_marketplace_settings(team_id='jR2kmLs')",
                             "update_marketplace_settings": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'], operation='add')",
+                            "get_pr_health_settings": "get_pr_health_settings(team_id='jR2kmLs')",
+                            "update_pr_health_settings": "update_pr_health_settings(team_id='jR2kmLs', aging_days=14, rotting_days=30)",
+                            "get_attribution_identity_policy": "get_attribution_identity_policy(team_id='jR2kmLs')",
+                            "update_attribution_identity_policy": "update_attribution_identity_policy(team_id='jR2kmLs', policy='ALLOW_SELF_ASSERTED_UNVERIFIED')",
+                            "list_verified_domains": "list_verified_domains(team_id='jR2kmLs')",
+                            "add_verified_domain": "add_verified_domain(team_id='jR2kmLs', domain='acme.com')",
+                            "remove_verified_domain": "remove_verified_domain(team_id='jR2kmLs', domain='acme.com')",
                         },
                     },
                 )
@@ -2505,6 +3736,43 @@ class CustomerManagement(ToolBase):
         result_text += f"- **Side effect**: {MARKETPLACE_RECLASSIFICATION_NOTE}\n"
         result_text += "- Updates require team-management permissions on the target team\n"
         result_text += f"- **Limitation**: {MARKETPLACE_CONCURRENCY_NOTE}\n\n"
+
+        result_text += "## **Team PR-Health Settings**\n"
+        result_text += "The inactivity thresholds behind the PR-health report's aging/rotting labels.\n\n"
+        result_text += "- `get_pr_health_settings(team_id='jR2kmLs')` - read the effective `agingDays` / `rottingDays`\n"
+        result_text += "- `update_pr_health_settings(team_id='jR2kmLs', aging_days=14, rotting_days=30)` - name one threshold and the other is read-merged from the current settings\n"
+        result_text += f"- **Semantics**: {PR_HEALTH_SEMANTICS_NOTE}\n"
+        result_text += f"- **Bounds**: {PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS} days each, with `aging_days` lower than `rotting_days`\n"
+        result_text += f"- **Why both fields are sent**: {PR_HEALTH_FULL_REPLACEMENT_NOTE}\n"
+        result_text += "- Updates require team-management permissions on the target team\n"
+        result_text += f"- **Limitation**: {PR_HEALTH_CONCURRENCY_NOTE}\n"
+        result_text += f"- **Downstream**: {PR_HEALTH_REPORT_NOTE}\n\n"
+        result_text += "## **Team Attribution Identity Policy**\n"
+        result_text += "Whether coding-assistant identity assertions from unverified email domains are honoured.\n\n"
+        result_text += "- `get_attribution_identity_policy(team_id='jR2kmLs')` - read the **effective** policy in force\n"
+        result_text += "- `update_attribution_identity_policy(team_id='jR2kmLs', policy='ALLOW_SELF_ASSERTED_UNVERIFIED')` - set it explicitly\n"
+        result_text += f"- **Known values**: {', '.join(ATTRIBUTION_POLICY_KNOWN_VALUES)} - {ATTRIBUTION_POLICY_VERBATIM_NOTE}\n"
+        result_text += f"- **Effective vs configured**: {ATTRIBUTION_POLICY_EFFECTIVE_NOTE}\n"
+        result_text += f"- **Permissions**: {ATTRIBUTION_POLICY_PRIVILEGE_NOTE}\n\n"
+
+        result_text += "## **Team Verified Domains**\n"
+        result_text += "The email domains the strict attribution policy is checked against.\n\n"
+        result_text += "- `list_verified_domains(team_id='jR2kmLs')` - every recorded `domain` with its `source` and `joinPolicy`\n"
+        result_text += "- `add_verified_domain(team_id='jR2kmLs', domain='acme.com')` - add ONE domain\n"
+        result_text += "- `remove_verified_domain(team_id='jR2kmLs', domain='acme.com')` - remove ONE domain\n"
+        result_text += f"- **Not a list replacement**: {VERIFIED_DOMAIN_ADD_SEMANTICS_NOTE}\n"
+        result_text += f"- **Fixed fields**: {VERIFIED_DOMAIN_FIXED_FIELDS_NOTE}\n"
+        result_text += f"- **Permissions (list/remove)**: {VERIFIED_DOMAIN_TENANT_PRIVILEGE_NOTE}\n"
+        result_text += f"- **Permissions (add)**: {VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE}\n"
+        result_text += f"- **Together**: {ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE}\n\n"
+
+        result_text += "## **Org Units (Departments)**\n"
+        result_text += "Read-only lookup that resolves a department name to the id the `ORG_UNIT` filter dimension expects.\n\n"
+        result_text += "- `list_org_units()` - every active org unit for the caller's team/organization\n"
+        result_text += "- `list_org_units(team_id='jR2kmLs')` - restrict the listing to one team\n"
+        result_text += "- Each unit reports `name`, `id`, `parentId`, `path` (materialized ancestor-id path, e.g. `/12/40/173/`) and `source`\n"
+        result_text += f"- **Types**: {ORG_UNIT_ID_STRING_NOTE}\n"
+        result_text += "- Org units are created and imported in the Revenium UI; this tool cannot create, change or delete them\n\n"
 
         result_text += "## **Business Rules**\n"
         for rule in capabilities.get("business_rules", []):
@@ -2770,9 +4038,24 @@ class CustomerManagement(ToolBase):
                 "example": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'], operation='add')",
             },
             {
+                "title": "Tune the PR-Health Thresholds",
+                "description": "Change how many days of inactivity make an open pull request aging or rotting for a team, reshaping every figure in the PR-health report",
+                "example": "update_pr_health_settings(team_id='jR2kmLs', aging_days=14, rotting_days=30)",
+            },
+            {
+                "title": "Loosen the Attribution Identity Policy",
+                "description": "Accept coding-assistant identity assertions from unverified domains, instead of only from the team's verified-domain list",
+                "example": "update_attribution_identity_policy(team_id='jR2kmLs', policy='ALLOW_SELF_ASSERTED_UNVERIFIED')",
+            },
+            {
+                "title": "See Which Domains the Strict Policy Accepts",
+                "description": "List the team's verified domains - under VERIFIED_DOMAIN_ONLY these are the only domains whose identity assertions are honoured",
+                "example": "list_verified_domains(team_id='jR2kmLs')",
+            },
+            {
                 "title": "Customer Analytics",
                 "description": "Analyze customer data and activity patterns",
-                "example": "analyze(resource_type='users', filters={'status': 'active'})",
+                "example": "analyze(resource_type='users', filters={'query': 'acme'})",
             },
             {
                 "title": "Update Customer Data",
@@ -2897,6 +4180,129 @@ class CustomerManagement(ToolBase):
                 ],
             ),
             ToolCapability(
+                name="Team PR-Health Settings",
+                description=(
+                    "Read and change the team's PR-health thresholds: how many days of "
+                    "INACTIVITY (not age) make an open pull request aging or rotting. The "
+                    "thresholds reshape every figure in the PR-health report, which is read "
+                    "with business_analytics_management get_pr_health."
+                ),
+                parameters={
+                    "get_pr_health_settings": {"team_id": "str (required)"},
+                    "update_pr_health_settings": {
+                        "team_id": "str (required)",
+                        "aging_days": f"int ({PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS}, optional when rotting_days is given)",
+                        "rotting_days": f"int ({PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS}, optional when aging_days is given)",
+                    },
+                },
+                examples=[
+                    "get_pr_health_settings(team_id='jR2kmLs')",
+                    "update_pr_health_settings(team_id='jR2kmLs', aging_days=14, rotting_days=30)",
+                    "update_pr_health_settings(team_id='jR2kmLs', rotting_days=21)",
+                ],
+                limitations=[
+                    "Updates require team-management permissions on the target team",
+                    f"Both thresholds are bounded to {PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS} days and aging_days must be lower than rotting_days",
+                    PR_HEALTH_FULL_REPLACEMENT_NOTE,
+                    PR_HEALTH_CONCURRENCY_NOTE,
+                    "When a stored threshold comes back different from the one sent, the response carries divergence_warning naming the fields the interleaved write changed",
+                    PR_HEALTH_SEMANTICS_NOTE,
+                ],
+            ),
+            ToolCapability(
+                name="Team Attribution Identity Policy",
+                description=(
+                    "Read and set the rule that decides whether a coding assistant's "
+                    "identity assertion is honoured when it comes from an email domain "
+                    "nobody has verified. The read reports the EFFECTIVE policy: the "
+                    "platform substitutes the strict VERIFIED_DOMAIN_ONLY when the team "
+                    "has never stored a choice, so a strict answer can mean 'nobody "
+                    "decided' rather than 'somebody chose strict'."
+                ),
+                parameters={
+                    "get_attribution_identity_policy": {"team_id": "str (required)"},
+                    "update_attribution_identity_policy": {
+                        "team_id": "str (required)",
+                        "policy": (
+                            "str (required - sent verbatim; known values "
+                            + ", ".join(ATTRIBUTION_POLICY_KNOWN_VALUES)
+                            + ")"
+                        ),
+                    },
+                },
+                examples=[
+                    "get_attribution_identity_policy(team_id='jR2kmLs')",
+                    "update_attribution_identity_policy(team_id='jR2kmLs', policy='ALLOW_SELF_ASSERTED_UNVERIFIED')",
+                    "update_attribution_identity_policy(team_id='jR2kmLs', policy='VERIFIED_DOMAIN_ONLY')",
+                ],
+                limitations=[
+                    ATTRIBUTION_POLICY_PRIVILEGE_NOTE,
+                    ATTRIBUTION_POLICY_EFFECTIVE_NOTE,
+                    ATTRIBUTION_POLICY_VERBATIM_NOTE,
+                    ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE,
+                ],
+            ),
+            ToolCapability(
+                name="Team Verified Domains",
+                description=(
+                    "List, add and remove the email domains the attribution identity "
+                    "policy is checked against. The add is a platform-operations action "
+                    "rather than a customer one, because the platform does not verify "
+                    "ownership: an unverified add could claim any unclaimed business "
+                    "domain and route its future signups."
+                ),
+                parameters={
+                    "list_verified_domains": {"team_id": "str (required)"},
+                    "add_verified_domain": {
+                        "team_id": "str (required)",
+                        "domain": "str (required - one bare email domain, e.g. 'acme.com')",
+                    },
+                    "remove_verified_domain": {
+                        "team_id": "str (required)",
+                        "domain": "str (required - one bare email domain)",
+                    },
+                },
+                examples=[
+                    "list_verified_domains(team_id='jR2kmLs')",
+                    "add_verified_domain(team_id='jR2kmLs', domain='acme.com')",
+                    "remove_verified_domain(team_id='jR2kmLs', domain='acme.com')",
+                ],
+                limitations=[
+                    VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE,
+                    VERIFIED_DOMAIN_TENANT_PRIVILEGE_NOTE,
+                    VERIFIED_DOMAIN_ADD_SEMANTICS_NOTE,
+                    VERIFIED_DOMAIN_FIXED_FIELDS_NOTE,
+                    "Adding a domain records an administrator's assertion - the platform "
+                    "performs no DNS or ownership check",
+                    ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE,
+                ],
+            ),
+            ToolCapability(
+                name="Org Unit (Department) Lookup",
+                description=(
+                    "List the organization's active org units (departments) to resolve a "
+                    "department name to the id the ORG_UNIT dimension expects. ORG_UNIT is "
+                    "accepted as a filter dimension by insight runs, department cost "
+                    "controls and group previews, and this is the only action that produces "
+                    "the id those filters take."
+                ),
+                parameters={
+                    "list_org_units": {
+                        "team_id": "str (optional - defaults to the caller's team/organization)"
+                    },
+                },
+                examples=[
+                    "list_org_units()",
+                    "list_org_units(team_id='jR2kmLs')",
+                ],
+                limitations=[
+                    "Read-only: org units are created and imported in the Revenium UI, not through this tool",
+                    "Only active org units are returned",
+                    ORG_UNIT_ID_STRING_NOTE,
+                    "Hierarchy is expressed by parentId and the materialized path (e.g. /12/40/173/, ancestors first, unit last)",
+                ],
+            ),
+            ToolCapability(
                 name="Customer Analytics",
                 description="Analyze customer data and relationships",
                 parameters={
@@ -2904,7 +4310,7 @@ class CustomerManagement(ToolBase):
                     "get_relationships": {"resource_type": "str", "resource_id": "str"},
                 },
                 examples=[
-                    "analyze(resource_type='users', filters={'status': 'active'})",
+                    "analyze(resource_type='users', filters={'query': 'acme'})",
                     "get_relationships(resource_type='organizations', resource_id='org_123')",
                 ],
             ),
@@ -3000,6 +4406,14 @@ class CustomerManagement(ToolBase):
             "delete",
             "get_marketplace_settings",
             "update_marketplace_settings",
+            "get_pr_health_settings",
+            "update_pr_health_settings",
+            "get_attribution_identity_policy",
+            "update_attribution_identity_policy",
+            "list_verified_domains",
+            "add_verified_domain",
+            "remove_verified_domain",
+            "list_org_units",
             "analyze",
             "get_capabilities",
             "get_examples",
@@ -3016,15 +4430,131 @@ class CustomerManagement(ToolBase):
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": await self._get_supported_actions()},
-                "name": {
+                "resource_type": {
                     "type": "string",
-                    "description": "Customer name - the only field users need to provide",
+                    "description": (
+                        "Which customer resource the action targets (users, "
+                        "subscribers, organizations, teams); inferred from context "
+                        "when omitted"
+                    ),
+                },
+                "resource_data": {
+                    "type": "object",
+                    "description": (
+                        "The resource fields for create/update. For creates, name is "
+                        "the key field — email/firstName/lastName are auto-generated "
+                        "from it when auto_generate is on. This matches the registered "
+                        "tool signature: there is no top-level name parameter."
+                    ),
+                },
+                "team_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional team scope for list_org_units; omitted, the "
+                        "ambient team from the auth config (or the caller's own "
+                        "organization) is used. Required by every team-settings "
+                        "action, which addresses the team explicitly"
+                    ),
+                },
+                "policy": {
+                    "type": "string",
+                    "description": (
+                        "The attribution identity policy for "
+                        "update_attribution_identity_policy. Sent verbatim - no local "
+                        "enum gates it - so a value the platform adds later works "
+                        "without a client change. Known values: "
+                        + ", ".join(ATTRIBUTION_POLICY_KNOWN_VALUES)
+                    ),
+                },
+                "domain": {
+                    "type": "string",
+                    "description": (
+                        "One bare email domain (e.g. 'acme.com') for "
+                        "add_verified_domain / remove_verified_domain. Each call "
+                        "carries a single domain; the add is not a list replacement"
+                    ),
                 },
                 # Note: email, firstName, lastName auto-generated from name
-                # Note: ownerId, teamId system-managed
+                # Note: ownerId, teamId system-managed for customer resources
                 # Note: resource_type determined from context
             },
-            "required": ["action", "name"],  # Context7: User-centric only
+            # `action` alone is genuinely universal. The old top-level `name` was
+            # fiction relative to the runtime surface: the registered closure only
+            # accepts `resource_data`, and the create handlers read the name from
+            # inside it — so requiring (or even declaring) a top-level name steered
+            # metadata-driven clients into calls the tool cannot accept. The create
+            # requirement is expressed conditionally against the container the
+            # closure actually takes.
+            "required": ["action"],
+            "allOf": [
+                # The create requirement is per resource type, matching the
+                # runtime exactly: organizations/teams key on name, while
+                # users/subscribers are email-keyed (auto-generation derives
+                # firstName from the email prefix). Requiring name globally
+                # forced email-based creates to invent one; requiring only the
+                # container blessed empty payloads that failed at execution.
+                {
+                    "if": {
+                        "properties": {"action": {"const": "create"}},
+                        "required": ["action"],
+                    },
+                    "then": {
+                        "required": ["resource_data"],
+                        "properties": {
+                            "resource_data": {"type": "object", "minProperties": 1}
+                        },
+                    },
+                },
+                # Omitted resource_type is not neutral: handle_action defaults it
+                # to organizations, so an untyped create is an organization create
+                # and must carry name like an explicit one.
+                {
+                    "if": {
+                        "properties": {"action": {"const": "create"}},
+                        "required": ["action"],
+                        "not": {"required": ["resource_type"]},
+                    },
+                    "then": {
+                        "properties": {
+                            "resource_data": {"type": "object", "required": ["name"]}
+                        }
+                    },
+                },
+                {
+                    "if": {
+                        "properties": {
+                            "action": {"const": "create"},
+                            "resource_type": {"enum": ["organizations", "teams"]},
+                        },
+                        "required": ["action", "resource_type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "resource_data": {"type": "object", "required": ["name"]}
+                        }
+                    },
+                },
+                {
+                    "if": {
+                        "properties": {
+                            "action": {"const": "create"},
+                            "resource_type": {"enum": ["users", "subscribers"]},
+                        },
+                        "required": ["action", "resource_type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "resource_data": {
+                                "type": "object",
+                                "anyOf": [
+                                    {"required": ["email"]},
+                                    {"required": ["name"]},
+                                ],
+                            }
+                        }
+                    },
+                }
+            ],
         }
 
     async def _get_tool_dependencies(self) -> List[ToolDependency]:
@@ -3106,7 +4636,7 @@ class CustomerManagement(ToolBase):
                 description="Analyze customer relationships and metrics",
                 frequency=0.5,
                 typical_sequence=["analyze", "get_relationships"],
-                common_parameters={"filters": {"status": "active"}},
+                common_parameters={"filters": {"query": "acme"}},
                 success_indicators=["Analytics generated", "Relationships mapped"],
             ),
         ]

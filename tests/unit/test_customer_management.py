@@ -5,22 +5,42 @@ TeamManager, CustomerValidator, CustomerAnalytics, and BaseManager classes.
 Focuses on CRUD operations, validation logic, error handling, and action routing.
 """
 
+import json
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.tools_decomposed.customer_management import (
+    ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE,
+    ATTRIBUTION_POLICY_EFFECTIVE_NOTE,
+    ATTRIBUTION_POLICY_PRIVILEGE_NOTE,
+    ATTRIBUTION_POLICY_VERBATIM_NOTE,
     MARKETPLACE_CONCURRENCY_NOTE,
     MARKETPLACE_DIVERGENCE_NOTE,
     MARKETPLACE_RECLASSIFICATION_NOTE,
     MARKETPLACE_SETTINGS_EXAMPLE,
+    PR_HEALTH_CONCURRENCY_NOTE,
+    PR_HEALTH_DIVERGENCE_NOTE,
+    PR_HEALTH_REPORT_NOTE,
+    PR_HEALTH_SEMANTICS_NOTE,
+    ORG_UNIT_ID_STRING_NOTE,
+    ORG_UNIT_UNEXPECTED_SHAPE_NOTE,
+    VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE,
+    VERIFIED_DOMAIN_ADD_SEMANTICS_NOTE,
+    VERIFIED_DOMAIN_FIXED_FIELDS_NOTE,
+    VERIFIED_DOMAIN_TENANT_PRIVILEGE_NOTE,
+    VERIFIED_DOMAIN_UNEXPECTED_SHAPE_NOTE,
     BaseManager,
     CustomerAnalytics,
     CustomerManagement,
     CustomerValidator,
+    OrgUnitManager,
     OrganizationManager,
     SubscriberManager,
     TeamManager,
     UserManager,
+    _format_org_units_text,
+    org_unit_id_to_filter_value,
 )
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
@@ -79,6 +99,26 @@ def mock_client():
     client.update_team_marketplace_settings = AsyncMock(
         return_value={"internalMarketplaceNames": []}
     )
+    client.get_team_pr_health_settings = AsyncMock(
+        return_value={"agingDays": 14, "rottingDays": 30}
+    )
+    client.update_team_pr_health_settings = AsyncMock(
+        return_value={"agingDays": 14, "rottingDays": 30}
+    )
+    client.get_team_attribution_identity_policy = AsyncMock(
+        return_value={"policy": "VERIFIED_DOMAIN_ONLY"}
+    )
+    client.update_team_attribution_identity_policy = AsyncMock(
+        return_value={"policy": "VERIFIED_DOMAIN_ONLY"}
+    )
+    client.list_team_verified_domains = AsyncMock(return_value=[])
+    client.add_team_verified_domain = AsyncMock(
+        return_value={"domain": "acme.com", "source": "ADMIN", "joinPolicy": "REQUEST"}
+    )
+    client.remove_team_verified_domain = AsyncMock(return_value={})
+
+    # Org-unit methods
+    client.get_org_units = AsyncMock(return_value=[])
 
     # Helpers
     client._extract_embedded_data = MagicMock(return_value=[])
@@ -107,6 +147,11 @@ def org_manager(mock_client):
 @pytest.fixture
 def team_manager(mock_client):
     return TeamManager(mock_client)
+
+
+@pytest.fixture
+def org_unit_manager(mock_client):
+    return OrgUnitManager(mock_client)
 
 
 @pytest.fixture
@@ -1453,8 +1498,1329 @@ class TestTeamMarketplaceSettingsUpdate:
 
 
 # ===========================================================================
+# Team PR-Health Settings Tests
+# ===========================================================================
+
+
+class TestTeamPrHealthSettingsRead:
+    """TeamManager.get_pr_health_settings."""
+
+    @pytest.mark.asyncio
+    async def test_missing_team_id_raises_before_any_call(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_pr_health_settings({})
+        assert exc.value.field == "team_id"
+        mock_client.get_team_pr_health_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_the_effective_thresholds(self, team_manager, mock_client):
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+
+        result = await team_manager.get_pr_health_settings({"team_id": "jR2kmLs"})
+
+        assert result["team_id"] == "jR2kmLs"
+        assert result["agingDays"] == 14
+        assert result["rottingDays"] == 30
+        mock_client.get_team_pr_health_settings.assert_called_once_with("jR2kmLs")
+
+    @pytest.mark.asyncio
+    async def test_states_the_thresholds_measure_inactivity(self, team_manager, mock_client):
+        """Relabelling inactivity as age inverts the signal, so the read says which it is."""
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        result = await team_manager.get_pr_health_settings({"team_id": "jR2kmLs"})
+        assert result["semantics"] == PR_HEALTH_SEMANTICS_NOTE
+        assert "INACTIVITY" in PR_HEALTH_SEMANTICS_NOTE
+
+    @pytest.mark.asyncio
+    async def test_absent_threshold_reads_as_none_not_a_fabricated_default(
+        self, team_manager, mock_client
+    ):
+        """The 14/30 defaults are the server's; inventing them client-side would
+        report a threshold the platform never confirmed."""
+        mock_client.get_team_pr_health_settings.return_value = {"agingDays": 14}
+
+        result = await team_manager.get_pr_health_settings({"team_id": "jR2kmLs"})
+
+        assert result["agingDays"] == 14
+        assert result["rottingDays"] is None
+
+    @pytest.mark.asyncio
+    async def test_403_maps_to_authorization_error(self, team_manager, mock_client):
+        mock_client.get_team_pr_health_settings.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_pr_health_settings({"team_id": "jR2kmLs"})
+        assert exc.value.error_code == ErrorCodes.API_AUTHORIZATION
+
+    @pytest.mark.asyncio
+    async def test_404_maps_to_not_found(self, team_manager, mock_client):
+        mock_client.get_team_pr_health_settings.side_effect = ReveniumAPIError(
+            "Not found", status_code=404
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_pr_health_settings({"team_id": "bad"})
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_500_reraises(self, team_manager, mock_client):
+        mock_client.get_team_pr_health_settings.side_effect = ReveniumAPIError(
+            "Boom", status_code=500
+        )
+        with pytest.raises(ReveniumAPIError):
+            await team_manager.get_pr_health_settings({"team_id": "jR2kmLs"})
+
+
+class TestTeamPrHealthSettingsUpdate:
+    """TeamManager.update_pr_health_settings — the read-merge-then-PUT write path."""
+
+    @pytest.mark.asyncio
+    async def test_missing_team_id_raises_before_any_call(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_settings({"aging_days": 7})
+        assert exc.value.field == "team_id"
+        mock_client.get_team_pr_health_settings.assert_not_called()
+        mock_client.update_team_pr_health_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_threshold_supplied_raises(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_settings({"team_id": "jR2kmLs"})
+        assert exc.value.field in ("aging_days", "rotting_days")
+        mock_client.update_team_pr_health_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", [0, 366, -1, 1000])
+    async def test_out_of_bounds_threshold_rejected_locally(
+        self, team_manager, mock_client, bad
+    ):
+        """@Min(1)/@Max(365) are mirrored so the caller sees the real constraint
+        instead of an opaque upstream 400."""
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_settings(
+                {"team_id": "jR2kmLs", "aging_days": bad, "rotting_days": 30}
+            )
+        assert exc.value.field == "aging_days"
+        assert "365" in str(exc.value.message) or "365" in str(exc.value.suggestions)
+        mock_client.get_team_pr_health_settings.assert_not_called()
+        mock_client.update_team_pr_health_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", ["14", 7.5, True])
+    async def test_non_integer_threshold_rejected(self, team_manager, mock_client, bad):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_settings(
+                {"team_id": "jR2kmLs", "rotting_days": bad, "aging_days": 7}
+            )
+        assert exc.value.field == "rotting_days"
+        mock_client.update_team_pr_health_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_explicit_none_means_leave_this_threshold_alone(
+        self, team_manager, mock_client
+    ):
+        """Agents routinely fill unspecified optional arguments with null; that must
+        read as "not supplied", not as an attempt to clear a non-nullable field."""
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        mock_client.update_team_pr_health_settings.return_value = {
+            "agingDays": 7,
+            "rottingDays": 30,
+        }
+
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "aging_days": 7, "rotting_days": None}
+        )
+
+        mock_client.update_team_pr_health_settings.assert_called_once_with(
+            "jR2kmLs", {"agingDays": 7, "rottingDays": 30}
+        )
+        assert result["read_merged"] == ["rottingDays"]
+
+    @pytest.mark.asyncio
+    async def test_aging_equal_to_rotting_rejected_before_the_put(
+        self, team_manager, mock_client
+    ):
+        """The server enforces agingDays < rottingDays; mirrored as a pre-check."""
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_settings(
+                {"team_id": "jR2kmLs", "aging_days": 30, "rotting_days": 30}
+            )
+        assert exc.value.error_code == ErrorCodes.VALIDATION_ERROR
+        assert "aging" in exc.value.message.lower()
+        mock_client.update_team_pr_health_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_aging_greater_than_rotting_rejected_before_the_put(
+        self, team_manager, mock_client
+    ):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_settings(
+                {"team_id": "jR2kmLs", "aging_days": 40, "rotting_days": 30}
+            )
+        assert exc.value.error_code == ErrorCodes.VALIDATION_ERROR
+        mock_client.update_team_pr_health_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_merged_pair_rejected_when_the_read_value_conflicts(
+        self, team_manager, mock_client
+    ):
+        """The ordering rule applies to the merged pair, not just to what was typed."""
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_settings(
+                {"team_id": "jR2kmLs", "aging_days": 45}
+            )
+        assert exc.value.error_code == ErrorCodes.VALIDATION_ERROR
+        mock_client.update_team_pr_health_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_one_field_update_read_merges_the_other(self, team_manager, mock_client):
+        """A one-field PUT fails deserialization upstream, so the missing half is
+        read from the current settings and sent alongside."""
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        mock_client.update_team_pr_health_settings.return_value = {
+            "agingDays": 7,
+            "rottingDays": 30,
+        }
+
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "aging_days": 7}
+        )
+
+        mock_client.get_team_pr_health_settings.assert_called_once_with("jR2kmLs")
+        mock_client.update_team_pr_health_settings.assert_called_once_with(
+            "jR2kmLs", {"agingDays": 7, "rottingDays": 30}
+        )
+        assert result["agingDays"] == 7
+        assert result["rottingDays"] == 30
+        assert result["previous_agingDays"] == 14
+        assert result["previous_rottingDays"] == 30
+
+    @pytest.mark.asyncio
+    async def test_both_fields_supplied_still_sends_the_complete_pair(
+        self, team_manager, mock_client
+    ):
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        mock_client.update_team_pr_health_settings.return_value = {
+            "agingDays": 3,
+            "rottingDays": 10,
+        }
+
+        await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "aging_days": 3, "rotting_days": 10}
+        )
+
+        mock_client.update_team_pr_health_settings.assert_called_once_with(
+            "jR2kmLs", {"agingDays": 3, "rottingDays": 10}
+        )
+
+    @pytest.mark.asyncio
+    async def test_unreadable_missing_half_raises_instead_of_guessing(
+        self, team_manager, mock_client
+    ):
+        """When the read cannot supply the other threshold, ask for it — a guessed
+        default would silently rewrite a threshold the caller never named."""
+        mock_client.get_team_pr_health_settings.return_value = {"agingDays": 14}
+
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_settings(
+                {"team_id": "jR2kmLs", "aging_days": 7}
+            )
+
+        assert exc.value.field == "rotting_days"
+        mock_client.update_team_pr_health_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_response_reports_the_report_impact(self, team_manager, mock_client):
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        mock_client.update_team_pr_health_settings.return_value = {
+            "agingDays": 7,
+            "rottingDays": 30,
+        }
+
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "aging_days": 7}
+        )
+
+        assert result["report_impact"] == PR_HEALTH_REPORT_NOTE
+        assert result["semantics"] == PR_HEALTH_SEMANTICS_NOTE
+
+    @pytest.mark.asyncio
+    async def test_echoed_pair_wins_over_the_pair_sent(self, team_manager, mock_client):
+        """The API echoes the stored resource; that is what actually landed."""
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        mock_client.update_team_pr_health_settings.return_value = {
+            "agingDays": 7,
+            "rottingDays": 21,
+        }
+
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "aging_days": 7}
+        )
+
+        assert result["requested_rottingDays"] == 30
+        assert result["rottingDays"] == 21
+
+    @pytest.mark.asyncio
+    async def test_403_on_the_write_maps_to_authorization_error(
+        self, team_manager, mock_client
+    ):
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        mock_client.update_team_pr_health_settings.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_settings(
+                {"team_id": "jR2kmLs", "aging_days": 7}
+            )
+        assert exc.value.error_code == ErrorCodes.API_AUTHORIZATION
+
+
+class TestTeamPrHealthSettingsConcurrency:
+    """BACK-2768 review: update_pr_health_settings performs the same unversioned
+    read-merge-PUT the marketplace settings do, so it carries the same two
+    safeguards — a standing note that the sequence is not atomic, and a
+    divergence warning when the echoed pair disagrees with the pair sent."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            {"team_id": "jR2kmLs", "aging_days": 7},
+            {"team_id": "jR2kmLs", "rotting_days": 21},
+            {"team_id": "jR2kmLs", "aging_days": 7, "rotting_days": 21},
+        ],
+    )
+    async def test_concurrency_note_on_every_update_response(
+        self, team_manager, mock_client, arguments
+    ):
+        """The read-then-PUT is never atomic, whichever fields the caller named."""
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        mock_client.update_team_pr_health_settings.return_value = {
+            "agingDays": arguments.get("aging_days", 14),
+            "rottingDays": arguments.get("rotting_days", 30),
+        }
+
+        result = await team_manager.update_pr_health_settings(dict(arguments))
+
+        assert result["concurrency_note"] == PR_HEALTH_CONCURRENCY_NOTE
+
+    @pytest.mark.asyncio
+    async def test_divergence_warning_when_echo_differs_from_merged(
+        self, team_manager, mock_client
+    ):
+        """An echoed threshold that is not the one sent is the only in-band
+        evidence that another write landed between the read and the PUT."""
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        mock_client.update_team_pr_health_settings.return_value = {
+            "agingDays": 7,
+            "rottingDays": 45,
+        }
+
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "aging_days": 7}
+        )
+
+        assert result["divergence_warning"] == PR_HEALTH_DIVERGENCE_NOTE
+        assert result["diverged_fields"] == ["rottingDays"]
+        assert result["divergence_detail"] == {
+            "rottingDays": {"sent": 30, "stored": 45}
+        }
+
+    @pytest.mark.asyncio
+    async def test_divergence_warning_names_both_fields_when_both_differ(
+        self, team_manager, mock_client
+    ):
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        mock_client.update_team_pr_health_settings.return_value = {
+            "agingDays": 2,
+            "rottingDays": 9,
+        }
+
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "aging_days": 7, "rotting_days": 21}
+        )
+
+        assert result["diverged_fields"] == ["agingDays", "rottingDays"]
+        assert result["divergence_detail"]["agingDays"] == {"sent": 7, "stored": 2}
+        assert result["divergence_detail"]["rottingDays"] == {"sent": 21, "stored": 9}
+
+    @pytest.mark.asyncio
+    async def test_no_divergence_warning_when_the_echo_matches(
+        self, team_manager, mock_client
+    ):
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        mock_client.update_team_pr_health_settings.return_value = {
+            "agingDays": 7,
+            "rottingDays": 30,
+        }
+
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "aging_days": 7}
+        )
+
+        assert "divergence_warning" not in result
+        assert "diverged_fields" not in result
+
+    @pytest.mark.asyncio
+    async def test_absent_echo_is_not_treated_as_divergence(
+        self, team_manager, mock_client
+    ):
+        """A field the echo omits is unknown, not changed — only a value that came
+        back different evidences an interleaved write."""
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        mock_client.update_team_pr_health_settings.return_value = {"agingDays": 7}
+
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "aging_days": 7}
+        )
+
+        assert "divergence_warning" not in result
+        assert result["rottingDays"] == 30
+
+    @pytest.mark.asyncio
+    async def test_one_field_update_still_merges_and_keeps_the_note(
+        self, team_manager, mock_client
+    ):
+        """The safeguards do not change the advertised contract: naming one
+        threshold still read-merges the other rather than demanding both."""
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        mock_client.update_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 21,
+        }
+
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "rotting_days": 21}
+        )
+
+        mock_client.update_team_pr_health_settings.assert_called_once_with(
+            "jR2kmLs", {"agingDays": 14, "rottingDays": 21}
+        )
+        assert result["read_merged"] == ["agingDays"]
+        assert result["concurrency_note"] == PR_HEALTH_CONCURRENCY_NOTE
+
+    @pytest.mark.asyncio
+    async def test_divergence_leads_the_rendered_text(self, mock_client):
+        """A lost update is the headline, not a JSON field the caller may skim past."""
+        tool = CustomerManagement(ucm_helper=None)
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        mock_client.update_team_pr_health_settings.return_value = {
+            "agingDays": 7,
+            "rottingDays": 45,
+        }
+        with patch.object(tool, "get_client", AsyncMock(return_value=mock_client)):
+            result = await tool.handle_action(
+                "update_pr_health_settings", {"team_id": "jR2kmLs", "aging_days": 7}
+            )
+
+        assert "WARNING" in result[0].text
+        assert PR_HEALTH_DIVERGENCE_NOTE in result[0].text
+
+
+class TestPrHealthSettingsActionRouting:
+    """manage_customers exposes both actions and routes them to TeamManager."""
+
+    @pytest.mark.asyncio
+    async def test_actions_are_supported(self):
+        tool = CustomerManagement(ucm_helper=None)
+        actions = await tool._get_supported_actions()
+        assert "get_pr_health_settings" in actions
+        assert "update_pr_health_settings" in actions
+
+    @pytest.mark.asyncio
+    async def test_get_action_is_routed(self, mock_client):
+        tool = CustomerManagement(ucm_helper=None)
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        with patch.object(tool, "get_client", AsyncMock(return_value=mock_client)):
+            result = await tool.handle_action(
+                "get_pr_health_settings", {"team_id": "jR2kmLs"}
+            )
+        assert isinstance(result[0], TextContent)
+        assert "jR2kmLs" in result[0].text
+        assert "agingDays" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_update_action_is_routed(self, mock_client):
+        tool = CustomerManagement(ucm_helper=None)
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+        mock_client.update_team_pr_health_settings.return_value = {
+            "agingDays": 7,
+            "rottingDays": 30,
+        }
+        with patch.object(tool, "get_client", AsyncMock(return_value=mock_client)):
+            result = await tool.handle_action(
+                "update_pr_health_settings", {"team_id": "jR2kmLs", "aging_days": 7}
+            )
+        assert isinstance(result[0], TextContent)
+        assert "jR2kmLs" in result[0].text
+
+
+# ===========================================================================
 # CustomerValidator Tests
 # ===========================================================================
+
+
+ORG_UNITS_PAYLOAD = [
+    {
+        "id": 12,
+        "name": "Acme Corp",
+        "parentId": None,
+        "path": "/12/",
+        "source": "MANUAL",
+        "externalRef": None,
+    },
+    {
+        "id": 173,
+        "name": "Engineering",
+        "parentId": 40,
+        "path": "/12/40/173/",
+        "source": "SCIM",
+        "externalRef": "ou-eng",
+    },
+]
+
+
+class TestOrgUnitIdConversion:
+    """org_unit_id_to_filter_value - BACK-2767's single number-to-string rule."""
+
+    def test_number_becomes_string(self):
+        assert org_unit_id_to_filter_value(173) == "173"
+
+    def test_float_id_drops_the_decimal(self):
+        """A JSON number decoded as a float is still the integer id, not '173.0'."""
+        assert org_unit_id_to_filter_value(173.0) == "173"
+
+    def test_string_passes_through(self):
+        assert org_unit_id_to_filter_value(" 173 ") == "173"
+
+    def test_none_stays_none(self):
+        """A root unit's parentId is legitimately absent."""
+        assert org_unit_id_to_filter_value(None) is None
+
+    def test_empty_string_is_not_an_id(self):
+        assert org_unit_id_to_filter_value("") is None
+
+    def test_bool_is_not_an_id(self):
+        """bool is an int subclass; True must not become the id '1'."""
+        assert org_unit_id_to_filter_value(True) is None
+
+
+class TestTeamAttributionIdentityPolicyRead:
+    """TeamManager.get_attribution_identity_policy."""
+
+    @pytest.mark.asyncio
+    async def test_missing_team_id_raises_before_any_call(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_attribution_identity_policy({})
+        assert exc.value.field == "team_id"
+        mock_client.get_team_attribution_identity_policy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_the_policy_the_platform_reported(self, team_manager, mock_client):
+        mock_client.get_team_attribution_identity_policy.return_value = {
+            "policy": "ALLOW_SELF_ASSERTED_UNVERIFIED"
+        }
+
+        result = await team_manager.get_attribution_identity_policy({"team_id": "jR2kmLs"})
+
+        assert result["team_id"] == "jR2kmLs"
+        assert result["effective_policy"] == "ALLOW_SELF_ASSERTED_UNVERIFIED"
+        mock_client.get_team_attribution_identity_policy.assert_called_once_with("jR2kmLs")
+
+    @pytest.mark.asyncio
+    async def test_strict_default_is_reported_as_effective_not_configured(
+        self, team_manager, mock_client
+    ):
+        """The platform substitutes VERIFIED_DOMAIN_ONLY when nothing is stored, so the
+        read must not present it as somebody's decision."""
+        mock_client.get_team_attribution_identity_policy.return_value = {
+            "policy": "VERIFIED_DOMAIN_ONLY"
+        }
+
+        result = await team_manager.get_attribution_identity_policy({"team_id": "jR2kmLs"})
+
+        assert result["effective_policy"] == "VERIFIED_DOMAIN_ONLY"
+        assert "effective_policy" in result
+        assert "effective" in json.dumps(result).lower()
+        assert result["effective_policy_note"] == ATTRIBUTION_POLICY_EFFECTIVE_NOTE
+        assert "EFFECTIVE" in ATTRIBUTION_POLICY_EFFECTIVE_NOTE
+        # and it names the way to make the choice explicit
+        assert "update_attribution_identity_policy" in result["set_explicitly"]
+        assert "update_attribution_identity_policy" in ATTRIBUTION_POLICY_EFFECTIVE_NOTE
+
+    @pytest.mark.asyncio
+    async def test_absent_policy_reads_as_none_not_a_fabricated_default(
+        self, team_manager, mock_client
+    ):
+        """The strict default is the server's to apply; inventing it here would report a
+        rule the platform never confirmed."""
+        mock_client.get_team_attribution_identity_policy.return_value = {}
+
+        result = await team_manager.get_attribution_identity_policy({"team_id": "jR2kmLs"})
+
+        assert result["effective_policy"] is None
+        assert "unknown" in result["policy_meaning"].lower()
+
+    @pytest.mark.asyncio
+    async def test_unknown_policy_value_is_reported_not_rejected(
+        self, team_manager, mock_client
+    ):
+        """A value newer than this tool must still reach the caller."""
+        mock_client.get_team_attribution_identity_policy.return_value = {
+            "policy": "SOME_FUTURE_POLICY"
+        }
+
+        result = await team_manager.get_attribution_identity_policy({"team_id": "jR2kmLs"})
+
+        assert result["effective_policy"] == "SOME_FUTURE_POLICY"
+        assert "SOME_FUTURE_POLICY" in result["policy_meaning"]
+
+    @pytest.mark.asyncio
+    async def test_403_names_the_organization_administrator(self, team_manager, mock_client):
+        mock_client.get_team_attribution_identity_policy.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_attribution_identity_policy({"team_id": "jR2kmLs"})
+        assert exc.value.error_code == ErrorCodes.API_AUTHORIZATION
+        assert "organization administrator" in str(exc.value).lower()
+        assert ATTRIBUTION_POLICY_PRIVILEGE_NOTE in exc.value.suggestions
+
+    @pytest.mark.asyncio
+    async def test_404_maps_to_not_found(self, team_manager, mock_client):
+        mock_client.get_team_attribution_identity_policy.side_effect = ReveniumAPIError(
+            "Not found", status_code=404
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_attribution_identity_policy({"team_id": "bad"})
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_500_reraises(self, team_manager, mock_client):
+        mock_client.get_team_attribution_identity_policy.side_effect = ReveniumAPIError(
+            "Boom", status_code=500
+        )
+        with pytest.raises(ReveniumAPIError):
+            await team_manager.get_attribution_identity_policy({"team_id": "jR2kmLs"})
+
+
+class TestTeamAttributionIdentityPolicyUpdate:
+    """TeamManager.update_attribution_identity_policy."""
+
+    @pytest.mark.asyncio
+    async def test_missing_team_id_raises_before_any_call(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_attribution_identity_policy(
+                {"policy": "VERIFIED_DOMAIN_ONLY"}
+            )
+        assert exc.value.field == "team_id"
+        mock_client.update_team_attribution_identity_policy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_policy_raises_before_the_write(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_attribution_identity_policy({"team_id": "jR2kmLs"})
+        assert exc.value.field == "policy"
+        mock_client.update_team_attribution_identity_policy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_blank_policy_is_rejected(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_attribution_identity_policy(
+                {"team_id": "jR2kmLs", "policy": "   "}
+            )
+        assert exc.value.field == "policy"
+        mock_client.update_team_attribution_identity_policy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_policy_is_sent_verbatim(self, team_manager, mock_client):
+        mock_client.update_team_attribution_identity_policy.return_value = {
+            "policy": "ALLOW_SELF_ASSERTED_UNVERIFIED"
+        }
+
+        result = await team_manager.update_attribution_identity_policy(
+            {"team_id": "jR2kmLs", "policy": "ALLOW_SELF_ASSERTED_UNVERIFIED"}
+        )
+
+        mock_client.update_team_attribution_identity_policy.assert_called_once_with(
+            "jR2kmLs", "ALLOW_SELF_ASSERTED_UNVERIFIED"
+        )
+        assert result["policy"] == "ALLOW_SELF_ASSERTED_UNVERIFIED"
+        assert result["requested_policy"] == "ALLOW_SELF_ASSERTED_UNVERIFIED"
+
+    @pytest.mark.asyncio
+    async def test_unknown_policy_value_is_not_gated_client_side(
+        self, team_manager, mock_client
+    ):
+        """A local enum copy is what makes the next platform value unreachable, so the
+        value goes to the API and the API decides."""
+        mock_client.update_team_attribution_identity_policy.return_value = {
+            "policy": "SOME_FUTURE_POLICY"
+        }
+
+        result = await team_manager.update_attribution_identity_policy(
+            {"team_id": "jR2kmLs", "policy": "SOME_FUTURE_POLICY"}
+        )
+
+        mock_client.update_team_attribution_identity_policy.assert_called_once_with(
+            "jR2kmLs", "SOME_FUTURE_POLICY"
+        )
+        assert result["policy"] == "SOME_FUTURE_POLICY"
+        assert result["verbatim_note"] == ATTRIBUTION_POLICY_VERBATIM_NOTE
+
+    @pytest.mark.asyncio
+    async def test_echoed_policy_wins_over_the_one_sent(self, team_manager, mock_client):
+        mock_client.update_team_attribution_identity_policy.return_value = {
+            "policy": "VERIFIED_DOMAIN_ONLY"
+        }
+
+        result = await team_manager.update_attribution_identity_policy(
+            {"team_id": "jR2kmLs", "policy": "ALLOW_SELF_ASSERTED_UNVERIFIED"}
+        )
+
+        assert result["policy"] == "VERIFIED_DOMAIN_ONLY"
+        assert result["requested_policy"] == "ALLOW_SELF_ASSERTED_UNVERIFIED"
+        assert "divergence_warning" in result
+
+    @pytest.mark.asyncio
+    async def test_absent_echo_falls_back_to_the_value_sent(self, team_manager, mock_client):
+        mock_client.update_team_attribution_identity_policy.return_value = {}
+
+        result = await team_manager.update_attribution_identity_policy(
+            {"team_id": "jR2kmLs", "policy": "VERIFIED_DOMAIN_ONLY"}
+        )
+
+        assert result["policy"] == "VERIFIED_DOMAIN_ONLY"
+        assert "divergence_warning" not in result
+
+    @pytest.mark.asyncio
+    async def test_403_names_the_organization_administrator(self, team_manager, mock_client):
+        mock_client.update_team_attribution_identity_policy.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_attribution_identity_policy(
+                {"team_id": "jR2kmLs", "policy": "VERIFIED_DOMAIN_ONLY"}
+            )
+        assert exc.value.error_code == ErrorCodes.API_AUTHORIZATION
+        assert "organization administrator" in str(exc.value).lower()
+
+
+class TestTeamVerifiedDomainsList:
+    """TeamManager.list_verified_domains."""
+
+    @pytest.mark.asyncio
+    async def test_missing_team_id_raises_before_any_call(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.list_verified_domains({})
+        assert exc.value.field == "team_id"
+        mock_client.list_team_verified_domains.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reads_a_bare_array_not_a_hal_envelope(self, team_manager, mock_client):
+        mock_client.list_team_verified_domains.return_value = [
+            {"domain": "acme.com", "source": "ADMIN", "joinPolicy": "REQUEST"},
+            {"domain": "engineering.acme.com", "source": "ADMIN", "joinPolicy": "REQUEST"},
+        ]
+
+        result = await team_manager.list_verified_domains({"team_id": "jR2kmLs"})
+
+        assert result["total_found"] == 2
+        assert result["verified_domains"][0] == {
+            "domain": "acme.com",
+            "source": "ADMIN",
+            "joinPolicy": "REQUEST",
+        }
+        mock_client.list_team_verified_domains.assert_called_once_with("jR2kmLs")
+
+    @pytest.mark.asyncio
+    async def test_empty_list_is_a_real_state(self, team_manager, mock_client):
+        mock_client.list_team_verified_domains.return_value = []
+
+        result = await team_manager.list_verified_domains({"team_id": "jR2kmLs"})
+
+        assert result["verified_domains"] == []
+        assert result["total_found"] == 0
+        assert "warning" not in result
+        # An empty list under the strict policy rejects every assertion, so the read
+        # states the coupling rather than leaving it to be inferred.
+        assert result["policy_link"] == ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE
+        assert result["fixed_fields"] == VERIFIED_DOMAIN_FIXED_FIELDS_NOTE
+
+    @pytest.mark.asyncio
+    async def test_non_list_payload_warns_instead_of_reading_as_empty(
+        self, team_manager, mock_client
+    ):
+        """An empty list and an unreadable one have opposite consequences under the
+        strict policy, so they must not render the same."""
+        mock_client.list_team_verified_domains.return_value = {"_embedded": {}}
+
+        result = await team_manager.list_verified_domains({"team_id": "jR2kmLs"})
+
+        assert result["verified_domains"] == []
+        assert result["warning"] == VERIFIED_DOMAIN_UNEXPECTED_SHAPE_NOTE
+
+    @pytest.mark.asyncio
+    async def test_malformed_entries_are_skipped_and_counted(self, team_manager, mock_client):
+        mock_client.list_team_verified_domains.return_value = [
+            {"domain": "acme.com", "source": "ADMIN", "joinPolicy": "REQUEST"},
+            "not-an-object",
+            {"source": "ADMIN"},
+        ]
+
+        result = await team_manager.list_verified_domains({"team_id": "jR2kmLs"})
+
+        assert result["total_found"] == 1
+        assert result["skipped_malformed_entries"] == 2
+        assert "malformed" in result["warning"]
+
+    @pytest.mark.asyncio
+    async def test_absent_source_reads_as_unknown_not_admin(self, team_manager, mock_client):
+        """ADMIN is only the default for administrator-created mappings; guessing it
+        would report a provenance the platform never stated."""
+        mock_client.list_team_verified_domains.return_value = [{"domain": "acme.com"}]
+
+        result = await team_manager.list_verified_domains({"team_id": "jR2kmLs"})
+
+        assert result["verified_domains"][0]["source"] == "unknown"
+        assert result["verified_domains"][0]["joinPolicy"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_403_names_the_tenant_administrator(self, team_manager, mock_client):
+        mock_client.list_team_verified_domains.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.list_verified_domains({"team_id": "jR2kmLs"})
+        assert exc.value.error_code == ErrorCodes.API_AUTHORIZATION
+        assert "tenant administrator" in str(exc.value).lower()
+        assert VERIFIED_DOMAIN_TENANT_PRIVILEGE_NOTE in exc.value.suggestions
+        # the read is gated too, so the 403 is never an empty list
+        assert "never" in VERIFIED_DOMAIN_TENANT_PRIVILEGE_NOTE
+
+    @pytest.mark.asyncio
+    async def test_404_maps_to_not_found(self, team_manager, mock_client):
+        mock_client.list_team_verified_domains.side_effect = ReveniumAPIError(
+            "Not found", status_code=404
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.list_verified_domains({"team_id": "bad"})
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_500_reraises(self, team_manager, mock_client):
+        mock_client.list_team_verified_domains.side_effect = ReveniumAPIError(
+            "Boom", status_code=500
+        )
+        with pytest.raises(ReveniumAPIError):
+            await team_manager.list_verified_domains({"team_id": "jR2kmLs"})
+
+
+class TestTeamVerifiedDomainAdd:
+    """TeamManager.add_verified_domain — the platform-admin-only write."""
+
+    @pytest.mark.asyncio
+    async def test_missing_domain_raises_before_the_write(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.add_verified_domain({"team_id": "jR2kmLs"})
+        assert exc.value.field == "domain"
+        mock_client.add_team_verified_domain.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_address_is_rejected_as_a_domain(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.add_verified_domain(
+                {"team_id": "jR2kmLs", "domain": "joao@acme.com"}
+            )
+        assert exc.value.field == "domain"
+        mock_client.add_team_verified_domain.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_adds_one_domain_rather_than_replacing_a_list(
+        self, team_manager, mock_client
+    ):
+        mock_client.add_team_verified_domain.return_value = {
+            "domain": "acme.com",
+            "source": "ADMIN",
+            "joinPolicy": "REQUEST",
+        }
+
+        result = await team_manager.add_verified_domain(
+            {"team_id": "jR2kmLs", "domain": " acme.com "}
+        )
+
+        mock_client.add_team_verified_domain.assert_called_once_with("jR2kmLs", "acme.com")
+        assert result["domain"] == "acme.com"
+        assert result["verified_domain"]["source"] == "ADMIN"
+        assert result["add_semantics"] == VERIFIED_DOMAIN_ADD_SEMANTICS_NOTE
+
+    @pytest.mark.asyncio
+    async def test_source_and_join_policy_are_never_forwarded(self, team_manager, mock_client):
+        """The API fixes both fields, so accepting them would imply control the endpoint
+        does not give."""
+        mock_client.add_team_verified_domain.return_value = {"domain": "acme.com"}
+
+        await team_manager.add_verified_domain(
+            {
+                "team_id": "jR2kmLs",
+                "domain": "acme.com",
+                "source": "SELF_SERVICE",
+                "joinPolicy": "AUTO",
+            }
+        )
+
+        assert mock_client.add_team_verified_domain.call_args[0] == ("jR2kmLs", "acme.com")
+        assert mock_client.add_team_verified_domain.call_args[1] == {}
+
+    @pytest.mark.asyncio
+    async def test_403_says_a_platform_administrator_is_required(
+        self, team_manager, mock_client
+    ):
+        """A tenant or org admin is denied by design here, so a generic 'ask for
+        permission' message would send them after something ungrantable."""
+        mock_client.add_team_verified_domain.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+
+        with pytest.raises(ToolError) as exc:
+            await team_manager.add_verified_domain(
+                {"team_id": "jR2kmLs", "domain": "acme.com"}
+            )
+
+        assert exc.value.error_code == ErrorCodes.API_AUTHORIZATION
+        message = str(exc.value).lower()
+        assert "platform administrator" in message
+        assert VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE in exc.value.suggestions
+        assert "by design" in VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE
+        assert "always denied" in VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE
+
+    @pytest.mark.asyncio
+    async def test_add_403_differs_from_the_list_403(self, team_manager, mock_client):
+        """The two privileges are not the same, and one blanket message would hide
+        which is missing."""
+        mock_client.add_team_verified_domain.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+        mock_client.list_team_verified_domains.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+
+        with pytest.raises(ToolError) as add_exc:
+            await team_manager.add_verified_domain(
+                {"team_id": "jR2kmLs", "domain": "acme.com"}
+            )
+        with pytest.raises(ToolError) as list_exc:
+            await team_manager.list_verified_domains({"team_id": "jR2kmLs"})
+
+        assert str(add_exc.value) != str(list_exc.value)
+        assert "platform administrator" in str(add_exc.value).lower()
+        assert "tenant administrator" in str(list_exc.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_500_reraises(self, team_manager, mock_client):
+        mock_client.add_team_verified_domain.side_effect = ReveniumAPIError(
+            "Boom", status_code=500
+        )
+        with pytest.raises(ReveniumAPIError):
+            await team_manager.add_verified_domain(
+                {"team_id": "jR2kmLs", "domain": "acme.com"}
+            )
+
+
+class TestTeamVerifiedDomainRemove:
+    """TeamManager.remove_verified_domain."""
+
+    @pytest.mark.asyncio
+    async def test_missing_domain_raises_before_the_delete(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.remove_verified_domain({"team_id": "jR2kmLs"})
+        assert exc.value.field == "domain"
+        mock_client.remove_team_verified_domain.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_removes_the_named_domain(self, team_manager, mock_client):
+        mock_client.remove_team_verified_domain.return_value = {}
+
+        result = await team_manager.remove_verified_domain(
+            {"team_id": "jR2kmLs", "domain": "acme.com"}
+        )
+
+        mock_client.remove_team_verified_domain.assert_called_once_with("jR2kmLs", "acme.com")
+        assert result["removed"] is True
+        assert result["domain"] == "acme.com"
+
+    @pytest.mark.asyncio
+    async def test_response_warns_that_re_adding_needs_revenium(
+        self, team_manager, mock_client
+    ):
+        """Removal is tenant-reversible only in appearance: putting the domain back is
+        platform-admin-only."""
+        mock_client.remove_team_verified_domain.return_value = {}
+
+        result = await team_manager.remove_verified_domain(
+            {"team_id": "jR2kmLs", "domain": "acme.com"}
+        )
+
+        assert result["re_add_warning"] == VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE
+
+    @pytest.mark.asyncio
+    async def test_403_names_the_tenant_administrator(self, team_manager, mock_client):
+        mock_client.remove_team_verified_domain.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.remove_verified_domain(
+                {"team_id": "jR2kmLs", "domain": "acme.com"}
+            )
+        assert exc.value.error_code == ErrorCodes.API_AUTHORIZATION
+        assert "tenant administrator" in str(exc.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_404_for_a_missing_domain_names_the_domain_not_the_team(
+        self, team_manager, mock_client
+    ):
+        """The DELETE answers 404 both for a missing team and for a domain that
+        is not on the list; the upstream body distinguishes them. Reporting a
+        missing domain as 'team not found' sends the caller to verify a team id
+        that is fine (live-caught on dev)."""
+        mock_client.remove_team_verified_domain.side_effect = ReveniumAPIError(
+            "Verified domain not found", status_code=404
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.remove_verified_domain(
+                {"team_id": "jR2kmLs", "domain": "ghost.example"}
+            )
+        assert "not on team" in str(exc.value.message)
+        assert "Team not found" not in str(exc.value.message)
+        # The rejected domain rides on the error so an agent processing many
+        # domains can tell which one was missing.
+        assert "ghost.example" in str(exc.value.message)
+        assert exc.value.value == "ghost.example"
+
+    @pytest.mark.asyncio
+    async def test_404_without_the_domain_wording_still_means_team_not_found(
+        self, team_manager, mock_client
+    ):
+        """Only the upstream's own 'verified domain' wording reroutes the 404; a
+        plain 404 keeps the shared team-not-found mapping."""
+        mock_client.remove_team_verified_domain.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.remove_verified_domain(
+                {"team_id": "jR2kmLs", "domain": "acme.com"}
+            )
+        assert "Team not found" in str(exc.value.message)
+
+    @pytest.mark.asyncio
+    async def test_500_reraises(self, team_manager, mock_client):
+        mock_client.remove_team_verified_domain.side_effect = ReveniumAPIError(
+            "Boom", status_code=500
+        )
+        with pytest.raises(ReveniumAPIError):
+            await team_manager.remove_verified_domain(
+                {"team_id": "jR2kmLs", "domain": "acme.com"}
+            )
+
+
+class TestCustomerManagementIdentityPolicyActions:
+    """The five new actions on the manage_customers surface."""
+
+    @pytest.mark.asyncio
+    async def test_all_five_actions_are_advertised(self, customer_mgmt):
+        actions = await customer_mgmt._get_supported_actions()
+        for action in (
+            "get_attribution_identity_policy",
+            "update_attribution_identity_policy",
+            "list_verified_domains",
+            "add_verified_domain",
+            "remove_verified_domain",
+        ):
+            assert action in actions
+
+    @pytest.mark.asyncio
+    async def test_policy_read_action_renders_the_effective_wording(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.get_team_attribution_identity_policy = AsyncMock(
+                return_value={"policy": "VERIFIED_DOMAIN_ONLY"}
+            )
+
+            result = await customer_mgmt.handle_action(
+                "get_attribution_identity_policy", {"team_id": "jR2kmLs"}
+            )
+
+        assert isinstance(result[0], TextContent)
+        assert "Effective attribution identity policy" in result[0].text
+        assert "effective" in result[0].text.lower()
+        assert ATTRIBUTION_POLICY_EFFECTIVE_NOTE in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_policy_update_action_forwards_the_value(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.update_team_attribution_identity_policy = AsyncMock(
+                return_value={"policy": "ALLOW_SELF_ASSERTED_UNVERIFIED"}
+            )
+
+            result = await customer_mgmt.handle_action(
+                "update_attribution_identity_policy",
+                {"team_id": "jR2kmLs", "policy": "ALLOW_SELF_ASSERTED_UNVERIFIED"},
+            )
+
+        mock_client.update_team_attribution_identity_policy.assert_awaited_once_with(
+            "jR2kmLs", "ALLOW_SELF_ASSERTED_UNVERIFIED"
+        )
+        assert "ALLOW_SELF_ASSERTED_UNVERIFIED" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_list_action_renders_the_domains(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.list_team_verified_domains = AsyncMock(
+                return_value=[
+                    {"domain": "acme.com", "source": "ADMIN", "joinPolicy": "REQUEST"}
+                ]
+            )
+
+            result = await customer_mgmt.handle_action(
+                "list_verified_domains", {"team_id": "jR2kmLs"}
+            )
+
+        assert "acme.com" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_add_action_routes_and_renders(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.add_team_verified_domain = AsyncMock(
+                return_value={"domain": "acme.com", "source": "ADMIN", "joinPolicy": "REQUEST"}
+            )
+
+            result = await customer_mgmt.handle_action(
+                "add_verified_domain", {"team_id": "jR2kmLs", "domain": "acme.com"}
+            )
+
+        mock_client.add_team_verified_domain.assert_awaited_once_with("jR2kmLs", "acme.com")
+        assert VERIFIED_DOMAIN_ADD_SEMANTICS_NOTE in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_remove_action_routes_and_renders(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.remove_team_verified_domain = AsyncMock(return_value={})
+
+            result = await customer_mgmt.handle_action(
+                "remove_verified_domain", {"team_id": "jR2kmLs", "domain": "acme.com"}
+            )
+
+        mock_client.remove_team_verified_domain.assert_awaited_once_with(
+            "jR2kmLs", "acme.com"
+        )
+        assert "removed from team jR2kmLs" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_capabilities_document_the_asymmetric_privileges(self, customer_mgmt):
+        capabilities = await customer_mgmt._get_tool_capabilities()
+        domains = next((c for c in capabilities if c.name == "Team Verified Domains"), None)
+        policy = next(
+            (c for c in capabilities if c.name == "Team Attribution Identity Policy"), None
+        )
+        assert domains is not None and policy is not None
+        assert VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE in domains.limitations
+        assert VERIFIED_DOMAIN_TENANT_PRIVILEGE_NOTE in domains.limitations
+        assert ATTRIBUTION_POLICY_PRIVILEGE_NOTE in policy.limitations
+        assert ATTRIBUTION_POLICY_EFFECTIVE_NOTE in policy.limitations
+
+    @pytest.mark.asyncio
+    async def test_schema_declares_policy_and_domain(self, customer_mgmt):
+        """The tool schema must offer the parameters, or the actions are undrivable."""
+        schema = await customer_mgmt._get_input_schema()
+        assert "policy" in schema["properties"]
+        assert "domain" in schema["properties"]
+        assert schema["properties"]["action"]["enum"] == await customer_mgmt._get_supported_actions()
+
+
+class TestOrgUnitManagerList:
+    """OrgUnitManager.list_org_units."""
+
+    @pytest.mark.asyncio
+    async def test_returns_units_with_string_ids(self, org_unit_manager, mock_client):
+        mock_client.get_org_units.return_value = ORG_UNITS_PAYLOAD
+
+        result = await org_unit_manager.list_org_units({})
+
+        assert result["action"] == "list_org_units"
+        assert result["resource_type"] == "org_units"
+        assert result["total_found"] == 2
+        engineering = result["org_units"][1]
+        assert engineering["name"] == "Engineering"
+        assert engineering["id"] == "173"
+        assert engineering["parentId"] == "40"
+        assert engineering["path"] == "/12/40/173/"
+        assert engineering["source"] == "SCIM"
+        assert result["id_type_note"] == ORG_UNIT_ID_STRING_NOTE
+
+    @pytest.mark.asyncio
+    async def test_root_unit_keeps_null_parent(self, org_unit_manager, mock_client):
+        mock_client.get_org_units.return_value = ORG_UNITS_PAYLOAD
+
+        result = await org_unit_manager.list_org_units({})
+
+        assert result["org_units"][0]["parentId"] is None
+        assert result["org_units"][0]["id"] == "12"
+
+    @pytest.mark.asyncio
+    async def test_omitted_team_id_is_not_forwarded(self, org_unit_manager, mock_client):
+        await org_unit_manager.list_org_units({})
+        mock_client.get_org_units.assert_called_once_with(None)
+
+    @pytest.mark.asyncio
+    async def test_team_id_is_forwarded(self, org_unit_manager, mock_client):
+        result = await org_unit_manager.list_org_units({"team_id": " jR2kmLs "})
+        mock_client.get_org_units.assert_called_once_with("jR2kmLs")
+        assert result["team_id"] == "jR2kmLs"
+
+    @pytest.mark.asyncio
+    async def test_empty_list_reports_zero_without_warning(self, org_unit_manager, mock_client):
+        mock_client.get_org_units.return_value = []
+
+        result = await org_unit_manager.list_org_units({})
+
+        assert result["org_units"] == []
+        assert result["total_found"] == 0
+        assert "warning" not in result
+
+    @pytest.mark.asyncio
+    async def test_non_list_response_degrades_with_warning(self, org_unit_manager, mock_client):
+        """A HAL page or error envelope must not crash, and must not read as 'no departments'."""
+        mock_client.get_org_units.return_value = {"_embedded": {"orgUnits": []}}
+
+        result = await org_unit_manager.list_org_units({})
+
+        assert result["org_units"] == []
+        assert result["total_found"] == 0
+        assert result["warning"] == ORG_UNIT_UNEXPECTED_SHAPE_NOTE
+
+    @pytest.mark.asyncio
+    async def test_malformed_entries_are_skipped_and_counted(self, org_unit_manager, mock_client):
+        mock_client.get_org_units.return_value = [ORG_UNITS_PAYLOAD[1], "not-a-unit", None]
+
+        result = await org_unit_manager.list_org_units({})
+
+        assert result["total_found"] == 1
+        assert result["skipped_malformed_entries"] == 2
+
+    @pytest.mark.asyncio
+    async def test_api_error_propagates(self, org_unit_manager, mock_client):
+        mock_client.get_org_units.side_effect = ReveniumAPIError("Boom", status_code=500)
+
+        with pytest.raises(ReveniumAPIError):
+            await org_unit_manager.list_org_units({})
+
+
+class TestOrgUnitFormatting:
+    """_format_org_units_text - the resolution-oriented rendering."""
+
+    @pytest.mark.asyncio
+    async def test_each_unit_is_greppable_by_name(self, org_unit_manager, mock_client):
+        mock_client.get_org_units.return_value = ORG_UNITS_PAYLOAD
+        result = await org_unit_manager.list_org_units({})
+
+        text = _format_org_units_text(result)
+
+        assert "Found 2 org unit(s)" in text
+        assert "- Engineering | id=173 | parentId=40 | path=/12/40/173/ | source=SCIM" in text
+        assert "- Acme Corp | id=12 | parentId=None | path=/12/ | source=MANUAL" in text
+        assert ORG_UNIT_ID_STRING_NOTE in text
+
+    def test_empty_listing_says_no_org_units(self):
+        text = _format_org_units_text(
+            {"action": "list_org_units", "org_units": [], "total_found": 0}
+        )
+
+        assert "No org units (departments) found" in text
+        assert "read-only" in text
+
+    def test_unexpected_shape_warning_leads_the_text(self):
+        text = _format_org_units_text(
+            {
+                "action": "list_org_units",
+                "org_units": [],
+                "total_found": 0,
+                "warning": ORG_UNIT_UNEXPECTED_SHAPE_NOTE,
+            }
+        )
+
+        assert "WARNING:" in text
+        assert ORG_UNIT_UNEXPECTED_SHAPE_NOTE in text
+
+    def test_team_scope_is_named(self):
+        text = _format_org_units_text(
+            {"action": "list_org_units", "team_id": "jR2kmLs", "org_units": [], "total_found": 0}
+        )
+
+        assert "for team jR2kmLs" in text
 
 
 class TestCustomerValidator:
@@ -2055,6 +3421,164 @@ class TestCustomerManagementHandleAction:
             c for c in capabilities if c.name == "Team Internal-Marketplace Settings"
         )
         assert MARKETPLACE_CONCURRENCY_NOTE in marketplace.limitations
+
+
+class TestOrgUnitMalformedEntries:
+    """Review round on PR #325: malformed entries must warn, never masquerade."""
+
+    @pytest.mark.asyncio
+    async def test_all_malformed_list_warns_instead_of_reading_as_empty_org(self, org_unit_manager):
+        org_unit_manager.client.get_org_units.return_value = ["junk", 42, {"name": "NoId"}]
+        result = await org_unit_manager.list_org_units({})
+        assert result["skipped_malformed_entries"] == 3
+        assert result["org_units"] == []
+        assert "upstream data or contract problem" in result["warning"]
+        text = _format_org_units_text(result)
+        assert "WARNING:" in text
+        assert "An organization with no departments defined" not in text
+
+    @pytest.mark.asyncio
+    async def test_partially_malformed_list_warns_and_lists_the_rest(self, org_unit_manager):
+        org_unit_manager.client.get_org_units.return_value = [
+            {"id": 173, "name": "Payments", "parentId": None, "path": "/173/", "source": "MANUAL"},
+            {"name": "NoId"},
+        ]
+        result = await org_unit_manager.list_org_units({})
+        assert result["total_found"] == 1
+        assert result["skipped_malformed_entries"] == 1
+        assert "well-formed entries" in result["warning"]
+        text = _format_org_units_text(result)
+        assert "WARNING:" in text and "Payments | id=173" in text
+
+    @pytest.mark.asyncio
+    async def test_entry_with_non_numeric_id_is_classified_malformed(self, org_unit_manager):
+        org_unit_manager.client.get_org_units.return_value = [
+            {"id": "not-a-number", "name": "Weird"},
+            {"id": None, "name": "Missing"},
+        ]
+        result = await org_unit_manager.list_org_units({})
+        assert result["org_units"] == []
+        assert result["skipped_malformed_entries"] == 2
+
+
+class TestIntrospectionSchemaRequired:
+    """PR #325 review (Greptile P1): only action is universally required."""
+
+    @pytest.mark.asyncio
+    async def test_name_is_not_required_so_advertised_reads_validate(self, customer_mgmt):
+        schema = await customer_mgmt._get_input_schema()
+        assert schema["required"] == ["action"]
+        assert "team_id" in schema["properties"]
+
+    @pytest.mark.asyncio
+    async def test_create_conditionally_requires_the_container_the_closure_accepts(
+        self, customer_mgmt
+    ):
+        # The create requirement must name resource_data — the parameter the
+        # registered closure actually takes — not a top-level name the tool
+        # would reject as an unexpected argument.
+        schema = await customer_mgmt._get_input_schema()
+        create_rule = next(
+            c for c in schema["allOf"]
+            if c["if"]["properties"]["action"] == {"const": "create"}
+        )
+        assert create_rule["then"]["required"] == ["resource_data"]
+        # The container alone is not enough (minProperties), and the key-field
+        # requirement is per resource type, matching the runtime: name for
+        # organizations/teams, email-or-name for users/subscribers.
+        assert create_rule["then"]["properties"]["resource_data"]["minProperties"] == 1
+        untyped_rule = next(
+            c for c in schema["allOf"]
+            if "not" in c["if"] and c["if"]["not"] == {"required": ["resource_type"]}
+        )
+        # handle_action defaults an omitted resource_type to organizations, so
+        # the untyped create inherits the organization requirement.
+        assert untyped_rule["then"]["properties"]["resource_data"]["required"] == ["name"]
+        org_rule = next(
+            c for c in schema["allOf"]
+            if c["if"]["properties"].get("resource_type", {}).get("enum") == ["organizations", "teams"]
+        )
+        assert org_rule["then"]["properties"]["resource_data"]["required"] == ["name"]
+        person_rule = next(
+            c for c in schema["allOf"]
+            if c["if"]["properties"].get("resource_type", {}).get("enum") == ["users", "subscribers"]
+        )
+        any_of = person_rule["then"]["properties"]["resource_data"]["anyOf"]
+        assert {"required": ["email"]} in any_of and {"required": ["name"]} in any_of
+        assert "name" not in schema["properties"]
+        assert "resource_data" in schema["properties"]
+        assert "resource_type" in schema["properties"]
+
+
+class TestOrgUnitFeatureFlagGate:
+    """PR #325 cross-repo review: the endpoint is behind a default-OFF tenant flag."""
+
+    @pytest.mark.asyncio
+    async def test_403_maps_to_the_feature_flag_explanation(self, org_unit_manager):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        org_unit_manager.client.get_org_units.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+        with pytest.raises(ToolError) as excinfo:
+            await org_unit_manager.list_org_units({})
+        assert "not enabled for this tenant" in str(excinfo.value.message)
+        assert any("org-unit-attribution-enabled" in s for s in excinfo.value.suggestions)
+
+    @pytest.mark.asyncio
+    async def test_non_403_api_errors_still_propagate(self, org_unit_manager):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        org_unit_manager.client.get_org_units.side_effect = ReveniumAPIError(
+            "boom", status_code=500
+        )
+        with pytest.raises(ReveniumAPIError):
+            await org_unit_manager.list_org_units({})
+
+
+class TestCustomerManagementOrgUnitAction:
+    """The list_org_units action on manage_customers."""
+
+    @pytest.mark.asyncio
+    async def test_action_renders_units(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.get_org_units = AsyncMock(return_value=ORG_UNITS_PAYLOAD)
+
+            result = await customer_mgmt.handle_action("list_org_units", {})
+
+            assert isinstance(result[0], TextContent)
+            assert "Engineering" in result[0].text
+            assert "id=173" in result[0].text
+            mock_client.get_org_units.assert_awaited_once_with(None)
+
+    @pytest.mark.asyncio
+    async def test_action_forwards_team_id(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.get_org_units = AsyncMock(return_value=[])
+
+            result = await customer_mgmt.handle_action("list_org_units", {"team_id": "jR2kmLs"})
+
+            mock_client.get_org_units.assert_awaited_once_with("jR2kmLs")
+            assert "No org units (departments) found for team jR2kmLs" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_action_is_advertised(self, customer_mgmt):
+        actions = await customer_mgmt._get_supported_actions()
+        assert "list_org_units" in actions
+
+    @pytest.mark.asyncio
+    async def test_capability_documents_the_string_id_rule(self, customer_mgmt):
+        capabilities = await customer_mgmt._get_tool_capabilities()
+        org_unit_capability = next(
+            (c for c in capabilities if "Org Unit" in c.name), None
+        )
+        assert org_unit_capability is not None
+        assert ORG_UNIT_ID_STRING_NOTE in org_unit_capability.limitations
 
 
 class TestCustomerManagementAutoGeneration:

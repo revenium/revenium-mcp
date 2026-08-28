@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, MagicMock
 from src.revenium_mcp_server.tools_decomposed.cost_controls_management import (
     CostControlsManager,
     CostControlsManagement,
+    _coerce_parent_org_unit_id,
+    _summarize_org_unit_blocks,
 )
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
@@ -36,6 +38,7 @@ def mock_client():
     client.delete_cost_control = AsyncMock()
     client.get_enforcement_events = AsyncMock()
     client.get_enforcement_rules = AsyncMock()
+    client.preview_org_unit_group = AsyncMock()
     client._extract_embedded_data = MagicMock()
     client._extract_pagination_info = MagicMock()
     return client
@@ -569,3 +572,372 @@ class TestCostControlsManagementActions:
         with pytest.raises(ToolError) as exc:
             await cc_mgmt.handle_action("list", {"page": 0, "size": 20})
         assert exc.value is boom
+
+
+# ===========================================================================
+# BACK-2764: ORG_UNIT (department) scoping
+# ===========================================================================
+
+
+class TestCoerceParentOrgUnitId:
+    """The raw numeric org-unit id arrives as an int or as a digit string."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [(173, 173), ("173", 173), ("  173 ", 173), (173.0, 173), (0, 0)],
+    )
+    def test_numeric_forms_are_accepted(self, raw, expected):
+        assert _coerce_parent_org_unit_id(raw) == expected
+
+    @pytest.mark.parametrize("raw", [True, False, "abc", "17.5", "", "-1", -1, None, [], {}])
+    def test_non_ids_are_rejected_before_the_call(self, raw):
+        """Rejecting here means the caller reads "not a numeric org-unit id"
+        instead of an upstream 400 about a field they cannot see."""
+        with pytest.raises(ToolError) as exc:
+            _coerce_parent_org_unit_id(raw)
+        assert exc.value.error_code == ErrorCodes.INVALID_PARAMETER
+
+    def test_rejection_points_at_the_org_unit_listing(self):
+        with pytest.raises(ToolError) as exc:
+            _coerce_parent_org_unit_id("engineering")
+        assert "list_org_units" in json.dumps(exc.value.suggestions)
+
+
+class TestSummarizeOrgUnitBlocks:
+    """orgUnitBudgetBlocks is subscriber email -> the id of the blocking rule."""
+
+    def test_absent_key_produces_no_line(self):
+        """An older tenant never sends the map; reporting "0 blocked" from its
+        absence would be an invented fact."""
+        assert _summarize_org_unit_blocks({"rules": [], "compiledAt": None}) is None
+
+    def test_explicit_null_produces_no_line(self):
+        assert _summarize_org_unit_blocks({"orgUnitBudgetBlocks": None}) is None
+
+    def test_non_dict_payload_produces_no_line(self):
+        assert _summarize_org_unit_blocks("not a payload") is None
+
+    def test_empty_map_says_nobody_is_blocked(self):
+        summary = _summarize_org_unit_blocks({"orgUnitBudgetBlocks": {}, "rules": []})
+        assert summary == "No subscribers are currently blocked by a department budget."
+
+    def test_rule_id_is_resolved_to_the_rule_name(self):
+        summary = _summarize_org_unit_blocks(
+            {
+                "orgUnitBudgetBlocks": {"ada@example.com": 42, "grace@example.com": 42},
+                "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
+            }
+        )
+        assert "2 subscribers are currently blocked" in summary
+        assert "ada@example.com (Engineering monthly cap)" in summary
+        assert "grace@example.com (Engineering monthly cap)" in summary
+
+    def test_single_block_reads_as_singular(self):
+        summary = _summarize_org_unit_blocks(
+            {
+                "orgUnitBudgetBlocks": {"ada@example.com": 42},
+                "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
+            }
+        )
+        assert "1 subscriber is currently blocked" in summary
+
+    def test_string_rule_ids_still_resolve_to_names(self):
+        """The map's values and rules[].ruleId are not guaranteed to share a
+        JSON type, so the lookup compares them as strings."""
+        summary = _summarize_org_unit_blocks(
+            {
+                "orgUnitBudgetBlocks": {"ada@example.com": "42"},
+                "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
+            }
+        )
+        assert "ada@example.com (Engineering monthly cap)" in summary
+
+    def test_unresolvable_rule_id_falls_back_to_the_id(self):
+        """A block whose rule is not in the compiled set still names someone
+        blocked — dropping the entry would hide a real block."""
+        summary = _summarize_org_unit_blocks(
+            {"orgUnitBudgetBlocks": {"ada@example.com": 99}, "rules": []}
+        )
+        assert "ada@example.com (rule 99)" in summary
+
+    def test_long_block_lists_are_bounded_and_point_at_the_payload(self):
+        blocks = {f"user{i}@example.com": 42 for i in range(15)}
+        summary = _summarize_org_unit_blocks(
+            {"orgUnitBudgetBlocks": blocks, "rules": [{"ruleId": 42, "name": "Cap"}]}
+        )
+        assert "15 subscribers are currently blocked" in summary
+        assert "and 5 more" in summary
+        assert "user14@example.com" not in summary
+
+    def test_unexpected_shape_is_reported_not_silently_dropped(self):
+        summary = _summarize_org_unit_blocks({"orgUnitBudgetBlocks": ["ada@example.com"]})
+        assert "not the expected" in summary
+
+    def test_summary_warns_that_it_names_people(self):
+        summary = _summarize_org_unit_blocks(
+            {"orgUnitBudgetBlocks": {"ada@example.com": 42}, "rules": []}
+        )
+        assert "subscriber email addresses" in summary
+
+
+class TestCostControlsManagerPreviewOrgUnitGroup:
+    """preview_org_unit_group counts the per-department fan-out, read-only."""
+
+    @pytest.mark.asyncio
+    async def test_missing_parent_id_raises(self, cc_manager):
+        with pytest.raises(ToolError) as exc:
+            await cc_manager.preview_org_unit_group({})
+        assert exc.value.error_code == ErrorCodes.MISSING_PARAMETER
+
+    @pytest.mark.asyncio
+    async def test_blank_parent_id_raises_missing_not_invalid(self, cc_manager):
+        with pytest.raises(ToolError) as exc:
+            await cc_manager.preview_org_unit_group({"parent_org_unit_id": "   "})
+        assert exc.value.error_code == ErrorCodes.MISSING_PARAMETER
+
+    @pytest.mark.asyncio
+    async def test_digit_string_is_sent_as_a_number(self, cc_manager, mock_client):
+        mock_client.preview_org_unit_group.return_value = {"targetCount": 3, "targets": []}
+
+        await cc_manager.preview_org_unit_group({"parent_org_unit_id": "173"})
+
+        mock_client.preview_org_unit_group.assert_awaited_once_with(173)
+
+    @pytest.mark.asyncio
+    async def test_returns_target_count_and_targets(self, cc_manager, mock_client):
+        targets = [{"id": "ou_1", "name": "Engineering"}]
+        mock_client.preview_org_unit_group.return_value = {"targetCount": 1, "targets": targets}
+
+        result = await cc_manager.preview_org_unit_group({"parent_org_unit_id": 173})
+
+        assert result["action"] == "preview_org_unit_group"
+        assert result["parent_org_unit_id"] == "173"
+        assert result["target_count"] == 1
+        assert result["targets"] == targets
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [403, 422])
+    async def test_feature_flag_refusal_is_explained(self, cc_manager, mock_client, status):
+        """403 (feature gate) and 422 (org-unit attribution check beneath it)
+        both mean "not enabled for this tenant", not "your key is wrong"."""
+        mock_client.preview_org_unit_group.side_effect = ReveniumAPIError(
+            "Feature not available", status_code=status
+        )
+
+        with pytest.raises(ToolError) as exc:
+            await cc_manager.preview_org_unit_group({"parent_org_unit_id": 173})
+
+        assert "not enabled for this team" in exc.value.message
+        assert "feature flag" in json.dumps(exc.value.suggestions)
+
+    @pytest.mark.asyncio
+    async def test_other_api_errors_propagate(self, cc_manager, mock_client):
+        """A 500 is a server failure, not evidence the feature is off."""
+        mock_client.preview_org_unit_group.side_effect = ReveniumAPIError(
+            "boom", status_code=500
+        )
+        with pytest.raises(ReveniumAPIError):
+            await cc_manager.preview_org_unit_group({"parent_org_unit_id": 173})
+
+    @pytest.mark.asyncio
+    async def test_unexpected_response_shape_is_reported(self, cc_manager, mock_client):
+        """Reporting the shape beats rendering a fabricated count of zero."""
+        mock_client.preview_org_unit_group.return_value = [1, 2, 3]
+
+        result = await cc_manager.preview_org_unit_group({"parent_org_unit_id": 173})
+
+        assert "unexpected shape" in result["warning"]
+        assert "target_count" not in result
+
+
+class TestOrgUnitDocumentationSurface:
+    """An agent must be able to discover ORG_UNIT without reading the wire format."""
+
+    @pytest.mark.asyncio
+    async def test_preview_action_is_supported(self, cc_mgmt):
+        assert "preview_org_unit_group" in await cc_mgmt._get_supported_actions()
+
+    @pytest.mark.asyncio
+    async def test_capabilities_document_the_preview_action(self, cc_mgmt):
+        caps = await cc_mgmt._get_tool_capabilities()
+        documented = set()
+        for cap in caps:
+            documented.update(cap.parameters.keys())
+        assert "preview_org_unit_group" in documented
+
+    @pytest.mark.asyncio
+    async def test_group_by_names_org_unit(self, cc_mgmt):
+        schema = await cc_mgmt._get_input_schema()
+        group_by = schema["properties"]["control_data"]["properties"]["groupBy"]
+        assert "ORG_UNIT" in group_by["description"]
+
+    @pytest.mark.asyncio
+    async def test_include_descendants_is_documented_on_the_filter_item(self, cc_mgmt):
+        """The flag lives on each filter entry and only means something for
+        ORG_UNIT, so documenting it as a top-level field would mislead."""
+        schema = await cc_mgmt._get_input_schema()
+        control_data = schema["properties"]["control_data"]["properties"]
+        assert "includeDescendants" not in control_data
+        item = control_data["filters"]["items"]["properties"]["includeDescendants"]
+        assert "ORG_UNIT" in item["description"]
+
+    @pytest.mark.asyncio
+    async def test_parent_org_unit_id_is_declared(self, cc_mgmt):
+        schema = await cc_mgmt._get_input_schema()
+        assert "parent_org_unit_id" in schema["properties"]
+
+    @pytest.mark.asyncio
+    async def test_org_unit_is_documented_as_cost_control_only(self, cc_mgmt):
+        """BACK-2760 closed with the alert/anomaly API throwing on ORG_UNIT, so
+        the tool that teaches the dimension must also fence it off."""
+        caps = await cc_mgmt._get_tool_capabilities()
+        rendered = json.dumps([c.description for c in caps])
+        assert "manage_alerts" in rendered
+        assert "cost-control-only" in rendered
+
+    @pytest.mark.asyncio
+    async def test_examples_teach_the_org_unit_notes(self, cc_mgmt):
+        result = await cc_mgmt.handle_action("get_examples", {})
+        assert "preview_org_unit_group" in result[0].text
+        assert "manage_alerts" in result[0].text
+
+
+class TestEnforcementRulesBlockSummaryRendering:
+    """The rendered get_enforcement_rules output must say who is blocked."""
+
+    @pytest.mark.asyncio
+    async def test_blocked_subscribers_are_named_with_their_rule(self, cc_mgmt, mock_client):
+        mock_client.get_enforcement_rules.return_value = {
+            "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
+            "compiledAt": "2026-08-26T00:00:00Z",
+            "orgUnitBudgetBlocks": {"ada@example.com": 42},
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_rules", {})
+
+        assert "ada@example.com (Engineering monthly cap)" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_payload_is_still_recoverable_after_the_summary_line(
+        self, cc_mgmt, mock_client
+    ):
+        """The summary is one extra line, never a blank one, so the first blank
+        line still separates prose from the JSON payload."""
+        payload = {
+            "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
+            "compiledAt": "2026-08-26T00:00:00Z",
+            "orgUnitBudgetBlocks": {"ada@example.com": 42},
+        }
+        mock_client.get_enforcement_rules.return_value = payload
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_rules", {})
+
+        assert json.loads(result[0].text.split("\n\n", 1)[1]) == payload
+
+    @pytest.mark.asyncio
+    async def test_tenant_without_the_key_gets_no_block_line(self, cc_mgmt, mock_client):
+        mock_client.get_enforcement_rules.return_value = {"rules": [], "compiledAt": None}
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_rules", {})
+
+        assert "blocked" not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_preview_action_reports_the_fan_out(self, cc_mgmt, mock_client):
+        mock_client.preview_org_unit_group.return_value = {
+            "targetCount": 4,
+            "targets": [],
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action(
+            "preview_org_unit_group", {"parent_org_unit_id": 173}
+        )
+
+        text = result[0].text
+        assert "4 direct child org unit(s)" in text
+        assert "organization-wide" in text
+
+
+class TestPreviewResponseShapeGuards:
+    """PR #331 review: malformed responses must warn, never render None counts."""
+
+    @pytest.mark.asyncio
+    async def test_unicode_digit_string_gets_the_structured_error(self, cc_manager):
+        with pytest.raises(ToolError) as excinfo:
+            await cc_manager.preview_org_unit_group({"parent_org_unit_id": "\u00b2"})
+        assert "numeric org-unit id" in str(excinfo.value.message)
+
+    @pytest.mark.asyncio
+    async def test_dict_without_expected_fields_takes_the_warning_path(self, cc_manager):
+        cc_manager.client.preview_org_unit_group = AsyncMock(return_value={"ok": True})
+        result = await cc_manager.preview_org_unit_group({"parent_org_unit_id": 42})
+        assert "warning" in result and "target_count" not in result
+
+    @pytest.mark.asyncio
+    async def test_wrong_typed_fields_take_the_warning_path(self, cc_manager):
+        cc_manager.client.preview_org_unit_group = AsyncMock(
+            return_value={"targetCount": "3", "targets": "nope"}
+        )
+        result = await cc_manager.preview_org_unit_group({"parent_org_unit_id": 42})
+        assert "warning" in result
+
+    @pytest.mark.asyncio
+    async def test_handler_renders_warning_not_none_count(self, cc_mgmt):
+        from unittest.mock import patch
+
+        with patch.object(
+            CostControlsManager, "preview_org_unit_group",
+            new=AsyncMock(return_value={
+                "action": "preview_org_unit_group",
+                "parent_org_unit_id": "42",
+                "warning": "The preview endpoint answered with an unexpected shape",
+                "raw_response": {},
+            }),
+        ):
+            out = await cc_mgmt.handle_action("preview_org_unit_group", {"parent_org_unit_id": 42})
+        text = out[0].text
+        assert text.startswith("WARNING:")
+        assert "None per-department" not in text and "would create None" not in text
+
+    @pytest.mark.asyncio
+    async def test_happy_render_states_direct_children_not_created_budgets(self, cc_mgmt):
+        from unittest.mock import patch
+
+        with patch.object(
+            CostControlsManager, "preview_org_unit_group",
+            new=AsyncMock(return_value={
+                "action": "preview_org_unit_group",
+                "parent_org_unit_id": "42",
+                "target_count": 6,
+                "targets": [],
+            }),
+        ):
+            out = await cc_mgmt.handle_action("preview_org_unit_group", {"parent_org_unit_id": 42})
+        text = out[0].text
+        assert "direct child org unit" in text
+        assert "organization-wide" in text
+        assert "would create" not in text
+
+
+class TestOrgUnitDocsMatchUpstreamContract:
+    """PR #331 cross-repo review: examples agents copy must not 400, and the
+    preview semantics must not invite under-sizing a BLOCK rule's fan-out."""
+
+    @pytest.mark.asyncio
+    async def test_no_surface_documents_the_rejected_equals_operator(self, cc_mgmt):
+        caps = await cc_mgmt.handle_action("get_capabilities", {})
+        examples = await cc_mgmt.handle_action("get_examples", {})
+        combined = caps[0].text + examples[0].text
+        assert "EQUALS" not in combined
+        assert "'operator': 'IS'" in combined or '"operator": "IS"' in combined
+
+    @pytest.mark.asyncio
+    async def test_preview_docs_state_direct_children_not_rule_fanout(self, cc_mgmt):
+        caps = await cc_mgmt.handle_action("get_capabilities", {})
+        text = caps[0].text
+        assert "DIRECT CHILDREN" in text
+        assert "organization-wide" in text

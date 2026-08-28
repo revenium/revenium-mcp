@@ -139,7 +139,7 @@ Unified system diagnostics combining configuration analysis, auto-discovery debu
 • **Log Search**: Search across historical log data
 • **Operation Analysis**: Analyze operation patterns and trends
 • **Ingestion Failures**: Strict-ingestion rejections with error details and redacted payloads
-• **Strict Ingestion Mode**: Guarded toggle for reject-vs-auto-create ingestion behavior
+• **Strict Ingestion Mode**: Guarded toggle for reject-vs-auto-create ingestion behavior, with an allow_ticket_jobs opt-in for ticket-grain Job creation
 
 ## **Primary Use Cases**
 • **System Troubleshooting**: Diagnose configuration and connectivity issues
@@ -168,7 +168,7 @@ Unified system diagnostics combining configuration analysis, auto-discovery debu
 
 ### Tenant Ingestion Diagnostics
 - `get_ingestion_failures` - List strict-ingestion rejections (error_code filter, pagination)
-- `set_strict_ingestion_mode` - Toggle strict mode (requires confirm=true; preview otherwise)
+- `set_strict_ingestion_mode` - Toggle strict mode (requires confirm=true; preview otherwise). Optional `allow_ticket_jobs` keeps ticket-grain Job creation on under strict mode; omit it to leave the tenant's current setting unchanged, and note that disabling strict mode clears the opt-in
 
 ### Meta Actions
 - `get_capabilities` - Show this capabilities overview

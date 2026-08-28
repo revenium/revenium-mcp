@@ -206,6 +206,28 @@ class TestFieldMappingAnalyzer:
         assert mappings["output_tokens"] == "outputTokenCount"
         assert mappings["duration_ms"] == "requestDuration"
 
+    def test_expected_field_mappings_cover_completion_provenance(self):
+        """effort, modelHost and subscriberEmailSource are submitted by the tool,
+        so the field-coverage analysis must know their API names — otherwise it
+        reports them permanently missing on every transaction that carries them."""
+        mappings = self.analyzer.expected_field_mappings
+        assert mappings["effort"] == "effort"
+        assert mappings["model_host"] == "modelHost"
+        assert mappings["subscriber_email_source"] == "subscriberEmailSource"
+        # model_host is the billing infrastructure and is distinct from the
+        # read-side model_source (the routing layer) already mapped here.
+        assert mappings["model_source"] == "modelSource"
+
+    def test_expected_field_mappings_cover_client_reported_cost(self):
+        """clientReportedCost is response-only: the platform writes it when it
+        re-rates a transaction against the tenant's rate card. Without the
+        mapping the field-presence analysis reports it absent on every
+        transaction that actually carries it."""
+        mappings = self.analyzer.expected_field_mappings
+        assert mappings["client_reported_cost"] == "clientReportedCost"
+        # It must not displace totalCost, which stays the billed figure.
+        assert mappings["total_cost"] == "totalCost"
+
     def test_critical_fields_populated(self):
         assert "model" in self.analyzer.critical_fields
         assert "provider" in self.analyzer.critical_fields

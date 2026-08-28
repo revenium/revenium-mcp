@@ -486,10 +486,10 @@ class TestListCredentials:
             return_value=[],
         ):
             await cred_tool._list_credentials(
-                {"page": 1, "size": 10, "filters": {"status": "active"}},
+                {"page": 1, "size": 10, "filters": {"query": "prod-key"}},
                 client=mock_client,
             )
-        mock_client.get_credentials.assert_called_once_with(page=1, size=10, status="active")
+        mock_client.get_credentials.assert_called_once_with(page=1, size=10, query="prod-key")
 
 
 # ---------------------------------------------------------------------------

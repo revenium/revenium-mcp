@@ -42,6 +42,10 @@ class TestNormalizeEntityName:
     def test_provider_anthropic(self):
         assert self.processor._normalize_entity_name("anthropic", "provider") == "Anthropic"
 
+    def test_provider_foundry_case_variants(self):
+        assert self.processor._normalize_entity_name("foundry", "provider") == "Foundry"
+        assert self.processor._normalize_entity_name("FOUNDRY", "provider") == "Foundry"
+
     def test_provider_already_normalized(self):
         assert self.processor._normalize_entity_name("OpenAI", "provider") == "OpenAI"
 

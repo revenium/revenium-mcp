@@ -17,6 +17,7 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..client import ReveniumAPIError, ReveniumClient
 from ..common.error_handling import ErrorCodes, ToolError
+from ..common.validation import apply_filter_allowlist
 from ..introspection.metadata import (
     ResourceRelationship,
     ToolCapability,
@@ -43,6 +44,44 @@ _MAX_JOBS_PAGE = 1_000_000
 # passed the `size <= 0` guard and was forwarded to the backend, which
 # returned the same generic HTTP 500 this PR closed for page.
 _MAX_JOBS_SIZE = 50
+
+# snake_case filter name -> camelCase query parameter, bounded to what the
+# endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
+# JobController.list, which binds teamId, a Pageable (page, size, sort) and a
+# JobSearchParams @ParameterObject whose fields are the names below
+# (model/repository/specification/JobSearchParams.kt). teamId and page/size are
+# set by the client.
+_JOB_FILTER_MAP: Dict[str, str] = {
+    "search": "search",
+    "type": "type",
+    "execution_status": "executionStatus",
+    "outcome_type": "outcomeType",
+    "outcome_value_min": "outcomeValueMin",
+    "outcome_value_max": "outcomeValueMax",
+    "environment": "environment",
+    "start_date": "startDate",
+    "end_date": "endDate",
+    "sort": "sort",
+}
+
+# Verified 2026-08-28 against hypercurrent origin/develop
+# JobController.getConversionFunnel: @RequestParam teamId / startDate / endDate
+# / jobType / environment. teamId is set by the client. The funnel is not
+# paginated, so there is no Pageable and no sort.
+_CONVERSION_FUNNEL_FILTER_MAP: Dict[str, str] = {
+    "start_date": "startDate",
+    "end_date": "endDate",
+    "job_type": "jobType",
+    "environment": "environment",
+}
+
+# get_roi_summary drives one funnel call per job type, so it sets jobType
+# itself and only accepts the date/environment narrowing from the caller.
+_ROI_SUMMARY_FILTER_MAP: Dict[str, str] = {
+    "start_date": "startDate",
+    "end_date": "endDate",
+    "environment": "environment",
+}
 
 
 def _strip_links(value: Any) -> Any:
@@ -137,7 +176,9 @@ class JobManager:
         """List jobs with pagination."""
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = arguments.get("filters", {})
+        filters = apply_filter_allowlist(
+            arguments.get("filters"), _JOB_FILTER_MAP, action="list_jobs"
+        )
         _validate_jobs_pagination(page, size)
         response = await self.client.get_jobs(page=page, size=size, **filters)
         jobs = self.client._extract_embedded_data(response)
@@ -220,20 +261,32 @@ class JobManager:
 
     async def get_conversion_funnel(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get global conversion funnel analytics with optional filters."""
-        filters = arguments.get("filters", {})
+        # paginated=False: this action takes no page/size arguments, so a
+        # page/size inside filters would be a silent no-op rather than a
+        # shadowed duplicate - reject it like any other unknown key.
+        filters = apply_filter_allowlist(
+            arguments.get("filters"),
+            _CONVERSION_FUNNEL_FILTER_MAP,
+            action="get_conversion_funnel",
+            paginated=False,
+        )
         result = await self.client.get_job_conversion_funnel(**filters)
         return {"action": "get_conversion_funnel", "data": _strip_links(result)}
 
     async def get_roi_summary(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get ROI summary across all job types with per-type conversion funnels.
 
-        Orchestrates get_job_types + get_conversion_funnel(jobType=...) for each type.
-        Optional filters: startDate, endDate (passed through to each funnel call).
+        Orchestrates get_job_types + get_conversion_funnel(jobType=...) for each type,
+        so jobType is set per call rather than accepted from the caller. The
+        remaining funnel filters (start_date, end_date, environment) are passed
+        through to every call.
         """
-        filters = arguments.get("filters", {})
-        if not isinstance(filters, dict):
-            filters = {}
-        date_filters = {k: filters[k] for k in ("startDate", "endDate") if k in filters}
+        date_filters = apply_filter_allowlist(
+            arguments.get("filters"),
+            _ROI_SUMMARY_FILTER_MAP,
+            action="get_roi_summary",
+            paginated=False,
+        )
 
         # Step 1: Get all job types
         types_result = await self.client.get_job_types()
@@ -426,10 +479,13 @@ class JobManagement(ToolBase):
                             "size": "int (default 20)",
                             "filters": (
                                 "dict (optional) — supported keys: "
+                                "search (free text), "
                                 "type (job type, case-insensitive), "
                                 "executionStatus (SUCCESS|FAILED|CANCELLED), "
                                 "outcomeType (CONVERTED|ESCALATED|DEFLECTED|UNSUCCESSFUL|CUSTOM|PENDING), "
-                                "startDate (ISO 8601), endDate (ISO 8601), sort"
+                                "outcomeValueMin, outcomeValueMax, environment, "
+                                "startDate (ISO 8601), endDate (ISO 8601), sort. "
+                                "Any other key is rejected rather than silently ignored"
                             ),
                             "returns": (
                                 "job records carrying outcomeReason — the human-readable "
@@ -454,14 +510,16 @@ class JobManagement(ToolBase):
                         "get_conversion_funnel": {
                             "filters": (
                                 "dict (optional) — supported keys: "
-                                "jobType (case-insensitive), startDate (ISO 8601), endDate (ISO 8601)"
+                                "jobType (case-insensitive), startDate (ISO 8601), "
+                                "endDate (ISO 8601), environment"
                             ),
                         },
                         "get_roi_summary": {
                             "filters": (
                                 "dict (optional) — supported keys: "
-                                "startDate (ISO 8601), endDate (ISO 8601). "
-                                "Orchestrates get_job_types + per-type conversion funnels."
+                                "startDate (ISO 8601), endDate (ISO 8601), environment. "
+                                "Orchestrates get_job_types + per-type conversion funnels, "
+                                "so jobType is set per call and not accepted here."
                             ),
                         },
                         "report_outcome": {
@@ -733,7 +791,7 @@ class JobManagement(ToolBase):
                     "get_job_transactions": {"job_id": "str", "page": "int", "size": "int"},
                     "get_job_roi": {"job_id": "str"},
                     "get_conversion_funnel": {"filters": "dict (optional)"},
-                    "get_roi_summary": {"filters": "dict (optional: startDate, endDate)"},
+                    "get_roi_summary": {"filters": "dict (optional: startDate, endDate, environment)"},
                 },
                 examples=[
                     "get_job_transactions(job_id='job_123')",

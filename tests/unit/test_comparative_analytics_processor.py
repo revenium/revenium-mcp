@@ -55,6 +55,10 @@ class TestNormalizeEntityName:
         assert self.proc._normalize_entity_name("anthropic", "provider") == "Anthropic"
         assert self.proc._normalize_entity_name("ANTHROPIC", "provider") == "Anthropic"
 
+    def test_provider_foundry_case_variants(self):
+        assert self.proc._normalize_entity_name("foundry", "provider") == "Foundry"
+        assert self.proc._normalize_entity_name("FOUNDRY", "provider") == "Foundry"
+
     def test_provider_unknown_preserved(self):
         assert self.proc._normalize_entity_name("CustomProvider", "provider") == "CustomProvider"
 

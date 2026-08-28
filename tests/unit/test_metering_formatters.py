@@ -552,3 +552,209 @@ class TestFormatFullTransactionDetails:
         assert "Session Tracking" in result
         assert "Cost Breakdown" not in result
         assert "Quality & Streaming" not in result
+
+
+# ===========================================================================
+# BACK-2763: read-side rendering of clientReportedCost, effort, modelHost
+# and subscriberEmailSource on the completions detail path.
+#
+# Shape confirmed live against dev on the BACK-2758 probe transaction
+# back2758-probe-1787760276 (GET /profitstream/v2/api/sources/metrics/ai/
+# completions/rj6dGJ): all four properties are present on the detail read
+# model, and effort is populated on the list projection too.
+# ===========================================================================
+
+
+# A completions row carrying the four provenance/re-rating fields. Values and
+# key casing mirror the live dev response.
+PROVENANCE_TRANSACTION = {
+    "transactionId": "back2758-probe-1787760276",
+    "model": "probe-model",
+    "provider": "OPENAI",
+    "inputTokenCount": 10,
+    "outputTokenCount": 5,
+    "inputTokenCost": 0.0,
+    "outputTokenCost": 0.0,
+    "totalCost": 0.0,
+    "clientReportedCost": 0.0,
+    "effort": "x_high",
+    "modelHost": "bedrock",
+    "subscriberEmailSource": "git",
+}
+
+
+class TestClientReportedCostRendering:
+    """clientReportedCost renders as the pre-re-rating client figure."""
+
+    def setup_method(self):
+        self.mm = make_mm()
+
+    def test_client_reported_cost_renders(self):
+        data = {"totalCost": 0.09, "clientReportedCost": 0.25}
+        result = self.mm._format_cost_breakdown(data)
+        assert "**Client-Reported Cost**: $0.250000" in result
+
+    def test_zero_client_reported_cost_still_renders(self):
+        """A clientReportedCost of exactly 0.0 means 're-rated to free'.
+
+        This is the case a truthiness gate silently drops: the value is real,
+        the user is asking why their cost changed, and 0.0 is the answer.
+        """
+        data = {"totalCost": 0.09, "clientReportedCost": 0.0}
+        result = self.mm._format_cost_breakdown(data)
+        assert "Cost Breakdown" in result
+        assert "**Client-Reported Cost**: $0.000000" in result
+
+    def test_client_reported_cost_alone_opens_the_section(self):
+        """clientReportedCost joins the section gate on `is not None`."""
+        result = self.mm._format_cost_breakdown({"clientReportedCost": 0.0})
+        assert "Cost Breakdown" in result
+        assert "**Client-Reported Cost**: $0.000000" in result
+
+    def test_null_client_reported_cost_omits_the_line(self):
+        data = {"totalCost": 0.09, "clientReportedCost": None}
+        result = self.mm._format_cost_breakdown(data)
+        assert "Client-Reported" not in result
+
+    def test_absent_client_reported_cost_omits_the_line(self):
+        result = self.mm._format_cost_breakdown({"totalCost": 0.09})
+        assert "Client-Reported" not in result
+
+    def test_client_reported_cost_is_not_presented_as_a_peer_of_total(self):
+        """totalCost stays the billed figure; the client-reported line must
+        say so, or a user quotes the wrong number."""
+        data = {"totalCost": 0.09, "clientReportedCost": 0.25}
+        result = self.mm._format_cost_breakdown(data)
+        assert "**Total Cost**: $0.090000" in result
+        client_line = next(
+            line for line in result.splitlines() if "Client-Reported Cost" in line
+        )
+        assert "billed" in client_line.lower()
+
+    def test_re_rating_is_explained_when_present(self):
+        data = {"totalCost": 0.09, "clientReportedCost": 0.25}
+        result = self.mm._format_cost_breakdown(data)
+        assert "re-rated" in result.lower()
+
+    def test_no_difference_or_discount_is_derived(self):
+        """A null clientReportedCost means 'not re-rated', not 'zero delta',
+        so no arithmetic between the two figures may appear."""
+        data = {"totalCost": 0.09, "clientReportedCost": 0.25}
+        result = self.mm._format_cost_breakdown(data)
+        lowered = result.lower()
+        assert "discount" not in lowered
+        assert "difference" not in lowered
+        assert "0.160000" not in result
+
+    def test_zero_total_cost_still_renders(self):
+        """A re-rated-to-free transaction has totalCost 0.0 and must not
+        vanish from the cost section either. Observed live on dev."""
+        result = self.mm._format_cost_breakdown({"totalCost": 0.0})
+        assert "**Total Cost**: $0.000000" in result
+
+
+class TestModelExecutionRendering:
+    """modelHost and effort render on the detail path."""
+
+    def setup_method(self):
+        self.mm = make_mm()
+
+    def test_model_host_renders(self):
+        result = self.mm._format_full_transaction_details({"modelHost": "bedrock"})
+        assert "**Model Host**: bedrock" in result
+
+    def test_effort_renders(self):
+        result = self.mm._format_full_transaction_details({"effort": "x_high"})
+        assert "**Reasoning Effort**: x_high" in result
+
+    def test_unrecognised_effort_renders_verbatim(self):
+        """effort is free text with an evolving vendor vocabulary; an
+        unrecognised level must survive rendering rather than be normalised."""
+        result = self.mm._format_full_transaction_details({"effort": "ultra_2"})
+        assert "**Reasoning Effort**: ultra_2" in result
+
+    def test_absent_fields_omit_the_section(self):
+        result = self.mm._format_full_transaction_details({"model": "gpt-4"})
+        assert "Model Execution" not in result
+
+    def test_null_fields_omit_the_section(self):
+        data = {"modelHost": None, "effort": None}
+        result = self.mm._format_full_transaction_details(data)
+        assert "Model Execution" not in result
+
+
+class TestSubscriberEmailSourceRendering:
+    """subscriberEmailSource renders next to subscriberEmail."""
+
+    def setup_method(self):
+        self.mm = make_mm()
+
+    def test_email_source_renders_beside_email(self):
+        data = {"subscriberEmail": "dev@acme.com", "subscriberEmailSource": "git"}
+        result = self.mm._format_attribution_details(data)
+        assert "**Subscriber Email**: dev@acme.com" in result
+        assert "**Subscriber Email Source**: git" in result
+
+    def test_email_source_without_email_still_renders(self):
+        """Observed live on dev: subscriberEmailSource is populated while
+        subscriberEmail is null, so the source must not hang off the email."""
+        result = self.mm._format_attribution_details({"subscriberEmailSource": "git"})
+        assert "Attribution" in result
+        assert "**Subscriber Email Source**: git" in result
+
+    def test_null_email_source_omits_the_line(self):
+        data = {"subscriberEmail": "dev@acme.com", "subscriberEmailSource": None}
+        result = self.mm._format_attribution_details(data)
+        assert "Subscriber Email Source" not in result
+
+    def test_email_source_does_not_suppress_nested_subscriber_fallback(self):
+        data = {
+            "subscriberEmailSource": "git",
+            "subscriber": {"email": "nested@acme.com", "id": "usr_1"},
+        }
+        result = self.mm._format_attribution_details(data)
+        assert "**Subscriber Email Source**: git" in result
+        assert "nested@acme.com" in result
+
+
+class TestListRowRendersProvenanceFields:
+    """The list projection forwards rows whole; the detail formatter must
+    render the fields the list rows actually carry."""
+
+    def setup_method(self):
+        self.mm = make_mm()
+
+    def test_list_row_renders_all_four_fields(self):
+        result = self.mm._format_full_transaction_details(PROVENANCE_TRANSACTION)
+        assert "**Client-Reported Cost**: $0.000000" in result
+        assert "**Model Host**: bedrock" in result
+        assert "**Subscriber Email Source**: git" in result
+        # effort is a detail-path field per the ticket; dev also populates it
+        # on the list projection, and either way it renders from the row.
+        assert "**Reasoning Effort**: x_high" in result
+
+    def test_summary_row_is_unchanged(self):
+        """The provenance fields belong to the detail rendering only."""
+        result = self.mm._format_transaction_summary(PROVENANCE_TRANSACTION)
+        assert "Model Host" not in result
+        assert "Reasoning Effort" not in result
+        assert "Client-Reported" not in result
+
+
+class TestNullTokenCountsWithZeroCosts:
+    """PR #332 review: explicit-null token counts beside 0.0 costs must render,
+    not TypeError — the case the is-not-None gates newly exposed."""
+
+    def setup_method(self):
+        self.mm = make_mm()
+
+    def test_null_counts_with_zero_costs_render(self):
+        data = {
+            "inputTokenCost": 0.0,
+            "outputTokenCost": 0.0,
+            "inputTokenCount": None,
+            "outputTokenCount": None,
+        }
+        text = self.mm._format_cost_breakdown(data)
+        assert "Input Cost" in text and "Output Cost" in text
+        assert "0 tokens" in text

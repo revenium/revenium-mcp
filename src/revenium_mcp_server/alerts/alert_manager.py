@@ -85,6 +85,10 @@ class AlertManager:
         - "firing alerts", "active alerts", "triggered alerts"
         - "recent alerts", "latest alerts"
         - Date ranges: "last 24 hours", "yesterday", "this week"
+
+        Only date ranges reach the API: `start` and `end` are the sole
+        query params GET /sources/ai/alert declares that this parser can
+        derive from free text. Everything else is display-side.
         """
         filters = {}
         query_lower = query.lower()
@@ -131,23 +135,12 @@ class AlertManager:
             # Disabled alerts would have 'enabled': false
             pass
 
-        # Parse severity keywords (though API doesn't have severity, keep for future)
-        if "critical" in query_lower:
-            filters["severity"] = "critical"
-        elif "high" in query_lower:
-            filters["severity"] = "high"
-        elif "medium" in query_lower:
-            filters["severity"] = "medium"
-        elif "low" in query_lower:
-            filters["severity"] = "low"
-
-        # Parse traditional status keywords (for backward compatibility)
-        if "open" in query_lower:
-            filters["status"] = "open"
-        elif "acknowledged" in query_lower:
-            filters["status"] = "acknowledged"
-        elif "investigating" in query_lower:
-            filters["status"] = "investigating"
+        # BACK-2783: severity and status keywords used to become `severity=` and
+        # `status=` query params here. GET /sources/ai/alert declares neither
+        # (AIAlertController.find: teamId, type, start, end, anomalyId, ownerId,
+        # resolved, Pageable — verified 2026-08-28 against origin/develop), so
+        # they never filtered anything: the caller got the unfiltered list back
+        # and believed it was severity-filtered. They are no longer sent.
 
         # Parse metric type keywords using user-validated metrics
         all_metrics = [metric.value for metric in MetricType]

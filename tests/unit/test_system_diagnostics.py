@@ -148,6 +148,14 @@ class TestIngestionDiagnosticsRouting:
         assert result[0].text == "failures"
 
     @pytest.mark.asyncio
+    async def test_capabilities_document_the_ticket_jobs_opt_in(self, diagnostics_tool):
+        """BACK-2770: system_diagnostics carries its own action documentation
+        for set_strict_ingestion_mode and goes stale without the sub-flag."""
+        result = await diagnostics_tool.handle_action("get_capabilities", {})
+        text = result[0].text
+        assert "allow_ticket_jobs" in text
+
+    @pytest.mark.asyncio
     async def test_set_strict_ingestion_mode_routes_to_log_tool(self):
         from unittest.mock import AsyncMock
         from mcp.types import TextContent

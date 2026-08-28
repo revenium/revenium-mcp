@@ -84,6 +84,10 @@ class TestNormalizeProviderName:
         assert self.analyzer._normalize_provider_name("litellm") == "LiteLLM"
         assert self.analyzer._normalize_provider_name("LITELLM") == "LiteLLM"
 
+    def test_foundry_variants(self):
+        assert self.analyzer._normalize_provider_name("foundry") == "Foundry"
+        assert self.analyzer._normalize_provider_name("FOUNDRY") == "Foundry"
+
     def test_unknown_provider_preserved(self):
         assert self.analyzer._normalize_provider_name("CustomProvider") == "CustomProvider"
 

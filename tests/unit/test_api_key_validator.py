@@ -129,12 +129,13 @@ async def test_metering_key_short_circuits_without_http():
 
 @pytest.mark.asyncio
 async def test_401_raises_invalid_token():
+    """401 is kept as a defensive branch even though the live backend sends 403."""
     v, client = _validator_with_response(_resp(401, text="Unauthorized"))
     with patch(
         "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
         return_value=client,
     ):
-        with pytest.raises(InvalidTokenError):
+        with pytest.raises(InvalidTokenError, match="invalid, revoked, or unknown"):
             await v.validate("rev_rk_revokedkey1234")
 
 
@@ -145,7 +146,7 @@ async def test_401_raises_invalid_token():
         ("API key is suspended", KeySuspendedError),
         ("API key has expired", KeyExpiredError),
         ("Insufficient API key scope", InsufficientScopeError),
-        ("Some other forbidden reason", ApiKeyValidationError),
+        ("Some other forbidden reason", InvalidTokenError),
     ],
 )
 async def test_403_maps_by_substring(text, exc):
@@ -159,6 +160,47 @@ async def test_403_maps_by_substring(text, exc):
 
 
 @pytest.mark.asyncio
+async def test_generic_403_envelope_classifies_as_invalid_token():
+    """The live rejection envelope is an unknown key, not an opaque Forbidden.
+
+    The platform answers malformed, well-formed-but-unknown, metering-format and
+    empty keys with this same generic 403 body, so it is the unrecognized-key
+    signal on this backend.
+    """
+    envelope = (
+        '{"timestamp":"2026-01-01T00:00:00.000+00:00","status":403,'
+        '"error":"Forbidden","path":"/profitstream/v2/api/users/me"}'
+    )
+    v, client = _validator_with_response(_resp(403, text=envelope))
+    with patch(
+        "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
+        return_value=client,
+    ):
+        with pytest.raises(InvalidTokenError) as exc_info:
+            await v.validate("rev_sk_0000000000000000000000000000")
+    message = str(exc_info.value)
+    assert message == "API key is invalid, revoked, or unknown"
+    # The opaque upstream body must not leak into the caller-facing message.
+    assert "Forbidden" not in message
+
+
+@pytest.mark.asyncio
+async def test_401_and_generic_403_share_one_message():
+    """Both rejection statuses classify identically, so callers see one outcome."""
+    messages = []
+    for status in (401, 403):
+        v, client = _validator_with_response(_resp(status, text="Forbidden"))
+        with patch(
+            "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
+            return_value=client,
+        ):
+            with pytest.raises(InvalidTokenError) as exc_info:
+                await v.validate("rev_rk_abcdef123456")
+        messages.append(str(exc_info.value))
+    assert messages[0] == messages[1]
+
+
+@pytest.mark.asyncio
 async def test_5xx_falls_through_to_base_error():
     v, client = _validator_with_response(_resp(503, text="upstream down"))
     with patch(
@@ -167,6 +209,21 @@ async def test_5xx_falls_through_to_base_error():
     ):
         with pytest.raises(ApiKeyValidationError):
             await v.validate("rev_rk_abcdef123456")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [404, 429, 500, 503])
+async def test_non_rejection_statuses_are_not_classified_as_invalid_token(status):
+    """Only 401/403 mean "bad key"; everything else stays the generic error."""
+    v, client = _validator_with_response(_resp(status, text="upstream said no"))
+    with patch(
+        "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
+        return_value=client,
+    ):
+        with pytest.raises(ApiKeyValidationError) as exc_info:
+            await v.validate("rev_rk_abcdef123456")
+    assert not isinstance(exc_info.value, InvalidTokenError)
+    assert f"Unexpected status {status}" in str(exc_info.value)
 
 
 @pytest.mark.asyncio

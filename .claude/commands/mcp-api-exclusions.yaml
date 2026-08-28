@@ -14,4 +14,46 @@
 #     decided_by: name                  # who made the call
 #     decided_on: YYYY-MM-DD
 #     revisit: "condition under which to reconsider"   # optional
-exclusions: []
+exclusions:
+  - path_prefix: /v2/api/coding-assistant
+    reason: >-
+      Read surface intentionally unadopted pending a product decision on whether
+      coding-assistant telemetry belongs on the agent-facing management surface.
+      It is documented in both the current and the preview platform API document
+      with zero MCP coverage, so it produces no drift item and would otherwise be
+      re-discovered by every coverage audit.
+    decided_by: Jonas Oliveira
+    decided_on: 2026-08-18
+    revisit: >-
+      When a product owner asks for coding-assistant data through an agent, or
+      when the surface grows a write path that a tool would have to guard.
+
+  - path_prefix: /v2/api/sources/metrics/tool
+    methods: [POST, PUT, DELETE]
+    reason: >-
+      Agent-driven mutation of metered tool usage events is not wanted — a logged
+      usage event is billing history, and an agent that can rewrite it can rewrite
+      an invoice. The upstream controller inherits create/update/delete from the
+      shared CRUD interface but supplies no request mapping for them and every
+      body throws 501 Not Implemented, so there is no route to adopt even if the
+      intent changed. Recording new usage has its own ingest surface
+      (/meter/v2/tool/events, exposed as the manage_tools meter_event and
+      record_event actions).
+    decided_by: Jonas Oliveira
+    decided_on: 2026-08-18
+
+  - path_prefix: /v2/api/sources/metrics/tool/{id}
+    methods: [GET]
+    reason: >-
+      The per-event read-by-id is declared by the upstream controller but is
+      annotated hidden (so it is absent from both published API documents), gated
+      by denyAll(), and throws 501 Not Implemented — it has never been callable.
+      An MCP action for it could only ever fail, so it is deliberately not
+      exposed. The list read on the same surface
+      (/v2/api/sources/metrics/tool/events) IS adopted, as the manage_tools
+      list_events and get_events actions.
+    decided_by: Jonas Oliveira
+    decided_on: 2026-08-18
+    revisit: >-
+      If the upstream controller implements the endpoint and drops denyAll(),
+      adopt it as a per-event read action on manage_tools.

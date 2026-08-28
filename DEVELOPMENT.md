@@ -78,7 +78,7 @@ python -m revenium_mcp_server
 **Expected Output:**
 ```
 Revenium MCP Server v<current version> ready with 7 tools
-FastMCP 3.2.0
+FastMCP <pinned fastmcp version>
 Server name: Revenium MCP Server v<current version>
 Transport: STDIO
 ```

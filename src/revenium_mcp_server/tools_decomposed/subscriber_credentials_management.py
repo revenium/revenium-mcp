@@ -25,7 +25,7 @@ from ..common.error_handling import (
     create_structured_missing_parameter_error,
     create_structured_validation_error,
 )
-from ..common.validation import validate_pagination_params
+from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..dry_run.credential_dry_run import CredentialDryRunValidator
 from ..hierarchy import (
     get_cross_tier_validator,
@@ -38,6 +38,17 @@ from ..common.security_utils import obfuscate_credentials_list, obfuscate_creden
 from .credential_business_handler import CredentialBusinessHandler
 from .credential_documentation_handler import CredentialDocumentationHandler
 from .unified_tool_base import ToolBase
+
+# snake_case filter name -> camelCase query parameter, bounded to what the
+# endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
+# CredentialController.list: @RequestParam query / teamId / type plus a
+# Pageable (page, size, sort). teamId and page/size are set by the client, so
+# what remains is the caller-settable set.
+_CREDENTIAL_FILTER_MAP: Dict[str, str] = {
+    "query": "query",
+    "type": "type",
+    "sort": "sort",
+}
 
 
 class CredentialsHierarchyManager:
@@ -557,7 +568,9 @@ class SubscriberCredentialsManagement(ToolBase):
         arguments = validate_pagination_params(arguments, action="list_credentials")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = arguments.get("filters", {})
+        filters = apply_filter_allowlist(
+            arguments.get("filters"), _CREDENTIAL_FILTER_MAP, action="list_credentials"
+        )
 
         response = await client.get_credentials(page=page, size=size, **filters)
         credentials = client._extract_embedded_data(response)
@@ -1102,7 +1115,11 @@ class SubscriberCredentialsManagement(ToolBase):
                 name="CRUD Operations",
                 description="Full create, read, update, delete operations for subscriber credentials with partial update support",
                 parameters={
-                    "list": {"page": "int", "size": "int", "filters": "dict"},
+                    "list": {
+                        "page": "int",
+                        "size": "int",
+                        "filters": "dict (optional) — valid keys: query, sort, type",
+                    },
                     "get": {"credential_id": "str"},
                     "create": {"credential_data": "dict", "dry_run": "bool"},
                     "update": {
