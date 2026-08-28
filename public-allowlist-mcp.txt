@@ -26,4 +26,5 @@ public-allowlist-mcp.txt
 !scripts/check-architecture-docs.sh
 !tests/unit/test_public_export_allowlist.py
 !.claude/commands/mcp-api-drift-local.md
+!.claude/commands/mcp-api-exclusions.yaml
 uv.lock
