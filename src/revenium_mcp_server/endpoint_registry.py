@@ -338,6 +338,21 @@ _ENDPOINT_REGISTRY: Dict[str, EndpointConfig] = {
         mapping_status="NEW_API_ONLY",
         force_new=True,
     ),
+    # ── Jobs ROI summary (BACK-2915) ──────────────────────────────────────
+    # Server-side ROI aggregation by job type. Replaces the client-side
+    # get_job_types + per-type conversion-funnel fan-out that JobManager.
+    # get_roi_summary used to run: the analytics host publishes the same shape
+    # in one call and adds fields the fan-out cannot produce (tokenCost,
+    # externalToolCost, humanCost and the toolCostAttribution qualifier).
+    # NEW_API_ONLY with no profitstream predecessor, so old_path is the usual
+    # never-routed placeholder and force_new keeps hosted deployments (which do
+    # not set REVENIUM_USE_NEW_ANALYTICS_API) reaching it.
+    "jobs_roi_summary": EndpointConfig(
+        old_path="/api/v2/analytics/jobs/roi-summary",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/jobs/roi-summary",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
     # ── Status / connectivity endpoint ────────────────────────────────────
     # Old: /profitstream/v2/api/sources/metrics/ai/data-connected
     # New: /api/v2/status/connection  (BACK-718 swap #14)

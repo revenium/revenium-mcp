@@ -16,6 +16,8 @@ from src.revenium_mcp_server.tools_decomposed.metering_management import (
     MeteringTransactionManager,
 )
 
+from tests.unit._helpers_hal import wire_embedded_reader
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -978,7 +980,7 @@ class TestListAiModelsTotalCount:
             "_embedded": {"aIModelResourceList": models},
             "page": {"totalElements": catalog_total, "totalPages": 44, "size": page_size, "number": 0},
         }
-        fake_client = MagicMock()
+        fake_client = wire_embedded_reader(MagicMock())
         fake_client.get_ai_models = AsyncMock(return_value=api_response)
 
         with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
@@ -1876,3 +1878,94 @@ class TestEmailAddressRejectedAsProvenance(TestSubmitCompletionProvenanceFields)
         )
         for label in ("git", "env", "cli-flag", "custom-env"):
             assert _email_source_shape_errors({"subscriber_email_source": label}) == []
+
+
+# ===========================================================================
+# BACK-3087 (PR #375 review): a transaction found in the SESSION store renders
+# its fields, cache tokens included.
+#
+# The session store keeps a bookkeeping wrapper (payload / timestamp /
+# verified / submitted), not the record, and the renderers were handed the
+# wrapper. Every field lookup missed, so the just-submitted verification path
+# printed "Found" with nothing under it.
+# ===========================================================================
+
+
+class TestSessionStoredTransactionRendersItsFields:
+    """A session hit renders the submitted payload, not the empty wrapper."""
+
+    def _store(self, mgmt):
+        from datetime import datetime, timezone
+
+        mgmt.transaction_manager.transaction_store["tx_sess_cache"] = {
+            "payload": {
+                "transactionId": "tx_sess_cache",
+                "model": "claude-sonnet-4",
+                "provider": "ANTHROPIC",
+                "inputTokenCount": 12,
+                "outputTokenCount": 8,
+                "requestDuration": 120,
+                # Submitted as cache_creation_tokens / cache_read_tokens; the
+                # payload carries the API's own request-body spellings, which
+                # for these two are the response spellings as well.
+                "cacheCreationTokenCount": 1300,
+                "cacheReadTokenCount": 900,
+            },
+            "timestamp": datetime(2026, 9, 9, 12, 0, 0, tzinfo=timezone.utc),
+            "verified": False,
+            "submitted": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_full_detail_shows_the_cache_section(self):
+        mgmt, _ = _make_mgmt_with_client()
+        self._store(mgmt)
+
+        result = await mgmt.handle_action(
+            "lookup_transactions",
+            {
+                "transaction_ids": ["tx_sess_cache"],
+                "return_transaction_data": "full",
+            },
+        )
+        text = result[0].text
+
+        assert "(source: session)" in text
+        assert "Cache Tokens" in text
+        assert "**Cache Read Tokens**: 900" in text
+        assert "**Cache Creation Tokens (total)**: 1300" in text
+        # The platform derives the TTL split, so a just-submitted record has
+        # none of it yet - and that must read unavailable, not 0.
+        assert "**Cache Creation Tokens (5m TTL)**: unavailable" in text
+        assert "**Cache TTL Split Source**: unavailable" in text
+
+    @pytest.mark.asyncio
+    async def test_summary_shows_the_submitted_core_fields(self):
+        """The same wrapper hid model, provider and token counts too."""
+        mgmt, _ = _make_mgmt_with_client()
+        self._store(mgmt)
+
+        result = await mgmt.handle_action(
+            "lookup_transactions",
+            {
+                "transaction_ids": ["tx_sess_cache"],
+                "return_transaction_data": "summary",
+            },
+        )
+        text = result[0].text
+
+        assert "claude-sonnet-4" in text
+        assert "ANTHROPIC" in text
+        # Summary stays summary: no cache section at this detail level.
+        assert "Cache Tokens" not in text
+
+    def test_unwrap_leaves_an_api_record_untouched(self):
+        """An API record has no `submitted` marker and must pass through."""
+        mgmt = MeteringManagement()
+        api_record = {"model": "gpt-4", "cacheReadTokenCount": 5}
+        assert mgmt._unwrap_session_transaction(api_record) is api_record
+
+    def test_unwrap_ignores_a_non_dict_payload(self):
+        mgmt = MeteringManagement()
+        odd = {"submitted": True, "payload": "not-a-dict"}
+        assert mgmt._unwrap_session_transaction(odd) is odd

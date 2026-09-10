@@ -42,6 +42,13 @@ CAPABILITIES_TEXT = """
    - Optional allow_ticket_jobs keeps ticket-grain Job creation on while strict mode is enabled
      (omit it to leave the tenant's current setting unchanged; disabling strict mode clears it)
 
+5c. **set_attribution_detail_text** - ✅ **AVAILABLE**
+   - Turn the tenant's free-text attribution detail on or off (no confirm needed)
+   - While off (the platform default) a session attribution carrying a free-text reason
+     still records, but the text is stored as null and never returned
+   - The flag has no published read-only endpoint, so the toggle response and the
+     set_strict_ingestion_mode response are the only places it is reported
+
 6. **get_capabilities** - ✅ **AVAILABLE**
    - Shows current implementation status
 
@@ -146,6 +153,15 @@ EXAMPLES_TEXT = """
 }
 ```
 **Purpose**: Toggle strict ingestion mode for the tenant. Without confirm=true the call returns a consequences preview and changes nothing. allow_ticket_jobs is optional: it keeps the coding-assistant enricher creating ticket-grain Jobs under strict mode (platform default is off), omitting it leaves the tenant's current setting unchanged, and it cannot be true while enabled is false. Disabling strict mode clears the opt-in server-side, so it must be re-stated the next time strict mode is enabled.
+
+### set_attribution_detail_text
+```json
+{
+  "action": "set_attribution_detail_text",
+  "enabled": true
+}
+```
+**Purpose**: Turn the tenant's free-text attribution detail on or off. With it off (the platform default) a coding-assistant session attribution carrying a free-text reason still succeeds and still records the structured attribution, but the text is stored as null and never returned. Switching it off withholds text already stored; it does not delete it. No confirm is required, and the response reports the state the server returned - which is the only place the platform reports this flag, alongside the set_strict_ingestion_mode response.
 
 ### get_recent_logs
 ```json
@@ -267,6 +283,7 @@ UNSUPPORTED_ACTION_TEMPLATE = """
 - analyze_operations (operation pattern analysis)
 - get_ingestion_failures (strict-ingestion rejections)
 - set_strict_ingestion_mode (guarded strict-mode toggle, optional allow_ticket_jobs opt-in)
+- set_attribution_detail_text (free-text attribution detail toggle)
 
 Use `get_capabilities()` for current status.
 """

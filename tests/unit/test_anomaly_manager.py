@@ -8,6 +8,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.alerts.anomaly_manager import AnomalyManager
+from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.exceptions import ValidationError
 
 
@@ -457,6 +458,55 @@ class TestGetAnomaly:
         text = result[0].text
         assert "PROVIDER" in text
         assert "openai" in text
+
+
+class TestGetAnomalyNotFound:
+    """BACK-2938: the default manage_alerts get lands here, and the platform
+    answers 403 for an id that simply does not exist."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [403, 404])
+    async def test_unknown_id_reads_as_not_found(self, manager, status):
+        client = MagicMock()
+        client.get_anomaly_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("Access Denied", status_code=status)
+        )
+
+        result = await manager.get_anomaly(client, "jM7Bz8P")
+        text = result[0].text
+
+        assert "jM7Bz8P" in text
+        assert "not found" in text.lower()
+        assert "Access Denied" not in text
+        assert "403" not in text
+
+    @pytest.mark.asyncio
+    async def test_server_error_propagates(self, manager):
+        """A 500 is a backend outage, not evidence the anomaly is missing.
+
+        Folding it into not-found would send the caller looking for a deleted
+        record instead of a broken service.
+        """
+        client = MagicMock()
+        client.get_anomaly_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("internal server error", status_code=500)
+        )
+
+        with pytest.raises(ReveniumAPIError) as exc_info:
+            await manager.get_anomaly(client, "anom-1")
+
+        assert exc_info.value.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_other_status_propagates(self, manager):
+        """A 502 is an upstream failure, not evidence the anomaly is missing."""
+        client = MagicMock()
+        client.get_anomaly_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("bad gateway", status_code=502)
+        )
+
+        with pytest.raises(ReveniumAPIError):
+            await manager.get_anomaly(client, "anom-1")
 
 
 class TestCreateAnomaly:

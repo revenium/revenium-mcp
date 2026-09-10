@@ -642,12 +642,13 @@ class TestMeteringElementsManagementHandleAction:
                     "element_data": {},
                 },
             ):
-                result = await mgmt.handle_action(
-                    "create",
-                    {"element_data": {}},
-                )
-        assert isinstance(result[0], TextContent)
-        assert "Validation Failed" in result[0].text or "failed" in result[0].text.lower()
+                with pytest.raises(ToolError) as exc_info:
+                    await mgmt.handle_action(
+                        "create",
+                        {"element_data": {}},
+                    )
+        assert "Validation Failed" in exc_info.value.message
+        assert "Missing required field: name" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_delete_action_calls_api(self, mgmt):

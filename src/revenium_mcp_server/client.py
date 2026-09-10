@@ -23,7 +23,13 @@ from loguru import logger
 from .api_field_mapper import APIFieldMapper
 from .auth import AuthConfig, AuthenticationError, get_auth_config, get_bearer_auth_headers
 from .config_store import get_config_value
-from .endpoint_registry import DEFAULT_APP_BASE_URL, KNOWN_APP_BASE_URLS, paired_app_base_url
+from .endpoint_registry import (
+    DEFAULT_APP_BASE_URL,
+    KNOWN_APP_BASE_URLS,
+    get_endpoint_config,
+    get_endpoint_path,
+    paired_app_base_url,
+)
 from .exceptions import AlertToolsError
 from .log_context import redact_headers
 from .logging_config import async_operation_context
@@ -204,13 +210,40 @@ def _strip_internal_error_id(text: str) -> str:
     return stripped if stripped else text.strip()
 
 
+# BACK-2941: a fully qualified Java/Kotlin class name in an upstream error body.
+# Spring's type-conversion failures quote the target type in full — e.g.
+# `io.hypercurrent.profitstream.model.entity.ExecutionStatus` — and echoing that
+# verbatim publishes internal implementation naming to anyone who can call this
+# server. Requires at least two lowercase package segments before a CamelCase
+# tail so ordinary prose and hostnames are left alone.
+_FQ_CLASS_NAME = re.compile(r"\b(?:[a-z][a-z0-9_]*\.){2,}([A-Z][A-Za-z0-9_$]*)\b")
+
+# BACK-2941: the shape Spring uses when a request parameter cannot be bound.
+_TYPE_CONVERSION_FAILURE = re.compile(
+    r"failed to convert (?:value of type .*? to required type|from type)",
+    re.IGNORECASE,
+)
+_REJECTED_VALUE = re.compile(r"for value \[([^\]]*)\]")
+
+
+def _strip_internal_class_names(text: str) -> str:
+    """Replace fully qualified internal class names with their simple names.
+
+    `io.hypercurrent.profitstream.model.entity.ExecutionStatus` becomes
+    `ExecutionStatus`, which still tells the caller which field was rejected
+    without publishing the backend's package layout.
+    """
+    return _FQ_CLASS_NAME.sub(r"\1", text)
+
+
 def _sanitize_error_text(text: str) -> str:
     """Apply the HTTP-error sanitizers in the right order.
 
     Internal Error ID first (it can appear as a leading line), then the
-    dict-repr suffix (anchored at end). Both helpers are idempotent.
+    dict-repr suffix (anchored at end), then fully qualified internal class
+    names anywhere in what is left. All three helpers are idempotent.
     """
-    return _strip_dict_repr_suffix(_strip_internal_error_id(text))
+    return _strip_internal_class_names(_strip_dict_repr_suffix(_strip_internal_error_id(text)))
 
 
 class ReveniumClient:
@@ -451,6 +484,33 @@ class ReveniumClient:
             f"**Next steps:**\n"
             f"• Use the list action to see current {resource_label_plural.lower()}\n"
             f"• Copy IDs from list results rather than reusing stored ones"
+        )
+
+    def _enhance_bad_request_error(self, error_text: str) -> Optional[str]:
+        """Rewrite an upstream parameter-binding 400 as caller guidance.
+
+        Spring answers a query parameter it cannot bind with its own
+        type-conversion prose, which reads as a stack trace and tells the
+        caller nothing they can act on. `_sanitize_error_text` has already
+        reduced the internal class names to simple names by the time this
+        runs; this turns what remains into a statement of which value was
+        rejected. Returns None when the body is not that shape, so every other
+        400 keeps its message (BACK-2941).
+        """
+        if not _TYPE_CONVERSION_FAILURE.search(error_text):
+            return None
+        rejected = _REJECTED_VALUE.search(error_text)
+        value_line = (
+            f"The value '{rejected.group(1)}' is not one this endpoint accepts.\n\n"
+            if rejected
+            else "One request parameter carried a value this endpoint cannot accept.\n\n"
+        )
+        return (
+            "Invalid request parameter\n\n"
+            f"{value_line}"
+            "**Next steps:**\n"
+            "• Use get_capabilities() on this tool to see the accepted values for each filter\n"
+            "• Values from a published list are matched regardless of case; check the spelling"
         )
 
     def _format_error_response(self, error_data: Any) -> str:
@@ -909,6 +969,14 @@ class ReveniumClient:
                     ):
                         comprehensive_error = ReveniumAPIError(
                             message=enhanced_not_found,
+                            status_code=response.status_code,
+                            response_data={"error_data": error_data},
+                        )
+                    elif response.status_code == 400 and (
+                        enhanced_bad_request := self._enhance_bad_request_error(error_text)
+                    ):
+                        comprehensive_error = ReveniumAPIError(
+                            message=enhanced_bad_request,
                             status_code=response.status_code,
                             response_data={"error_data": error_data},
                         )
@@ -1461,7 +1529,10 @@ class ReveniumClient:
 
         Args:
             agent_data: Agent data; telemetryKey (the value the agent emits
-                in telemetry) is required, displayName/ownerId optional
+                in telemetry) is required. Optional: displayName, ownerId,
+                description (string, max 1024 characters) and metadata (JSON
+                object, max 8192 bytes serialized). Both size caps are
+                enforced by the platform.
 
         Returns:
             Created agent data
@@ -1474,7 +1545,10 @@ class ReveniumClient:
 
         Args:
             agent_id: The agent ID
-            agent_data: Updated agent data (telemetryKey required by the API)
+            agent_data: Updated agent data (telemetryKey required by the API).
+                description and metadata are forwarded exactly as given: an
+                omitted field leaves the stored value unchanged, an empty
+                string clears description, and JSON null clears metadata.
 
         Returns:
             Updated agent data
@@ -1907,8 +1981,16 @@ class ReveniumClient:
         platform adds is immediately usable. ``custom`` requires ``startDate``
         and ``endDate`` as ISO instants; the other periods ignore them.
         ``provider`` optionally narrows the report to one provider. The bound
-        search object also carries usageType/minCost/maxCost, but the coverage
-        service never reads them, so they are not exposed here.
+        search object also carries usageType/minCost/maxCost and, since the
+        BACK-2877 drift of 2026-09-03, ``apiKey`` — but the coverage service
+        reads none of them, so none are exposed here. ``apiKey`` is the one
+        worth naming, because the spec's own description promises that a value
+        matching nothing returns an empty result rather than the organization
+        total. Live dev 2026-09-03 says otherwise: ``?apiKey=3BygmAQ`` (a real
+        credential id) and ``?apiKey=zzz-nonexistent-key-id`` both returned the
+        byte-identical organization-wide report. Forwarding it would hand the
+        caller an unfiltered answer that reads as filtered, so it stays out
+        until the service honours it (BACK-2958).
 
         The response is a flat coverage report (state, aggregateRatio,
         hiddenSpend, trend, confidence, byProvider[]) with no HAL ``_embedded``
@@ -2012,6 +2094,37 @@ class ReveniumClient:
         return cast(Dict[str, Any], await self.patch(
             f"/profitstream/v2/api/tenants/{tenant_id}/strict-ingestion-mode",
             data=body,
+        ))
+
+    async def set_attribution_detail_text(self, enabled: bool) -> Dict[str, Any]:
+        """Toggle free-text attribution detail for the current tenant.
+
+        When enabled, the tenant accepts and serves the free-text ``reason`` on
+        coding-assistant session attributions. When disabled — the platform
+        default — a POST carrying a reason still succeeds and still records the
+        attribution: the server stores null for the text and flags the response
+        so the caller knows its note was not kept. Turning it off takes effect
+        on the read path immediately and does NOT delete text already stored.
+        Structured attribution (ticket, source, subscriber, repository, branch,
+        timing) is unaffected in either state.
+
+        Args:
+            enabled: Desired attribution-detail-text state
+
+        Returns:
+            The updated tenant resource (includes attributionDetailTextEnabled).
+            This response is the only place the platform reports the flag:
+            GET /v2/api/tenants/{id} is hidden from the published contract, so
+            there is no documented read-only endpoint to check it against — the
+            sibling strict-ingestion-mode PATCH echoes the same field. The
+            hidden route still answered on dev when this was written and is
+            deliberately left unwrapped: an undocumented route can be withdrawn
+            without a contract change.
+        """
+        tenant_id = self._require_tenant_id()
+        return cast(Dict[str, Any], await self.patch(
+            f"/profitstream/v2/api/tenants/{tenant_id}/attribution-detail-text",
+            data={"attributionDetailTextEnabled": enabled},
         ))
 
     # Squads API methods
@@ -2313,6 +2426,53 @@ class ReveniumClient:
         params.update(filters)
         params = self._add_team_id_to_params(params)
         return cast(Dict[str, Any], await self.get("/profitstream/v2/api/credentials", params=params))
+
+    async def get_credentials_by_organization(
+        self, organization_id: str, page: int = 0, size: int = 20, **filters: Any
+    ) -> Dict[str, Any]:
+        """List the credentials attached to one organization (BACK-2958).
+
+        Same credential resources as ``get_credentials``, scoped by the owning
+        organization instead of by the caller's team. The organization id is a
+        path segment, following the ``get_job_by_id`` shape; the remaining
+        parameters are the pageable plus the ``query`` search the operation
+        declares.
+
+        No ``teamId`` here, deliberately. The operation declares only
+        ``organizationId`` (path), ``query``, ``page``, ``size`` and ``sort``,
+        and it scopes itself from the organization in the path. Injecting the
+        team id the way every team-scoped method does would put an undeclared
+        parameter on the wire — the exact failure
+        ``tests/unit/test_openapi_contract.py::TestClientParamsAreDeclared``
+        exists to catch — so the injection is omitted rather than forgotten.
+
+        Tenant scoping is enforced server-side, not here: hypercurrent's
+        ``CredentialController.listByOrganization`` carries
+        ``@PreAuthorize("@authz.canManageOrganization(#organizationId)")``, so
+        an organization the caller's team does not manage is refused before
+        the service runs. Checked against origin/develop on 2026-09-03; a
+        local pre-check would duplicate that gate with a weaker copy.
+
+        Live dev 2026-09-03: for organization ``OQNBA6J`` this returned six
+        credentials where the team-scoped ``/credentials`` listing returned
+        five, so the two views are not interchangeable — this one answers
+        "what does this organization hold", which the team listing cannot.
+
+        Args:
+            organization_id: Organization whose credentials to list
+            page: Page number (0-based)
+            size: Number of items per page
+            **filters: Additional declared query parameters (``query``, ``sort``)
+
+        Returns:
+            Paginated HAL response containing the organization's credentials
+        """
+        params: Dict[str, Any] = {"page": page, "size": size}
+        params.update(filters)
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/credentials/by-organization/{organization_id}", params=params
+        ))
+
     async def get_credential_by_id(self, credential_id: str) -> Dict[str, Any]:
         """Get a specific credential by ID.
 
@@ -3437,6 +3597,40 @@ class ReveniumClient:
         params: Dict[str, Any] = {**filters}
         params = self._add_team_id_to_params(params)
         return cast(Dict[str, Any], await self.get("/profitstream/v2/api/jobs/conversion-funnel", params=params))
+    async def get_jobs_roi_summary(self, **filters: Any) -> Any:
+        """Get the server-side ROI summary aggregated by job type (BACK-2915).
+
+        Lives on the analytics host, not the profitstream API, and is resolved
+        through ``endpoint_registry`` rather than a literal URL: the registry
+        pairs the analytics host with the configured platform host, so a dev
+        configuration cannot send dev credentials to the production analytics
+        host.
+
+        Args:
+            **filters: Query parameters to send. The operation declares four --
+                startDate, endDate, metricType and jobType -- and the caller
+                chooses which of them it means to send; ``None`` values are
+                dropped. Anything the operation does not declare is discarded
+                upstream without an error, so it must be filtered out before it
+                gets here.
+
+        Returns:
+            Whatever the endpoint answered, uncoerced. The published shape is
+            an envelope carrying ``byJobType`` rows and a ``summary`` block, but
+            a body of another shape is returned as it arrived so the caller can
+            refuse it by name; normalizing it to ``{}`` here would turn a schema
+            failure into an empty report. ``unwrap_hal_embedded=False`` because
+            this response has no ``_embedded`` member -- the default unwrap
+            would collapse it to an empty list and throw away every row.
+        """
+        params: Dict[str, Any] = {k: v for k, v in filters.items() if v is not None}
+        return await self.get(
+            get_endpoint_path("jobs_roi_summary"),
+            params=params,
+            base_url=get_endpoint_config("jobs_roi_summary").new_base_url,
+            use_bearer=True,
+            unwrap_hal_embedded=False,
+        )
     async def report_job_outcome(self, job_id: str, outcome_data: Dict[str, Any]) -> Dict[str, Any]:
         """Report an outcome for a specific job.
 
@@ -3461,6 +3655,83 @@ class ReveniumClient:
         # appears in no machine-readable contract. Re-verify against the generated
         # spec, not prose, before changing it again.
         return cast(Dict[str, Any], await self.post(f"/profitstream/v2/api/jobs/{job_id}/outcome", data=outcome_data, params=params))
+
+    async def amend_job_outcome(self, job_id: str, outcome_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Amend the outcome already reported for a job (BACK-3091).
+
+        PATCH on the same path the outcome POST uses. The platform's
+        UpdateOutcomeRequest accepts the optional outcome fields, a ``reason``
+        for the correction, a ``metrics`` array, and ``expectedEntityVersion``
+        — the optimistic lock. A stale version is answered with 409 whose
+        message carries the current version; the caller (JobManager.amend_outcome)
+        turns that into a structured conflict rather than retrying, because the
+        amendment is not idempotent and a blind retry appends a duplicate
+        revision.
+
+        ``use_retry=False`` is the load-bearing argument here, and the ONLY
+        call in this file that turns the transport retry off for that reason.
+        ``_should_retry`` resends on 408, 429 and every 5xx, and each amendment
+        appends a JobOutcomeRevision row: a transient error arriving after the
+        origin already committed would turn one amendment into two, and the
+        caller would see a single success. The application-level "never retry a
+        409" rule in JobManager.amend_outcome does nothing about that loop one
+        layer down, so the guarantee has to be made here too. An idempotency
+        key would be the better fix — it is how submit_ai_transaction and the
+        tool-event writes stay safe under retry — but ``patch`` takes no
+        ``extra_headers`` (only ``post`` and ``put`` do) and the platform
+        declares no dedup key on this operation, so there is nothing for the
+        backend to dedupe on. Give this endpoint an Idempotency-Key server-side
+        and retry can come back; until then a transient failure surfaces to the
+        caller, who can re-read the job and decide.
+
+        Args:
+            job_id: The job identifier
+            outcome_data: Amendment body, forwarded verbatim for the same
+                reason report_job_outcome forwards its body verbatim — a field
+                the API adds must reach it without a client release. Never
+                filter or rename keys here.
+
+        Returns:
+            Response from the API, carrying the job's new ``entityVersion``
+
+        Raises:
+            ReveniumAPIError: With status_code 409 if expectedEntityVersion is stale
+        """
+        params = self._add_team_id_to_params({})
+        return cast(Dict[str, Any], await self.patch(f"/profitstream/v2/api/jobs/{job_id}/outcome", data=outcome_data, params=params, use_retry=False))
+
+    async def get_session_attributions(self, session_id: str) -> Dict[str, Any]:
+        """List the recorded ticket attributions for a coding-assistant session.
+
+        BACK-2769. ``GET /v2/api/sessions/{sessionId}/attribution`` returns one
+        interval per attribution write, newest first (``effectiveFrom``
+        descending), so element 0 is what the session is attributed to now. An
+        empty collection means the session has never been attributed — it is not
+        an error.
+
+        Shaped like ``get_job_by_id``: path parameter plus
+        ``_add_team_id_to_params``. ``teamId`` is declared optional by the
+        operation, but that optionality applies to METERING-scoped API keys
+        only, where the platform resolves the team from the key itself. The MCP
+        authenticates on the management plane, where omitting ``teamId`` is
+        answered with a 400, so it is always sent.
+
+        The write half of this endpoint is deliberately not exposed here — see
+        the "Decision (BACK-2769)" note in
+        ``tools_decomposed/job_management.py``.
+
+        Args:
+            session_id: Opaque coding-assistant session identifier (for Claude
+                Code, the session UUID)
+
+        Returns:
+            HAL collection of attribution intervals, newest first
+        """
+        params = self._add_team_id_to_params({})
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/sessions/{session_id}/attribution", params=params
+        ))
+
     # Tool Registry API methods
     async def list_tools(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of tools with pagination.
@@ -3533,17 +3804,6 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/tools/{tool_id}", params=params))
-    async def restore_tool(self, tool_id: str) -> Dict[str, Any]:
-        """Restore a previously deleted tool.
-
-        Args:
-            tool_id: The tool ID
-
-        Returns:
-            Restored tool data
-        """
-        params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.post(f"/profitstream/v2/api/tools/{tool_id}/restore", params=params))
     async def search_tools(self, query: str, page: int = 0, size: int = 20) -> Dict[str, Any]:  # noqa: E501
         """Search tools by text query.
 

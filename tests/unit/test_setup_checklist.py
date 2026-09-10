@@ -4,10 +4,16 @@ Tests the SetupChecklist class: action routing, checklist building logic,
 requirements checking, system status, and recommendations.
 """
 
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
 import pytest
 from unittest.mock import patch, MagicMock
 
 
+from src.revenium_mcp_server.onboarding.env_validation import API_AUTH_REJECTED_MESSAGE
+from src.revenium_mcp_server.tools_decomposed import setup_checklist as setup_checklist_module
 from src.revenium_mcp_server.tools_decomposed.setup_checklist import SetupChecklist
 
 
@@ -123,6 +129,129 @@ class TestShowChecklist:
         assert "Complete Setup Checklist" in text
         assert "READY" in text or "[OK]" in text
 
+    @pytest.mark.asyncio
+    async def test_show_checklist_permission_denied_gives_scope_guidance(self, checklist_tool):
+        """The full checklist gives scope guidance, not network debugging (BACK-2839)."""
+        validation = _mock_validation_result(api_status="failed")
+        validation.api_connectivity = {
+            "status": "permission_denied",
+            "status_code": 403,
+            "error": "The API refused to let this key read data (HTTP 403)",
+        }
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_onboarding_state",
+            return_value=_mock_onboarding_state(
+                is_first_time=False, email=True, slack=True, auto_discovery=True
+            ),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=validation,
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_config_value",
+            side_effect=lambda key, *args: {
+                "REVENIUM_API_KEY": "rev_mk_key",
+                "REVENIUM_TEAM_ID": "team-1",
+            }.get(key),
+        ):
+            result = await checklist_tool.handle_action("show_checklist", {})
+        text = result[0].text
+        assert "Forbidden - no data could be read" in text
+        # The Action line carries the shared read_forbidden_detail() wording.
+        assert "The API refused to let this key read data (HTTP 403)" in text
+        assert "Check API key and network connectivity" not in text
+        # The readiness verdict must not contradict the Forbidden line above it.
+        assert "Setup Complete!" not in text
+        assert "Restore API read access" in text
+
+    @pytest.mark.asyncio
+    async def test_show_checklist_401_names_the_rejected_key_case(self, checklist_tool):
+        """A 401 gets the shared rejected-key wording, not network advice (BACK-2841)."""
+        validation = _mock_validation_result(api_status="failed")
+        validation.api_connectivity = {
+            "status": "failed",
+            "status_code": 401,
+            "error": API_AUTH_REJECTED_MESSAGE,
+        }
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_onboarding_state",
+            return_value=_mock_onboarding_state(
+                is_first_time=False, email=True, slack=True, auto_discovery=True
+            ),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=validation,
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_config_value",
+            side_effect=lambda key, *args: {
+                "REVENIUM_API_KEY": "rev_sk_unknown",
+                "REVENIUM_TEAM_ID": "team-1",
+            }.get(key),
+        ):
+            result = await checklist_tool.handle_action("show_checklist", {})
+        text = result[0].text
+        assert "the key was not accepted (HTTP 401)" in text
+        # The Action line carries the shared API_AUTH_REJECTED_MESSAGE wording.
+        assert API_AUTH_REJECTED_MESSAGE in text
+        assert "Check API key and network connectivity" not in text
+        assert "Setup Complete!" not in text
+
+    @pytest.mark.asyncio
+    async def test_show_checklist_first_time_user_gets_configure_not_restore(
+        self, checklist_tool
+    ):
+        """No key configured means nothing to restore - point at configuration."""
+        validation = _mock_validation_result(api_status="failed")
+        validation.api_connectivity = {
+            "status": "not_attempted",
+            "error": "No API key available",
+        }
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_onboarding_state",
+            return_value=_mock_onboarding_state(is_first_time=True),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=validation,
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_config_value",
+            side_effect=lambda key, *args: None,
+        ):
+            result = await checklist_tool.handle_action("show_checklist", {})
+        text = result[0].text
+        assert "Configure required environment variables" in text
+        assert "Restore API read access" not in text
+
+    @pytest.mark.asyncio
+    async def test_show_checklist_cached_key_without_probe_is_not_complete(
+        self, checklist_tool
+    ):
+        """A key visible only in the config cache must not yield Setup Complete."""
+        validation = _mock_validation_result(api_status="failed")
+        validation.api_connectivity = {
+            "status": "not_attempted",
+            "error": "No API key available",
+        }
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_onboarding_state",
+            return_value=_mock_onboarding_state(
+                is_first_time=False, email=True, slack=True, auto_discovery=True
+            ),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=validation,
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_config_value",
+            side_effect=lambda key, *args: {
+                "REVENIUM_API_KEY": "rev_sk_cached",
+                "REVENIUM_TEAM_ID": "team-1",
+                "REVENIUM_DEFAULT_EMAIL": "user@test.com",
+                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": "slack-1",
+            }.get(key),
+        ):
+            result = await checklist_tool.handle_action("show_checklist", {})
+        text = result[0].text
+        assert "Setup Complete!" not in text
+        assert "API connectivity was not verified" in text
+
 
 class TestCheckRequirements:
     """Test check_requirements action."""
@@ -201,6 +330,54 @@ class TestCheckSystemStatus:
             result = await checklist_tool.handle_action("check_system_status", {})
         text = result[0].text
         assert "failed" in text.lower() or "Failed" in text
+
+    @pytest.mark.asyncio
+    async def test_system_status_permission_denied_reports_scope(self, checklist_tool):
+        """A forbidden read is reported as such, not as 'Not tested' (BACK-2839)."""
+        validation = _mock_validation_result(api_status="failed")
+        # auth-config "success" only means a key string is configured - exactly
+        # the combination that used to render "Authentication working" under a
+        # Forbidden connectivity line.
+        validation.auth_config = {
+            "status": "success",
+            "config": {"team_id": "team-1", "api_key_preview": "SET (rev_...key)"},
+        }
+        validation.api_connectivity = {
+            "status": "permission_denied",
+            "status_code": 403,
+            "error": "The API refused to let this key read data (HTTP 403) - check the key scope",
+        }
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=validation,
+        ):
+            result = await checklist_tool.handle_action("check_system_status", {})
+        text = result[0].text
+        assert "forbidden" in text.lower()
+        assert "no data could be read" in text
+        assert "Not tested" not in text
+        # The auth section must not certify what the forbidden probe disproved.
+        assert "Authentication working" not in text
+        assert "not verified by the live probe" in text
+
+    @pytest.mark.asyncio
+    async def test_system_status_401_names_the_rejected_key_case(self, checklist_tool):
+        """The system-status view renders the shared 401 wording (BACK-2841)."""
+        validation = _mock_validation_result(api_status="failed")
+        validation.api_connectivity = {
+            "status": "failed",
+            "status_code": 401,
+            "error": API_AUTH_REJECTED_MESSAGE,
+        }
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=validation,
+        ):
+            result = await checklist_tool.handle_action("check_system_status", {})
+        text = result[0].text
+        assert API_AUTH_REJECTED_MESSAGE in text
+        # The probe never sets a "response" key, so the detail must come from "error".
+        assert "**Error**: Unknown error" not in text
 
 
 class TestGetRecommendations:
@@ -394,3 +571,77 @@ class TestDataIngestionHardening:
         text = result[0].text
         assert "Data Ingestion" in text
         assert "unavailable" in text.lower()
+
+
+class TestUtcTimestamps:
+    """BACK-2944: every stamp this tool labels UTC must actually be UTC.
+
+    Before the fix the checklist builders called a naive ``datetime.now()`` and appended the
+    literal " UTC", so on any host that is not on UTC the reported time was the local clock
+    under a UTC label - three hours off on a UTC-3 host.
+    """
+
+    _STAMP = re.compile(r"\*\*Generated\*\*: (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC")
+
+    @staticmethod
+    def _fixed_env():
+        """Patch the module so every builder can run without touching the network."""
+        return (
+            patch(
+                "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+                return_value=_mock_validation_result(email="user@test.com"),
+            ),
+            patch(
+                "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_config_value",
+                side_effect=lambda key, *args: args[0] if args else None,
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "action",
+        [
+            "show_checklist",
+            "check_requirements",
+            "check_optional",
+            "check_system_status",
+            "get_recommendations",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_generated_stamp_is_utc_not_local(self, checklist_tool, action):
+        """The rendered stamp tracks UTC, whatever the host's local clock says."""
+        validation, config = self._fixed_env()
+        with validation, config:
+            result = await checklist_tool.handle_action(action, {})
+
+        text = result[0].text
+        match = self._STAMP.search(text)
+        assert match is not None, f"{action} rendered no UTC-labelled Generated stamp"
+
+        stamped = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc
+        )
+        drift = abs((datetime.now(timezone.utc) - stamped).total_seconds())
+        assert drift < 120, (
+            f"{action} stamped {match.group(1)} UTC, which is {drift:.0f}s from real UTC - "
+            "the builder is almost certainly using the local clock"
+        )
+
+    def test_module_has_no_naive_now_feeding_a_utc_label(self):
+        """Guard the whole module, not just the five builders exercised above.
+
+        Every stamp this module renders is labelled UTC, so the invariant is simply
+        that no naive ``datetime.now()`` exists anywhere in it - the call and the
+        label are usually on different lines, so a same-line scan would miss the
+        idiomatic ``now = datetime.now()`` ... ``f"{now} UTC"`` form.
+        """
+        source = Path(setup_checklist_module.__file__).read_text(encoding="utf-8")
+        assert "UTC" in source, "the module no longer labels any stamp UTC; update this guard"
+        naive_calls = [
+            f"line {lineno}: {line.strip()}"
+            for lineno, line in enumerate(source.splitlines(), 1)
+            if re.search(r"datetime\.now\(\s*\)", line)
+        ]
+        assert naive_calls == [], (
+            "naive datetime.now() in a module whose stamps are labelled UTC: " + "; ".join(naive_calls)
+        )

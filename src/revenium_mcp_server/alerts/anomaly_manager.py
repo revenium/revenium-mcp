@@ -10,14 +10,41 @@ from typing import Any, Dict, List, Optional, Union
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
-from ..client import ReveniumClient
+from ..client import ReveniumAPIError, ReveniumClient
 from ..common.error_handling import ToolError, ErrorCodes
 from ..error_handlers import (
     handle_alert_tool_errors,
     validate_anomaly_id,
 )
-from ..exceptions import ValidationError
+from ..exceptions import AnomalyNotFoundError, ValidationError
+from ..alert_metrics import check_metric_rules
+from ..alert_operators import (
+    ACCEPTED_OPERATORS,
+    CHANGE_OPERATORS,
+    FILTER_LIST_OPERATOR,
+    accepted_operators_for,
+    historical_operator_notice,
+    is_rejected_operator,
+    rejected_operator_message,
+    validate_filter_rows,
+)
 from ..validators import InputValidator
+
+
+def format_filter_row(filter_item: Dict[str, Any]) -> str:
+    """Render one stored filter row as the comparison it expresses.
+
+    An IN row keeps its set in ``values`` and its ``value`` comes back null, so
+    rendering ``value`` alone showed the reader ``MODEL IN 'None'`` for a row
+    that matches several models.
+    """
+    dimension = filter_item.get("dimension", "N/A")
+    operator = filter_item.get("operator", "N/A")
+    values = filter_item.get("values")
+    if str(operator).upper() == FILTER_LIST_OPERATOR and isinstance(values, list) and values:
+        rendered = ", ".join(f"'{entry}'" for entry in values)
+        return f"{dimension} {operator} [{rendered}]"
+    return f"{dimension} {operator} '{filter_item.get('value', 'N/A')}'"
 
 
 class AnomalyManager:
@@ -90,7 +117,7 @@ class AnomalyManager:
         if "filters" in anomaly_data:
             filters = anomaly_data["filters"]
             if filters and isinstance(filters, list):
-                validated_data["filters"] = filters
+                validated_data["filters"] = validate_filter_rows(filters)
 
         # Handle alert type
         if "alert_type" in anomaly_data:
@@ -182,11 +209,7 @@ class AnomalyManager:
             if anomaly_filters:
                 filter_count = len(anomaly_filters)
                 if filter_count == 1:
-                    filter_item = anomaly_filters[0]
-                    dimension = filter_item.get("dimension", "N/A")
-                    operator = filter_item.get("operator", "CONTAINS")
-                    value = filter_item.get("value", "N/A")
-                    filter_summary = f"\n  • Filter: {dimension} {operator} '{value}'"
+                    filter_summary = f"\n  • Filter: {format_filter_row(anomaly_filters[0])}"
                 else:
                     filter_summary = f"\n  • Filters: {filter_count} applied"
             else:
@@ -245,8 +268,26 @@ class AnomalyManager:
 
         logger.info(f"Getting anomaly: {anomaly_id}")
 
-        # Call the API client method
-        anomaly = await client.get_anomaly_by_id(anomaly_id)
+        # Call the API client method. The anomalies service answers 403 for an
+        # id that never existed and for one this key cannot read, and 404 for
+        # the rest; both mean "no anomaly here" from the caller's POV, and the
+        # raw "HTTP 403: Access Denied" that used to escape read as a
+        # permissions problem instead. Fold those two into
+        # AnomalyNotFoundError so @handle_alert_tool_errors renders the named
+        # not-found envelope, the same shape AlertManager.get_alert produces
+        # for resource_type="alerts" (BACK-2938).
+        #
+        # 500 is deliberately NOT folded: a backend outage is not evidence the
+        # anomaly is missing, and reporting it as not-found would send the
+        # caller looking for a deleted record instead of a broken service.
+        # AlertManager.get_alert does fold 500, from BACK-1142's evidence on
+        # that endpoint; leaving that asymmetry alone is out of scope here.
+        try:
+            anomaly = await client.get_anomaly_by_id(anomaly_id)
+        except ReveniumAPIError as e:
+            if e.status_code in (403, 404):
+                raise AnomalyNotFoundError(anomaly_id) from e
+            raise
 
         # Format the response
         enabled_status = "✅ Enabled" if anomaly.get("enabled", True) else "❌ Disabled"
@@ -276,10 +317,7 @@ class AnomalyManager:
         if filters:
             filter_list = []
             for filter_item in filters:
-                dimension = filter_item.get("dimension", "N/A")
-                operator = filter_item.get("operator", "N/A")
-                value = filter_item.get("value", "N/A")
-                filter_list.append(f"  • {dimension} {operator} '{value}'")
+                filter_list.append(f"  • {format_filter_row(filter_item)}")
             filters_text = "\n\n**Filters Applied:**\n" + "\n".join(filter_list)
 
         result_text = (
@@ -319,6 +357,9 @@ class AnomalyManager:
                         "LESS_THAN_OR_EQUAL_TO": "≤",
                         "EQUALS": "=",
                         "NOT_EQUALS": "≠",
+                        # Refused on create/update, still stored on existing alerts.
+                        "EQUAL_TO": "=",
+                        "NOT_EQUAL_TO": "≠",
                         "INCREASES_BY": "increases by",
                         "DECREASES_BY": "decreases by",
                     }
@@ -461,19 +502,10 @@ class AnomalyManager:
             # Direct API format - use validated data as-is, just add required fields
             api_data = validated_data.copy()
 
-            # Apply operator mapping for filters in direct API format
+            # Operator aliases, the IN/values exclusivity and the row shape are all
+            # resolved by validate_filter_rows during payload validation.
             if "filters" in api_data and isinstance(api_data["filters"], list):
-                operator_mapping = {
-                    "EQUALS": "IS",
-                    "NOT_EQUALS": "IS_NOT",
-                    "EQUAL": "IS",
-                    "NOT_EQUAL": "IS_NOT",
-                }
-
-                for filter_item in api_data["filters"]:
-                    if isinstance(filter_item, dict) and "operator" in filter_item:
-                        raw_operator = str(filter_item["operator"]).upper()
-                        filter_item["operator"] = operator_mapping.get(raw_operator, raw_operator)
+                api_data["filters"] = validate_filter_rows(api_data["filters"])
 
             # Ensure required API fields are present
             if "label" not in api_data and "name" in validated_data:
@@ -572,10 +604,7 @@ class AnomalyManager:
         if filters:
             result_text += "\n\n**Filters Applied:**"
             for filter_item in filters:
-                dimension = filter_item.get("dimension", "N/A")
-                operator = filter_item.get("operator", "N/A")
-                value = filter_item.get("value", "N/A")
-                result_text += f"\n  • {dimension} {operator} '{value}'"
+                result_text += f"\n  • {format_filter_row(filter_item)}"
 
         return [TextContent(type="text", text=result_text)]
 
@@ -649,58 +678,27 @@ class AnomalyManager:
 
                         # Check if filters are already in API format (have 'dimension' field)
                         if value and isinstance(value[0], dict) and "dimension" in value[0]:
-                            # Already in API format, validate structure
-                            validated_filters = []
-                            for filter_item in value:
-                                if not isinstance(filter_item, dict):
-                                    raise ValidationError(
-                                        message="Each filter must be a dictionary",
-                                        field="filters",
-                                        value=type(filter_item).__name__,
-                                        expected="Dictionary with dimension, operator, and value fields",
-                                    )
-
-                                required_fields = ["dimension", "operator", "value"]
-                                for field in required_fields:
-                                    if field not in filter_item:
-                                        raise ValidationError(
-                                            message=f"Filter missing required field: {field}",
-                                            field="filters",
-                                            value=filter_item,
-                                            expected=f"Dictionary with {', '.join(required_fields)} fields",
-                                        )
-
-                                # Map operator to API format (handle common aliases)
-                                operator_mapping = {
-                                    "EQUALS": "IS",
-                                    "NOT_EQUALS": "IS_NOT",
-                                    "EQUAL": "IS",
-                                    "NOT_EQUAL": "IS_NOT",
-                                }
-
-                                raw_operator = str(filter_item["operator"]).upper()
-                                mapped_operator = operator_mapping.get(raw_operator, raw_operator)
-
-                                validated_filters.append(
-                                    {
-                                        "dimension": str(filter_item["dimension"]).upper(),
-                                        "operator": mapped_operator,
-                                        "value": str(filter_item["value"]),
-                                    }
-                                )
-                            converted_updates["filters"] = validated_filters
+                            # Already in API format: the same row check the create
+                            # path runs, so an IN row keeps its values list here
+                            # instead of being rebuilt as a value-only row.
+                            converted_updates["filters"] = validate_filter_rows(value)
                         else:
                             # User-friendly format, convert to API format
                             converted_updates["filters"] = (
                                 InputValidator._convert_filters_to_api_format(value)
                             )
+                    except ValidationError:
+                        # validate_filter_rows already names the offending field
+                        # (values, operator, filters); re-wrapping it here would
+                        # bury that behind a generic "Invalid filter format".
+                        raise
                     except Exception as e:
                         raise ValidationError(
                             message=f"Invalid filter format: {str(e)}",
                             field="filters",
                             value=value,
                             expected="List of filter dictionaries with dimension/operator/value or field/operator/value",
-                            suggestion="Use format: [{'dimension': 'PROVIDER', 'operator': 'CONTAINS', 'value': 'openai'}] or [{'field': 'provider', 'operator': 'contains', 'value': 'openai'}]",
+                            suggestion="Use format: [{'dimension': 'PROVIDER', 'operator': 'CONTAINS', 'value': 'openai'}] or [{'field': 'provider', 'operator': 'contains', 'value': 'openai'}], or [{'dimension': 'MODEL', 'operator': 'IN', 'values': ['gpt-4', 'claude-sonnet-4-5']}]",
                         )
                 else:
                     raise ValidationError(
@@ -784,6 +782,15 @@ class AnomalyManager:
         # Apply the converted updates to the current data
         merged_data.update(converted_updates)
 
+        # The platform refuses EQUAL_TO and NOT_EQUAL_TO on update exactly as it does
+        # on create, and a read-modify-write can resubmit one the caller never typed.
+        operator_note = self._check_update_operator(converted_updates, merged_data)
+
+        # An update is a read-modify-write, so the outgoing body is the merged one: a
+        # groupBy added to a stored QUALITY_RATE rule, or a coverage floor moved onto a
+        # cost alert, is caught on the body the platform would receive.
+        self._reject_metric_rule_violation(merged_data)
+
         # Call the API client method with merged data
         updated_anomaly = await client.update_anomaly(anomaly_id, merged_data)
 
@@ -794,6 +801,18 @@ class AnomalyManager:
             f"**Status:** {updated_anomaly.get('enabled', True) and 'Enabled' or 'Disabled'}\n"
             f"**Updated:** {updated_anomaly.get('updatedAt', updated_anomaly.get('updated', 'N/A'))}"
         )
+
+        if operator_note:
+            result_text += f"\n\n{operator_note}"
+
+        # An update is the one call that can change the filters, so it confirms
+        # them the way get and create do — through format_filter_row, or an IN row
+        # reads back as its null scalar value.
+        updated_filters = updated_anomaly.get("filters", [])
+        if updated_filters:
+            result_text += "\n\n**Filters Applied:**"
+            for filter_item in updated_filters:
+                result_text += f"\n  • {format_filter_row(filter_item)}"
 
         # Always show current notification configuration (not conditional)
         notification_text = await self._format_notification_configuration(client, updated_anomaly)
@@ -998,6 +1017,81 @@ class AnomalyManager:
         required_api_fields = ["alertType", "metricType", "operatorType", "threshold"]
         return all(field in anomaly_data for field in required_api_fields)
 
+    def _reject_unsupported_operator(self, operator: Any) -> None:
+        """Refuse an operator the platform declares but no longer accepts on write.
+
+        Mirrors AIAnomalyService.getOperator (BACK-2875), naming the alternative the
+        platform's own error names instead of letting a generic enum error list the
+        legal values without explaining the omission.
+        """
+        if is_rejected_operator(operator):
+            raise ValidationError(
+                message=rejected_operator_message(operator),
+                field="operatorType",
+                value=operator,
+                expected=f"One of: {', '.join(ACCEPTED_OPERATORS)}",
+            )
+
+    def _check_update_operator(
+        self, converted_updates: Dict[str, Any], merged_data: Dict[str, Any]
+    ) -> Optional[str]:
+        """Apply the platform's write-time operator gates to an update body.
+
+        An update is a read-modify-write: the stored definition is fetched and PUT
+        back whole, so the outgoing body can carry an operator the caller never
+        mentioned. The two cases are treated differently on purpose:
+
+        - The caller supplied an operator. It gets the same gates create gets — the
+          accepted set (AIAnomalyService.getOperator) and the per-alert-type
+          narrowing (acceptedOperatorsFor) — and a refused value raises here rather
+          than becoming an avoidable HTTP 400.
+        - The body only carries what the platform itself stored. Blocking that would
+          make an alert created before the refusal impossible to rename, enable or
+          disable through the MCP. The call goes out and the caller is told what it
+          carried, which is returned here as a note for the result text.
+
+        Returns the note to append to the result, or ``None``.
+        """
+        submitted = converted_updates.get("operatorType")
+        if submitted is not None:
+            self._reject_unsupported_operator(submitted)
+            operator = str(submitted).upper()
+            if operator not in ACCEPTED_OPERATORS:
+                raise ValidationError(
+                    message=f"Invalid operatorType value: {submitted}",
+                    field="operatorType",
+                    value=submitted,
+                    expected=f"One of: {', '.join(ACCEPTED_OPERATORS)}",
+                )
+        else:
+            stored = merged_data.get("operatorType")
+            operator = str(stored).upper() if stored else ""
+
+        if not operator:
+            return None
+        if is_rejected_operator(operator):
+            # Stored by the platform before it stopped accepting the value.
+            return historical_operator_notice(operator)
+
+        # The per-type narrowing only has to be re-checked when the caller moved one
+        # of the two fields it relates; an untouched stored pairing is the platform's
+        # own and is left to the platform.
+        if submitted is None and "alertType" not in converted_updates:
+            return None
+        alert_type = str(merged_data.get("alertType") or "")
+        allowed = accepted_operators_for(alert_type)
+        if operator not in allowed:
+            raise ValidationError(
+                message=(
+                    f"Operator '{operator}' is not accepted for "
+                    f"{alert_type or 'this'} alerts"
+                ),
+                field="operatorType",
+                value=operator,
+                expected=f"One of: {', '.join(allowed)}",
+            )
+        return None
+
     def _validate_direct_api_format(self, anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
         """Validate and sanitize direct API format data."""
         validated_data: Dict[str, Any] = {}
@@ -1005,29 +1099,28 @@ class AnomalyManager:
         # CRITICAL FIX: Process convenience notification fields before validation
         processed_data = self._process_convenience_notification_fields(anomaly_data.copy())
 
+        # The platform still declares EQUAL_TO and NOT_EQUAL_TO but refuses both on
+        # create and update, so name the alternative it names rather than letting the
+        # generic enum error list operators without explaining the omission.
+        submitted_operator = processed_data.get("operatorType")
+        if submitted_operator is not None:
+            self._reject_unsupported_operator(submitted_operator)
+
         # Validate required API fields - CORRECTED: Only 3 supported alert types
         required_fields = {
             "alertType": ["THRESHOLD", "CUMULATIVE_USAGE", "RELATIVE_CHANGE"],
-            "metricType": [
-                "TOTAL_COST",
-                "COST_PER_TRANSACTION",
-                "TOKEN_COUNT",
-                "INPUT_TOKEN_COUNT",
-                "OUTPUT_TOKEN_COUNT",
-                "ERROR_RATE",
-                "REQUESTS_PER_MINUTE",
-                "TOKENS_PER_MINUTE",
-            ],
-            "operatorType": [
-                "GREATER_THAN",
-                "LESS_THAN",
-                "GREATER_THAN_OR_EQUAL",
-                "LESS_THAN_OR_EQUAL",
-                "EQUAL",
-                "NOT_EQUAL",
-                "INCREASES_BY",
-                "DECREASES_BY",
-            ],
+            # No client-side metric enum (BACK-3103). The hand-typed accept-list that
+            # used to sit here refused QUALITY_RATE, a metric the platform publishes,
+            # and would refuse the next metric the platform adds before anyone noticed.
+            # The platform is the authority on the name; what the MCP validates is the
+            # prerequisites a metric carries — see revenium_mcp_server.alert_metrics.
+            "metricType": "non_empty_string",
+            # Mirrors AIAnomalyService.ACCEPTED_OPERATORS. The previous list spelled
+            # four of these without the platform's _TO suffix and added EQUAL /
+            # NOT_EQUAL, which are not operatorType values at all: it refused the
+            # real GREATER_THAN_OR_EQUAL_TO and let GREATER_THAN_OR_EQUAL through to
+            # an HTTP 400 "No enum constant OperatorType.GREATER_THAN_OR_EQUAL".
+            "operatorType": list(ACCEPTED_OPERATORS),
             "threshold": "numeric",
         }
 
@@ -1056,6 +1149,15 @@ class AnomalyManager:
                         value=value,
                         expected="Numeric value",
                     )
+            elif valid_values == "non_empty_string":
+                if not isinstance(value, str) or not value.strip():
+                    raise ValidationError(
+                        message=f"Invalid {field} value",
+                        field=field,
+                        value=value,
+                        expected="Non-empty metric name, for example TOTAL_COST",
+                    )
+                validated_data[field] = value
             elif isinstance(valid_values, list):
                 # Validate enum values
                 if value not in valid_values:
@@ -1069,8 +1171,10 @@ class AnomalyManager:
             else:
                 validated_data[field] = value
 
-        # Cross-field validation: operator must match alertType
-        relative_change_operators = {"INCREASES_BY", "DECREASES_BY"}
+        # Cross-field validation: operator must match alertType, the same narrowing
+        # AIAnomalyService.acceptedOperatorsFor(alertType) applies after the
+        # accepted-set check.
+        relative_change_operators = set(CHANGE_OPERATORS)
         alert_type = validated_data.get("alertType")
         operator_type = validated_data.get("operatorType")
 
@@ -1079,14 +1183,16 @@ class AnomalyManager:
                 message=f"Operator '{operator_type}' is only valid for RELATIVE_CHANGE alerts",
                 field="operatorType",
                 value=operator_type,
-                expected="INCREASES_BY/DECREASES_BY require alertType: RELATIVE_CHANGE",
+                expected=(
+                    f"{'/'.join(CHANGE_OPERATORS)} require alertType: RELATIVE_CHANGE"
+                ),
             )
         if alert_type == "RELATIVE_CHANGE" and operator_type not in relative_change_operators:
             raise ValidationError(
                 message="RELATIVE_CHANGE alerts require a relative operator",
                 field="operatorType",
                 value=operator_type,
-                expected="One of: INCREASES_BY, DECREASES_BY",
+                expected=f"One of: {', '.join(CHANGE_OPERATORS)}",
             )
 
         # Validate optional fields
@@ -1110,6 +1216,12 @@ class AnomalyManager:
             "slackConfigurations": "list",
             "triggerAfterPersistsDuration": "string",
             "filters": "list",
+            # Both used to be dropped here rather than forwarded, so a caller that set
+            # a coverage floor or a grouping got an alert without one and no way to
+            # tell (BACK-3103). The prerequisite check below decides whether the pair
+            # is coherent; these entries decide whether it reaches the platform at all.
+            "minSampleCount": "passthrough",
+            "groupBy": "passthrough",
         }
 
         for field, field_type in optional_fields.items():
@@ -1142,9 +1254,35 @@ class AnomalyManager:
                         expected="List/array",
                     )
 
+                if field == "filters" and isinstance(value, list):
+                    # Row shape is checked here as well as in
+                    # _process_advanced_configuration: both write filters into the
+                    # payload, and validate_filter_rows is idempotent.
+                    value = validate_filter_rows(value)
+
                 validated_data[field] = value
 
+        # QUALITY_RATE carries prerequisites no other metric has, and minSampleCount
+        # means something on QUALITY_RATE alone. AIAnomalyService.validateQualityRateRule
+        # refuses a rule that breaks any of them; refusing it here names the whole rule
+        # instead of one platform sentence, and names the prerequisite the platform
+        # cannot check at all (the job type declaring quality_rate PER_JOB).
+        self._reject_metric_rule_violation(validated_data)
+
         return validated_data
+
+    def _reject_metric_rule_violation(self, payload: Dict[str, Any]) -> None:
+        """Raise when ``payload`` breaks a metric prerequisite (see alert_metrics)."""
+        violation = check_metric_rules(payload)
+        if violation is None:
+            return
+        raise ValidationError(
+            message=violation.message,
+            field=violation.field,
+            value=violation.value,
+            expected=violation.expected,
+            suggestion=violation.suggestion,
+        )
 
     def _process_convenience_notification_fields(self, anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
         """Process convenience notification fields (email, slackConfigId) and convert to API format.

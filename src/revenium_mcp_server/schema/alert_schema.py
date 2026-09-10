@@ -8,6 +8,20 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from ..alert_metrics import (
+    QUALITY_RATE,
+    QUALITY_RATE_PREREQUISITES,
+    QUALITY_RATE_SUMMARY,
+    bucket_metrics,
+)
+from ..alert_operators import (
+    ACCEPTED_OPERATORS,
+    CHANGE_OPERATORS,
+    COMPARISON_OPERATORS,
+    FILTER_IN_OPERATOR_NOTE,
+    FILTER_LIST_OPERATOR,
+    FILTER_OPERATORS,
+)
 from ..models import MetricType
 from .discovery_engine import BaseSchemaDiscovery
 
@@ -41,19 +55,11 @@ async def get_alert_metrics_capabilities(ucm_helper=None) -> Dict[str, Any]:
     logger.debug("Alert metrics: Using MetricType enum fallback")
     all_metrics = [metric.value for metric in MetricType]
 
-    # Categorize metrics for better organization
-    cost_metrics = [m for m in all_metrics if "COST" in m]
-    token_metrics = [m for m in all_metrics if "TOKEN" in m]
-    performance_metrics = [
-        m for m in all_metrics if any(perf in m for perf in ["PER_MINUTE", "RATE"])
-    ]
-    quality_metrics = [m for m in all_metrics if "ERROR" in m]
-
+    # Grouped by the explicit mapping in revenium_mcp_server.alert_metrics rather than
+    # by substring, which listed ERROR_RATE under performance and quality at once and
+    # would file QUALITY_RATE under performance (BACK-3103).
     return {
-        "cost_metrics": cost_metrics,
-        "token_metrics": token_metrics,
-        "performance_metrics": performance_metrics,
-        "quality_metrics": quality_metrics,
+        **bucket_metrics(all_metrics),
         "all": all_metrics,
     }
 
@@ -70,40 +76,34 @@ class AlertSchemaDiscovery(BaseSchemaDiscovery):
         # Get metrics from single source of truth (MetricType enum)
         all_metrics = [metric.value for metric in MetricType]
 
-        # Categorize metrics for better organization
-        cost_metrics = [m for m in all_metrics if "COST" in m]
-        token_metrics = [m for m in all_metrics if "TOKEN" in m]
-        performance_metrics = [
-            m for m in all_metrics if any(perf in m for perf in ["PER_MINUTE", "RATE"])
-        ]
-        quality_metrics = [m for m in all_metrics if "ERROR" in m]
-
+        # Grouped by the explicit mapping in revenium_mcp_server.alert_metrics
+        # (BACK-3103), not by substring.
         return {
             "alert_types": ["THRESHOLD", "CUMULATIVE_USAGE", "RELATIVE_CHANGE"],
             "metrics": {
-                "cost_metrics": cost_metrics,
-                "token_metrics": token_metrics,
-                "performance_metrics": performance_metrics,
-                "quality_metrics": quality_metrics,
+                **bucket_metrics(all_metrics),
                 "all": all_metrics,
             },
+            "quality_rate": {
+                "metric": QUALITY_RATE,
+                "summary": QUALITY_RATE_SUMMARY,
+                "prerequisites": list(QUALITY_RATE_PREREQUISITES),
+            },
+            # Threshold and relative-change operators mirror the platform's
+            # accepted sets. The string and equality entries below are *filter*
+            # operators (a dimension against a value), a different vocabulary that
+            # has nothing to do with operatorType.
             "operators": {
-                "threshold_operators": [
-                    "GREATER_THAN",
-                    "GREATER_THAN_OR_EQUAL_TO",
-                    "LESS_THAN",
-                    "LESS_THAN_OR_EQUAL_TO",
-                ],
-                "relative_change_operators": ["INCREASES_BY", "DECREASES_BY"],
+                "threshold_operators": list(COMPARISON_OPERATORS),
+                "relative_change_operators": list(CHANGE_OPERATORS),
                 "string_operators": ["CONTAINS", "STARTS_WITH", "ENDS_WITH"],
                 "equality_operators": ["EQUALS", "NOT_EQUALS"],
-                "all": [
-                    "GREATER_THAN",
-                    "GREATER_THAN_OR_EQUAL_TO",
-                    "LESS_THAN",
-                    "LESS_THAN_OR_EQUAL_TO",
-                    "INCREASES_BY",
-                    "DECREASES_BY",
+                # IN stays OUT of every list here, "all" included: this map feeds
+                # the detection-rule operatorType field mapping, and the platform
+                # refuses IN as an operatorType. The filter vocabulary is published
+                # under its own key below.
+                "all": list(ACCEPTED_OPERATORS)
+                + [
                     "CONTAINS",
                     "STARTS_WITH",
                     "ENDS_WITH",
@@ -111,6 +111,9 @@ class AlertSchemaDiscovery(BaseSchemaDiscovery):
                     "NOT_EQUALS",
                 ],
             },
+            # The filter vocabulary, kept apart from the operatorType lists above.
+            "filter_operators": list(FILTER_OPERATORS),
+            "filter_row_shape": FILTER_IN_OPERATOR_NOTE,
             "time_periods": {
                 "period_duration": [
                     "ONE_MINUTE",
@@ -161,37 +164,37 @@ class AlertSchemaDiscovery(BaseSchemaDiscovery):
             "filter_dimensions": {
                 "ORGANIZATION": {
                     "description": "Filter by customer/business organization",
-                    "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS"],
+                    "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS", FILTER_LIST_OPERATOR],
                     "example": "acme corp",
                 },
                 "CREDENTIAL": {
                     "description": "Filter by API key/credential name",
-                    "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS"],
+                    "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS", FILTER_LIST_OPERATOR],
                     "example": "production-api-key",
                 },
                 "PRODUCT": {
                     "description": "Filter by product name",
-                    "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS"],
+                    "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS", FILTER_LIST_OPERATOR],
                     "example": "AI API Service",
                 },
                 "MODEL": {
                     "description": "Filter by AI model name",
-                    "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS"],
+                    "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS", FILTER_LIST_OPERATOR],
                     "example": "gpt-4",
                 },
                 "PROVIDER": {
                     "description": "Filter by AI provider",
-                    "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS"],
+                    "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS", FILTER_LIST_OPERATOR],
                     "example": "openai",
                 },
                 "AGENT": {
                     "description": "Filter by agent/user",
-                    "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS"],
+                    "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS", FILTER_LIST_OPERATOR],
                     "example": "support-agent",
                 },
                 "SUBSCRIBER": {
                     "description": "Filter by subscriber name or email",
-                    "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS"],
+                    "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS", FILTER_LIST_OPERATOR],
                     "example": "john.doe@company.com",
                 },
             },
@@ -456,12 +459,14 @@ class AlertSchemaDiscovery(BaseSchemaDiscovery):
                 "relative_change": capabilities["operators"]["relative_change_operators"],
                 "string": capabilities["operators"]["string_operators"],
             },
+            "filter_operators": capabilities.get("filter_operators", list(FILTER_OPERATORS)),
             "time_periods": {
                 "check_every": capabilities["time_periods"]["period_duration"],
                 "trigger_after": capabilities["time_periods"]["trigger_after_persists_duration"],
                 "compare_to": capabilities["time_periods"]["comparison_period"],
             },
             "filter_dimensions": list(capabilities.get("filter_dimensions", {}).keys()),
+            "filter_row_shape": FILTER_IN_OPERATOR_NOTE,
         }
 
     def _build_common_patterns(self, capabilities: Dict[str, Any]) -> Dict[str, Any]:
@@ -470,11 +475,10 @@ class AlertSchemaDiscovery(BaseSchemaDiscovery):
         all_metrics = capabilities.get("metrics", {}).get(
             "all", [metric.value for metric in MetricType]
         )
-        cost_metrics = [m for m in all_metrics if "COST" in m]
-        token_metrics = [m for m in all_metrics if "TOKEN" in m]
-        performance_metrics = [
-            m for m in all_metrics if any(perf in m for perf in ["PER_MINUTE", "RATE"])
-        ]
+        buckets = bucket_metrics(all_metrics)
+        cost_metrics = buckets["cost_metrics"]
+        token_metrics = buckets["token_metrics"]
+        performance_metrics = buckets["performance_metrics"]
 
         return {
             "cost_monitoring": {

@@ -27,4 +27,17 @@ public-allowlist-mcp.txt
 !tests/unit/test_public_export_allowlist.py
 !.claude/commands/mcp-api-drift-local.md
 !.claude/commands/mcp-api-exclusions.yaml
+# Reads the internal exclusions file above (and specs/), so it cannot run
+# in the public mirror.
+!tests/unit/test_api_exclusions_declaration.py
+# OpenAPI spec snapshots and their tooling are internal (BACK-2868).
+# specs/ is absent from the includes above on purpose — the upstream contract
+# documents stay in this repo. These four files all read specs/, so exporting
+# them would ship a script and a test that cannot run in the public mirror.
+# The generated models under src/revenium_mcp_server/generated/ DO export, via
+# the wholesale src/ include: they are self-contained and need no snapshot.
+!scripts/fetch_openapi_specs.py
+!scripts/derive_consumed_operations.py
+!scripts/generate_openapi_models.py
+!tests/unit/test_openapi_contract.py
 uv.lock

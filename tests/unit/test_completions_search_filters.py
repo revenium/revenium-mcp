@@ -173,7 +173,7 @@ class TestFilterPassThroughAnalyze:
             ]},
         })
         await self.mm._handle_analyze_recent_transactions(
-            client, {"limit": 10, "model": "gpt-4", "end_date": "2026-03-15T00:00:00Z"}
+            client, {"page_size": 10, "model": "gpt-4", "end_date": "2026-03-15T00:00:00Z"}
         )
         call_kwargs = client.get.call_args
         params = call_kwargs[1]["params"]

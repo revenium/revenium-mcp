@@ -17,6 +17,8 @@ import re
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from packaging.version import Version
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -58,6 +60,31 @@ class TestFastmcpPin:
             f"pyproject pins {spec!r} but uv.lock resolves fastmcp {locked}: "
             "CI tests the locked version, so the pin must match it."
         )
+
+    def test_ci_matrix_tracks_the_pin(self):
+        """Every fastmcp-version cell in ci.yml must equal the pyproject pin.
+
+        The per-PR workflow installs the matrix version over the editable
+        install, so a stale cell silently tests a version the image will never
+        run. The nightly fastmcp-canary workflow deliberately floats to the
+        latest release and is not covered by this rule.
+        """
+        pinned = _fastmcp_spec().split("==", 1)[1]
+        ci_path = REPO_ROOT / ".github/workflows/ci.yml"
+        if not ci_path.exists():
+            pytest.skip(
+                ".github/workflows/ci.yml is internal-only and not part of the public export "
+                "(see public-allowlist-mcp.txt); the CI-matrix check runs in the internal repo"
+            )
+        ci = ci_path.read_text()
+        cells = re.findall(r'fastmcp-version:\s*\[([^\]]*)\]', ci)
+        assert cells, "no fastmcp-version matrix found in ci.yml"
+        for cell in cells:
+            versions = [v.strip().strip('"\'') for v in cell.split(",")]
+            assert versions == [pinned], (
+                f"ci.yml tests fastmcp {versions} but pyproject pins {pinned}: "
+                "bump the CI matrix together with the pin."
+            )
 
 
 class TestOAuthRedisStoreTlsFloor:

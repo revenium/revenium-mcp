@@ -24,6 +24,7 @@ from ..common.error_handling import (
     ErrorCodes,
     ToolError,
     create_structured_missing_parameter_error,
+    raise_unknown_action_error,
 )
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..introspection.metadata import (
@@ -41,6 +42,15 @@ DEFAULT_DISCOVERY_PERIOD = "THIRTY_DAYS"
 # rendered inline; the rest are summarised as an overflow line so a squad
 # with hundreds of trace events cannot produce an unbounded payload.
 INLINE_LIST_CAP = 50
+
+# Platform caps on the two free-form write fields, from AgentResource
+# (hypercurrent origin/develop): description carries @Size(max = 1024) and
+# metadata must not exceed 8192 bytes when serialized. Both are surfaced in the
+# schema so a caller sees the limit before the server rejects the write;
+# enforcement stays server-side, as it already does for telemetryKey's
+# 255-character cap.
+AGENT_DESCRIPTION_MAX_CHARS = 1024
+AGENT_METADATA_MAX_BYTES = 8192
 
 # snake_case filter name -> camelCase query parameter, bounded to what the
 # endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
@@ -191,9 +201,17 @@ class AgentManager:
             agent_data = {**agent_data, "teamId": self.client.team_id}
         return await self.client.create_agent(agent_data)
 
-    # Writable fields on the agent resource (the API's Write view). PUT is
-    # full-replacement over this view, so partial updates must merge these
-    # from the current resource before sending.
+    # Writable fields on the agent resource (the API's Write view) that are
+    # merged from the current resource before sending, because PUT is
+    # full-replacement over them.
+    #
+    # description and metadata are deliberately NOT in this tuple. The platform
+    # documents its own omission semantics for them on AgentResource —
+    # description: "an empty string clears the field; omit the field entirely to
+    # leave it unchanged"; metadata: "JSON null clears the field; omit the field
+    # entirely to leave it unchanged" — so merging them from the current
+    # resource would forward a value the caller never sent and would hide the
+    # documented clear path.
     _WRITE_VIEW_FIELDS = ("telemetryKey", "displayName", "ownerId", "teamId")
 
     async def update_agent(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -203,6 +221,11 @@ class AgentManager:
         resource's writable fields are merged under the caller's changes —
         omitting displayName or ownerId can never clear them, and the
         required telemetryKey is always present.
+
+        description and metadata are passed straight through instead: the
+        platform leaves an omitted one unchanged, clears description on an
+        empty string and metadata on JSON null, so what the caller sent (or
+        did not send) is exactly what is forwarded.
         """
         agent_id = arguments.get("agent_id")
         if not agent_id:
@@ -551,6 +574,25 @@ class AgentManagement(ToolBase):
                             "type": "string",
                             "description": "Human-friendly name shown in the UI (optional)",
                         },
+                        "description": {
+                            "type": "string",
+                            "maxLength": AGENT_DESCRIPTION_MAX_CHARS,
+                            "description": (
+                                "Human-readable description of the agent's purpose (optional, "
+                                f"max {AGENT_DESCRIPTION_MAX_CHARS} characters). Omit the field "
+                                "on update to leave the stored value unchanged; send an empty "
+                                "string to clear it."
+                            ),
+                        },
+                        "metadata": {
+                            "type": ["object", "null"],
+                            "description": (
+                                "Free-form JSON object of agent-specific metadata (optional, "
+                                f"max {AGENT_METADATA_MAX_BYTES} bytes serialized). Omit the "
+                                "field on update to leave the stored value unchanged; send JSON "
+                                "null to clear it."
+                            ),
+                        },
                         "ownerId": {
                             "type": "string",
                             "description": "Owning user ID (optional)",
@@ -643,20 +685,42 @@ class AgentManagement(ToolBase):
                         "filters": "dict (optional). Supports 'query' for server-side search on name/org (contains) and externalId (equals)",
                     },
                     "get": {"agent_id": "str"},
-                    "create": {"agent_data": "dict (required: telemetryKey; optional: displayName, ownerId)"},
-                    "update": {"agent_id": "str", "agent_data": "dict (telemetryKey merged from current resource when omitted)"},
+                    "create": {
+                        "agent_data": (
+                            "dict (required: telemetryKey; optional: displayName, description, "
+                            "metadata, ownerId)"
+                        )
+                    },
+                    "update": {
+                        "agent_id": "str",
+                        "agent_data": (
+                            "dict (telemetryKey merged from current resource when omitted; "
+                            "description and metadata are sent as-is - omit to leave unchanged, "
+                            "'' clears description, null clears metadata)"
+                        ),
+                    },
                     "delete": {"agent_id": "str"},
                 },
                 examples=[
                     "list(page=0, size=20)",
                     "list(filters={'query': 'copilot'})",
                     "create(agent_data={'telemetryKey': 'my-agent', 'displayName': 'My Agent'})",
+                    (
+                        "create(agent_data={'telemetryKey': 'my-agent', 'description': 'Answers "
+                        "billing questions', 'metadata': {'department': 'support'}})"
+                    ),
                     "update(agent_id='agt_123', agent_data={'displayName': 'Renamed'})",
+                    "update(agent_id='agt_123', agent_data={'description': '', 'metadata': None})",
                     "delete(agent_id='agt_123')",
                 ],
                 limitations=[
                     "Requires valid API authentication",
                     "telemetryKey must match the agent value emitted in telemetry for usage to attribute",
+                    (
+                        f"description is capped at {AGENT_DESCRIPTION_MAX_CHARS} characters and "
+                        f"metadata at {AGENT_METADATA_MAX_BYTES} serialized bytes by the "
+                        "platform, which rejects over-limit values"
+                    ),
                 ],
             ),
             ToolCapability(
@@ -748,12 +812,19 @@ class AgentManagement(ToolBase):
                             "agent_data": {
                                 "telemetryKey": "my-agent",
                                 "displayName": "My Agent",
+                                "description": "Answers customer billing questions",
+                                "metadata": {"department": "support"},
                             },
                         },
                         "update": {
                             "action": "update",
                             "agent_id": "agt_123",
                             "agent_data": {"displayName": "Renamed Agent"},
+                        },
+                        "update_clear_description_and_metadata": {
+                            "action": "update",
+                            "agent_id": "agt_123",
+                            "agent_data": {"description": "", "metadata": None},
                         },
                         "delete": {"action": "delete", "agent_id": "agt_123"},
                         "list_discovered": {
@@ -867,12 +938,10 @@ class AgentManagement(ToolBase):
 
             else:
                 supported = await self._get_supported_actions()
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"Unknown action '{action}'. Supported actions: {', '.join(supported)}",
-                    )
-                ]
+                # BACK-2937: raise so the envelope carries the error flag.
+                raise_unknown_action_error(
+                    action, hint=f"Supported actions: {', '.join(supported)}"
+                )
 
         except ToolError as e:
             logger.error(f"Tool error in manage_agents: {e}")

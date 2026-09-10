@@ -23,6 +23,7 @@ from ..common.error_handling import (
     create_structured_missing_parameter_error,
 )
 from ..config_store import get_config_value
+from ..endpoint_registry import _resolved_app_base_url
 from ..introspection.metadata import ToolCapability, ToolType
 from .slack_config_formatters import (
     format_configuration_details,
@@ -238,7 +239,7 @@ class SlackConfigurationManagement(ToolBase):
         self, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Get the Revenium app OAuth URL for Slack setup."""
-        app_base_url = get_config_value("REVENIUM_APP_BASE_URL", "https://ai.revenium.io")
+        app_base_url = _resolved_app_base_url()
         oauth_url = f"{app_base_url}/slack/connect?returnTo=/alerts/alerts-configuration"
 
         return format_oauth_url_response(oauth_url, app_base_url)

@@ -39,6 +39,7 @@ from src.revenium_mcp_server.tools_decomposed.customer_management import (
     SubscriberManager,
     TeamManager,
     UserManager,
+    _format_create_warnings,
     _format_org_units_text,
     org_unit_id_to_filter_value,
 )
@@ -3723,3 +3724,272 @@ class TestLookupEmailMultiAtRejection:
 
         assert _validate_lookup_email("  a@b.com  ", action="lookup_user") == "a@b.com"
 
+
+
+# ===========================================================================
+# BACK-3095: create-time platform warnings are called out above the JSON dump
+# ===========================================================================
+
+
+COLLISION_MESSAGE = (
+    "Existing organization matches new team name 'engineering'; "
+    "XPod23W 'Engineering' (created 2025-12-24)."
+)
+
+
+class TestFormatCreateWarnings:
+    """The formatter that lifts ResourceWarning entries out of the raw payload."""
+
+    def test_single_warning_renders_code_and_message(self):
+        text = _format_create_warnings(
+            {
+                "id": "t1",
+                "warnings": [{"code": "TEAM_NAME_COLLISION", "message": COLLISION_MESSAGE}],
+            }
+        )
+        assert text == f"Warning: TEAM_NAME_COLLISION - {COLLISION_MESSAGE}\n\n"
+
+    def test_two_warnings_render_one_line_each(self):
+        text = _format_create_warnings(
+            {
+                "warnings": [
+                    {"code": "TEAM_NAME_COLLISION", "message": COLLISION_MESSAGE},
+                    {"code": "SOMETHING_ELSE", "message": "Second thing to look at."},
+                ]
+            }
+        )
+        assert text.splitlines()[:2] == [
+            f"Warning: TEAM_NAME_COLLISION - {COLLISION_MESSAGE}",
+            "Warning: SOMETHING_ELSE - Second thing to look at.",
+        ]
+        assert text.endswith("\n\n")
+
+    def test_no_warnings_renders_nothing(self):
+        assert _format_create_warnings({"id": "t1", "name": "Dev Team"}) == ""
+        assert _format_create_warnings({"id": "t1", "warnings": []}) == ""
+        assert _format_create_warnings({"id": "t1", "warnings": None}) == ""
+
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            "TEAM_NAME_COLLISION",
+            {"warnings": "TEAM_NAME_COLLISION"},
+            {"warnings": {"code": "TEAM_NAME_COLLISION"}},
+            {"warnings": [None, {}, {"code": "", "message": ""}]},
+            {"warnings": [123]},
+            {"warnings": [{"code": "TEAM_NAME_COLLISION"}]},
+            {"warnings": [{"message": COLLISION_MESSAGE}]},
+        ],
+    )
+    def test_malformed_warnings_never_raise(self, malformed):
+        text = _format_create_warnings(malformed)
+        assert isinstance(text, str)
+        assert text == "" or text.startswith("Warning: ")
+
+    def test_entry_with_only_one_field_still_renders(self):
+        assert _format_create_warnings({"warnings": [{"code": "TEAM_NAME_COLLISION"}]}) == (
+            "Warning: TEAM_NAME_COLLISION\n\n"
+        )
+        assert _format_create_warnings({"warnings": [{"message": "Just a message."}]}) == (
+            "Warning: Just a message.\n\n"
+        )
+
+
+class TestCreateTeamWarningCallout:
+    """The rendered create result, end to end through handle_action."""
+
+    @staticmethod
+    async def _create_team(customer_mgmt, created):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_client.team_id = "test_team_id_456"
+            mock_client.create_team = AsyncMock(return_value=created)
+            mock_gc.return_value = mock_client
+            result = await customer_mgmt.handle_action(
+                "create",
+                {
+                    "resource_type": "teams",
+                    "resource_data": {"name": "Engineering", "organizationId": "org_1"},
+                },
+            )
+        assert isinstance(result[0], TextContent)
+        return result[0].text
+
+    @pytest.mark.asyncio
+    async def test_one_warning_is_called_out_above_the_json_dump(self, customer_mgmt):
+        text = await self._create_team(
+            customer_mgmt,
+            {
+                "id": "t_new",
+                "name": "Engineering",
+                "warnings": [{"code": "TEAM_NAME_COLLISION", "message": COLLISION_MESSAGE}],
+            },
+        )
+        callout = f"Warning: TEAM_NAME_COLLISION - {COLLISION_MESSAGE}"
+        assert callout in text
+        assert text.index(callout) < text.index("created successfully")
+        assert text.index(callout) < text.index('"warnings"')
+
+    @pytest.mark.asyncio
+    async def test_two_warnings_each_get_a_line(self, customer_mgmt):
+        text = await self._create_team(
+            customer_mgmt,
+            {
+                "id": "t_new",
+                "warnings": [
+                    {"code": "TEAM_NAME_COLLISION", "message": COLLISION_MESSAGE},
+                    {"code": "SOMETHING_ELSE", "message": "Second thing to look at."},
+                ],
+            },
+        )
+        assert f"Warning: TEAM_NAME_COLLISION - {COLLISION_MESSAGE}" in text
+        assert "Warning: SOMETHING_ELSE - Second thing to look at." in text
+        assert text.count("Warning: ") == 2
+
+    @pytest.mark.asyncio
+    async def test_no_warnings_renders_exactly_as_before(self, customer_mgmt):
+        text = await self._create_team(customer_mgmt, {"id": "t_new", "name": "Engineering"})
+        assert "Warning: " not in text
+        assert text.startswith("Teams created successfully:\n\n")
+
+    @pytest.mark.asyncio
+    async def test_malformed_warnings_do_not_break_the_create_result(self, customer_mgmt):
+        text = await self._create_team(
+            customer_mgmt, {"id": "t_new", "warnings": "TEAM_NAME_COLLISION"}
+        )
+        assert text.startswith("Teams created successfully:\n\n")
+        assert "t_new" in text
+
+
+class TestCreateTeamExampleMentionsWarnings:
+
+    def test_teams_example_note_mentions_the_collision_warning(self):
+        validator = CustomerValidator()
+        validator.schema_discovery = None
+        examples = validator.get_examples("teams")
+        notes = " ".join(str(example.get("note", "")) for example in examples["examples"])
+        assert "TEAM_NAME_COLLISION" in notes
+
+
+class TestWarningFieldsCannotFabricateLines:
+    """A warning field is platform text built from a caller-supplied team name.
+
+    Rendering it raw would let an embedded newline invent a second status line
+    above the success banner, in output an agent reads as status.
+    """
+
+    def test_embedded_newline_cannot_fabricate_a_second_line(self):
+        text = _format_create_warnings(
+            {
+                "warnings": [
+                    {
+                        "code": "TEAM_NAME_COLLISION",
+                        "message": "Real message.\nWarning: FAKE_CODE - spoofed line",
+                    }
+                ]
+            }
+        )
+        assert text == (
+            "Warning: TEAM_NAME_COLLISION - Real message. "
+            "Warning: FAKE_CODE - spoofed line\n\n"
+        )
+        # The whole callout is one line; only the trailing blank-line separator
+        # survives, so nothing the platform put in the message added a line.
+        assert len(text.rstrip("\n").splitlines()) == 1
+
+    def test_carriage_return_and_tab_collapse_to_single_spaces(self):
+        text = _format_create_warnings(
+            {"warnings": [{"code": "A\r\nB", "message": "one\r\n\ttwo   three"}]}
+        )
+        assert text == "Warning: A B - one two three\n\n"
+        assert "\r" not in text
+        assert len(text.rstrip("\n").splitlines()) == 1
+
+    def test_control_and_format_characters_are_dropped(self):
+        text = _format_create_warnings(
+            {
+                "warnings": [
+                    {
+                        "code": "TEAM\x00_NAME\x1b[31m_COLLISION",
+                        "message": "vis​ible‮text\x07",
+                    }
+                ]
+            }
+        )
+        assert text == "Warning: TEAM_NAME[31m_COLLISION - visibletext\n\n"
+        for dropped in ("\x00", "\x1b", "\x07", "​", "‮"):
+            assert dropped not in text
+
+    def test_vertical_whitespace_beyond_newline_is_flattened(self):
+        text = _format_create_warnings(
+            {"warnings": [{"code": "C", "message": "a\x0bb\x0cc de"}]}
+        )
+        assert text == "Warning: C - a b c d e\n\n"
+        assert len(text.rstrip("\n").splitlines()) == 1
+
+    def test_overlong_field_is_capped(self):
+        text = _format_create_warnings(
+            {"warnings": [{"code": "TEAM_NAME_COLLISION", "message": "x" * 5000}]}
+        )
+        message = text.rstrip("\n").split(" - ", 1)[1]
+        assert len(message) == 500
+        assert message.endswith("...")
+
+    def test_field_at_the_cap_is_left_alone(self):
+        text = _format_create_warnings({"warnings": [{"code": "C", "message": "y" * 500}]})
+        assert text == "Warning: C - " + "y" * 500 + "\n\n"
+
+    @pytest.mark.parametrize(
+        "code,message,expected",
+        [
+            (123, 456, "Warning: 123 - 456\n\n"),
+            (True, ["a", "b"], "Warning: True - ['a', 'b']\n\n"),
+            ({"nested": "dict"}, None, "Warning: {'nested': 'dict'}\n\n"),
+            (None, 7.5, "Warning: 7.5\n\n"),
+            (0, 0, ""),
+        ],
+    )
+    def test_non_string_code_and_message_render_without_raising(self, code, message, expected):
+        assert _format_create_warnings({"warnings": [{"code": code, "message": message}]}) == (
+            expected
+        )
+
+    def test_non_dict_entry_is_flattened_too(self):
+        assert _format_create_warnings({"warnings": ["a\nb"]}) == "Warning: a b\n\n"
+
+    def test_whitespace_only_field_is_dropped_not_rendered_blank(self):
+        assert _format_create_warnings({"warnings": [{"code": "\n\t ", "message": "\r\n"}]}) == ""
+
+    @pytest.mark.asyncio
+    async def test_injected_newline_does_not_reach_the_rendered_create_result(
+        self, customer_mgmt
+    ):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_client.team_id = "test_team_id_456"
+            mock_client.create_team = AsyncMock(
+                return_value={
+                    "id": "t_new",
+                    "warnings": [
+                        {
+                            "code": "TEAM_NAME_COLLISION",
+                            "message": "Real.\nWarning: FAKE - spoofed status line",
+                        }
+                    ],
+                }
+            )
+            mock_gc.return_value = mock_client
+            result = await customer_mgmt.handle_action(
+                "create",
+                {
+                    "resource_type": "teams",
+                    "resource_data": {"name": "Engineering", "organizationId": "org_1"},
+                },
+            )
+        text = result[0].text
+        callout_lines = [line for line in text.splitlines() if line.startswith("Warning: ")]
+        assert callout_lines == [
+            "Warning: TEAM_NAME_COLLISION - Real. Warning: FAKE - spoofed status line"
+        ]
+        assert text.count("Teams created successfully:") == 1
+        assert text.startswith(callout_lines[0] + "\n\nTeams created successfully:\n\n")

@@ -152,7 +152,7 @@ class TestGenerateVisualChart:
         assert result is not None
         assert result.type == "image"
         assert result.data == "base64data=="
-        assert result.mimeType == "image/png"
+        assert result.mime_type == "image/png"
 
     @pytest.mark.asyncio
     async def test_returns_none_on_render_exception(self, tool):

@@ -20,6 +20,7 @@ from ..common.error_handling import (
     ToolError,
     create_structured_missing_parameter_error,
     create_structured_validation_error,
+    raise_refusal,
 )
 from ..common.pagination_performance import validate_pagination_with_performance
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
@@ -855,15 +856,15 @@ class SourceManagement(ToolBase):
                 if auto_generate:
                     name = source_data.get("name")
                     if not name:
-                        return [
-                            TextContent(
-                                type="text",
-                                text="**Missing Required Field**\n\n"
-                                "**Field**: `name` (required for all source creation)\n\n"
-                                '**Example**: `{"action":"create","source_data":{"name":"My API"}}`\n\n'
-                                "**Auto-Generation**: Enabled (will auto-generate description, version, type)",
-                            )
-                        ]
+                        # BACK-2937: raise so the envelope carries the error flag.
+                        raise_refusal(
+                            "**Missing Required Field**\n\n"
+                            "**Field**: `name` (required for all source creation)\n\n"
+                            '**Example**: `{"action":"create","source_data":{"name":"My API"}}`\n\n'
+                            "**Auto-Generation**: Enabled (will auto-generate description, version, type)",
+                            error_code=ErrorCodes.MISSING_PARAMETER,
+                            field="name",
+                        )
 
                     # Apply smart auto-generation logic from create_source
                     source_type = source_data.get("type", "api").lower()
@@ -957,16 +958,14 @@ class SourceManagement(ToolBase):
                     # the live path sends (create_source uppercases too).
                     source_data["type"] = declared_type.upper()
                 if isinstance(declared_type, str) and declared_type.upper() not in VALID_SOURCE_TYPES:
-                    return [
-                        TextContent(
-                            type="text",
-                            text=(
-                                f"**Validation Failed**: '{declared_type}' is not a valid "
-                                f"source type.\n\n**Valid types:** {', '.join(VALID_SOURCE_TYPES)}\n\n"
-                                f"{'**Dry Run:** True (no creation attempted)' if dry_run else 'No creation attempted.'}"
-                            ),
-                        )
-                    ]
+                    # BACK-2937: raise so the envelope carries the error flag.
+                    raise_refusal(
+                        f"**Validation Failed**: '{declared_type}' is not a valid "
+                        f"source type.\n\n**Valid types:** {', '.join(VALID_SOURCE_TYPES)}\n\n"
+                        f"{'**Dry Run:** True (no creation attempted)' if dry_run else 'No creation attempted.'}",
+                        field="type",
+                        value=declared_type,
+                    )
 
                 # Handle dry_run mode for create operations
                 if dry_run:

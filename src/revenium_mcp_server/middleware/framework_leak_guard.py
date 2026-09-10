@@ -38,9 +38,19 @@ class FrameworkLeakGuardMiddleware(Middleware):
     The binding error arrives in two shapes depending on the fastmcp version:
     raw ``pydantic.ValidationError`` (<= 3.2), or wrapped in fastmcp's own
     ``ValidationError`` with the pydantic original as ``__cause__`` (>= 3.4,
-    fastmcp #4128). Both are translated; everything else propagates untouched.
+    fastmcp #4128). Both are translated; every non-ValidationError propagates
+    untouched.
 
-    BACK-1312 (audit findings B.1-B.4); wrapped shape: BACK-2253.
+    A raw ``pydantic.ValidationError`` that is *not* from the binding layer —
+    one raised inside the tool handler body — keeps its original text, but is
+    re-raised as ``ToolError`` rather than bare. See ``_untranslated_text``: on
+    fastmcp 4 a bare re-raise escapes as a JSON-RPC ``-32602`` instead of an
+    ``isError`` result, which would misreport a server-side fault as a bad
+    caller request. The already-wrapped shape needs no such handling — fastmcp
+    routes its own exception types the same way on 3.x and 4.x.
+
+    BACK-1312 (audit findings B.1-B.4); wrapped shape: BACK-2253;
+    fastmcp 4 re-raise path: BACK-2872.
     """
 
     async def on_call_tool(
@@ -53,7 +63,7 @@ class FrameworkLeakGuardMiddleware(Middleware):
         except ValidationError as exc:
             msg = await self._translate_binding_error(context, exc)
             if msg is None:
-                raise
+                raise ToolError(_untranslated_text(exc)) from exc
             raise ToolError(msg) from exc
         except FastMCPValidationError as exc:
             cause = exc.__cause__
@@ -61,6 +71,8 @@ class FrameworkLeakGuardMiddleware(Middleware):
                 raise
             msg = await self._translate_binding_error(context, cause)
             if msg is None:
+                # Already a fastmcp-level exception: fastmcp routes it the same
+                # way on 3.x and 4.x, so a bare re-raise stays correct here.
                 raise
             raise ToolError(msg) from exc
 
@@ -83,6 +95,22 @@ class FrameworkLeakGuardMiddleware(Middleware):
         return translate_pydantic_error(
             exc, tool_name=tool_name, accepted_params=accepted
         )
+
+
+def _untranslated_text(exc: ValidationError) -> str:
+    """Return the message a ValidationError carried before fastmcp 4 (BACK-2872).
+
+    Out-of-scope ValidationError — raised inside the tool handler body rather
+    than at the signature-binding layer — must keep its original validation
+    context. Under fastmcp 3 a bare re-raise did that: `_call_tool` masked the
+    exception into a normal tool result carrying `isError: true` plus
+    `str(exc)`. fastmcp 4 instead re-raises pydantic errors out of `_call_tool`,
+    where the transport turns them into a JSON-RPC `-32602 Invalid request
+    parameters`. That blames the caller for a server-side fault and drops the
+    detail, so the guard re-raises as `ToolError` with this text to preserve the
+    fastmcp 3 envelope exactly.
+    """
+    return str(exc)
 
 
 async def _resolve_accepted_params(

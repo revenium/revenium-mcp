@@ -5,6 +5,42 @@ All notable changes to the Revenium MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-09-10
+
+### Added
+- `manage_jobs`: amend a reported outcome (amend_outcome) under the platform's optimistic lock; a stale expected entity version is refused and the current version is named. Outcome guidance documents the metrics array and entityVersion
+- `manage_jobs`: read session ticket attributions (list_session_attributions), including the reason a session was classified as it was
+- `manage_jobs`: get_roi_summary reads the platform's published ROI summary instead of stitching funnels client-side
+- `manage_metering`: analyze_recent_transactions reports field coverage across recent transactions; transaction detail renders cache creation/read tokens and session-stored transactions
+- `manage_metering`: AI model listings show the price-pin flag and distinguish an empty catalog from a malformed envelope
+- `manage_alerts`: IN filter operator with a values list; QUALITY_RATE metric with its prerequisites (declared job type, TASK_TYPE filter, minSampleCount); operators advertised and validated per alert type, EQUAL_TO/NOT_EQUAL_TO refused on create and update with guidance
+- `manage_agents`: description (max 1024 chars) and metadata (max 8192 bytes) on create and update
+- `manage_cost_controls`: several values in one filter row; department-budget warnings summarized
+- `manage_customers`: create-time platform warnings called out above the created resource; org-unit warnings summarized
+- `manage_subscriber_credentials`: read an organization's credentials
+- `system_diagnostics`: attribution-detail-text toggle
+- tools/list advertises cache hints (ttlMs / cacheScope) so clients stop re-fetching it
+
+### Changed
+- fastmcp 3.4.7 -> 4.0.0, mcp 1.29.0 -> 2.1.1 (MCP protocol revision 2026-07-28; the best mutual protocol era is negotiated per connection, so older clients are unaffected); pydantic >= 2.12
+- Upstream API contract pinned: models generated from committed OpenAPI snapshots, with a drift alarm in tests
+- Readiness verdicts (system_diagnostics, system_setup, manage_capabilities) require a successful authenticated read; a forbidden read is reported as NOT READY with neutral wording instead of counting as connectivity, and a rejected key is named as such on the setup path
+- Analytics empty results no longer assert user inactivity; the cost summary states its coding-assistant scope
+- `manage_jobs`: job filter enum values are validated locally with the platform's case handling and PENDING contract; upstream 400 bodies are no longer echoed
+- `manage_tools`: tool_version is no longer advertised (the platform discards it) and is rejected when present; tool categories derive from the contract
+- `manage_alerts`: an unknown-id 403 is translated to a named not-found
+- Validation and unknown-action refusals are raised as tool errors instead of returned as text
+
+### Fixed
+- A validation error raised inside a tool handler is reported as a tool error again instead of a JSON-RPC "Invalid request parameters"
+- `manage_metering`: the documented submit fields are accepted; an unknown model name is not reported as an API outage; get_supported_providers reports the real model total; dry-run and validate share the catalog check
+- `manage_subscriptions`: clientEmailAddress must be an email address on every creation path
+- `system_setup`: checklists stamped with real UTC; the Slack app URL resolves from the configured environment; dev users are no longer told to set REVENIUM_APP_BASE_URL
+- Coverage-ratio responses say what is and is not compared
+
+### Removed
+- `manage_tools`: the restore action, which the platform never supported
+
 ## [0.5.0] - 2026-08-28
 
 ### Added
@@ -307,4 +343,5 @@ No functional changes. Changelog formatting update only.
 [0.2.0]: https://github.com/revenium/revenium-mcp/compare/v0.1.27...v0.2.0
 [0.1.27]: https://github.com/revenium/revenium-mcp/releases/tag/v0.1.27
 
+[0.6.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.6.0
 [0.5.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.5.0

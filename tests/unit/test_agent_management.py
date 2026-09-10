@@ -9,6 +9,8 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.tools_decomposed.agent_management import (
+    AGENT_DESCRIPTION_MAX_CHARS,
+    AGENT_METADATA_MAX_BYTES,
     AgentManager,
     AgentManagement,
     SquadManager,
@@ -182,6 +184,36 @@ class TestAgentManagerCreate:
         sent = mock_client.create_agent.call_args[0][0]
         assert sent["teamId"] == "other_team"
 
+    @pytest.mark.asyncio
+    async def test_create_agent_forwards_description_and_metadata(
+        self, agent_manager, mock_client
+    ):
+        """BACK-3083: both write fields reach the API untouched on create."""
+        mock_client.create_agent.return_value = {"id": "agt_new"}
+        await agent_manager.create_agent(
+            {
+                "agent_data": {
+                    "telemetryKey": "my-agent",
+                    "description": "Answers customer billing questions",
+                    "metadata": {"department": "support", "tier": 2},
+                }
+            }
+        )
+        sent = mock_client.create_agent.call_args[0][0]
+        assert sent["description"] == "Answers customer billing questions"
+        assert sent["metadata"] == {"department": "support", "tier": 2}
+
+    @pytest.mark.asyncio
+    async def test_create_agent_omits_unsent_description_and_metadata(
+        self, agent_manager, mock_client
+    ):
+        """Neither field is invented when the caller does not send it."""
+        mock_client.create_agent.return_value = {"id": "agt_new"}
+        await agent_manager.create_agent({"agent_data": {"telemetryKey": "my-agent"}})
+        sent = mock_client.create_agent.call_args[0][0]
+        assert "description" not in sent
+        assert "metadata" not in sent
+
 
 class TestAgentManagerUpdate:
     """Test AgentManager.update_agent behavior."""
@@ -243,6 +275,82 @@ class TestAgentManagerUpdate:
         sent = mock_client.update_agent.call_args[0][1]
         assert sent["telemetryKey"] == "new-key"
         assert sent["ownerId"] == "usr_7"
+
+    @pytest.mark.asyncio
+    async def test_update_forwards_description_and_metadata(
+        self, agent_manager, mock_client
+    ):
+        """BACK-3083: both write fields reach the API untouched on update."""
+        mock_client.get_agent_by_id.return_value = {
+            "id": "agt_1",
+            "telemetryKey": "existing-key",
+        }
+        mock_client.update_agent.return_value = {"id": "agt_1"}
+
+        await agent_manager.update_agent(
+            {
+                "agent_id": "agt_1",
+                "agent_data": {
+                    "description": "Handles refunds",
+                    "metadata": {"department": "support"},
+                },
+            }
+        )
+
+        sent = mock_client.update_agent.call_args[0][1]
+        assert sent["description"] == "Handles refunds"
+        assert sent["metadata"] == {"department": "support"}
+
+    @pytest.mark.asyncio
+    async def test_update_omitting_description_and_metadata_sends_neither(
+        self, agent_manager, mock_client
+    ):
+        """BACK-3083: omission means "leave unchanged" on the platform, so the
+        fields must NOT be merged from the current resource — re-sending them
+        would forward a value the caller never sent and would hide the
+        documented clear path."""
+        mock_client.get_agent_by_id.return_value = {
+            "id": "agt_1",
+            "telemetryKey": "existing-key",
+            "description": "Set in the UI",
+            "metadata": {"department": "support"},
+        }
+        mock_client.update_agent.return_value = {"id": "agt_1"}
+
+        await agent_manager.update_agent(
+            {"agent_id": "agt_1", "agent_data": {"displayName": "Renamed"}}
+        )
+
+        sent = mock_client.update_agent.call_args[0][1]
+        assert "description" not in sent
+        assert "metadata" not in sent
+
+    @pytest.mark.asyncio
+    async def test_update_forwards_clear_sentinels_verbatim(
+        self, agent_manager, mock_client
+    ):
+        """BACK-3083: an empty string clears description and JSON null clears
+        metadata, so neither may be dropped or coerced on the way out."""
+        mock_client.get_agent_by_id.return_value = {
+            "id": "agt_1",
+            "telemetryKey": "existing-key",
+            "description": "Set in the UI",
+            "metadata": {"department": "support"},
+        }
+        mock_client.update_agent.return_value = {"id": "agt_1"}
+
+        await agent_manager.update_agent(
+            {
+                "agent_id": "agt_1",
+                "agent_data": {"description": "", "metadata": None},
+            }
+        )
+
+        sent = mock_client.update_agent.call_args[0][1]
+        assert "description" in sent
+        assert sent["description"] == ""
+        assert "metadata" in sent
+        assert sent["metadata"] is None
 
 
 class TestAgentManagerDelete:
@@ -325,6 +433,37 @@ class TestAgentManagementMetadata:
         agent_data = schema["properties"]["agent_data"]
         assert "telemetryKey" in agent_data["properties"]
 
+    @pytest.mark.asyncio
+    async def test_input_schema_declares_description_and_metadata(self, agent_mgmt):
+        """BACK-3083: the write schema advertises both fields, their platform
+        size caps and how to clear each one."""
+        schema = await agent_mgmt._get_input_schema()
+        props = schema["properties"]["agent_data"]["properties"]
+
+        description = props["description"]
+        assert description["type"] == "string"
+        assert description["maxLength"] == AGENT_DESCRIPTION_MAX_CHARS
+        assert str(AGENT_DESCRIPTION_MAX_CHARS) in description["description"]
+        assert "unchanged" in description["description"]
+        assert "empty string" in description["description"]
+
+        metadata = props["metadata"]
+        assert metadata["type"] == ["object", "null"]
+        assert str(AGENT_METADATA_MAX_BYTES) in metadata["description"]
+        assert "unchanged" in metadata["description"]
+        assert "null" in metadata["description"]
+
+    @pytest.mark.asyncio
+    async def test_capabilities_surface_description_and_metadata(self, agent_mgmt):
+        """BACK-3083: get_capabilities is where an agent looks for write
+        fields, so both must appear there too."""
+        result = await agent_mgmt.handle_action("get_capabilities", {})
+        text = result[0].text
+        assert "description" in text
+        assert "metadata" in text
+        assert str(AGENT_DESCRIPTION_MAX_CHARS) in text
+        assert str(AGENT_METADATA_MAX_BYTES) in text
+
 
 class TestAgentManagementActions:
     """handle_action dispatch."""
@@ -342,9 +481,11 @@ class TestAgentManagementActions:
 
     @pytest.mark.asyncio
     async def test_unknown_action_lists_supported(self, agent_mgmt):
-        result = await agent_mgmt.handle_action("bogus_action", {})
-        assert "Unknown action" in result[0].text
-        assert "list_discovered" in result[0].text
+        """BACK-2937: an unknown action raises so the envelope carries isError."""
+        with pytest.raises(ToolError) as exc_info:
+            await agent_mgmt.handle_action("bogus_action", {})
+        assert "Unknown action" in exc_info.value.message
+        assert "list_discovered" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_list_action_formats_result(self, agent_mgmt, mock_client):

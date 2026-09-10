@@ -3,7 +3,7 @@
 This module provides shared validation functions used across the MCP server.
 """
 
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from ..validators import InputValidator
 from ..exceptions import ValidationError
 
@@ -348,6 +348,7 @@ def apply_filter_allowlist(
     *,
     action: str,
     paginated: bool = True,
+    value_enums: Optional[Mapping[str, Sequence[str]]] = None,
 ) -> Dict[str, Any]:
     """Bound a caller-supplied filter object to an endpoint's declared parameters.
 
@@ -362,17 +363,29 @@ def apply_filter_allowlist(
     parameter checking is switched on the same key becomes a 400 whose cause is
     a word the model chose.
 
+    A filter *value* the endpoint cannot bind is the same problem one step in.
+    Where the caller passes ``value_enums``, the value is checked against the
+    published list before the request leaves: the backend answers an unbindable
+    enum with a type-conversion 400 naming its own internal classes, which is
+    unreadable for a person, useless for an agent, and a leak of implementation
+    naming (BACK-2941). Filters with free-form values are simply left out of
+    ``value_enums`` and pass through unchecked.
+
     Args:
         filters: The raw ``filters`` value from tool arguments (may be None)
         allowlist: snake_case argument name -> camelCase API query parameter
         action: Action name used in the error text
+        paginated: Whether ``page``/``size`` are dropped rather than rejected
+        value_enums: camelCase API query parameter -> the values the endpoint
+            accepts for it. Omit a parameter to leave its values unchecked.
 
     Returns:
         A dict of camelCase query parameters, with None values omitted.
 
     Raises:
-        ToolError: when ``filters`` is not an object, or carries a key the
-            target endpoint does not declare.
+        ToolError: when ``filters`` is not an object, carries a key the target
+            endpoint does not declare, or carries a value outside a declared
+            enum.
     """
     # Local import to avoid a circular dependency at module import time.
     from .error_handling import ErrorCodes, ToolError
@@ -428,5 +441,36 @@ def apply_filter_allowlist(
             value=sorted(unknown),
             suggestions=suggestions,
         )
+
+    if value_enums:
+        for api_name, accepted in value_enums.items():
+            if api_name not in mapped:
+                continue
+            value = mapped[api_name]
+            if value in accepted:
+                continue
+            # The platform uppercases these query values before matching, so a
+            # lowercase spelling has always worked upstream. Accept it here too
+            # and forward the canonical form, so this gate never refuses a value
+            # the API would have served.
+            if isinstance(value, str):
+                canonical = next((a for a in accepted if a.upper() == value.strip().upper()), None)
+                if canonical is not None:
+                    mapped[api_name] = canonical
+                    continue
+            raise ToolError(
+                message=(
+                    f"Invalid value '{value}' for filter '{api_name}' on '{action}'. "
+                    f"The API cannot convert it, so the request would fail rather than "
+                    f"filter. Valid values for '{api_name}': {', '.join(accepted)}"
+                ),
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=f"filters.{api_name}",
+                value=value,
+                suggestions=[
+                    f"Use one of: {', '.join(accepted)}",
+                    "Case does not matter; the accepted values are published by get_capabilities()",
+                ],
+            )
 
     return mapped

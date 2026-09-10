@@ -12,10 +12,12 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.tools_decomposed.cost_controls_management import (
+    ORG_UNIT_ENFORCEMENT_MAPS_NOTE,
     CostControlsManager,
     CostControlsManagement,
     _coerce_parent_org_unit_id,
     _summarize_org_unit_blocks,
+    _summarize_org_unit_warnings,
 )
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
@@ -501,9 +503,11 @@ class TestCostControlsManagementActions:
 
     @pytest.mark.asyncio
     async def test_unknown_action_lists_supported(self, cc_mgmt):
-        result = await cc_mgmt.handle_action("bogus_action", {})
-        assert "Unknown action" in result[0].text
-        assert "get_enforcement_rules" in result[0].text
+        """BACK-2937: an unknown action raises so the envelope carries isError."""
+        with pytest.raises(ToolError) as exc_info:
+            await cc_mgmt.handle_action("bogus_action", {})
+        assert "Unknown action" in exc_info.value.message
+        assert "get_enforcement_rules" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_list_action_formats_result(self, cc_mgmt, mock_client):
@@ -941,3 +945,333 @@ class TestOrgUnitDocsMatchUpstreamContract:
         text = caps[0].text
         assert "DIRECT CHILDREN" in text
         assert "organization-wide" in text
+
+
+class TestFilterValuesOnTheItemSchema:
+    """BACK-3088: an IN row carries its list in `values`, and the schema has to
+    say so or an operator writes one control per department instead."""
+
+    @pytest.mark.asyncio
+    async def test_values_is_declared_as_a_string_array(self, cc_mgmt):
+        schema = await cc_mgmt._get_input_schema()
+        item = schema["properties"]["control_data"]["properties"]["filters"]["items"]
+        assert item["properties"]["values"]["type"] == "array"
+        assert item["properties"]["values"]["items"] == {"type": "string"}
+
+    @pytest.mark.asyncio
+    async def test_value_and_values_are_both_optional(self, cc_mgmt):
+        """The server decides which of the two a row needs, per operator; a
+        client-side `required` here would refuse a legal IN row."""
+        schema = await cc_mgmt._get_input_schema()
+        item = schema["properties"]["control_data"]["properties"]["filters"]["items"]
+        assert "required" not in item
+
+    @pytest.mark.asyncio
+    async def test_no_client_side_operator_enum_is_introduced(self, cc_mgmt):
+        """A new upstream operator must not need an MCP release."""
+        schema = await cc_mgmt._get_input_schema()
+        item = schema["properties"]["control_data"]["properties"]["filters"]["items"]
+        assert "enum" not in item["properties"]["operator"]
+
+    @pytest.mark.asyncio
+    async def test_in_semantics_are_documented_on_the_row(self, cc_mgmt):
+        schema = await cc_mgmt._get_input_schema()
+        item = schema["properties"]["control_data"]["properties"]["filters"]["items"]
+        rendered = json.dumps(item)
+        assert "IN" in rendered
+        assert "values" in rendered
+        # The AND/OR boundary is the part a caller gets wrong: several rows are
+        # ANDed, so IN is the only way to say "any of these" in one row.
+        assert "OR within one row only" in rendered
+
+    @pytest.mark.asyncio
+    async def test_org_unit_is_fenced_off_from_in(self, cc_mgmt):
+        """Upstream refuses IN for ORG_UNIT (CostControlService.toEntity), so
+        the surface that teaches the dimension must not invite it."""
+        schema = await cc_mgmt._get_input_schema()
+        item = schema["properties"]["control_data"]["properties"]["filters"]["items"]
+        operator_doc = item["properties"]["operator"]["description"]
+        assert "ORG_UNIT" in operator_doc
+        assert "only IS" in operator_doc
+
+    @pytest.mark.asyncio
+    async def test_examples_teach_an_in_row(self, cc_mgmt):
+        result = await cc_mgmt.handle_action("get_examples", {})
+        assert '"operator": "IN"' in result[0].text
+        assert '"values"' in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_capabilities_state_the_value_values_exclusivity(self, cc_mgmt):
+        caps = await cc_mgmt._get_tool_capabilities()
+        rendered = json.dumps([c.limitations for c in caps])
+        assert "either value or values, never both" in rendered
+
+    @pytest.mark.asyncio
+    async def test_org_unit_capability_carries_the_is_only_rule(self, cc_mgmt):
+        caps = await cc_mgmt.handle_action("get_capabilities", {})
+        assert "only the IS operator" in caps[0].text
+
+
+class TestSummarizeOrgUnitWarnings:
+    """orgUnitBudgetWarnings is subscriber email -> the rule whose warn tier
+    they crossed, disjoint from orgUnitBudgetBlocks."""
+
+    def test_absent_key_produces_no_line(self):
+        assert _summarize_org_unit_warnings({"rules": [], "compiledAt": None}) is None
+
+    def test_explicit_null_produces_no_line(self):
+        assert _summarize_org_unit_warnings({"orgUnitBudgetWarnings": None}) is None
+
+    def test_non_dict_payload_produces_no_line(self):
+        assert _summarize_org_unit_warnings("not a payload") is None
+
+    def test_empty_map_says_nobody_crossed_a_warn_threshold(self):
+        summary = _summarize_org_unit_warnings({"orgUnitBudgetWarnings": {}, "rules": []})
+        assert summary == "No subscribers have crossed a department budget warn threshold."
+
+    def test_rule_ids_are_resolved_to_names_and_counted(self):
+        summary = _summarize_org_unit_warnings(
+            {
+                "orgUnitBudgetWarnings": {
+                    "ada@example.com": 42,
+                    "grace@example.com": 42,
+                    "alan@example.com": 43,
+                },
+                "rules": [
+                    {"ruleId": 42, "name": "Engineering monthly cap"},
+                    {"ruleId": 43, "name": "Design monthly cap"},
+                ],
+            }
+        )
+        assert "3 subscribers are approaching a department budget" in summary
+        assert "- Engineering monthly cap: 2 subscribers warned" in summary
+        assert "- Design monthly cap: 1 subscriber warned" in summary
+
+    def test_people_are_counted_not_named(self):
+        """The block summary names people because a block is an incident about
+        one person; the warn summary is per rule, so it must not widen the PII
+        footprint of the same action."""
+        summary = _summarize_org_unit_warnings(
+            {
+                "orgUnitBudgetWarnings": {"ada@example.com": 42},
+                "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
+            }
+        )
+        assert "ada@example.com" not in summary
+        assert "1 subscriber is approaching" in summary
+        assert "orgUnitBudgetWarnings in the payload below" in summary
+
+    def test_balances_are_shown_when_the_map_carries_them(self):
+        summary = _summarize_org_unit_warnings(
+            {
+                "orgUnitBudgetWarnings": {"ada@example.com": 42, "grace@example.com": 42},
+                "orgUnitBudgetBlockBalances": {
+                    "ada@example.com": 455.25,
+                    "grace@example.com": 480.5,
+                },
+                "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
+            }
+        )
+        # Highest first: the point of the line is who is closest to the block.
+        assert "balances compared: 480.5, 455.25" in summary
+
+    def test_missing_balance_map_still_reports_the_counts(self):
+        summary = _summarize_org_unit_warnings(
+            {
+                "orgUnitBudgetWarnings": {"ada@example.com": 42},
+                "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
+            }
+        )
+        assert "1 subscriber warned" in summary
+        assert "balances compared" not in summary
+
+    def test_malformed_balance_map_does_not_break_rendering(self):
+        summary = _summarize_org_unit_warnings(
+            {
+                "orgUnitBudgetWarnings": {"ada@example.com": 42},
+                "orgUnitBudgetBlockBalances": ["455.25"],
+                "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
+            }
+        )
+        assert "1 subscriber warned" in summary
+        assert "balances compared" not in summary
+
+    def test_unparseable_balance_is_kept_and_sorted_last(self):
+        """A balance the caller cannot read is still evidence someone is at
+        risk, so it is rendered rather than dropped."""
+        summary = _summarize_org_unit_warnings(
+            {
+                "orgUnitBudgetWarnings": {"ada@example.com": 42, "grace@example.com": 42},
+                "orgUnitBudgetBlockBalances": {
+                    "ada@example.com": "not-a-number",
+                    "grace@example.com": 10,
+                },
+                "rules": [{"ruleId": 42, "name": "Cap"}],
+            }
+        )
+        assert "balances compared: 10, not-a-number" in summary
+
+    def test_string_rule_ids_still_resolve_to_names(self):
+        summary = _summarize_org_unit_warnings(
+            {
+                "orgUnitBudgetWarnings": {"ada@example.com": "42"},
+                "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
+            }
+        )
+        assert "- Engineering monthly cap: 1 subscriber warned" in summary
+
+    def test_unresolvable_rule_id_falls_back_to_the_id(self):
+        summary = _summarize_org_unit_warnings(
+            {"orgUnitBudgetWarnings": {"ada@example.com": 99}, "rules": []}
+        )
+        assert "- rule 99: 1 subscriber warned" in summary
+
+    def test_unexpected_shape_is_reported_not_silently_dropped(self):
+        summary = _summarize_org_unit_warnings(
+            {"orgUnitBudgetWarnings": ["ada@example.com"]}
+        )
+        assert "not the expected" in summary
+
+    def test_long_balance_lists_are_bounded(self):
+        warned = {f"user{i}@example.com": 42 for i in range(15)}
+        balances = {f"user{i}@example.com": float(i) for i in range(15)}
+        summary = _summarize_org_unit_warnings(
+            {
+                "orgUnitBudgetWarnings": warned,
+                "orgUnitBudgetBlockBalances": balances,
+                "rules": [{"ruleId": 42, "name": "Cap"}],
+            }
+        )
+        assert "15 subscribers are approaching" in summary
+        assert "and 5 more" in summary
+
+    def test_summary_never_contains_a_blank_line(self):
+        """get_enforcement_rules splits the first blank line to recover the
+        JSON payload, so a multi-line summary must stay one block."""
+        summary = _summarize_org_unit_warnings(
+            {
+                "orgUnitBudgetWarnings": {"ada@example.com": 42, "alan@example.com": 43},
+                "rules": [{"ruleId": 42, "name": "A"}, {"ruleId": 43, "name": "B"}],
+            }
+        )
+        assert "\n\n" not in summary
+
+
+class TestEnforcementRulesWarnSummaryRendering:
+    """The rendered get_enforcement_rules output must answer "who is about to
+    be blocked", not hand back a raw email map."""
+
+    @pytest.mark.asyncio
+    async def test_warned_rules_are_named_with_their_counts(self, cc_mgmt, mock_client):
+        mock_client.get_enforcement_rules.return_value = {
+            "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
+            "compiledAt": "2026-09-09T00:00:00Z",
+            "orgUnitBudgetWarnings": {"ada@example.com": 42, "grace@example.com": 42},
+            "orgUnitBudgetBlockBalances": {"ada@example.com": 480.5},
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_rules", {})
+
+        text = result[0].text.split("\n\n", 1)[0]
+        assert "Engineering monthly cap: 2 subscribers warned" in text
+        assert "balances compared: 480.5" in text
+        assert "ada@example.com" not in text
+
+    @pytest.mark.asyncio
+    async def test_blocks_are_reported_before_warnings(self, cc_mgmt, mock_client):
+        """The two maps are disjoint upstream; what is already enforced
+        outranks what is only approaching."""
+        mock_client.get_enforcement_rules.return_value = {
+            "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
+            "compiledAt": None,
+            "orgUnitBudgetBlocks": {"ada@example.com": 42},
+            "orgUnitBudgetWarnings": {"grace@example.com": 42},
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_rules", {})
+
+        prose = result[0].text.split("\n\n", 1)[0]
+        assert prose.index("currently blocked") < prose.index("approaching")
+
+    @pytest.mark.asyncio
+    async def test_payload_is_still_recoverable_after_both_summaries(
+        self, cc_mgmt, mock_client
+    ):
+        payload = {
+            "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
+            "compiledAt": "2026-09-09T00:00:00Z",
+            "orgUnitBudgetBlocks": {"ada@example.com": 42},
+            "orgUnitBudgetWarnings": {"grace@example.com": 42, "alan@example.com": 42},
+            "orgUnitBudgetBlockBalances": {"grace@example.com": 12.5},
+        }
+        mock_client.get_enforcement_rules.return_value = payload
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_rules", {})
+
+        assert json.loads(result[0].text.split("\n\n", 1)[1]) == payload
+
+    @pytest.mark.asyncio
+    async def test_payload_without_the_map_renders_exactly_as_before(
+        self, cc_mgmt, mock_client
+    ):
+        payload = {"rules": [], "compiledAt": None}
+        mock_client.get_enforcement_rules.return_value = payload
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_rules", {})
+
+        assert result[0].text == (
+            "Compiled enforcement rules (0 rules, compiledAt=None):\n\n"
+            + json.dumps(payload, indent=2)
+        )
+
+    @pytest.mark.asyncio
+    async def test_block_units_map_is_never_summarized_as_a_verdict(
+        self, cc_mgmt, mock_client
+    ):
+        """orgUnitBudgetBlockUnits covers warned and blocked people alike - it
+        is attribution for notification routing, not a block list."""
+        mock_client.get_enforcement_rules.return_value = {
+            "rules": [],
+            "compiledAt": None,
+            "orgUnitBudgetBlockUnits": {"ada@example.com": 173},
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_rules", {})
+
+        prose = result[0].text.split("\n\n", 1)[0]
+        assert "blocked" not in prose
+        assert "warned" not in prose
+
+    @pytest.mark.asyncio
+    async def test_capabilities_explain_the_three_maps(self, cc_mgmt):
+        caps = await cc_mgmt._get_tool_capabilities()
+        rendered = json.dumps([c.description for c in caps])
+        assert "orgUnitBudgetWarnings" in rendered
+        assert "orgUnitBudgetBlockBalances" in rendered
+        assert "NOT a verdict" in rendered
+
+    @pytest.mark.asyncio
+    async def test_the_tools_own_actions_publish_the_map_meanings(self, cc_mgmt):
+        """_get_tool_capabilities prose only reaches an agent through
+        tool_introspection, so the note also has to ride the notes list that
+        get_capabilities and get_examples render."""
+        caps = await cc_mgmt.handle_action("get_capabilities", {})
+        examples = await cc_mgmt.handle_action("get_examples", {})
+        for text in (caps[0].text, examples[0].text):
+            assert "orgUnitBudgetWarnings" in text
+            assert "NOT a verdict" in text
+
+    @pytest.mark.asyncio
+    async def test_the_map_meanings_are_stated_once(self, cc_mgmt):
+        """One definition, interpolated twice: a second copy is how the
+        capability text and the notes list drift apart."""
+        caps = await cc_mgmt._get_tool_capabilities()
+        enforcement = [c for c in caps if c.name == "Enforcement Visibility"][0]
+        assert ORG_UNIT_ENFORCEMENT_MAPS_NOTE in enforcement.description
+        rendered = (await cc_mgmt.handle_action("get_capabilities", {}))[0].text
+        assert json.dumps(ORG_UNIT_ENFORCEMENT_MAPS_NOTE)[1:-1] in rendered

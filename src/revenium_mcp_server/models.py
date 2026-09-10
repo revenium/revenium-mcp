@@ -675,6 +675,9 @@ class MetricType(str, Enum):
     REQUESTS_PER_MINUTE = "REQUESTS_PER_MINUTE"
     ERROR_RATE = "ERROR_RATE"
     ERROR_COUNT = "ERROR_COUNT"
+    # Evaluated from job outcome facts rather than AI transactions, and only usable
+    # with the prerequisites in revenium_mcp_server.alert_metrics (BACK-3103).
+    QUALITY_RATE = "QUALITY_RATE"
 
 
 class OperatorType(str, Enum):

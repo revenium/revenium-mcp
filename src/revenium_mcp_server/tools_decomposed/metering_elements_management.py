@@ -20,6 +20,7 @@ from ..common.error_handling import (
     ToolError,
     create_structured_missing_parameter_error,
     create_structured_validation_error,
+    raise_refusal,
 )
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.update_configs import UpdateConfigFactory
@@ -618,14 +619,13 @@ class MeteringElementsManagement(ToolBase):
                 # Check if validation failed
                 if not validation_result["valid"]:
                     errors_text = "\n".join([f"• {error}" for error in validation_result["errors"]])
-                    return [
-                        TextContent(
-                            type="text",
-                            text=f"**Validation Failed**\n\n"
-                            f"**Errors Found:**\n{errors_text}\n\n"
-                            f"Please fix the errors above before creating the metering element.",
-                        )
-                    ]
+                    # BACK-2937: raise so the envelope carries the error flag.
+                    raise_refusal(
+                        f"**Validation Failed**\n\n"
+                        f"**Errors Found:**\n{errors_text}\n\n"
+                        f"Please fix the errors above before creating the metering element.",
+                        field="element_data",
+                    )
 
                 result = await elements_manager.create_element(client, arguments)
                 # Format create response consistently

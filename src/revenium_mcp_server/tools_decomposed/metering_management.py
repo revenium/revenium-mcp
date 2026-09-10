@@ -362,6 +362,129 @@ def _invalid_provider_message(provider: str) -> str:
     )
 
 
+# BACK-3084 / BACK-3005: AI model price pins.
+#
+# `priceOverridden` and `priceOverrideReason` are READ-ONLY BY PLATFORM DESIGN.
+# `AIModelResource` declares both with `Schema.AccessMode.READ_ONLY` and
+# `@JsonView(Views.Read::class)`: a pin lives on a *global* model row shared by
+# every tenant and is stamped by a platform operator
+# (`revctl ai-model override set`, `AIModelService.stampOverride`), never
+# through the API — the model endpoints authorise against the caller's own
+# organization, so a tenant may not pin a row it shares. The two fields the
+# API-drift report saw on the POST/PUT request schemas are readme.io
+# write-view artifacts of the same read-only properties, not writable inputs.
+#
+# Consequence for this file: RENDER them, never accept them. The MCP exposes no
+# AI-model write action at all (client.py only GETs
+# /profitstream/v2/api/sources/ai/models), and
+# tests/unit/test_metering_ai_model_price_override.py pins that. Do not add one
+# that forwards either field.
+
+# A server that predates BACK-3005 sends neither field. That is NOT the same
+# answer as `priceOverridden: false`, so it must never render as "no": a cost
+# figure reconciled against an invoice needs to know the difference between
+# "this price tracks upstream" and "this server cannot tell you".
+_PRICE_PIN_UNAVAILABLE = "unavailable (not reported by this server)"
+_PRICE_PIN_NOT_OVERRIDDEN = "no (tracks upstream pricing)"
+_PRICE_PIN_NO_REASON = "no reason recorded"
+
+
+def _format_price_pin(model: Any) -> str:
+    """Render one model's price-pin status for the AI model listings.
+
+    Only a real boolean is an answer. `True` renders `yes - <reason>`, `False`
+    renders the "no" wording, and EVERYTHING ELSE — absent, null, or any
+    non-boolean the platform might send — renders the "unavailable" wording.
+    That last clause is deliberate rather than defensive: these rows arrive
+    straight off the HAL payload with no field coercion, so a string `"false"`
+    is truthy in Python and would otherwise be rendered as a pinned price. The
+    reason text is only ever printed alongside a boolean `True`; a reason
+    attached to an uninterpretable flag says nothing a caller can rely on.
+    """
+    if not isinstance(model, dict):
+        return _PRICE_PIN_UNAVAILABLE
+    overridden = model.get("priceOverridden")
+    if overridden is True:
+        reason = model.get("priceOverrideReason")
+        reason_text = str(reason).strip() if reason is not None else ""
+        return f"yes - {reason_text or _PRICE_PIN_NO_REASON}"
+    if overridden is False:
+        return _PRICE_PIN_NOT_OVERRIDDEN
+    if overridden is not None:
+        logger.debug(
+            "priceOverridden is not a boolean; rendering the price pin as "
+            "unavailable",
+            model_id=model.get("id"),
+            price_overridden_repr=repr(overridden),
+        )
+    return _PRICE_PIN_UNAVAILABLE
+
+
+# The three answers an AI model listing can owe its caller, decided before any
+# listing text is built. `ReveniumClient._extract_embedded_data` answers `[]`
+# for every shape it does not recognise, so an `_embedded` block carrying no
+# list value is indistinguishable from an empty catalog once it has run — and
+# rendering a reshaped upstream response as a valid empty listing (worse, with
+# a non-zero `page.totalElements` printed beside zero rows) is a wrong answer
+# that reads like a real one. Classify the envelope first, then extract.
+_AI_MODEL_ENVELOPE_ABSENT = "absent"
+_AI_MODEL_ENVELOPE_MALFORMED = "malformed"
+_AI_MODEL_ENVELOPE_COLLECTION = "collection"
+
+
+def _classify_ai_model_envelope(response: Any) -> str:
+    """Say which of the three answers an AI model catalog response supports."""
+    if not isinstance(response, dict) or "_embedded" not in response:
+        return _AI_MODEL_ENVELOPE_ABSENT
+    embedded = response["_embedded"]
+    if isinstance(embedded, dict) and any(
+        isinstance(value, list) for value in embedded.values()
+    ):
+        return _AI_MODEL_ENVELOPE_COLLECTION
+    return _AI_MODEL_ENVELOPE_MALFORMED
+
+
+def _malformed_ai_model_envelope_error(response: Any, action: str) -> ToolError:
+    """Structured error for an `_embedded` block that holds no collection."""
+    embedded = response.get("_embedded") if isinstance(response, dict) else None
+    observed = (
+        sorted(embedded.keys()) if isinstance(embedded, dict) else type(embedded).__name__
+    )
+    return ToolError(
+        message=(
+            "The AI model catalog response is malformed: its `_embedded` block "
+            "contains no model collection, so no catalog could be read. This is "
+            "not an empty catalog - nothing was returned that could be counted."
+        ),
+        error_code=ErrorCodes.API_ERROR,
+        field="_embedded",
+        value=observed,
+        suggestions=[
+            "Retry the call - a reshaped or truncated response is usually transient",
+            "If it persists, the upstream model listing has changed shape and the "
+            f"`{action}` renderer needs updating rather than the call retried",
+            "Do not read this as 'no models exist' - the catalog size is unknown here",
+        ],
+    )
+
+
+def _empty_ai_model_page_note(page_info: Any) -> str:
+    """Name the reported catalog total when a page came back with no rows.
+
+    A page that returns no rows while `page.totalElements` reports thousands is
+    a paging answer, not a catalog size — printing the total beside zero rows
+    reads as a catalog that vanished.
+    """
+    total = page_info.get("totalElements") if isinstance(page_info, dict) else None
+    if not isinstance(total, int) or total <= 0:
+        return ""
+    return (
+        f"\n\nThe catalog reports **{total}** models in total, so this page is "
+        "past the end of the results or was filtered empty upstream - the total "
+        "is not the number of models on this page. Retry with `page: 0`."
+    )
+
+
 PROMETHEUS_METRICS_AVAILABLE = False
 
 # Accepted transaction_id formats. The backend silently drops ids it does not
@@ -529,6 +652,110 @@ def _coding_assistant_scope_note(include_coding_assistants: bool) -> str:
     )
 
 
+# The prompt-cache token fields and their display labels, in the order the
+# detail rendering shows them. THE ONLY PLACE THESE NAMES ARE ENUMERATED:
+# _CACHE_TOKEN_FIELDS below is derived from this table rather than retyped, so
+# a sixth cache field cannot be added to one list and forgotten in the other -
+# which would either render a field the section never opens for, or track a
+# field in the presence diagnostic that nothing prints.
+#
+# cacheCreationTokenCount is the platform's TOTAL cache-write count, and the 5m
+# and 1h counts are the split of that total, not additions to it. Nothing here
+# adds the tiers together or derives one from the others: the split is nullable
+# on its own (BACK-1939 - a source that never reported it, or a call the
+# platform could not resolve), so arithmetic on a partial split would invent a
+# figure and present it as the platform's.
+_CACHE_TOKEN_LABELS: Tuple[Tuple[str, str], ...] = (
+    ("cacheReadTokenCount", "Cache Read Tokens"),
+    ("cacheCreationTokenCount", "Cache Creation Tokens (total)"),
+    ("cacheCreation5mTokenCount", "Cache Creation Tokens (5m TTL)"),
+    ("cacheCreation1hTokenCount", "Cache Creation Tokens (1h TTL)"),
+    ("cacheTtlSplitSource", "Cache TTL Split Source"),
+)
+
+# Reused by _format_cache_tokens (which fields open the section) and by the
+# presence diagnostic, so the two surfaces cannot drift apart.
+_CACHE_TOKEN_FIELDS: Tuple[str, ...] = tuple(field for field, _ in _CACHE_TOKEN_LABELS)
+
+# What a field the platform did not return renders as. Never 0: a zero cache
+# count is a real reading ("this call wrote nothing to the cache") and printing
+# it for a field the response simply did not carry is the reconciliation error
+# this section exists to prevent.
+_CACHE_TOKEN_UNAVAILABLE = "unavailable"
+
+
+# Fields analyze_recent_transactions measures presence for. These are the
+# RESPONSE spellings declared on AICompletionMetricResource in
+# specs/openapi/hypercurrent.json, not the submission spellings, and that
+# distinction is the whole point of the list: measured against the submission
+# names, the report called `durationMs`, `organizationName`, `productName` and
+# the nested `subscriber` object "missing from every transaction" while the
+# values were sitting in the response under the names below - a data-loss
+# verdict on data that arrived intact (BACK-2931).
+_COMPLETIONS_REPORTED_FIELDS: Tuple[str, ...] = (
+    "transactionId",
+    "model",
+    "provider",
+    "inputTokenCount",
+    "outputTokenCount",
+    # Spliced rather than retyped so the diagnostic tracks exactly the fields
+    # the detail rendering shows.
+    *_CACHE_TOKEN_FIELDS,
+    "requestDuration",
+    "organization",
+    "product",
+    "subscriptionId",
+    "taskType",
+    "agent",
+    "traceId",
+    "traceType",
+    "traceName",
+    "responseQualityScore",
+    "skillName",
+    "skillSource",
+    "skillKind",
+    "skillPluginName",
+    "skillMarketplaceName",
+    "skillInvocationTrigger",
+    "effort",
+    "modelHost",
+    "subscriberEmail",
+    "subscriberId",
+    "subscriberCredential",
+    "subscriberEmailSource",
+    "isStreamed",
+    "stopReason",
+    "requestTime",
+    "responseTime",
+    "completionStartTime",
+    "timeToFirstToken",
+)
+
+# Submission field -> the name it reads back under, for every field whose two
+# spellings differ. Reported verbatim so a caller comparing what they sent with
+# what they see is not left to guess the mapping.
+_COMPLETIONS_RESPONSE_FIELD_ALIASES: Dict[str, str] = {
+    "duration_ms": "requestDuration",
+    "organization_name": "organization",
+    "product_name": "product",
+    "subscriber.email": "subscriberEmail",
+    "subscriber.id": "subscriberId",
+    "subscriber.credential": "subscriberCredential",
+}
+
+# Submission fields AICompletionMetricResource does not declare at all. A
+# transaction carrying these can land perfectly and still never come back
+# through a completions read, so the report names them apart rather than listing
+# them as absent - "absent from every transaction" reads as data loss.
+_COMPLETIONS_UNREADABLE_SUBMISSION_FIELDS: Tuple[str, ...] = ("ticket_id",)
+
+# Envelope and bookkeeping keys that are not transaction data. Excluded from the
+# untracked-field listing so it stays a list of payload fields.
+_COMPLETIONS_REPORT_IGNORED_FIELDS: FrozenSet[str] = frozenset(
+    {"_links", "id", "resourceType", "label", "created", "updated"}
+)
+
+
 def _extract_completions_filters(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Build completions API filter params from MCP arguments, omitting absent/None/empty values.
 
@@ -583,6 +810,15 @@ _COMPLETION_PROVENANCE_EXAMPLES: Dict[str, str] = {
     "effort": "high",
     "model_host": "bedrock",
     "subscriber_email_source": "jwt",
+}
+
+# The metering API stopped accepting organizationId / productId on the wire;
+# the replacements are organizationName / productName. Both spellings stay
+# declared on the MCP tool so a caller using the old one gets the rename
+# instruction rather than an "unrecognized parameter" dead end.
+_DEPRECATED_SUBMISSION_ALIASES: Dict[str, str] = {
+    "organization_id": "organization_name",
+    "product_id": "product_name",
 }
 
 # effort carries the vendor's reasoning-effort level. The vocabulary is
@@ -1872,7 +2108,10 @@ The subscriber data structure has been updated. The old individual fields are no
                 if any("string" in error for error in errors):
                     detailed_message += "• Strings: Ensure non-empty text without special characters (<, >, \", ', &)\n"
                 if any("integer" in error for error in errors):
-                    detailed_message += "• Numbers: Use positive integers for tokens and duration\n"
+                    detailed_message += (
+                        "• Numbers: input_tokens must be > 0; output_tokens and "
+                        "duration_ms must be >= 0\n"
+                    )
 
                 detailed_message += "\n**📚 Get Help:**\n"
                 detailed_message += "• Use get_examples() to see working examples\n"
@@ -2184,7 +2423,10 @@ The subscriber data structure has been updated. The old individual fields are no
                 if any("string" in error for error in errors):
                     detailed_message += "• Strings: Ensure non-empty text without special characters (<, >, \", ', &)\n"
                 if any("integer" in error for error in errors):
-                    detailed_message += "• Numbers: Use positive integers for tokens and duration\n"
+                    detailed_message += (
+                        "• Numbers: input_tokens must be > 0; output_tokens and "
+                        "duration_ms must be >= 0\n"
+                    )
 
                 detailed_message += "\n**📚 Get Help:**\n"
                 detailed_message += "• Use get_examples() to see working examples\n"
@@ -2284,6 +2526,34 @@ The subscriber data structure has been updated. The old individual fields are no
         return 0.0
 
     # Performance monitoring decorator removed - infrastructure monitoring handled externally
+    def reject_deprecated_submission_aliases(self, arguments: Dict[str, Any]) -> None:
+        """Reject the deprecated submission aliases up-front.
+
+        The metering API stopped accepting `organizationId` / `productId` on the
+        wire, so accepting the snake_case aliases silently would lose data —
+        surface a clear error pointing callers at the new field names.
+
+        Called from both the live submit and the dry-run branch of
+        MeteringManagement.handle_action, so that a payload dry-run calls valid
+        cannot fail on submit (and vice versa).
+        """
+        for old_name, new_name in _DEPRECATED_SUBMISSION_ALIASES.items():
+            if old_name in arguments:
+                raise create_structured_validation_error(
+                    message=(
+                        f"{old_name!r} is no longer accepted — the metering API "
+                        f"stopped accepting this field. Use {new_name!r} instead."
+                    ),
+                    field=old_name,
+                    value=arguments.get(old_name),
+                    suggestions=[
+                        f"Rename `{old_name}` to `{new_name}` in your tool call.",
+                        f"`{new_name}` is accepted by submit_ai_transaction and is "
+                        "carried through to the metering payload.",
+                        "See BACK-1456 for the migration context.",
+                    ],
+                )
+
     async def submit_transaction(
         self, client: ReveniumClient, arguments: Dict[str, Any], *, ctx: Optional["TenantContext"] = None
     ) -> Dict[str, Any]:
@@ -2291,28 +2561,7 @@ The subscriber data structure has been updated. The old individual fields are no
         # No hardcoded required fields - API will validate based on UCM capabilities
         logger.info("Transaction submission validation delegated to API based on UCM capabilities")
 
-        # Reject the deprecated submission aliases up-front. The metering API
-        # stopped accepting `organizationId` / `productId` on the wire, so
-        # accepting the snake_case aliases silently would lose data — surface
-        # a clear error pointing callers at the new field names.
-        _DEPRECATED_SUBMISSION_ALIASES = {
-            "organization_id": "organization_name",
-            "product_id": "product_name",
-        }
-        for _old_name, _new_name in _DEPRECATED_SUBMISSION_ALIASES.items():
-            if _old_name in arguments:
-                raise create_structured_validation_error(
-                    message=(
-                        f"{_old_name!r} is no longer accepted — the metering API "
-                        f"stopped accepting this field. Use {_new_name!r} instead."
-                    ),
-                    field=_old_name,
-                    value=arguments.get(_old_name),
-                    suggestions=[
-                        f"Rename `{_old_name}` to `{_new_name}` in your tool call.",
-                        "See BACK-1456 for the migration context.",
-                    ],
-                )
+        self.reject_deprecated_submission_aliases(arguments)
 
         # Security validation: Sanitize and validate inputs (async optimized)
         validation_result = await self._validate_transaction_inputs_async(arguments, ctx=ctx)
@@ -2326,7 +2575,7 @@ The subscriber data structure has been updated. The old individual fields are no
                     "Use validate_model_provider() to check if your model/provider combination is supported",
                     "Use get_capabilities() to see all required and optional fields",
                     "Ensure all required fields (model, provider, input_tokens, output_tokens, duration_ms) are provided",
-                    "Check that token counts and duration are positive integers",
+                    "Check that input_tokens is greater than zero and that output_tokens and duration_ms are not negative",
                 ],
                 examples={
                     "valid_transaction": {
@@ -3475,17 +3724,35 @@ class MeteringManagement(ToolBase):
 
             # Route to appropriate handler
             if action == "submit_ai_transaction":
+                # Deprecated-alias rejection runs before the dry_run split so
+                # both branches return the same verdict for the same payload:
+                # a dry run must never call valid a payload the live submit
+                # refuses.
+                self.transaction_manager.reject_deprecated_submission_aliases(arguments)
+
                 # Handle dry_run mode for transaction submission
                 dry_run = arguments.get("dry_run", False)
                 if dry_run:
                     # Validate transaction data without submitting
                     validation_result = await self.validator.validate_transaction(arguments, ctx=ctx)
                     if validation_result["valid"]:
+                        # Same catalog check the validate action runs, on the
+                        # same payload: a dry run that answers "ready to submit"
+                        # for a model or pairing validate calls incomplete would
+                        # be the divergence this branch exists to prevent.
+                        model_warning = await self._catalog_advisory(client, arguments)
+
                         # Build comprehensive dry-run output including optional fields
                         dry_run_text = "🧪 **DRY RUN MODE - Transaction Validation**\n\n"
-                        dry_run_text += (
-                            "✅ **Validation Successful**: Transaction data is valid and ready for submission\n\n"
-                        )
+                        if model_warning:
+                            dry_run_text += (
+                                "**Validation Incomplete**: every field is well formed, "
+                                "but the transaction is not ready to submit\n\n"
+                            )
+                        else:
+                            dry_run_text += (
+                                "✅ **Validation Successful**: Transaction data is valid and ready for submission\n\n"
+                            )
                         dry_run_text += "**Would Submit:**\n"
                         dry_run_text += f"- **Model:** {arguments.get('model', 'N/A')}\n"
                         dry_run_text += f"- **Provider:** {arguments.get('provider', 'N/A')}\n"
@@ -3536,6 +3803,8 @@ class MeteringManagement(ToolBase):
                                 if "name" in credential and credential["name"]:
                                     dry_run_text += f"  - Credential Name: {credential['name']}\n"
 
+                        if model_warning:
+                            dry_run_text += model_warning + "\n"
                         dry_run_text += "\n**Dry Run:** True (no actual submission performed)"
 
                         return [TextContent(type="text", text=dry_run_text)]
@@ -3594,9 +3863,22 @@ class MeteringManagement(ToolBase):
             elif action == "validate":
                 result = await self.validator.validate_transaction(arguments, ctx=ctx)
                 if result["valid"]:
-                    # Enhanced validation response with progressive guidance
-                    response_text = "✅ **Validation Successful**\n\n"
-                    response_text += result["message"]
+                    # Field validation passing is not the same as the model
+                    # being one the catalog can price. Saying "valid" for a
+                    # model validate_model_provider() reports as not found is
+                    # the disagreement callers act on, so the unknown-model case
+                    # is named here instead of being hidden behind a tick.
+                    model_warning = await self._catalog_advisory(client, arguments)
+                    if model_warning:
+                        response_text = "**Validation Incomplete**\n\n"
+                        response_text += (
+                            "Every field is well formed, but the transaction is not "
+                            "ready to submit."
+                        )
+                        response_text += model_warning
+                    else:
+                        response_text = "✅ **Validation Successful**\n\n"
+                        response_text += result["message"]
                     return [TextContent(type="text", text=response_text)]
                 else:
                     return [
@@ -3659,7 +3941,9 @@ class MeteringManagement(ToolBase):
 
                         # Show transaction data based on consolidated parameter
                         if return_transaction_data in ["summary", "full"] and "transaction_data" in transaction_result:
-                            data = transaction_result["transaction_data"]
+                            data = self._unwrap_session_transaction(
+                                transaction_result["transaction_data"]
+                            )
 
                             # Use shared method for core fields display
                             response_text += self._format_transaction_summary(data, include_timestamp=False)
@@ -3681,6 +3965,10 @@ class MeteringManagement(ToolBase):
                     client, arguments, ctx=ctx
                 )
                 return [TextContent(type="text", text=recent_text)]
+            elif action == "analyze_recent_transactions":
+                return await self._handle_analyze_recent_transactions(
+                    client, arguments, ctx=ctx
+                )
             elif action == "get_capabilities":
                 return await self._handle_get_capabilities(ctx=ctx)
             elif action == "get_examples":
@@ -3934,6 +4222,32 @@ class MeteringManagement(ToolBase):
         logger.info(f"📊 Retrieved {len(transactions)} transactions for page {page}")
         return transactions, pagination_info
 
+    @staticmethod
+    def _unwrap_session_transaction(data: Any) -> Any:
+        """Return the transaction fields, unwrapping a session-store entry.
+
+        A transaction found in `MeteringTransactionManager.transaction_store` -
+        the just-submitted case, before the platform has it queryable - is
+        stored as a bookkeeping wrapper (`payload`, `timestamp`, `verified`,
+        `submitted`) rather than as the record itself. Handing that wrapper to
+        the formatters means every `data.get("model")`, `data.get("totalCost")`
+        and `data.get("cacheReadTokenCount")` misses, so a session hit rendered
+        a "Found" line with nothing under it: the verification path that exists
+        precisely to show what was just submitted showed none of it.
+
+        The submitted payload already carries the API's own request-body
+        spellings (`cacheCreationTokenCount`, `cacheReadTokenCount`,
+        `inputTokenCount`, ...), which for these fields are the response
+        spellings too, so unwrapping is all the read path needs. An API record
+        has no `submitted` marker and is returned untouched.
+        """
+        if not isinstance(data, dict):
+            return data
+        payload = data.get("payload")
+        if data.get("submitted") and isinstance(payload, dict):
+            return payload
+        return data
+
     def _format_full_transaction_details(self, data: Dict[str, Any]) -> str:
         """Format comprehensive transaction details for full detail mode.
 
@@ -3950,6 +4264,7 @@ class MeteringManagement(ToolBase):
 
         # Add each section using dedicated helper methods
         details += self._format_cost_breakdown(data)
+        details += self._format_cache_tokens(data)
         details += self._format_model_execution(data)
         details += self._format_performance_metrics(data)
         details += self._format_attribution_details(data)
@@ -4006,6 +4321,76 @@ class MeteringManagement(ToolBase):
                 f"  - **Client-Reported Cost**: ${client_reported_cost:.6f} "
                 "(reported by the client before the platform re-rated this "
                 "transaction; Total Cost above is the billed figure)\n"
+            )
+
+        return details
+
+    def _format_cache_tokens(self, data: Dict[str, Any]) -> str:
+        """Format the prompt-cache token section (BACK-3087).
+
+        Someone reconciling cached traffic against a vendor invoice needs the
+        cache figures the platform holds, and until this section existed the
+        detail rendering carried none of them - not the two long-standing
+        counts, and not the 5-minute / 1-hour cache-write split BACK-1939
+        added.
+
+        Three rules, each of them a way a caller could otherwise be misled:
+
+        * A field the response did not carry renders as
+          `_CACHE_TOKEN_UNAVAILABLE`, never as 0. Every one of these is
+          nullable, and a zero cache-write count is a real reading, so
+          defaulting the missing case to 0 would tell a reconciler this call
+          wrote nothing to the cache when the truth is that nobody reported.
+        * The tiers are never summed and no tier is ever derived from another.
+          `cacheCreationTokenCount` is the platform's own total; the 5m and 1h
+          counts are its split.
+        * When both tiers and the total are present but the tiers do not add
+          up to it, the discrepancy is stated rather than hidden. Silently
+          showing three numbers that do not reconcile is worse than showing
+          them with the gap named.
+
+        The section is gated on at least one of the five being present, like
+        every other section here: a transaction that touched no cache at all
+        would otherwise gain five `unavailable` lines that say nothing.
+        """
+        if not any(data.get(field) is not None for field in _CACHE_TOKEN_FIELDS):
+            return ""
+
+        details = "- **Cache Tokens**:\n"
+
+        missing_any = False
+        for field, label in _CACHE_TOKEN_LABELS:
+            value = data.get(field)
+            if value is None:
+                missing_any = True
+                details += f"  - **{label}**: {_CACHE_TOKEN_UNAVAILABLE}\n"
+            else:
+                details += f"  - **{label}**: {value}\n"
+
+        total = data.get("cacheCreationTokenCount")
+        five_minute = data.get("cacheCreation5mTokenCount")
+        one_hour = data.get("cacheCreation1hTokenCount")
+        if (
+            isinstance(total, (int, float))
+            and not isinstance(total, bool)
+            and isinstance(five_minute, (int, float))
+            and not isinstance(five_minute, bool)
+            and isinstance(one_hour, (int, float))
+            and not isinstance(one_hour, bool)
+            and five_minute + one_hour != total
+        ):
+            details += (
+                f"  - **Split Check**: the 5m and 1h counts add up to "
+                f"{five_minute + one_hour}, which differs from the platform's "
+                f"cache-creation total of {total}. Both are shown as reported; "
+                "the total is the figure the platform bills against.\n"
+            )
+
+        if missing_any:
+            details += (
+                f"  - **Note**: `{_CACHE_TOKEN_UNAVAILABLE}` means the platform "
+                "returned no value for that field on this transaction - not "
+                "that the value is zero.\n"
             )
 
         return details
@@ -4323,251 +4708,240 @@ class MeteringManagement(ToolBase):
         return [TextContent(type="text", text=capabilities_text + migration_guidance)]
 
     async def _handle_analyze_recent_transactions(
-        self, client: ReveniumClient, arguments: Dict[str, Any]
+        self,
+        client: ReveniumClient,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Analyze recent transactions from Revenium reporting API to identify field mapping issues."""
-        try:
-            # Get parameters with validation
-            limit = arguments.get("limit", 20)
+        """Analyze recent transactions from Revenium reporting API to identify field mapping issues.
 
-            # ✅ PAGINATION VALIDATION: Enforce API limits with helpful guidance
-            if limit > 100:
-                logger.warning(
-                    f"Requested limit {limit} exceeds maximum of 100, automatically capping to 100"
-                )
-                limit = 100
+        Upstream failures are deliberately NOT caught here. This handler used to
+        wrap its whole body in `except Exception` and return the failure as
+        ordinary TextContent, so an API, auth or policy failure reached the
+        caller as a successful tool result with prose about it - a failed
+        analysis indistinguishable from a real one. The sibling completions
+        reads (`_handle_lookup_recent_transactions`, and
+        `MeteringTransactionManager.lookup_transactions` behind
+        `lookup_transactions`) let the error propagate to `handle_action`, which
+        re-raises for `standardized_tool_execution` so the result carries
+        isError. This one does the same.
+        """
+        # Sample size. Only `page_size` is declared on the manage_metering
+        # closure, and FastMCP derives the accepted arguments from that
+        # signature, so it is the only spelling that can reach this handler.
+        # (`recent_page_size`, which _handle_lookup_recent_transactions prefers,
+        # is not declared either - see its schema description.)
+        sample_size = arguments.get("page_size", 20)
 
-            # include_test_transactions = arguments.get("include_test_transactions", True)  # Reserved for future use
-
-            # Delegate to the shared paginated fetch helper to avoid duplicating
-            # request construction, filter application, and response-structure parsing.
-            endpoint = get_endpoint_path("completions")  # Retained for report output below
-            filters = _extract_completions_filters(arguments)
-            scope_note = _coding_assistant_scope_note(
-                bool(filters.get("includeCodingAssistants"))
+        # PAGINATION VALIDATION: the endpoint truncates a page at 100.
+        if sample_size > 100:
+            logger.warning(
+                f"Requested page_size {sample_size} exceeds maximum of 100, "
+                "automatically capping to 100"
             )
-            transactions, _ = await self._fetch_recent_transactions_paginated(
-                client, page=0, page_size=limit, filters=filters or None
-            )
-            total_found = len(transactions)
+            sample_size = 100
 
-            if total_found == 0:
-                # The scope line matters most here: an empty result is the answer
-                # a user is most likely to misread as "my data never arrived".
+        # Delegate to the shared paginated fetch helper to avoid duplicating
+        # request construction, filter application, and response-structure parsing.
+        endpoint = get_endpoint_path("completions")  # Retained for report output below
+        filters = _extract_completions_filters(arguments)
+        scope_note = _coding_assistant_scope_note(
+            bool(filters.get("includeCodingAssistants"))
+        )
+        transactions, _ = await self._fetch_recent_transactions_paginated(
+            client, page=0, page_size=sample_size, filters=filters or None
+        )
+        sampled = len(transactions)
+
+        # Same tenant provider policy the other two completions reads apply.
+        # This action reports raw field values, so skipping the filter here
+        # would make it the one read path that surfaces coding-assistant
+        # records the tenant is not subscribed to.
+        allowed = await get_policy_cache().get_allowed_metric_providers(
+            client, getattr(ctx, "tenant_id", None) if ctx else None
+        )
+        transactions = filter_transactions_by_policy(transactions, allowed)
+
+        total_found = len(transactions)
+        excluded_by_policy = sampled - total_found
+
+        if total_found == 0:
+            # Two very different answers share this branch, and conflating
+            # them is how the tool ends up telling someone their data never
+            # arrived. Only one page is fetched, so a page made entirely of
+            # records outside the tenant's provider scope leaves nothing to
+            # analyse while eligible records may sit on later pages.
+            if excluded_by_policy:
                 return [
                     TextContent(
                         type="text",
                         text=(
-                            "📊 **No Recent Transactions**\n\n"
+                            "**No Transactions In Scope To Analyze**\n\n"
                             + scope_note
-                            + "\nNo transactions found in the reporting API. "
-                            "Submit some test transactions first using `submit_ai_transaction()`."
+                            + f"\nSampled {sampled} transaction(s) from the reporting API; "
+                            f"all {excluded_by_policy} were excluded by the tenant provider "
+                            "policy (coding-assistant providers the tenant is not subscribed "
+                            "to), leaving none to analyze.\n\n"
+                            "This is NOT an empty reporting API: only the first page is "
+                            "sampled, so eligible transactions may sit on later pages. Raise "
+                            "`page_size` (up to 100) or narrow with a filter such as "
+                            "`provider` to reach them."
                         ),
                     )
                 ]
-
-            # Analyze field mapping for each transaction
-            field_analysis: Dict[str, Any] = {
-                "total_transactions": total_found,
-                "field_presence": {},
-                "field_samples": {},
-                "missing_fields": [],
-                "unexpected_fields": [],
-                "subscriber_analysis": {
-                    "total_with_subscriber": 0,
-                    "email_present": 0,
-                    "id_present": 0,
-                    "credential_present": 0,
-                    "credential_name_present": 0,
-                    "credential_value_present": 0,
-                },
-            }
-
-            # Expected fields based on our implementation
-            expected_fields = [
-                "transactionId",
-                "model",
-                "provider",
-                "inputTokenCount",
-                "outputTokenCount",
-                "durationMs",
-                "organizationName",
-                "taskType",
-                "agent",
-                "traceId",
-                "taskId",
-                "productName",
-                "subscriptionId",
-                "responseQualityScore",
-                "ticketId",
-                "skillName",
-                "skillSource",
-                "skillKind",
-                "skillPluginName",
-                "skillMarketplaceName",
-                "skillInvocationTrigger",
-                "effort",
-                "modelHost",
-                "subscriberEmailSource",
-                "isStreamed",
-                "stopReason",
-                "requestTime",
-                "responseTime",
-                "completionStartTime",
-                "timeToFirstToken",
-                "subscriber",
-            ]
-
-            # Analyze each transaction
-            for i, tx in enumerate(transactions):
-                # Track field presence
-                for field in expected_fields:
-                    if field not in field_analysis["field_presence"]:
-                        field_analysis["field_presence"][field] = 0
-
-                    if field in tx and tx[field] is not None:
-                        field_analysis["field_presence"][field] += 1
-
-                        # Store sample values (first 3 transactions)
-                        if i < 3:
-                            if field not in field_analysis["field_samples"]:
-                                field_analysis["field_samples"][field] = []
-                            field_analysis["field_samples"][field].append(str(tx[field])[:100])
-
-                # Analyze subscriber object specifically
-                if "subscriber" in tx and tx["subscriber"] is not None:
-                    field_analysis["subscriber_analysis"]["total_with_subscriber"] += 1
-                    subscriber = tx["subscriber"]
-
-                    if isinstance(subscriber, dict):
-                        if "email" in subscriber and subscriber["email"]:
-                            field_analysis["subscriber_analysis"]["email_present"] += 1
-                        if "id" in subscriber and subscriber["id"]:
-                            field_analysis["subscriber_analysis"]["id_present"] += 1
-                        if "credential" in subscriber and subscriber["credential"]:
-                            field_analysis["subscriber_analysis"]["credential_present"] += 1
-                            credential = subscriber["credential"]
-                            if isinstance(credential, dict):
-                                if "name" in credential and credential["name"]:
-                                    field_analysis["subscriber_analysis"][
-                                        "credential_name_present"
-                                    ] += 1
-                                if "value" in credential and credential["value"]:
-                                    field_analysis["subscriber_analysis"][
-                                        "credential_value_present"
-                                    ] += 1
-
-                # Check for unexpected fields
-                for field in tx.keys():
-                    if (
-                        field not in expected_fields
-                        and field not in field_analysis["unexpected_fields"]
-                    ):
-                        field_analysis["unexpected_fields"].append(field)
-
-            # Identify missing fields
-            for field in expected_fields:
-                if field_analysis["field_presence"].get(field, 0) == 0:
-                    field_analysis["missing_fields"].append(field)
-
-            # Build comprehensive analysis report
-            report = "# **Recent Transactions Field Analysis**\n\n"
-            report += f"**Analysis Date:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-            report += f"**Transactions Analyzed:** {total_found}\n"
-            report += f"**API Endpoint:** `{endpoint}`\n"
-            report += scope_note + "\n"
-
-            # Field presence summary
-            report += "## **Field Presence Summary**\n\n"
-            report += "| **Field** | **Present** | **Missing** | **Percentage** |\n"
-            report += "|-----------|-------------|-------------|----------------|\n"
-
-            for field in expected_fields:
-                present = field_analysis["field_presence"].get(field, 0)
-                missing = total_found - present
-                percentage = (present / total_found * 100) if total_found > 0 else 0
-                status_icon = "✅" if percentage > 80 else "⚠️" if percentage > 0 else "❌"
-                report += (
-                    f"| {status_icon} `{field}` | {present} | {missing} | {percentage:.1f}% |\n"
-                )
-
-            # Subscriber analysis
-            sub_analysis = field_analysis["subscriber_analysis"]
-            report += "\n## **👤 Subscriber Object Analysis**\n\n"
-            report += f"- **Total transactions with subscriber object:** {sub_analysis['total_with_subscriber']}/{total_found}\n"
-            report += f"- **Subscriber.email present:** {sub_analysis['email_present']}/{sub_analysis['total_with_subscriber']} ({(sub_analysis['email_present']/max(sub_analysis['total_with_subscriber'], 1)*100):.1f}%)\n"
-            report += f"- **Subscriber.id present:** {sub_analysis['id_present']}/{sub_analysis['total_with_subscriber']} ({(sub_analysis['id_present']/max(sub_analysis['total_with_subscriber'], 1)*100):.1f}%)\n"
-            report += f"- **Subscriber.credential present:** {sub_analysis['credential_present']}/{sub_analysis['total_with_subscriber']} ({(sub_analysis['credential_present']/max(sub_analysis['total_with_subscriber'], 1)*100):.1f}%)\n"
-            report += f"- **Credential.name present:** {sub_analysis['credential_name_present']}/{sub_analysis['credential_present']} ({(sub_analysis['credential_name_present']/max(sub_analysis['credential_present'], 1)*100):.1f}%)\n"
-            report += f"- **Credential.value present:** {sub_analysis['credential_value_present']}/{sub_analysis['credential_present']} ({(sub_analysis['credential_value_present']/max(sub_analysis['credential_present'], 1)*100):.1f}%)\n"
-
-            # Missing fields
-            if field_analysis["missing_fields"]:
-                report += "\n## **❌ Completely Missing Fields**\n\n"
-                for field in field_analysis["missing_fields"]:
-                    report += f"- `{field}`: Not found in any transaction\n"
-
-            # Unexpected fields
-            if field_analysis["unexpected_fields"]:
-                report += "\n## **🔍 Unexpected Fields Found**\n\n"
-                for field in field_analysis["unexpected_fields"]:
-                    report += f"- `{field}`: Found in API response but not expected\n"
-
-            # Sample data
-            if field_analysis["field_samples"]:
-                report += "\n## **📝 Sample Field Values**\n\n"
-                for field, samples in field_analysis["field_samples"].items():
-                    if samples:
-                        report += f"**{field}:**\n"
-                        for i, sample in enumerate(samples[:3]):
-                            report += f"  {i+1}. `{sample}`\n"
-                        report += "\n"
-
-            # Recommendations
-            report += "\n## **Recommendations**\n\n"
-
-            if sub_analysis["email_present"] == 0 and sub_analysis["total_with_subscriber"] > 0:
-                report += (
-                    "⚠️ CRITICAL: Subscriber email field is not being stored in any transactions!\n"
-                )
-                report += "- Check backend processing of subscriber.email field\n"
-                report += "- Verify API endpoint expects nested subscriber structure\n"
-                report += "- Review database schema for subscriber email storage\n\n"
-
-            if (
-                sub_analysis["credential_present"] == 0
-                and sub_analysis["total_with_subscriber"] > 0
-            ):
-                report += "⚠️ **WARNING**: Subscriber credential object is not being stored\n"
-                report += "- Verify backend handles nested credential structure\n"
-                report += "- Check if credential data is being filtered for security\n\n"
-
-            missing_critical = [
-                f
-                for f in ["model", "provider", "inputTokenCount", "outputTokenCount"]
-                if f in field_analysis["missing_fields"]
-            ]
-            if missing_critical:
-                report += f"⚠️ CRITICAL: Core fields missing: {', '.join(missing_critical)}\n"
-                report += "- These are required fields for billing calculations\n"
-                report += "- Check API endpoint and field mapping\n\n"
-
-            report += "**Next Steps:**\n"
-            report += "1. Focus on subscriber.email field mapping issue\n"
-            report += "2. Verify backend API endpoint structure\n"
-            report += "3. Check database schema for nested object support\n"
-            report += "4. Review API logs for payload structure\n"
-
-            return [TextContent(type="text", text=report)]
-
-        except Exception as e:
-            logger.error(f"Error analyzing recent transactions: {e}")
             return [
                 TextContent(
                     type="text",
-                    text=f"❌ **Analysis Failed**\n\nError querying recent transactions: {str(e)}\n\nThis could indicate:\n• API connectivity issues\n• Permission problems\n• Different endpoint structure\n• Authentication errors",
+                    text=(
+                        "**No Recent Transactions**\n\n"
+                        + scope_note
+                        + "\nThe reporting API returned no transactions for this page and "
+                        "filter set. Submit some test transactions first using "
+                        "`submit_ai_transaction()`."
+                    ),
                 )
             ]
+
+        # Presence, sample values and untracked extras, all measured against
+        # the RESPONSE spellings in _COMPLETIONS_REPORTED_FIELDS.
+        present_counts: Dict[str, int] = dict.fromkeys(
+            _COMPLETIONS_REPORTED_FIELDS, 0
+        )
+        field_samples: Dict[str, List[str]] = {}
+        untracked_fields: List[str] = []
+
+        for index, tx in enumerate(transactions):
+            for field in _COMPLETIONS_REPORTED_FIELDS:
+                if tx.get(field) is None:
+                    continue
+                present_counts[field] += 1
+                if index < 3:
+                    field_samples.setdefault(field, []).append(str(tx[field])[:100])
+
+            for field in tx.keys():
+                if (
+                    field not in present_counts
+                    and field not in _COMPLETIONS_REPORT_IGNORED_FIELDS
+                    and field not in untracked_fields
+                ):
+                    untracked_fields.append(field)
+
+        absent_fields = [f for f in _COMPLETIONS_REPORTED_FIELDS if not present_counts[f]]
+
+        report = "# **Recent Transactions Field Analysis**\n\n"
+        report += f"**Analysis Date:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+        report += f"**Transactions Sampled:** {sampled}\n"
+        # Stated whenever the policy removed anything, so every percentage
+        # below has a visible denominator: a caller comparing this count
+        # with lookup_recent_transactions must be able to see the gap
+        # rather than infer missing data.
+        if excluded_by_policy:
+            report += (
+                f"**Excluded By Policy:** {excluded_by_policy} (coding-assistant "
+                "providers not in the tenant's scope)\n"
+            )
+        report += f"**Transactions Analyzed:** {total_found}\n"
+        report += f"**API Endpoint:** `{endpoint}`\n"
+        report += scope_note + "\n"
+        report += (
+            "\nField names below are the ones this endpoint returns, which differ from the "
+            "submission field names for some values - see **Submission Field Names** at the "
+            "end of the report.\n"
+        )
+
+        # Field presence summary
+        report += "\n## **Field Presence Summary**\n\n"
+        report += "| **Field** | **Present** | **Absent** | **Percentage** |\n"
+        report += "|-----------|-------------|------------|----------------|\n"
+
+        for field in _COMPLETIONS_REPORTED_FIELDS:
+            present = present_counts[field]
+            percentage = present / total_found * 100
+            status_icon = "✅" if percentage > 80 else "⚠️" if percentage > 0 else "❌"
+            report += (
+                f"| {status_icon} `{field}` | {present} | {total_found - present} "
+                f"| {percentage:.1f}% |\n"
+            )
+
+        # Subscriber attribution. The submission API takes a nested
+        # `subscriber` object; this endpoint returns the same values flat,
+        # so the counts are read from the flat names.
+        report += "\n## **Subscriber Attribution**\n\n"
+        for label, field in (
+            ("subscriberEmail", "subscriberEmail"),
+            ("subscriberId", "subscriberId"),
+            ("subscriberCredential", "subscriberCredential"),
+            ("subscriberEmailSource", "subscriberEmailSource"),
+        ):
+            present = present_counts[field]
+            report += (
+                f"- **{label}:** {present}/{total_found} "
+                f"({present / total_found * 100:.1f}%)\n"
+            )
+        report += (
+            "\nSubmitted as `subscriber={\"email\": ..., \"id\": ..., "
+            "\"credential\": {...}}`; read back flat under the names above.\n"
+        )
+
+        if absent_fields:
+            report += "\n## **Absent From Every Transaction In The Sample**\n\n"
+            for field in absent_fields:
+                report += f"- `{field}`\n"
+            report += (
+                "\nThese fields are declared on this endpoint's response, so an absent "
+                "field means the sampled transactions did not carry a value - not that "
+                "the value was lost. Widen the sample or filter to the transactions you "
+                "submitted before treating it as a gap.\n"
+            )
+
+        report += "\n## **Not Readable Through This Endpoint**\n\n"
+        for field in _COMPLETIONS_UNREADABLE_SUBMISSION_FIELDS:
+            report += f"- `{field}`\n"
+        report += (
+            "\nThe submission API accepts these and this endpoint's response does not "
+            "declare them, so a transaction carrying them can land correctly and still "
+            "never show them here. Their absence is not evidence of anything.\n"
+        )
+
+        if untracked_fields:
+            report += "\n## **Returned But Not Tracked By This Report**\n\n"
+            for field in untracked_fields:
+                report += f"- `{field}`\n"
+            report += (
+                "\nThe API returned these; this report does not measure them. Use "
+                "`lookup_recent_transactions(return_transaction_data='full')` to read "
+                "their values.\n"
+            )
+
+        if field_samples:
+            report += "\n## **Sample Field Values**\n\n"
+            for field, samples in field_samples.items():
+                report += f"**{field}:**\n"
+                for position, sample in enumerate(samples[:3], start=1):
+                    report += f"  {position}. `{sample}`\n"
+                report += "\n"
+
+        missing_core = [
+            field
+            for field in ("model", "provider", "inputTokenCount", "outputTokenCount")
+            if not present_counts[field]
+        ]
+        if missing_core:
+            report += "\n## **Core Billing Fields Absent**\n\n"
+            report += (
+                f"`{', '.join(missing_core)}` carried no value in any of the "
+                f"{total_found} sampled transactions. These are required for cost "
+                "calculation, so records without them are not billable. Check the "
+                "submitting integration rather than this endpoint.\n"
+            )
+
+        report += "\n## **Submission Field Names**\n\n"
+        report += "Where a submitted field is returned under a different name:\n\n"
+        for submitted, returned in _COMPLETIONS_RESPONSE_FIELD_ALIASES.items():
+            report += f"- `{submitted}` (submitted) -> `{returned}` (returned)\n"
+
+        return [TextContent(type="text", text=report)]
 
     async def _build_enhanced_capabilities_text(
         self, ucm_capabilities: Optional[Dict[str, Any]]
@@ -4611,6 +4985,7 @@ validate(model="<model>", provider="<provider>", input_tokens=3000, output_token
 lookup_transactions(transaction_ids=["tx_abc123"])             # Find specific transactions by ID
 lookup_recent_transactions()                                   # Browse recent transactions (no IDs needed)
 lookup_recent_transactions(page=1, page_size=10)              # Get specific page of recent transactions
+analyze_recent_transactions()                                  # Field-by-field report on the latest transactions
 get_transaction_status(transaction_id="tx_abc123")             # Check local transaction status
 ```
 ## **Detailed Capabilities**
@@ -4757,7 +5132,7 @@ get_field_documentation()
 - `subscriber_email_source`: String, 1-20 characters — how the email was resolved (e.g. `jwt`), never an email address
 - `response_quality_score`: Float between 0.0 and 1.0 (inclusive)
 - `is_streamed`: Boolean (true/false, accepts string conversion)
-- `time_to_first_token`: Positive integer in milliseconds (≤ 60,000ms)
+- `time_to_first_token`: Non-negative integer in milliseconds (≥ 0, ≤ 60,000ms)
 
 #### **Timestamp Fields**
 - `request_time`, `response_time`, `completion_start_time`:
@@ -4829,6 +5204,7 @@ lookup_transactions(transaction_ids=["tx_abc123"])             # Find specific t
 lookup_transactions(transaction_ids=["tx_abc123", "tx_def456"]) # Batch lookup by IDs
 lookup_recent_transactions()                                   # Browse recent transactions (no IDs needed)
 lookup_recent_transactions(page=1, page_size=10)              # Get specific page of recent transactions
+analyze_recent_transactions()                                  # Field-by-field report on the latest transactions
 get_transaction_status(transaction_id="tx_abc123")             # Check local transaction status
 get_agent_summary()                                            # Get tool overview
 ```
@@ -4845,6 +5221,16 @@ increasingly verbose responses for the respective choices.
 }
 ```
 *This example returns only verification status (✅ Found/❌ Not Found)*
+
+### **Cache Tokens (full detail only)**
+`return_transaction_data="full"` adds a **Cache Tokens** section carrying
+`cacheReadTokenCount`, `cacheCreationTokenCount` and, where the platform resolved the
+prompt-cache write split, `cacheCreation5mTokenCount`, `cacheCreation1hTokenCount` and
+`cacheTtlSplitSource` (which says whether the split was reported by the client, derived
+from its cost, or left unresolved). The 5m and 1h counts are a split OF the cache-creation
+total, not additions to it, and are never summed here. A field the platform did not return
+reads `unavailable` rather than 0, so a call nobody reported a split for is not mistaken
+for one that wrote nothing to the cache.
 
 ## **Pagination**
 
@@ -4875,7 +5261,7 @@ lookup_transactions(transaction_ids=["tx_abc123"], max_retries=5)
 - `return_transaction_data` (string|boolean) - Transaction data detail level:
   - "no": Show only verification status (✅ Found/❌ Not Found) - default
   - "summary": Show core fields (Model, Provider, Input/Output Tokens)
-  - "full": Show comprehensive details including metadata, costs, attribution
+  - "full": Show comprehensive details including metadata, costs, attribution and cache tokens
   - Legacy boolean support: true="summary", false="no"
 - `wait_seconds` (integer) - Wait time for transaction verification (0-300):
   - Default: 30 seconds
@@ -4937,6 +5323,28 @@ Browse recent transactions without needing specific transaction IDs. Perfect for
 - `page_size` (optional): Transactions per page (1-50, default: 20)
 - `return_transaction_data` (optional): Detail level - "no", "summary", "full" (default: "summary")
 - `include_coding_assistants` (optional): Include coding-assistant records such as Claude Code and Gemini CLI (default: true)
+
+## **Field Analysis of Recent Transactions**
+`analyze_recent_transactions` reports on the *shape* of the records the reporting API is
+returning, not on spend. It reads one page of recent transactions and, for every field this
+MCP submits, states how many of them carry a value, with sample values, a breakdown of the
+nested `subscriber` and `subscriber.credential` objects, the fields absent from every record
+and any fields the API returned that this MCP does not expect. Use it to answer "is my
+attribution actually landing?" - it is a data-quality check, not an analytics aggregation
+(use `business_analytics_management` for cost and usage figures).
+
+```json
+{
+  "action": "analyze_recent_transactions",
+  "page_size": 50
+}
+```
+*Analyzes the 50 most recent transactions*
+
+### **Parameters for Field Analysis**
+- `page_size` (optional): Number of transactions to sample (1-100, default: 20)
+- `include_coding_assistants` (optional): Include coding-assistant records such as Claude Code and Gemini CLI (default: true)
+- Server-side filters narrow the sample before it is analyzed. The ones this tool accepts are `query`, `model`, `provider`, `organization_name`, `agent`, `task_type`, `stop_reason`, `error_reason`, `trace_id`, `transaction_id` and `subscription_id` - a name outside that list (a date range, for one) is rejected before the action runs, so it is not offered here
 
 ### **Coding-Assistant Scope**
 `lookup_transactions`, `lookup_recent_transactions` and `analyze_recent_transactions` INCLUDE
@@ -5134,9 +5542,9 @@ main();
 ### **Required Fields**
 - `model`: String, AI model identifier (max 200 chars)
 - `provider`: String, AI provider name (max 200 chars)
-- `input_tokens`: Integer (> 0, ≤ 10,000,000)
-- `output_tokens`: Integer (> 0, ≤ 10,000,000)
-- `duration_ms`: Integer (> 0, ≤ 10,000,000)
+- `input_tokens`: Integer (> 0, ≤ 10,000,000) - zero is rejected, no real completion consumes no input
+- `output_tokens`: Integer (≥ 0, ≤ 10,000,000) - zero is accepted (embeddings and errored calls legitimately return no output)
+- `duration_ms`: Integer (≥ 0, ≤ 10,000,000) - zero is accepted (republished and synthetic traces carry no measured duration)
 
 ### **Optional Fields**
 - **String fields**: `organization_name`, `task_type`, `agent`, `trace_id`, `product_name`, `subscription_id`, `stop_reason`
@@ -5179,11 +5587,16 @@ get_supported_providers()              # List providers
 list_ai_models()                       # List all models
 ```
 
+Both listings report **Price pinned** per model: `yes` (with the reason) when a
+platform-curated override pins the prices so they no longer track the upstream
+price list, `no` when they track upstream, `unavailable` when the server does not
+report the flag. The pin is read-only here - it is set by a platform operator.
+
 ## **Common Validation Errors**
 
 ### **Field Errors**
-- **Token Counts**: Must be positive integers > 0
-- **Duration**: Must be positive integer milliseconds > 0
+- **Token Counts**: `input_tokens` > 0; `output_tokens` ≥ 0
+- **Duration**: Milliseconds ≥ 0
 - **String Format**: Remove `<>\"'&` characters
 - **Timestamp**: Use ISO UTC format with 'Z'
 - **Type Mismatch**: Ensure correct data types
@@ -5213,9 +5626,9 @@ list_ai_models()                       # List all models
 ## **Required Fields**
 - `model` (string) - AI model identifier (max 200 chars)
 - `provider` (string) - AI provider name (max 200 chars)
-- `input_tokens` (integer) - Input tokens (> 0, ≤ 10,000,000)
-- `output_tokens` (integer) - Output tokens (> 0, ≤ 10,000,000)
-- `duration_ms` (integer) - Duration in milliseconds (> 0, ≤ 10,000,000)
+- `input_tokens` (integer) - Input tokens (> 0, ≤ 10,000,000); zero is rejected
+- `output_tokens` (integer) - Output tokens (≥ 0, ≤ 10,000,000); zero is accepted for embeddings and errored calls
+- `duration_ms` (integer) - Duration in milliseconds (≥ 0, ≤ 10,000,000); zero is accepted
 
 ## **Optional Fields**
 - `organization_name`, `task_type`, `agent`, `trace_id`, `product_name`, `subscription_id`, `stop_reason`, `error_reason` (string, 1-500 chars, no `< > " ' &`)
@@ -5264,7 +5677,7 @@ list_ai_models()                       # List all models
 
 ## **Validation**
 - String fields: 1-500 chars, no `<>\"'&`
-- Tokens/duration: Positive integers
+- Tokens/duration: Integers; `input_tokens` > 0, `output_tokens` and `duration_ms` ≥ 0
 - Quality score: 0.0-1.0 float
 - Timestamps: ISO UTC with 'Z'
 
@@ -5298,16 +5711,16 @@ Use `validate()` before submission."""
 
 ## **Business Rules**
 - Follow AI Model Validation Process above
-- All token counts must be positive integers
-- Duration must be in milliseconds (positive integer)
+- `input_tokens` must be a positive integer (> 0)
+- `output_tokens` and `duration_ms` must be non-negative integers (≥ 0): embeddings return no output tokens and republished traces carry no measured duration, and both are metered as-is
 - Attribution fields enable customer billing and cost allocation
 - Transaction verification ensures data integrity
 
 ## **Field Validation**
 - **Required**: `model`, `provider`, `input_tokens`, `output_tokens`, `duration_ms`
 - **String fields**: 1-500 chars, no `<>\"'&`
-- **Token counts**: Positive integers (> 0, ≤ 10,000,000)
-- **Duration**: Positive integer milliseconds (> 0, ≤ 10,000,000)
+- **Token counts**: `input_tokens` (> 0, ≤ 10,000,000), `output_tokens` (≥ 0, ≤ 10,000,000)
+- **Duration**: Milliseconds (≥ 0, ≤ 10,000,000)
 - **Quality score**: Float 0.0-1.0
 - **Timestamps**: ISO UTC with 'Z' (e.g., "2025-06-16T15:30:45.123Z")
 - **Booleans**: true/false (string conversion supported)
@@ -5340,10 +5753,39 @@ Use `validate()` before submission."""
             # Get AI models from API
             response = await client.get_ai_models(page=page, size=size)
 
-            if "_embedded" in response and "aIModelResourceList" in response["_embedded"]:
-                models = response["_embedded"]["aIModelResourceList"]
+            # BACK-3084: read the HAL list through the client's key-agnostic
+            # helper instead of indexing `aIModelResourceList` literally, the
+            # way the rest of the codebase reads embedded collections — but
+            # classify the envelope FIRST. The helper answers `[]` for every
+            # shape it does not recognise, so all three cases have to be
+            # separated before it runs: no `_embedded` at all is the historical
+            # "no models found" answer; an `_embedded` block carrying no
+            # collection is a malformed upstream response and must never render
+            # as a catalog; only a real list is rendered.
+            envelope = _classify_ai_model_envelope(response)
+            if envelope == _AI_MODEL_ENVELOPE_MALFORMED:
+                raise _malformed_ai_model_envelope_error(response, "list_ai_models")
+
+            if envelope == _AI_MODEL_ENVELOPE_COLLECTION:
+                models = client._extract_embedded_data(response)
                 page_info = response.get("page", {})
                 total_models = page_info.get("totalElements", len(models))
+
+                # A recognised collection can still be empty — a page past the
+                # end of the results, most often. That is not a catalog, so it
+                # must not be rendered as one with `totalElements` printed
+                # beside zero rows.
+                if not models:
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                "**No AI models found on this page**\n\n"
+                                "The API returned a model collection with no "
+                                "entries." + _empty_ai_model_page_note(page_info)
+                            ),
+                        )
+                    ]
 
                 # Group models by provider
                 providers: Dict[str, List[Dict[str, Any]]] = {}
@@ -5364,11 +5806,26 @@ Use `validate()` before submission."""
                         name = model.get("name", "Unknown")
                         input_cost = model.get("inputCostPerToken", "N/A")
                         output_cost = model.get("outputCostPerToken", "N/A")
-                        text += f"- **{name}** (Input: ${input_cost}/token, Output: ${output_cost}/token)\n"
+                        # BACK-3084: a pinned price does not track the upstream
+                        # rate card, so a cost figure built on it is only
+                        # defensible if the pin is visible. Read-only field —
+                        # see _format_price_pin.
+                        text += (
+                            f"- **{name}** (Input: ${input_cost}/token, "
+                            f"Output: ${output_cost}/token, "
+                            f"Price pinned: {_format_price_pin(model)})\n"
+                        )
                     if len(provider_models) > 5:
                         text += f"- ... and {len(provider_models) - 5} more models\n"
                     text += "\n"
 
+                text += (
+                    "**Price pinned**: `yes` means the price is pinned by a "
+                    "platform-curated override and no longer tracks the upstream "
+                    "price list; `no` means it tracks upstream; "
+                    "`unavailable` means this server does not report the flag. "
+                    "Pins are set by a platform operator and are read-only here.\n"
+                )
                 text += '**💡 Tip**: Use `search_ai_models(query="<provider>")` to find specific models\n'
                 text += '**💡 Tip**: Use `get_ai_model(model_id="<id>")` for detailed model information'
 
@@ -5429,8 +5886,16 @@ Use `validate()` before submission."""
 
             response = await client.search_ai_models(query=query, page=page, size=size)
 
-            if "_embedded" in response and "aIModelResourceList" in response["_embedded"]:
-                models = response["_embedded"]["aIModelResourceList"]
+            # BACK-3084: same three-way envelope classification as
+            # _handle_list_ai_models, for the same reason — a reshaped
+            # `_embedded` block must not be reported as "no matches", which is
+            # an answer about the catalog rather than about the response.
+            envelope = _classify_ai_model_envelope(response)
+            if envelope == _AI_MODEL_ENVELOPE_MALFORMED:
+                raise _malformed_ai_model_envelope_error(response, "search_ai_models")
+
+            if envelope == _AI_MODEL_ENVELOPE_COLLECTION:
+                models = client._extract_embedded_data(response)
                 page_info = response.get("page", {})
                 total_elements = page_info.get("totalElements", len(models))
                 total_pages = page_info.get("totalPages", 1)
@@ -5443,7 +5908,8 @@ Use `validate()` before submission."""
                             "**Suggestions**:\n"
                             "- Try a broader search term\n"
                             '- Search by provider name (e.g., "openai", "anthropic")\n'
-                            "- Use `list_ai_models()` to see all available models",
+                            "- Use `list_ai_models()` to see all available models"
+                            + _empty_ai_model_page_note(page_info),
                         )
                     ]
 
@@ -5462,6 +5928,8 @@ Use `validate()` before submission."""
                     text += f"- **ID**: {model_id}\n"
                     text += f"- **Input Cost**: ${input_cost}/token\n"
                     text += f"- **Output Cost**: ${output_cost}/token\n"
+                    # BACK-3084: read-only price-pin status (see _format_price_pin).
+                    text += f"- **Price Pinned**: {_format_price_pin(model)}\n"
 
                     features = []
                     if model.get("supportFunctionCalling"):
@@ -5475,6 +5943,12 @@ Use `validate()` before submission."""
                         text += f"- **Features**: {', '.join(features)}\n"
                     text += "\n"
 
+                text += (
+                    "**Price pinned**: `yes` means a platform-curated override pins "
+                    "this model's prices, so they do not track the upstream price "
+                    "list; `no` means they track upstream; `unavailable` means this "
+                    "server does not report the flag. The pin is read-only here.\n\n"
+                )
                 text += (
                     '**Tip**: Use `get_ai_model(model_id="<id>")` for complete model details'
                 )
@@ -5514,6 +5988,16 @@ Use `validate()` before submission."""
             if "_embedded" in response and "aIModelResourceList" in response["_embedded"]:
                 models = response["_embedded"]["aIModelResourceList"]
 
+                # The upstream caps the page below the requested size, so
+                # len(models) is the size of one page, never the catalog total.
+                # The true total rides on the paging block of this same
+                # response - the sibling _handle_list_ai_models reads it from
+                # there too. Reporting the page size as the total told callers
+                # that most of the supported catalog was unsupported.
+                page_info = response.get("page", {}) if isinstance(response, dict) else {}
+                total_models = page_info.get("totalElements", len(models))
+                is_sample = isinstance(total_models, int) and total_models > len(models)
+
                 # Extract unique providers with model counts
                 provider_stats: Dict[str, Dict[str, Any]] = {}
                 for model in models:
@@ -5533,12 +6017,26 @@ Use `validate()` before submission."""
 
                 # Build response
                 text = "# 🏢 **Supported AI Providers**\n\n"
-                text += f"**Total Providers**: {len(provider_stats)}\n"
-                text += f"**Total Models**: {len(models)}\n\n"
+                text += f"**Total Models**: {total_models}\n"
+                if is_sample:
+                    text += (
+                        f"**Providers In This Sample**: {len(provider_stats)} "
+                        f"(from the first {len(models)} of {total_models} models)\n\n"
+                    )
+                    text += (
+                        "**Note**: the breakdown below is a sample of the catalog, not the "
+                        "complete provider list. A model missing from it is not unsupported - "
+                        'use `search_ai_models(query="<model>")` or '
+                        "`validate_model_provider(model=..., provider=...)` to check a specific "
+                        "model before concluding it is unavailable.\n\n"
+                    )
+                else:
+                    text += f"**Total Providers**: {len(provider_stats)}\n\n"
 
+                count_label = "Models In This Sample" if is_sample else "Models Available"
                 for provider, stats in sorted(provider_stats.items()):
                     text += f"## **{provider}**\n"
-                    text += f"- **Models Available**: {stats['count']}\n"
+                    text += f"- **{count_label}**: {stats['count']}\n"
 
                     # Show sample models
                     sample_models = stats["models"][:3]
@@ -5569,6 +6067,123 @@ Use `validate()` before submission."""
             from ..common.error_handling import format_error_response
 
             return format_error_response(e, "getting supported providers")
+
+    async def _catalog_advisory(
+        self, client: ReveniumClient, arguments: Dict[str, Any]
+    ) -> str:
+        """Check a submission payload's model/provider pair against the catalog.
+
+        The single catalog check behind every pre-flight path - the `validate`
+        action and `submit_ai_transaction` with `dry_run` - so the two cannot
+        return different verdicts for the same payload. It answers the same
+        question `validate_model_provider` answers: is there a catalog entry
+        with this model name, and does one of them carry this provider.
+
+        Advisory only: it never flips the verdict - the submit path deliberately
+        accepts models the catalog has not listed yet - and a catalog that
+        cannot be read produces no warning, so an outage is never reported as a
+        bad model name. Returns an empty string when there is nothing to say.
+        """
+        model = arguments.get("model")
+        if not isinstance(model, str) or not model.strip():
+            return ""
+
+        try:
+            response = await client.search_ai_models(
+                query=model, page=0, size=100, exactMatch=True
+            )
+        except Exception as exc:  # pragma: no cover - advisory lookup only
+            logger.debug(f"Catalog check for '{model}' failed: {exc}")
+            return ""
+
+        # Typed as a dict upstream, but a transport hiccup can still hand back
+        # something else; widen to Any so the shape is actually checked here.
+        envelope: Any = response
+        if not isinstance(envelope, dict):
+            # Not a search envelope: the catalog could not be read. Stay quiet
+            # rather than blame the model name for a service problem.
+            return ""
+
+        embedded = envelope.get("_embedded")
+        found = embedded.get("aIModelResourceList") or [] if isinstance(embedded, dict) else []
+        # `or ""` rather than a get() default: the catalog can carry a row with
+        # an explicit null name, and the default only covers a missing key. An
+        # AttributeError here would turn an advisory check into a hard failure
+        # of the whole validate call.
+        name_matches = [
+            entry
+            for entry in found
+            if isinstance(entry, dict) and (entry.get("name") or "").lower() == model.lower()
+        ]
+
+        provider = arguments.get("provider")
+        provider_text = provider if isinstance(provider, str) and provider.strip() else "<provider>"
+        check_call = (
+            f'`validate_model_provider(model="{model}", provider="{provider_text}")`'
+        )
+
+        if not name_matches:
+            return (
+                f"\n\n**Warning**: `{model}` is not in the AI model catalog for this "
+                "tenant, so the model/provider pair is unverified and its cost cannot "
+                f"be calculated accurately. Run {check_call} and correct the name "
+                "before metering it."
+            )
+
+        if not isinstance(provider, str) or not provider.strip():
+            # No provider to compare - the name is in the catalog, nothing to say.
+            return ""
+
+        catalog_providers = []
+        for entry in name_matches:
+            entry_provider = entry.get("provider") or ""
+            if isinstance(entry_provider, str) and entry_provider.strip():
+                if entry_provider not in catalog_providers:
+                    catalog_providers.append(entry_provider)
+
+        if any(p.lower() == provider.lower() for p in catalog_providers):
+            return ""
+
+        # The name is priced, but not for this provider. validate_model_provider
+        # rejects exactly this pair, so staying silent here would put the two
+        # validators back in disagreement.
+        listed = ", ".join(f"`{p}`" for p in sorted(catalog_providers)) or "no provider"
+        return (
+            f"\n\n**Warning**: the AI model catalog carries `{model}`, but not for "
+            f"provider `{provider}` - it lists {listed}. The pair is unpriced, so its "
+            f"cost cannot be calculated accurately. Run {check_call} and correct the "
+            "provider before metering it."
+        )
+
+    async def _closest_model_matches(
+        self, client: ReveniumClient, model: str, limit: int = 5
+    ) -> List[Dict[str, Any]]:
+        """Best-effort did-you-mean candidates for a model name nothing matched.
+
+        One extra catalog search on the leading segment of the name (the model
+        family, e.g. `gpt` from `gpt-4oo`), which is where the common typo
+        lives. Returns an empty list rather than raising: the caller is already
+        reporting a not-found result and must not turn a suggestion lookup into
+        a failure.
+        """
+        prefix = re.split(r"[-_.:/ ]", model.strip(), maxsplit=1)[0]
+        if len(prefix) < 3 or prefix.lower() == model.strip().lower():
+            return []
+
+        try:
+            response = await client.search_ai_models(query=prefix, page=0, size=limit)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"Closest-match lookup for '{model}' failed: {exc}")
+            return []
+
+        envelope: Any = response
+        if not isinstance(envelope, dict):
+            return []
+        embedded = envelope.get("_embedded")
+        if not isinstance(embedded, dict):
+            return []
+        candidates = embedded.get("aIModelResourceList") or []
+        return [c for c in candidates if isinstance(c, dict)][:limit]
 
     async def _handle_validate_model_provider(
         self,
@@ -5622,63 +6237,94 @@ Use `validate()` before submission."""
                 # so the "did you mean" branch below still has candidates.
                 response = await client.search_ai_models(query=model, page=0, size=100)
 
-            if "_embedded" in response and "aIModelResourceList" in response["_embedded"]:
-                models = response["_embedded"]["aIModelResourceList"]
-
-                exact_match = None
-                partial_matches = []
-
-                for api_model in models:
-                    api_model_name = api_model.get("name", "").lower()
-                    api_provider = api_model.get("provider", "").lower()
-
-                    if api_model_name == model.lower() and api_provider == provider.lower():
-                        exact_match = api_model
-                        break
-                    elif api_model_name == model.lower() or api_provider == provider.lower():
-                        partial_matches.append(api_model)
-
-                if exact_match:
-                    text = "✅ **Valid Model/Provider Combination**\n\n"
-                    text += f"**Model**: {exact_match.get('name')}\n"
-                    text += f"**Provider**: {exact_match.get('provider')}\n"
-                    text += f"**Model ID**: {exact_match.get('id')}\n\n"
-                    text += "**Cost Information**:\n"
-                    text += f"- Input: ${exact_match.get('inputCostPerToken', 'N/A')}/token\n"
-                    text += f"- Output: ${exact_match.get('outputCostPerToken', 'N/A')}/token\n\n"
-                    text += "**✅ Ready for metering transactions**"
-
-                    return [TextContent(type="text", text=text)]
-
-                elif partial_matches:
-                    text = "❌ **Invalid Model/Provider Combination**\n\n"
-                    text += f"**Requested**: {model} ({provider})\n\n"
-                    text += "**Did you mean one of these?**\n"
-
-                    for match in partial_matches[:5]:
-                        text += f"- **{match.get('name')}** ({match.get('provider')})\n"
-
-                    text += f'\n**💡 Tip**: Use `search_ai_models(query="{model}")` to see all matching models'
-
-                    return [TextContent(type="text", text=text)]
-
-                else:
-                    text = "❌ **Model/Provider Not Found**\n\n"
-                    text += f"**Requested**: {model} ({provider})\n\n"
-                    text += "**Suggestions**:\n"
-                    text += "- Use `list_ai_models()` to see all available models\n"
-                    text += "- Use `get_supported_providers()` to see all providers\n"
-                    text += "- Check spelling and try again"
-
-                    return [TextContent(type="text", text=text)]
-
-            else:
+            # A well-formed envelope that carries no models is an empty catalog
+            # match - a model name nobody has - not a retrieval failure. Only a
+            # response that is not a search envelope at all means the models
+            # service could not be read; that is the one case the
+            # retrieval-failure text belongs to.
+            envelope: Any = response
+            if not isinstance(envelope, dict):
                 return [
                     TextContent(
                         type="text",
                         text="❌ **Validation failed**\n\nUnable to retrieve models from API for validation.",
                     )
                 ]
+
+            embedded = envelope.get("_embedded")
+            models: List[Dict[str, Any]] = []
+            if isinstance(embedded, dict):
+                models = embedded.get("aIModelResourceList") or []
+
+            exact_match = None
+            partial_matches = []
+
+            for api_model in models:
+                api_model_name = (api_model.get("name") or "").lower()
+                api_provider = (api_model.get("provider") or "").lower()
+
+                if api_model_name == model.lower() and api_provider == provider.lower():
+                    exact_match = api_model
+                    break
+                elif api_model_name == model.lower() or api_provider == provider.lower():
+                    partial_matches.append(api_model)
+
+            if exact_match:
+                text = "✅ **Valid Model/Provider Combination**\n\n"
+                text += f"**Model**: {exact_match.get('name')}\n"
+                text += f"**Provider**: {exact_match.get('provider')}\n"
+                text += f"**Model ID**: {exact_match.get('id')}\n\n"
+                text += "**Cost Information**:\n"
+                text += f"- Input: ${exact_match.get('inputCostPerToken', 'N/A')}/token\n"
+                text += f"- Output: ${exact_match.get('outputCostPerToken', 'N/A')}/token\n\n"
+                text += "**✅ Ready for metering transactions**"
+
+                return [TextContent(type="text", text=text)]
+
+            elif partial_matches:
+                text = "❌ **Invalid Model/Provider Combination**\n\n"
+                text += f"**Requested**: {model} ({provider})\n\n"
+                text += "**Did you mean one of these?**\n"
+
+                for match in partial_matches[:5]:
+                    text += f"- **{match.get('name')}** ({match.get('provider')})\n"
+
+                text += f'\n**💡 Tip**: Use `search_ai_models(query="{model}")` to see all matching models'
+
+                return [TextContent(type="text", text=text)]
+
+            else:
+                # Reached both when the catalog returned candidates that match
+                # neither the name nor the provider, and when it returned
+                # nothing at all. Either way the model is not in the catalog:
+                # say so, and name the model, rather than blaming the service.
+                closest = (
+                    list(models)[:5]
+                    if models
+                    else await self._closest_model_matches(client, model)
+                )
+                text = "❌ **Model/Provider Not Found**\n\n"
+                text += f"**Requested**: {model} ({provider})\n\n"
+                text += (
+                    f"No model named `{model}` exists in the AI model catalog "
+                    "for this tenant. The catalog was read successfully - this "
+                    "is an unknown model name, not a service failure.\n\n"
+                )
+                if closest:
+                    text += "**Closest catalog entries**:\n"
+                    for candidate in closest:
+                        text += (
+                            f"- **{candidate.get('name')}** "
+                            f"({candidate.get('provider')})\n"
+                        )
+                    text += "\n"
+                text += "**Suggestions**:\n"
+                text += "- Use `list_ai_models()` to see all available models\n"
+                text += "- Use `get_supported_providers()` to see all providers\n"
+                text += "- Check spelling and try again"
+
+                return [TextContent(type="text", text=text)]
+
 
         except Exception as e:
             logger.error(f"Error validating model/provider: {e}")
@@ -6118,6 +6764,16 @@ Use `validate()` before submission."""
                 '  "transaction_id": "tx_abc123def456"\n'
                 "}\n"
                 "```\n\n"
+                "### **Field Analysis of Recent Transactions**\n"
+                "```json\n"
+                "{\n"
+                '  "action": "analyze_recent_transactions",\n'
+                '  "page_size": 50\n'
+                "}\n"
+                "```\n"
+                "*Reports which fields the reporting API is actually returning across the 50 most\n"
+                "recent transactions, with sample values and a `subscriber` / `credential`\n"
+                "breakdown - a data-quality check on attribution, not a spend report*\n\n"
                 "## **AI Models Discovery**\n\n"
                 "### **List Available Models**\n"
                 "```json\n"
@@ -6126,7 +6782,12 @@ Use `validate()` before submission."""
                 '  "page": 0,\n'
                 '  "size": 20\n'
                 "}\n"
-                "```\n\n"
+                "```\n"
+                "*Each model reports `Price pinned` - `yes` (with the reason) when a\n"
+                "platform-curated override pins its prices instead of tracking the upstream\n"
+                "price list, `no` when it tracks upstream, `unavailable` when the server does\n"
+                "not report the flag. Read-only: pins are set by a platform operator, not\n"
+                "through this tool*\n\n"
                 "### **Search for Specific Models**\n"
                 "```json\n"
                 "{\n"
@@ -6245,8 +6906,9 @@ Use `validate()` before submission."""
                 "- **is_streamed**: Boolean (true/false)\n"
                 "- **Timestamps**: ISO UTC format ending in 'Z' (e.g., \"2025-06-16T15:30:45.123Z\")\n"
                 "- **String fields**: Non-empty, max 500 characters, no special characters (<, >, \", ', &)\n"
-                "- **Token counts**: Positive integers\n"
-                "- **Duration**: Positive integer in milliseconds\n\n"
+                "- **Token counts**: `input_tokens` > 0; `output_tokens` >= 0 "
+                "(zero is valid for embeddings and errored calls)\n"
+                "- **Duration**: Milliseconds >= 0\n\n"
                 "### **Integration Guide Examples**\n"
                 "```bash\n"
                 "# Get comprehensive implementation guidance\n"
@@ -7044,6 +7706,24 @@ Use `validate()` before submission."""
                 ],
             ),
             ToolCapability(
+                name="Recent Transaction Field Analysis",
+                description=(
+                    "Report which fields the reporting API is returning across a sample of recent "
+                    "transactions - presence counts, sample values, a subscriber/credential breakdown, "
+                    "fields absent from every record, and fields returned that this tool does not expect. "
+                    "A data-quality check on attribution, not a spend report."
+                ),
+                parameters={
+                    "page_size": "int (optional) - Number of transactions to sample (1-100, default: 20)",
+                    "include_coding_assistants": "bool (optional) - Include coding-assistant records such as Claude Code and Gemini CLI (default: true)",
+                },
+                examples=[
+                    "analyze_recent_transactions()  # Analyze the 20 most recent transactions",
+                    "analyze_recent_transactions(page_size=100)  # Widen the sample",
+                    "analyze_recent_transactions(provider='openai')  # Narrow the sample server-side",
+                ],
+            ),
+            ToolCapability(
                 name="Status Tracking",
                 description="Check status of individual transactions (local session data only)",
                 parameters={"transaction_id": "str (required) - Transaction ID to check"},
@@ -7057,6 +7737,7 @@ Use `validate()` before submission."""
             "submit_ai_transaction",
             "lookup_transactions",
             "lookup_recent_transactions",
+            "analyze_recent_transactions",
             "get_transaction_status",
             "validate",
             "get_capabilities",
@@ -7106,15 +7787,15 @@ Use `validate()` before submission."""
                 },
                 "input_tokens": {
                     "type": "integer",
-                    "description": "Number of input tokens - required for submit_ai_transaction",
+                    "description": "Number of input tokens - required for submit_ai_transaction (> 0, <= 10,000,000)",
                 },
                 "output_tokens": {
                     "type": "integer",
-                    "description": "Number of output tokens - required for submit_ai_transaction",
+                    "description": "Number of output tokens - required for submit_ai_transaction (>= 0, <= 10,000,000; zero is valid for embeddings and errored calls)",
                 },
                 "duration_ms": {
                     "type": "integer",
-                    "description": "Request duration in milliseconds - required for submit_ai_transaction",
+                    "description": "Request duration in milliseconds - required for submit_ai_transaction (>= 0, <= 10,000,000)",
                 },
                 # Enterprise Attribution Fields (optional)
                 "organization_name": {
@@ -7190,7 +7871,7 @@ Use `validate()` before submission."""
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 1000,
-                    "description": "Transactions per API call for pagination. Use smaller values (50-100) for quick recent searches, larger values (500-1000) for comprehensive historical searches. Default: 1000 (maximum efficiency)",
+                    "description": "Transactions per API call for pagination. For lookup_transactions: use smaller values (50-100) for quick recent searches, larger values (500-1000) for comprehensive historical searches, default 1000. This is also the only accepted page/sample size for the two recent-transactions actions, where the endpoint caps a page at 100: lookup_recent_transactions rejects a value above 100 (default 20), analyze_recent_transactions caps it at 100 (default 20).",
                 },
                 "early_termination": {
                     "type": "boolean",
@@ -7256,7 +7937,7 @@ Use `validate()` before submission."""
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 100,
-                    "description": "Number of transactions per page (1-100, default: 20) - used with lookup_recent_transactions",
+                    "description": "NOT ACCEPTED by the registered manage_metering tool: this name is absent from the _register_manage_metering closure signature, which is what FastMCP derives the tool's arguments from, so a call passing it is rejected before any handler runs. _handle_lookup_recent_transactions still prefers it when present, which only happens for a direct in-process call. Use page_size - it is what sets the page for lookup_recent_transactions and the sample size for analyze_recent_transactions.",
                 },
                 # Search Filters for lookup_recent_transactions and analyze_recent_transactions.
                 # All filters are sent directly to the completions API; only non-None values are included.
@@ -7384,7 +8065,7 @@ Use `validate()` before submission."""
                 # Streaming performance
                 "time_to_first_token": {
                     "type": "integer",
-                    "description": "Time to first token in milliseconds (positive integer, <= 60000). Auto-calculated from duration_ms if not provided.",
+                    "description": "Time to first token in milliseconds (>= 0, <= 60000). Auto-calculated from duration_ms if not provided.",
                 },
                 "time_to_first_token_min": {
                     "type": "number",

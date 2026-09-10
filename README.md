@@ -203,11 +203,11 @@ the "First-time TLS" note above for the browser equivalent.
 
 ## MCP Specification
 
-Implements [Model Context Protocol](https://modelcontextprotocol.io/specification/2025-11-25) revision
-**2025-11-25** — the `LATEST_PROTOCOL_VERSION` of the pinned `mcp` SDK, which is what the server
-negotiates. Earlier revisions (including `2025-06-18`) are still served to older clients.
+Implements [Model Context Protocol](https://modelcontextprotocol.io/specification/2026-07-28) revision
+**2026-07-28** — the `LATEST_PROTOCOL_VERSION` of the pinned `mcp` SDK, which is what the server
+negotiates. Earlier revisions (including `2025-11-25` and `2025-06-18`) are still served to older clients.
 
-- **Framework:** FastMCP (pinned to `fastmcp==3.4.7`)
+- **Framework:** FastMCP (pinned to `fastmcp==4.0.0`)
 - **Transport:** stdio (default) and HTTP (set `TRANSPORT_MODE=http`)
 - **Protocol:** JSON-RPC 2.0
 
@@ -642,7 +642,7 @@ These values are loaded from your account and can be overridden if needed:
 | Variable | Required | Description | Example |
 |----------|----------|-------------|---------|
 | `REVENIUM_BASE_URL` |  | API endpoint URL (defaults to main Revenium instance) | `https://api.revenium.ai` |
-| `REVENIUM_APP_BASE_URL` |  | Revenium application/analytics host used by tool-cost analytics (`/api/v2/analytics/*`) and Slack integrations. When `REVENIUM_BASE_URL` points at a non-production environment, set this too — otherwise analytics calls default to production and fail with 401 for non-prod API keys. | `https://ai.revenium.io` |
+| `REVENIUM_APP_BASE_URL` |  | Revenium application/analytics host used by tool-cost analytics (`/api/v2/analytics/*`) and by the application links the Slack setup actions hand you. Known non-production environments are paired with `REVENIUM_BASE_URL` automatically; set this only for an environment the server does not recognise, otherwise it falls back to production and 401s for non-prod API keys. | `https://ai.dev.hcapp.io` |
 | `LOG_LEVEL` |  | Logging verbosity level | `DEBUG` |
 | `REQUEST_TIMEOUT` |  | API request timeout in seconds | `30` |
 

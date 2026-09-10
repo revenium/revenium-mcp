@@ -24,7 +24,11 @@ from ..common.error_handling import (
 from ..config_store import get_config_value
 from ..introspection.metadata import ToolCapability, ToolType
 from ..onboarding.detection_service import get_onboarding_state
-from ..onboarding.env_validation import validate_environment_variables
+from ..onboarding.env_validation import (
+    API_AUTH_REJECTED_MESSAGE,
+    API_READ_FORBIDDEN_MESSAGE,
+    validate_environment_variables,
+)
 from .unified_tool_base import ToolBase
 
 
@@ -465,6 +469,21 @@ class ConfigurationStatus(ToolBase):
         # static API key by design (auth is per-request via the Clerk JWT), so the
         # API-key checks don't apply — the OAuth configuration is what's critical.
         is_clerk = validation_result.summary.get("auth_mode") == "clerk"
+        # A key that authenticates but cannot read data is its own failure mode:
+        # it must fail the critical check, and the report must say why.
+        api_read_forbidden = validation_result.summary.get("api_read_forbidden", False)
+        read_forbidden_detail = (
+            validation_result.summary.get("api_read_forbidden_detail")
+            or API_READ_FORBIDDEN_MESSAGE
+        )
+        # A key the platform did not accept (401) is a different failure from a
+        # forbidden read: it may simply not be active yet. The wording comes from
+        # API_AUTH_REJECTED_MESSAGE, the single source of the rejected-key guidance.
+        api_auth_rejected = validation_result.summary.get("api_auth_rejected", False)
+        auth_rejected_detail = (
+            validation_result.summary.get("api_auth_rejected_detail")
+            or API_AUTH_REJECTED_MESSAGE
+        )
         if is_clerk:
             critical_checks = [
                 (
@@ -490,9 +509,15 @@ class ConfigurationStatus(ToolBase):
         critical_healthy = 0
         for check_name, is_healthy in critical_checks:
             status_icon = "[OK]" if is_healthy else "[FAIL]"
-            summary += (
-                f"- {status_icon} **{check_name}**: {'Operational' if is_healthy else 'Failed'}\n"
-            )
+            if is_healthy:
+                status_text = "Operational"
+            elif check_name == "API Connectivity" and api_read_forbidden:
+                status_text = "Forbidden - the key cannot read data (wrong scope or unrecognized key)"
+            elif check_name == "API Connectivity" and api_auth_rejected:
+                status_text = "Rejected - the platform did not accept the key (HTTP 401)"
+            else:
+                status_text = "Failed"
+            summary += f"- {status_icon} **{check_name}**: {status_text}\n"
             if is_healthy:
                 critical_healthy += 1
 
@@ -553,9 +578,14 @@ class ConfigurationStatus(ToolBase):
             if not validation_result.summary.get("api_key_available"):
                 summary += "[CRITICAL] API key not configured - system cannot function\n"
             if not validation_result.summary.get("direct_api_works"):
-                summary += (
-                    "[CRITICAL] API connectivity failed - check network and authentication\n"
-                )
+                if api_read_forbidden:
+                    summary += f"[CRITICAL] {read_forbidden_detail}\n"
+                elif api_auth_rejected:
+                    summary += f"[CRITICAL] {auth_rejected_detail}\n"
+                else:
+                    summary += (
+                        "[CRITICAL] API connectivity failed - check network and authentication\n"
+                    )
         if not validation_result.summary.get("auth_config_works"):
             summary += "[WARN] Authentication configuration issues detected\n"
         if not validation_result.summary.get("auto_discovery_works"):
@@ -578,11 +608,29 @@ class ConfigurationStatus(ToolBase):
 
         if not overall_status:
             summary += "**Immediate Actions**:\n"
-            summary += (
-                "1. Use `configuration_status(action='full_diagnostic')` for detailed analysis\n"
-            )
-            summary += "2. Follow `system_setup()` for guided resolution\n"
-            summary += "3. Check `setup_checklist()` for specific configuration steps\n"
+            if api_read_forbidden:
+                summary += "1. Verify REVENIUM_API_KEY and replace it with a key that has read access\n"
+                summary += f"   - {read_forbidden_detail}\n"
+                summary += (
+                    "2. Use `configuration_status(action='system_health')` for detailed analysis\n"
+                )
+                summary += "3. Follow `system_setup()` for guided resolution\n"
+            elif api_auth_rejected:
+                summary += (
+                    "1. Wait a moment and retry before replacing REVENIUM_API_KEY - "
+                    "a key created in the last few minutes may not be active yet\n"
+                )
+                summary += f"   - {auth_rejected_detail}\n"
+                summary += (
+                    "2. Use `configuration_status(action='system_health')` for detailed analysis\n"
+                )
+                summary += "3. Follow `system_setup()` for guided resolution\n"
+            else:
+                summary += (
+                    "1. Use `configuration_status(action='system_health')` for detailed analysis\n"
+                )
+                summary += "2. Follow `system_setup()` for guided resolution\n"
+                summary += "3. Check `setup_checklist()` for specific configuration steps\n"
         else:
             summary += "**Maintenance Actions**:\n"
             summary += "1. Monitor system health regularly\n"
@@ -601,6 +649,12 @@ class ConfigurationStatus(ToolBase):
                 summary += "\n**Complete Onboarding**: Use `system_setup(action='setup_checklist')` to finish setup\n"
         else:
             summary += "[NOT READY] System requires configuration before use\n"
+            if api_read_forbidden:
+                summary += f"- {read_forbidden_detail}\n"
+                summary += "- No data endpoint could be read with the current key\n"
+            elif api_auth_rejected:
+                summary += f"- {auth_rejected_detail}\n"
+                summary += "- The current key was not accepted, so no read was possible\n"
             summary += "- Complete setup using the onboarding tools\n"
             summary += "- Address critical configuration issues\n"
             summary += "- Test connectivity and authentication\n"

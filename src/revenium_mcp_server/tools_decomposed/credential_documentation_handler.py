@@ -32,8 +32,11 @@ class CredentialDocumentationHandler:
         result_text += "**Top-level parameters** for tool behavior:\n"
         result_text += "- `action` - What operation to perform (default: get_capabilities)\n"
         result_text += "- `credential_id` - For get/update/delete operations\n"
+        result_text += "- `organizationId` - For the list_by_organization action\n"
         result_text += "- `dry_run` - Preview without creating (optional)\n"
-        result_text += "- `page`, `size` - For list operations\n\n"
+        result_text += "- `page`, `size` - For list operations\n"
+        result_text += ("- `filters` - Narrows a listing. `list` accepts query, sort, type; "
+                        "`list_by_organization` accepts query, sort\n\n")
 
         # CRUD Operations
         result_text += "## **CRUD Operations**\n\n"
@@ -43,8 +46,15 @@ class CredentialDocumentationHandler:
         result_text += "- Supports dry-run validation\n\n"
 
         result_text += "### **Read**\n"
-        result_text += "- `list` - Get paginated list of credentials\n"
+        result_text += "- `list` - Get paginated list of credentials for the caller's team\n"
+        result_text += ("- `list_by_organization` - Get paginated list of the credentials one "
+                        "organization holds (`organizationId` required)\n")
         result_text += "- `get` - Get specific credential by ID\n\n"
+        result_text += ("The two listings answer different questions and can return different "
+                        "sets: `list` is scoped to the caller's team, `list_by_organization` to "
+                        "the organization in the request. Use `manage_customers(action='list', "
+                        "resource_type='organizations')` or `resolve_organization_name_to_id` to "
+                        "find the organization ID.\n\n")
 
         result_text += "### **Update**\n"
         result_text += "- Update existing credential properties\n"
@@ -163,6 +173,13 @@ class CredentialDocumentationHandler:
         result_text += "list(page=0, size=20)\n"
         result_text += "```\n"
         result_text += "Returns paginated list of credentials with metadata\n\n"
+
+        result_text += "### **List an Organization's Credentials**\n"
+        result_text += "```bash\n"
+        result_text += "list_by_organization(organizationId='ORGANIZATION_ID_FROM_LIST', page=0, size=20)\n"
+        result_text += "```\n"
+        result_text += ("Returns the credentials that organization holds, regardless of which team "
+                        "the team-scoped `list` would show\n\n")
 
         result_text += "### **Get Specific Credential**\n"
         result_text += "```bash\n"

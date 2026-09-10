@@ -2647,6 +2647,50 @@ class TestSystemDiagnosticsStrictIngestionClosure:
         assert captured["allow_ticket_jobs"] is True
         assert captured["confirm"] == "true"
 
+    @pytest.mark.asyncio
+    async def test_attribution_detail_text_reaches_the_handler(self):
+        """BACK-3096: the second tenant toggle rides the same `enabled`
+        parameter. Its action name is new, so assert the pair arrives - a
+        declared parameter is worth nothing if the action cannot carry it."""
+        registry = _make_registry()
+        fn = await _get_registered_closure(registry, "_register_system_diagnostics")
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await fn(action="set_attribution_detail_text", enabled=False)
+        assert captured["action"] == "set_attribution_detail_text"
+        assert captured["enabled"] is False
+        # The strict-mode-only arguments must not be invented for this action.
+        assert "allow_ticket_jobs" not in captured
+        assert "confirm" not in captured
+
+    @pytest.mark.asyncio
+    async def test_attribution_detail_text_accepts_a_string_boolean(self):
+        """`enabled` is in the boolean-preprocessing list, so a loosely typed
+        MCP client reaches the handler's isinstance check with a real bool
+        instead of a validation error."""
+        registry = _make_registry()
+        fn = await _get_registered_closure(registry, "_register_system_diagnostics")
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await fn(action="set_attribution_detail_text", enabled="false")
+        assert captured["enabled"] is False
+
 
 # ---------------------------------------------------------------------------
 # manage_metering closure — completion provenance forwarding
@@ -2785,3 +2829,102 @@ class TestPrHealthClosureParameters:
 # manage_metering closure — completion provenance forwarding
 # ---------------------------------------------------------------------------
 
+
+
+# ---------------------------------------------------------------------------
+# manage_tools closure: retired parameters must not be advertised (BACK-2936)
+# ---------------------------------------------------------------------------
+
+class TestManageToolsClosureParameters:
+    @pytest.mark.asyncio
+    async def test_tool_version_is_not_a_registered_parameter(self):
+        """FastMCP builds the public schema from this signature, so a retired
+        field has to disappear here, not only in the handler."""
+        import inspect
+
+        registry = _make_registry(profile="business")
+        closure = await _get_registered_closure(registry, "_register_manage_tools")
+        params = inspect.signature(closure).parameters
+        assert "tool_version" not in params
+        assert "version" not in params
+        assert "tool_type" in params
+
+
+# ---------------------------------------------------------------------------
+# manage_subscriber_credentials closure: both spellings the capability text
+# advertises for the organization id must be declared (BACK-2958)
+# ---------------------------------------------------------------------------
+
+class TestManageJobsClosureParameters:
+    @pytest.mark.asyncio
+    async def test_session_id_is_registered(self):
+        """BACK-2769: FastMCP builds manage_jobs' schema from this signature, so
+        list_session_attributions is unreachable unless session_id is declared
+        here — the BACK-2934 class of bug."""
+        import inspect
+
+        registry = _make_registry(profile="business")
+        closure = await _get_registered_closure(registry, "_register_manage_jobs")
+        params = inspect.signature(closure).parameters
+        assert "session_id" in params
+        assert "job_id" in params
+
+    @pytest.mark.asyncio
+    async def test_session_id_is_forwarded_to_the_handler(self):
+        """The declared parameter must also reach `arguments`, or the handler
+        raises its own missing-parameter error on a call that supplied it."""
+        registry = _make_registry(profile="business")
+        closure = await _get_registered_closure(registry, "_register_manage_jobs")
+
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await closure(
+                action="list_session_attributions",
+                session_id="853a73bf-d9d7-4351-a548-9d6c05648c61",
+            )
+
+        assert captured["session_id"] == "853a73bf-d9d7-4351-a548-9d6c05648c61"
+
+    @pytest.mark.asyncio
+    async def test_omitted_session_id_is_stripped_not_passed_as_none(self):
+        """The trailing None-strip keeps an unset session_id out of `arguments`,
+        so the handler's "absent" branch stays reachable."""
+        registry = _make_registry(profile="business")
+        closure = await _get_registered_closure(registry, "_register_manage_jobs")
+
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await closure(action="get_job_types")
+
+        assert "session_id" not in captured
+
+
+class TestSubscriberCredentialsClosureParameters:
+    @pytest.mark.asyncio
+    async def test_both_organization_id_spellings_are_registered(self):
+        """FastMCP builds the schema from this signature; an alias that only the
+        handler knows about is rejected before the handler ever runs."""
+        import inspect
+
+        registry = _make_registry(profile="business")
+        closure = await _get_registered_closure(registry, "_register_manage_subscriber_credentials")
+        params = inspect.signature(closure).parameters
+        assert "organizationId" in params
+        assert "organization_id" in params
+        assert "filters" in params

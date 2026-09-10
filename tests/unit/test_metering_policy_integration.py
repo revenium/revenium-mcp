@@ -227,6 +227,147 @@ class TestLookupRecentTransactionsWithPolicy:
         assert policy_call_count == 1
 
 
+class TestAnalyzeRecentTransactionsWithPolicy:
+    """BACK-2931: the third completions read must honour the same policy.
+
+    analyze_recent_transactions became live-reachable in BACK-2931. It reports
+    raw field values, so without this filter it would be the one read path that
+    surfaces coding-assistant records the tenant is not subscribed to.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.mm = MeteringManagement.__new__(MeteringManagement)
+        _policy_cache._cache.clear()
+
+    @staticmethod
+    def _routed_client(allowed_providers):
+        client = _make_client()
+
+        async def route_get(endpoint, **kwargs):
+            if "coding-assistant" in endpoint:
+                return _subscription_response(allowed_providers)
+            return _completions_response(MIXED_TRANSACTIONS)
+
+        client.get = AsyncMock(side_effect=route_get)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_disallowed_providers_are_excluded_from_the_analysis(self):
+        result = await self.mm._handle_analyze_recent_transactions(
+            self._routed_client(["claude-code"]), {"page_size": 20}
+        )
+        text = result[0].text
+
+        # tx-2 (CursorIde) and tx-3 (GeminiCli) are unsubscribed, so the sample
+        # is 3 of the 5 records the API returned.
+        assert "**Transactions Analyzed:** 3" in text
+
+    @pytest.mark.asyncio
+    async def test_all_records_counted_when_all_subscribed(self):
+        result = await self.mm._handle_analyze_recent_transactions(
+            self._routed_client(["claude-code", "cursor", "gemini-cli"]),
+            {"page_size": 20},
+        )
+        assert "**Transactions Analyzed:** 5" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_report_states_the_sample_composition(self):
+        """Every percentage needs a visible denominator."""
+        text = (
+            await self.mm._handle_analyze_recent_transactions(
+                self._routed_client(["claude-code"]), {"page_size": 20}
+            )
+        )[0].text
+
+        assert "**Transactions Sampled:** 5" in text
+        assert (
+            "**Excluded By Policy:** 2 (coding-assistant providers not in the "
+            "tenant's scope)" in text
+        )
+        assert "**Transactions Analyzed:** 3" in text
+
+    @pytest.mark.asyncio
+    async def test_no_policy_exclusion_line_when_nothing_was_excluded(self):
+        text = (
+            await self.mm._handle_analyze_recent_transactions(
+                self._routed_client(["claude-code", "cursor", "gemini-cli"]),
+                {"page_size": 20},
+            )
+        )[0].text
+
+        assert "Excluded By Policy" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_fully_excluded_page_is_not_reported_as_an_empty_api(self):
+        """Only one page is fetched, so this is the false-emptiness trap.
+
+        A page made entirely of records outside the tenant's provider scope
+        leaves nothing to analyze while eligible records may sit on later
+        pages. Saying "the API returned none, submit some transactions" there
+        is a wrong answer that reads like a real one.
+        """
+        client = _make_client()
+        coding_assistant_only = [
+            t for t in MIXED_TRANSACTIONS if t["provider"] in ("CursorIde", "GeminiCli")
+        ]
+
+        async def route_get(endpoint, **kwargs):
+            if "coding-assistant" in endpoint:
+                return _subscription_response(["claude-code"])
+            return _completions_response(coding_assistant_only)
+
+        client.get = AsyncMock(side_effect=route_get)
+
+        text = (
+            await self.mm._handle_analyze_recent_transactions(client, {"page_size": 2})
+        )[0].text
+
+        assert "No Transactions In Scope To Analyze" in text
+        assert "Sampled 2 transaction(s)" in text
+        assert "all 2 were excluded by the tenant provider policy" in text
+        assert "This is NOT an empty reporting API" in text
+        assert "`page_size`" in text
+        # The claim the old wording made, which was false here.
+        assert "Submit some test transactions first" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_empty_page_still_says_so(self):
+        """The other half of that branch must keep its own answer."""
+        client = _make_client()
+
+        async def route_get(endpoint, **kwargs):
+            if "coding-assistant" in endpoint:
+                return _subscription_response(["claude-code"])
+            return _completions_response([])
+
+        client.get = AsyncMock(side_effect=route_get)
+
+        text = (
+            await self.mm._handle_analyze_recent_transactions(client, {"page_size": 20})
+        )[0].text
+
+        assert "No Recent Transactions" in text
+        assert "Submit some test transactions first" in text
+        assert "excluded by the tenant provider policy" not in text
+
+    @pytest.mark.asyncio
+    async def test_policy_fetch_failure_leaves_the_sample_intact(self):
+        client = _make_client()
+
+        async def route_get(endpoint, **kwargs):
+            if "coding-assistant" in endpoint:
+                raise RuntimeError("policy endpoint down")
+            return _completions_response(MIXED_TRANSACTIONS)
+
+        client.get = AsyncMock(side_effect=route_get)
+
+        result = await self.mm._handle_analyze_recent_transactions(
+            client, {"page_size": 20}
+        )
+        assert "**Transactions Analyzed:** 5" in result[0].text
+
+
 class TestLookupTransactionsWithPolicy:
 
     @pytest.fixture(autouse=True)

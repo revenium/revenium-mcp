@@ -4,7 +4,7 @@ This module provides standardized error handling patterns used across the MCP se
 following FastMCP patterns for structured, agent-friendly error responses.
 """
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, NoReturn, Optional, Union
 
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
@@ -386,6 +386,86 @@ def create_resource_not_found_error(
     )
 
 
+def raise_refusal(
+    text: str,
+    *,
+    error_code: str = ErrorCodes.VALIDATION_ERROR,
+    field: Optional[str] = None,
+    value: Optional[Any] = None,
+) -> NoReturn:
+    """Raise a refusal that the MCP envelope flags as an error (BACK-2937).
+
+    Several tools refused a request and then returned the refusal as plain
+    text content. The framework only sets the error flag when a tool raises,
+    so an automated caller read a validation failure as a completed operation.
+    This raises the same prose instead, leaving the wording untouched.
+
+    Args:
+        text: The caller-facing refusal message, used verbatim
+        error_code: Machine-readable code from ErrorCodes
+        field: Field that caused the refusal, when there is one
+        value: The rejected value, when there is one
+
+    Raises:
+        ToolError: always
+    """
+    raise ToolError(message=text, error_code=error_code, field=field, value=value)
+
+
+def raise_unknown_action_error(
+    action: str,
+    *,
+    hint: str = "Use get_capabilities() to see all supported actions.",
+) -> NoReturn:
+    """Raise the shared unknown-action refusal (BACK-2937).
+
+    Every tool worded this refusal the same way and then differed only in how
+    it listed the alternatives, so the message shape lives here and the caller
+    supplies the hint. Keeping one builder means a tool cannot quietly go back
+    to returning the refusal as content text.
+
+    Args:
+        action: The action the caller asked for
+        hint: What follows the action name — typically an explicit
+            ``Supported actions: ...`` list, or the get_capabilities pointer
+            used by tools whose action list is too long to inline
+
+    Raises:
+        ToolError: always
+    """
+    raise ToolError(
+        message=f"Unknown action '{action}'. {hint}",
+        error_code=ErrorCodes.ACTION_NOT_SUPPORTED,
+        field="action",
+        value=action,
+    )
+
+
+def raise_structured_error(error: ToolError) -> NoReturn:
+    """Raise a structured error, keeping its formatted guidance as the message.
+
+    Companion to ``raise_refusal`` for the sites that already built a
+    ``ToolError`` and then returned ``format_structured_error(error)`` as text.
+    Formatting up front keeps the caller-visible prose byte-identical to what
+    the text return produced while the envelope now carries the error flag.
+
+    Args:
+        error: The structured error to raise
+
+    Raises:
+        ToolError: always
+    """
+    raise ToolError(
+        message=format_structured_error(error),
+        error_code=error.error_code,
+        field=error.field,
+        value=error.value,
+        suggestions=error.suggestions,
+        examples=error.examples,
+        context=error.context,
+    )
+
+
 # Re-export for common use
 __all__ = [
     "StandardErrorBuilder",
@@ -412,6 +492,9 @@ __all__ = [
     "create_structured_validation_error",
     "create_structured_missing_parameter_error",
     "create_resource_not_found_error",
+    "raise_refusal",
+    "raise_structured_error",
+    "raise_unknown_action_error",
 ]
 
 

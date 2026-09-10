@@ -154,10 +154,12 @@ class TestHandleActionCreate:
 
     @pytest.mark.asyncio
     async def test_create_missing_anomaly_data_returns_error(self):
+        """BACK-2937: the refusal raises so the envelope carries isError."""
         tools, _ = _make_alert_with_client()
-        result = await tools.handle_action("create", {"resource_type": "anomalies"})
-        assert isinstance(result[0], TextContent)
-        assert "anomaly_data" in result[0].text.lower()
+        with pytest.raises(ToolError) as exc_info:
+            await tools.handle_action("create", {"resource_type": "anomalies"})
+        assert "anomaly_data" in exc_info.value.message.lower()
+        assert "MISSING_PARAMETER" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_create_dry_run_valid(self):

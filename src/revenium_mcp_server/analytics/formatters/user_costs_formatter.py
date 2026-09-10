@@ -13,6 +13,10 @@ from .base_formatter import AnalyticsResponseFormatter
 class UserCostsFormatter(AnalyticsResponseFormatter):
     """Format user costs analytics responses."""
 
+    # Endpoint this formatter renders, so the coding-assistant scope note
+    # follows the plane the registry actually routes to.
+    ENDPOINT_KEY = "cost_metric_by_user_aggregated"
+
     def format(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format user costs data for response.
 
@@ -28,11 +32,27 @@ class UserCostsFormatter(AnalyticsResponseFormatter):
 
         if not data:
             return self.utilities.format_no_data_response(
-                "user costs", period, f"aggregation: {aggregation}"
+                "user costs",
+                period,
+                f"aggregation: {aggregation}",
+                scope_note=self._scope_notes(),
             )
 
         return self._format_user_costs_content(
             data, {"period": period, "aggregation": aggregation}
+        )
+
+    def _scope_notes(self) -> str:
+        """Scope caveats every user-cost response carries, empty or not.
+
+        A per-user total that is small or absent must never be read as a
+        measure of a person's usage, so the caveat cannot be attached to the
+        empty case alone.
+        """
+        return (
+            self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY)
+            + "\n"
+            + self.utilities.user_attribution_note()
         )
 
     def _format_user_costs_content(
@@ -100,6 +120,7 @@ class UserCostsFormatter(AnalyticsResponseFormatter):
     def _format_user_costs_footer(self, params: Dict[str, Any]) -> str:
         period = params.get("period", "Unknown")
         aggregation = params.get("aggregation", "Unknown")
-        return self.utilities.add_insights_footer(
+        footer = self.utilities.add_insights_footer(
             "user costs", period, f"{aggregation} aggregation"
         )
+        return f"{footer}\n{self._scope_notes()}"

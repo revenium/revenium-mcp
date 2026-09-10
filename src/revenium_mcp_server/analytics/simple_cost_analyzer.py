@@ -821,7 +821,12 @@ class SimpleCostAnalyzer:
 
             extra_old = {"group": aggregation} if aggregation else {}
             extra_new = dict(filters) if filters else {}
-            # Default costSources to coding_assistant (subscriber email only populated there)
+            # Default costSources to coding_assistant: subscriber email is populated
+            # on those rows. Note this is not a per-user view of coding-assistant
+            # spend - the v2 analytics plane's own predicate drops rows priced as
+            # coding_assistant (its REST context carries no API-rate provider list),
+            # which the response's scope notes state. Changing the default is a
+            # behaviour change tracked separately.
             if "costSources" not in extra_new:
                 extra_new["costSources"] = ["coding_assistant"]
             if aggregation and "aggregation" not in extra_new:
@@ -874,8 +879,9 @@ class SimpleCostAnalyzer:
 
         Single total from the new-API transaction-count-by-team endpoint.
         teamId is resolved server-side from the API-key auth context, and the
-        count matches the cost endpoints' universe (coding-assistant
-        transactions are excluded on this transport).
+        count matches the v2 analytics cost endpoints' universe: transactions
+        priced as coding-assistant usage are excluded on this transport, while
+        coding-assistant traffic carrying real provider spend is counted.
 
         Args:
             period: Time period (API-verified values only)

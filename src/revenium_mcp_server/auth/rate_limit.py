@@ -12,6 +12,46 @@ Scope notes:
 - Per-credential buckets are bypassable by rotating the Authorization
   header (each unique value gets a fresh bucket); the WAF per-IP rules at
   the ALB remain the outer defense for that pattern.
+
+Decision (BACK-2472): DECLINED — this limiter gains no per-tool bucket
+keyed on the ``Mcp-Name`` header. Per-tool limiting is the edge's job,
+briefed to infrastructure as BACK-3057 (hypercurrent-infrastructure).
+
+The capability is genuinely available now. On mcp 2.1.1 the client stamps
+``mcp-method`` (``MCP_METHOD_HEADER``) on every streamable-HTTP request and
+``mcp-name`` (``MCP_NAME_HEADER``) for the methods in
+``NAME_BEARING_METHODS`` — ``tools/call`` -> ``name`` is the row that
+carries the tool name — and the server enforces agreement with the body:
+``classify_inbound_request`` in ``mcp/shared/inbound.py``, called from
+``mcp/server/_streamable_http_modern.py`` next to
+``find_duplicated_routing_header``, rejects a header that disagrees with
+the body as ``HEADER_MISMATCH``. A gateway can therefore key on the tool
+name without parsing JSON, and can trust what it reads. This repo neither
+reads nor emits those headers; it is the client that sends them.
+
+The reason not to spend that here is the scope notes above: a per-tool
+bucket added to this middleware would inherit all three constraints
+unchanged. Its keys stay attacker-rotatable (a fresh Authorization value
+is a fresh per-tool bucket too, so the caller most motivated to hammer one
+expensive tool is exactly the caller who can reset its budget), its state
+stays one process's memory (a second task silently doubles every budget),
+and it stays positioned where the module records it — capping tool
+execution, not verification (the precise ordering against FastMCP's auth
+layer is flagged as unverified in
+``docs/architecture/server-and-runtime.md``, which is itself a reason not
+to build a security control on top of it). The ALB/WAF has none of those
+three limits and now has the tool name, so that is where the enforcement
+belongs.
+
+Reopens if either holds: the deployment stops being single-task and this
+limiter gains shared (distributed) state, or the edge is shown unable to
+key on the header and an in-process budget is the only option left. The
+shape to build then is a second ``SlidingWindowLimiter`` keyed on
+``(credential, mcp-name)`` for a configurable allowlist of expensive
+tools, applied only when the header is present — a legacy client sends
+neither header, and absence must read as "unknown tool", not as an error —
+leaving the flat per-credential bucket and ``DEFAULT_MCP_LIMIT_PER_MINUTE``
+untouched.
 """
 from __future__ import annotations
 

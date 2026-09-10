@@ -22,6 +22,9 @@ from loguru import logger
 # Import MCP types for type checking
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
+# Import cacheable-list hint values (SEP-2549) declared on the FastMCP constructor
+from .constants import MCP_CACHE_HINT_SCOPE, MCP_CACHE_HINT_TTL_SECONDS
+
 # Import crash handling
 from .crash_handler import install_crash_logging
 
@@ -232,6 +235,14 @@ def create_enhanced_server(auth: Optional[Any] = None) -> FastMCP:
     mcp = FastMCP(
         name=f"Revenium MCP Server v{server_version}",
         auth=auth,
+        # BACK-2471: advertise `ttlMs`/`cacheScope` on cacheable list results so a
+        # modern client can skip re-fetching `tools/list` on every session. FastMCP
+        # converts the seconds to wire milliseconds and hands a CacheHint to the SDK
+        # low-level server; see MCP_CACHE_HINT_TTL_SECONDS in constants.py for why
+        # these values. Clients that ignore the fields or negotiate a pre-2026-07-28
+        # revision are unaffected — honoring the hint is opt-in on the client side.
+        cache_ttl=MCP_CACHE_HINT_TTL_SECONDS,
+        cache_scope=MCP_CACHE_HINT_SCOPE,
         instructions="""
 # Enhanced Revenium Platform API MCP Server
 

@@ -24,6 +24,7 @@ from ..common.error_handling import (
     format_structured_error,
 )
 from ..config_store import get_config_value
+from ..endpoint_registry import _resolved_app_base_url
 
 # from ..error_handlers import format_structured_error  # Not available
 from ..exceptions import ValidationError
@@ -393,7 +394,7 @@ class SlackSetupAssistant(ToolBase):
             current_default = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
 
             # Get app base URL
-            app_base_url = get_config_value("REVENIUM_APP_BASE_URL", "https://ai.revenium.io")
+            app_base_url = _resolved_app_base_url()
 
             result_text = "# Slack Integration Setup Status\n\n"
 

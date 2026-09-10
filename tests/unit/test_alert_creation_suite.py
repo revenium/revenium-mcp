@@ -1258,10 +1258,12 @@ class TestCreateFlatFieldMerge:
 
     @pytest.mark.asyncio
     async def test_create_with_no_fields_still_errors(self):
+        """BACK-2937: the refusal raises instead of being returned as content."""
         tools, client = _make_tools_with_client()
-        result = await tools._handle_anomaly_operations(client, "create", {})
+        with pytest.raises(ToolError) as exc_info:
+            await tools._handle_anomaly_operations(client, "create", {})
         tools.anomaly_manager.create_anomaly.assert_not_called()
-        assert "anomaly_data" in result[0].text
+        assert "anomaly_data" in exc_info.value.message
 
 
     @pytest.mark.asyncio

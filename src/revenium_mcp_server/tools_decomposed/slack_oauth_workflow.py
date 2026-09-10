@@ -19,7 +19,7 @@ from ..common.error_handling import (
     ErrorCodes,
     ToolError,
 )
-from ..config_store import get_config_value
+from ..endpoint_registry import _resolved_app_base_url
 from ..introspection.metadata import ToolCapability, ToolType
 from .slack_oauth_formatters import (
     format_check_new_configurations_response,
@@ -134,7 +134,7 @@ class SlackOAuthWorkflow(ToolBase):
                 )
             ]
 
-        app_base_url = get_config_value("REVENIUM_APP_BASE_URL", "https://ai.revenium.io")
+        app_base_url = _resolved_app_base_url()
         oauth_url = f"{app_base_url}/slack/connect?returnTo={return_to}"
 
         return format_oauth_initiation_response(oauth_url, app_base_url, return_to)

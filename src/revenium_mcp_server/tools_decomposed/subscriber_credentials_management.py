@@ -3,6 +3,16 @@
 This module provides comprehensive subscriber credential management operations
 including CRUD operations, enhanced NLP support, dry run capabilities, and
 extensive business context for product managers managing billing automation.
+
+Ownership note (BACK-2958): the credentials-by-organization read
+(``list_by_organization``) lives here, not in ``manage_customers``. The answer
+it returns is a list of credential resources — the same shape ``list`` and
+``get`` return, obfuscated by the same ``obfuscate_credentials_list``, paged by
+the same validator — and an organization id is only the scope it is asked for.
+``manage_customers`` owns the organization entity and is where a caller
+discovers that id (``list``/``get`` on ``resource_type='organizations'``, or
+``resolve_organization_name_to_id`` here); putting the credential listing there
+too would split one resource's read surface across two tools.
 """
 
 import time
@@ -47,6 +57,17 @@ from .unified_tool_base import ToolBase
 _CREDENTIAL_FILTER_MAP: Dict[str, str] = {
     "query": "query",
     "type": "type",
+    "sort": "sort",
+}
+
+# Filter surface of GET /v2/api/credentials/by-organization/{organizationId}
+# (BACK-2958). Verified 2026-09-03 against the committed snapshot: the
+# operation declares organizationId (path), query, page, size and sort, and
+# nothing else. `type` is absent here on purpose — it is declared on the
+# team-scoped list, not on this one, and forwarding it would be a filter that
+# silently does not narrow.
+_CREDENTIAL_BY_ORGANIZATION_FILTER_MAP: Dict[str, str] = {
+    "query": "query",
     "sort": "sort",
 }
 
@@ -226,7 +247,7 @@ class SubscriberCredentialsManagement(ToolBase):
                 },
                 "organizationId": {
                     "type": "string",
-                    "description": "ID of the organization - required for create",
+                    "description": "ID of the organization - required for create, and required for list_by_organization (organization_id is accepted as an alias)",
                 },
                 "externalId": {
                     "type": "string",
@@ -250,6 +271,10 @@ class SubscriberCredentialsManagement(ToolBase):
                 "credential_id": {
                     "type": "string",
                     "description": "Credential ID for get/update/delete operations",
+                },
+                "filters": {
+                    "type": "object",
+                    "description": "Narrows a listing. Valid keys: query, sort, type for list; query, sort for list_by_organization",
                 },
                 "credential_data": {
                     "type": "object",
@@ -289,6 +314,8 @@ class SubscriberCredentialsManagement(ToolBase):
             # Route to appropriate handler
             if action == "list":
                 result = await self._list_credentials(arguments, client=client)
+            elif action == "list_by_organization":
+                result = await self._list_credentials_by_organization(arguments, client=client)
             elif action == "get":
                 result = await self._get_credential(arguments, client=client)
             elif action == "create":
@@ -417,6 +444,7 @@ class SubscriberCredentialsManagement(ToolBase):
                     examples={
                         "supported_actions": [
                             "list",
+                            "list_by_organization",
                             "get",
                             "create",
                             "update",
@@ -431,6 +459,7 @@ class SubscriberCredentialsManagement(ToolBase):
                         ],
                         "example_usage": {
                             "list": "list(page=0, size=20)",
+                            "list_by_organization": "list_by_organization(organizationId='ORGANIZATION_ID_FROM_LIST')",
                             "get": "get(credential_id='cred_123')",
                             "create": "create(credential_data={...})",
                             "update": "update(credential_id='cred_123', credential_data={...})",
@@ -444,10 +473,10 @@ class SubscriberCredentialsManagement(ToolBase):
                 )
 
             # Format response using unified formatter based on action type
-            if action == "list":
+            if action in ("list", "list_by_organization"):
                 return self.formatter.format_list_response(
                     items=result.get("credentials", []),
-                    action="list",
+                    action=action,
                     page=result.get("pagination", {}).get("page", 0),
                     size=result.get("pagination", {}).get("size", 20),
                     total_pages=result.get("pagination", {}).get("totalPages", 1),
@@ -583,6 +612,61 @@ class SubscriberCredentialsManagement(ToolBase):
         return {
             "action": "list",
             "resource_type": "subscriber_credentials",
+            "credentials": obfuscated_credentials,
+            "pagination": page_info,
+            "total_found": len(credentials),
+        }
+
+    async def _list_credentials_by_organization(
+        self, arguments: Dict[str, Any], *, client: ReveniumClient
+    ) -> Dict[str, Any]:
+        """List the credentials one organization holds (BACK-2958).
+
+        Scoped by the organization in the path rather than by the caller's
+        team, so it answers "what does this organization hold" — a question the
+        team-scoped ``list`` cannot answer.
+        """
+        organization_id = arguments.get("organization_id") or arguments.get("organizationId")
+        if not organization_id:
+            raise create_structured_missing_parameter_error(
+                parameter_name="organizationId",
+                action="list credentials by organization",
+                examples={
+                    "usage": "list_by_organization(organizationId='OQNBA6J')",
+                    "valid_format": "Organization ID should be a string identifier",
+                    "how_to_find_it": (
+                        "manage_customers(action='list', resource_type='organizations'), "
+                        "or resolve_organization_name_to_id(name='Acme Inc')"
+                    ),
+                },
+            )
+
+        arguments = validate_pagination_params(
+            arguments, action="list_credentials_by_organization"
+        )
+        page = arguments.get("page", 0)
+        size = arguments.get("size", 20)
+        filters = apply_filter_allowlist(
+            arguments.get("filters"),
+            _CREDENTIAL_BY_ORGANIZATION_FILTER_MAP,
+            action="list_credentials_by_organization",
+        )
+
+        response = await client.get_credentials_by_organization(
+            str(organization_id), page=page, size=size, **filters
+        )
+        credentials = client._extract_embedded_data(response)
+        page_info = client._extract_pagination_info(response)
+
+        # SECURITY: same obfuscation the team-scoped listing applies — this
+        # path returns the identical credential resources and must not become
+        # the way external ids and secrets leak.
+        obfuscated_credentials = obfuscate_credentials_list(credentials)
+
+        return {
+            "action": "list_by_organization",
+            "resource_type": "subscriber_credentials",
+            "organization_id": organization_id,
             "credentials": obfuscated_credentials,
             "pagination": page_info,
             "total_found": len(credentials),
@@ -1087,6 +1171,7 @@ class SubscriberCredentialsManagement(ToolBase):
         """Get supported actions for tool introspection."""
         return [
             "list",
+            "list_by_organization",
             "get",
             "create",
             "update",
@@ -1119,6 +1204,12 @@ class SubscriberCredentialsManagement(ToolBase):
                         "page": "int",
                         "size": "int",
                         "filters": "dict (optional) — valid keys: query, sort, type",
+                    },
+                    "list_by_organization": {
+                        "organizationId": "str (organization_id also accepted)",
+                        "page": "int",
+                        "size": "int",
+                        "filters": "dict (optional) — valid keys: query, sort",
                     },
                     "get": {"credential_id": "str"},
                     "create": {"credential_data": "dict", "dry_run": "bool"},

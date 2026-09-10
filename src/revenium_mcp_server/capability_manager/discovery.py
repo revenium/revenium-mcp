@@ -7,6 +7,18 @@ and existing schema definitions.
 import logging
 from typing import Any, Dict, List
 
+from ..alert_metrics import (
+    QUALITY_RATE,
+    QUALITY_RATE_PREREQUISITES,
+    QUALITY_RATE_SUMMARY,
+    bucket_metrics,
+)
+from ..alert_operators import (
+    ACCEPTED_OPERATORS,
+    OPERATORS_BY_ALERT_TYPE,
+    REJECTED_OPERATOR_GUIDANCE,
+    REJECTED_OPERATORS,
+)
 from ..client import ReveniumClient
 from ..constants import (
     API_BURST_LIMIT,
@@ -333,33 +345,43 @@ class CapabilityDiscovery:
         # Get metrics from single source of truth (MetricType enum)
         all_metrics = [metric.value for metric in MetricType]
 
-        # Categorize metrics for better organization
-        cost_metrics = [m for m in all_metrics if "COST" in m]
-        token_metrics = [m for m in all_metrics if "TOKEN" in m]
-        performance_metrics = [
-            m for m in all_metrics if any(perf in m for perf in ["PER_MINUTE", "RATE"])
-        ]
-        quality_metrics = [m for m in all_metrics if "ERROR" in m]
+        # Group them by the explicit mapping in revenium_mcp_server.alert_metrics.
+        # Substring bucketing used to decide this, which listed ERROR_RATE as both a
+        # performance and a quality metric and would have filed QUALITY_RATE under
+        # performance because its name ends in RATE (BACK-3103).
+        buckets = bucket_metrics(all_metrics)
 
         return {
             "alert_types": ["THRESHOLD", "CUMULATIVE_USAGE", "RELATIVE_CHANGE"],
             "metrics": {
-                "cost_metrics": cost_metrics,
-                "token_metrics": token_metrics,
-                "performance_metrics": performance_metrics,
-                "quality_metrics": quality_metrics,
+                **buckets,
                 "all": all_metrics,
             },
-            "operators": [
-                "GREATER_THAN",
-                "GREATER_THAN_OR_EQUAL_TO",
-                "LESS_THAN",
-                "LESS_THAN_OR_EQUAL_TO",
-                "EQUAL_TO",
-                "NOT_EQUAL_TO",
-                "INCREASES_BY",
-                "DECREASES_BY",
-            ],
+            # QUALITY_RATE is the one metric an agent cannot just point at a threshold:
+            # it is evaluated from job outcome facts, and a rule that misses any of
+            # these is either refused on create or stored and never fired.
+            "quality_rate": {
+                "metric": QUALITY_RATE,
+                "summary": QUALITY_RATE_SUMMARY,
+                "prerequisites": list(QUALITY_RATE_PREREQUISITES),
+            },
+            # Advertise only what a create/update call survives. The platform
+            # declares EQUAL_TO and NOT_EQUAL_TO but refuses both, so they are
+            # deliberately absent here — see
+            # revenium_mcp_server.alert_operators.
+            "operators": list(ACCEPTED_OPERATORS),
+            "operators_by_alert_type": {
+                alert_type: list(operators)
+                for alert_type, operators in OPERATORS_BY_ALERT_TYPE.items()
+            },
+            "unsupported_operators": {
+                "operators": list(REJECTED_OPERATORS),
+                "reason": REJECTED_OPERATOR_GUIDANCE,
+                "readable": (
+                    "Alerts already stored with either operator keep listing and "
+                    "rendering normally; only create and update refuse them."
+                ),
+            },
             "period_durations": ["ONE_MINUTE", "DAILY", "WEEKLY", "MONTHLY", "QUARTERLY"],
             "schema": {
                 "threshold_alert": {

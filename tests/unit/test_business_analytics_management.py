@@ -4,17 +4,54 @@ Tests handle_action routing, get_capabilities/get_examples,
 unsupported action handling, error formatting, and chart generation logic.
 """
 
+import importlib.util
 import json
+import re
+import sys
+from pathlib import Path
+from typing import Any
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from src.revenium_mcp_server.tools_decomposed import (
+    business_analytics_management as business_analytics_module,
+)
 from src.revenium_mcp_server.tools_decomposed.business_analytics_management import (
     BusinessAnalyticsManagement,
 )
 from src.revenium_mcp_server.auth import AuthenticationError
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ToolError
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# The billing plane's per-person spend endpoint, recorded as intentionally
+# unwrapped in BACK-2765. Spelled with the /profitstream prefix every client.py
+# call site carries, which is what the derivation script collects.
+PER_PERSON_ENDPOINT = "/profitstream/v2/api/billing/users"
+
+
+def _load_script(name: str) -> Any:
+    """Import a ``scripts/`` module by path.
+
+    Same loader as ``tests/unit/test_openapi_contract.py`` uses: the scripts
+    directory is not a package, and importing the module keeps one definition of
+    the call-site parsing rather than a second copy here that can drift.
+    """
+    script = REPO_ROOT / "scripts" / f"{name}.py"
+    if not script.exists():
+        pytest.skip(
+            f"scripts/{name}.py is internal-only and not part of the public export "
+            "(see public-allowlist-mcp.txt); this check runs in the internal repo"
+        )
+    spec = importlib.util.spec_from_file_location(name, script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture
@@ -884,6 +921,81 @@ COVERAGE_PAYLOAD = {
 }
 
 
+# BACK-2957. The same report once the platform states its own scope: the two
+# metered totals, a per-provider credential flag (CURSOR is metered-only, so its
+# dollars sit outside the comparison), and the basis the metered figures were
+# read on with a transform other than 'none'.
+COVERAGE_SCOPE_PAYLOAD = {
+    "state": "OK",
+    "aggregateRatio": 0.8425,
+    "hiddenSpend": 1234.5,
+    "trend": 0.025,
+    "confidence": "HIGH",
+    "codingAssistantUsagePresent": True,
+    "meteredTotalInComparison": 7057.33,
+    "meteredTotalOutsideComparison": 1088.34,
+    "meteredBasis": {
+        "store": "postgres",
+        "table": "profitstream_ai_metric",
+        "windowStart": "2026-08-03",
+        "windowEnd": "2026-09-01",
+        "transform": "billing-weighted-split, narrowed-window",
+    },
+    "byProvider": [
+        {
+            "provider": "ANTHROPIC",
+            "state": "active",
+            "ratio": 0.91,
+            "metered": 910.0,
+            "billing": 1000.0,
+            "codingAssistantUsagePresent": True,
+            "billingCredentialConnected": True,
+        },
+        {
+            "provider": "CURSOR",
+            "state": "active",
+            "ratio": None,
+            "metered": 1088.34,
+            "billing": None,
+            "codingAssistantUsagePresent": True,
+            "billingCredentialConnected": False,
+        },
+    ],
+}
+
+# The rendering of COVERAGE_PAYLOAD (no BACK-2957 fields) frozen verbatim. AC 4
+# is a byte-for-byte guarantee about payloads from an older platform build, so
+# it is asserted against the literal text rather than re-derived from the code
+# under test.
+COVERAGE_ABSENT_FIELDS_RENDERING = """**Provider Metering Coverage — all providers**
+
+How much of what the providers billed was actually metered by Revenium. \
+Comparison window: 30d.
+
+**State**: OK
+
+**Aggregate**
+- Coverage ratio: 84.2%
+- Hidden spend (billed but not metered): 1234.5
+- Trend vs. the previous window: +2.5 pp
+- Confidence: HIGH
+
+**Coding-assistant usage**
+- Present: yes
+Coding-assistant usage is reported as a PRESENCE FLAG, not an amount. 'no' does \
+not prove there was no coding-assistant usage — a probe that cannot complete \
+also reports no.
+
+**By provider**
+Each row's share is that provider's portion of TOTAL billed spend, not its \
+coverage. Compare metered against billed within a row to see that provider's \
+gap. A row state of no-data means the provider reported nothing to compare.
+- ANTHROPIC [active] | share of billed spend=91.0% metered=910 billed=1000 \
+coding-assistant usage: yes
+- OPENAI [no-data] | share of billed spend=n/a metered=0 billed=0 \
+coding-assistant usage: no"""
+
+
 def _coverage_client(payload=None):
     """A client mock whose only exercised method is the coverage report read."""
     client = MagicMock()
@@ -1281,6 +1393,127 @@ class TestCoverageRatio:
         assert "get_coverage_ratio" in capabilities
         assert "get_coverage_ratio" in examples
 
+    # BACK-2957 — the scope fields. The aggregate ratio and hiddenSpend cover
+    # only the credentialed providers; the rest of the metered dollars are real
+    # and are reported apart. The rendering has to say so, and has to say
+    # nothing at all when an older platform build omits the fields.
+
+    @pytest.mark.asyncio
+    async def test_both_metered_totals_are_named_and_kept_apart(self, analytics_tool):
+        text = await self._render(analytics_tool, COVERAGE_SCOPE_PAYLOAD)
+        assert (
+            "- Metered spend inside the comparison (what the ratio and hidden spend "
+            "were computed from): 7057.33" in text
+        )
+        assert (
+            "- Metered spend outside the comparison (no billing credential to "
+            "compare against): 1088.34" in text
+        )
+        # AC 1: the outside total must not be read as hidden spend.
+        assert "outside the comparison is NOT hidden spend" in text
+
+    @pytest.mark.asyncio
+    async def test_uncredentialed_provider_row_is_labelled(self, analytics_tool):
+        text = await self._render(analytics_tool, COVERAGE_SCOPE_PAYLOAD)
+        cursor = next(line for line in text.split("\n") if line.startswith("- CURSOR"))
+        assert "| billing credential connected: no" in cursor
+        anthropic = next(
+            line for line in text.split("\n") if line.startswith("- ANTHROPIC")
+        )
+        assert "| billing credential connected: yes" in anthropic
+        assert "excluded from the aggregate ratio and from hidden spend" in text
+
+    @pytest.mark.asyncio
+    async def test_credential_flag_does_not_run_on_from_the_preceding_flag(
+        self, analytics_tool
+    ):
+        """Space-joined, the two yes/no pairs read as one phrase
+        ("usage: no billing credential connected: no")."""
+        text = await self._render(analytics_tool, COVERAGE_SCOPE_PAYLOAD)
+        assert "usage: no billing credential connected" not in text
+        assert "usage: yes billing credential connected" not in text
+
+    @pytest.mark.asyncio
+    async def test_metered_basis_names_the_window_and_spells_out_the_transform(
+        self, analytics_tool
+    ):
+        text = await self._render(analytics_tool, COVERAGE_SCOPE_PAYLOAD)
+        assert "**Metered basis**" in text
+        assert "- Metered window: 2026-08-03 to 2026-09-01" in text
+        assert "- Read from: postgres.profitstream_ai_metric" in text
+        assert "- Transform: billing-weighted-split, narrowed-window" in text
+        # AC 3: a transform other than none is spelled out, not left as a token.
+        assert "divided across several credentials by billing share" in text
+        assert "shorter window than requested" in text
+
+    @pytest.mark.asyncio
+    async def test_unrecognised_transform_token_is_still_surfaced(self, analytics_tool):
+        """A transform the platform adds after this build must stay visible:
+        swallowing it would report a reshaped figure as a plain row sum."""
+        payload = dict(COVERAGE_SCOPE_PAYLOAD)
+        payload["meteredBasis"] = {"transform": "some-future-reshape"}
+        text = await self._render(analytics_tool, payload)
+        assert "- Transform: some-future-reshape" in text
+        assert "a reshaping this client does not recognise" in text
+
+    @pytest.mark.asyncio
+    async def test_transform_none_is_stated_as_plain_row_sums(self, analytics_tool):
+        payload = dict(COVERAGE_SCOPE_PAYLOAD)
+        payload["meteredBasis"] = {
+            "windowStart": "2026-08-03",
+            "windowEnd": "2026-09-01",
+            "transform": "none",
+        }
+        text = await self._render(analytics_tool, payload)
+        assert "- Transform: none" in text
+        assert "exactly the sum of that provider's metered rows" in text
+
+    @pytest.mark.asyncio
+    async def test_absent_scope_fields_render_exactly_as_before(self, analytics_tool):
+        """AC 4 — an older payload carries none of these fields, and the report
+        must not grow a zero, an empty label or a headerless block for them."""
+        text = await self._render(analytics_tool)
+        assert "Metered spend inside the comparison" not in text
+        assert "Metered spend outside the comparison" not in text
+        assert "Metered basis" not in text
+        assert "billing credential connected" not in text
+        assert "NOT hidden spend" not in text
+
+    @pytest.mark.asyncio
+    async def test_absent_scope_fields_leave_the_text_byte_identical(
+        self, analytics_tool
+    ):
+        """Byte equality, not a substring check: a stray blank line or a
+        reordered bullet is still a change to an answer nobody asked to change."""
+        before = COVERAGE_ABSENT_FIELDS_RENDERING
+        after = await self._render(analytics_tool)
+        assert after == before
+
+    @pytest.mark.asyncio
+    async def test_zero_outside_comparison_total_is_reported_not_dropped(
+        self, analytics_tool
+    ):
+        """0 is a real answer here (every observed provider is credentialed) and
+        must survive the presence gate that keeps absence off the page."""
+        payload = dict(COVERAGE_SCOPE_PAYLOAD)
+        payload["meteredTotalOutsideComparison"] = 0
+        text = await self._render(analytics_tool, payload)
+        assert (
+            "- Metered spend outside the comparison (no billing credential to "
+            "compare against): 0" in text
+        )
+
+    @pytest.mark.asyncio
+    async def test_null_hidden_spend_is_unknown_not_zero(self, analytics_tool):
+        """hiddenSpend became nullable with the scope fields: a null is 'we did
+        not compute one', which a zero would report as 'nothing is unmetered'."""
+        payload = dict(COVERAGE_SCOPE_PAYLOAD)
+        payload["hiddenSpend"] = None
+        text = await self._render(analytics_tool, payload)
+        assert "- Hidden spend (billed but not metered): n/a" in text
+        # The outside-comparison total is a separate figure and stays a number.
+        assert "compare against): 1088.34" in text
+
     def test_removed_cost_field_is_referenced_nowhere_in_src(self):
         """BACK-2776 acceptance: the release replaced the cost field with a flag."""
         import pathlib
@@ -1450,3 +1683,154 @@ class TestCoerceNumericParam:
         with pytest.raises(ToolError) as exc:
             coerce_numeric_param({"x": None}, "x", action="t")
         assert exc.value.field == "x"
+
+
+class TestCapabilitiesCoverDispatch:
+    """BACK-2944: the capabilities text and the dispatch table must not drift apart.
+
+    get_filter_options (added by BACK-2377) was dispatchable, named in the tool description
+    and reachable, but absent from the get_capabilities listing - so an agent reading
+    capabilities to decide what the tool can do never learned the action existed.
+    """
+
+    @staticmethod
+    def _actions_named_in(capabilities_text):
+        """Action names the capabilities markdown advertises.
+
+        Entries are bolded and some group several actions on one line
+        (`**list_skills / get_skill**`), so split each bolded run on the slash.
+        """
+        return {
+            name.strip()
+            for bolded in re.findall(r"\*\*(.+?)\*\*", capabilities_text)
+            for name in bolded.split("/")
+        }
+
+    @pytest.mark.asyncio
+    async def test_every_dispatchable_action_is_listed(self, analytics_tool):
+        """Every action handle_action can route is advertised by get_capabilities."""
+        supported = set(await analytics_tool._get_supported_actions())
+        result = await analytics_tool.handle_action("get_capabilities", {})
+        listed = self._actions_named_in(result[0].text)
+
+        missing = sorted(supported - listed)
+        assert missing == [], (
+            "get_capabilities does not name these dispatchable actions: "
+            f"{missing}. Add them to the capabilities markdown in _handle_get_capabilities."
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_filter_options_is_listed(self, analytics_tool):
+        """The specific action the 2 September audit found missing."""
+        result = await analytics_tool.handle_action("get_capabilities", {})
+        assert "get_filter_options" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_capabilities_names_nothing_undispatchable(self, analytics_tool):
+        """The listing does not advertise an action handle_action cannot route.
+
+        Only names that look like actions are checked - the markdown also bolds prose
+        headings, which are not action names and are ignored here.
+        """
+        supported = set(await analytics_tool._get_supported_actions())
+        result = await analytics_tool.handle_action("get_capabilities", {})
+        action_shaped = {
+            name
+            for name in self._actions_named_in(result[0].text)
+            if re.fullmatch(r"(get|list|analyze)_[a-z_]+", name)
+        }
+        assert sorted(action_shaped - supported) == []
+
+    @pytest.mark.asyncio
+    async def test_legacy_api_variant_stays_consistent(self, analytics_tool):
+        """The non-new-api rendering strips get_user_costs from both surfaces together."""
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.business_analytics_management._use_new_api",
+            return_value=False,
+        ):
+            supported = set(await analytics_tool._get_supported_actions())
+            result = await analytics_tool.handle_action("get_capabilities", {})
+
+        listed = self._actions_named_in(result[0].text)
+        assert "get_user_costs" not in supported
+        assert sorted(supported - listed) == []
+
+
+class TestPerPersonSpendDecision:
+    """BACK-2765: per-person billed spend is intentionally unwrapped.
+
+    The decision is only useful if it stays where the next reader and the next
+    drift run look: in the module next to ``get_user_costs``, and in the text the
+    tool publishes about that action. These tests fail if either is dropped, so
+    the endpoint cannot quietly go back to looking like an oversight. If it is
+    ever wrapped, update the decision record and these tests together.
+    """
+
+    def test_module_records_the_decision_next_to_get_user_costs(self):
+        """The rationale lives in the module, naming the endpoint and the ticket."""
+        source = Path(business_analytics_module.__file__).read_text()
+        assert "Decision (BACK-2765)" in source
+        assert "/v2/api/billing/users" in source
+        marker = source.index("Decision (BACK-2765)")
+        handler = source.index("async def _handle_get_user_costs")
+        assert marker < handler, "the decision note must sit above the handler it explains"
+
+    @pytest.mark.asyncio
+    async def test_capabilities_say_per_person_spend_is_not_exposed(self, analytics_tool):
+        """A caller reading get_user_costs is told per-person billed spend is elsewhere.
+
+        The note sits inside the get_user_costs entry, which is stripped when the new
+        analytics API is off, so the surface is exercised with that action available.
+        """
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.business_analytics_management._use_new_api",
+            return_value=True,
+        ):
+            result = await analytics_tool.handle_action("get_capabilities", {})
+        text = result[0].text
+        assert "Per-person billed spend" in text
+        # Self-contained for MCP callers: the providers are named in the capability text
+        # itself rather than by reference to a source comment they cannot read.
+        assert "anthropic_enterprise" in text and "github_copilot" in text
+        assert "Decision (BACK-2765)" not in text
+
+    def test_no_call_site_module_targets_the_endpoint(self):
+        """Nothing in any call-site module calls /billing/users itself.
+
+        Reuses the consumed-operations derivation rather than grepping one file:
+        that script is what decides which paths the MCP is recorded as calling,
+        it already parses every module in ``CALL_SITE_MODULES`` with ``ast``, and
+        a wrapper added tomorrow could live in ``endpoint_registry.py`` or in a
+        module added to that tuple later. A line-based check on ``client.py``
+        alone would call the endpoint unconsumed while the derivation reported it
+        consumed.
+
+        A literal counts as a hit when it has the endpoint's segment count and
+        every segment either matches or is an f-string slot, so
+        ``f"/profitstream/v2/api/billing/{resource}"`` is caught alongside the
+        exact spelling. The ``vcs-pr-health`` sub-path is longer and therefore
+        never a hit; ``get_pr_health`` legitimately calls it.
+        """
+        derive = _load_script("derive_consumed_operations")
+        target = PER_PERSON_ENDPOINT.split("/")
+        allowed_subpath = f"{PER_PERSON_ENDPOINT}/vcs-pr-health"
+
+        hits = []
+        for module_name in derive.CALL_SITE_MODULES:
+            for literal in derive.collect_path_literals(derive.SRC_DIR / module_name):
+                if literal == allowed_subpath:
+                    continue
+                segments = literal.split("/")
+                if len(segments) != len(target):
+                    continue
+                if all(
+                    found == wanted or derive.SLOT in found
+                    for found, wanted in zip(segments, target)
+                ):
+                    hits.append(f"{module_name}: {literal}")
+
+        assert hits == [], (
+            f"{PER_PERSON_ENDPOINT} is recorded as intentionally unwrapped "
+            f"(BACK-2765) but these call sites reach it: {hits}. If it is now "
+            "wrapped on purpose, update the decision record and this test together."
+        )

@@ -10,11 +10,22 @@ Based on MCP specification:
 - Protocol version negotiation
 - Capability declaration and negotiation
 - Ping/pong support for connection liveness
+
+Scope note: this is a standalone helper, NOT the handshake the running server
+performs. `create_enhanced_server()` (`enhanced_server.py`) hands the wire
+protocol to FastMCP, which negotiates the pinned SDK's
+`LATEST_PROTOCOL_VERSION` (`mcp.types`) down per connection and declares
+capabilities from what is actually registered. Everything here is reached only
+through `MCPProtocolHandler` (`protocol_handler.py`) and this module's own
+tests, so its version list and capability declaration describe what this helper
+accepts, not what a client sees on the wire.
 """
 
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from loguru import logger
+from mcp.types import LATEST_PROTOCOL_VERSION as SDK_LATEST_PROTOCOL_VERSION
+from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
 
 from ..version import get_package_version
 from .error_handling import (
@@ -25,14 +36,28 @@ from .error_handling import (
 )
 
 
+# `instructions` was added to the initialize result in 2025-03-26, so only the
+# oldest era is excluded. Gating on the exclusion (rather than enumerating the
+# eras that get instructions) keeps this correct when a newer revision is added.
+PROTOCOL_VERSIONS_WITHOUT_INSTRUCTIONS = ["2024-11-05"]
+
+
 class MCPLifecycleManager:
     """Manages MCP protocol lifecycle including initialization and capability negotiation."""
 
-    # Supported MCP protocol versions
-    SUPPORTED_PROTOCOL_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18"]
+    # Latest protocol version (preferred) — tracked from the pinned SDK so an SDK
+    # bump cannot leave this helper advertising a superseded revision.
+    LATEST_PROTOCOL_VERSION: str = SDK_LATEST_PROTOCOL_VERSION
 
-    # Latest protocol version (preferred)
-    LATEST_PROTOCOL_VERSION = "2025-06-18"
+    # Every revision the pinned SDK itself accepts, oldest first: the legacy
+    # handshake eras plus the modern (2026-07-28+) ones. Derived rather than
+    # hardcoded — the hardcoded list this replaced had fallen two revisions behind
+    # the SDK, so this helper would have rejected both `2025-11-25` (what the
+    # mcptools CLI negotiates) and `2026-07-28` (what the server actually offers).
+    SUPPORTED_PROTOCOL_VERSIONS: List[str] = [
+        *HANDSHAKE_PROTOCOL_VERSIONS,
+        *MODERN_PROTOCOL_VERSIONS,
+    ]
 
     def __init__(self, server_name: str = "revenium-mcp", server_version: Optional[str] = None):
         """Initialize the MCP lifecycle manager.
@@ -141,8 +166,8 @@ class MCPLifecycleManager:
                 },
             }
 
-            # Add optional instructions for newer protocol versions
-            if protocol_version in ["2025-03-26", "2025-06-18"]:
+            # Add optional instructions for every era that carries the field
+            if protocol_version not in PROTOCOL_VERSIONS_WITHOUT_INSTRUCTIONS:
                 response["result"]["instructions"] = self._get_server_instructions()
 
             # Mark as initialized (but not ready until initialized notification)

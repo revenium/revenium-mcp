@@ -1015,9 +1015,15 @@ class CapabilityVerifier:
 
             discovery = CapabilityDiscovery(self.client)
 
-            # Get operators from the metering capabilities
-            metering_capabilities = await discovery._discover_metering_capabilities()
-            discovered_operators = set(metering_capabilities.get("operators", []))
+            # Route by resource type. Alert operators are the threshold operators
+            # AIAnomalyService accepts; metering operators are a different, unrelated
+            # set. Verifying alert operators against the metering list rejected every
+            # one of them, which is how "operators": [] reached agents.
+            if resource_type == "alerts":
+                source_capabilities = await discovery._discover_alert_capabilities()
+            else:
+                source_capabilities = await discovery._discover_metering_capabilities()
+            discovered_operators = set(source_capabilities.get("operators", []))
 
             if discovered_operators:
                 self._cache_capabilities("operators", discovered_operators, resource_type)

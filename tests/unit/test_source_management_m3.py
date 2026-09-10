@@ -732,7 +732,7 @@ class TestSourceManagementHandleActionExtended:
 
     @pytest.mark.asyncio
     async def test_create_auto_generate_unknown_type(self, source_mgmt):
-        """Auto-generate create with non-standard type still succeeds."""
+        """BACK-2937: a non-standard type is refused with the error flag set."""
         with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_client = _make_client()
             mock_client.create_source = AsyncMock(
@@ -744,12 +744,14 @@ class TestSourceManagementHandleActionExtended:
                 "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value",
                 return_value=None,
             ):
-                result = await source_mgmt.handle_action(
-                    "create",
-                    {"source_data": {"name": "DB Source", "type": "database"}},
-                )
+                with pytest.raises(ToolError) as exc_info:
+                    await source_mgmt.handle_action(
+                        "create",
+                        {"source_data": {"name": "DB Source", "type": "database"}},
+                    )
 
-        assert len(result) >= 1
+        assert "not a valid" in exc_info.value.message
+        mock_client.create_source.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_create_dry_run_explicit_config_mode(self, source_mgmt):

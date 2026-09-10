@@ -45,8 +45,8 @@ class TestOAuthRouting:
     async def test_initiate_oauth_generates_url(self, oauth_tool):
         with patch.object(oauth_tool, "get_client", return_value=AsyncMock()), \
              patch(
-                 "src.revenium_mcp_server.tools_decomposed.slack_oauth_workflow.get_config_value",
-                 return_value="https://ai.revenium.io",
+                 "src.revenium_mcp_server.tools_decomposed.slack_oauth_workflow._resolved_app_base_url",
+                 return_value="https://ai.dev.hcapp.io",
              ):
             result = await oauth_tool.handle_action("initiate_oauth", {})
         text = result[0].text
@@ -57,8 +57,8 @@ class TestOAuthRouting:
     async def test_initiate_oauth_custom_return_to(self, oauth_tool):
         with patch.object(oauth_tool, "get_client", return_value=AsyncMock()), \
              patch(
-                 "src.revenium_mcp_server.tools_decomposed.slack_oauth_workflow.get_config_value",
-                 return_value="https://ai.revenium.io",
+                 "src.revenium_mcp_server.tools_decomposed.slack_oauth_workflow._resolved_app_base_url",
+                 return_value="https://ai.dev.hcapp.io",
              ):
             result = await oauth_tool.handle_action(
                 "initiate_oauth", {"return_to": "/custom-page"}

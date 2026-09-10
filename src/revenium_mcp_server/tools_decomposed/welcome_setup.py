@@ -24,7 +24,10 @@ from ..common.error_handling import (
 from ..config_store import get_config_value
 from ..introspection.metadata import ToolCapability, ToolType
 from ..onboarding.detection_service import get_onboarding_state
-from ..onboarding.env_validation import validate_environment_variables
+from ..onboarding.env_validation import (
+    API_AUTH_REJECTED_MESSAGE,
+    validate_environment_variables,
+)
 from .unified_tool_base import ToolBase
 
 
@@ -654,18 +657,60 @@ Some configuration items need your attention to ensure optimal functionality.
         # System status
         checklist += "##  **System Status**\n\n"
 
-        api_works = validation_result.api_connectivity.get("status") == "success"
+        api_status = validation_result.api_connectivity.get("status")
+        api_works = api_status == "success"
         auto_discovery_works = validation_result.summary.get("auto_discovery_works", False)
 
-        checklist += f"{'[OK]' if api_works else '❌'} **API Connectivity**: {'Working' if api_works else 'Check API key and network'}\n"
+        if api_works:
+            api_connectivity_text = "Working"
+        elif api_status == "permission_denied":
+            # A forbidden read needs key-scope guidance, not network debugging.
+            # The error text comes from read_forbidden_detail() upstream, the
+            # single source of the key-scope wording.
+            api_connectivity_text = (
+                "Forbidden - the key cannot read data. "
+                + validation_result.api_connectivity.get(
+                    "error", "Verify the key and use one with read access"
+                )
+            )
+        elif api_status == "failed" and validation_result.api_connectivity.get("status_code") == 401:
+            # A rejected key needs the wait-and-retry-before-replacing guidance,
+            # not network debugging. The text comes from API_AUTH_REJECTED_MESSAGE
+            # upstream, the single source of the rejected-key wording.
+            api_connectivity_text = (
+                "Not accepted (HTTP 401) - "
+                + validation_result.api_connectivity.get("error", API_AUTH_REJECTED_MESSAGE)
+            )
+        else:
+            api_connectivity_text = "Check API key and network"
+        checklist += f"{'[OK]' if api_works else '❌'} **API Connectivity**: {api_connectivity_text}\n"
         checklist += f"{'[OK]' if auto_discovery_works else '⚠️'} **Auto-Discovery**: {'Working' if auto_discovery_works else 'Manual configuration required'}\n\n"
 
-        # Next steps
-        if not api_key_set or not team_id_set:
+        # Next steps. A failed read gates readiness too: without it, "Ready to
+        # Go!" would render directly under a Forbidden connectivity line.
+        # Only when the probe actually ran, though - a first-time user with no
+        # key configured (status not_attempted) has nothing to "restore" and
+        # needs the configure-variables path below instead.
+        if api_status in ("permission_denied", "failed", "error"):
+            checklist += "##**Next Steps**\n\n"
+            checklist += "1. Restore API read access - see the API Connectivity status above\n"
+            checklist += "2. Use `environment_status()` to see all variables\n"
+            checklist += "3. Run `setup_checklist()` again to verify\n"
+        elif not api_key_set or not team_id_set:
             checklist += "##**Next Steps**\n\n"
             checklist += "1. Configure required environment variables\n"
             checklist += "2. Use `environment_status()` to see all variables\n"
             checklist += "3. Run `setup_checklist()` again to verify\n"
+        elif not api_works:
+            # Everything looks configured but the probe never ran - the key can
+            # live in the config cache while missing from the environment the
+            # probe reads. Readiness cannot be claimed without a read.
+            checklist += "##**Next Steps**\n\n"
+            checklist += (
+                "1. API connectivity was not verified - the probe found no "
+                "REVENIUM_API_KEY in the process environment\n"
+            )
+            checklist += "2. Export REVENIUM_API_KEY, then run `setup_checklist()` again\n"
         elif not email_set or not slack_set:
             checklist += "##**Next Steps**\n\n"
             step_num = 1

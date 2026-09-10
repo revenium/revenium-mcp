@@ -329,6 +329,51 @@ class TestFrameworkLeakGuardMiddlewareIntegration:
             "caller-side parameter-mismatch error"
         )
 
+    @pytest.mark.asyncio
+    async def test_tool_body_validation_error_stays_a_tool_error(self):
+        """A tool-body ValidationError must reach the caller as an `isError`
+        tool result carrying the original validation detail — never as a
+        JSON-RPC protocol error.
+
+        BACK-2872: fastmcp 4 re-raises pydantic errors out of `_call_tool`
+        instead of masking them, which surfaced this case as
+        `-32602 Invalid request parameters` and blamed the caller for a
+        server-side fault. The guard re-wraps it to keep the fastmcp 3
+        envelope."""
+        from fastmcp import FastMCP, Client
+        from pydantic import BaseModel
+        from src.revenium_mcp_server.middleware.framework_leak_guard import (
+            FrameworkLeakGuardMiddleware,
+        )
+
+        class _InternalModel(BaseModel):
+            internal_field: int
+
+        srv = FastMCP("integration-test")
+
+        @srv.tool()
+        async def construct_internal(passthrough: str = "x") -> str:
+            _InternalModel(internal_field="not_an_int")
+            return passthrough
+
+        srv.add_middleware(FrameworkLeakGuardMiddleware())
+
+        async with Client(srv) as client:
+            # Must not raise: a protocol-level error would propagate out of
+            # call_tool even with raise_on_error=False.
+            result = await client.call_tool(
+                "construct_internal", {"passthrough": "ok"}, raise_on_error=False
+            )
+
+        assert result.is_error is True
+        text = result.content[0].text
+        # The original validation context survives translation.
+        assert "_InternalModel" in text
+        assert "internal_field" in text
+        # And it is not reframed as a caller-side parameter problem.
+        assert "is not a recognized parameter" not in text
+        assert "Invalid request parameters" not in text
+
     @staticmethod
     def _make_ctx(tool_name: str = "manage_products"):
         """Minimal MiddlewareContext stand-in for direct on_call_tool tests."""

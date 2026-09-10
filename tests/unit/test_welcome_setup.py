@@ -11,6 +11,7 @@ from datetime import datetime
 
 from mcp.types import TextContent
 
+from src.revenium_mcp_server.onboarding.env_validation import API_AUTH_REJECTED_MESSAGE
 from src.revenium_mcp_server.tools_decomposed.welcome_setup import WelcomeSetup
 
 
@@ -220,6 +221,120 @@ class TestSetupChecklist:
         text = result[0].text
         assert "API Key" in text
         assert "Team ID" in text
+
+    @pytest.mark.asyncio
+    async def test_permission_denied_gives_scope_guidance(self, welcome_tool):
+        """The welcome checklist names the key-scope cause, not the network (BACK-2839)."""
+        validation = _mock_validation_result(api_status="failed")
+        validation.api_connectivity = {
+            "status": "permission_denied",
+            "status_code": 403,
+            "error": "The API refused to let this key read data (HTTP 403)",
+        }
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_onboarding_state",
+            return_value=_mock_onboarding_state(),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.validate_environment_variables",
+            return_value=validation,
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_config_value",
+            side_effect=lambda key, *args: {
+                "REVENIUM_API_KEY": "rev_mk_key",
+                "REVENIUM_TEAM_ID": "team-1",
+                "REVENIUM_DEFAULT_EMAIL": None,
+                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": None,
+            }.get(key),
+        ):
+            result = await welcome_tool.handle_action("setup_checklist", {})
+        text = result[0].text
+        assert "Forbidden - the key cannot read data" in text
+        assert "Check API key and network" not in text
+        # The readiness verdict must not contradict the Forbidden line above it.
+        assert "Ready to Go!" not in text
+        assert "Restore API read access" in text
+
+    @pytest.mark.asyncio
+    async def test_401_names_the_rejected_key_case(self, welcome_tool):
+        """The welcome checklist carries the shared 401 wording (BACK-2841)."""
+        validation = _mock_validation_result(api_status="failed")
+        validation.api_connectivity = {
+            "status": "failed",
+            "status_code": 401,
+            "error": API_AUTH_REJECTED_MESSAGE,
+        }
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_onboarding_state",
+            return_value=_mock_onboarding_state(),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.validate_environment_variables",
+            return_value=validation,
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_config_value",
+            side_effect=lambda key, *args: {
+                "REVENIUM_API_KEY": "rev_sk_unknown",
+                "REVENIUM_TEAM_ID": "team-1",
+                "REVENIUM_DEFAULT_EMAIL": None,
+                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": None,
+            }.get(key),
+        ):
+            result = await welcome_tool.handle_action("setup_checklist", {})
+        text = result[0].text
+        assert "Not accepted (HTTP 401)" in text
+        assert API_AUTH_REJECTED_MESSAGE in text
+        assert "Check API key and network" not in text
+        assert "Ready to Go!" not in text
+
+    @pytest.mark.asyncio
+    async def test_first_time_user_gets_configure_not_restore(self, welcome_tool):
+        """No key configured means nothing to restore - point at configuration."""
+        validation = _mock_validation_result(api_status="failed")
+        validation.api_connectivity = {
+            "status": "not_attempted",
+            "error": "No API key available",
+        }
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_onboarding_state",
+            return_value=_mock_onboarding_state(),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.validate_environment_variables",
+            return_value=validation,
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_config_value",
+            side_effect=lambda key, *args: None,
+        ):
+            result = await welcome_tool.handle_action("setup_checklist", {})
+        text = result[0].text
+        assert "Configure required environment variables" in text
+        assert "Restore API read access" not in text
+
+    @pytest.mark.asyncio
+    async def test_cached_key_without_probe_is_not_ready(self, welcome_tool):
+        """A key visible only in the config cache must not yield Ready to Go."""
+        validation = _mock_validation_result(api_status="failed")
+        validation.api_connectivity = {
+            "status": "not_attempted",
+            "error": "No API key available",
+        }
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_onboarding_state",
+            return_value=_mock_onboarding_state(),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.validate_environment_variables",
+            return_value=validation,
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_config_value",
+            side_effect=lambda key, *args: {
+                "REVENIUM_API_KEY": "rev_sk_cached",
+                "REVENIUM_TEAM_ID": "team-1",
+                "REVENIUM_DEFAULT_EMAIL": "user@test.com",
+                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": "slack-1",
+            }.get(key),
+        ):
+            result = await welcome_tool.handle_action("setup_checklist", {})
+        text = result[0].text
+        assert "Ready to Go!" not in text
+        assert "API connectivity was not verified" in text
 
 
 class TestEnvironmentStatus:

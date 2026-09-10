@@ -2293,3 +2293,79 @@ class TestErrorRenderingSweep:
         assert "Asset" not in msg
         assert "Source" in msg
         assert "qx1yQqQ" in msg
+
+
+# ===========================================================================
+# BACK-3091 — the outcome PATCH must not be retried by the transport
+# ===========================================================================
+
+class TestAmendJobOutcomeIsNotRetried:
+    """Each amendment appends a JobOutcomeRevision row, and the operation
+    declares no idempotency key, so a transport retry after the origin has
+    already committed turns one amendment into two while the caller sees a
+    single success. `amend_job_outcome` therefore opts out of the retry loop —
+    `report_job_outcome` (POST) does not, and is left alone: the platform
+    answers a replayed report with "outcome already reported" rather than
+    recording a second one."""
+
+    def setup_method(self):
+        self.client = _client()
+
+    @pytest.mark.asyncio
+    async def test_amend_bypasses_the_retry_helper(self):
+        self.client._request = AsyncMock(return_value={"id": "j1", "entityVersion": 4})
+        self.client._request_with_retry = AsyncMock(return_value={"unused": True})
+
+        result = await self.client.amend_job_outcome("j1", {"outcomeValue": 1.0})
+
+        self.client._request_with_retry.assert_not_called()
+        self.client._request.assert_called_once()
+        assert self.client._request.call_args[0][0] == "PATCH"
+        assert self.client._request.call_args[0][1] == "/profitstream/v2/api/jobs/j1/outcome"
+        assert self.client._request.call_args.kwargs["json_data"] == {"outcomeValue": 1.0}
+        assert result["entityVersion"] == 4
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [503, 502, 500, 429, 408])
+    async def test_transient_failures_surface_instead_of_being_resent(self, status):
+        """Every status `_should_retry` would resend on must reach the caller
+        after exactly one attempt."""
+        self.client._request = AsyncMock(
+            side_effect=ReveniumAPIError("Transient", status_code=status)
+        )
+        self.client._request_with_retry = AsyncMock()
+
+        with pytest.raises(ReveniumAPIError) as exc_info:
+            await self.client.amend_job_outcome("j1", {"outcomeValue": 1.0})
+
+        assert exc_info.value.status_code == status
+        assert self.client._request.call_count == 1
+        self.client._request_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_409_still_reaches_the_caller(self):
+        """The optimistic-lock conflict is not a transport concern — it must
+        pass through for JobManager.amend_outcome to structure."""
+        self.client._request = AsyncMock(
+            side_effect=ReveniumAPIError(
+                "Outcome has changed since entity version 1; current version is 4",
+                status_code=409,
+            )
+        )
+
+        with pytest.raises(ReveniumAPIError) as exc_info:
+            await self.client.amend_job_outcome("j1", {"outcomeValue": 1.0})
+
+        assert exc_info.value.status_code == 409
+        assert self.client._request.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_report_job_outcome_keeps_the_shared_retry_path(self):
+        """Recorded, not changed: the POST is guarded by the platform's own
+        duplicate-outcome 409, so a replay is rejected rather than recorded."""
+        self.client._request_with_retry = AsyncMock(return_value={"status": "reported"})
+
+        await self.client.report_job_outcome("j1", {"executionStatus": "SUCCESS"})
+
+        self.client._request_with_retry.assert_called_once()
+        assert self.client._request_with_retry.call_args[0][0] == "POST"

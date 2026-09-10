@@ -1,10 +1,12 @@
 """Unit tests for Tool Registry Management tools.
 
 Tests the ToolManager and ToolManagement classes from the decomposed tools module.
-Covers CRUD (list, get, get_by_tool_id, create, update, replace, delete, restore, search),
+Covers CRUD (list, get, get_by_tool_id, create, update, replace, delete, search),
 event-metering (meter_event, list_events, record_event, get_events), and analytics actions
 including per-tool, aggregated, agent, provider, and filter options.
 """
+
+import pathlib
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -33,7 +35,6 @@ def mock_client():
     client.create_tool = AsyncMock()
     client.update_tool = AsyncMock()
     client.delete_tool = AsyncMock()
-    client.restore_tool = AsyncMock()
     client.search_tools = AsyncMock()
     client.meter_tool_event = AsyncMock()
     client.list_tool_events = AsyncMock()
@@ -331,20 +332,60 @@ class TestToolManagerDelete:
             await tool_manager.delete_tool({})
 
 
-class TestToolManagerRestore:
-    """Test ToolManager.restore_tool behavior."""
+class TestRestoreIsRetired:
+    """BACK-2935: restore never worked and is no longer advertised.
+
+    The Tool Registry API publishes no restore path, so the action promised a
+    recovery the platform cannot perform and every call came back as a raw
+    HTTP 404. The action is retired: it is absent from the advertised list and
+    invoking it explains that deletion is permanent.
+    """
 
     @pytest.mark.asyncio
-    async def test_restore_tool_calls_client(self, tool_manager, mock_client):
-        mock_client.restore_tool.return_value = {"id": "t1", "status": "active"}
-        result = await tool_manager.restore_tool({"tool_id": "t1"})
-        assert result["status"] == "active"
-        mock_client.restore_tool.assert_called_once_with("t1")
+    async def test_restore_absent_from_supported_actions(self, tool_mgmt):
+        assert "restore" not in await tool_mgmt._get_supported_actions()
 
     @pytest.mark.asyncio
-    async def test_restore_tool_missing_id_raises(self, tool_manager):
-        with pytest.raises(ToolError):
-            await tool_manager.restore_tool({})
+    async def test_restore_absent_from_advertised_action_enum(self, tool_mgmt):
+        schema = await tool_mgmt._get_input_schema()
+        assert "restore" not in schema["properties"]["action"]["enum"]
+
+    @pytest.mark.asyncio
+    async def test_restore_returns_structured_not_supported_error(self, tool_mgmt):
+        """No client is built for a retired action, so this needs no auth."""
+        with pytest.raises(ToolError) as excinfo:
+            await tool_mgmt.handle_action("restore", {"tool_id": "t1"})
+        error = excinfo.value
+        assert error.error_code == ErrorCodes.ACTION_NOT_SUPPORTED
+        assert "restore is not supported" in error.message
+        assert "permanent" in error.message
+        assert "404" not in error.message
+
+    def test_no_client_method_posts_a_tools_restore_path(self):
+        """The dead upstream call is gone, not merely unreachable."""
+        from src.revenium_mcp_server import client as client_module
+
+        source = pathlib.Path(client_module.__file__).read_text()
+        assert "/restore" not in source
+        assert not hasattr(client_module.ReveniumClient, "restore_tool")
+
+    @pytest.mark.asyncio
+    async def test_capabilities_do_not_promise_restore(self, tool_mgmt):
+        capabilities = await tool_mgmt._get_tool_capabilities()
+        crud = next(c for c in capabilities if c.name == "Tool CRUD Operations")
+        assert "restore" not in crud.parameters
+        assert not any("restore(" in example for example in crud.examples)
+        assert any("no restore endpoint" in limit for limit in crud.limitations)
+
+    @pytest.mark.asyncio
+    async def test_delete_result_warns_the_deletion_cannot_be_undone(
+        self, tool_mgmt, monkeypatch, mock_client
+    ):
+        mock_client.delete_tool.return_value = {"status": "deleted"}
+        monkeypatch.setattr(tool_mgmt, "get_client", AsyncMock(return_value=mock_client))
+        result = await tool_mgmt.handle_action("delete", {"tool_id": "t1"})
+        assert "permanent" in result[0].text
+        assert "no restore" in result[0].text
 
 
 class TestToolManagerSearch:
@@ -981,9 +1022,10 @@ class TestToolManagementHandleAction:
 
     @pytest.mark.asyncio
     async def test_unknown_action_returns_error(self, tool_mgmt):
-        result = await tool_mgmt.handle_action("nonexistent_action", {})
-        assert len(result) == 1
-        assert "Unknown action" in result[0].text
+        """BACK-2937: an unknown action raises so the envelope carries isError."""
+        with pytest.raises(ToolError) as exc_info:
+            await tool_mgmt.handle_action("nonexistent_action", {})
+        assert "Unknown action" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_get_pricing_help_dispatch(self, tool_mgmt):
@@ -1558,3 +1600,77 @@ class TestAgenticJobIdRejectionThroughTheRegisteredPath:
         assert "reserved" in text
         # The agent-facing surface is a formatted error, not a raised exception.
         assert "ReveniumAPIError" not in text or "400" in text
+
+
+# ===========================================================================
+# BACK-2936: advertised tool categories and the version field that was discarded
+# ===========================================================================
+
+
+class TestToolTypeEnumIsDerived:
+    """The advertised categories come from the contract, not from a typed copy."""
+
+    @pytest.mark.asyncio
+    async def test_advertised_categories_include_human(self, tool_mgmt):
+        """The platform persists HUMAN; the hand-typed list used to omit it."""
+        schema = await tool_mgmt._get_input_schema()
+        assert "HUMAN" in schema["properties"]["tool_data"]["properties"]["toolType"]["enum"]
+
+    @pytest.mark.asyncio
+    async def test_create_simple_tool_type_advertises_the_same_categories(self, tool_mgmt):
+        schema = await tool_mgmt._get_input_schema()
+        assert (
+            schema["properties"]["tool_type"]["enum"]
+            == schema["properties"]["tool_data"]["properties"]["toolType"]["enum"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_hand_typed_category_list_remains_in_the_module(self, tool_mgmt):
+        """A copied literal is how this drifted; keep it from coming back."""
+        from src.revenium_mcp_server.tools_decomposed import tool_management
+
+        source = pathlib.Path(tool_management.__file__).read_text()
+        assert "LOCAL_FUNCTION" not in source
+
+
+class TestToolVersionIsRefusedNotDiscarded:
+    """BACK-2936: the tool record has no version, so a version must not look accepted."""
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_version_in_tool_data(self, tool_manager, mock_client):
+        with pytest.raises(ToolError) as excinfo:
+            await tool_manager.create_tool(
+                {"tool_data": {"name": "T", "toolType": "HUMAN", "version": "1.0.0"}}
+            )
+        assert "version" in excinfo.value.message
+        mock_client.create_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_rejects_version_in_tool_data(self, tool_manager, mock_client):
+        with pytest.raises(ToolError) as excinfo:
+            await tool_manager.update_tool({"tool_id": "t1", "tool_data": {"version": "2.0.0"}})
+        assert "version" in excinfo.value.message
+        mock_client.update_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_simple_rejects_tool_version(self, tool_manager, mock_client):
+        with pytest.raises(ToolError) as excinfo:
+            await tool_manager.create_simple({"tool_name": "T", "tool_version": "1.0.0"})
+        assert "tool_version" in excinfo.value.message
+        mock_client.create_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_simple_rejects_empty_string_tool_version(self, tool_manager, mock_client):
+        # BACK-2936: presence, not truthiness. An empty string is still a caller
+        # asking for a field the platform does not store.
+        with pytest.raises(ToolError) as excinfo:
+            await tool_manager.create_simple({"tool_name": "T", "tool_version": ""})
+        assert "tool_version" in excinfo.value.message
+        mock_client.create_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_without_version_still_works(self, tool_manager, mock_client):
+        mock_client.create_tool.return_value = {"id": "t1"}
+        await tool_manager.create_tool({"tool_data": {"name": "T", "toolType": "HUMAN"}})
+        mock_client.create_tool.assert_called_once()
+        assert "version" not in mock_client.create_tool.call_args[0][0]

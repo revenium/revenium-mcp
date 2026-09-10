@@ -234,7 +234,7 @@ class TestParamReachesCompletionsApi:
         client.get = AsyncMock(
             return_value=_completions_response([{"transactionId": "tx-1"}])
         )
-        await self.mm._handle_analyze_recent_transactions(client, {"limit": 5})
+        await self.mm._handle_analyze_recent_transactions(client, {"page_size": 5})
         params = client.get.call_args_list[0][1]["params"]
         assert params["includeCodingAssistants"] is True
 
@@ -245,7 +245,7 @@ class TestParamReachesCompletionsApi:
             return_value=_completions_response([{"transactionId": "tx-1"}])
         )
         await self.mm._handle_analyze_recent_transactions(
-            client, {"limit": 5, "include_coding_assistants": False}
+            client, {"page_size": 5, "include_coding_assistants": False}
         )
         params = client.get.call_args_list[0][1]["params"]
         assert params["includeCodingAssistants"] is False
@@ -334,8 +334,8 @@ class TestScopeNoteInResponses:
     @pytest.mark.parametrize(
         "arguments,expected",
         [
-            ({"limit": 5}, "INCLUDED"),
-            ({"limit": 5, "include_coding_assistants": False}, "EXCLUDED"),
+            ({"page_size": 5}, "INCLUDED"),
+            ({"page_size": 5, "include_coding_assistants": False}, "EXCLUDED"),
         ],
     )
     async def test_analyze_states_scope(self, arguments, expected):
@@ -353,7 +353,7 @@ class TestScopeNoteInResponses:
         """An empty answer is the one most likely to be misread as 'no data'."""
         client = _make_client()
         client.get = AsyncMock(return_value=_completions_response([]))
-        result = await self.mm._handle_analyze_recent_transactions(client, {"limit": 5})
+        result = await self.mm._handle_analyze_recent_transactions(client, {"page_size": 5})
         text = result[0].text
         assert "No Recent Transactions" in text
         assert "**Scope**" in text

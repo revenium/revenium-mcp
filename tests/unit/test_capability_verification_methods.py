@@ -785,20 +785,45 @@ class TestVerifyOperatorCapability:
 
     @pytest.mark.asyncio
     async def test_discovery_service_success(self, verifier):
+        """Alert operators verify against alert discovery.
+
+        BACK-3085 — they used to be checked against the metering operator list,
+        an unrelated vocabulary that matched none of them, so every alert operator
+        failed verification and agents were handed "operators": [].
+        """
         mock_discovery = MagicMock()
-        mock_discovery._discover_metering_capabilities = AsyncMock(return_value={
-            "operators": ["GT", "LT", "EQ", "GTE"]
+        mock_discovery._discover_alert_capabilities = AsyncMock(return_value={
+            "operators": ["GREATER_THAN", "LESS_THAN", "GREATER_THAN_OR_EQUAL_TO"]
         })
         with patch(
             DISCOVERY_PATCH,
             return_value=mock_discovery,
         ):
-            assert await verifier._verify_operator_capability("alerts", "GTE") is True
+            assert (
+                await verifier._verify_operator_capability(
+                    "alerts", "GREATER_THAN_OR_EQUAL_TO"
+                )
+                is True
+            )
+
+    @pytest.mark.asyncio
+    async def test_metering_operators_still_verify_against_metering_discovery(
+        self, verifier
+    ):
+        mock_discovery = MagicMock()
+        mock_discovery._discover_metering_capabilities = AsyncMock(return_value={
+            "operators": ["GT", "LT"]
+        })
+        with patch(
+            DISCOVERY_PATCH,
+            return_value=mock_discovery,
+        ):
+            assert await verifier._verify_operator_capability("metering", "GT") is True
 
     @pytest.mark.asyncio
     async def test_discovery_empty_raises(self, verifier):
         mock_discovery = MagicMock()
-        mock_discovery._discover_metering_capabilities = AsyncMock(return_value={
+        mock_discovery._discover_alert_capabilities = AsyncMock(return_value={
             "operators": []
         })
         with patch(
@@ -1162,7 +1187,7 @@ class TestDiscoveryCachingSideEffects:
     @pytest.mark.asyncio
     async def test_operator_discovery_caches(self, verifier):
         mock_discovery = MagicMock()
-        mock_discovery._discover_metering_capabilities = AsyncMock(return_value={
+        mock_discovery._discover_alert_capabilities = AsyncMock(return_value={
             "operators": ["GT", "LT"]
         })
         with patch(

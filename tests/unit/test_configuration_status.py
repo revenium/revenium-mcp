@@ -9,6 +9,7 @@ import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from mcp.types import TextContent
 
+from src.revenium_mcp_server.onboarding.env_validation import API_AUTH_REJECTED_MESSAGE
 from src.revenium_mcp_server.tools_decomposed.configuration_status import (
     ConfigurationStatus,
 )
@@ -426,3 +427,113 @@ class TestBuildSystemHealthSummary:
         text = config_tool._build_system_health_summary(validation, state)
         assert "NEEDS ATTENTION" in text
         assert "Clerk OAuth" in text
+
+    def _make_forbidden_validation(self, detail=None):
+        """API-key mode where the key authenticates but every read is forbidden."""
+        result = MagicMock()
+        result.summary = {
+            "auth_mode": "api_key",
+            "overall_status": False,
+            "api_key_available": True,
+            "direct_api_works": False,
+            "api_read_forbidden": True,
+            "api_read_forbidden_detail": detail,
+            "auth_config_works": True,
+            "auto_discovery_works": True,
+        }
+        return result
+
+    def test_forbidden_read_is_not_production_ready(self, config_tool):
+        """A 403 probe must never yield a READY verdict or a full critical score."""
+        state = self._make_state()
+        validation = self._make_forbidden_validation(
+            detail="The API refused to let this key read data (HTTP 403) - check the key scope."
+        )
+        text = config_tool._build_system_health_summary(validation, state)
+        assert "[READY] System is ready for production use" not in text
+        assert "[NOT READY]" in text
+        assert "NEEDS ATTENTION" in text
+        assert "EXCELLENT" not in text
+        # One of two critical checks passes.
+        assert "Critical: 1/2" in text
+
+    def test_forbidden_read_surfaces_the_key_scope_cause(self, config_tool):
+        """The scope-specific detail replaces the generic connectivity message."""
+        state = self._make_state()
+        validation = self._make_forbidden_validation(
+            detail="metering-scope key (rev_mk_ prefix) cannot read analytics"
+        )
+        text = config_tool._build_system_health_summary(validation, state)
+        assert "metering-scope key (rev_mk_ prefix) cannot read analytics" in text
+        assert "API connectivity failed - check network and authentication" not in text
+        assert (
+            "Forbidden - the key cannot read data (wrong scope or unrecognized key)" in text
+        )
+        # The remediation names the cause instead of generic setup advice.
+        assert "Verify REVENIUM_API_KEY and replace it with a key that has read access" in text
+
+    def test_forbidden_read_without_detail_falls_back_to_scope_message(self, config_tool):
+        """Missing detail still explains the key-scope cause, not a network failure."""
+        state = self._make_state()
+        validation = self._make_forbidden_validation(detail=None)
+        text = config_tool._build_system_health_summary(validation, state)
+        assert "rev_mk_" in text
+        assert "API connectivity failed - check network and authentication" not in text
+
+    def test_plain_connectivity_failure_keeps_generic_message(self, config_tool):
+        """Without the forbidden flag the generic connectivity diagnostic is unchanged."""
+        state = self._make_state()
+        validation = self._make_validation(api_key=True, api_works=False)
+        text = config_tool._build_system_health_summary(validation, state)
+        assert "API connectivity failed - check network and authentication" in text
+        assert "cannot read data" not in text
+
+    def _make_auth_rejected_validation(self, detail=None):
+        """API-key mode where the platform did not accept the configured key (401)."""
+        result = MagicMock()
+        result.summary = {
+            "auth_mode": "api_key",
+            "overall_status": False,
+            "api_key_available": True,
+            "direct_api_works": False,
+            "api_read_forbidden": False,
+            "api_read_forbidden_detail": None,
+            "api_auth_rejected": True,
+            "api_auth_rejected_detail": detail,
+            "auth_config_works": True,
+            "auto_discovery_works": True,
+        }
+        return result
+
+    def test_rejected_key_is_not_production_ready(self, config_tool):
+        """A 401 probe must never yield a READY verdict (BACK-2841)."""
+        state = self._make_state()
+        validation = self._make_auth_rejected_validation(detail=API_AUTH_REJECTED_MESSAGE)
+        text = config_tool._build_system_health_summary(validation, state)
+        assert "[READY] System is ready for production use" not in text
+        assert "[NOT READY]" in text
+        assert "NEEDS ATTENTION" in text
+        assert "Critical: 1/2" in text
+
+    def test_rejected_key_surfaces_the_shared_401_wording(self, config_tool):
+        """The 401 detail replaces the generic connectivity message (BACK-2841)."""
+        state = self._make_state()
+        validation = self._make_auth_rejected_validation(detail=API_AUTH_REJECTED_MESSAGE)
+        text = config_tool._build_system_health_summary(validation, state)
+        assert API_AUTH_REJECTED_MESSAGE in text
+        assert "API connectivity failed - check network and authentication" not in text
+        assert "Rejected - the platform did not accept the key (HTTP 401)" in text
+        # The remediation says wait and retry before replacing the key.
+        assert (
+            "Wait a moment and retry before replacing REVENIUM_API_KEY" in text
+        )
+        # The 403 wording must not leak into the 401 case.
+        assert "The API refused to let this key read data" not in text
+
+    def test_rejected_key_without_detail_falls_back_to_shared_message(self, config_tool):
+        """Missing detail still explains the rejected-key case, not a network failure."""
+        state = self._make_state()
+        validation = self._make_auth_rejected_validation(detail=None)
+        text = config_tool._build_system_health_summary(validation, state)
+        assert API_AUTH_REJECTED_MESSAGE in text
+        assert "API connectivity failed - check network and authentication" not in text

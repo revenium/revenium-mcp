@@ -4,7 +4,7 @@ This tool provides comprehensive setup completion status using existing validati
 infrastructure from config_store.py and slack_setup_assistant patterns.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
@@ -23,7 +23,10 @@ from ..common.error_handling import (
 from ..config_store import get_config_value
 from ..introspection.metadata import ToolCapability, ToolType
 from ..onboarding.detection_service import get_onboarding_state
-from ..onboarding.env_validation import validate_environment_variables
+from ..onboarding.env_validation import (
+    API_AUTH_REJECTED_MESSAGE,
+    validate_environment_variables,
+)
 from .unified_tool_base import ToolBase
 
 
@@ -395,7 +398,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
     def _build_complete_checklist(self, onboarding_state, validation_result, slack_status) -> str:
         """Build complete setup checklist."""
         checklist = "# **Complete Setup Checklist**\n\n"
-        checklist += f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+        checklist += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
         checklist += f"**First-time User**: {'Yes' if onboarding_state.is_first_time else 'No'}\n\n"
 
         # Overall status
@@ -454,10 +457,28 @@ Comprehensive setup status verification and configuration guidance for Revenium 
         # System status
         checklist += "## **System Status**\n\n"
 
-        api_works = validation_result.api_connectivity.get("status") == "success"
+        api_status = validation_result.api_connectivity.get("status")
+        api_works = api_status == "success"
         checklist += f"{'[OK]' if api_works else '❌'} **API Connectivity**\n"
         if api_works:
             checklist += "   - Status: Working - API calls successful\n"
+        elif api_status == "permission_denied":
+            # A forbidden read is not a connectivity problem: pointing the user
+            # at the network would send them debugging the wrong thing. The
+            # error text comes from read_forbidden_detail() upstream, the single
+            # source of the key-scope wording.
+            api_error = validation_result.api_connectivity.get("error", "Read access denied")
+            checklist += "   - Status: Forbidden - no data could be read\n"
+            checklist += f"   - Action: {api_error}\n"
+        elif api_status == "failed" and validation_result.api_connectivity.get("status_code") == 401:
+            # A rejected key is not a network fault, and it is not yet proof that
+            # the key is wrong. The wording comes from API_AUTH_REJECTED_MESSAGE
+            # upstream, the single source of the rejected-key guidance.
+            api_error = validation_result.api_connectivity.get(
+                "error", API_AUTH_REJECTED_MESSAGE
+            )
+            checklist += "   - Status: Failed - the key was not accepted (HTTP 401)\n"
+            checklist += f"   - Action: {api_error}\n"
         else:
             api_error = validation_result.api_connectivity.get("error", "Unknown error")
             checklist += f"   - Status: ❌ Failed - {api_error}\n"
@@ -474,11 +495,31 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             checklist += "   - Action: Ensure API connectivity for auto-discovery\n"
         checklist += "\n"
 
-        # Next steps
-        if not api_key_set or not team_id_set:
+        # Next steps. A failed read gates readiness too: without it, "Setup
+        # Complete!" would render directly under a Forbidden connectivity line.
+        # Only when the probe actually ran, though - a first-time user with no
+        # key configured (status not_attempted) has nothing to "restore" and
+        # needs the configure-variables path below instead.
+        if api_status in ("permission_denied", "failed", "error"):
+            checklist += "## **Critical Next Steps**\n\n"
+            checklist += "1. Restore API read access - see the API Connectivity status above\n"
+            checklist += "2. Test API connectivity with debug_auto_discovery()\n"
+            checklist += "3. Run setup_checklist() again to verify\n"
+        elif not api_key_set or not team_id_set:
             checklist += "## **Critical Next Steps**\n\n"
             checklist += "1. Configure required environment variables (API key, Team ID)\n"
             checklist += "2. Test API connectivity with debug_auto_discovery()\n"
+            checklist += "3. Run setup_checklist() again to verify\n"
+        elif not api_works:
+            # Everything looks configured but the probe never ran - the key can
+            # live in the config cache while missing from the environment the
+            # probe reads. Completeness cannot be claimed without a read.
+            checklist += "## **Critical Next Steps**\n\n"
+            checklist += (
+                "1. API connectivity was not verified - the probe found no "
+                "REVENIUM_API_KEY in the process environment\n"
+            )
+            checklist += "2. Export REVENIUM_API_KEY, then test with debug_auto_discovery()\n"
             checklist += "3. Run setup_checklist() again to verify\n"
         elif not email_set or not slack_configured:
             checklist += "## **Recommended Next Steps**\n\n"
@@ -503,7 +544,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
     def _build_requirements_checklist(self, validation_result) -> str:
         """Build requirements-only checklist."""
         requirements = "# **Required Configuration Checklist**\n\n"
-        requirements += f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+        requirements += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
         # Check required variables
         required_vars = [
@@ -560,7 +601,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
     def _build_optional_checklist(self, validation_result, slack_status) -> str:
         """Build optional/recommended items checklist."""
         optional = "# **Optional & Recommended Configuration**\n\n"
-        optional += f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+        optional += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
         # Email configuration
         email_set = bool(get_config_value("REVENIUM_DEFAULT_EMAIL"))
@@ -649,7 +690,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
                 Data Ingestion section is omitted when None
         """
         system = "#  **System Status & Connectivity**\n\n"
-        system += f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+        system += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
         # API connectivity
         api_result = validation_result.api_connectivity
@@ -662,11 +703,23 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             status_code = api_result.get("status_code", "unknown")
             system += f"**Response Code**: {status_code}\n"
             system += "**Test**: Successfully called /users/me endpoint\n"
+        elif api_status == "permission_denied":
+            # The key reached the API but read nothing - report the scope cause,
+            # not a connection failure and not "not tested".
+            system += "[FAIL] **Status**: Forbidden - no data could be read\n"
+            status_code = api_result.get("status_code", "unknown")
+            system += f"**Response Code**: {status_code}\n"
+            system += f"**Reason**: {api_result.get('error', 'Read access denied')}\n"
         elif api_status == "failed":
             system += "❌ **Status**: Connection failed\n"
             status_code = api_result.get("status_code", "unknown")
             system += f"**Response Code**: {status_code}\n"
-            error_response = api_result.get("response", "Unknown error")
+            # The probe reports its wording under "error"; it never sets "response",
+            # so reading that key dropped the 401 guidance from this view entirely.
+            default_error = (
+                API_AUTH_REJECTED_MESSAGE if status_code == 401 else "Unknown error"
+            )
+            error_response = api_result.get("error", default_error)
             system += f"**Error**: {error_response}\n"
         elif api_status == "error":
             system += "❌ **Status**: Connection error\n"
@@ -686,7 +739,16 @@ Comprehensive setup status verification and configuration guidance for Revenium 
         system += "##  **Authentication Configuration**\n\n"
 
         if auth_status == "success":
-            system += "[OK] **Status**: Authentication working\n"
+            # test_auth_config's "success" only proves the key is configured
+            # locally; whether it authenticates is the live probe's verdict, so
+            # this line must never certify more than that probe showed.
+            if api_status == "success":
+                system += "[OK] **Status**: Authentication working\n"
+            else:
+                system += (
+                    "[WARN] **Status**: Key configured, but not verified by the live "
+                    "probe - see API Connectivity above\n"
+                )
             config = auth_result.get("config", {})
             system += f"**Team ID**: {config.get('team_id', 'Unknown')}\n"
             system += f"**Tenant ID**: {config.get('tenant_id', 'Auto-discovered')}\n"
@@ -769,7 +831,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
     def _build_recommendations(self, onboarding_state) -> str:
         """Build personalized recommendations based on setup status."""
         recommendations = "#  **Personalized Setup Recommendations**\n\n"
-        recommendations += f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+        recommendations += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
         setup_completion = onboarding_state.setup_completion
         user_recommendations = onboarding_state.recommendations

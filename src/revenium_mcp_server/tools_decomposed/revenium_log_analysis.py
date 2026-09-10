@@ -33,6 +33,20 @@ from .log_filters import LogFilter
 from .log_formatters import LogResponseFormatter
 from .unified_tool_base import ToolBase
 
+# The attribution-detail-text flag has no published read-only endpoint: the
+# platform hides GET /v2/api/tenants/{id} from its API contract, so the only
+# two places it reports the value are the responses of this PATCH and of the
+# sibling strict-ingestion-mode PATCH. (The hidden route still answered on dev
+# when this was written; it is deliberately not wrapped, because an
+# undocumented route can be withdrawn without a contract change.) A caller who
+# wants to check the setting without changing it has nowhere to look, which is
+# worth saying on the response rather than leaving them to discover it.
+ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE = (
+    "Reading this flag: the platform publishes no read-only endpoint for it "
+    "(the tenant GET is hidden from the API contract), so this response and "
+    "the set_strict_ingestion_mode response are the only places it is reported."
+)
+
 
 class ReveniumLogAnalysis(ToolBase):
     """Revenium Log Analysis Tool.
@@ -43,7 +57,7 @@ class ReveniumLogAnalysis(ToolBase):
 
     tool_name: ClassVar[str] = "revenium_log_analysis"
     tool_description: ClassVar[str] = (
-        "Revenium log analysis for system troubleshooting and diagnostic investigation. Key actions: get_internal_logs, get_integration_logs, get_recent_logs, search_logs, analyze_operations, get_ingestion_failures, set_strict_ingestion_mode. Default size: 200 records (max: 1000). Use get_examples() for usage guidance and get_capabilities() for status."
+        "Revenium log analysis for system troubleshooting and diagnostic investigation. Key actions: get_internal_logs, get_integration_logs, get_recent_logs, search_logs, analyze_operations, get_ingestion_failures, set_strict_ingestion_mode, set_attribution_detail_text. Default size: 200 records (max: 1000). Use get_examples() for usage guidance and get_capabilities() for status."
     )
     business_category: ClassVar[str] = "System & Monitoring Tools"
     tool_type: ClassVar[ToolType] = ToolType.UTILITY
@@ -400,6 +414,8 @@ No log entries found for analysis. This may be expected for integration logs.
             return await self._handle_get_ingestion_failures(arguments, ctx=ctx)
         elif action == "set_strict_ingestion_mode":
             return await self._handle_set_strict_ingestion_mode(arguments, ctx=ctx)
+        elif action == "set_attribution_detail_text":
+            return await self._handle_set_attribution_detail_text(arguments, ctx=ctx)
         else:
             return await self._handle_unsupported_action(action)
 
@@ -635,10 +651,34 @@ No log entries found for analysis. This may be expected for integration logs.
             )
             new_state = result.get("strictIngestionMode")
             new_allow_ticket_jobs = result.get("strictIngestionAllowTicketJobs")
+            # Same tenant resource, so this PATCH echoes the
+            # attribution-detail-text flag too, and this is one of only two
+            # responses that carry it (see
+            # ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE). The line is therefore
+            # built BEFORE the missing-strict-state branch below and rendered
+            # by both: a response carrying the flag but not strictIngestionMode
+            # has told the caller exactly one thing, and dropping it there
+            # would lose state nothing else can report.
+            attribution_detail_text = result.get("attributionDetailTextEnabled")
+            attribution_line = (
+                f"- **Attribution detail text**: "
+                f"{'enabled' if attribution_detail_text else 'disabled'}\n"
+                if isinstance(attribution_detail_text, bool)
+                else ""
+            )
+            attribution_note = (
+                f"\n\n{ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE}" if attribution_line else ""
+            )
             if not isinstance(new_state, bool):
                 # The PATCH succeeded but the response did not carry the
                 # field — report that honestly instead of echoing the
                 # requested value back as the server's confirmed state.
+                reported_attribution = (
+                    f"\n\nThe response did carry the tenant's other setting:\n\n"
+                    f"{attribution_line}"
+                    if attribution_line
+                    else ""
+                )
                 return [
                     TextContent(
                         type="text",
@@ -647,6 +687,8 @@ No log entries found for analysis. This may be expected for integration logs.
                             "The server accepted the request but its response did not include "
                             "strictIngestionMode, so the resulting state could not be verified. "
                             "Check the tenant's current state before relying on it."
+                            + reported_attribution
+                            + attribution_note
                         ),
                     )
                 ]
@@ -673,8 +715,10 @@ No log entries found for analysis. This may be expected for integration logs.
                         f"**Strict Ingestion Mode Updated**\n\n"
                         f"- **State**: {'enabled' if new_state else 'disabled'}\n"
                         f"{ticket_jobs_line}"
+                        f"{attribution_line}"
                         f"- **Tenant**: {result.get('id', 'current')}\n\n"
                         + follow_up
+                        + attribution_note
                     ),
                 )
             ]
@@ -689,6 +733,98 @@ No log entries found for analysis. This may be expected for integration logs.
                 message=f"Failed to toggle strict ingestion mode: {str(e)}",
                 error_code=ErrorCodes.API_ERROR,
                 field="strict_ingestion_mode",
+                suggestions=[
+                    "Verify the tenant id is available (auto-discovered from the API key)",
+                    "Check that your API key can manage the tenant",
+                ],
+            )
+
+    async def _handle_set_attribution_detail_text(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Turn the tenant's free-text attribution detail on or off.
+
+        The flag decides whether the platform stores and serves the free-text
+        `reason` on coding-assistant session attributions. While it is off (the
+        platform default) an attribution POST carrying a reason still succeeds
+        and still records the attribution - the text is stored as null and
+        never returned, and the response says the note was suppressed.
+
+        Unlike set_strict_ingestion_mode this action takes no confirm: there is
+        no irreversible consequence to preview. It rejects nothing, deletes
+        nothing (text already stored survives being switched off), leaves
+        structured attribution untouched, and the opposite value undoes it in
+        one call. The state it reports is the one the server returned, never
+        the requested value.
+        """
+        enabled = arguments.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ToolError(
+                message="set_attribution_detail_text requires 'enabled' (boolean)",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="enabled",
+                value=enabled,
+                suggestions=[
+                    "Pass enabled=true to let the tenant store and serve the "
+                    "free-text attribution reason",
+                    "Pass enabled=false to stop storing and serving it "
+                    "(the platform default)",
+                ],
+            )
+
+        try:
+            client = await self.get_client(ctx=ctx)
+            result = await client.set_attribution_detail_text(enabled)
+            new_state = result.get("attributionDetailTextEnabled")
+            if not isinstance(new_state, bool):
+                # The PATCH succeeded but the response did not carry the
+                # field. Report that instead of echoing the requested value
+                # back as the server's confirmed state - and there is no read
+                # endpoint to fall back on.
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            "**Attribution Detail Text - change accepted, state not "
+                            "confirmed**\n\nThe server accepted the request but its "
+                            "response did not include attributionDetailTextEnabled, so "
+                            "the resulting state could not be verified.\n\n"
+                            + ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE
+                        ),
+                    )
+                ]
+            follow_up = (
+                "Free-text reasons sent with a coding-assistant session attribution "
+                "are now stored and returned on the read path."
+                if new_state
+                else "Free-text reasons are now dropped: an attribution POST carrying "
+                "one still succeeds and still records the structured attribution, but "
+                "the text is stored as null and the response reports it as suppressed. "
+                "Text stored while the setting was on is not deleted, only withheld "
+                "from the read path."
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"**Attribution Detail Text Updated**\n\n"
+                        f"- **State**: {'enabled' if new_state else 'disabled'}\n"
+                        f"- **Tenant**: {result.get('id', 'current')}\n\n"
+                        f"{follow_up}\n\n" + ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE
+                    ),
+                )
+            ]
+        except ToolError:
+            raise
+        except PermissionError:
+            # Auth failures must fail closed - never mask as a tool-error envelope.
+            raise
+        except Exception as e:
+            logger.error(f"Failed to set attribution detail text: {e}")
+            raise ToolError(
+                message=f"Failed to set attribution detail text: {str(e)}",
+                error_code=ErrorCodes.API_ERROR,
+                field="attribution_detail_text",
                 suggestions=[
                     "Verify the tenant id is available (auto-discovered from the API key)",
                     "Check that your API key can manage the tenant",

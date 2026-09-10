@@ -24,6 +24,7 @@ from ..common.error_handling import (
     ToolError,
     create_structured_missing_parameter_error,
     create_structured_validation_error,
+    raise_refusal,
 )
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.update_configs import UpdateConfigFactory
@@ -206,6 +207,58 @@ def _validate_subscriptions_pagination(page: Any, size: Any) -> None:
                 "Paginate with larger page numbers instead of oversized page sizes.",
             ],
         )
+
+
+# BACK-2944: the invoice address is documented as an email address, so reject anything
+# that is not one locally instead of forwarding it to the platform, which derives a user
+# from whatever string it is handed. Same pattern as the email checks in models.py.
+_CLIENT_EMAIL_PATTERN = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+
+
+def _validate_client_email_address(client_email: Any) -> Any:
+    """Validate clientEmailAddress and return the value the platform should receive.
+
+    Args:
+        client_email: The clientEmailAddress value supplied by the caller. A falsy value is
+            returned untouched - the required-field checks own that case and produce a
+            better message.
+
+    Returns:
+        The address with surrounding whitespace removed. The platform derives a client
+        user from exactly what it receives, so a padded address must not leave as-is.
+
+    Raises:
+        ToolError: VALIDATION_ERROR when the value is present but not a valid email address.
+    """
+    if not client_email:
+        return client_email
+
+    if not isinstance(client_email, str) or not _CLIENT_EMAIL_PATTERN.match(client_email.strip()):
+        raise create_structured_validation_error(
+            message=f"clientEmailAddress '{client_email}' is not a valid email address",
+            field="clientEmailAddress",
+            value=client_email,
+            suggestions=[
+                "Provide a full email address, for example user@company.com",
+                "The invoice address must be an address the customer can actually receive mail at",
+                "Check for a missing @ sign, a missing domain, or a typo in the domain",
+            ],
+            examples={
+                "correct_usage": "create(subscription_data={'product_id': 'prod_123', 'clientEmailAddress': 'user@company.com'})",
+                "valid_examples": [
+                    "user@company.com",
+                    "billing@organization.com",
+                ],
+                "billing_safety": "BILLING SAFETY: invoices are sent to this address, so it must be a real email address",
+            },
+        )
+    return client_email.strip()
+
+
+def _normalize_client_email_field(data: Dict[str, Any]) -> None:
+    """Validate and trim data["clientEmailAddress"] in place when the key is present."""
+    if "clientEmailAddress" in data:
+        data["clientEmailAddress"] = _validate_client_email_address(data["clientEmailAddress"])
 
 
 class SubscriptionManager:
@@ -407,7 +460,14 @@ class SubscriptionManager:
             _sanitize_undefined_sentinels(subscription)
             return subscription
         except ReveniumAPIError as e:
-            if e.status_code == 404:
+            # BACK-2938: the platform answers 403 for an id that does not exist
+            # as well as for one owned by another team, and a bare "HTTP 403:
+            # Access Denied" reads as a permissions problem the caller could
+            # fix. Both mean this id resolves to no subscription this API key
+            # can read, so they fold into one named not-found whose suggestions
+            # cover the team-scoping case. Same mapping as
+            # _raise_billing_read_not_found and AlertManager.get_alert.
+            if e.status_code in (403, 404):
                 raise ToolError(
                     message=f"Subscription not found for id: {subscription_id}",
                     error_code=ErrorCodes.RESOURCE_NOT_FOUND,
@@ -416,6 +476,7 @@ class SubscriptionManager:
                     suggestions=[
                         "Verify the subscription ID exists using list()",
                         "Check if the subscription was recently deleted or cancelled",
+                        "Confirm your API key's team owns this subscription (reads are team-scoped)",
                         "Use get_examples() to see valid subscription ID formats",
                         "🔒 BILLING SAFETY: Ensure subscription ID is correct to avoid billing errors",
                     ],
@@ -659,6 +720,8 @@ class SubscriptionManager:
                     "REVENIUM_OWNER_ID not available from configuration store, API will use default owner"
                 )
 
+        _normalize_client_email_field(subscription_data)
+
         result = await self.client.create_subscription(subscription_data)
         # BACK-1311: normalize nested `"undefined"` placeholders + locale dates.
         _sanitize_undefined_sentinels(result)
@@ -692,6 +755,10 @@ class SubscriptionManager:
                     "billing_safety": "🔒 BILLING SAFETY: Partial updates preserve existing subscription configuration while changing specific fields",
                 },
             )
+
+        # A partial update can rewrite the billing identity, so it gets the same check the
+        # create paths do. An update that does not touch the field is left alone.
+        _normalize_client_email_field(subscription_data)
 
         # Get update configuration for subscriptions
         config = self.update_config_factory.get_config("subscriptions")
@@ -1151,7 +1218,7 @@ class SubscriptionManager:
         )
 
         # Validate required parameters
-        self._validate_simple_required_parameters(product_id, client_email)
+        client_email = self._validate_simple_required_parameters(product_id, client_email)
 
         # Validate product existence and availability
         await self._validate_simple_product(product_id)
@@ -1187,8 +1254,11 @@ class SubscriptionManager:
 
     def _validate_simple_required_parameters(
         self, product_id: str, client_email: str
-    ) -> None:
-        """Validate required parameters for simple subscription creation."""
+    ) -> str:
+        """Validate required parameters for simple subscription creation.
+
+        Returns the client email trimmed, which is the value the platform must receive.
+        """
         if not product_id:
             raise create_structured_missing_parameter_error(
                 parameter_name="product_id",
@@ -1218,6 +1288,9 @@ class SubscriptionManager:
                     "billing_safety": "🔒 BILLING SAFETY: Customer email is required for billing notifications and subscription management",
                 },
             )
+
+        normalized = _validate_client_email_address(client_email)
+        return normalized if isinstance(normalized, str) else client_email
 
     async def _validate_simple_product(self, product_id: str) -> Any:
         """Validate product existence and availability for simple subscription."""
@@ -1384,6 +1457,12 @@ class SubscriptionManager:
             client_email = extracted_info["clientEmailAddress"]
         else:
             self._raise_client_email_safety_error()
+
+        # The address may have come from the caller or been pulled out of free text; either
+        # way it is about to become a billing identity, so it gets the same format check as
+        # the structured create paths - and it gets it here, before the product lookup, so a
+        # malformed address costs no network call.
+        client_email = _validate_client_email_address(client_email)
 
         return product_id, client_email
 
@@ -2027,6 +2106,8 @@ class SubscriptionHierarchyManager:
                     "REVENIUM_OWNER_ID not available from configuration store, API will use default owner"
                 )
 
+        _normalize_client_email_field(subscription_data)
+
         return subscription_data
 
     async def _create_subscription_and_credentials(
@@ -2189,15 +2270,15 @@ class SubscriptionManagement(ToolBase):
             if auto_generate:
                 name = subscription_data.get("name")
                 if not name:
-                    return [
-                        TextContent(
-                            type="text",
-                            text="**Missing Required Field**\n\n"
-                            "**Field**: `name` (required for all subscription creation)\n\n"
-                            '**Example**: `{"action":"create","subscription_data":{"name":"Monthly Subscription"}}`\n\n'
-                            "**Auto-Generation**: Enabled (will auto-generate product_id from available products, clientEmailAddress from defaults)",
-                        )
-                    ]
+                    # BACK-2937: raise so the envelope carries the error flag.
+                    raise_refusal(
+                        "**Missing Required Field**\n\n"
+                        "**Field**: `name` (required for all subscription creation)\n\n"
+                        '**Example**: `{"action":"create","subscription_data":{"name":"Monthly Subscription"}}`\n\n'
+                        "**Auto-Generation**: Enabled (will auto-generate product_id from available products, clientEmailAddress from defaults)",
+                        error_code=ErrorCodes.MISSING_PARAMETER,
+                        field="name",
+                    )
 
                 # Apply smart auto-generation logic
                 enhanced_subscription_data = {
