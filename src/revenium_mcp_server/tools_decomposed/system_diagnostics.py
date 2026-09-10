@@ -68,6 +68,7 @@ class SystemDiagnostics(ToolBase):
             # Tenant ingestion diagnostics
             "get_ingestion_failures": self.log_tool,
             "set_strict_ingestion_mode": self.log_tool,
+            "set_attribution_detail_text": self.log_tool,
         }
 
         logger.info("System Diagnostics consolidated tool initialized")
@@ -140,6 +141,7 @@ Unified system diagnostics combining configuration analysis, auto-discovery debu
 • **Operation Analysis**: Analyze operation patterns and trends
 • **Ingestion Failures**: Strict-ingestion rejections with error details and redacted payloads
 • **Strict Ingestion Mode**: Guarded toggle for reject-vs-auto-create ingestion behavior, with an allow_ticket_jobs opt-in for ticket-grain Job creation
+• **Attribution Detail Text**: Toggle for whether the tenant stores and serves the free-text reason on coding-assistant session attributions
 
 ## **Primary Use Cases**
 • **System Troubleshooting**: Diagnose configuration and connectivity issues
@@ -169,6 +171,7 @@ Unified system diagnostics combining configuration analysis, auto-discovery debu
 ### Tenant Ingestion Diagnostics
 - `get_ingestion_failures` - List strict-ingestion rejections (error_code filter, pagination)
 - `set_strict_ingestion_mode` - Toggle strict mode (requires confirm=true; preview otherwise). Optional `allow_ticket_jobs` keeps ticket-grain Job creation on under strict mode; omit it to leave the tenant's current setting unchanged, and note that disabling strict mode clears the opt-in
+- `set_attribution_detail_text` - Turn the tenant's free-text attribution detail on or off (`enabled`, no confirm). While off (the platform default) a coding-assistant session attribution carrying a free-text reason still records, but the text is stored as null and never returned. The flag has no published read-only endpoint: this response and the `set_strict_ingestion_mode` response are the only places the platform reports it
 
 ### Meta Actions
 - `get_capabilities` - Show this capabilities overview
@@ -246,6 +249,22 @@ Use `get_examples()` for detailed usage examples and parameter guidance.
 ```json
 {"action": "analyze_operations"}
 ```
+
+## **Tenant Ingestion Settings**
+
+These two actions WRITE a tenant-wide setting; everything else in this tool reads.
+
+### Toggle Strict Ingestion Mode
+```json
+{"action": "set_strict_ingestion_mode", "enabled": true, "confirm": true}
+```
+Without `confirm: true` the call returns a consequences preview and changes nothing. Optional `allow_ticket_jobs` keeps ticket-grain Job creation on under strict mode.
+
+### Toggle Free-Text Attribution Detail
+```json
+{"action": "set_attribution_detail_text", "enabled": true}
+```
+Applies immediately (no confirm): it rejects nothing and deletes nothing. While the setting is off - the platform default - a coding-assistant session attribution carrying a free-text reason still succeeds and still records the structured attribution, but the text is stored as null and never returned. Both actions report the state the server returned, which for `attributionDetailTextEnabled` is the only place the platform reports it.
 
 ## **Troubleshooting Workflows**
 

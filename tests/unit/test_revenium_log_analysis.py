@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 from mcp.types import TextContent
 
 from src.revenium_mcp_server.tools_decomposed.revenium_log_analysis import (
+    ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE,
     ReveniumLogAnalysis,
 )
 from src.revenium_mcp_server.common.error_handling import ToolError
@@ -244,13 +245,18 @@ class TestCreateActionError:
 # Tenant ingestion diagnostics
 # ---------------------------------------------------------------------------
 
-def _ingestion_client(failures=None, strict_result=None):
+def _ingestion_client(failures=None, strict_result=None, attribution_result=None):
     client = MagicMock()
     client.get_ingestion_failures = AsyncMock(
         return_value=failures if failures is not None else {"page": {"totalElements": 0}}
     )
     client.set_strict_ingestion_mode = AsyncMock(
         return_value=strict_result or {"id": "ten_1", "strictIngestionMode": True}
+    )
+    client.set_attribution_detail_text = AsyncMock(
+        return_value=attribution_result
+        if attribution_result is not None
+        else {"id": "ten_1", "attributionDetailTextEnabled": True}
     )
     client._extract_embedded_data = MagicMock(
         side_effect=lambda resp: resp.get("_embedded", {}).get("items", [])
@@ -603,3 +609,184 @@ class TestStrictModeTicketJobsOptIn:
             {"enabled": True, "allow_ticket_jobs": True, "confirm": True},
         )
         assert "Ticket-grain Jobs" not in result[0].text
+
+
+class TestSetAttributionDetailText:
+    """BACK-3096: the free-text attribution detail switch.
+
+    The platform reports ``attributionDetailTextEnabled`` on the PATCH response
+    and nowhere else - GET /v2/api/tenants/{id} is hidden - so this action is
+    both the only way to change the setting and one of only two ways to read
+    it. Every assertion below is about that: the state comes from the response,
+    never from the request.
+    """
+
+    @pytest.mark.asyncio
+    async def test_enables_and_reports_the_state_the_server_returned(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_attribution_detail_text", {"enabled": True}
+        )
+        text = result[0].text
+        client.set_attribution_detail_text.assert_awaited_once_with(True)
+        assert "Attribution Detail Text Updated" in text
+        assert "**State**: enabled" in text
+        assert "ten_1" in text
+
+    @pytest.mark.asyncio
+    async def test_applies_without_a_confirm_argument(self, log_tool):
+        """The action is deliberately unguarded: nothing is rejected or
+        deleted, so there is no consequence a preview would be protecting."""
+        client = _ingestion_client(
+            attribution_result={"id": "ten_1", "attributionDetailTextEnabled": False}
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_attribution_detail_text", {"enabled": False}
+        )
+        client.set_attribution_detail_text.assert_awaited_once_with(False)
+        assert "Confirmation Required" not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_disable_states_stored_text_is_withheld_not_deleted(self, log_tool):
+        client = _ingestion_client(
+            attribution_result={"id": "ten_1", "attributionDetailTextEnabled": False}
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_attribution_detail_text", {"enabled": False}
+        )
+        text = result[0].text
+        assert "**State**: disabled" in text
+        assert "not deleted" in text
+        assert "still records" in text
+
+    @pytest.mark.asyncio
+    async def test_response_names_the_missing_read_path(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_attribution_detail_text", {"enabled": True}
+        )
+        assert ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_server_value_wins_over_the_requested_one(self, log_tool):
+        """A server that answers with the opposite value must be believed."""
+        client = _ingestion_client(
+            attribution_result={"id": "ten_1", "attributionDetailTextEnabled": False}
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_attribution_detail_text", {"enabled": True}
+        )
+        assert "**State**: disabled" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_absent_state_is_not_reported_as_confirmed(self, log_tool):
+        client = _ingestion_client(attribution_result={"id": "ten_1"})
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_attribution_detail_text", {"enabled": True}
+        )
+        text = result[0].text
+        assert "state not confirmed" in text
+        assert "**State**: enabled" not in text
+
+    @pytest.mark.asyncio
+    async def test_missing_enabled_raises_structured_error(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        with pytest.raises(ToolError) as exc:
+            await log_tool.handle_action("set_attribution_detail_text", {})
+        assert exc.value.field == "enabled"
+        client.set_attribution_detail_text.assert_not_called()
+
+    @pytest.mark.parametrize("value", ["true", 1, 0, None, "yes"])
+    @pytest.mark.asyncio
+    async def test_non_boolean_enabled_raises_and_calls_nothing(self, log_tool, value):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        with pytest.raises(ToolError):
+            await log_tool.handle_action(
+                "set_attribution_detail_text", {"enabled": value}
+            )
+        client.set_attribution_detail_text.assert_not_called()
+
+
+class TestStrictModeReportsAttributionDetailText:
+    """The strict-ingestion PATCH returns the same tenant resource, so it
+    carries ``attributionDetailTextEnabled`` too. Rendering it there gives the
+    flag its second - and only other - read path."""
+
+    @pytest.mark.asyncio
+    async def test_flag_is_rendered_when_the_response_carries_it(self, log_tool):
+        client = _ingestion_client(
+            strict_result={
+                "id": "ten_1",
+                "strictIngestionMode": True,
+                "attributionDetailTextEnabled": True,
+            }
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+        )
+        text = result[0].text
+        assert "**Attribution detail text**: enabled" in text
+        assert ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE in text
+
+    @pytest.mark.asyncio
+    async def test_flag_absent_from_the_response_is_not_claimed(self, log_tool):
+        """Same honesty rule as the other two flags: no field, no claim."""
+        client = _ingestion_client(
+            strict_result={"id": "ten_1", "strictIngestionMode": True}
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+        )
+        assert "Attribution detail text" not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_flag_survives_a_response_that_omits_the_strict_state(self, log_tool):
+        """The unconfirmed branch must still report it: a response carrying the
+        attribution flag and not strictIngestionMode has told the caller
+        exactly one thing, and that thing has no other read path."""
+        client = _ingestion_client(
+            strict_result={"id": "ten_1", "attributionDetailTextEnabled": True}
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+        )
+        text = result[0].text
+        assert "state not confirmed" in text
+        assert "**Attribution detail text**: enabled" in text
+        assert ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE in text
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_response_without_the_flag_claims_nothing(self, log_tool):
+        client = _ingestion_client(strict_result={"id": "ten_1"})
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+        )
+        text = result[0].text
+        assert "state not confirmed" in text
+        assert "Attribution detail text" not in text
+        assert ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE not in text
+

@@ -16,6 +16,49 @@ from ..auth.auth_mode import read_auth_mode
 from ..config_store import get_config_value
 from ..endpoint_registry import _resolved_app_base_url, _use_new_api, get_endpoint_path
 
+# Connectivity-probe status values (the "status" key of the api_connectivity dict):
+#   success           - the probe completed a real read (HTTP 200)
+#   permission_denied - the key authenticated but the read was forbidden (HTTP 403)
+#   failed            - the key was rejected (401, see API_AUTH_REJECTED_MESSAGE) or the
+#                       endpoint returned another error status
+#   error             - the request never completed (network/transport failure)
+#   not_attempted     - no API key was configured, so nothing was probed
+API_READ_FORBIDDEN_MESSAGE = (
+    "The API refused to let this key read data (HTTP 403). The platform returns the "
+    "same 403 for a key without read scope and for a key it does not recognize, so "
+    "this does not prove the key is valid. Verify the key value, and note that "
+    "metering-scope keys (rev_mk_) can record usage but cannot read analytics or "
+    "data endpoints - reading requires a read-scope (rev_rk_) or write-scope "
+    "(rev_sk_) key."
+)
+API_AUTH_REJECTED_MESSAGE = (
+    "The platform did not recognize this API key (HTTP 401). A key created in the "
+    "last few minutes may not be active yet, so wait a moment and retry before "
+    "replacing it; if it keeps failing, verify the exact key value. Note that the "
+    "platform normally reports keys it does not recognize as 403, so a 401 here is "
+    "worth mentioning if you contact support."
+)
+_METERING_KEY_MESSAGE = (
+    "The configured REVENIUM_API_KEY has the metering-scope prefix (rev_mk_): if the "
+    "key is valid, it can record usage but cannot read analytics or data endpoints - "
+    "management and reporting require a read-scope (rev_rk_) or write-scope (rev_sk_) "
+    "key. A 403 does not prove the key is recognized, so verify the exact key value "
+    "before swapping scopes."
+)
+
+
+def read_forbidden_detail(api_key: Optional[str]) -> str:
+    """Explain a forbidden read, naming the key's effective scope when the prefix says it.
+
+    A metering prefix is the one case where the cause is knowable from our side; a
+    generic 403 stays ambiguous between wrong scope and unrecognized key, and the
+    message says so. The prefix taxonomy is owned by ``_scope_from_prefix`` in
+    ``auth/api_key_validator.py`` (rev_sk_ -> WRITE, rev_rk_ -> READ, rev_mk_ -> METERING).
+    """
+    if api_key and api_key.startswith("rev_mk_"):
+        return _METERING_KEY_MESSAGE
+    return API_READ_FORBIDDEN_MESSAGE
+
 
 @dataclass
 class EnvironmentVariableStatus:
@@ -230,37 +273,41 @@ class EnvironmentVariableValidator:
                             "status_code": response.status_code,
                             "endpoint": endpoint,
                             "url": url,
-                            "note": "Basic API connectivity confirmed",
-                        }
-                    elif response.status_code == 400:
-                        # 400 might mean missing team ID, but API key is valid
-                        api_result = {
-                            "status": "success",
-                            "status_code": response.status_code,
-                            "endpoint": endpoint,
-                            "url": url,
-                            "note": "API key valid, may need team configuration for full functionality",
+                            "note": "Data read confirmed - the API key can read platform data",
                         }
                     elif response.status_code == 401:
-                        # Unauthorized - API key issue
+                        # Unauthorized - the platform did not accept the key. It
+                        # normally answers 403 for keys it does not recognize
+                        # (test_rejected_keys_are_403_forbidden in
+                        # tests/integration/test_hypercurrent_auth_contract.py), so a
+                        # 401 is its own case: it may be a key that is not active yet.
+                        # API_AUTH_REJECTED_MESSAGE is the single source of that wording.
                         api_result = {
                             "status": "failed",
                             "status_code": response.status_code,
                             "endpoint": endpoint,
                             "url": url,
-                            "error": "Authentication failed - check API key",
+                            "error": API_AUTH_REJECTED_MESSAGE,
                         }
                     elif response.status_code == 403:
-                        # Forbidden - API key valid but insufficient permissions
+                        # Forbidden - the key authenticated but is not allowed to read.
+                        # This is NOT connectivity success: the probe returned no data,
+                        # so nothing downstream may treat the key as production-ready.
                         api_result = {
-                            "status": "success",
+                            "status": "permission_denied",
                             "status_code": response.status_code,
                             "endpoint": endpoint,
                             "url": url,
-                            "note": "API key valid but may need additional permissions",
+                            "error": read_forbidden_detail(api_key),
                         }
                     else:
-                        # Other error
+                        # No 400 special case. This branch used to map 400 to "success"
+                        # on the theory that the endpoint needs a team ID; it does not.
+                        # The data-connected / status-connection endpoint resolves the
+                        # team from the API key and answers 200 with a body when called
+                        # with no query parameters (verified against the live endpoint),
+                        # so a 400 here proves no read happened and cannot count as a
+                        # passing connectivity check.
                         api_result = {
                             "status": "failed",
                             "status_code": response.status_code,
@@ -470,7 +517,15 @@ class EnvironmentVariableValidator:
             discovered_config.get("status") == "success" and discovered_count >= 1
         )
         auth_config_works = auth_config.get("status") == "success"
-        api_works = api_connectivity.get("status") == "success"
+        # Only a completed read counts as working connectivity. A key that
+        # authenticates but is forbidden from reading is a degraded state of its
+        # own, never a passing check.
+        api_status = api_connectivity.get("status")
+        api_works = api_status == "success"
+        api_read_forbidden = api_status == "permission_denied"
+        # A rejected key (401) is its own reportable case, distinct from a forbidden
+        # read (403) and from a transport failure: see API_AUTH_REJECTED_MESSAGE.
+        api_auth_rejected = api_status == "failed" and api_connectivity.get("status_code") == 401
 
         # Convert env_vars_dict to variables format with proper EnvironmentVariableStatus objects
         variables = {}
@@ -564,6 +619,14 @@ class EnvironmentVariableValidator:
             "owner_discovered": bool(discovered_config.get("values", {}).get("owner_id")),
             "email_discovered": bool(discovered_config.get("values", {}).get("default_email")),
             "direct_api_works": api_works,
+            "api_read_forbidden": api_read_forbidden,
+            "api_read_forbidden_detail": (
+                api_connectivity.get("error") if api_read_forbidden else None
+            ),
+            "api_auth_rejected": api_auth_rejected,
+            "api_auth_rejected_detail": (
+                api_connectivity.get("error") if api_auth_rejected else None
+            ),
             "auth_config_works": auth_config_works,
             "auth_mode": auth_mode,
             "clerk_configured": clerk_configured,

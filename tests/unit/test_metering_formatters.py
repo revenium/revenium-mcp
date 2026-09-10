@@ -3,6 +3,7 @@
 Covers:
 - _format_transaction_summary
 - _format_full_transaction_details
+- _format_cache_tokens
 - _format_cost_breakdown
 - _format_performance_metrics
 - _format_attribution_details
@@ -14,6 +15,9 @@ Covers:
 
 
 from src.revenium_mcp_server.tools_decomposed.metering_management import (
+    _CACHE_TOKEN_FIELDS,
+    _COMPLETIONS_REPORTED_FIELDS,
+    _COMPLETIONS_RESPONSE_FIELD_ALIASES,
     MeteringManagement,
 )
 
@@ -758,3 +762,153 @@ class TestNullTokenCountsWithZeroCosts:
         text = self.mm._format_cost_breakdown(data)
         assert "Input Cost" in text and "Output Cost" in text
         assert "0 tokens" in text
+
+
+# ===========================================================================
+# BACK-3087: prompt-cache token rendering on the completions detail path.
+#
+# Before this section the detail rendering carried no cache figure at all -
+# neither the two long-standing counts nor the 5m/1h cache-write split - so a
+# user reconciling cached traffic against a vendor invoice had nothing to read.
+# ===========================================================================
+
+
+CACHE_TRANSACTION_FULL = {
+    "cacheReadTokenCount": 1300,
+    "cacheCreationTokenCount": 1300,
+    "cacheCreation5mTokenCount": 1000,
+    "cacheCreation1hTokenCount": 300,
+    "cacheTtlSplitSource": "derived",
+}
+
+CACHE_TRANSACTION_LEGACY_ONLY = {
+    "cacheReadTokenCount": 900,
+    "cacheCreationTokenCount": 400,
+}
+
+
+class TestCacheTokenRendering:
+    """The five cache fields render, and an absent one never renders as 0."""
+
+    def setup_method(self):
+        self.mm = make_mm()
+
+    def test_all_five_fields_render(self):
+        result = self.mm._format_full_transaction_details(CACHE_TRANSACTION_FULL)
+        assert "Cache Tokens" in result
+        assert "**Cache Read Tokens**: 1300" in result
+        assert "**Cache Creation Tokens (total)**: 1300" in result
+        assert "**Cache Creation Tokens (5m TTL)**: 1000" in result
+        assert "**Cache Creation Tokens (1h TTL)**: 300" in result
+        assert "**Cache TTL Split Source**: derived" in result
+
+    def test_consistent_split_carries_no_discrepancy_note(self):
+        result = self.mm._format_full_transaction_details(CACHE_TRANSACTION_FULL)
+        assert "Split Check" not in result
+        # Nothing is unavailable on this record, so no explanatory note either.
+        assert "unavailable" not in result
+
+    def test_tiers_are_not_summed_into_a_client_side_total(self):
+        """The platform's cacheCreationTokenCount is the total. A rendering
+        that added the tiers would print 1300 for a record whose platform
+        total is 1200, inventing a figure and labelling it the platform's."""
+        data = {
+            "cacheCreationTokenCount": 1200,
+            "cacheCreation5mTokenCount": 1000,
+            "cacheCreation1hTokenCount": 300,
+        }
+        result = self.mm._format_full_transaction_details(data)
+        assert "**Cache Creation Tokens (total)**: 1200" in result
+        assert "**Cache Creation Tokens (total)**: 1300" not in result
+
+    def test_split_that_does_not_add_up_is_stated(self):
+        data = {
+            "cacheCreationTokenCount": 1200,
+            "cacheCreation5mTokenCount": 1000,
+            "cacheCreation1hTokenCount": 300,
+        }
+        result = self.mm._format_full_transaction_details(data)
+        assert "Split Check" in result
+        assert "add up to 1300" in result
+        assert "total of 1200" in result
+
+    def test_legacy_two_fields_only_leaves_the_split_unavailable(self):
+        """Every tenant with prompt caching but no reported TTL split lands
+        here: the two counts show, the three split fields say unavailable."""
+        result = self.mm._format_full_transaction_details(CACHE_TRANSACTION_LEGACY_ONLY)
+        assert "**Cache Read Tokens**: 900" in result
+        assert "**Cache Creation Tokens (total)**: 400" in result
+        assert "**Cache Creation Tokens (5m TTL)**: unavailable" in result
+        assert "**Cache Creation Tokens (1h TTL)**: unavailable" in result
+        assert "**Cache TTL Split Source**: unavailable" in result
+        assert "not that the value is zero" in result
+
+    def test_absent_field_never_renders_as_zero(self):
+        result = self.mm._format_full_transaction_details(CACHE_TRANSACTION_LEGACY_ONLY)
+        assert "(5m TTL)**: 0" not in result
+        assert "(1h TTL)**: 0" not in result
+
+    def test_explicit_zero_counts_render_as_zero(self):
+        """A zero cache-write count is a real reading and must survive: the
+        `unavailable` rule is about fields the response did not carry."""
+        data = {"cacheReadTokenCount": 0, "cacheCreationTokenCount": 0}
+        result = self.mm._format_full_transaction_details(data)
+        assert "**Cache Read Tokens**: 0" in result
+        assert "**Cache Creation Tokens (total)**: 0" in result
+
+    def test_no_cache_fields_omits_the_section(self):
+        """A transaction that touched no cache gains no cache lines at all,
+        the same gating every other detail section uses."""
+        result = self.mm._format_full_transaction_details(FULL_TRANSACTION)
+        assert "Cache Tokens" not in result
+        assert "unavailable" not in result
+
+    def test_null_cache_fields_omit_the_section(self):
+        data = {
+            "cacheReadTokenCount": None,
+            "cacheCreationTokenCount": None,
+            "cacheCreation5mTokenCount": None,
+            "cacheCreation1hTokenCount": None,
+            "cacheTtlSplitSource": None,
+        }
+        assert self.mm._format_full_transaction_details(data) == ""
+
+    def test_split_source_alone_opens_the_section(self):
+        """An `unresolved` marker is a real answer to why there is no split
+        here, and it arrives with both tier counts cleared."""
+        result = self.mm._format_full_transaction_details(
+            {"cacheTtlSplitSource": "unresolved"}
+        )
+        assert "**Cache TTL Split Source**: unresolved" in result
+        assert "**Cache Creation Tokens (5m TTL)**: unavailable" in result
+
+    def test_summary_row_is_unchanged(self):
+        """The cache section belongs to the full detail rendering only."""
+        result = self.mm._format_transaction_summary(CACHE_TRANSACTION_FULL)
+        assert "Cache" not in result
+
+
+class TestCacheFieldsTrackedByPresenceDiagnostic:
+    """The five names the detail section renders are the five the
+    analyze_recent_transactions presence diagnostic measures."""
+
+    def test_reported_fields_cover_every_cache_field(self):
+        assert len(_CACHE_TOKEN_FIELDS) == 5
+        for field in _CACHE_TOKEN_FIELDS:
+            assert field in _COMPLETIONS_REPORTED_FIELDS
+
+    def test_labels_are_the_single_source_of_the_field_names(self):
+        """PR #375 review: the names were enumerated twice and could drift.
+        A sixth cache field must land in one table only."""
+        from src.revenium_mcp_server.tools_decomposed.metering_management import (
+            _CACHE_TOKEN_LABELS,
+        )
+
+        assert _CACHE_TOKEN_FIELDS == tuple(field for field, _ in _CACHE_TOKEN_LABELS)
+
+    def test_alias_table_is_untouched(self):
+        """The cache fields are spelled the same on submission and response,
+        so none of them belongs in the submitted -> returned alias table."""
+        assert not set(_CACHE_TOKEN_FIELDS) & set(
+            _COMPLETIONS_RESPONSE_FIELD_ALIASES.values()
+        )

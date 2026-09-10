@@ -688,6 +688,9 @@ class AlertManager:
                     "LESS_THAN_OR_EQUAL_TO": "≤",
                     "EQUALS": "=",
                     "NOT_EQUALS": "≠",
+                    # Refused on create/update, still stored on existing alerts.
+                    "EQUAL_TO": "=",
+                    "NOT_EQUAL_TO": "≠",
                 }
 
                 operator_symbol = operator_mapping.get(operator_type, operator_type)
@@ -719,6 +722,9 @@ class AlertManager:
                 "LESS_THAN_OR_EQUAL_TO": "≤",
                 "EQUALS": "=",
                 "NOT_EQUALS": "≠",
+                # Refused on create/update, still stored on existing alerts.
+                "EQUAL_TO": "=",
+                "NOT_EQUAL_TO": "≠",
             }
 
             operator_symbol = operator_mapping.get(operator_type, operator_type)

@@ -9,14 +9,78 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from src.revenium_mcp_server.tools_decomposed import job_management as job_management_module
 from src.revenium_mcp_server.tools_decomposed.job_management import (
     JobManager,
     JobManagement,
+    _SESSION_ATTRIBUTION_FIELDS,
+    _parse_outcome_conflict_version,
+    _SESSION_ATTRIBUTION_REASON_NOTE,
+    _SESSION_ATTRIBUTION_SPLITS_NOTE,
+    _render_session_attributions,
+    _session_attribution_intervals,
     _strip_links,
 )
 from src.revenium_mcp_server.client import ReveniumAPIError
-from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from mcp.types import TextContent
+
+
+# The published GET /api/v2/analytics/jobs/roi-summary envelope (isotope), with
+# the field set the byJobType row declares. Built once here so a test that
+# narrows a field is visibly narrowing this shape rather than inventing one.
+ROI_SUMMARY_RESPONSE = {
+    "id": "jobs-roi-summary",
+    "resourceType": "JobTypeRoiSummary",
+    "label": "Job type ROI summary",
+    "period": {"start": "2026-08-05T00:00:00.000Z", "end": "2026-09-04T00:00:00.000Z"},
+    "byJobType": [
+        {
+            "jobType": "LEAD_QUALIFICATION",
+            "totalJobs": 2,
+            "totalCost": 3.5,
+            "tokenCost": 2.0,
+            "externalToolCost": 1.0,
+            "humanCost": 0.5,
+            "conversions": 1,
+            "deflections": 0,
+            "totalValue": 100.0,
+            "averageValue": 50.0,
+            "costPerConversion": 3.5,
+            "costPerOutcome": 3.5,
+            "roi": 27.57,
+            "successRate": 1.0,
+            "toolCostAttribution": "ALLOCATED_BY_AGENT",
+        },
+        {
+            "jobType": "SUPPORT_DEFLECTION",
+            "totalJobs": 1,
+            "totalCost": 0.5,
+            "tokenCost": 0.5,
+            "externalToolCost": 0.0,
+            "humanCost": 0.0,
+            "conversions": 0,
+            "deflections": 1,
+            "totalValue": 20.0,
+            "averageValue": 20.0,
+            "costPerConversion": 0.0,
+            "costPerOutcome": 0.5,
+            "roi": 39.0,
+            "successRate": 1.0,
+            "toolCostAttribution": "ALLOCATED_BY_AGENT",
+        },
+    ],
+    "summary": {
+        "totalJobTypes": 2,
+        "totalJobs": 3,
+        "totalCost": 4.0,
+        "totalValue": 120.0,
+        "overallROI": 29.0,
+    },
+    "_links": {
+        "self": {"href": "https://api-lb.dev.hcapp.io/api/v2/analytics/jobs/roi-summary"}
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +98,10 @@ def mock_client():
     client.get_job_roi = AsyncMock()
     client.get_job_types = AsyncMock()
     client.get_job_conversion_funnel = AsyncMock()
+    client.get_jobs_roi_summary = AsyncMock()
     client.report_job_outcome = AsyncMock()
+    client.amend_job_outcome = AsyncMock()
+    client.get_session_attributions = AsyncMock()
     client._extract_embedded_data = MagicMock()
     client._extract_pagination_info = MagicMock()
     return client
@@ -62,7 +129,10 @@ def mock_mgmt_client(job_mgmt):
     client.get_job_roi = AsyncMock()
     client.get_job_types = AsyncMock()
     client.get_job_conversion_funnel = AsyncMock()
+    client.get_jobs_roi_summary = AsyncMock()
     client.report_job_outcome = AsyncMock()
+    client.amend_job_outcome = AsyncMock()
+    client.get_session_attributions = AsyncMock()
     client._extract_embedded_data = MagicMock()
     client._extract_pagination_info = MagicMock()
     with patch.object(job_mgmt, "get_client", new_callable=AsyncMock) as mock_get_client:
@@ -133,6 +203,91 @@ class TestJobManagerListJobs:
         await job_manager.list_jobs({"page": 0, "size": 5, "filters": {"type": "loan_processing", "executionStatus": "SUCCESS"}})
 
         mock_client.get_jobs.assert_called_once_with(page=0, size=5, type="loan_processing", executionStatus="SUCCESS")
+
+
+class TestJobFilterValueValidation:
+    """BACK-2941: an unbindable enum value is refused here, not upstream.
+
+    The backend answered an invalid executionStatus with Spring's own
+    type-conversion 400, naming internal platform classes in the message.
+    """
+
+    @pytest.mark.asyncio
+    async def test_invalid_execution_status_rejected_before_request(
+        self, job_manager, mock_client
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.list_jobs({"filters": {"executionStatus": "BOGUS_STATUS"}})
+
+        message = exc_info.value.message
+        assert "BOGUS_STATUS" in message
+        assert "SUCCESS" in message and "FAILED" in message and "CANCELLED" in message
+        assert "io.hypercurrent" not in message
+        assert exc_info.value.field == "filters.executionStatus"
+        mock_client.get_jobs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lowercase_filter_value_is_canonicalised_not_refused(self, job_manager, mock_client):
+        """hypercurrent uppercases these values, so lowercase must keep working through the MCP."""
+        mock_client._extract_embedded_data.return_value = []
+        mock_client._extract_pagination_info.return_value = {"totalPages": 1, "totalElements": 0}
+
+        await job_manager.list_jobs({"filters": {"outcomeType": "converted", "executionStatus": "failed"}})
+
+        mock_client.get_jobs.assert_called_once_with(page=0, size=20, outcomeType="CONVERTED", executionStatus="FAILED")
+
+    @pytest.mark.asyncio
+    async def test_virtual_pending_outcome_is_accepted(self, job_manager, mock_client):
+        """PENDING is not an OutcomeType member but the platform documents it as a filter value."""
+        mock_client._extract_embedded_data.return_value = []
+        mock_client._extract_pagination_info.return_value = {"totalPages": 1, "totalElements": 0}
+
+        await job_manager.list_jobs({"filters": {"outcomeType": "PENDING"}})
+
+        mock_client.get_jobs.assert_called_once_with(page=0, size=20, outcomeType="PENDING")
+
+    @pytest.mark.asyncio
+    async def test_invalid_outcome_type_rejected_before_request(
+        self, job_manager, mock_client
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.list_jobs({"filters": {"outcome_type": "NOT_A_TYPE"}})
+
+        assert "NOT_A_TYPE" in exc_info.value.message
+        assert "CONVERTED" in exc_info.value.message
+        mock_client.get_jobs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_valid_values_still_filter(self, job_manager, mock_client):
+        mock_client._extract_embedded_data.return_value = []
+        mock_client._extract_pagination_info.return_value = {"totalPages": 1, "totalElements": 0}
+
+        await job_manager.list_jobs(
+            {"filters": {"executionStatus": "SUCCESS", "outcomeType": "CONVERTED"}}
+        )
+
+        mock_client.get_jobs.assert_called_once_with(
+            page=0, size=20, executionStatus="SUCCESS", outcomeType="CONVERTED"
+        )
+
+    @pytest.mark.asyncio
+    async def test_free_form_filter_values_are_not_checked(self, job_manager, mock_client):
+        """`type` is a caller-defined job type, so its values stay unchecked."""
+        mock_client._extract_embedded_data.return_value = []
+        mock_client._extract_pagination_info.return_value = {"totalPages": 1, "totalElements": 0}
+
+        await job_manager.list_jobs({"filters": {"type": "anything_at_all"}})
+
+        mock_client.get_jobs.assert_called_once_with(page=0, size=20, type="anything_at_all")
+
+    @pytest.mark.asyncio
+    async def test_unknown_key_message_is_unchanged(self, job_manager, mock_client):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.list_jobs({"filters": {"nonsenseKey": "x"}})
+
+        assert "Unknown filter key 'nonsenseKey' for 'list_jobs'" in exc_info.value.message
+        assert exc_info.value.field == "filters"
+        mock_client.get_jobs.assert_not_called()
 
 
 class TestJobManagerGetJob:
@@ -270,94 +425,258 @@ class TestJobManagerGetConversionFunnel:
 
 
 class TestJobManagerGetRoiSummary:
-    """Test JobManager.get_roi_summary orchestration behavior."""
+    """Test JobManager.get_roi_summary against the published summary endpoint.
+
+    BACK-2915: the action used to call get_job_types and then one conversion
+    funnel per type, aggregating here. It now makes one request whose response
+    already carries the per-type cost breakdown and the toolCostAttribution
+    qualifier, so these tests mock that single call.
+    """
 
     @pytest.mark.asyncio
-    async def test_get_roi_summary_aggregates_all_types(self, job_manager, mock_client):
-        """get_roi_summary fetches types and funnels, returns aggregated data."""
-        mock_client.get_job_types.return_value = ["LEAD", "SALE"]
-        mock_client.get_job_conversion_funnel.side_effect = [
-            {"totalJobs": 100, "successfulJobs": 80, "convertedJobs": 60, "successRate": 0.8, "conversionRate": 0.6},
-            {"totalJobs": 50, "successfulJobs": 40, "convertedJobs": 30, "successRate": 0.8, "conversionRate": 0.6},
-        ]
+    async def test_get_roi_summary_makes_one_published_call(self, job_manager, mock_client):
+        """One request to the ROI summary endpoint, and no funnel fan-out."""
+        mock_client.get_jobs_roi_summary.return_value = ROI_SUMMARY_RESPONSE
 
         result = await job_manager.get_roi_summary({})
 
         assert result["action"] == "get_roi_summary"
-        assert result["summary"]["totalJobTypes"] == 2
-        assert result["summary"]["totalJobs"] == 150
-        assert result["summary"]["successfulJobs"] == 120
-        assert result["summary"]["convertedJobs"] == 90
-        assert result["partial_failures"] == 0
-        assert len(result["per_type_breakdown"]) == 2
-        mock_client.get_job_types.assert_called_once()
-        assert mock_client.get_job_conversion_funnel.call_count == 2
+        mock_client.get_jobs_roi_summary.assert_called_once_with()
+        mock_client.get_job_types.assert_not_called()
+        mock_client.get_job_conversion_funnel.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_get_roi_summary_passes_date_filters(self, job_manager, mock_client):
-        """Date filters are forwarded to each funnel call."""
-        mock_client.get_job_types.return_value = ["LEAD"]
-        mock_client.get_job_conversion_funnel.return_value = {
-            "totalJobs": 10, "successfulJobs": 8, "convertedJobs": 5,
-            "successRate": 0.8, "conversionRate": 0.5,
-        }
+    async def test_get_roi_summary_returns_the_server_rows(self, job_manager, mock_client):
+        """Rows and summary come back as the endpoint reported them."""
+        mock_client.get_jobs_roi_summary.return_value = ROI_SUMMARY_RESPONSE
+
+        result = await job_manager.get_roi_summary({})
+
+        assert [row["jobType"] for row in result["by_job_type"]] == [
+            "LEAD_QUALIFICATION",
+            "SUPPORT_DEFLECTION",
+        ]
+        first = result["by_job_type"][0]
+        assert first["tokenCost"] == 2.0
+        assert first["externalToolCost"] == 1.0
+        assert first["humanCost"] == 0.5
+        assert first["roi"] == 27.57
+        assert result["summary"]["totalJobs"] == 3
+        assert result["summary"]["overallROI"] == 29.0
+        assert result["period"]["start"] == "2026-08-05T00:00:00.000Z"
+
+    @pytest.mark.asyncio
+    async def test_get_roi_summary_surfaces_tool_cost_attribution(self, job_manager, mock_client):
+        """Each row keeps its qualifier, and its meaning is stated once."""
+        mock_client.get_jobs_roi_summary.return_value = ROI_SUMMARY_RESPONSE
+
+        result = await job_manager.get_roi_summary({})
+
+        assert all(
+            row["toolCostAttribution"] == "ALLOCATED_BY_AGENT"
+            for row in result["by_job_type"]
+        )
+        assert result["cost_attribution"]["field"] == "toolCostAttribution"
+        notes = " ".join(result["cost_attribution"]["notes"])
+        assert "ALLOCATED_BY_AGENT" in notes
+        assert "apportioned" in notes
+        assert "not measured per job type directly" in notes
+
+    @pytest.mark.asyncio
+    async def test_get_roi_summary_names_an_unrecognised_attribution(
+        self, job_manager, mock_client
+    ):
+        """An enum value the client does not know is named, not dropped."""
+        response = json.loads(json.dumps(ROI_SUMMARY_RESPONSE))
+        response["byJobType"][0]["toolCostAttribution"] = "MEASURED_PER_JOB_TYPE"
+        mock_client.get_jobs_roi_summary.return_value = response
+
+        result = await job_manager.get_roi_summary({})
+
+        notes = " ".join(result["cost_attribution"]["notes"])
+        assert "MEASURED_PER_JOB_TYPE" in notes
+
+    @pytest.mark.asyncio
+    async def test_get_roi_summary_forwards_declared_filters(self, job_manager, mock_client):
+        """startDate/endDate reach the endpoint, and are reported as applied."""
+        mock_client.get_jobs_roi_summary.return_value = ROI_SUMMARY_RESPONSE
 
         result = await job_manager.get_roi_summary(
             {"filters": {"startDate": "2025-01-01", "endDate": "2025-12-31"}}
         )
 
-        mock_client.get_job_conversion_funnel.assert_called_once_with(
-            jobType="LEAD", startDate="2025-01-01", endDate="2025-12-31"
+        mock_client.get_jobs_roi_summary.assert_called_once_with(
+            startDate="2025-01-01", endDate="2025-12-31"
         )
-        assert result["filters_applied"] == {"startDate": "2025-01-01", "endDate": "2025-12-31"}
+        assert result["filters_applied"] == {
+            "startDate": "2025-01-01",
+            "endDate": "2025-12-31",
+        }
+        assert "filters_not_applied" not in result
 
     @pytest.mark.asyncio
-    async def test_get_roi_summary_handles_partial_failure(self, job_manager, mock_client):
-        """If one type's funnel fails, others still return successfully."""
-        mock_client.get_job_types.return_value = ["LEAD", "BROKEN_TYPE"]
-        mock_client.get_job_conversion_funnel.side_effect = [
-            {"totalJobs": 100, "successfulJobs": 80, "convertedJobs": 60, "successRate": 0.8, "conversionRate": 0.6},
-            ReveniumAPIError("Not found", status_code=404),
-        ]
+    async def test_get_roi_summary_accepts_snake_case_filters(self, job_manager, mock_client):
+        """The caller-facing surface still takes the snake_case spellings."""
+        mock_client.get_jobs_roi_summary.return_value = ROI_SUMMARY_RESPONSE
+
+        await job_manager.get_roi_summary(
+            {"filters": {"start_date": "2025-01-01", "end_date": "2025-12-31"}}
+        )
+
+        mock_client.get_jobs_roi_summary.assert_called_once_with(
+            startDate="2025-01-01", endDate="2025-12-31"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_roi_summary_reports_a_filter_it_cannot_apply(
+        self, job_manager, mock_client
+    ):
+        """environment is accepted, held back, and reported as not applied.
+
+        The published operation does not declare it, so forwarding it would
+        return a tenant-wide answer that reads as environment-scoped.
+        """
+        mock_client.get_jobs_roi_summary.return_value = ROI_SUMMARY_RESPONSE
+
+        result = await job_manager.get_roi_summary(
+            {"filters": {"startDate": "2025-01-01", "environment": "production"}}
+        )
+
+        mock_client.get_jobs_roi_summary.assert_called_once_with(startDate="2025-01-01")
+        assert result["filters_not_applied"]["parameters"] == ["environment"]
+        assert "does not declare" in result["filters_not_applied"]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_get_roi_summary_rejects_an_unknown_filter(self, job_manager, mock_client):
+        """The allow-list is unchanged: jobType is still not accepted here."""
+        mock_client.get_jobs_roi_summary.return_value = ROI_SUMMARY_RESPONSE
+
+        with pytest.raises(ToolError):
+            await job_manager.get_roi_summary({"filters": {"jobType": "LEAD"}})
+
+        mock_client.get_jobs_roi_summary.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_roi_summary_absent_fields_are_unavailable(self, job_manager, mock_client):
+        """A field the endpoint omits reads as unavailable, never as 0."""
+        response = json.loads(json.dumps(ROI_SUMMARY_RESPONSE))
+        del response["byJobType"][0]["externalToolCost"]
+        response["byJobType"][0]["humanCost"] = None
+        del response["byJobType"][0]["toolCostAttribution"]
+        del response["summary"]["overallROI"]
+        mock_client.get_jobs_roi_summary.return_value = response
 
         result = await job_manager.get_roi_summary({})
 
-        assert result["action"] == "get_roi_summary"
-        assert result["summary"]["totalJobs"] == 100
-        assert result["partial_failures"] == 1
-        assert len(result["per_type_breakdown"]) == 2
-        assert result["per_type_breakdown"][0]["status"] == "success"
-        assert result["per_type_breakdown"][1]["status"] == "error"
-        assert "status=404" in result["per_type_breakdown"][1]["error"]
+        row = result["by_job_type"][0]
+        assert row["externalToolCost"] == "unavailable"
+        assert row["humanCost"] == "unavailable"
+        assert row["toolCostAttribution"] == "unavailable"
+        assert result["summary"]["overallROI"] == "unavailable"
+        # One note, for the one row that still reports a qualifier: none is
+        # invented for the row whose qualifier is missing.
+        notes = result["cost_attribution"]["notes"]
+        assert len(notes) == 1
+        assert "ALLOCATED_BY_AGENT" in notes[0]
 
     @pytest.mark.asyncio
-    async def test_get_roi_summary_empty_types(self, job_manager, mock_client):
-        """When no job types exist, returns empty summary."""
-        mock_client.get_job_types.return_value = []
+    async def test_get_roi_summary_empty_window_is_an_empty_report(
+        self, job_manager, mock_client
+    ):
+        """A window with no jobs is the envelope with no rows, and renders as one."""
+        mock_client.get_jobs_roi_summary.return_value = {
+            "id": "jobs-roi-summary",
+            "resourceType": "JobTypeRoiSummary",
+            "label": "Job type ROI summary",
+            "period": {"start": "2026-09-03T00:00:00.000Z", "end": "2026-09-04T00:00:00.000Z"},
+            "byJobType": [],
+            "summary": {
+                "totalJobTypes": 0,
+                "totalJobs": 0,
+                "totalCost": 0,
+                "totalValue": 0,
+                "overallROI": 0,
+            },
+        }
 
         result = await job_manager.get_roi_summary({})
 
-        assert result["action"] == "get_roi_summary"
-        assert result["summary"]["totalJobTypes"] == 0
+        assert result["by_job_type"] == []
         assert result["summary"]["totalJobs"] == 0
-        assert result["summary"]["overallSuccessRate"] == 0
-        assert result["summary"]["overallConversionRate"] == 0
-        assert len(result["per_type_breakdown"]) == 0
-        mock_client.get_job_conversion_funnel.assert_not_called()
+        assert result["cost_attribution"]["notes"] == []
 
+    @pytest.mark.parametrize(
+        "response,expected_in_message",
+        [
+            pytest.param("<html>gateway timeout</html>", "is a str", id="string_body"),
+            pytest.param([{"jobType": "LEAD"}], "is a list", id="list_body"),
+            pytest.param({}, "top-level keys observed: []", id="empty_object"),
+            pytest.param(
+                {"summary": {"totalJobs": 3}, "period": {}},
+                "byJobType (array)",
+                id="missing_byJobType",
+            ),
+            pytest.param(
+                {"byJobType": [], "period": {}},
+                "summary (object)",
+                id="missing_summary",
+            ),
+            pytest.param(
+                {"byJobType": {}, "summary": []},
+                "byJobType (array), summary (object)",
+                id="wrongly_typed_members",
+            ),
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_get_roi_summary_all_failures_raises_error(self, job_manager, mock_client):
-        """When all funnel calls fail, raises ToolError instead of returning zeroed data."""
-        mock_client.get_job_types.return_value = ["LEAD", "SALE"]
-        mock_client.get_job_conversion_funnel.side_effect = [
-            ReveniumAPIError("Forbidden", status_code=403),
-            ReveniumAPIError("Forbidden", status_code=403),
-        ]
+    async def test_get_roi_summary_refuses_an_unpublished_envelope(
+        self, job_manager, mock_client, response, expected_in_message
+    ):
+        """A body that is not the published envelope is an error, not no data.
+
+        Rendering it would produce an empty by_job_type and unavailable totals
+        -- indistinguishable from a quiet tenant, which is the one reading a
+        schema failure must never get.
+        """
+        mock_client.get_jobs_roi_summary.return_value = response
 
         with pytest.raises(ToolError) as exc_info:
             await job_manager.get_roi_summary({})
 
-        assert "all" in str(exc_info.value).lower() or "failed" in str(exc_info.value).lower()
+        message = str(exc_info.value)
+        assert "published envelope" in message
+        assert expected_in_message in message
+
+    @pytest.mark.asyncio
+    async def test_get_roi_summary_error_names_the_observed_keys(
+        self, job_manager, mock_client
+    ):
+        """The refusal names what did arrive, so it can be diagnosed once."""
+        mock_client.get_jobs_roi_summary.return_value = {
+            "error": "upstream unavailable",
+            "status": 503,
+        }
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.get_roi_summary({})
+
+        assert "top-level keys observed: ['error', 'status']" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_get_roi_summary_upstream_failure_raises_structured_error(
+        self, job_manager, mock_client
+    ):
+        """An upstream failure is a structured error, not an empty summary."""
+        mock_client.get_jobs_roi_summary.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.get_roi_summary({})
+
+        message = str(exc_info.value)
+        assert "status=403" in message
+        assert "no summary was returned" in message.lower()
 
 
 class TestJobManagerReportOutcome:
@@ -559,13 +878,12 @@ class TestJobManagementMetaActions:
 
     @pytest.mark.asyncio
     async def test_unknown_action_returns_error_message(self, job_mgmt, mock_mgmt_client):
-        """Unknown action returns a message indicating the action is not supported."""
-        result = await job_mgmt.handle_action("nonexistent_action", {})
+        """BACK-2937: an unknown action raises so the envelope carries isError."""
+        with pytest.raises(ToolError) as exc_info:
+            await job_mgmt.handle_action("nonexistent_action", {})
 
-        assert len(result) >= 1
-        assert isinstance(result[0], TextContent)
-        text_lower = result[0].text.lower()
-        assert "unknown action" in text_lower or "not supported" in text_lower
+        assert "unknown action" in exc_info.value.message.lower()
+        assert exc_info.value.field == "action"
 
 
 # ===========================================================================
@@ -657,18 +975,62 @@ class TestJobManagementBusinessActions:
 
     @pytest.mark.asyncio
     async def test_get_roi_summary_action_returns_summary(self, job_mgmt, mock_mgmt_client):
-        """get_roi_summary action returns aggregated ROI summary."""
-        mock_mgmt_client.get_job_types = AsyncMock(return_value=["LEAD"])
-        mock_mgmt_client.get_job_conversion_funnel = AsyncMock(return_value={
-            "totalJobs": 100, "successfulJobs": 80, "convertedJobs": 60,
-            "successRate": 0.8, "conversionRate": 0.6,
-        })
+        """get_roi_summary action renders the published summary."""
+        mock_mgmt_client.get_jobs_roi_summary = AsyncMock(return_value=ROI_SUMMARY_RESPONSE)
 
         result = await job_mgmt.handle_action("get_roi_summary", {})
 
         assert len(result) >= 1
         assert isinstance(result[0], TextContent)
         assert "roi summary" in result[0].text.lower()
+        assert "LEAD_QUALIFICATION" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_get_roi_summary_renders_the_attribution_qualifier(
+        self, job_mgmt, mock_mgmt_client
+    ):
+        """The rendered text says what ALLOCATED_BY_AGENT means.
+
+        Without it the cost split reads as measured per job type, which it is
+        not -- external tool cost is apportioned via the agent that spent it.
+        """
+        mock_mgmt_client.get_jobs_roi_summary = AsyncMock(return_value=ROI_SUMMARY_RESPONSE)
+
+        result = await job_mgmt.handle_action("get_roi_summary", {})
+
+        text = result[0].text
+        assert "toolCostAttribution" in text
+        assert "ALLOCATED_BY_AGENT" in text
+        assert "apportioned to job types via the agent that incurred it" in text
+        assert "not measured per job type directly" in text
+
+    @pytest.mark.asyncio
+    async def test_get_roi_summary_renders_unavailable_fields_as_missing(
+        self, job_mgmt, mock_mgmt_client
+    ):
+        """An omitted field renders as unavailable, and is called out as missing."""
+        response = json.loads(json.dumps(ROI_SUMMARY_RESPONSE))
+        del response["byJobType"][0]["externalToolCost"]
+        mock_mgmt_client.get_jobs_roi_summary = AsyncMock(return_value=response)
+
+        result = await job_mgmt.handle_action("get_roi_summary", {})
+
+        text = result[0].text
+        assert '"externalToolCost": "unavailable"' in text
+        assert "missing values, not zeros" in text
+
+    @pytest.mark.asyncio
+    async def test_get_roi_summary_renders_the_unapplied_filter(
+        self, job_mgmt, mock_mgmt_client
+    ):
+        """A filter the endpoint cannot apply is visible in the rendered text."""
+        mock_mgmt_client.get_jobs_roi_summary = AsyncMock(return_value=ROI_SUMMARY_RESPONSE)
+
+        result = await job_mgmt.handle_action(
+            "get_roi_summary", {"filters": {"environment": "production"}}
+        )
+
+        assert "Filters not applied: environment" in result[0].text
 
     @pytest.mark.asyncio
     async def test_report_outcome_action_returns_success_response(self, job_mgmt, mock_mgmt_client):
@@ -977,23 +1339,15 @@ class TestGetConversionFunnelStripsLinks:
 
 
 class TestGetRoiSummaryStripsLinks:
-    """get_roi_summary must strip _links from each per-type funnel breakdown item."""
+    """get_roi_summary must strip _links from the published envelope."""
 
     @pytest.mark.asyncio
     async def test_get_roi_summary_strips_links(self, job_manager, mock_client):
-        mock_client.get_job_types.return_value = {"_embedded": {"jobTypes": []}}
-        mock_client._extract_embedded_data.return_value = ["TYPE_A"]
-        mock_client.get_job_conversion_funnel = AsyncMock(return_value={
-            "totalJobs": 10,
-            "successfulJobs": 7,
-            "convertedJobs": 5,
-            "_links": {"self": {"href": "https://api-lb.dev.hcapp.io/profitstream/v2/api/jobs/conversion-funnel?jobType=TYPE_A"}},
-        })
+        mock_client.get_jobs_roi_summary.return_value = ROI_SUMMARY_RESPONSE
 
         result = await job_manager.get_roi_summary({"filters": {}})
 
-        for entry in result["per_type_breakdown"]:
-            assert entry["data"] is None or "_links" not in entry["data"]
+        assert "_links" not in result
         assert "api-lb.dev.hcapp.io" not in json.dumps(result)
 
 
@@ -1027,3 +1381,968 @@ class TestListJobsRejectsFloatPageNoLeak:
             await job_manager.list_jobs({"page": 3.7, "size": 20})
         assert exc.value.field == "page"
         assert_no_framework_leak(exc.value.message)
+
+
+# ===========================================================================
+# BACK-2769 — coding-session attribution, read half
+# ===========================================================================
+
+
+SESSION_ID = "853a73bf-d9d7-4351-a548-9d6c05648c61"
+
+
+def _collection(*intervals):
+    """The CollectionModel envelope the platform wraps intervals in."""
+    return {
+        "_embedded": {"objectList": list(intervals)},
+        "_links": {"self": {"href": "https://example.invalid/attribution"}},
+    }
+
+
+class TestListSessionAttributions:
+    """JobManager.list_session_attributions behaviour."""
+
+    @pytest.mark.asyncio
+    async def test_returns_intervals_newest_first(self, job_manager, mock_client):
+        """The client's ordering is preserved: element 0 is the current interval."""
+        mock_client.get_session_attributions.return_value = _collection(
+            {"ticketId": "BACK-2769", "effectiveFrom": "2026-09-04T10:00:00Z"},
+            {"ticketId": "BACK-2768", "effectiveFrom": "2026-09-03T10:00:00Z"},
+        )
+
+        result = await job_manager.list_session_attributions({"session_id": SESSION_ID})
+
+        mock_client.get_session_attributions.assert_awaited_once_with(SESSION_ID)
+        assert result["action"] == "list_session_attributions"
+        assert result["session_id"] == SESSION_ID
+        assert result["count"] == 2
+        assert [row["ticketId"] for row in result["data"]] == ["BACK-2769", "BACK-2768"]
+
+    @pytest.mark.parametrize(
+        "envelope",
+        [
+            # What dev actually returns for a session with no attributions
+            # (verified live 2026-09-04), and what the client returns for an
+            # empty body.
+            {},
+            # HAL omits _embedded when there is nothing to embed.
+            {"_links": {"self": {"href": "https://example.invalid/x"}}},
+            {"_links": {}, "page": {"totalElements": 0}},
+            # An _embedded envelope carrying an empty list is equally empty.
+            {"_embedded": {"objectList": []}},
+        ],
+        ids=["bare-object", "links-only", "links-and-page", "empty-objectList"],
+    )
+    @pytest.mark.asyncio
+    async def test_empty_collection_is_an_answer_not_an_error(
+        self, job_manager, mock_client, envelope
+    ):
+        """A session that was never attributed returns an empty, successful result."""
+        mock_client.get_session_attributions.return_value = envelope
+
+        result = await job_manager.list_session_attributions({"session_id": SESSION_ID})
+
+        assert result["count"] == 0
+        assert result["data"] == []
+
+    @pytest.mark.asyncio
+    async def test_links_are_stripped(self, job_manager, mock_client):
+        """HAL _links leak the internal load balancer hostname."""
+        mock_client.get_session_attributions.return_value = _collection(
+            {
+                "ticketId": "BACK-2769",
+                "_links": {
+                    "self": {
+                        "href": "https://api-lb.dev.hcapp.io/profitstream/v2/api/"
+                        "sessions/x/attribution"
+                    }
+                },
+            }
+        )
+
+        result = await job_manager.list_session_attributions({"session_id": SESSION_ID})
+
+        assert "api-lb.dev.hcapp.io" not in json.dumps(result)
+
+    @pytest.mark.asyncio
+    async def test_missing_session_id_raises_structured_error(self, job_manager, mock_client):
+        """No session_id means no request is attempted at all."""
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.list_session_attributions({})
+
+        assert exc_info.value.field == "session_id"
+        assert "session_id" in exc_info.value.message
+        mock_client.get_session_attributions.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_upstream_403_propagates(self, job_manager, mock_client):
+        """A team the caller cannot read must surface as the upstream 403."""
+        mock_client.get_session_attributions.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+
+        with pytest.raises(ReveniumAPIError) as exc_info:
+            await job_manager.list_session_attributions({"session_id": SESSION_ID})
+
+        assert exc_info.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_upstream_404_propagates(self, job_manager, mock_client):
+        """404 is team-not-found upstream, not an empty attribution list."""
+        mock_client.get_session_attributions.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+
+        with pytest.raises(ReveniumAPIError) as exc_info:
+            await job_manager.list_session_attributions({"session_id": SESSION_ID})
+
+        assert exc_info.value.status_code == 404
+
+
+class TestSessionAttributionEnvelopeShape:
+    """An envelope this code does not recognise must not read as "no attributions"."""
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            "not an object at all",
+            ["a", "list"],
+            42,
+            None,
+            {"error": "boom", "status": 500},
+            {"_embedded": "not an object"},
+            {"_embedded": {}},
+            {"_embedded": {"objectList": {"not": "a list"}}},
+            {"_embedded": {"attributions": [], "somethingElse": []}},
+            # Two lists are refused even when one of them is the expected
+            # member: picking objectList would silently drop the other.
+            {"_embedded": {"objectList": [{"ticketId": "A-1"}], "somethingElse": [{"x": 1}]}},
+            # A non-object element must never reach the renderer, where it
+            # would be printed verbatim and bypass the field allowlist.
+            {"_embedded": {"objectList": ["a string, not an interval"]}},
+            {"_embedded": {"objectList": [{"ticketId": "A-1"}, None]}},
+        ],
+        ids=[
+            "string-body",
+            "list-body",
+            "int-body",
+            "none-body",
+            "unexpected-keys",
+            "embedded-not-an-object",
+            "embedded-with-no-list",
+            "objectList-not-a-list",
+            "two-list-members",
+            "objectList-plus-another-list",
+            "string-item-in-the-collection",
+            "null-item-in-the-collection",
+        ],
+    )
+    def test_unrecognised_shapes_are_refused(self, response):
+        with pytest.raises(ToolError) as exc_info:
+            _session_attribution_intervals(SESSION_ID, response)
+
+        assert exc_info.value.error_code == ErrorCodes.API_ERROR
+        assert "Unexpected response shape" in exc_info.value.message
+        assert SESSION_ID in exc_info.value.message
+
+    def test_the_error_names_what_came_back(self):
+        with pytest.raises(ToolError) as exc_info:
+            _session_attribution_intervals(SESSION_ID, {"error": "boom", "status": 500})
+
+        assert "error" in exc_info.value.message and "status" in exc_info.value.message
+        assert exc_info.value.context["observed"] == ["error", "status"]
+
+    def test_two_lists_are_refused_by_name_even_with_objectList_present(self):
+        with pytest.raises(ToolError) as exc_info:
+            _session_attribution_intervals(
+                SESSION_ID,
+                {"_embedded": {"objectList": [{"ticketId": "A-1"}], "extra": [{"x": 1}]}},
+            )
+
+        message = exc_info.value.message
+        assert "more than one list member" in message
+        assert "objectList" in message and "extra" in message
+
+    def test_a_non_object_element_is_refused_naming_its_index_and_type(self):
+        with pytest.raises(ToolError) as exc_info:
+            _session_attribution_intervals(
+                SESSION_ID,
+                {"_embedded": {"objectList": [{"ticketId": "A-1"}, "not an interval"]}},
+            )
+
+        message = exc_info.value.message
+        assert "element 1" in message
+        assert "str" in message
+        assert exc_info.value.context["observed"] == {
+            "member": "objectList",
+            "index": 1,
+            "type": "str",
+        }
+
+    def test_snapshot_member_name_is_read(self):
+        intervals = _session_attribution_intervals(
+            SESSION_ID, {"_embedded": {"objectList": [{"ticketId": "BACK-2769"}]}}
+        )
+
+        assert intervals == [{"ticketId": "BACK-2769"}]
+
+    def test_a_single_differently_named_list_is_accepted(self):
+        """A resource-named list must not turn a working read into a failure."""
+        intervals = _session_attribution_intervals(
+            SESSION_ID,
+            {"_embedded": {"sessionAttributionIntervalResourceList": [{"ticketId": "A-1"}]}},
+        )
+
+        assert intervals == [{"ticketId": "A-1"}]
+
+    @pytest.mark.asyncio
+    async def test_malformed_envelope_reaches_the_caller_as_an_error(
+        self, job_manager, mock_client
+    ):
+        """The action must not answer "no attributions recorded" for a bad shape."""
+        mock_client.get_session_attributions.return_value = {"unexpected": "payload"}
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.list_session_attributions({"session_id": SESSION_ID})
+
+        assert exc_info.value.error_code == ErrorCodes.API_ERROR
+        assert "No attributions recorded" not in exc_info.value.message
+
+
+class TestRenderSessionAttributions:
+    """The rendering must not invent values it was not given."""
+
+    def test_absent_fields_render_as_unavailable_never_zero(self):
+        rendered = _render_session_attributions(SESSION_ID, [{"ticketId": "BACK-2769"}])
+
+        assert "Ticket: BACK-2769" in rendered
+        assert "Ticket title: unavailable" in rendered
+        assert "Effective from: unavailable" in rendered
+        assert ": 0" not in rendered
+
+    def test_every_declared_field_gets_a_row(self):
+        rendered = _render_session_attributions(SESSION_ID, [{"ticketId": "BACK-2769"}])
+
+        for _, label in _SESSION_ATTRIBUTION_FIELDS:
+            assert f"{label}:" in rendered
+
+    def test_unknown_field_names_are_reported_but_their_values_are_not(self):
+        rendered = _render_session_attributions(
+            SESSION_ID,
+            [{"ticketId": "BACK-2769", "brandNewField": "surprise", "another": "secret"}],
+        )
+
+        assert "2 additional fields not shown: another, brandNewField" in rendered
+        assert "surprise" not in rendered
+        assert "secret" not in rendered
+
+    def test_a_single_unknown_field_reads_in_the_singular(self):
+        rendered = _render_session_attributions(
+            SESSION_ID, [{"ticketId": "BACK-2769", "brandNewField": "surprise"}]
+        )
+
+        assert "1 additional field not shown: brandNewField" in rendered
+
+    def test_no_extras_line_when_every_field_is_known(self):
+        rendered = _render_session_attributions(
+            SESSION_ID, [{name: "x" for name, _ in _SESSION_ATTRIBUTION_FIELDS}]
+        )
+
+        assert "additional field" not in rendered
+
+    def test_empty_collection_says_so_in_words(self):
+        rendered = _render_session_attributions(SESSION_ID, [])
+
+        assert "No attributions recorded for this session." in rendered
+        assert SESSION_ID in rendered
+
+    def test_footer_states_splits_are_not_exposed(self):
+        for intervals in ([], [{"ticketId": "BACK-2769"}]):
+            rendered = _render_session_attributions(SESSION_ID, intervals)
+            assert "does not expose splits" in rendered
+            assert "declares no splits field" in rendered
+
+    def test_interval_count_is_reported(self):
+        one = _render_session_attributions(SESSION_ID, [{"ticketId": "A-1"}])
+        two = _render_session_attributions(
+            SESSION_ID, [{"ticketId": "A-1"}, {"ticketId": "A-2"}]
+        )
+
+        assert "(1 interval, current first)" in one
+        assert "(2 intervals, current first)" in two
+
+
+class TestSessionAttributionAction:
+    """JobManagement.handle_action routing and documented surfaces."""
+
+    @pytest.mark.asyncio
+    async def test_action_renders_the_collection(self, job_mgmt, mock_mgmt_client):
+        mock_mgmt_client.get_session_attributions = AsyncMock(
+            return_value=_collection(
+                {"ticketId": "BACK-2769", "ticketTitle": "Session attribution read"}
+            )
+        )
+
+        result = await job_mgmt.handle_action(
+            "list_session_attributions", {"session_id": SESSION_ID}
+        )
+
+        assert isinstance(result[0], TextContent)
+        assert SESSION_ID in result[0].text
+        assert "BACK-2769" in result[0].text
+        assert "does not expose splits" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_action_renders_empty_collection(self, job_mgmt, mock_mgmt_client):
+        mock_mgmt_client.get_session_attributions = AsyncMock(return_value={})
+
+        result = await job_mgmt.handle_action(
+            "list_session_attributions", {"session_id": SESSION_ID}
+        )
+
+        assert "No attributions recorded for this session." in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_action_without_session_id_raises(self, job_mgmt, mock_mgmt_client):
+        with pytest.raises(ToolError) as exc_info:
+            await job_mgmt.handle_action("list_session_attributions", {})
+
+        assert exc_info.value.field == "session_id"
+
+    @pytest.mark.asyncio
+    async def test_action_is_advertised(self, job_mgmt, mock_mgmt_client):
+        actions = await job_mgmt._get_supported_actions()
+        assert "list_session_attributions" in actions
+
+        result = await job_mgmt.handle_action("get_capabilities", {})
+        payload = json.loads(result[0].text)
+
+        assert "list_session_attributions" in payload["business_actions"]
+        assert "list_session_attributions" in payload["parameters"]
+        assert "session_id" in payload["parameters"]["list_session_attributions"]
+
+    @pytest.mark.asyncio
+    async def test_documentation_names_the_missing_splits_field(self, job_mgmt, mock_mgmt_client):
+        result = await job_mgmt.handle_action("get_capabilities", {})
+        payload = json.loads(result[0].text)
+
+        assert "splits" in payload["parameters"]["list_session_attributions"]["splits"]
+        assert (
+            "declares no splits field"
+            in payload["parameters"]["list_session_attributions"]["splits"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_examples_include_the_action(self, job_mgmt, mock_mgmt_client):
+        result = await job_mgmt.handle_action("get_examples", {})
+        payload = json.loads(result[0].text)
+
+        assert payload["list_session_attributions"]["example"]["action"] == (
+            "list_session_attributions"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_write_action_is_exposed(self, job_mgmt, mock_mgmt_client):
+        """Decision (BACK-2769): the MCP exposes no session-attribution write."""
+        actions = await job_mgmt._get_supported_actions()
+
+        assert not [
+            action
+            for action in actions
+            if "session" in action and action != "list_session_attributions"
+        ]
+
+
+class TestSessionAttributionDecisionIsRecorded:
+    """The decision must stay findable in code, not only on the ticket."""
+
+    def test_module_docstring_records_the_decision_and_error_semantics(self):
+        from src.revenium_mcp_server.tools_decomposed import job_management
+
+        doc = job_management.__doc__ or ""
+        assert "Decision (BACK-2769)" in doc
+        assert "does NOT expose" in doc
+        assert "association-client.ts" in doc
+        assert "422" in doc and "400" in doc
+        assert "CodingAssistantSource" in doc
+
+
+# ===========================================================================
+
+
+REASON_CATEGORY_ROW = {
+    "ticketId": "BACK-3094",
+    "reasonCategory": "peer-review",
+    "reasonCategoryGroup": "delivery-support",
+    "reasonCategoryWorkClassification": "WORK",
+}
+
+
+class TestSessionAttributionReasonCategoryFields:
+    """PRODUCT-2796 added three classification fields the renderer must name."""
+
+    def test_the_three_fields_are_declared(self):
+        names = [name for name, _ in _SESSION_ATTRIBUTION_FIELDS]
+
+        assert names.count("reasonCategory") == 1
+        assert names.count("reasonCategoryGroup") == 1
+        assert names.count("reasonCategoryWorkClassification") == 1
+
+    def test_values_render_by_name_when_present(self):
+        rendered = _render_session_attributions(SESSION_ID, [REASON_CATEGORY_ROW])
+
+        assert "Reason category: peer-review" in rendered
+        assert "Reason category group: delivery-support" in rendered
+        assert "Reason category work classification: WORK" in rendered
+
+    def test_absent_fields_render_as_unavailable_never_zero_or_empty(self):
+        rendered = _render_session_attributions(SESSION_ID, [{"ticketId": "BACK-3094"}])
+
+        assert "Reason category: unavailable" in rendered
+        assert "Reason category group: unavailable" in rendered
+        assert "Reason category work classification: unavailable" in rendered
+        assert ": 0" not in rendered
+        assert "Reason category:\n" not in rendered
+
+    def test_a_standalone_category_without_a_group_still_shows_the_category(self):
+        """The registry returns no group for personal/restricted/other/uncategorized."""
+        rendered = _render_session_attributions(
+            SESSION_ID,
+            [
+                {
+                    "ticketId": "BACK-3094",
+                    "reasonCategory": "personal",
+                    "reasonCategoryGroup": None,
+                    "reasonCategoryWorkClassification": "NON_WORK",
+                }
+            ],
+        )
+
+        assert "Reason category: personal" in rendered
+        assert "Reason category group: unavailable" in rendered
+        assert "Reason category work classification: NON_WORK" in rendered
+
+    def test_they_no_longer_count_as_additional_fields_not_shown(self):
+        rendered = _render_session_attributions(SESSION_ID, [REASON_CATEGORY_ROW])
+
+        assert "additional field" not in rendered
+
+    def test_only_genuinely_unknown_fields_are_counted(self):
+        rendered = _render_session_attributions(
+            SESSION_ID, [{**REASON_CATEGORY_ROW, "brandNewField": "surprise"}]
+        )
+
+        assert "1 additional field not shown: brandNewField" in rendered
+        assert "surprise" not in rendered
+
+
+class TestSessionAttributionNullReasonNote:
+    """A null reason has three meanings this read cannot tell apart."""
+
+    def test_note_states_all_three_meanings(self):
+        rendered = _render_session_attributions(SESSION_ID, [{"ticketId": "BACK-3094"}])
+
+        assert "Reason: unavailable" in rendered
+        assert "no note was recorded for the interval" in rendered
+        assert "not visible to this caller" in rendered
+        assert "attribution detail text setting is off" in rendered
+        assert "BACK-3096" in rendered
+
+    def test_note_is_absent_when_every_row_carries_its_reason(self):
+        rendered = _render_session_attributions(
+            SESSION_ID,
+            [
+                {"ticketId": "A-1", "reason": "Investigating before opening a ticket"},
+                {"ticketId": "A-2", "reason": "Follow-up"},
+            ],
+        )
+
+        assert _SESSION_ATTRIBUTION_REASON_NOTE not in rendered
+        assert "Reason: Investigating before opening a ticket" in rendered
+
+    def test_note_appears_when_only_one_row_lacks_the_reason(self):
+        rendered = _render_session_attributions(
+            SESSION_ID,
+            [{"ticketId": "A-1", "reason": "Kept"}, {"ticketId": "A-2"}],
+        )
+
+        assert _SESSION_ATTRIBUTION_REASON_NOTE in rendered
+
+    def test_an_empty_collection_carries_no_reason_note(self):
+        rendered = _render_session_attributions(SESSION_ID, [])
+
+        assert _SESSION_ATTRIBUTION_REASON_NOTE not in rendered
+        assert "does not expose splits" in rendered
+
+    def test_the_splits_note_is_still_the_last_line(self):
+        rendered = _render_session_attributions(SESSION_ID, [{"ticketId": "A-1"}])
+
+        assert rendered.endswith(_SESSION_ATTRIBUTION_SPLITS_NOTE)
+
+    @pytest.mark.asyncio
+    async def test_result_carries_the_note_only_when_a_row_lacks_the_reason(
+        self, job_manager, mock_client
+    ):
+        mock_client.get_session_attributions.return_value = _collection(
+            {"ticketId": "A-1"}
+        )
+        without = await job_manager.list_session_attributions({"session_id": SESSION_ID})
+
+        mock_client.get_session_attributions.return_value = _collection(
+            {"ticketId": "A-1", "reason": "Kept"}
+        )
+        with_reason = await job_manager.list_session_attributions(
+            {"session_id": SESSION_ID}
+        )
+
+        assert without["reason_note"] == _SESSION_ATTRIBUTION_REASON_NOTE
+        assert "reason_note" not in with_reason
+
+    @pytest.mark.asyncio
+    async def test_action_output_carries_the_note(self, job_mgmt, mock_mgmt_client):
+        mock_mgmt_client.get_session_attributions = AsyncMock(
+            return_value=_collection(REASON_CATEGORY_ROW)
+        )
+
+        result = await job_mgmt.handle_action(
+            "list_session_attributions", {"session_id": SESSION_ID}
+        )
+
+        assert "Reason category: peer-review" in result[0].text
+        assert _SESSION_ATTRIBUTION_REASON_NOTE in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_capabilities_document_the_fields_and_the_note(
+        self, job_mgmt, mock_mgmt_client
+    ):
+        result = await job_mgmt.handle_action("get_capabilities", {})
+        entry = json.loads(result[0].text)["parameters"]["list_session_attributions"]
+
+        assert "reasonCategoryWorkClassification" in entry["returns"]
+        assert "WORK, NON_WORK or UNKNOWN" in entry["returns"]
+        assert entry["reason"] == _SESSION_ATTRIBUTION_REASON_NOTE
+
+    @pytest.mark.asyncio
+    async def test_capability_metadata_lists_the_note_as_a_limitation(
+        self, job_mgmt, mock_mgmt_client
+    ):
+        capabilities = await job_mgmt._get_tool_capabilities()
+        attribution = [
+            capability for capability in capabilities if "Attribution" in capability.name
+        ]
+
+        assert attribution
+        assert _SESSION_ATTRIBUTION_REASON_NOTE in attribution[0].limitations
+# BACK-3091 — the outcome metrics array, entityVersion, and amend_outcome
+# ===========================================================================
+
+
+class TestOutcomeMetricsAndEntityVersionAreDocumented:
+    """The two fields already flowed through untouched; nothing an agent reads
+    said so. `metrics` rides the outcome body verbatim and `entityVersion`
+    survives `_strip_links`, so the only possible regression is the guidance
+    going quiet about them again."""
+
+    @pytest.mark.asyncio
+    async def test_capabilities_name_metrics_on_report_outcome(self, job_mgmt):
+        result = await job_mgmt.handle_action("get_capabilities", {})
+        report_outcome = json.loads(result[0].text)["parameters"]["report_outcome"]
+
+        assert "metrics" in report_outcome["outcome_data"]
+        assert "quality_rate" in report_outcome["outcome_data"]
+        assert "PER_JOB" in report_outcome["outcome_data"]
+        assert "entityVersion" in report_outcome["outcome_data"]
+
+    @pytest.mark.asyncio
+    async def test_examples_carry_a_metrics_payload(self, job_mgmt):
+        result = await job_mgmt.handle_action("get_examples", {})
+        report_outcome = json.loads(result[0].text)["report_outcome"]
+
+        entry = report_outcome["example_with_metrics"]["outcome_data"]["metrics"][0]
+        assert entry["key"] == "quality_rate"
+        assert entry["provenance"] == "MEASURED"
+        assert "entityVersion" in report_outcome["entity_version"]
+
+    @pytest.mark.asyncio
+    async def test_read_examples_name_entity_version(self, job_mgmt):
+        result = await job_mgmt.handle_action("get_examples", {})
+        parsed = json.loads(result[0].text)
+
+        assert "entityVersion" in parsed["list_jobs"]["description"]
+        assert "entityVersion" in parsed["get_job"]["description"]
+
+    @pytest.mark.asyncio
+    async def test_report_outcome_still_forwards_metrics_verbatim(
+        self, job_manager, mock_client
+    ):
+        """The docs item must not have grown a filter on the write path."""
+        mock_client.report_job_outcome.return_value = {"status": "reported"}
+        outcome_data = {
+            "executionStatus": "SUCCESS",
+            "metrics": [{"key": "quality_rate", "value": 0.93, "provenance": "MEASURED"}],
+        }
+
+        await job_manager.report_outcome({"job_id": "j1", "outcome_data": outcome_data})
+
+        mock_client.report_job_outcome.assert_called_once_with("j1", outcome_data)
+
+    @pytest.mark.asyncio
+    async def test_get_job_keeps_entity_version(self, job_manager, mock_client):
+        mock_client.get_job_by_id.return_value = {
+            "id": "j1",
+            "entityVersion": 3,
+            "_links": {"self": {"href": "http://internal-lb/x"}},
+        }
+
+        result = await job_manager.get_job({"job_id": "j1"})
+
+        assert result["data"]["entityVersion"] == 3
+        assert "_links" not in result["data"]
+
+
+class TestAmendOutcomeDecisionIsRecorded:
+    """BACK-3091 item 2. The adopt-or-decline decision lives in the module
+    docstring beside Decision (BACK-2769); a future drift run must find the
+    reasoning rather than re-deriving it. Deleting the block, or shipping the
+    action without it, fails here."""
+
+    def test_decision_block_present_in_module_docstring(self):
+        docstring = job_management_module.__doc__ or ""
+
+        assert "Decision (BACK-3091)" in docstring
+        assert "ADOPTED" in docstring
+        assert "expected_entity_version" in docstring
+        assert "outcome/metrics" in docstring
+
+    @pytest.mark.asyncio
+    async def test_amend_outcome_is_an_advertised_action(self, job_mgmt):
+        actions = await job_mgmt._get_supported_actions()
+
+        assert "amend_outcome" in actions
+
+    def test_registry_closure_declares_expected_entity_version(self):
+        """FastMCP derives the public schema from the closure signature, so a
+        parameter missing there is rejected before handle_action runs."""
+        import inspect
+
+        from src.revenium_mcp_server.tool_configuration import registry as registry_module
+
+        source = inspect.getsource(registry_module.ToolConfigurationRegistry._register_manage_jobs)
+        assert "expected_entity_version: Optional[Union[int, str]] = None" in source
+        assert '"expected_entity_version": expected_entity_version,' in source
+
+
+class TestJobManagerAmendOutcome:
+    """The PATCH path: verbatim body, the optimistic lock, and the 409."""
+
+    @pytest.mark.asyncio
+    async def test_amend_forwards_the_body_verbatim_with_the_version(
+        self, job_manager, mock_client
+    ):
+        mock_client.amend_job_outcome.return_value = {"id": "j1", "entityVersion": 3}
+
+        result = await job_manager.amend_outcome(
+            {
+                "job_id": "j1",
+                "expected_entity_version": 2,
+                "outcome_data": {
+                    "reason": "Deal value corrected after invoicing",
+                    "outcomeValue": 149.99,
+                    "metrics": [{"key": "quality_rate", "value": 0.93}],
+                },
+            }
+        )
+
+        mock_client.amend_job_outcome.assert_called_once_with(
+            "j1",
+            {
+                "reason": "Deal value corrected after invoicing",
+                "outcomeValue": 149.99,
+                "metrics": [{"key": "quality_rate", "value": 0.93}],
+                "expectedEntityVersion": 2,
+            },
+        )
+        assert result["action"] == "amend_outcome"
+        assert result["data"]["entityVersion"] == 3
+
+    @pytest.mark.asyncio
+    async def test_amend_omits_the_lock_when_no_version_is_given(
+        self, job_manager, mock_client
+    ):
+        """Omitted means last-write-wins, the platform's documented backward
+        compatible default. The key must be absent, not null."""
+        mock_client.amend_job_outcome.return_value = {"id": "j1"}
+
+        await job_manager.amend_outcome(
+            {"job_id": "j1", "outcome_data": {"outcomeReason": "Customer confirmed churn"}}
+        )
+
+        sent = mock_client.amend_job_outcome.call_args[0][1]
+        assert "expectedEntityVersion" not in sent
+
+    @pytest.mark.asyncio
+    async def test_version_zero_is_sent_not_dropped_as_falsy(
+        self, job_manager, mock_client
+    ):
+        mock_client.amend_job_outcome.return_value = {"id": "j1"}
+
+        await job_manager.amend_outcome(
+            {"job_id": "j1", "expected_entity_version": 0, "outcome_data": {"outcomeValue": 1.0}}
+        )
+
+        assert mock_client.amend_job_outcome.call_args[0][1]["expectedEntityVersion"] == 0
+
+    @pytest.mark.asyncio
+    async def test_numeric_string_version_is_coerced(self, job_manager, mock_client):
+        """The MCP boundary can hand a string through for any argument."""
+        mock_client.amend_job_outcome.return_value = {"id": "j1"}
+
+        await job_manager.amend_outcome(
+            {"job_id": "j1", "expected_entity_version": "4", "outcome_data": {"outcomeValue": 1.0}}
+        )
+
+        assert mock_client.amend_job_outcome.call_args[0][1]["expectedEntityVersion"] == 4
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", [-1, "abc", 1.5, True, {"v": 1}])
+    async def test_bad_version_is_rejected_before_the_request(
+        self, job_manager, mock_client, bad
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.amend_outcome(
+                {"job_id": "j1", "expected_entity_version": bad, "outcome_data": {"outcomeValue": 1.0}}
+            )
+
+        assert exc_info.value.field == "expected_entity_version"
+        assert exc_info.value.error_code == ErrorCodes.INVALID_PARAMETER
+        mock_client.amend_job_outcome.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_job_id_is_rejected(self, job_manager):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.amend_outcome({"outcome_data": {"outcomeValue": 1.0}})
+
+        assert exc_info.value.field == "job_id"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("empty", [None, {}, "not a dict"])
+    async def test_empty_amendment_is_rejected(self, job_manager, mock_client, empty):
+        """An amendment naming nothing burns a revision for no change."""
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.amend_outcome({"job_id": "j1", "outcome_data": empty})
+
+        assert exc_info.value.field == "outcome_data"
+        mock_client.amend_job_outcome.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_409_becomes_a_structured_conflict_naming_the_current_version(
+        self, job_manager, mock_client
+    ):
+        """The version to retry with exists only in the platform's prose."""
+        mock_client.amend_job_outcome.side_effect = ReveniumAPIError(
+            "Outcome has changed since entity version 1; current version is 4",
+            status_code=409,
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.amend_outcome(
+                {"job_id": "j1", "expected_entity_version": 1, "outcome_data": {"outcomeValue": 1.0}}
+            )
+
+        error = exc_info.value
+        assert error.error_code == ErrorCodes.RESOURCE_CONFLICT
+        assert error.context["current_entity_version"] == 4
+        assert error.context["expected_entity_version"] == 1
+        assert "was NOT applied" in error.message
+        assert any("get_job" in s for s in error.suggestions)
+
+    @pytest.mark.asyncio
+    async def test_409_without_a_parseable_version_says_unknown_rather_than_guessing(
+        self, job_manager, mock_client
+    ):
+        mock_client.amend_job_outcome.side_effect = ReveniumAPIError(
+            "Conflict", status_code=409
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.amend_outcome(
+                {"job_id": "j1", "expected_entity_version": 1, "outcome_data": {"outcomeValue": 1.0}}
+            )
+
+        assert exc_info.value.context["current_entity_version"] is None
+        assert "did not name the current version" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_409_is_not_retried(self, job_manager, mock_client):
+        """The PATCH is not idempotent; a retry appends a duplicate revision."""
+        mock_client.amend_job_outcome.side_effect = ReveniumAPIError(
+            "Outcome has changed since entity version 1; current version is 4",
+            status_code=409,
+        )
+
+        with pytest.raises(ToolError):
+            await job_manager.amend_outcome(
+                {"job_id": "j1", "expected_entity_version": 1, "outcome_data": {"outcomeValue": 1.0}}
+            )
+
+        assert mock_client.amend_job_outcome.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_non_409_api_errors_are_reraised(self, job_manager, mock_client):
+        mock_client.amend_job_outcome.side_effect = ReveniumAPIError(
+            "Bad request", status_code=400
+        )
+
+        with pytest.raises(ReveniumAPIError):
+            await job_manager.amend_outcome(
+                {"job_id": "j1", "outcome_data": {"outcomeValue": 1.0}}
+            )
+
+    @pytest.mark.asyncio
+    async def test_amend_strips_links(self, job_manager, mock_client):
+        mock_client.amend_job_outcome.return_value = {
+            "id": "j1",
+            "entityVersion": 5,
+            "_links": {"self": {"href": "http://internal-lb/x"}},
+        }
+
+        result = await job_manager.amend_outcome(
+            {"job_id": "j1", "outcome_data": {"outcomeValue": 1.0}}
+        )
+
+        assert "_links" not in result["data"]
+
+    def test_conflict_version_is_read_from_the_response_body_too(self):
+        """Depending on how the body decoded, the prose may be on a field."""
+        error = ReveniumAPIError(
+            "Conflict",
+            status_code=409,
+            response_data={"message": "Outcome has changed since entity version 2; current version is 7"},
+        )
+
+        assert _parse_outcome_conflict_version(error) == 7
+
+
+class TestAmendOutcomeThroughHandleAction:
+    @pytest.mark.asyncio
+    async def test_amend_outcome_dispatches(self, job_mgmt, mock_mgmt_client):
+        mock_mgmt_client.amend_job_outcome = AsyncMock(
+            return_value={"id": "j1", "entityVersion": 3}
+        )
+
+        result = await job_mgmt.handle_action(
+            "amend_outcome",
+            {
+                "job_id": "j1",
+                "expected_entity_version": 2,
+                "outcome_data": {"reason": "corrected", "outcomeValue": 149.99},
+            },
+        )
+
+        assert isinstance(result[0], TextContent)
+        assert "Outcome amended for job j1" in result[0].text
+        assert "entityVersion" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_capabilities_describe_the_amendment(self, job_mgmt):
+        result = await job_mgmt.handle_action("get_capabilities", {})
+        parsed = json.loads(result[0].text)
+
+        assert "amend_outcome" in parsed["business_actions"]
+        amend = parsed["parameters"]["amend_outcome"]
+        assert set(amend) == {"job_id", "outcome_data", "expected_entity_version", "history"}
+        assert "metrics" in amend["outcome_data"]
+        assert "last-write-wins" in amend["expected_entity_version"]
+
+    @pytest.mark.asyncio
+    async def test_examples_show_the_read_then_amend_loop(self, job_mgmt):
+        result = await job_mgmt.handle_action("get_examples", {})
+        amend = json.loads(result[0].text)["amend_outcome"]
+
+        assert amend["example_corrected_value"]["expected_entity_version"] == 2
+        assert (
+            amend["example_late_quality_metric"]["outcome_data"]["metrics"][0]["key"]
+            == "quality_rate"
+        )
+        assert "expected_entity_version" not in amend["example_without_the_lock"]
+
+
+class TestAmendOutcomeNestedVersionCannotBypassValidation:
+    """outcome_data is free-form and forwarded verbatim, so a caller can put
+    the platform's own `expectedEntityVersion` spelling inside it. It is lifted
+    out and run through the same coercion as the argument — never forwarded
+    unvalidated, and never counted as a field being amended."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["expectedEntityVersion", "expected_entity_version"])
+    async def test_nested_version_is_validated_and_sent(self, job_manager, mock_client, key):
+        mock_client.amend_job_outcome.return_value = {"id": "j1"}
+
+        await job_manager.amend_outcome(
+            {"job_id": "j1", "outcome_data": {"outcomeValue": 1.0, key: "4"}}
+        )
+
+        sent = mock_client.amend_job_outcome.call_args[0][1]
+        assert sent == {"outcomeValue": 1.0, "expectedEntityVersion": 4}
+
+    @pytest.mark.asyncio
+    async def test_malformed_nested_version_is_rejected_before_the_request(
+        self, job_manager, mock_client
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.amend_outcome(
+                {
+                    "job_id": "j1",
+                    "outcome_data": {"outcomeValue": 1.0, "expectedEntityVersion": -3},
+                }
+            )
+
+        assert exc_info.value.error_code == ErrorCodes.INVALID_PARAMETER
+        assert "outcome_data.expectedEntityVersion" in exc_info.value.message
+        mock_client.amend_job_outcome.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_nested_and_argument_agreeing_is_accepted(self, job_manager, mock_client):
+        mock_client.amend_job_outcome.return_value = {"id": "j1"}
+
+        await job_manager.amend_outcome(
+            {
+                "job_id": "j1",
+                "expected_entity_version": 2,
+                "outcome_data": {"outcomeValue": 1.0, "expectedEntityVersion": 2},
+            }
+        )
+
+        assert mock_client.amend_job_outcome.call_args[0][1]["expectedEntityVersion"] == 2
+
+    @pytest.mark.asyncio
+    async def test_nested_and_argument_disagreeing_is_refused_not_guessed(
+        self, job_manager, mock_client
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.amend_outcome(
+                {
+                    "job_id": "j1",
+                    "expected_entity_version": 2,
+                    "outcome_data": {"outcomeValue": 1.0, "expectedEntityVersion": 5},
+                }
+            )
+
+        assert "Conflicting optimistic-lock versions" in exc_info.value.message
+        mock_client.amend_job_outcome.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_body_naming_only_the_lock_is_an_empty_amendment(
+        self, job_manager, mock_client
+    ):
+        """The lock is not a change; a body carrying nothing else amends nothing."""
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.amend_outcome(
+                {"job_id": "j1", "outcome_data": {"expectedEntityVersion": 2}}
+            )
+
+        assert exc_info.value.field == "outcome_data"
+        assert "A version is the lock, not a change" in exc_info.value.message
+        mock_client.amend_job_outcome.assert_not_called()
+# BACK-3094 — the reason-category fields, and what a null reason means
+# ====================================================================

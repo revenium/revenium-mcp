@@ -81,7 +81,6 @@ class BusinessManagementRegistry(BaseToolRegistry):
                     "update",
                     "replace",
                     "delete",
-                    "restore",
                     "search",
                     "meter_event",
                     "list_events",

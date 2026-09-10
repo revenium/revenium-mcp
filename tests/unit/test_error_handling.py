@@ -235,5 +235,84 @@ class TestErrorHandlingDecorator:
         assert "unknown action" in str(exc_info.value).lower()
 
 
+class TestRefusalHelpers:
+    """BACK-2937: refusal helpers raise so the MCP envelope sets the error flag."""
+
+    def test_raise_refusal_keeps_prose_verbatim(self):
+        from src.revenium_mcp_server.common.error_handling import (
+            ErrorCodes,
+            ToolError,
+            raise_refusal,
+        )
+
+        prose = "**Missing Required Field**\n\n**Field**: `name`"
+        with pytest.raises(ToolError) as exc_info:
+            raise_refusal(
+                prose,
+                error_code=ErrorCodes.MISSING_PARAMETER,
+                field="name",
+                value=None,
+            )
+
+        assert exc_info.value.message == prose
+        assert exc_info.value.error_code == ErrorCodes.MISSING_PARAMETER
+        assert exc_info.value.field == "name"
+
+    def test_raise_structured_error_formats_guidance_into_message(self):
+        from src.revenium_mcp_server.common.error_handling import (
+            ToolError,
+            create_structured_missing_parameter_error,
+            format_structured_error,
+            raise_structured_error,
+        )
+
+        error = create_structured_missing_parameter_error(
+            parameter_name="anomaly_data",
+            action="create",
+            examples={"usage": "create(anomaly_data={...})"},
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            raise_structured_error(error)
+
+        assert exc_info.value.message == format_structured_error(error)
+        assert "anomaly_data" in exc_info.value.message
+        assert exc_info.value.error_code == error.error_code
+
+    def test_raise_unknown_action_error_default_hint(self):
+        from src.revenium_mcp_server.common.error_handling import (
+            ErrorCodes,
+            ToolError,
+            raise_unknown_action_error,
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            raise_unknown_action_error("this_does_not_exist")
+
+        assert exc_info.value.message == (
+            "Unknown action 'this_does_not_exist'. "
+            "Use get_capabilities() to see all supported actions."
+        )
+        assert exc_info.value.error_code == ErrorCodes.ACTION_NOT_SUPPORTED
+        assert exc_info.value.field == "action"
+        assert exc_info.value.value == "this_does_not_exist"
+
+    def test_raise_unknown_action_error_explicit_hint(self):
+        """The tools that inline their action list produce the same wording
+        they did before the builder existed."""
+        from src.revenium_mcp_server.common.error_handling import (
+            ToolError,
+            raise_unknown_action_error,
+        )
+
+        supported = ["list", "get", "create"]
+        with pytest.raises(ToolError) as exc_info:
+            raise_unknown_action_error(
+                "bogus", hint=f"Supported actions: {', '.join(supported)}"
+            )
+
+        assert exc_info.value.message == "Unknown action 'bogus'. Supported actions: list, get, create"
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

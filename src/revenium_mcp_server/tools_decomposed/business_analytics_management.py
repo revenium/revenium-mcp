@@ -50,6 +50,25 @@ from ..common.numeric_param_validator import coerce_numeric_param
 from ..common.validation import validate_pagination_params
 from ..introspection.metadata import ToolType
 
+# Section bounds of the get_user_costs capability entry, which is dropped when
+# the new analytics API is off (the endpoint is NEW_API_ONLY).
+_USER_COSTS_SECTION_START = "6. **get_user_costs**"
+_USER_COSTS_SECTION_END = "6a. **get_transaction_count**"
+
+
+def _strip_user_costs_section(capabilities: str) -> str:
+    """Remove the get_user_costs entry from the capabilities text.
+
+    Cuts between the section markers rather than matching a second copy of the
+    entry's wording, which stops removing anything the moment the entry is
+    reworded and leaves the tool advertising an action it cannot run.
+    """
+    start = capabilities.find(_USER_COSTS_SECTION_START)
+    end = capabilities.find(_USER_COSTS_SECTION_END)
+    if start == -1 or end == -1 or end < start:
+        return capabilities
+    return capabilities[:start] + capabilities[end:]
+
 
 class BusinessAnalyticsManagement(ToolBase):
     """Business Analytics Management Tool.
@@ -146,7 +165,7 @@ class BusinessAnalyticsManagement(ToolBase):
             )
 
             # Create image content
-            return ImageContent(type="image", data=base64_image, mimeType="image/png")
+            return ImageContent(type="image", data=base64_image, mime_type="image/png")
 
         except Exception as e:
             logger.error(f"Chart generation failed: {e}")
@@ -371,11 +390,23 @@ If you're seeing this error, please report it as it indicates a reliability issu
 6. **get_user_costs**
    - Analyze costs by user email (subscriber)
    - Returns cost, request count, and token usage per user
-   - Data from coding assistant traces (Cursor, Claude Code, Gemini CLI)
+   - Reports only rows whose subscriber email is populated; defaults to
+     filters.costSources=["coding_assistant"]
+   - NOT a per-employee coding-assistant report: the v2 analytics plane excludes usage priced as
+     coding-assistant activity, so an empty or small total here says nothing about a person's usage.
+     Use the web app's AI by Employee view for that, or pass
+     filters.costSources=["revenium_metered", "provider_billing"] for API-metered per-user spend
+   - Per-person billed spend (the platform's billing per-person view) is not exposed by this tool
+     at all: only anthropic_enterprise and github_copilot attribute spend to a named person at the
+     source, so that view answers an empty page for most tenants with nothing to explain why. For
+     cost by user from metered data, use get_user_costs; for per-employee coding-assistant spend,
+     the web app's AI by Employee view
 
 6a. **get_transaction_count**
    - Total transaction volume for your team over a period (real count, not derived from cost)
-   - Single aggregate number; same universe as the cost endpoints (coding-assistant transactions excluded)
+   - Single aggregate number; same universe as the v2 analytics cost actions - transactions priced as
+     coding-assistant usage are excluded, coding-assistant traffic billed as real provider spend is
+     counted, and no cost action applies a different rule
    - Deliberately narrower than manage_metering's transaction lookups, which include coding-assistant
      records by default; use those to verify whether Claude Code / Gemini CLI data arrived
 
@@ -416,8 +447,16 @@ If you're seeing this error, please report it as it indicates a reliability issu
    - A null coverage ratio is NOT zero coverage: state carries NO_INTEGRATION / ZERO_SPEND_PERIOD / DATA_UNAVAILABLE
    - trend is a signed percentage-point delta vs. the previous window; 0.0 pp is a real answer, only null means no prior period
    - Per-provider rows report that provider's SHARE of total billed spend plus its metered/billed amounts — the share is not a per-provider coverage
+   - Two metered totals when the platform sends them: inside the comparison (what the ratio and hidden spend came from) and outside it (metered spend with no billing credential to compare against)
+   - Metered spend outside the comparison is NOT hidden spend: hidden spend is billed and not metered, the other is metered with nothing to compare
+   - A per-provider 'billing credential connected: no' row is metered-only and is excluded from the aggregate ratio and hidden spend
+   - meteredBasis, when present, names the metered window, the store it was read from, and any transform applied to the figures
    - Coding-assistant usage is a yes/no PRESENCE FLAG, never an amount; 'no' does not prove absence
    - Requires the coding-assistant-separation-active feature: without it the platform answers 403, not a reduced report
+
+6g. **get_filter_options**
+   - Enumerate the valid filter values for a dimension (providers, models, agents, tasks, and the rest)
+   - Use it before passing a filter value to any cost action, so the value is one the platform knows
 
 7. **get_cost_summary**
    - Generate a summary report of recent AI spending (includes all dimensions)
@@ -507,13 +546,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - **Aggregations**: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
         if not _use_new_api():
-            capabilities = capabilities.replace(
-                "6. **get_user_costs**\n"
-                "   - Analyze costs by user email (subscriber)\n"
-                "   - Returns cost, request count, and token usage per user\n"
-                "   - Data from coding assistant traces (Cursor, Claude Code, Gemini CLI)\n\n",
-                "",
-            )
+            capabilities = _strip_user_costs_section(capabilities)
             for old, new in [("7.", "6."), ("8.", "7."), ("9.", "8."), ("10.", "9.")]:
                 capabilities = capabilities.replace(old, new, 1)
 
@@ -917,7 +950,11 @@ If you're seeing this error, please report it as it indicates a reliability issu
 **Scope**: the team is resolved from your credentials. `period` picks the comparison window — `24h`, `7d`, `30d` (default), `90d`, or `custom` with `start_date`/`end_date` as ISO instants. The value is passed through verbatim, so a newer platform period also works.
 **Reading the numbers**:
 - a coverage ratio of `n/a` is NOT zero coverage — `state` says which of `NO_INTEGRATION`, `ZERO_SPEND_PERIOD` or `DATA_UNAVAILABLE` produced it
-- `hiddenSpend` is billed-but-not-metered spend, so it is the gap to close, not additional cost
+- `hiddenSpend` is billed-but-not-metered spend, so it is the gap to close, not additional cost; it can also be null
+- `meteredTotalInComparison` is the metered spend the ratio and `hiddenSpend` were computed from — the providers that have a billing credential
+- `meteredTotalOutsideComparison` is metered spend Revenium counted but kept out of the comparison because its provider has no billing credential. It is real spend, and it is NOT hidden spend — reading only the comparison total understates what Revenium metered
+- a `byProvider` row with `billingCredentialConnected: false` reports metered spend whose invoice Revenium cannot see: no ratio, and deliberately excluded from the aggregate ratio and `hiddenSpend`
+- `meteredBasis` says where the metered figures came from — the window, the store/table, and a `transform` other than `none` naming what reshaped the row sums
 - `trend` is a signed PERCENTAGE-POINT delta against the previous window (current ratio minus previous), so `0.0 pp` means coverage held steady and is a real answer; only a null means there was no prior period
 - each `byProvider` row's ratio is that provider's SHARE of total billed spend, not its coverage — compare the row's `metered` against its `billing` to see one provider's gap; a row `state` of `no-data` means it reported nothing to compare
 - no amount carries a currency code: the report does not send one, so figures print bare rather than under an invented denomination
@@ -2757,6 +2794,43 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         "gap. A row state of no-data means the provider reported nothing to compare."
     )
 
+    # BACK-2957. The aggregate ratio and hiddenSpend are computed only over the
+    # providers that have a billing credential to compare against. Dollars
+    # metered for a provider with no credential are real spend and are reported
+    # apart, in meteredTotalOutsideComparison. Saying so is what stops a reader
+    # taking the comparison total for the whole of what Revenium metered.
+    _COVERAGE_OUTSIDE_COMPARISON_NOTE: ClassVar[str] = (
+        "Metered spend outside the comparison is NOT hidden spend. Hidden spend is "
+        "billed and not metered; this is metered with no billing credential to compare "
+        "against, so it is deliberately left out of the ratio and out of hidden spend."
+    )
+    _COVERAGE_NO_CREDENTIAL_NOTE: ClassVar[str] = (
+        "A row with billing credential connected: no reports metered spend whose invoice "
+        "Revenium cannot see, so it carries no ratio and is excluded from the aggregate "
+        "ratio and from hidden spend. Its dollars are real and are counted in the metered "
+        "spend outside the comparison."
+    )
+    # transform is a comma-separated list of what reshaped the metered row sums
+    # before they were reported. Printing the bare tokens would hide a reshaped
+    # figure behind a word the reader cannot decode, so each one is spelled out.
+    _COVERAGE_TRANSFORM_NOTES: ClassVar[Dict[str, str]] = {
+        "none": (
+            "each provider's figure is exactly the sum of that provider's metered rows "
+            "over the window above"
+        ),
+        "billing-weighted-split": (
+            "one vendor's telemetry was divided across several credentials by billing share"
+        ),
+        "narrowed-window": (
+            "at least one row was measured over a shorter window than requested; that "
+            "row's own comparison dates say which"
+        ),
+        "zeroed-no-overlap": (
+            "at least one row's amounts were zeroed because its billing and telemetry "
+            "never overlap"
+        ),
+    }
+
     @staticmethod
     def _render_presence_flag(value: Any) -> str:
         """Render a boolean presence flag as yes/no, or ``unknown`` when absent.
@@ -2837,6 +2911,67 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
                 # (e.g. 4e-09) instead of a bare "0." artifact.
                 return repr(value)
         return text
+
+    @staticmethod
+    def _is_coverage_amount(value: Any) -> bool:
+        """Whether a coverage figure is a real number worth rendering at all.
+
+        Absence must never print as 0: the scope totals arrived in a later
+        platform build (BACK-2957) and an older response simply omits them, so
+        presence is decided here rather than by rendering ``n/a`` in their place.
+        """
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+        )
+
+    def _render_metered_basis_lines(self, basis: Any) -> List[str]:
+        """Render where and how the metered figures were read, when upstream says.
+
+        The whole block is absent on older payloads and every sub-field is
+        independently optional, so a line is emitted only for what actually
+        arrived and the block header only when something did.
+        """
+        if not isinstance(basis, dict):
+            return []
+        lines: List[str] = []
+        window_start = basis.get("windowStart")
+        window_end = basis.get("windowEnd")
+        has_start = isinstance(window_start, str) and bool(window_start.strip())
+        has_end = isinstance(window_end, str) and bool(window_end.strip())
+        if has_start and has_end:
+            lines.append(f"- Metered window: {window_start} to {window_end}")
+        elif has_start:
+            lines.append(f"- Metered window starts: {window_start}")
+        elif has_end:
+            lines.append(f"- Metered window ends: {window_end}")
+        source = ".".join(
+            part
+            for part in (basis.get("store"), basis.get("table"))
+            if isinstance(part, str) and part.strip()
+        )
+        if source:
+            # The transactional metered store, not the analytics table the
+            # comparison surfaces read - naming it keeps the two apart.
+            lines.append(f"- Read from: {source}")
+        transform = basis.get("transform")
+        if isinstance(transform, str) and transform.strip():
+            tokens = [token.strip() for token in transform.split(",") if token.strip()]
+            lines.append(f"- Transform: {', '.join(tokens)}")
+            for token in tokens:
+                note = self._COVERAGE_TRANSFORM_NOTES.get(token)
+                if note is None:
+                    # A transform the platform added after this build: name it
+                    # rather than swallow it, so the reshaping stays visible.
+                    note = (
+                        "a reshaping this client does not recognise; the metered figures "
+                        "are not plain row sums"
+                    )
+                lines.append(f"  - {token}: {note}")
+        if lines:
+            lines[:0] = ["", "**Metered basis**"]
+        return lines
 
     async def _handle_get_coverage_ratio(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -2955,6 +3090,23 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
                 f"- Trend vs. the previous window: {self._render_trend(report.get('trend'))}",
                 f"- Confidence: {report.get('confidence') or 'n/a'}",
             ])
+            # BACK-2957: the ratio and hidden spend above cover only the
+            # providers with a billing credential. Naming both totals is what
+            # makes the scope of the answer visible instead of implicit.
+            in_comparison = report.get("meteredTotalInComparison")
+            if self._is_coverage_amount(in_comparison):
+                lines.append(
+                    "- Metered spend inside the comparison (what the ratio and hidden "
+                    "spend were computed from): "
+                    f"{self._render_coverage_amount(in_comparison)}"
+                )
+            outside_comparison = report.get("meteredTotalOutsideComparison")
+            if self._is_coverage_amount(outside_comparison):
+                lines.append(
+                    "- Metered spend outside the comparison (no billing credential to "
+                    f"compare against): {self._render_coverage_amount(outside_comparison)}"
+                )
+                lines.append(self._COVERAGE_OUTSIDE_COMPARISON_NOTE)
             if aggregate_ratio == "n/a":
                 # Said only when it applies, so it reads as an explanation of this
                 # report rather than boilerplate the caller learns to skip.
@@ -2975,6 +3127,8 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
                     f"This n/a is NOT zero coverage — no ratio could be computed at all. {why}",
                 ])
 
+            lines.extend(self._render_metered_basis_lines(report.get("meteredBasis")))
+
             # Upstream serializes this boolean on every 200 (flag-off tenants
             # get a 403 instead, since the endpoint is feature-gated). The
             # membership check stays as defense against older payloads only.
@@ -2990,6 +3144,9 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             # List[Any], not List[Dict]: the rows come off the wire, so each one is
             # re-checked below rather than trusted to be a dict.
             rows: List[Any] = raw_rows if isinstance(raw_rows, list) else []
+            # Set by any rendered row that reports no billing credential, so the
+            # explanation is printed only where a reader can see the label.
+            uncredentialed_row_seen = False
             lines.extend(["", "**By provider**"])
             if not rows:
                 # The share note explains columns that are not about to be printed.
@@ -3017,11 +3174,24 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
                         "coding-assistant usage: "
                         f"{self._render_presence_flag(row.get('codingAssistantUsagePresent'))}"
                     )
+                if "billingCredentialConnected" in row:
+                    connected = row.get("billingCredentialConnected")
+                    # Piped off the preceding flag: two space-joined
+                    # "label: yes/no" pairs read as one run-on phrase
+                    # ("usage: no billing credential connected: no").
+                    parts.append(
+                        "| billing credential connected: "
+                        f"{self._render_presence_flag(connected)}"
+                    )
+                    if connected is False:
+                        uncredentialed_row_seen = True
                 lines.append(" ".join(parts))
             if len(rows) > self._COVERAGE_MAX_PROVIDER_ROWS:
                 lines.append(
                     f"… {len(rows) - self._COVERAGE_MAX_PROVIDER_ROWS} more providers not shown."
                 )
+            if uncredentialed_row_seen:
+                lines.append(self._COVERAGE_NO_CREDENTIAL_NOTE)
 
             return [TextContent(type="text", text="\n".join(lines))]
 
@@ -3303,10 +3473,48 @@ If you're seeing this error, please report it as it indicates a reliability issu
 """
             return [TextContent(type="text", text=error_response)]
 
+    # Decision (BACK-2765): GET /v2/api/billing/users is intentionally unwrapped.
+    #
+    # That endpoint ("List Per-Person Analytics") is the billing plane's per-person
+    # spend view, and it is deliberately absent from this tool — an omission that has
+    # been decided rather than overlooked, so a drift run that rediscovers the path
+    # finds this note instead of filing it again.
+    #
+    # Why it stays out:
+    # - Only providers that attribute spend to a named person at the source produce
+    #   rows. Its own contract names two (anthropic_enterprise, github_copilot), so
+    #   every tenant without that usage gets a well-formed empty page and HTTP 200 —
+    #   never an error the action could turn into an explanation. Verified live on dev
+    #   2026-09-04: period=24h/7d/30d/90d each returned 200 with page.totalElements 0,
+    #   no _embedded block, totalCost 0.
+    # - The provider filter does not discriminate on that path: anthropic_enterprise,
+    #   github_copilot, anthropic and a deliberately bogus value all returned the same
+    #   empty page with 200, so a wrapped filter would silently no-op (the same shape
+    #   as the /billing/coverage apiKey filter in BACK-2959).
+    # - The response is cost-only. Token counts, request counts and per-million rates
+    #   have no source here, so a per-person action would have to render them as
+    #   unavailable, and any formatter reuse risks printing 0 — which reads as
+    #   "no usage" rather than "not measured on this path".
+    # - The question is already answerable one level up: get_user_costs below reports
+    #   cost by user from the v2 analytics plane (cost_metric_by_user_aggregated), and
+    #   its own scope note points at the web app's AI by Employee view for the
+    #   per-employee coding-assistant cut. Adding a second, near-identically named
+    #   action over a mostly-empty endpoint would cost more in confusion than it buys.
+    #
+    # What reopens it: per-person attribution reaching a provider whose usage this
+    # tenant base actually has, or the endpoint gaining something a tool could show a
+    # caller when the page is empty (an attribution-coverage figure, a reason code).
+    # Either of those makes a `get_person_costs` action worth adding here, with the
+    # client method on GET /profitstream/v2/api/billing/users (teamId and period
+    # required), rows parsed from _embedded, and cost-only rendering.
     async def _handle_get_user_costs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Handle get_user_costs request — cost attribution by subscriber email."""
+        """Handle get_user_costs request — cost attribution by subscriber email.
+
+        Per-person *billed* spend (GET /v2/api/billing/users) is intentionally not
+        wrapped; see the "Decision (BACK-2765)" comment above.
+        """
         try:
             logger.info("Processing get_user_costs request")
 
@@ -3356,13 +3564,15 @@ If you're seeing this error, please report it as it indicates a reliability issu
 
 **Troubleshooting:**
 - Verify your parameters: period (required), aggregation (optional, defaults to TOTAL)
-- User cost data is only available for coding assistant traces (Cursor, Claude Code, Gemini CLI)
+- User cost data exists only for rows whose subscriber email is populated; per-employee
+  coding-assistant spend is not answerable from this action
 
 **Supported Parameters:**
 - **period**: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - **aggregation**: TOTAL, MEAN, MAXIMUM, MINIMUM (optional, defaults to TOTAL)
 - **filters**: Optional dict with array keys `agents`, `providers`, `models`, `users`, `costSources`
-- **costSources**: Defaults to `["coding_assistant"]` (only coding-assistant traces populate subscriber email)
+- **costSources**: Defaults to `["coding_assistant"]` (the rows that populate subscriber email);
+  pass `["revenium_metered", "provider_billing"]` for API-metered per-user spend
 
 **For Help:**
 - Use `get_capabilities()` to check current status
@@ -4142,7 +4352,12 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "NO_INTEGRATION / ZERO_SPEND_PERIOD / DATA_UNAVAILABLE separately. Trend is "
                     "a signed percentage-point delta against the previous window, and each "
                     "per-provider row reports that provider's share of total billed spend "
-                    "alongside its metered and billed amounts."
+                    "alongside its metered and billed amounts. Where the platform sends "
+                    "them, the report states two metered totals: the spend inside the "
+                    "comparison, which the ratio and hidden spend were computed from, and "
+                    "the spend outside it, metered for a provider with no billing "
+                    "credential to compare against. The per-provider billing-credential "
+                    "flag marks the rows that produced the second total."
                 ),
                 parameters={
                     "get_coverage_ratio": {
@@ -4159,6 +4374,9 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "A null aggregateRatio is not zero coverage — read state before concluding anything",
                     "trend is a percentage-point delta, not a percentage: 0.0 pp means unchanged, null means no prior period",
                     "A per-provider ratio is a share of total billed spend, not that provider's coverage",
+                    "meteredTotalOutsideComparison is metered spend with no billing credential to compare against, not hidden spend",
+                    "A billingCredentialConnected: false row is metered-only and is excluded from the aggregate ratio and hiddenSpend",
+                    "The two metered totals, the credential flag and meteredBasis are omitted by older platform builds; absent is not zero",
                     "No figure carries a currency code — the report does not send one",
                     "codingAssistantUsagePresent is a presence flag: 'no' also covers a probe that could not complete",
                     "The coding-assistant flag is absent for teams without coding-assistant separation enabled",

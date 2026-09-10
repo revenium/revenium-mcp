@@ -8,10 +8,11 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.tools_decomposed.subscription_management import (
+    SubscriptionHierarchyManager,
     SubscriptionManager,
     SubscriptionManagement,
 )
-from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from src.revenium_mcp_server.client import ReveniumAPIError
 from mcp.types import TextContent
 
@@ -329,6 +330,33 @@ class TestSubscriptionManagerGet:
             await sub_manager.get_subscription({"subscription_id": "bad_id"})
 
         assert "not found" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_get_subscription_403_raises_not_found(self, sub_manager, mock_client):
+        """BACK-2938: the platform answers 403 for an id that does not exist,
+        and the raw "HTTP 403: Access Denied" read as a permissions problem."""
+        mock_client.get_subscription_by_id = AsyncMock(
+            side_effect=ReveniumAPIError(message="Access Denied", status_code=403)
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager.get_subscription({"subscription_id": "jM7Bz8P"})
+
+        assert exc_info.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert "jM7Bz8P" in exc_info.value.message
+        assert "not found" in exc_info.value.message.lower()
+        assert "Access Denied" not in exc_info.value.message
+        assert any("team-scoped" in s for s in exc_info.value.suggestions)
+
+    @pytest.mark.asyncio
+    async def test_get_subscription_500_propagates(self, sub_manager, mock_client):
+        """A server failure is not evidence the subscription is missing."""
+        mock_client.get_subscription_by_id = AsyncMock(
+            side_effect=ReveniumAPIError(message="boom", status_code=500)
+        )
+
+        with pytest.raises(ReveniumAPIError):
+            await sub_manager.get_subscription({"subscription_id": "sub1"})
 
     @pytest.mark.asyncio
     async def test_get_subscription_400_raises_validation_error(self, sub_manager, mock_client):
@@ -822,15 +850,16 @@ class TestSubscriptionManagementHandleAction:
 
     @pytest.mark.asyncio
     async def test_create_auto_generate_missing_name_returns_message(self, sub_mgmt):
-        """Create in auto-generate mode without name returns missing field message."""
+        """BACK-2937: the missing-name refusal raises so isError is set."""
         with patch.object(sub_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_client = MagicMock()
             mock_gc.return_value = mock_client
 
-            result = await sub_mgmt.handle_action("create", {"subscription_data": {}})
+            with pytest.raises(ToolError) as exc_info:
+                await sub_mgmt.handle_action("create", {"subscription_data": {}})
 
-        assert len(result) >= 1
-        assert "name" in result[0].text.lower()
+        assert "Missing Required Field" in exc_info.value.message
+        assert exc_info.value.field == "name"
 
     @pytest.mark.asyncio
     async def test_discover_products_action_routes_correctly(self, sub_mgmt):
@@ -1129,3 +1158,213 @@ class TestSubscriptionDryRunProductParity:
                 },
                 sub_manager,
             )
+
+
+# ===========================================================================
+# BACK-2944 - clientEmailAddress is format-validated before the platform call
+# ===========================================================================
+
+
+class TestClientEmailAddressValidation:
+    """The invoice address is documented as an email address, so enforce that locally.
+
+    Before this, a create with clientEmailAddress "not-an-email" reached the platform,
+    which derived a client user labelled "not-an-email" from it. The platform has no
+    opinion on the format, so the check has to be MCP-side.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_email",
+        [
+            "not-an-email",
+            "missing-at-sign.com",
+            "no-domain@",
+            "@no-local-part.com",
+            "spaces in@example.com",
+            "trailing@dot.",
+            12345,
+        ],
+    )
+    async def test_create_rejects_a_non_email_invoice_address(
+        self, sub_manager, mock_client, bad_email
+    ):
+        """create raises a structured validation error and never calls the platform."""
+        with pytest.raises(ToolError) as exc:
+            await sub_manager.create_subscription(
+                {
+                    "subscription_data": {
+                        "name": "mcp-test-bad-email",
+                        "productId": "prod_x",
+                        "clientEmailAddress": bad_email,
+                    }
+                }
+            )
+
+        assert exc.value.field == "clientEmailAddress"
+        assert "valid email address" in exc.value.message
+        assert exc.value.suggestions, "the error should tell the caller how to fix it"
+        mock_client.create_subscription.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "good_email",
+        [
+            "user@company.com",
+            "first.last+tag@sub.domain.co.uk",
+            "  padded@example.com  ",
+        ],
+    )
+    async def test_create_accepts_a_real_email_address(
+        self, sub_manager, mock_client, good_email
+    ):
+        """A well-formed address reaches the platform trimmed of surrounding whitespace."""
+        mock_client.create_subscription.return_value = {"id": "sub_1"}
+
+        result = await sub_manager.create_subscription(
+            {
+                "subscription_data": {
+                    "name": "mcp-test-good-email",
+                    "productId": "prod_x",
+                    "clientEmailAddress": good_email,
+                }
+            }
+        )
+
+        assert result["id"] == "sub_1"
+        sent = mock_client.create_subscription.await_args.args[0]
+        assert sent["clientEmailAddress"] == good_email.strip()
+
+    @pytest.mark.asyncio
+    async def test_create_simple_rejects_a_non_email_invoice_address(
+        self, sub_manager, mock_client
+    ):
+        """The create_simple path validates too, before any product lookup."""
+        with pytest.raises(ToolError) as exc:
+            await sub_manager.create_simple(
+                {"product_id": "prod_x", "clientEmailAddress": "not-an-email"}
+            )
+
+        assert exc.value.field == "clientEmailAddress"
+        mock_client.create_subscription.assert_not_awaited()
+
+    def test_missing_address_is_left_to_the_required_field_check(self, sub_manager):
+        """An absent value is not this check's business - it has its own better message."""
+        from src.revenium_mcp_server.tools_decomposed.subscription_management import (
+            _validate_client_email_address,
+        )
+
+        _validate_client_email_address(None)
+        _validate_client_email_address("")
+
+    @pytest.mark.asyncio
+    async def test_create_from_text_rejects_a_non_email_invoice_address(
+        self, sub_manager, mock_client
+    ):
+        """The natural-language path validates before it looks the product up."""
+        with pytest.raises(ToolError) as exc:
+            await sub_manager.create_from_text(
+                {
+                    "text": "Monthly subscription for the ops team",
+                    "product_id": "prod_x",
+                    "clientEmailAddress": "not-an-email",
+                }
+            )
+
+        assert exc.value.field == "clientEmailAddress"
+        assert "valid email address" in exc.value.message
+        mock_client.create_subscription.assert_not_awaited()
+        mock_client.get_product_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_from_text_rejects_a_bad_address_pulled_from_the_text(
+        self, sub_manager, mock_client
+    ):
+        """An address the analyzer extracts from free text is checked the same way."""
+        with patch.object(
+            sub_manager,
+            "_analyze_subscription_text",
+            AsyncMock(
+                return_value={"product_id": "prod_x", "clientEmailAddress": "not-an-email"}
+            ),
+        ):
+            with pytest.raises(ToolError) as exc:
+                await sub_manager.create_from_text(
+                    {"text": "Subscribe not-an-email to the basic plan"}
+                )
+
+        assert exc.value.field == "clientEmailAddress"
+        mock_client.create_subscription.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_from_text_still_accepts_a_real_address(self, sub_manager, mock_client):
+        """A well-formed address reaches the platform with the address unchanged."""
+        mock_client.get_product_by_id = AsyncMock(
+            return_value={"id": "prod_x", "name": "Basic", "published": True}
+        )
+        mock_client.create_subscription.return_value = {"id": "sub_nl"}
+
+        result = await sub_manager.create_from_text(
+            {
+                "text": "Monthly subscription for the ops team",
+                "product_id": "prod_x",
+                "clientEmailAddress": "ops@company.com",
+            }
+        )
+
+        assert result["id"] == "sub_nl"
+        sent = mock_client.create_subscription.await_args.args[0]
+        assert sent["clientEmailAddress"] == "ops@company.com"
+
+    def test_credentials_path_rejects_a_non_email_invoice_address(self, mock_client):
+        """The create_with_credentials path builds its own payload and is guarded too."""
+        mock_client.create_credential = AsyncMock()
+        mgr = SubscriptionHierarchyManager(mock_client)
+
+        with pytest.raises(ToolError) as exc:
+            mgr._prepare_credentials_subscription_data(
+                {"productId": "prod_x", "clientEmailAddress": "not-an-email"}, {}
+            )
+
+        assert exc.value.field == "clientEmailAddress"
+        mock_client.create_subscription.assert_not_awaited()
+        mock_client.create_credential.assert_not_awaited()
+
+    def test_credentials_path_trims_a_padded_address(self, mock_client):
+        """The address the credentials flow forwards is the trimmed one."""
+        mgr = SubscriptionHierarchyManager(mock_client)
+
+        prepared = mgr._prepare_credentials_subscription_data(
+            {"productId": "prod_x"}, {"clientEmailAddress": "  ops@company.com  "}
+        )
+
+        assert prepared["clientEmailAddress"] == "ops@company.com"
+
+    @pytest.mark.asyncio
+    async def test_update_rejects_a_non_email_invoice_address(self, sub_manager, mock_client):
+        """An update can rewrite the billing identity, so it is checked too."""
+        with pytest.raises(ToolError) as exc:
+            await sub_manager.update_subscription(
+                {
+                    "subscription_id": "sub_1",
+                    "subscription_data": {"clientEmailAddress": "not-an-email"},
+                }
+            )
+
+        assert exc.value.field == "clientEmailAddress"
+
+    @pytest.mark.asyncio
+    async def test_update_that_does_not_touch_the_address_is_unaffected(
+        self, sub_manager, mock_client
+    ):
+        """A partial update naming other fields never reaches the email check."""
+        sub_manager.update_handler = MagicMock()
+        sub_manager.update_handler.update_with_merge = AsyncMock(
+            return_value={"id": "sub_1", "name": "Renamed"}
+        )
+
+        result = await sub_manager.update_subscription(
+            {"subscription_id": "sub_1", "subscription_data": {"name": "Renamed"}}
+        )
+
+        assert result["name"] == "Renamed"

@@ -20,6 +20,7 @@ from ..common.error_handling import (
     format_structured_error,
 )
 from ..endpoint_registry import _resolved_app_base_url, _use_new_api, get_endpoint_path
+from ..onboarding.env_validation import API_AUTH_REJECTED_MESSAGE, read_forbidden_detail
 from ..introspection.metadata import ToolType
 from .unified_tool_base import ToolBase
 
@@ -150,15 +151,19 @@ class DebugAutoDiscovery(ToolBase):
 
                     if response.status_code == 200:
                         api_test_result = "SUCCESS"
-                    elif response.status_code == 400:
-                        # 400 might mean missing team ID, but API key is valid
-                        api_test_result = "SUCCESS (API key valid, may need team configuration)"
                     elif response.status_code == 401:
-                        api_test_result = "FAILED (Authentication failed - check API key)"
+                        # The shared message keeps this wording in sync with the
+                        # connectivity probe in env_validation.py.
+                        api_test_result = f"FAILED ({API_AUTH_REJECTED_MESSAGE})"
                     elif response.status_code == 403:
-                        # Forbidden - API key valid but insufficient permissions
-                        api_test_result = "SUCCESS (API key valid, limited permissions)"
+                        # Forbidden - the read was denied. Never reported as SUCCESS:
+                        # the probe read no data. The shared helper keeps this wording
+                        # in sync with the connectivity probe in env_validation.py.
+                        api_test_result = f"FORBIDDEN ({read_forbidden_detail(api_key)})"
                     else:
+                        # 400 is deliberately not a success: the probed endpoint resolves
+                        # the team from the API key and answers 200 without query
+                        # parameters, so a 400 means the read did not happen.
                         api_test_result = f"FAILED (HTTP {response.status_code})"
 
                 except Exception as e:
@@ -205,6 +210,14 @@ class DebugAutoDiscovery(ToolBase):
                 result_text += (
                     "🔴 **Critical**: Set REVENIUM_API_KEY - required for all functionality\n"
                 )
+            elif api_test_result.startswith("FORBIDDEN"):
+                # The connectivity line above already names the scope cause;
+                # pointing at network/credentials here would contradict it.
+                result_text += f"[CRITICAL] {read_forbidden_detail(api_key)}\n"
+            elif API_AUTH_REJECTED_MESSAGE in api_test_result:
+                # The connectivity line above already names the rejected-key case;
+                # pointing at the network here would contradict it.
+                result_text += f"[CRITICAL] {API_AUTH_REJECTED_MESSAGE}\n"
             elif not diagnostic_report["summary"]["api_accessible"]:
                 result_text += "🔴 **Critical**: Check API connectivity and credentials\n"
             elif api_key_set and diagnostic_report["summary"]["api_accessible"]:

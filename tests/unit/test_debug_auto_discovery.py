@@ -7,6 +7,7 @@ and the _handle_debug diagnostic report generation.
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
+from src.revenium_mcp_server.onboarding.env_validation import API_AUTH_REJECTED_MESSAGE
 from src.revenium_mcp_server.tools_decomposed.debug_auto_discovery import (
     DebugAutoDiscovery,
 )
@@ -130,7 +131,11 @@ class TestHandleDebug:
                 result = await debug_tool._handle_debug({})
 
         text = result[0].text
-        assert "Authentication failed" in text or "FAILED" in text
+        assert "FAILED" in text
+        # The 401 wording comes from the shared source in env_validation (BACK-2841),
+        # so this report cannot drift from the setup-path renderers.
+        assert API_AUTH_REJECTED_MESSAGE in text
+        assert "Check API connectivity and credentials" not in text
 
     @pytest.mark.asyncio
     async def test_api_connection_error_shows_failure(self, debug_tool):
@@ -186,8 +191,8 @@ class TestHandleDebug:
         assert "Optional" in text or "optional" in text.lower() or "TENANT_ID" in text
 
     @pytest.mark.asyncio
-    async def test_api_400_shows_team_config_needed(self, debug_tool):
-        """When API returns 400, report indicates API key valid but config needed."""
+    async def test_api_400_is_not_reported_as_success(self, debug_tool):
+        """A 400 read no data, so the report must not call it SUCCESS (BACK-2839)."""
         env_patch = {
             "REVENIUM_API_KEY": "valid-key",
             "REVENIUM_TEAM_ID": None,
@@ -210,5 +215,35 @@ class TestHandleDebug:
                 result = await debug_tool._handle_debug({})
 
         text = result[0].text
-        assert "SUCCESS" in text
-        assert "team" in text.lower() or "configuration" in text.lower()
+        assert "FAILED (HTTP 400)" in text
+        assert "API Accessible**: No" in text
+
+    @pytest.mark.asyncio
+    async def test_api_403_reported_as_forbidden_not_success(self, debug_tool):
+        """A 403 is a forbidden read, never SUCCESS, and names the key scope (BACK-2839)."""
+        env_patch = {
+            "REVENIUM_API_KEY": "rev_mk_metering-key",
+            "REVENIUM_TEAM_ID": None,
+            "REVENIUM_TENANT_ID": None,
+            "REVENIUM_OWNER_ID": None,
+            "REVENIUM_DEFAULT_EMAIL": None,
+            "REVENIUM_BASE_URL": None,
+        }
+
+        mock_response = MagicMock()
+        mock_response.status_code = 403
+
+        with patch("os.getenv", side_effect=lambda k, default=None: env_patch.get(k, default)):
+            with patch("httpx.AsyncClient") as MockClient:
+                mock_client_instance = AsyncMock()
+                mock_client_instance.get = AsyncMock(return_value=mock_response)
+                mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                MockClient.return_value = mock_client_instance
+                result = await debug_tool._handle_debug({})
+
+        text = result[0].text
+        assert "FORBIDDEN" in text
+        assert "SUCCESS" not in text
+        assert "rev_mk_" in text
+        assert "API Accessible**: No" in text

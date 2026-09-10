@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+from .alert_operators import CHANGE_OPERATORS, FILTER_LIST_OPERATOR, validate_filter_rows
 from .exceptions import InvalidInputError, ValidationError
 
 
@@ -479,7 +480,18 @@ class InputValidator:
         validated_rule["metric"] = metric
 
         # Validate operator (special handling - no HTML escaping for operators)
-        valid_operators = [">", "<", ">=", "<=", "==", "!=", "contains", "not_contains", "INCREASES_BY", "DECREASES_BY"]
+        # "==" / "!=" are the symbolic spelling of the exact-match operators the
+        # platform refuses on create and update, and convert_to_api_format never
+        # had a mapping for them, so they are deliberately absent.
+        valid_operators = [
+            ">",
+            "<",
+            ">=",
+            "<=",
+            "contains",
+            "not_contains",
+            *CHANGE_OPERATORS,
+        ]
         operator = str(rule["operator"]).strip()  # Simple string conversion without HTML escaping
         if operator not in valid_operators:
             raise ValidationError(
@@ -491,24 +503,26 @@ class InputValidator:
         validated_rule["operator"] = operator
 
         # Cross-field validation: operator must match rule_type
-        relative_change_operators = {"INCREASES_BY", "DECREASES_BY"}
+        relative_change_operators = set(CHANGE_OPERATORS)
         if operator in relative_change_operators and rule_type_upper != "RELATIVE_CHANGE":
             raise ValidationError(
                 message=f"Operator '{operator}' is only valid for RELATIVE_CHANGE rules",
                 field="operator",
                 value=operator,
-                expected="INCREASES_BY/DECREASES_BY require rule_type: RELATIVE_CHANGE",
+                expected=(
+                    f"{'/'.join(CHANGE_OPERATORS)} require rule_type: RELATIVE_CHANGE"
+                ),
             )
         if rule_type_upper == "RELATIVE_CHANGE" and operator not in relative_change_operators:
             raise ValidationError(
                 message="RELATIVE_CHANGE rules require a relative operator",
                 field="operator",
                 value=operator,
-                expected="One of: INCREASES_BY, DECREASES_BY",
+                expected=f"One of: {', '.join(CHANGE_OPERATORS)}",
             )
 
         # Validate value (can be numeric or string depending on operator)
-        if operator in [">", "<", ">=", "<=", "==", "!=", "INCREASES_BY", "DECREASES_BY"]:
+        if operator in [">", "<", ">=", "<=", *CHANGE_OPERATORS]:
             # Numeric operators (including relative change operators)
             validated_rule["value"] = InputValidator.validate_numeric_range(
                 rule["value"], "value", allow_zero=True
@@ -660,6 +674,8 @@ class InputValidator:
             "is": "IS",
             "not_equals": "IS_NOT",
             "is_not": "IS_NOT",
+            "in": FILTER_LIST_OPERATOR,
+            "one_of": FILTER_LIST_OPERATOR,
         }
 
         for filter_data in filters:
@@ -676,11 +692,29 @@ class InputValidator:
             # Convert operator
             api_operator = filter_operator_mapping.get(operator, operator.upper())
 
-            api_filter = {"dimension": dimension, "operator": api_operator, "value": str(value)}
+            if api_operator == FILTER_LIST_OPERATOR:
+                # IN reads the list in `values`. A scalar `value` is NOT promoted
+                # to a one-entry list here: the dimension-format path refuses an
+                # IN row that carries no `values`, and a convenience surface that
+                # guessed instead would teach a shape the other path rejects.
+                # An absent list stays absent so validate_filter_rows below names
+                # `values` in the refusal.
+                raw_values = filter_data.get("values")
+                api_filter: Dict[str, Any] = {
+                    "dimension": dimension,
+                    "operator": api_operator,
+                    "values": raw_values if isinstance(raw_values, list) else [],
+                }
+            else:
+                api_filter = {"dimension": dimension, "operator": api_operator, "value": str(value)}
 
             api_filters.append(api_filter)
 
-        return api_filters
+        # The converted rows are dimension-format rows now, so they go through the
+        # one row check both shapes share: a rule enforced on the API-format path
+        # and skipped here would let the user-friendly shape send an IN row that
+        # matches nothing (BACK-3102 review).
+        return validate_filter_rows(api_filters)
 
     @staticmethod
     def convert_to_api_format(user_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -702,8 +736,7 @@ class InputValidator:
             ">=": "GREATER_THAN_OR_EQUAL_TO",
             "<=": "LESS_THAN_OR_EQUAL_TO",
             # Relative change operators — API accepts these directly
-            "INCREASES_BY": "INCREASES_BY",
-            "DECREASES_BY": "DECREASES_BY",
+            **{op: op for op in CHANGE_OPERATORS},
         }
 
         metric_mapping = {

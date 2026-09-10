@@ -5,6 +5,8 @@ negotiation, capability support queries, and shutdown.
 """
 
 import pytest
+from mcp.types import LATEST_PROTOCOL_VERSION as SDK_LATEST_PROTOCOL_VERSION
+from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
 
 from src.revenium_mcp_server.mcp_compliance.lifecycle import MCPLifecycleManager
 from src.revenium_mcp_server.mcp_compliance.error_handling import MCPError
@@ -27,6 +29,31 @@ class TestProtocolVersionSupport:
     def test_unsupported_version(self, lifecycle):
         """Unknown protocol versions are not supported."""
         assert lifecycle.is_supported_protocol_version("1999-01-01") is False
+
+    def test_installed_sdk_revision_is_supported(self, lifecycle):
+        """The revision the pinned SDK actually speaks must be accepted.
+
+        Before BACK-2471 this list stopped at 2025-06-18, so a client offering
+        the SDK's own latest revision would have been rejected by this helper.
+        """
+        assert lifecycle.is_supported_protocol_version(SDK_LATEST_PROTOCOL_VERSION) is True
+        assert lifecycle.LATEST_PROTOCOL_VERSION == SDK_LATEST_PROTOCOL_VERSION
+        assert lifecycle.SUPPORTED_PROTOCOL_VERSIONS[-1] == SDK_LATEST_PROTOCOL_VERSION
+
+    def test_legacy_versions_remain_supported(self, lifecycle):
+        """Tracking the SDK must not drop the older handshake eras.
+
+        2025-11-25 is in this list on purpose: it is what the mcptools CLI
+        negotiates against the live server, and the pre-BACK-2471 hardcoded list
+        omitted it.
+        """
+        for version in ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"):
+            assert lifecycle.is_supported_protocol_version(version) is True
+
+    def test_supported_versions_match_the_sdk(self, lifecycle):
+        """The accepted set is derived from the SDK, not restated."""
+        expected = [*HANDSHAKE_PROTOCOL_VERSIONS, *MODERN_PROTOCOL_VERSIONS]
+        assert lifecycle.SUPPORTED_PROTOCOL_VERSIONS == expected
 
 
 class TestInitializeRequest:
@@ -55,6 +82,18 @@ class TestInitializeRequest:
         params = {"protocolVersion": "2025-06-18"}
         response = await lifecycle.handle_initialize_request(params, request_id=1)
         assert "instructions" in response["result"]
+
+    @pytest.mark.asyncio
+    async def test_instructions_included_for_installed_sdk_revision(self, lifecycle):
+        """The newest revision carries instructions too.
+
+        The gate used to enumerate the eras that get instructions, so a newer
+        revision silently lost them; it now excludes only the pre-2025-03-26 era.
+        """
+        params = {"protocolVersion": SDK_LATEST_PROTOCOL_VERSION}
+        response = await lifecycle.handle_initialize_request(params, request_id=1)
+        assert "instructions" in response["result"]
+        assert response["result"]["protocolVersion"] == SDK_LATEST_PROTOCOL_VERSION
 
     @pytest.mark.asyncio
     async def test_instructions_not_included_for_old_protocol(self, lifecycle):

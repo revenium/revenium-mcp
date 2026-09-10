@@ -34,6 +34,7 @@ from ..common.error_handling import (
     create_structured_missing_parameter_error,
     create_structured_validation_error,
     format_structured_error,
+    raise_structured_error,
 )
 from ..common.pagination_performance import validate_pagination_with_performance
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
@@ -48,7 +49,21 @@ from ..introspection.metadata import (
     UsagePattern,
 )
 from ..mixins.slack_prompting_mixin import SlackPromptingMixin
-from ..models import AlertType, MetricType, OperatorType
+from ..alert_metrics import (
+    QUALITY_RATE,
+    QUALITY_RATE_PREREQUISITES,
+    QUALITY_RATE_SUMMARY,
+)
+from ..alert_operators import (
+    FILTER_IN_OPERATOR_NOTE,
+    FILTER_OPERATORS,
+    OPERATORS_BY_ALERT_TYPE,
+    REJECTED_OPERATOR_GUIDANCE,
+    REJECTED_OPERATORS,
+    historical_operator_notice,
+    is_rejected_operator,
+)
+from ..models import AlertType, MetricType
 from ..schema.alert_schema import get_alert_metrics_capabilities
 from .unified_tool_base import ToolBase
 
@@ -86,6 +101,20 @@ _ALERT_TYPE_DESCRIPTIONS = {
     AlertType.CUMULATIVE_USAGE.value: "budget / quota tracking across a billing period",
     AlertType.RELATIVE_CHANGE.value: "trend detection — alert when a metric increases or decreases by a percentage",
 }
+
+
+def _stored_operator_note(anomaly: Dict[str, Any]) -> str:
+    """A trailing note when a stored definition carries a refused operator.
+
+    Enable and disable read the alert and PUT it back whole, so an alert stored
+    with EQUAL_TO or NOT_EQUAL_TO resubmits one. They must not refuse the call —
+    the value is the platform's own and blocking it would make the alert
+    impossible to turn off through the MCP — so they say what the body carried.
+    """
+    operator = anomaly.get("operatorType") if isinstance(anomaly, dict) else None
+    if operator and is_rejected_operator(operator):
+        return f"\n\n{historical_operator_notice(operator)}"
+    return ""
 
 
 class AlertManagement(ToolBase, SlackPromptingMixin):
@@ -317,11 +346,17 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                 examples=[
                     "create(resource_type='anomalies', anomaly_data={'metric': 'TOTAL_COST', 'threshold': 100})",
                     "update(anomaly_id='anom_123', anomaly_data={'threshold': 150})",
+                    "create(resource_type='anomalies', anomaly_data={'name': 'Frontier model spend', "
+                    "'alertType': 'THRESHOLD', 'metricType': 'TOTAL_COST', 'operatorType': "
+                    "'GREATER_THAN', 'threshold': 500, 'filters': [{'dimension': 'MODEL', "
+                    "'operator': 'IN', 'values': ['gpt-4', 'claude-sonnet-4-5']}]})",
                 ],
                 limitations=[
                     "Requires valid metric types",
                     "Threshold values must be positive",
                     "Some metrics require specific configurations",
+                    f"Filter operators are {', '.join(FILTER_OPERATORS)}. "
+                    + FILTER_IN_OPERATOR_NOTE,
                 ],
             ),
             ToolCapability(
@@ -1122,7 +1157,8 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                         },
                     },
                 )
-                return [TextContent(type="text", text=format_structured_error(error))]
+                # BACK-2937: raise so the envelope carries the error flag.
+                raise_structured_error(error)
             return await self.anomaly_manager.create_anomaly(client, anomaly_data)
 
         elif action == "update":
@@ -1527,15 +1563,69 @@ get_budget_progress(anomaly_id="anom_123")      # Current period spend vs. thres
             for metric in MetricType:
                 text += f"- **{metric.value}**\n"
 
-        # Available Operators — prefer UCM, fall back to OperatorType enum so
-        # the section is never rendered with an empty body. Empty UCM lists
-        # also fall through to the enum.
-        operators = list(ucm_capabilities.get("operators") or []) if ucm_capabilities else []
-        if not operators:
-            operators = [op.value for op in OperatorType]
+        # QUALITY_RATE reads like any other metric in the list above and behaves like
+        # nothing else in it: the platform evaluates it from job outcome facts. Without
+        # this section an agent composes the obvious call and gets either a refusal it
+        # cannot interpret or an alert that stores fine and never fires (BACK-3103).
+        text += f"\n\n### **{QUALITY_RATE} — read this before using it**\n"
+        text += f"\n{QUALITY_RATE_SUMMARY}\n\n"
+        for prerequisite in QUALITY_RATE_PREREQUISITES:
+            text += f"- {prerequisite}\n"
+        text += (
+            "\n```bash\n"
+            'create(anomaly_data={"name": "Code review quality floor", '
+            '"alertType": "THRESHOLD", "metricType": "QUALITY_RATE", '
+            '"operatorType": "LESS_THAN", "threshold": 95, "minSampleCount": 30, '
+            '"filters": [{"dimension": "TASK_TYPE", "operator": "IS", '
+            '"value": "code-review"}]})\n'
+            "```\n"
+        )
+
+        # Available Operators — the platform narrows operators per alert type, so
+        # render them per type rather than as one flat list an agent has to guess
+        # from. Prefer UCM's per-type map, then its flat list, then the
+        # platform-mirroring constants; the constants are the fallback (not the
+        # OperatorType enum, whose members are not platform operatorType values).
+        ucm_by_type = (
+            dict(ucm_capabilities.get("operators_by_alert_type") or {})
+            if ucm_capabilities
+            else {}
+        )
+        ucm_flat = list(ucm_capabilities.get("operators") or []) if ucm_capabilities else []
         text += "\n\n## **Available Operators**\n"
-        for operator in operators:
+        for alert_type, defaults in OPERATORS_BY_ALERT_TYPE.items():
+            # A refused operator never becomes a bullet, whatever UCM sent: UCM
+            # discovery can be fed by a platform build that still publishes the
+            # declared enum, and this section is what an agent copies from.
+            operators = [
+                op for op in (ucm_by_type.get(alert_type) or []) if not is_rejected_operator(op)
+            ]
+            if not operators:
+                # Keep the per-type narrowing even when UCM only sent a flat list.
+                operators = [op for op in ucm_flat if op in defaults] or list(defaults)
+            text += f"\n### **{alert_type}**\n"
+            for operator in operators:
+                text += f"- **{operator}**\n"
+        text += (
+            f"\n**Not accepted on create or update**: "
+            f"{', '.join(REJECTED_OPERATORS)}. {REJECTED_OPERATOR_GUIDANCE} "
+            "Alerts already stored with either operator keep listing and rendering "
+            "normally.\n"
+        )
+
+        # Filter operators are a separate vocabulary from the operatorType values
+        # above: they compare a dimension against a value, not a metric against a
+        # threshold. Rendered here because this section is what an agent copies.
+        text += "\n\n## **Filter Operators** (anomaly_data.filters)\n"
+        for operator in FILTER_OPERATORS:
             text += f"- **{operator}**\n"
+        text += (
+            f"\n{FILTER_IN_OPERATOR_NOTE}\n\n"
+            "```json\n"
+            '{"dimension": "MODEL", "operator": "IN", '
+            '"values": ["gpt-4", "claude-sonnet-4-5"]}\n'
+            "```\n"
+        )
 
         # Alert Types — same fallback chain. Each enum value carries a short
         # description so the rendered section is informative even when UCM
@@ -2077,6 +2167,27 @@ create(
 - **IS_NOT**: Exact non-match
 - **STARTS_WITH**: Prefix match
 - **ENDS_WITH**: Suffix match
+- **IN**: Is one of a list, carried in `values` instead of `value`
+
+## **Matching Several Values in One Row**
+"""
+                        + FILTER_IN_OPERATOR_NOTE
+                        + """
+
+```json
+{
+  "action": "create",
+  "anomaly_data": {
+    "name": "Frontier Model Cost Alert",
+    "alertType": "THRESHOLD",
+    "metricType": "TOTAL_COST",
+    "operatorType": "GREATER_THAN",
+    "threshold": 500,
+    "periodDuration": "FIFTEEN_MINUTES",
+    "filters": [{"dimension": "MODEL", "operator": "IN", "values": ["gpt-4", "claude-sonnet-4-5"]}]
+  }
+}
+```
 
 **Pro Tip**: Use metric filtering to create targeted alerts that monitor specific providers, models, customers, or products instead of global thresholds!""",
                     )
@@ -2510,6 +2621,14 @@ Both alert types support advanced filtering to target specific entities:
 - **Model filtering**: Monitor specific AI models (GPT-4, Claude-3, Gemini, etc.)
 - **Customer filtering**: Monitor specific customers or organizations
 - **Product filtering**: Monitor specific products or services
+
+### **Filter Row Shape**
+"""
+                        + FILTER_IN_OPERATOR_NOTE
+                        + """
+```json
+{"dimension": "MODEL", "operator": "IN", "values": ["gpt-4", "claude-sonnet-4-5"]}
+```
 
 ## **Creation Method Selection Guide**
 
@@ -3533,9 +3652,11 @@ create(resource_type="anomalies", anomaly_data={
                 },
             )
 
+        operator_note = ""
         try:
             # Get current anomaly data and update enabled field
             current_anomaly = await client.get_anomaly_by_id(str(anomaly_id))
+            operator_note = _stored_operator_note(current_anomaly)
             update_data = current_anomaly.copy()
             update_data["enabled"] = True
             updated_anomaly = await client.update_anomaly(str(anomaly_id), update_data)
@@ -3546,7 +3667,7 @@ create(resource_type="anomalies", anomaly_data={
                     text=f"**Alert Enabled Successfully**\n\n"
                     f"**Name**: {updated_anomaly.get('name', 'Unnamed')}\n"
                     f"**ID**: `{anomaly_id}`\n"
-                    f"**Status**: Now enabled and monitoring",
+                    f"**Status**: Now enabled and monitoring{operator_note}",
                 )
             ]
 
@@ -3567,7 +3688,8 @@ create(resource_type="anomalies", anomaly_data={
                     "Ensure the alert is not already enabled",
                     "Use list() to verify the alert exists before enabling",
                     "Try get_anomaly_status() to check current state",
-                ],
+                ]
+                + ([operator_note.strip()] if operator_note else []),
                 examples={
                     "verification_steps": [
                         "list()",
@@ -3601,9 +3723,11 @@ create(resource_type="anomalies", anomaly_data={
                 },
             )
 
+        operator_note = ""
         try:
             # Get current anomaly data and update enabled field
             current_anomaly = await client.get_anomaly_by_id(str(anomaly_id))
+            operator_note = _stored_operator_note(current_anomaly)
             update_data = current_anomaly.copy()
             update_data["enabled"] = False
             updated_anomaly = await client.update_anomaly(str(anomaly_id), update_data)
@@ -3614,7 +3738,7 @@ create(resource_type="anomalies", anomaly_data={
                     text=f"**Alert Disabled Successfully**\n\n"
                     f"**Name**: {updated_anomaly.get('name', 'Unnamed')}\n"
                     f"**ID**: `{anomaly_id}`\n"
-                    f"**Status**: Now disabled and not monitoring",
+                    f"**Status**: Now disabled and not monitoring{operator_note}",
                 )
             ]
 
@@ -3635,7 +3759,8 @@ create(resource_type="anomalies", anomaly_data={
                     "Ensure the alert is not already disabled",
                     "Use list() to verify the alert exists before disabling",
                     "Try get_anomaly_status() to check current state",
-                ],
+                ]
+                + ([operator_note.strip()] if operator_note else []),
                 examples={
                     "verification_steps": [
                         "list()",
@@ -4470,7 +4595,11 @@ create(resource_type="anomalies", anomaly_data={
                 # Advanced configuration
                 "anomaly_data": {
                     "type": "object",
-                    "description": "Detailed alert configuration object (advanced usage)",
+                    "description": (
+                        "Detailed alert configuration object (advanced usage). Its "
+                        "'filters' entries are {dimension, operator, value} rows, one "
+                        "dimension each. " + FILTER_IN_OPERATOR_NOTE
+                    ),
                 },
                 "metric": {
                     "type": "string",

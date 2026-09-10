@@ -5,6 +5,7 @@ tool with internal composition, following the proven alert/source management tem
 """
 
 import json
+import unicodedata
 from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional, Union
 
 if TYPE_CHECKING:
@@ -179,6 +180,80 @@ def _with_marketplace_example(
     if MARKETPLACE_SETTINGS_EXAMPLE not in examples:
         examples.append(dict(MARKETPLACE_SETTINGS_EXAMPLE))
     return payload
+
+
+# Unicode categories dropped outright from a warning field: C0/C1 controls (Cc),
+# format characters including the zero-width and bidi-override family (Cf), and
+# lone surrogates (Cs). Unassigned code points (Cn) are deliberately NOT dropped
+# — that would silently eat characters a newer Unicode release assigns.
+_WARNING_DROPPED_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
+
+# A warning line is a status line, so it is bounded. The real TEAM_NAME_COLLISION
+# message is one short sentence; anything far longer is not something a reader
+# gains from and would push the success banner off the top of the output.
+_WARNING_FIELD_MAX_LENGTH = 500
+
+
+def _one_line(value: Any) -> str:
+    """Flatten an untrusted warning field to a single bounded line of text.
+
+    The platform builds a warning message from values the caller supplied (the
+    collision message interpolates the new team's name), and the rendered result
+    is plain text an agent reads as status, so an embedded newline must not be
+    able to fabricate a second "Warning:" line — or any other line — above the
+    success banner. Every run of whitespace, newlines and carriage returns
+    included, collapses to a single space; other control and format characters
+    are dropped; the result is truncated to ``_WARNING_FIELD_MAX_LENGTH``.
+    """
+    text = "".join(
+        " " if char.isspace() else char
+        for char in str(value)
+        if char.isspace() or unicodedata.category(char) not in _WARNING_DROPPED_CATEGORIES
+    )
+    text = " ".join(text.split())
+    if len(text) > _WARNING_FIELD_MAX_LENGTH:
+        text = text[: _WARNING_FIELD_MAX_LENGTH - 3].rstrip() + "..."
+    return text
+
+
+# Non-blocking warnings the platform attaches to a successful create response
+# (ResourceWarning: a stable `code` plus a plain-language `message`). Today only
+# create_team raises them, as TEAM_NAME_COLLISION. They arrive inside the created
+# resource, which the create branch renders as a raw JSON dump, so they get their
+# own lines above it instead of being buried in the payload.
+def _format_create_warnings(result: Any) -> str:
+    """Render one line per platform warning carried by a create response.
+
+    Returns an empty string when the response carries no usable warnings, so a
+    create without warnings renders exactly as it did before. A malformed
+    ``warnings`` value (not a list, entries without ``code``/``message``,
+    non-string values) is tolerated rather than failing an otherwise successful
+    create, and every field goes through ``_one_line`` so one warning is always
+    exactly one line.
+    """
+    if not isinstance(result, dict):
+        return ""
+    warnings = result.get("warnings")
+    if not isinstance(warnings, list):
+        return ""
+
+    lines: List[str] = []
+    for warning in warnings:
+        code = ""
+        message = ""
+        if isinstance(warning, dict):
+            code = _one_line(warning.get("code") or "")
+            message = _one_line(warning.get("message") or "")
+        elif warning is not None:
+            message = _one_line(warning)
+        if code and message:
+            lines.append(f"Warning: {code} - {message}")
+        elif code or message:
+            lines.append(f"Warning: {code or message}")
+
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n\n"
 
 
 def _dedupe_marketplace_names(names: List[str]) -> List[str]:
@@ -2635,6 +2710,12 @@ class CustomerValidator:
                     "organizationId": "org_123",
                     "status": "active",
                 },
+                "note": (
+                    "The team is still created when the platform returns a warning "
+                    "(for example TEAM_NAME_COLLISION, when another organization in the "
+                    "tenant already uses the name); each warning is called out on its own "
+                    "line above the created team."
+                ),
             },
         }
 
@@ -3203,7 +3284,8 @@ class CustomerManagement(ToolBase):
                 return [
                     TextContent(
                         type="text",
-                        text=f"{resource_type.title()} created successfully:\n\n"
+                        text=_format_create_warnings(result)
+                        + f"{resource_type.title()} created successfully:\n\n"
                         + json.dumps(result, indent=2),
                     )
                 ]

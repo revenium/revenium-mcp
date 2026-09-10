@@ -1,12 +1,14 @@
 """Consolidated tool registry management following MCP best practices.
 
 This module implements ToolManagement(ToolBase) for the Revenium Tool
-Registry API, covering 27 actions: 10 CRUD, 4 event-metering, 10 analytics, 3 introspection.
+Registry API, covering 26 actions: 9 CRUD, 4 event-metering, 10 analytics, 3 introspection.
 """
 
 import json
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from enum import Enum
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, get_args
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -20,6 +22,7 @@ from ..common.error_handling import (
     ToolError,
     create_structured_missing_parameter_error,
     create_structured_validation_error,
+    raise_unknown_action_error,
 )
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..introspection.metadata import (
@@ -61,6 +64,63 @@ _TOOL_EVENT_FILTER_MAP: Dict[str, str] = {
     "charge_min": "chargeMin",
     "charge_max": "chargeMax",
 }
+
+
+@lru_cache(maxsize=1)
+def _tool_type_values() -> Tuple[str, ...]:
+    """Tool categories the platform accepts, read off the generated contract model.
+
+    BACK-2936: this list used to be hand-typed here and had drifted a value
+    short (``HUMAN`` was missing), so a client that validated against the
+    advertised schema could not create a category the server persists happily.
+    Deriving it from ``ToolResource.toolType`` in the BACK-2868 generated models
+    means the next contract change lands here with the codegen refresh instead
+    of waiting for someone to notice.
+
+    The generated module is large and nothing on the startup path needs it, so
+    it is imported on first use rather than at module import.
+    """
+    from ..generated.hypercurrent_models import ToolResource  # noqa: PLC0415
+
+    annotation = ToolResource.model_fields["toolType"].annotation
+    for candidate in (annotation, *get_args(annotation)):
+        if isinstance(candidate, type) and issubclass(candidate, Enum):
+            return tuple(str(member.value) for member in candidate)
+    raise RuntimeError(
+        "ToolResource.toolType is no longer an enum in the generated models — "
+        "refresh specs/openapi/hypercurrent.json and the generated models, then "
+        "re-derive the advertised tool categories."
+    )
+
+
+# BACK-2936: ToolResource has no version property (its properties are _links,
+# configSource, created, description, enabled, id, label, name, plan, pricing,
+# resourceType, team, teamId, toolId, toolProvider, toolType, updated), so a
+# version sent on a write was accepted, reported as success and discarded. The
+# field is no longer advertised, and supplying it is refused rather than
+# silently dropped.
+_UNSUPPORTED_TOOL_FIELDS: Dict[str, str] = {
+    "version": (
+        "The platform's tool record has no version field, so a value sent here "
+        "would be accepted and then discarded, and no read would ever return it."
+    ),
+}
+
+
+def _reject_unsupported_tool_fields(tool_data: Dict[str, Any]) -> None:
+    """Refuse fields the Tool Registry does not store, instead of dropping them."""
+    for field, reason in _UNSUPPORTED_TOOL_FIELDS.items():
+        if field in tool_data:
+            raise create_structured_validation_error(
+                message=f"tool_data.{field} is not supported by the Tool Registry. {reason}",
+                field=f"tool_data.{field}",
+                value=tool_data[field],
+                suggestions=[
+                    f"Remove '{field}' from tool_data and retry",
+                    "Carry the version in the tool name or description if you need to track it",
+                    "Use get_capabilities() to see the fields the tool record actually stores",
+                ],
+            )
 
 
 class ToolManager:
@@ -162,6 +222,7 @@ class ToolManager:
                     "required_fields": ["name"],
                 },
             )
+        _reject_unsupported_tool_fields(tool_data)
         if "pricing" in tool_data:
             errors = self._validate_tool_pricing(tool_data["pricing"])
             if errors:
@@ -197,6 +258,7 @@ class ToolManager:
                 action="update tool",
                 examples={"usage": "update(tool_id='tool_123', tool_data={'name': 'Updated Name'})"},
             )
+        _reject_unsupported_tool_fields(tool_data)
         if "pricing" in tool_data:
             errors = self._validate_tool_pricing(tool_data["pricing"])
             if errors:
@@ -222,17 +284,6 @@ class ToolManager:
                 examples={"usage": "delete(tool_id='tool_123')"},
             )
         return await self.client.delete_tool(tool_id)
-
-    async def restore_tool(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Restore a deleted tool."""
-        tool_id = arguments.get("tool_id")
-        if not tool_id:
-            raise create_structured_missing_parameter_error(
-                parameter_name="tool_id",
-                action="restore tool",
-                examples={"usage": "restore(tool_id='tool_123')"},
-            )
-        return await self.client.restore_tool(tool_id)
 
     async def search_tools(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Search tools by query.
@@ -454,9 +505,22 @@ class ToolManager:
             "toolType": arguments.get("tool_type") or arguments.get("type") or arguments.get("toolType", "MCP_SERVER"),
             "toolProvider": arguments.get("tool_provider") or arguments.get("toolProvider", ""),
         }
-        version = arguments.get("tool_version") or arguments.get("version")
-        if version:
-            tool_data["version"] = version
+        # BACK-2936: reject on presence, not truthiness, so an empty string is
+        # refused too instead of being silently ignored.
+        if any(arguments.get(key) is not None for key in ("tool_version", "version")):
+            raise create_structured_validation_error(
+                message=(
+                    "tool_version is not supported by the Tool Registry. "
+                    + _UNSUPPORTED_TOOL_FIELDS["version"]
+                ),
+                field="tool_version",
+                value=arguments.get("tool_version") or arguments.get("version"),
+                suggestions=[
+                    "Drop tool_version from the call and retry",
+                    "Carry the version in tool_name or tool_description if you need to track it",
+                    "Use get_capabilities() to see the fields the tool record actually stores",
+                ],
+            )
 
         if pricing_model == "per_request":
             tool_data["pricing"] = {
@@ -667,8 +731,8 @@ class ToolManager:
 class ToolManagement(ToolBase):
     """Consolidated tool registry management MCP tool.
 
-    Exposes the Revenium Tool Registry API with 27 actions:
-    - 10 CRUD: list, get, get_by_tool_id, create, create_simple, update, replace, delete, restore, search
+    Exposes the Revenium Tool Registry API with 26 actions:
+    - 9 CRUD: list, get, get_by_tool_id, create, create_simple, update, replace, delete, search
     - 4 event-metering: meter_event, list_events, record_event, get_events
     - 10 analytics: get_cost_breakdown, get_top_tools, get_success_rate, get_latency,
                      get_cost_aggregated, get_cost_by_agent, get_agent_breakdown,
@@ -679,7 +743,7 @@ class ToolManagement(ToolBase):
     tool_name = "manage_tools"
     tool_description = (
         "Tool Registry management for Revenium platform. "
-        "Key actions: list, get, get_by_tool_id, create, create_simple, update, replace, delete, restore, search, "
+        "Key actions: list, get, get_by_tool_id, create, create_simple, update, replace, delete, search, "
         "meter_event, list_events, record_event, get_events, "
         "get_cost_breakdown, get_cost_aggregated, get_top_tools, get_success_rate, get_latency, "
         "get_cost_by_agent, get_agent_breakdown, get_cost_by_provider, get_cost_by_provider_aggregated, "
@@ -722,12 +786,13 @@ class ToolManagement(ToolBase):
                         "toolId": {"type": "string", "description": "Team-scoped tool identifier"},
                         "toolType": {
                             "type": "string",
-                            "enum": ["SDK", "MCP_SERVER", "AI_SERVICE", "REST_API", "LOCAL_FUNCTION", "CUSTOM"],
+                            # Derived from the generated contract model, never
+                            # re-typed here — see _tool_type_values (BACK-2936).
+                            "enum": list(_tool_type_values()),
                             "description": "Type of tool",
                         },
                         "toolProvider": {"type": "string", "description": "Tool provider (e.g. 'anthropic')"},
                         "description": {"type": "string", "description": "Tool description"},
-                        "version": {"type": "string", "description": "Tool version"},
                         "enabled": {"type": "boolean", "description": "Whether tool is enabled (default: true)"},
                         "pricing": {
                             "type": "object",
@@ -832,15 +897,15 @@ class ToolManagement(ToolBase):
                 },
                 "tool_type": {
                     "type": "string",
-                    "description": "Tool type for create_simple action (default: MCP_SERVER). Valid: SDK, MCP_SERVER, AI_SERVICE, REST_API, LOCAL_FUNCTION, CUSTOM",
+                    "enum": list(_tool_type_values()),
+                    "description": (
+                        "Tool type for create_simple action (default: MCP_SERVER). Valid values: "
+                        + ", ".join(_tool_type_values())
+                    ),
                 },
                 "tool_description": {
                     "type": "string",
                     "description": "Tool description for create_simple action",
-                },
-                "tool_version": {
-                    "type": "string",
-                    "description": "Tool version for create_simple action (default: 1.0.0)",
                 },
                 "tool_provider": {
                     "type": "string",
@@ -929,7 +994,6 @@ class ToolManagement(ToolBase):
             "update",
             "replace",
             "delete",
-            "restore",
             "search",
             # Event-metering actions
             "meter_event",
@@ -959,7 +1023,10 @@ class ToolManagement(ToolBase):
         return [
             ToolCapability(
                 name="Tool CRUD Operations",
-                description="Full lifecycle management for tool registry entries with soft-delete and restore",
+                description=(
+                    "Full lifecycle management for tool registry entries. Deletion is permanent: "
+                    "the platform exposes no restore endpoint for tools."
+                ),
                 parameters={
                     "list": {"page": "int (optional)", "size": "int (optional)"},
                     "get": {"tool_id": "str (system UUID)"},
@@ -968,8 +1035,7 @@ class ToolManagement(ToolBase):
                     "create_simple": {"tool_name": "str", "pricing_model": "str", "per_unit_price": "float"},
                     "update": {"tool_id": "str", "tool_data": "dict (partial update)"},
                     "replace": {"tool_id": "str", "tool_data": "dict (alias for update; partial update)"},
-                    "delete": {"tool_id": "str (soft delete)"},
-                    "restore": {"tool_id": "str"},
+                    "delete": {"tool_id": "str (permanent, cannot be undone)"},
                     "search": {"query": "str", "page": "int (optional)", "size": "int (optional)"},
                 },
                 examples=[
@@ -979,7 +1045,6 @@ class ToolManagement(ToolBase):
                     "create(tool_data={'name': 'My Tool', 'toolType': 'MCP_SERVER', 'pricing': {...}})",
                     "search(query='billing')",
                     "delete(tool_id='tool_123')",
-                    "restore(tool_id='tool_123')",
                 ],
                 limitations=[
                     "Requires valid API authentication",
@@ -987,6 +1052,8 @@ class ToolManagement(ToolBase):
                     "Some fields (toolType, id) are immutable after creation",
                     "get uses system UUID; get_by_tool_id uses team-scoped toolId",
                     "replace is an alias for update; both perform partial updates via the upstream PUT endpoint",
+                    "delete is permanent — the Tool Registry API has no restore endpoint, so a "
+                    "deleted tool has to be created again from scratch",
                 ],
             ),
             ToolCapability(
@@ -1144,8 +1211,8 @@ class ToolManagement(ToolBase):
     async def _get_agent_summary(self) -> str:
         return (
             "manage_tools is the central tool for registering, configuring, and monitoring tools "
-            "in the Revenium platform. It supports full CRUD on tool registry entries (with soft-delete "
-            "and restore), event metering for billing, analytics (cost, latency, success rate), and "
+            "in the Revenium platform. It supports full CRUD on tool registry entries (deletion is "
+            "permanent), event metering for billing, analytics (cost, latency, success rate), and "
             "pricing model discovery. Analytics are only available once events have been metered. "
             "Start with get_capabilities or list to explore the registry, use create_simple for quick "
             "onboarding, and meter_event to record usage for monetization."
@@ -1158,14 +1225,14 @@ class ToolManagement(ToolBase):
             "Record tool invocation events for usage-based billing",
             "Analyze cost breakdown and top tools by spend",
             "Monitor tool reliability via success rate and latency analytics",
-            "Soft-delete and restore tools without losing history",
         ]
 
     async def _get_troubleshooting_tips(self) -> List[str]:
         return [
             "Use get_by_tool_id for the team-scoped toolId field; use get for the system UUID",
             "create requires a pricing.elements array; use create_simple for a shortcut",
-            "If delete returns success but the tool still appears, it was soft-deleted; use restore to recover",
+            "delete is permanent and there is no restore action: confirm the tool_id before deleting, "
+            "and re-create the entry with create or create_simple if it was removed by mistake",
             "Analytics return empty results when no events have been metered for the tool",
             "Tool cost that does not attribute to an agentic job was metered without "
             "agenticJobId in event_data; pass the same identifier the job reports on its "
@@ -1265,6 +1332,33 @@ class ToolManagement(ToolBase):
                     )
                 ]
 
+            if action == "restore":
+                # BACK-2935: restore was advertised for as long as this tool has
+                # existed and never worked — the platform publishes no restore
+                # path for tools (specs/openapi/hypercurrent.json declares only
+                # /v2/api/tools, /v2/api/tools/by-tool-id/{toolId} and
+                # /v2/api/tools/{id}), so every call returned a raw HTTP 404.
+                # The action is retired; say so instead of proxying a 404.
+                raise ToolError(
+                    message=(
+                        "restore is not supported: the Revenium Tool Registry has no restore "
+                        "endpoint, so a deleted tool cannot be recovered. Deleting a tool is "
+                        "permanent."
+                    ),
+                    error_code=ErrorCodes.ACTION_NOT_SUPPORTED,
+                    field="action",
+                    value=action,
+                    suggestions=[
+                        "Re-create the tool with create(tool_data={...}) or create_simple(tool_name='...')",
+                        "Use list(action='list') or search(query='...') to confirm whether the tool is really gone",
+                        "Use get_capabilities() for the actions this tool actually supports",
+                    ],
+                    examples={
+                        "recreate": "create_simple(tool_name='My API Tool', pricing_model='per_request', per_unit_price=0.01)",
+                        "verify": "search(query='My API Tool')",
+                    },
+                )
+
             client = await self.get_client(ctx=ctx)
             manager = ToolManager(client)
 
@@ -1305,11 +1399,16 @@ class ToolManagement(ToolBase):
             elif action == "delete":
                 result = await manager.delete_tool(arguments)
                 deleted_tool_id = arguments.get("tool_id", "")
-                return [TextContent(type="text", text=f"Tool {deleted_tool_id} deleted:\n{json.dumps(result, indent=2)}")]
-
-            elif action == "restore":
-                result = await manager.restore_tool(arguments)
-                return [TextContent(type="text", text=f"Tool restored:\n{json.dumps(result, indent=2)}")]
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            f"Tool {deleted_tool_id} deleted:\n{json.dumps(result, indent=2)}\n\n"
+                            "This deletion is permanent. The Tool Registry API has no restore "
+                            "endpoint, so recovering this entry means creating it again."
+                        ),
+                    )
+                ]
 
             elif action == "search":
                 result = await manager.search_tools(arguments)
@@ -1383,12 +1482,10 @@ class ToolManagement(ToolBase):
 
             else:
                 supported = await self._get_supported_actions()
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"Unknown action '{action}'. Supported actions: {', '.join(supported)}",
-                    )
-                ]
+                # BACK-2937: raise so the envelope carries the error flag.
+                raise_unknown_action_error(
+                    action, hint=f"Supported actions: {', '.join(supported)}"
+                )
 
         except ToolError as e:
             logger.error(f"Tool error in manage_tools: {e}")

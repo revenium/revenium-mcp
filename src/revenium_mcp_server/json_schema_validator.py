@@ -8,6 +8,12 @@ from typing import Any, Dict, List
 
 from loguru import logger
 
+from .alert_operators import (
+    CHANGE_OPERATORS,
+    FILTER_IN_OPERATOR_NOTE,
+    FILTER_OPERATORS,
+)
+
 # Using custom validation logic for MCP tool parameters
 # This provides better error messages and agent-friendly feedback
 
@@ -996,7 +1002,15 @@ class JSONSchemaValidator:
                                     },
                                     "operator": {
                                         "type": "string",
-                                        "enum": [">=", ">", "<=", "<", "==", "!=", "INCREASES_BY", "DECREASES_BY"],
+                                        # "==" / "!=" removed: the exact-match
+                                        # operators the platform refuses.
+                                        "enum": [
+                                            ">=",
+                                            ">",
+                                            "<=",
+                                            "<",
+                                            *CHANGE_OPERATORS,
+                                        ],
                                     },
                                     "value": {"type": "number", "minimum": 0},
                                     "time_window": {
@@ -1050,25 +1064,39 @@ class JSONSchemaValidator:
                                     },
                                     "operator": {
                                         "type": "string",
-                                        "enum": [
-                                            "IS",
-                                            "IS_NOT",
-                                            "CONTAINS",
-                                            "STARTS_WITH",
-                                            "ENDS_WITH",
-                                        ],
-                                        "description": "Filter operator",
+                                        "enum": list(FILTER_OPERATORS),
+                                        "description": (
+                                            "Filter operator. " + FILTER_IN_OPERATOR_NOTE
+                                        ),
                                     },
                                     "value": {
                                         "type": "string",
                                         "minLength": 1,
-                                        "description": "Filter value to match against",
+                                        "description": (
+                                            "Filter value to match against. Required for "
+                                            "every operator except IN, which takes its "
+                                            "list in values."
+                                        ),
+                                    },
+                                    "values": {
+                                        "type": "array",
+                                        "items": {"type": "string", "minLength": 1},
+                                        "minItems": 1,
+                                        "description": (
+                                            "Value list for the IN operator, e.g. "
+                                            "['gpt-4', 'claude-sonnet-4-5'] to match "
+                                            "several models in one row. Send it instead "
+                                            "of value, not alongside it."
+                                        ),
                                     },
                                 },
-                                "required": ["dimension", "operator", "value"],
+                                "required": ["dimension", "operator"],
                                 "additionalProperties": False,
                             },
-                            "description": "Array of filter objects to scope alerts to specific dimensions",
+                            "description": (
+                                "Array of filter objects to scope alerts to specific "
+                                "dimensions. " + FILTER_IN_OPERATOR_NOTE
+                            ),
                         },
                     },
                     "description": "Alert/anomaly data",
@@ -1109,19 +1137,36 @@ class JSONSchemaValidator:
                             },
                             "operator": {
                                 "type": "string",
-                                "enum": ["IS", "IS_NOT", "CONTAINS", "STARTS_WITH", "ENDS_WITH"],
-                                "description": "Filter operator",
+                                "enum": list(FILTER_OPERATORS),
+                                "description": "Filter operator. " + FILTER_IN_OPERATOR_NOTE,
                             },
                             "value": {
                                 "type": "string",
                                 "minLength": 1,
-                                "description": "Filter value to match against",
+                                "description": (
+                                    "Filter value to match against. Required for every "
+                                    "operator except IN, which takes its list in values."
+                                ),
+                            },
+                            "values": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1},
+                                "minItems": 1,
+                                "description": (
+                                    "Value list for the IN operator, e.g. ['gpt-4', "
+                                    "'claude-sonnet-4-5'] to match several models in one "
+                                    "row. Send it instead of value, not alongside it."
+                                ),
                             },
                         },
-                        "required": ["dimension", "operator", "value"],
+                        "required": ["dimension", "operator"],
                         "additionalProperties": False,
                     },
-                    "description": "Array of filter objects to scope alerts to specific dimensions. Each filter contains dimension, operator, and value.",
+                    "description": (
+                        "Array of filter objects to scope alerts to specific dimensions. "
+                        "Each filter contains a dimension, an operator and either value "
+                        "or values. " + FILTER_IN_OPERATOR_NOTE
+                    ),
                 },
                 "query": {"type": "string", "description": "Natural language query for alerts"},
                 "metric": {

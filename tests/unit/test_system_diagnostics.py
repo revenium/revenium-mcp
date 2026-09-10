@@ -169,3 +169,37 @@ class TestIngestionDiagnosticsRouting:
         )
         tool.log_tool.handle_action.assert_called_once()
         assert result[0].text == "toggled"
+
+    @pytest.mark.asyncio
+    async def test_set_attribution_detail_text_routes_to_log_tool(self):
+        """BACK-3096: an action the tool documents but does not route answers
+        the unknown-action error, so the route is the capability."""
+        from unittest.mock import AsyncMock
+        from mcp.types import TextContent
+
+        tool = SystemDiagnostics()
+        tool.log_tool.handle_action = AsyncMock(
+            return_value=[TextContent(type="text", text="attribution toggled")]
+        )
+        result = await tool.handle_action(
+            "set_attribution_detail_text", {"enabled": True}
+        )
+        tool.log_tool.handle_action.assert_called_once()
+        assert result[0].text == "attribution toggled"
+
+    @pytest.mark.asyncio
+    async def test_capabilities_document_the_attribution_detail_text_toggle(
+        self, diagnostics_tool
+    ):
+        """system_diagnostics carries its own action documentation, and the
+        switch is only discoverable from it."""
+        result = await diagnostics_tool.handle_action("get_capabilities", {})
+        text = result[0].text
+        assert "set_attribution_detail_text" in text
+
+    @pytest.mark.asyncio
+    async def test_attribution_detail_text_is_an_advertised_action(
+        self, diagnostics_tool
+    ):
+        actions = await diagnostics_tool._get_supported_actions()
+        assert "set_attribution_detail_text" in actions

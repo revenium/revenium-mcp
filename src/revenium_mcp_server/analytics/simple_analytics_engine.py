@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Union, cast
 
 from ..auth import AuthenticationError
+from .formatters.base_formatter import BaseFormattingUtilities
 from .response_formatter import ResponseFormatter
 from .simple_cost_analyzer import SimpleCostAnalyzer
 from .validation import AnalyticsValidator, ValidationError
@@ -574,6 +575,10 @@ class SimpleAnalyticsEngine:
 
         count = await self.analyzer.get_transaction_count(period)
 
+        scope_note = BaseFormattingUtilities.coding_assistant_scope_note(
+            "transaction_count_by_team"
+        )
+
         if count is None:
             return f"""# **Transaction Volume**
 
@@ -581,11 +586,17 @@ class SimpleAnalyticsEngine:
 
 **Time Period**: {period}
 
-No transaction count was returned for the specified period.
+The transaction-count endpoint returned no metric value for this period. That
+is a statement about this endpoint's dataset, not about whether anyone used AI:
+the count covers only the traffic this endpoint's scope rules admit, and traffic
+outside them is counted nowhere in this response.
 
+{scope_note}
 **Suggestions:**
 - Try a longer time period (e.g., THIRTY_DAYS)
-- Check if there was any AI activity during this period
+- Cross-check `get_provider_costs` for the same period to see whether the
+  analytics plane has any traffic at all
+- Use `manage_metering` transaction lookups to confirm individual records
 """
 
         return f"""# **Transaction Volume**
@@ -593,9 +604,10 @@ No transaction count was returned for the specified period.
 **Time Period**: {period}
 **Total Transactions**: {count:,}
 
-Scope: your team's transactions on the analytics API — the same universe the
-cost endpoints report (coding-assistant transactions excluded).
-"""
+Scope: your team's transactions on the v2 analytics plane, the same universe the
+analytics cost actions report.
+
+{scope_note}"""
 
     async def get_filter_options(self, **kwargs: Any) -> str:
         """Enumerate the valid filter values for an analytics dimension.

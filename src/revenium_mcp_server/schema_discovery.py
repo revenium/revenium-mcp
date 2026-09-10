@@ -19,6 +19,19 @@ from .models import (  # REMOVED: SourceStatus - API doesn't support status fiel
     TrialPeriod,
     UserRole,
 )
+from .alert_metrics import (
+    QUALITY_RATE,
+    QUALITY_RATE_PREREQUISITES,
+    QUALITY_RATE_SUMMARY,
+    bucket_metrics,
+)
+from .alert_operators import (
+    ACCEPTED_OPERATORS,
+    CHANGE_OPERATORS,
+    COMPARISON_OPERATORS,
+    FILTER_IN_OPERATOR_NOTE,
+    FILTER_OPERATORS,
+)
 from .product_validators import ProductValidationEngine
 
 
@@ -281,11 +294,10 @@ class SchemaDiscoveryEngine:
         """Build dynamic patterns using MetricType enum."""
         # Get metrics dynamically
         all_metrics = caps.get("metrics", {}).get("all", [metric.value for metric in MetricType])
-        cost_metrics = [m for m in all_metrics if "COST" in m]
-        token_metrics = [m for m in all_metrics if "TOKEN" in m]
-        performance_metrics = [
-            m for m in all_metrics if any(perf in m for perf in ["PER_MINUTE", "RATE"])
-        ]
+        buckets = bucket_metrics(all_metrics)
+        cost_metrics = buckets["cost_metrics"]
+        token_metrics = buckets["token_metrics"]
+        performance_metrics = buckets["performance_metrics"]
 
         return {
             "cost_monitoring": {
@@ -317,41 +329,34 @@ class SchemaDiscoveryEngine:
         # Get metrics from single source of truth (MetricType enum)
         all_metrics = [metric.value for metric in MetricType]
 
-        # Categorize metrics for better organization
-        cost_metrics = [m for m in all_metrics if "COST" in m]
-        token_metrics = [m for m in all_metrics if "TOKEN" in m]
-        performance_metrics = [
-            m for m in all_metrics if any(perf in m for perf in ["PER_MINUTE", "RATE"])
-        ]
-        quality_metrics = [m for m in all_metrics if "ERROR" in m]
-
+        # Grouped by the explicit mapping in revenium_mcp_server.alert_metrics
+        # (BACK-3103), not by substring.
         return {
             "anomalies": {
                 "alert_types": ["THRESHOLD", "CUMULATIVE_USAGE", "RELATIVE_CHANGE"],
                 "metrics": {
-                    "cost_metrics": cost_metrics,
-                    "token_metrics": token_metrics,
-                    "performance_metrics": performance_metrics,
-                    "quality_metrics": quality_metrics,
+                    **bucket_metrics(all_metrics),
                     "all": all_metrics,
                 },
+                "quality_rate": {
+                    "metric": QUALITY_RATE,
+                    "summary": QUALITY_RATE_SUMMARY,
+                    "prerequisites": list(QUALITY_RATE_PREREQUISITES),
+                },
+                # As in schema/alert_schema.py: the threshold and relative-change
+                # entries are operatorType values mirrored from the platform; the
+                # string and equality entries are filter operators.
                 "operators": {
-                    "threshold_operators": [
-                        "GREATER_THAN",
-                        "GREATER_THAN_OR_EQUAL_TO",
-                        "LESS_THAN",
-                        "LESS_THAN_OR_EQUAL_TO",
-                    ],
-                    "relative_change_operators": ["INCREASES_BY", "DECREASES_BY"],
+                    "threshold_operators": list(COMPARISON_OPERATORS),
+                    "relative_change_operators": list(CHANGE_OPERATORS),
                     "string_operators": ["CONTAINS", "STARTS_WITH", "ENDS_WITH"],
                     "equality_operators": ["EQUALS", "NOT_EQUALS"],
-                    "all": [
-                        "GREATER_THAN",
-                        "GREATER_THAN_OR_EQUAL_TO",
-                        "LESS_THAN",
-                        "LESS_THAN_OR_EQUAL_TO",
-                        "INCREASES_BY",
-                        "DECREASES_BY",
+                    # IN stays OUT of every list here, "all" included: this map
+                    # feeds the detection-rule operatorType field mapping, and the
+                    # platform refuses IN as an operatorType. The filter vocabulary
+                    # is published under its own key below.
+                    "all": list(ACCEPTED_OPERATORS)
+                    + [
                         "CONTAINS",
                         "STARTS_WITH",
                         "ENDS_WITH",
@@ -359,6 +364,9 @@ class SchemaDiscoveryEngine:
                         "NOT_EQUALS",
                     ],
                 },
+                # The filter vocabulary, kept apart from the operatorType lists.
+                "filter_operators": list(FILTER_OPERATORS),
+                "filter_row_shape": FILTER_IN_OPERATOR_NOTE,
                 "time_periods": {
                     "period_duration": [
                         "ONE_MINUTE",

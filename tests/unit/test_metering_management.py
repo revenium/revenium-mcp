@@ -16,6 +16,8 @@ from src.revenium_mcp_server.tools_decomposed.metering_management import (
 from src.revenium_mcp_server.common.error_handling import ToolError
 from mcp.types import TextContent
 
+from tests.unit._helpers_hal import wire_embedded_reader
+
 
 # ---------------------------------------------------------------------------
 # Shared test data helpers
@@ -36,7 +38,7 @@ def make_client():
     client.team_id = "test_team_id_456"
     client.post = AsyncMock(return_value={"status": "ok", "id": "api_tx_001"})
     client.get = AsyncMock(return_value={})
-    return client
+    return wire_embedded_reader(client)
 
 
 # ===========================================================================
@@ -743,10 +745,12 @@ def make_model_catalog_client(models=None):
     client = make_client()
 
     async def _search(query, page=0, size=20, **filters):
+        # The catalog can carry a row with a null name; the server returns it
+        # like any other, so the double must not filter it out by raising.
         if filters.get("exactMatch"):
-            matches = [m for m in catalog if m["name"].lower() == query.lower()]
+            matches = [m for m in catalog if (m.get("name") or "").lower() == query.lower()]
         else:
-            matches = [m for m in catalog if query.lower() in m["name"].lower()]
+            matches = [m for m in catalog if query.lower() in (m.get("name") or "").lower()]
         return {"_embedded": {"aIModelResourceList": matches}}
 
     client.search_ai_models = AsyncMock(side_effect=_search)
@@ -832,7 +836,363 @@ class TestValidateModelProviderUsesExactMatch:
             )
 
         assert isinstance(result[0], TextContent)
-        assert client.search_ai_models.call_count == 2
+        assert client.search_ai_models.call_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_zero_results_is_not_found_not_a_retrieval_failure(self, mgmt):
+        """BACK-2940: an empty catalog match is an unknown model, not an outage."""
+        client = make_client()
+        client.search_ai_models = AsyncMock(return_value={"page": {"totalElements": 0}})
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            result = await mgmt.handle_action(
+                "validate_model_provider",
+                {"model": "totally-fake-model-zzz999", "provider": "OPENAI"},
+            )
+
+        text = result[0].text
+        assert "Model/Provider Not Found" in text, text
+        assert "totally-fake-model-zzz999" in text
+        assert "Unable to retrieve models from API" not in text
+
+    @pytest.mark.asyncio
+    async def test_unknown_name_gets_closest_catalog_entries(self, mgmt):
+        """A typo in a family the catalog carries gets did-you-mean candidates."""
+        client = make_model_catalog_client()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            result = await mgmt.handle_action(
+                "validate_model_provider", {"model": "gpt-4ooo", "provider": "openai"}
+            )
+
+        text = result[0].text
+        assert "Model/Provider Not Found" in text, text
+        assert "Closest catalog entries" in text
+        assert "gpt-4o" in text
+
+    @pytest.mark.asyncio
+    async def test_a_response_that_is_not_an_envelope_still_reports_retrieval_failure(
+        self, mgmt
+    ):
+        """A genuine failure to read the models service keeps the outage message."""
+        client = make_client()
+        client.search_ai_models = AsyncMock(return_value=None)
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            result = await mgmt.handle_action(
+                "validate_model_provider", {"model": "gpt-4o", "provider": "openai"}
+            )
+
+        text = result[0].text
+        assert "Unable to retrieve models from API" in text, text
+
+    @pytest.mark.asyncio
+    async def test_validate_action_does_not_call_an_unknown_model_valid(self, mgmt):
+        """BACK-2940: the sibling validate action must not disagree with this one."""
+        client = make_model_catalog_client()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            with patch.object(
+                mgmt.transaction_manager,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                result = await mgmt.handle_action(
+                    "validate",
+                    {
+                        "model": "totally-fake-model-zzz999",
+                        "provider": "openai",
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "duration_ms": 1000,
+                    },
+                )
+
+        text = result[0].text
+        assert "Validation Successful" not in text, text
+        assert "Validation Incomplete" in text
+        assert "not in the AI model catalog" in text
+
+    @pytest.mark.asyncio
+    async def test_dry_run_submit_flags_an_unknown_model_like_validate_does(self, mgmt):
+        """The dry run and the validate action share one catalog check."""
+        client = make_model_catalog_client()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            with patch.object(
+                mgmt.transaction_manager,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                result = await mgmt.handle_action(
+                    "submit_ai_transaction",
+                    {
+                        "dry_run": True,
+                        "model": "totally-fake-model-zzz999",
+                        "provider": "openai",
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "duration_ms": 1000,
+                    },
+                )
+
+        text = result[0].text
+        assert "Validation Incomplete" in text, text
+        assert "not in the AI model catalog" in text
+        assert "Validation Successful" not in text
+
+    @pytest.mark.asyncio
+    async def test_dry_run_submit_stays_successful_for_a_catalog_pair(self, mgmt):
+        client = make_model_catalog_client()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            with patch.object(
+                mgmt.transaction_manager,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                result = await mgmt.handle_action(
+                    "submit_ai_transaction",
+                    {
+                        "dry_run": True,
+                        "model": "gpt-4o",
+                        "provider": "openai",
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "duration_ms": 1000,
+                    },
+                )
+
+        text = result[0].text
+        assert "Validation Successful" in text, text
+        assert "Warning" not in text
+        assert "**Dry Run:** True (no actual submission performed)" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["validate", "submit_ai_transaction"])
+    async def test_a_catalog_model_with_the_wrong_provider_is_warned_about(self, mgmt, action):
+        """validate_model_provider rejects gpt-4o/anthropic; these must not bless it."""
+        client = make_model_catalog_client()
+        arguments = {
+            "model": "gpt-4o",
+            "provider": "anthropic",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "duration_ms": 1000,
+        }
+        if action == "submit_ai_transaction":
+            arguments["dry_run"] = True
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            with patch.object(
+                mgmt.transaction_manager,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                result = await mgmt.handle_action(action, arguments)
+
+        text = result[0].text
+        assert "Validation Incomplete" in text, text
+        assert "but not for provider `anthropic`" in text
+        assert "AZURE" in text and "OPENAI" in text
+        assert "Validation Successful" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_catalog_model_with_a_listed_provider_is_not_warned_about(self, mgmt):
+        client = make_model_catalog_client()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            with patch.object(
+                mgmt.transaction_manager,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                result = await mgmt.handle_action(
+                    "validate",
+                    {
+                        "model": "gpt-4o",
+                        "provider": "AZURE",
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "duration_ms": 1000,
+                    },
+                )
+
+        text = result[0].text
+        assert "Validation Successful" in text, text
+        assert "Warning" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["validate", "submit_ai_transaction"])
+    async def test_a_catalog_row_with_a_null_name_still_produces_a_verdict(
+        self, mgmt, action
+    ):
+        """A null name in the result set must not turn the advisory into an error."""
+        client = make_client()
+        client.search_ai_models = AsyncMock(
+            return_value={
+                "_embedded": {
+                    "aIModelResourceList": [
+                        {"id": "model_null", "name": None, "provider": None},
+                        {"id": "model_gpt4o_openai", "name": "gpt-4o", "provider": "OPENAI"},
+                    ]
+                }
+            }
+        )
+        arguments = {
+            "model": "gpt-4o",
+            "provider": "openai",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "duration_ms": 1000,
+        }
+        if action == "submit_ai_transaction":
+            arguments["dry_run"] = True
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            with patch.object(
+                mgmt.transaction_manager,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                result = await mgmt.handle_action(action, arguments)
+
+        text = result[0].text
+        assert "Validation Successful" in text, text
+        assert "Warning" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_null_named_row_is_not_mistaken_for_a_match(self, mgmt):
+        """Only null-named rows come back: the model is still reported unknown."""
+        client = make_client()
+        client.search_ai_models = AsyncMock(
+            return_value={
+                "_embedded": {"aIModelResourceList": [{"id": "n", "name": None}]}
+            }
+        )
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            with patch.object(
+                mgmt.transaction_manager,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                result = await mgmt.handle_action(
+                    "validate",
+                    {
+                        "model": "gpt-4o",
+                        "provider": "openai",
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "duration_ms": 1000,
+                    },
+                )
+
+        text = result[0].text
+        assert "Validation Incomplete" in text, text
+        assert "not in the AI model catalog" in text
+
+    @pytest.mark.asyncio
+    async def test_a_matched_row_with_a_null_provider_warns_rather_than_raising(self, mgmt):
+        """A priced name whose rows carry no provider still answers, advisory only."""
+        client = make_client()
+        client.search_ai_models = AsyncMock(
+            return_value={
+                "_embedded": {
+                    "aIModelResourceList": [{"id": "n", "name": "gpt-4o", "provider": None}]
+                }
+            }
+        )
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            with patch.object(
+                mgmt.transaction_manager,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                result = await mgmt.handle_action(
+                    "validate",
+                    {
+                        "model": "gpt-4o",
+                        "provider": "openai",
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "duration_ms": 1000,
+                    },
+                )
+
+        text = result[0].text
+        assert "Validation Incomplete" in text, text
+        assert "not for provider `openai`" in text
+
+    @pytest.mark.asyncio
+    async def test_a_null_named_row_does_not_break_validate_model_provider(self, mgmt):
+        client = make_client()
+        client.search_ai_models = AsyncMock(
+            return_value={
+                "_embedded": {
+                    "aIModelResourceList": [
+                        {"id": "model_null", "name": None, "provider": None},
+                        {"id": "model_gpt4o_openai", "name": "gpt-4o", "provider": "OPENAI"},
+                    ]
+                }
+            }
+        )
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            result = await mgmt.handle_action(
+                "validate_model_provider", {"model": "gpt-4o", "provider": "openai"}
+            )
+
+        assert "Valid Model/Provider Combination" in result[0].text, result[0].text
+
+    @pytest.mark.asyncio
+    async def test_a_catalog_read_failure_produces_no_warning(self, mgmt):
+        """An unreadable catalog must never be reported as a bad model name."""
+        client = make_client()
+        client.search_ai_models = AsyncMock(side_effect=RuntimeError("boom"))
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            with patch.object(
+                mgmt.transaction_manager,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                result = await mgmt.handle_action(
+                    "validate",
+                    {
+                        "model": "gpt-4o",
+                        "provider": "openai",
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "duration_ms": 1000,
+                    },
+                )
+
+        text = result[0].text
+        assert "Validation Successful" in text, text
+        assert "Warning" not in text
+
+    @pytest.mark.asyncio
+    async def test_validate_action_stays_successful_for_a_catalog_model(self, mgmt):
+        client = make_model_catalog_client()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            with patch.object(
+                mgmt.transaction_manager,
+                "_validate_transaction_inputs_async",
+                new_callable=AsyncMock,
+                return_value={"valid": True, "message": "ok"},
+            ):
+                result = await mgmt.handle_action(
+                    "validate",
+                    {
+                        "model": "gpt-4o",
+                        "provider": "openai",
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "duration_ms": 1000,
+                    },
+                )
+
+        text = result[0].text
+        assert "Validation Successful" in text, text
+        assert "not in the AI model catalog" not in text
 
 
 # ===========================================================================

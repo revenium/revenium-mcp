@@ -13,6 +13,10 @@ from .base_formatter import AnalyticsResponseFormatter
 class ProviderCostsFormatter(AnalyticsResponseFormatter):
     """Format provider costs analytics responses."""
 
+    # Endpoint this formatter renders, so the coding-assistant scope note
+    # follows the plane the registry actually routes to.
+    ENDPOINT_KEY = "cost_metric_by_provider_over_time"
+
     def format(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format provider costs data for response.
 
@@ -28,7 +32,10 @@ class ProviderCostsFormatter(AnalyticsResponseFormatter):
 
         if not data:
             return self.utilities.format_no_data_response(
-                "provider costs", period, f"aggregation: {aggregation}"
+                "provider costs",
+                period,
+                f"aggregation: {aggregation}",
+                scope_note=self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY),
             )
 
         return self._format_provider_costs_content(
@@ -165,6 +172,7 @@ class ProviderCostsFormatter(AnalyticsResponseFormatter):
         """
         period = params.get("period", "Unknown")
         aggregation = params.get("aggregation", "Unknown")
-        return self.utilities.add_insights_footer(
+        footer = self.utilities.add_insights_footer(
             "provider costs", period, f"{aggregation} aggregation"
         )
+        return f"{footer}\n{self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY)}"

@@ -35,6 +35,7 @@ from ..common.error_handling import (
     ErrorCodes,
     ToolError,
     create_structured_missing_parameter_error,
+    raise_unknown_action_error,
 )
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..introspection.metadata import (
@@ -73,7 +74,31 @@ ORG_UNIT_PREVIEW_SEMANTICS_NOTE = (
     "groupBy=ORG_UNIT rule is organization-wide and unscoped by that parent: it "
     "caps every attributed org unit in the organization, so the preview can "
     "understate the real fan-out of a BLOCK rule. ORG_UNIT filter entries "
-    "accept only the IS operator upstream."
+    "accept only the IS operator upstream: an IN row naming several org units "
+    "in values is refused for this dimension even though every other dimension "
+    "takes one (re-verified 2026-09-09), because the ancestor-cap evaluation "
+    "assumes exactly one org-unit id. To cap several departments, use "
+    "groupBy=ORG_UNIT (one budget per department) or one control per "
+    "department."
+)
+
+# What the three department-budget maps on the compiled ruleset mean. Stated
+# once because two surfaces need it: the Enforcement Visibility capability and
+# the notes get_capabilities/get_examples publish. The distinction that matters
+# is which of them is a verdict — orgUnitBudgetBlockUnits is not.
+ORG_UNIT_ENFORCEMENT_MAPS_NOTE = (
+    "orgUnitBudgetWarnings is the same subscriber email -> rule-id shape as "
+    "orgUnitBudgetBlocks, for the people who crossed a rule's WARN tier and "
+    "are not blocked yet; the two maps are disjoint, and get_enforcement_rules "
+    "summarizes the warnings per rule - the rule name, how many people it is "
+    "warning, and their balances from orgUnitBudgetBlockBalances (subscriber "
+    "email -> the balance that rule's threshold was compared against for them, "
+    "which is neither the rule's own currentValue nor a per-department total) - "
+    "leaving the email addresses in the payload rather than in the summary "
+    "line. orgUnitBudgetBlockUnits (subscriber email -> the org unit whose cap "
+    "named them) covers warned and blocked people alike: it is an attribution "
+    "helper for notification routing, NOT a verdict, so an entry there does "
+    "not mean that person is blocked and nothing summarizes it as one."
 )
 
 ORG_UNIT_BUDGETS_FEATURE_NOTE = (
@@ -102,7 +127,23 @@ ORG_UNIT_ID_SOURCE_NOTE = (
 
 # Blocked-subscriber lists are unbounded (one entry per blocked person), so the
 # human summary renders a bounded prefix and points at the payload for the rest.
+# The warn summary reuses the bound for the per-rule balance list, which is one
+# entry per warned person and unbounded for the same reason.
 _MAX_BLOCKED_SUBSCRIBERS_RENDERED = 10
+
+# The filter row shape the IN operator takes. Stated once because the input
+# schema, the capability text and the examples all have to teach the same rule:
+# IN carries its list in `values` and no scalar `value`, every other operator
+# carries `value` and no `values`, and the server is the only validator of
+# either (the tool declares no operator enum, so a new upstream operator needs
+# no MCP release).
+FILTER_IN_OPERATOR_NOTE = (
+    "The IN operator (\"is one of\") takes its list in `values` instead of a "
+    "single `value` and matches when the dimension equals any listed entry; "
+    "every other operator takes `value`. Filter rows are still combined with "
+    "AND, so IN adds OR within one row only. Both fields are optional here and "
+    "validated server-side."
+)
 
 
 def _coerce_parent_org_unit_id(raw: Any) -> int:
@@ -144,6 +185,116 @@ def _coerce_parent_org_unit_id(raw: Any) -> int:
     return candidate
 
 
+def _rule_names_by_id(result: Any) -> Dict[str, Any]:
+    """Map ``rules[].ruleId`` to ``rules[].name``, keyed as strings.
+
+    Both org-unit summaries resolve rule ids the same way, and the keys are
+    stringified because the id maps' values and ``ruleId`` are not guaranteed
+    to share a JSON type.
+    """
+    rule_names: Dict[str, Any] = {}
+    if not isinstance(result, dict):
+        return rule_names
+    rules = result.get("rules")
+    if isinstance(rules, list):
+        for rule in rules:
+            if isinstance(rule, dict) and rule.get("ruleId") is not None:
+                rule_names[str(rule["ruleId"])] = rule.get("name")
+    return rule_names
+
+
+def _balance_sort_key(raw: Any) -> Any:
+    """Order balances highest-first, keeping unparseable ones last.
+
+    The map's values are decimals on the wire but a caller can be handed
+    anything, and the point of the listing is "who is closest to the block",
+    so a value that will not parse is kept (never dropped: it is a real
+    warning) and sorted after the ones that will.
+    """
+    if isinstance(raw, bool):
+        return (1, 0.0)
+    if isinstance(raw, (int, float)):
+        return (0, -float(raw))
+    if isinstance(raw, str):
+        try:
+            return (0, -float(raw))
+        except ValueError:
+            return (1, 0.0)
+    return (1, 0.0)
+
+
+def _summarize_org_unit_warnings(result: Any) -> Optional[str]:
+    """Render ``orgUnitBudgetWarnings`` as which rules are warning how many people.
+
+    The key is a flat map of subscriber email -> the id of the rule whose warn
+    tier that person crossed, disjoint from ``orgUnitBudgetBlocks`` (a person
+    already blocked is not warned). It answers "who is about to be blocked by a
+    department budget", which the raw map does not: the same rule id repeats
+    once per person, and the number that was compared against the threshold
+    lives in a second map, ``orgUnitBudgetBlockBalances``.
+
+    The summary is per rule, not per person: it names the rule, counts the
+    people it is warning and lists their compared balances, and leaves the
+    email addresses in the payload. Returns None when the key is absent, so a
+    tenant on an older payload is not told that nobody is warned by a map that
+    never came.
+    """
+    if not isinstance(result, dict):
+        return None
+    if result.get("orgUnitBudgetWarnings") is None:
+        return None
+    warnings = result["orgUnitBudgetWarnings"]
+    if not isinstance(warnings, dict):
+        return (
+            "orgUnitBudgetWarnings was not the expected subscriber-email -> rule-id "
+            "map; read it from the payload below."
+        )
+    if not warnings:
+        return "No subscribers have crossed a department budget warn threshold."
+
+    rule_names = _rule_names_by_id(result)
+    balances = result.get("orgUnitBudgetBlockBalances")
+    if not isinstance(balances, dict):
+        # A missing or malformed balance map costs the balances, never the
+        # warning: the counts are what tell an operator someone is at risk.
+        balances = {}
+
+    # Insertion-ordered so the rendering is stable for a given payload.
+    counts: Dict[str, int] = {}
+    per_rule_balances: Dict[str, List[Any]] = {}
+    for email, rule_id in warnings.items():
+        key = str(rule_id)
+        counts[key] = counts.get(key, 0) + 1
+        per_rule_balances.setdefault(key, [])
+        balance = balances.get(email)
+        if balance is not None:
+            per_rule_balances[key].append(balance)
+
+    lines: List[str] = []
+    for key, count in counts.items():
+        name = rule_names.get(key)
+        label = name if name else f"rule {key}"
+        subject = "subscriber" if count == 1 else "subscribers"
+        line = f"- {label}: {count} {subject} warned"
+        rendered_balances = sorted(per_rule_balances[key], key=_balance_sort_key)
+        shown = rendered_balances[:_MAX_BLOCKED_SUBSCRIBERS_RENDERED]
+        if shown:
+            listing = ", ".join(str(balance) for balance in shown)
+            remaining = len(rendered_balances) - len(shown)
+            if remaining > 0:
+                listing += f", and {remaining} more"
+            line += f"; balances compared: {listing}"
+        lines.append(line)
+
+    total = len(warnings)
+    subject = "subscriber is" if total == 1 else "subscribers are"
+    header = (
+        f"{total} {subject} approaching a department budget (warned, not blocked); "
+        "see orgUnitBudgetWarnings in the payload below for who:"
+    )
+    return "\n".join([header] + lines)
+
+
 def _summarize_org_unit_blocks(result: Any) -> Optional[str]:
     """Render ``orgUnitBudgetBlocks`` as the people it says are blocked.
 
@@ -168,12 +319,7 @@ def _summarize_org_unit_blocks(result: Any) -> Optional[str]:
     if not blocks:
         return "No subscribers are currently blocked by a department budget."
 
-    rule_names: Dict[str, Any] = {}
-    rules = result.get("rules")
-    if isinstance(rules, list):
-        for rule in rules:
-            if isinstance(rule, dict) and rule.get("ruleId") is not None:
-                rule_names[str(rule["ruleId"])] = rule.get("name")
+    rule_names = _rule_names_by_id(result)
 
     rendered: List[str] = []
     for email, rule_id in list(blocks.items())[:_MAX_BLOCKED_SUBSCRIBERS_RENDERED]:
@@ -394,9 +540,10 @@ class CostControlsManager:
         missing or null groupBreakdown means the rule is pooled, which is not
         the same thing as a grouped rule with zero groups.
 
-        The payload also carries ``orgUnitBudgetBlocks`` on tenants with
-        department budgets; ``_summarize_org_unit_blocks`` is what turns it
-        into readable prose at the action boundary.
+        The payload also carries ``orgUnitBudgetBlocks`` and
+        ``orgUnitBudgetWarnings`` on tenants with department budgets;
+        ``_summarize_org_unit_blocks`` and ``_summarize_org_unit_warnings`` are
+        what turn them into readable prose at the action boundary.
         """
         return await self.client.get_enforcement_rules()
 
@@ -624,13 +771,30 @@ class CostControlsManagement(ToolBase):
                                     },
                                     "operator": {
                                         "type": "string",
-                                        "description": "Comparison applied to value (server-validated)",
+                                        "description": (
+                                            "Comparison applied to value (server-validated). "
+                                            + FILTER_IN_OPERATOR_NOTE
+                                            + " ORG_UNIT is the exception: it accepts only IS, so "
+                                            "one control cannot cover several departments through "
+                                            "an IN row."
+                                        ),
                                     },
                                     "value": {
                                         "type": "string",
                                         "description": (
-                                            "Value matched on this dimension. For ORG_UNIT this is the "
-                                            "raw numeric org-unit id as a string, e.g. '173'."
+                                            "Value matched on this dimension, for every operator "
+                                            "except IN (which uses values). For ORG_UNIT this is "
+                                            "the raw numeric org-unit id as a string, e.g. '173'."
+                                        ),
+                                    },
+                                    "values": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": (
+                                            "Value list for the IN operator, e.g. ['gpt-4', "
+                                            "'claude-sonnet-4-5'] to cover several models in one "
+                                            "row. Send it instead of value, not alongside it. "
+                                            + FILTER_IN_OPERATOR_NOTE
                                         ),
                                     },
                                     "includeDescendants": {
@@ -737,6 +901,7 @@ class CostControlsManagement(ToolBase):
                     "list(page=0, size=20)",
                     "list(filters={'query': 'monthly'})",
                     "create(control_data={'name': 'Monthly Guardrail', 'metricType': 'TOTAL_COST', 'hardLimit': 1000, 'windowType': 'MONTHLY', 'action': 'BLOCK'})",
+                    "create(control_data={'name': 'Frontier models cap', 'metricType': 'TOTAL_COST', 'hardLimit': 1000, 'windowType': 'MONTHLY', 'action': 'BLOCK', 'filters': [{'dimension': 'MODEL', 'operator': 'IN', 'values': ['gpt-4', 'claude-sonnet-4-5']}]})",
                     "update(control_id='cc_123', control_data={'hardLimit': 2000})",
                     "delete(control_id='cc_123')",
                 ],
@@ -744,6 +909,8 @@ class CostControlsManagement(ToolBase):
                     "Requires valid API authentication",
                     "action/metricType/windowType are validated server-side, not client-side",
                     "shadowMode evaluates and logs a control without applying its enforcement action",
+                    "A filter row carries either value or values, never both: "
+                    + FILTER_IN_OPERATOR_NOTE,
                 ],
             ),
             ToolCapability(
@@ -761,7 +928,8 @@ class CostControlsManagement(ToolBase):
                     "department budgets: a flat map of subscriber email -> the id of the rule "
                     "currently blocking that person (not a per-department count), which "
                     "get_enforcement_rules summarizes into who is blocked and by which rule. "
-                    "That output therefore contains subscriber email addresses"
+                    "That output therefore contains subscriber email addresses. "
+                    + ORG_UNIT_ENFORCEMENT_MAPS_NOTE
                 ),
                 parameters={
                     "list_enforcement_events": {
@@ -784,6 +952,9 @@ class CostControlsManagement(ToolBase):
                     "department budgets are blocking anyone (see this capability's description)",
                     "orgUnitBudgetBlocks is absent on tenants without department budgets; the "
                     "summary omits the line rather than reporting zero blocked subscribers",
+                    "orgUnitBudgetWarnings is treated the same way - absent means no warn "
+                    "summary at all, not zero warned - and its summary counts people per rule "
+                    "instead of naming them",
                     "groupBreakdown (see this capability's description) is a response field, never "
                     "an input, and is populated on API reads only",
                 ],
@@ -819,6 +990,7 @@ class CostControlsManagement(ToolBase):
                     "preview_org_unit_group is read-only and is never called implicitly by "
                     "create or update",
                     ORG_UNIT_BUDGETS_FEATURE_NOTE,
+                    ORG_UNIT_PREVIEW_SEMANTICS_NOTE,
                 ],
             ),
         ]
@@ -897,23 +1069,42 @@ class CostControlsManagement(ToolBase):
                                 ],
                             },
                         },
+                        "filter_several_values_in_one_row": {
+                            "action": "create",
+                            "control_data": {
+                                "name": "Frontier models cap",
+                                "metricType": "TOTAL_COST",
+                                "hardLimit": 1000,
+                                "windowType": "MONTHLY",
+                                "action": "BLOCK",
+                                "filters": [
+                                    {
+                                        "dimension": "MODEL",
+                                        "operator": "IN",
+                                        "values": ["gpt-4", "claude-sonnet-4-5"],
+                                    }
+                                ],
+                            },
+                        },
                         "preview_org_unit_group": {
                             "action": "preview_org_unit_group",
                             "parent_org_unit_id": 173,
                         },
                     },
+                    "filter_notes": [FILTER_IN_OPERATOR_NOTE],
                     "org_unit_notes": [
                         ORG_UNIT_ID_SOURCE_NOTE,
                         ORG_UNIT_DIMENSION_SCOPE_NOTE,
                         ORG_UNIT_BUDGETS_FEATURE_NOTE,
                         ORG_UNIT_PREVIEW_SEMANTICS_NOTE,
+                        ORG_UNIT_ENFORCEMENT_MAPS_NOTE,
                     ],
                 }
                 if action == "get_examples":
                     return [
                         TextContent(
                             type="text",
-                            text=f"Cost Controls Management Examples:\n{json.dumps({'action': 'get_examples', 'examples': capabilities['examples'], 'org_unit_notes': capabilities['org_unit_notes']}, indent=2)}",
+                            text=f"Cost Controls Management Examples:\n{json.dumps({'action': 'get_examples', 'examples': capabilities['examples'], 'filter_notes': capabilities['filter_notes'], 'org_unit_notes': capabilities['org_unit_notes']}, indent=2)}",
                         )
                     ]
                 return [
@@ -972,11 +1163,17 @@ class CostControlsManagement(ToolBase):
                     f"Compiled enforcement rules ({len(rules)} rules, "
                     f"compiledAt={result.get('compiledAt') if isinstance(result, dict) else None}):"
                 )
-                # A single extra line, never a blank one: callers (and tests)
-                # split the first blank line to recover the JSON payload.
+                # Extra lines, never a blank one: callers (and tests) split the
+                # first blank line to recover the JSON payload.
                 blocks_summary = _summarize_org_unit_blocks(result)
                 if blocks_summary:
                     header = f"{header}\n{blocks_summary}"
+                # Blocks first, then warnings: the two maps are disjoint
+                # upstream, and what is already enforced outranks what is
+                # merely approaching.
+                warnings_summary = _summarize_org_unit_warnings(result)
+                if warnings_summary:
+                    header = f"{header}\n{warnings_summary}"
                 return [
                     TextContent(
                         type="text",
@@ -1015,12 +1212,10 @@ class CostControlsManagement(ToolBase):
 
             else:
                 supported = await self._get_supported_actions()
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"Unknown action '{action}'. Supported actions: {', '.join(supported)}",
-                    )
-                ]
+                # BACK-2937: raise so the envelope carries the error flag.
+                raise_unknown_action_error(
+                    action, hint=f"Supported actions: {', '.join(supported)}"
+                )
 
         except ToolError as e:
             logger.error(f"Tool error in manage_cost_controls: {e}")

@@ -13,6 +13,11 @@ from .base_formatter import AnalyticsResponseFormatter
 class CostSummaryFormatter(AnalyticsResponseFormatter):
     """Format cost summary analytics responses."""
 
+    # The summary aggregates the five dimension endpoints, which all live on
+    # the same analytics plane; the provider endpoint is the total's primary
+    # reference, so its key selects the plane for the scope note.
+    ENDPOINT_KEY = "cost_metric_by_provider_over_time"
+
     def format(self, data: Dict[str, Any], params: Dict[str, Any]) -> str:
         """Format cost summary data for response.
 
@@ -73,7 +78,7 @@ class CostSummaryFormatter(AnalyticsResponseFormatter):
             "cost summary", period, f"{aggregation} aggregation"
         )
 
-        return response
+        return f"{response}\n{self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY)}"
 
     def _format_top_contributors_section(
         self, section_name: str, contributors: List[Dict[str, Any]], key_field: str

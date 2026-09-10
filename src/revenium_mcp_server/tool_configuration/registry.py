@@ -687,9 +687,12 @@ class ToolConfigurationRegistry:
             search_all_pages: Optional[Union[bool, str]] = None,
             search_term: Optional[str] = None,
             status_filter: Optional[str] = None,
-            # set_strict_ingestion_mode: the closure signature is this tool's
-            # public schema, so the toggle's arguments must be declared here
-            # for FastMCP to bind them at all.
+            # Tenant-setting toggles (set_strict_ingestion_mode,
+            # set_attribution_detail_text): the closure signature is this
+            # tool's public schema, so their arguments must be declared here
+            # for FastMCP to bind them at all. `enabled` carries the desired
+            # state for both; `confirm` and `allow_ticket_jobs` are read only
+            # by the strict-ingestion toggle.
             enabled: Optional[Union[bool, str]] = None,
             allow_ticket_jobs: Optional[Union[bool, str]] = None,
             confirm: Optional[Union[bool, str]] = None
@@ -753,6 +756,22 @@ class ToolConfigurationRegistry:
             organization_id: Optional[str] = None,
             subscription_id: Optional[str] = None,
             product_id: Optional[str] = None,
+            # Attribution and error fields the metering API accepts by name.
+            # organization_id / product_id above are the deprecated spellings and
+            # are kept declared only so the submit path can answer them with the
+            # rename message instead of a generic "unrecognized parameter".
+            # These names are published by get_examples and
+            # get_field_documentation, and FastMCP builds the tool schema from
+            # this signature, so an undeclared name never reaches the handler.
+            organization_name: Optional[str] = None,
+            product_name: Optional[str] = None,
+            error_reason: Optional[str] = None,
+            # Submission timestamps (ISO UTC, 'Z'-suffixed). Handled by
+            # MeteringTransactionManager._process_timestamp_field, which
+            # auto-populates them when they are omitted.
+            request_time: Optional[str] = None,
+            response_time: Optional[str] = None,
+            completion_start_time: Optional[str] = None,
             page: Optional[Union[int, str]] = None,
             size: Optional[Union[int, str]] = None,
             query: Optional[str] = None,
@@ -818,6 +837,14 @@ class ToolConfigurationRegistry:
                 "organization_id": organization_id,
                 "subscription_id": subscription_id,
                 "product_id": product_id,
+                # Attribution and error fields accepted by name
+                "organization_name": organization_name,
+                "product_name": product_name,
+                "error_reason": error_reason,
+                # Submission timestamps
+                "request_time": request_time,
+                "response_time": response_time,
+                "completion_start_time": completion_start_time,
                 "page": page,
                 "size": size,
                 "query": query,
@@ -1129,8 +1156,16 @@ class ToolConfigurationRegistry:
             credential_data: Optional[Union[dict, str]] = None,
             subscriberId: Optional[str] = None,
             organizationId: Optional[str] = None,
+            organization_id: Optional[str] = None,
             page: int = 0,
             size: int = 20,
+            # BACK-2958: the tool has advertised a `filters` object in
+            # get_capabilities since the allowlist landed, but it was never a
+            # registered parameter, so every filtered listing was rejected at
+            # the MCP boundary before the tool saw it. Declaring it here is
+            # what makes the documented filter surface reachable — for `list`
+            # and for `list_by_organization`.
+            filters: Optional[dict] = None,
             dry_run: Optional[Union[bool, str]] = None,
             email: Optional[str] = None,
             name: Optional[str] = None
@@ -1142,8 +1177,10 @@ class ToolConfigurationRegistry:
                 "credential_data": credential_data,
                 "subscriberId": subscriberId,
                 "organizationId": organizationId,
+                "organization_id": organization_id,
                 "page": page,
                 "size": size,
+                "filters": filters,
                 "dry_run": dry_run,
                 "email": email,
                 "name": name
@@ -1669,13 +1706,23 @@ class ToolConfigurationRegistry:
             return result
 
     async def _register_manage_jobs(self, mcp: FastMCP) -> None:
-        """Register manage jobs tool."""
+        """Register manage jobs tool.
+
+        FastMCP derives this tool's public input schema from the signature
+        below, not from anything the handler reads, so every parameter an
+        action accepts must be declared here — `session_id` (BACK-2769) and
+        `expected_entity_version` (BACK-3091) included. A parameter the handler
+        understands but this signature omits is rejected at the MCP boundary
+        before `handle_action` runs.
+        """
         @mcp.tool()
         @dynamic_mcp_tool("manage_jobs")
         async def manage_jobs(
             action: str = "get_capabilities",
             job_id: Optional[str] = None,
+            session_id: Optional[str] = None,
             outcome_data: Optional[Union[dict, str]] = None,
+            expected_entity_version: Optional[Union[int, str]] = None,
             page: Union[int, str] = 0,
             size: Union[int, str] = 20,
             filters: Optional[Union[dict, str]] = None,
@@ -1684,7 +1731,9 @@ class ToolConfigurationRegistry:
             arguments = {
                 "action": action,
                 "job_id": job_id,
+                "session_id": session_id,
                 "outcome_data": outcome_data,
+                "expected_entity_version": expected_entity_version,
                 "page": page,
                 "size": size,
                 "filters": filters or {},
@@ -1765,7 +1814,6 @@ class ToolConfigurationRegistry:
             per_unit_price: Optional[float] = None,
             tool_type: Optional[_JSONScalar] = None,
             tool_description: Optional[_JSONScalar] = None,
-            tool_version: Optional[_JSONScalar] = None,
             tool_provider: Optional[_JSONScalar] = None,
             period: Optional[_JSONScalar] = None,
             group: Optional[_JSONScalar] = None,
@@ -1788,7 +1836,6 @@ class ToolConfigurationRegistry:
                 "per_unit_price": per_unit_price,
                 "tool_type": tool_type,
                 "tool_description": tool_description,
-                "tool_version": tool_version,
                 "tool_provider": tool_provider,
                 "period": period,
                 "group": group,
@@ -1808,7 +1855,6 @@ class ToolConfigurationRegistry:
                     "pricing_model",
                     "tool_type",
                     "tool_description",
-                    "tool_version",
                     "tool_provider",
                     "period",
                     "group",

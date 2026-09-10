@@ -1,12 +1,16 @@
 """In-memory sliding-window rate limiting for the HTTP transport."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from src.revenium_mcp_server.auth.rate_limit import (
     RateLimitMiddleware,
     SlidingWindowLimiter,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class FakeClock:
@@ -246,3 +250,75 @@ class TestProxyAwareIpKey:
         await _run(mw, _scope("/token", client=("203.0.113.7", 1)))
         sent = await _run(mw, _scope("/token", client=("198.51.100.3", 1)))
         assert sent[0]["status"] == 200
+
+
+class TestPerToolRateLimitDecision:
+    """BACK-2472: no per-tool bucket keyed on ``Mcp-Name`` in this limiter.
+
+    A declined decision is only useful if it stays where the next reader looks:
+    in the module docstring that already records this limiter's scope, and in
+    the middleware section of the architecture doc. These tests fail if either
+    is dropped, so the flat per-credential bucket cannot quietly go back to
+    looking like an oversight — plus one behavioral pin so "declined" also
+    means what it says at runtime. If a per-tool bucket is ever adopted, update
+    the decision record, the doc paragraph and these tests together.
+    """
+
+    def test_module_docstring_records_the_decision(self):
+        """The rationale lives in the docstring, declining and naming the headers."""
+        import src.revenium_mcp_server.auth.rate_limit as rl
+
+        doc = rl.__doc__ or ""
+        assert "Decision (BACK-2472)" in doc
+        assert "DECLINED" in doc
+        # The header contract the decision rests on, cited by anchor name.
+        assert "Mcp-Name" in doc
+        assert "MCP_METHOD_HEADER" in doc and "MCP_NAME_HEADER" in doc
+        assert "NAME_BEARING_METHODS" in doc
+        assert "HEADER_MISMATCH" in doc
+        assert "classify_inbound_request" in doc
+        # The decision sits below the scope notes it argues from.
+        assert doc.index("Scope notes:") < doc.index("Decision (BACK-2472)")
+
+    def test_decision_names_what_would_reopen_it(self):
+        """A decline is only actionable if its exit conditions are written down."""
+        import src.revenium_mcp_server.auth.rate_limit as rl
+
+        doc = rl.__doc__ or ""
+        reopen = doc[doc.index("Reopens if") :]
+        assert "distributed" in reopen
+        # The legacy-client case a per-tool bucket must not treat as an error.
+        assert "unknown tool" in reopen
+        # The flat bucket stays untouched even under the adopt shape.
+        assert "DEFAULT_MCP_LIMIT_PER_MINUTE" in reopen
+
+    def test_architecture_doc_carries_the_same_decision(self):
+        """server-and-runtime.md states it and points back at the module."""
+        doc = REPO_ROOT / "docs" / "architecture" / "server-and-runtime.md"
+        if not doc.exists():
+            pytest.skip(
+                "docs/architecture/ is internal-only and not part of the public export "
+                "(see public-allowlist-mcp.txt); the doc-mirror check runs in the internal repo"
+            )
+        text = doc.read_text()
+        assert "Decision (BACK-2472)" in text
+        assert "src/revenium_mcp_server/auth/rate_limit.py" in text
+        # The edge owns the implementation; the doc must say where it lives.
+        assert "hypercurrent-infrastructure" in text
+        assert "mcp-stack" in text
+
+    @pytest.mark.asyncio
+    async def test_tool_name_header_does_not_buy_a_separate_bucket(self):
+        """Declined means declined: one credential, one bucket, whatever the tool.
+
+        Two calls naming different tools from the same credential must exhaust
+        the same per-minute budget. Adopting a per-tool bucket would let the
+        second call through, which is the change this test exists to catch.
+        """
+        app = _App()
+        mw = RateLimitMiddleware(app, mcp_limit=1, auth_limit=100, window_seconds=60)
+        await _run(mw, _scope("/mcp", {"authorization": "Bearer t", "mcp-name": "manage_products"}))
+        sent = await _run(
+            mw, _scope("/mcp", {"authorization": "Bearer t", "mcp-name": "manage_alerts"})
+        )
+        assert sent[0]["status"] == 429

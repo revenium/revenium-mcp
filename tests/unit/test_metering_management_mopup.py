@@ -25,7 +25,10 @@ from src.revenium_mcp_server.tools_decomposed.metering_management import (
     MeteringManagement,
     MeteringValidator,
 )
+
+from tests.unit._helpers_hal import wire_embedded_reader
 from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.client import ReveniumAPIError
 from mcp.types import TextContent
 
 
@@ -48,7 +51,7 @@ def make_client():
     client.team_id = "test_team_id_456"
     client.post = AsyncMock(return_value={"status": "ok", "id": "api_tx_001"})
     client.get = AsyncMock(return_value={})
-    return client
+    return wire_embedded_reader(client)
 
 
 def make_mm() -> MeteringManagement:
@@ -530,7 +533,13 @@ class TestHandleAnalyzeRecentTransactions:
         assert "No Recent Transactions" in result[0].text
 
     async def test_successful_analysis(self):
-        """Lines 3166-3346: full analysis with subscriber data."""
+        """Full analysis over the shape the completions endpoint really returns.
+
+        Subscriber attribution is submitted as a nested `subscriber` object and
+        read back FLAT (subscriberEmail / subscriberId / subscriberCredential),
+        per AICompletionMetricResource - the record below uses the response
+        spellings on purpose.
+        """
         client = make_client()
         client.get = AsyncMock(return_value={
             "_embedded": {
@@ -541,38 +550,97 @@ class TestHandleAnalyzeRecentTransactions:
                         "provider": "OPENAI",
                         "inputTokenCount": 100,
                         "outputTokenCount": 50,
-                        "subscriber": {
-                            "email": "test@example.com",
-                            "id": "sub_001",
-                            "credential": {"name": "key1", "value": "val1"},
-                        },
+                        "subscriberEmail": "test@example.com",
+                        "subscriberId": "sub_001",
+                        "subscriberCredential": "key1",
                         "unexpectedField": "something",
                     }
                 ]
             },
         })
-        result = await self.mm._handle_analyze_recent_transactions(client, {"limit": 10})
+        result = await self.mm._handle_analyze_recent_transactions(client, {"page_size": 10})
         text = result[0].text
         assert "Field Presence Summary" in text
-        assert "Subscriber Object Analysis" in text
+        assert "Subscriber Attribution" in text
+        assert "**subscriberEmail:** 1/1 (100.0%)" in text
+        # An untracked field is reported as returned-but-not-measured, never as
+        # a problem with the response.
+        assert "Returned But Not Tracked By This Report" in text
+        assert "`unexpectedField`" in text
 
-    async def test_limit_capped_at_100(self):
-        """limit > 100 is capped to 100."""
+    async def test_absent_fields_are_not_reported_as_data_loss(self):
+        """BACK-2931: a field the sample did not carry is not a lost value."""
+        client = make_client()
+        client.get = AsyncMock(return_value={
+            "_embedded": {
+                "aICompletionMetricResourceList": [
+                    {"transactionId": "tx_1", "model": "m", "provider": "OPENAI"}
+                ]
+            },
+        })
+        text = (await self.mm._handle_analyze_recent_transactions(client, {}))[0].text
+
+        assert "Absent From Every Transaction In The Sample" in text
+        assert "not that the value was lost" in text
+        # ticket_id is accepted on submission and undeclared on the response, so
+        # it is listed apart rather than counted as absent.
+        assert "Not Readable Through This Endpoint" in text
+        assert "`ticket_id`" in text
+
+    async def test_response_spellings_replace_submission_spellings(self):
+        """The names the old report measured were never in the response."""
+        client = make_client()
+        client.get = AsyncMock(return_value={
+            "_embedded": {
+                "aICompletionMetricResourceList": [
+                    {"transactionId": "tx_1", "requestDuration": 250, "organization": "acme"}
+                ]
+            },
+        })
+        text = (await self.mm._handle_analyze_recent_transactions(client, {}))[0].text
+
+        assert "`requestDuration`" in text
+        assert "`organization`" in text
+        # The submission spellings appear only in the alias table at the end.
+        assert "`durationMs`" not in text
+        assert "`organizationName`" not in text
+        assert "`duration_ms` (submitted) -> `requestDuration` (returned)" in text
+
+    async def test_page_size_capped_at_100(self):
+        """page_size > 100 is capped to 100 - the endpoint truncates there."""
         client = make_client()
         client.get = AsyncMock(return_value={
             "_embedded": {"aICompletionMetricResourceList": [{"transactionId": "tx_1", "model": "m"}]},
         })
-        await self.mm._handle_analyze_recent_transactions(client, {"limit": 200})
-        # Verify the call used capped limit
+        await self.mm._handle_analyze_recent_transactions(client, {"page_size": 200})
+        # Verify the call used the capped sample size
         call_kwargs = client.get.call_args
         assert call_kwargs[1]["params"]["size"] == 100
 
-    async def test_exception_returns_error(self):
-        """Line 3349-3351: exception handling."""
+    async def test_upstream_failure_raises_instead_of_reporting_success(self):
+        """BACK-2931: a failed read must not look like a successful analysis.
+
+        The handler used to wrap its whole body in `except Exception` and return
+        the failure as ordinary TextContent, so an API, auth or policy failure
+        reached the caller as a successful tool result. It now propagates, the
+        way the sibling completions reads do, and `handle_action` re-raises for
+        `standardized_tool_execution`.
+        """
         client = make_client()
         client.get = AsyncMock(side_effect=RuntimeError("API down"))
-        result = await self.mm._handle_analyze_recent_transactions(client, {})
-        assert "Analysis Failed" in result[0].text
+
+        with pytest.raises(RuntimeError, match="API down"):
+            await self.mm._handle_analyze_recent_transactions(client, {})
+
+    async def test_api_error_propagates_too(self):
+        """The structured upstream error is not swallowed either."""
+        client = make_client()
+        client.get = AsyncMock(
+            side_effect=ReveniumAPIError("Forbidden", status_code=403)
+        )
+
+        with pytest.raises(ReveniumAPIError):
+            await self.mm._handle_analyze_recent_transactions(client, {})
 
 
 # ===========================================================================
@@ -654,6 +722,7 @@ class TestAIModelHandlers:
 
     def _install_mock_client(self, client):
         """Helper: patch self.mm.get_client to return the supplied client mock."""
+        wire_embedded_reader(client)
         mock_gc = AsyncMock(return_value=client)
         self.mm.get_client = mock_gc
         return mock_gc
@@ -819,14 +888,25 @@ class TestAIModelHandlers:
         assert "Not Found" in result[0].text
 
     async def test_validate_model_provider_empty_response(self):
-        """Line 4395: empty API response."""
+        """An empty envelope means the catalog has no such model, not an outage."""
         mock_client = MagicMock()
         mock_client.search_ai_models = AsyncMock(return_value={})
         self._install_mock_client(mock_client)
         result = await self.mm._handle_validate_model_provider(
             {"model": "gpt-4o", "provider": "openai"}
         )
-        assert "failed" in result[0].text.lower()
+        assert "Not Found" in result[0].text
+        assert "Unable to retrieve models from API" not in result[0].text
+
+    async def test_validate_model_provider_non_envelope_response(self):
+        """Only a response that is not a search envelope is a retrieval failure."""
+        mock_client = MagicMock()
+        mock_client.search_ai_models = AsyncMock(return_value=None)
+        self._install_mock_client(mock_client)
+        result = await self.mm._handle_validate_model_provider(
+            {"model": "gpt-4o", "provider": "openai"}
+        )
+        assert "Unable to retrieve models from API" in result[0].text
 
     async def test_estimate_cost_missing_params(self):
         """Lines 4419-4434: missing model/provider returns error."""
@@ -1290,3 +1370,65 @@ class TestNormalizeReturnDataParameter:
 
     def test_non_string_non_bool_defaults(self):
         assert self.mm._normalize_return_data_parameter({"return_transaction_data": 42}) == "no"
+
+
+class TestAnalyzeReportsCacheTokenPresence:
+    """BACK-3087: the presence diagnostic measures the five cache fields.
+
+    Without them the one action whose job is answering "did my data land?"
+    said nothing at all about cache tokens, so a tenant whose cache figures
+    were missing had no way to see that from this report.
+    """
+
+    def setup_method(self):
+        self.mm = make_mm()
+
+    async def test_present_cache_fields_are_counted(self):
+        client = make_client()
+        client.get = AsyncMock(return_value={
+            "_embedded": {
+                "aICompletionMetricResourceList": [
+                    {
+                        "transactionId": "tx_1",
+                        "model": "claude-sonnet-4",
+                        "cacheReadTokenCount": 1300,
+                        "cacheCreationTokenCount": 1300,
+                        "cacheCreation5mTokenCount": 1000,
+                        "cacheCreation1hTokenCount": 300,
+                        "cacheTtlSplitSource": "derived",
+                    }
+                ]
+            },
+        })
+        text = (await self.mm._handle_analyze_recent_transactions(client, {}))[0].text
+
+        for field in (
+            "cacheReadTokenCount",
+            "cacheCreationTokenCount",
+            "cacheCreation5mTokenCount",
+            "cacheCreation1hTokenCount",
+            "cacheTtlSplitSource",
+        ):
+            assert f"`{field}` | 1 | 0 | 100.0%" in text
+        # They are response-side names, so none of them is an untracked extra.
+        assert "Returned But Not Tracked By This Report" not in text
+
+    async def test_missing_cache_fields_are_reported_absent_not_lost(self):
+        client = make_client()
+        client.get = AsyncMock(return_value={
+            "_embedded": {
+                "aICompletionMetricResourceList": [
+                    {"transactionId": "tx_1", "model": "gpt-4"}
+                ]
+            },
+        })
+        text = (await self.mm._handle_analyze_recent_transactions(client, {}))[0].text
+
+        assert "Absent From Every Transaction In The Sample" in text
+        for field in (
+            "cacheReadTokenCount",
+            "cacheCreation5mTokenCount",
+            "cacheTtlSplitSource",
+        ):
+            assert f"- `{field}`" in text
+        assert "not that the value was lost" in text

@@ -1,9 +1,10 @@
 """Unit tests for EnvironmentVariableValidator (onboarding/env_validation.py)."""
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.onboarding.env_validation import (
+    API_AUTH_REJECTED_MESSAGE,
     EnvironmentVariableValidator,
     get_debug_auto_discovery_env_vars,
     get_all_env_vars_dict,
@@ -274,3 +275,165 @@ class TestClerkModeHealth:
         assert result.summary["overall_status"] is True
         # Unchanged: the ConfigManager probe still governs the flag outside clerk mode.
         assert result.summary["auth_config_works"] is False
+
+
+class TestApiConnectivityProbeStatuses:
+    """The connectivity probe must prove a read, not just authentication (BACK-2839)."""
+
+    async def _probe(self, monkeypatch, status_code, api_key="rev_sk_test_key"):
+        monkeypatch.setenv("REVENIUM_API_KEY", api_key)
+        monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
+        response = MagicMock()
+        response.status_code = status_code
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=response)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+        validator = EnvironmentVariableValidator()
+        with patch("httpx.AsyncClient", return_value=client):
+            return await validator.test_api_connectivity_debug_auto_discovery()
+
+    @pytest.mark.asyncio
+    async def test_200_is_success(self, monkeypatch):
+        result = await self._probe(monkeypatch, 200)
+        assert result["status"] == "success"
+        assert "read" in result["note"].lower()
+
+    @pytest.mark.asyncio
+    async def test_401_stays_failed(self, monkeypatch):
+        result = await self._probe(monkeypatch, 401)
+        assert result["status"] == "failed"
+        assert "API key" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_401_names_the_rejected_key_case(self, monkeypatch):
+        """A 401 gets the shared rejected-key wording, not 'check API key' (BACK-2841)."""
+        result = await self._probe(monkeypatch, 401)
+        assert result["error"] == API_AUTH_REJECTED_MESSAGE
+        # The platform did not recognize the key ...
+        assert "did not recognize this API key (HTTP 401)" in result["error"]
+        # ... a brand-new key may not be active yet, so retry before replacing ...
+        assert "may not be active yet" in result["error"]
+        assert "retry before" in result["error"]
+        # ... and a 401 is itself unusual, because unknown keys come back as 403.
+        assert "403" in result["error"]
+        assert "support" in result["error"]
+        # The window is not asserted as fact - it stays conditional.
+        assert "keys are inactive for" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_403_is_permission_denied_not_success(self, monkeypatch):
+        result = await self._probe(monkeypatch, 403)
+        assert result["status"] == "permission_denied"
+        assert result["status_code"] == 403
+        assert "rev_mk_" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_403_with_metering_key_names_the_key_scope(self, monkeypatch):
+        result = await self._probe(monkeypatch, 403, api_key="rev_mk_metering_key")
+        assert result["status"] == "permission_denied"
+        assert "metering-scope prefix" in result["error"]
+        # The prefix does not prove the key is recognized - the message must
+        # keep the 403 ambiguity instead of certifying validity.
+        assert "verify the exact key value" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_400_is_not_success(self, monkeypatch):
+        """The probed endpoint answers 200 without a team ID, so a 400 read nothing."""
+        result = await self._probe(monkeypatch, 400)
+        assert result["status"] == "failed"
+        assert result["status_code"] == 400
+
+    @pytest.mark.asyncio
+    async def test_500_stays_failed(self, monkeypatch):
+        result = await self._probe(monkeypatch, 500)
+        assert result["status"] == "failed"
+
+
+class TestForbiddenReadSummary:
+    """A forbidden read must fail the critical check and be flagged in the summary."""
+
+    async def _summary(self, monkeypatch, api_connectivity):
+        monkeypatch.setenv("AUTH_MODE", "api_key")
+        monkeypatch.setenv("REVENIUM_API_KEY", "rev_mk_metering_key")
+        validator = EnvironmentVariableValidator()
+        with patch.object(
+            validator,
+            "test_api_connectivity_debug_auto_discovery",
+            new=AsyncMock(return_value=api_connectivity),
+        ), patch.object(
+            validator,
+            "test_discovered_configuration_debug_auto_discovery",
+            new=AsyncMock(
+                return_value={
+                    "status": "success",
+                    "discovered_count": 4,
+                    "values": {"team_id": "t"},
+                }
+            ),
+        ), patch.object(
+            validator,
+            "test_auth_config_debug_auto_discovery",
+            new=AsyncMock(return_value={"status": "success"}),
+        ):
+            result = await validator.validate_all_debug_auto_discovery_format()
+        return result.summary
+
+    @pytest.mark.asyncio
+    async def test_permission_denied_fails_the_critical_check(self, monkeypatch):
+        summary = await self._summary(
+            monkeypatch,
+            {"status": "permission_denied", "status_code": 403, "error": "cannot read data"},
+        )
+        assert summary["direct_api_works"] is False
+        assert summary["api_read_forbidden"] is True
+        assert summary["api_read_forbidden_detail"] == "cannot read data"
+        assert summary["overall_status"] is False
+
+    @pytest.mark.asyncio
+    async def test_success_keeps_the_flag_off(self, monkeypatch):
+        summary = await self._summary(monkeypatch, {"status": "success", "status_code": 200})
+        assert summary["direct_api_works"] is True
+        assert summary["api_read_forbidden"] is False
+        assert summary["api_read_forbidden_detail"] is None
+        assert summary["overall_status"] is True
+
+    @pytest.mark.asyncio
+    async def test_plain_failure_is_not_flagged_as_forbidden(self, monkeypatch):
+        summary = await self._summary(
+            monkeypatch,
+            {"status": "failed", "status_code": 401, "error": "Authentication failed"},
+        )
+        assert summary["direct_api_works"] is False
+        assert summary["api_read_forbidden"] is False
+        assert summary["overall_status"] is False
+
+    @pytest.mark.asyncio
+    async def test_401_is_flagged_as_auth_rejected_with_its_detail(self, monkeypatch):
+        """The 401 case carries its own summary flag and detail (BACK-2841)."""
+        summary = await self._summary(
+            monkeypatch,
+            {"status": "failed", "status_code": 401, "error": API_AUTH_REJECTED_MESSAGE},
+        )
+        assert summary["api_auth_rejected"] is True
+        assert summary["api_auth_rejected_detail"] == API_AUTH_REJECTED_MESSAGE
+        assert summary["api_read_forbidden"] is False
+        assert summary["overall_status"] is False
+
+    @pytest.mark.asyncio
+    async def test_forbidden_read_is_not_flagged_as_auth_rejected(self, monkeypatch):
+        summary = await self._summary(
+            monkeypatch,
+            {"status": "permission_denied", "status_code": 403, "error": "cannot read data"},
+        )
+        assert summary["api_auth_rejected"] is False
+        assert summary["api_auth_rejected_detail"] is None
+
+    @pytest.mark.asyncio
+    async def test_other_failure_statuses_are_not_auth_rejected(self, monkeypatch):
+        summary = await self._summary(
+            monkeypatch,
+            {"status": "failed", "status_code": 500, "error": "HTTP 500"},
+        )
+        assert summary["api_auth_rejected"] is False
+        assert summary["api_auth_rejected_detail"] is None

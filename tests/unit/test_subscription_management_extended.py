@@ -1004,9 +1004,11 @@ class TestHandleCrudCreate:
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
     async def test_create_auto_gen_missing_name(self, mock_get_client, sub_management, mock_client):
         mock_get_client.return_value = mock_client
-        result = await sub_management.handle_action("create", {"subscription_data": {}})
-        assert "Missing Required Field" in result[0].text
-        assert "name" in result[0].text
+        # BACK-2937: the refusal raises so the envelope carries isError.
+        with pytest.raises(ToolError) as exc_info:
+            await sub_management.handle_action("create", {"subscription_data": {}})
+        assert "Missing Required Field" in exc_info.value.message
+        assert "name" in exc_info.value.message
 
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
     async def test_create_auto_gen_no_products_available(self, mock_get_client, sub_management, mock_client):

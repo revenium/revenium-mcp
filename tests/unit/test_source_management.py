@@ -371,14 +371,15 @@ class TestSourceManagementHandleAction:
 
     @pytest.mark.asyncio
     async def test_create_auto_generate_missing_name_returns_error(self, source_mgmt):
-        """Create in auto-generate mode without name returns missing field message."""
+        """BACK-2937: the missing-name refusal raises so isError is set."""
         with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_gc.return_value = MagicMock()
 
-            result = await source_mgmt.handle_action("create", {"source_data": {}})
+            with pytest.raises(ToolError) as exc_info:
+                await source_mgmt.handle_action("create", {"source_data": {}})
 
-        assert len(result) >= 1
-        assert "name" in result[0].text.lower()
+        assert "Missing Required Field" in exc_info.value.message
+        assert exc_info.value.field == "name"
 
     @pytest.mark.asyncio
     async def test_create_dry_run_returns_preview(self, source_mgmt):
@@ -489,14 +490,15 @@ class TestSourceTypeParity:
     async def test_dry_run_rejects_invalid_type(self, source_mgmt):
         with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_gc.return_value = MagicMock()
-            result = await source_mgmt.handle_action(
-                "create",
-                {
-                    "source_data": {"name": "probe", "type": "NOT_A_VALID_TYPE"},
-                    "dry_run": True,
-                },
-            )
-        text = result[0].text
+            with pytest.raises(ToolError) as exc_info:
+                await source_mgmt.handle_action(
+                    "create",
+                    {
+                        "source_data": {"name": "probe", "type": "NOT_A_VALID_TYPE"},
+                        "dry_run": True,
+                    },
+                )
+        text = exc_info.value.message
         assert "Validation Successful" not in text
         assert "NOT_A_VALID_TYPE" in text
         assert "API" in text and "STREAM" in text and "AI" in text
@@ -507,12 +509,12 @@ class TestSourceTypeParity:
             client = MagicMock()
             client.create_source = AsyncMock()
             mock_gc.return_value = client
-            result = await source_mgmt.handle_action(
-                "create",
-                {"source_data": {"name": "probe", "type": "NOT_A_VALID_TYPE"}},
-            )
-        text = result[0].text
-        assert "NOT_A_VALID_TYPE" in text
+            with pytest.raises(ToolError) as exc_info:
+                await source_mgmt.handle_action(
+                    "create",
+                    {"source_data": {"name": "probe", "type": "NOT_A_VALID_TYPE"}},
+                )
+        assert "NOT_A_VALID_TYPE" in exc_info.value.message
         client.create_source.assert_not_called()
 
     @pytest.mark.asyncio

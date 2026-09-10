@@ -7,7 +7,11 @@ import pytest
 from unittest.mock import AsyncMock
 
 from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
-from src.revenium_mcp_server.models import AlertType, OperatorType
+from src.revenium_mcp_server.alert_operators import (
+    ACCEPTED_OPERATORS,
+    REJECTED_OPERATORS,
+)
+from src.revenium_mcp_server.models import AlertType
 from mcp.types import TextContent
 
 
@@ -50,19 +54,25 @@ class TestAlertManagement:
 
     @pytest.mark.asyncio
     async def test_get_capabilities_renders_operators_and_alert_types(self, alert_tools):
-        """get_capabilities must populate Available Operators and Alert Types from
-        the OperatorType / AlertType enums when UCM does not supply them.
+        """get_capabilities must populate Available Operators and Alert Types when
+        UCM does not supply them.
 
         BACK-1113 audit shape — both section headers were rendered with no items
         underneath, leaving callers unable to discover the supported set.
+
+        BACK-3085 — operators are driven by ``alert_operators``, the platform's
+        accepted set, not by the OperatorType enum, whose members
+        (GREATER_THAN_OR_EQUAL, EQUAL, CONTAINS, ...) are not platform operatorType
+        values and were refused on every create.
         """
         result = await alert_tools.handle_action("get_capabilities", {})
         text = result[0].text
 
         assert "## **Available Operators**" in text
-        # Drive assertions from the enums directly so new members are covered automatically.
-        for op in OperatorType:
-            assert f"**{op.value}**" in text, f"Available Operators section missing {op.value}"
+        for operator in ACCEPTED_OPERATORS:
+            assert f"**{operator}**" in text, f"Available Operators section missing {operator}"
+        for operator in REJECTED_OPERATORS:
+            assert f"- **{operator}**" not in text, f"{operator} is refused on create"
 
         assert "## **Alert Types**" in text
         for at in AlertType:

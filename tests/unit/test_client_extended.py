@@ -797,6 +797,36 @@ class TestTenantIngestionAPIMethods:
             await client.set_strict_ingestion_mode(False)
         client.patch.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_set_attribution_detail_text_patches_body(self):
+        client = self._client_with_tenant()
+        await client.set_attribution_detail_text(True)
+        assert (
+            client.patch.call_args[0][0]
+            == "/profitstream/v2/api/tenants/ten_1/attribution-detail-text"
+        )
+        assert client.patch.call_args.kwargs.get("data") == {
+            "attributionDetailTextEnabled": True
+        }
+
+    @pytest.mark.asyncio
+    async def test_set_attribution_detail_text_sends_false(self):
+        """False is the platform default, and turning it back off is a real
+        request - not an omission the server can be left to infer."""
+        client = self._client_with_tenant()
+        await client.set_attribution_detail_text(False)
+        assert client.patch.call_args.kwargs.get("data") == {
+            "attributionDetailTextEnabled": False
+        }
+
+    @pytest.mark.asyncio
+    async def test_set_attribution_detail_text_requires_tenant_id(self):
+        client = _make_client()
+        client.patch = AsyncMock(return_value={})
+        with pytest.raises(ValueError, match="tenant"):
+            await client.set_attribution_detail_text(True)
+        client.patch.assert_not_called()
+
 
 # ===========================================================================
 # API convenience methods — AI Cost Controls

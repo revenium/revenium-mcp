@@ -14,6 +14,7 @@ from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.tools_decomposed.metering_management import (
     MeteringManagement,
 )
+from tests.unit._helpers_hal import wire_embedded_reader
 from tests.unit._helpers_no_framework_leak import assert_no_framework_leak
 
 
@@ -27,7 +28,7 @@ class TestListAiModelsPaginationCoercion:
     async def test_string_page_is_coerced_to_int(self):
         """page='0' must be coerced to int 0 and reach the upstream client."""
         mgmt = _make_mgmt()
-        client = AsyncMock()
+        client = wire_embedded_reader(AsyncMock())
         client.get_ai_models = AsyncMock(return_value={"_embedded": {"aIModelResourceList": []}})
         with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_gc.return_value = client

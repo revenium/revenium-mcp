@@ -13,6 +13,10 @@ from .base_formatter import AnalyticsResponseFormatter
 class ApiKeyCostsFormatter(AnalyticsResponseFormatter):
     """Format API key costs analytics responses."""
 
+    # Endpoint this formatter renders, so the coding-assistant scope note
+    # follows the plane the registry actually routes to.
+    ENDPOINT_KEY = "cost_metrics_by_subscriber_credential"
+
     def format(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format API key costs data for response.
 
@@ -28,7 +32,10 @@ class ApiKeyCostsFormatter(AnalyticsResponseFormatter):
 
         if not data:
             return self.utilities.format_no_data_response(
-                "API key costs", period, f"aggregation: {aggregation}"
+                "API key costs",
+                period,
+                f"aggregation: {aggregation}",
+                scope_note=self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY),
             )
 
         # BACK-1270 / item #8: distinct upstream API keys can mask to the same
@@ -271,6 +278,7 @@ class ApiKeyCostsFormatter(AnalyticsResponseFormatter):
         """
         period = params.get("period", "Unknown")
         aggregation = params.get("aggregation", "Unknown")
-        return self.utilities.add_insights_footer(
+        footer = self.utilities.add_insights_footer(
             "API key costs", period, f"{aggregation} aggregation"
         )
+        return f"{footer}\n{self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY)}"

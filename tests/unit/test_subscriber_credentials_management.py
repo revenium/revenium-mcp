@@ -233,3 +233,122 @@ class TestListCredentialsPaginationValidation:
             await cred_tool._list_credentials({"page": 0, "size": 2147483647}, client=cred_tool.client)
         assert exc.value.field == "size"
         assert "[1, 100]" in exc.value.message or "100" in exc.value.message
+
+
+class TestListCredentialsByOrganization:
+    """BACK-2958 — the credentials-by-organization read.
+
+    The endpoint is scoped by the organization in the path, not by the caller's
+    team, so these pin what makes it a different answer from ``list``: the
+    organization id is required, it reaches the client as the path scope, only
+    the filters this operation declares are forwarded, and the result is
+    obfuscated the same way.
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_organization_id_raises_structured_error(self, cred_tool):
+        with pytest.raises(ToolError) as exc:
+            await cred_tool._list_credentials_by_organization({}, client=cred_tool.client)
+        assert exc.value.field == "organizationId"
+        assert_no_framework_leak(exc.value.message)
+
+    @pytest.mark.asyncio
+    async def test_forwards_organization_id_and_pagination(self, cred_tool):
+        client = cred_tool.client
+        client.get_credentials_by_organization = AsyncMock(return_value={})
+        client._extract_embedded_data = MagicMock(return_value=[])
+        client._extract_pagination_info = MagicMock(
+            return_value={"page": 0, "size": 5, "totalPages": 0, "totalElements": 0}
+        )
+
+        result = await cred_tool._list_credentials_by_organization(
+            {"organization_id": "OQNBA6J", "page": 0, "size": 5}, client=client
+        )
+
+        client.get_credentials_by_organization.assert_awaited_once_with(
+            "OQNBA6J", page=0, size=5
+        )
+        assert result["action"] == "list_by_organization"
+        assert result["organization_id"] == "OQNBA6J"
+
+    @pytest.mark.asyncio
+    async def test_accepts_camel_case_organization_id(self, cred_tool):
+        """The tool's own schema spells organization ids camelCase for create."""
+        client = cred_tool.client
+        client.get_credentials_by_organization = AsyncMock(return_value={})
+        client._extract_embedded_data = MagicMock(return_value=[])
+        client._extract_pagination_info = MagicMock(return_value={})
+
+        await cred_tool._list_credentials_by_organization(
+            {"organizationId": "OQNBA6J"}, client=client
+        )
+        assert client.get_credentials_by_organization.await_args.args == ("OQNBA6J",)
+
+    @pytest.mark.asyncio
+    async def test_forwards_allowlisted_query_filter(self, cred_tool):
+        client = cred_tool.client
+        client.get_credentials_by_organization = AsyncMock(return_value={})
+        client._extract_embedded_data = MagicMock(return_value=[])
+        client._extract_pagination_info = MagicMock(return_value={})
+
+        await cred_tool._list_credentials_by_organization(
+            {"organization_id": "OQNBA6J", "filters": {"query": "prod"}}, client=client
+        )
+        assert client.get_credentials_by_organization.await_args.kwargs["query"] == "prod"
+
+    @pytest.mark.asyncio
+    async def test_rejects_filter_the_endpoint_does_not_declare(self, cred_tool):
+        """``type`` is declared on the team-scoped list only, so forwarding it
+        here would be a filter that silently does not narrow."""
+        with pytest.raises(ToolError) as exc:
+            await cred_tool._list_credentials_by_organization(
+                {"organization_id": "OQNBA6J", "filters": {"type": "SUBSCRIBER"}},
+                client=cred_tool.client,
+            )
+        assert exc.value.field == "filters"
+
+    @pytest.mark.asyncio
+    async def test_secrets_are_obfuscated(self, cred_tool):
+        client = cred_tool.client
+        client.get_credentials_by_organization = AsyncMock(return_value={})
+        client._extract_embedded_data = MagicMock(
+            return_value=[
+                {
+                    "id": "3BygmAQ",
+                    "label": "prod",
+                    "externalId": "ak-live-1234567890",
+                    "externalSecret": "super-secret-value",
+                }
+            ]
+        )
+        client._extract_pagination_info = MagicMock(return_value={})
+
+        result = await cred_tool._list_credentials_by_organization(
+            {"organization_id": "OQNBA6J"}, client=client
+        )
+        rendered = str(result["credentials"])
+        assert "super-secret-value" not in rendered
+        assert "ak-live-1234567890" not in rendered
+
+    @pytest.mark.asyncio
+    async def test_rejects_size_zero(self, cred_tool):
+        with pytest.raises(ToolError) as exc:
+            await cred_tool._list_credentials_by_organization(
+                {"organization_id": "OQNBA6J", "size": 0}, client=cred_tool.client
+            )
+        assert exc.value.field == "size"
+
+    @pytest.mark.asyncio
+    async def test_action_is_routed_and_advertised(self, cred_tool):
+        cred_tool._list_credentials_by_organization = AsyncMock(
+            return_value={
+                "credentials": [],
+                "pagination": {"page": 0, "size": 20, "totalPages": 1},
+            }
+        )
+        result = await cred_tool.handle_action(
+            "list_by_organization", {"organization_id": "OQNBA6J"}
+        )
+        assert cred_tool._list_credentials_by_organization.await_count == 1
+        assert len(result) >= 1
+        assert "list_by_organization" in await cred_tool._get_supported_actions()
