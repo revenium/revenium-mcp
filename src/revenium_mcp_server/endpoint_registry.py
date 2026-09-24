@@ -343,7 +343,8 @@ _ENDPOINT_REGISTRY: Dict[str, EndpointConfig] = {
     # get_job_types + per-type conversion-funnel fan-out that JobManager.
     # get_roi_summary used to run: the analytics host publishes the same shape
     # in one call and adds fields the fan-out cannot produce (tokenCost,
-    # externalToolCost, humanCost and the toolCostAttribution qualifier).
+    # modalityCost, externalToolCost, humanCost and the toolCostAttribution
+    # qualifier).
     # NEW_API_ONLY with no profitstream predecessor, so old_path is the usual
     # never-routed placeholder and force_new keeps hosted deployments (which do
     # not set REVENIUM_USE_NEW_ANALYTICS_API) reaching it.

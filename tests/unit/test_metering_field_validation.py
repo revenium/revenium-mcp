@@ -1146,3 +1146,52 @@ class TestValidationReporter:
         }
         csv = self.reporter._generate_csv_report(analysis)
         assert "value;with;commas" in csv
+
+
+class TestPromptContextFieldMappings:
+    """BACK-3383: the read-back comparison maps each prompt-context argument
+    to the name the completions endpoint returns it under."""
+
+    def test_expected_field_mappings_cover_prompt_context(self):
+        mappings = FieldMappingAnalyzer()._build_expected_field_mappings()
+        assert mappings["prompt_id"] == "promptId"
+        assert mappings["prompt_length"] == "promptLength"
+        assert mappings["query_source"] == "querySource"
+        assert mappings["speed"] == "speed"
+        assert mappings["subagent_type"] == "subagentType"
+
+
+class TestPromptContextReadBackComparison:
+    """BACK-3383: the stored payload holds the prompt-context fields under
+    their wire names, and the comparison must read them from there."""
+
+    SUBMITTED = {
+        "transactionId": "tx_a1b2c3d4e5f6",
+        "promptId": "0f2b8a54-6c31-4d7e-9a10-b5c7d2e84f63",
+        "promptLength": 412,
+        "querySource": "repl_main_thread",
+        "speed": "fast",
+        "subagentType": "general-purpose",
+    }
+
+    def test_differing_prompt_id_is_reported(self):
+        retrieved = {**self.SUBMITTED, "promptId": "99999999-0000-0000-0000-000000000000"}
+        mismatches = FieldMappingAnalyzer()._compare_transaction_values(self.SUBMITTED, retrieved)
+        fields = [m["field"] for m in mismatches]
+        assert fields == ["prompt_id"]
+        assert mismatches[0]["api_field"] == "promptId"
+        assert mismatches[0]["submitted"] == self.SUBMITTED["promptId"]
+
+    def test_every_prompt_context_field_is_compared(self):
+        retrieved = {
+            "promptId": "other",
+            "promptLength": 7,
+            "querySource": "compact",
+            "speed": "normal",
+            "subagentType": "reviewer",
+        }
+        mismatches = FieldMappingAnalyzer()._compare_transaction_values(self.SUBMITTED, retrieved)
+        assert {m["api_field"] for m in mismatches} == set(retrieved)
+
+    def test_matching_values_report_no_mismatch(self):
+        assert FieldMappingAnalyzer()._compare_transaction_values(self.SUBMITTED, dict(self.SUBMITTED)) == []

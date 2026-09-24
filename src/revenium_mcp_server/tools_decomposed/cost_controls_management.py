@@ -2,9 +2,10 @@
 
 This module implements CostControlsManagement(ToolBase) for the Revenium AI
 Cost Controls API (/v2/api/ai/cost-controls), covering 5 CRUD actions (list,
-get, create, update, delete), 2 read-only enforcement-visibility actions
-(list_enforcement_events, get_enforcement_rules), plus the standard
-introspection actions.
+get, create, update, delete), 6 read-only enforcement-visibility actions
+(list_enforcement_events and its unpaged summary/history/affected sub-reads,
+get_enforcement_rules and one rule's get_enforcement_rule_roster), plus the
+standard introspection actions.
 
 Cost controls are spend guardrails: each pairs a warn threshold and a hard
 limit over a spend window (windowType) for a metric (metricType) with an
@@ -60,6 +61,113 @@ _COST_CONTROL_FILTER_MAP: Dict[str, str] = {
     "type": "type",
     "sort": "sort",
 }
+
+# snake_case tool argument -> camelCase query parameter shared by the
+# enforcement-events list and its summary, history and affected sub-reads.
+# Bounded and built by name rather than splatted from a caller dict, the way
+# `since` and `rule_id` always were: `ruleId` is read off the raw request
+# upstream instead of being an annotated @RequestParam, so an unbounded splat
+# would forward names no endpoint declares.
+_ENFORCEMENT_EVENT_FILTER_MAP: Dict[str, str] = {
+    "since": "since",
+    "until": "until",
+    "rule_id": "ruleId",
+    "level": "level",
+    "mode": "mode",
+    "query": "query",
+    "group_by": "groupBy",
+    "group_value": "groupValue",
+    "transaction_id": "transactionId",
+}
+
+# Filters only one of the sub-reads declares, folded in on top of the shared
+# set for that read alone.
+_HISTORY_ONLY_FILTER_MAP: Dict[str, str] = {"bucket": "bucket", "zone": "zone"}
+_AFFECTED_ONLY_FILTER_MAP: Dict[str, str] = {"affected_search": "affectedSearch"}
+
+ENFORCEMENT_GROUP_PAIR_NOTE = (
+    "group_by and group_value travel together: group_value is the exact "
+    "affected person or object and group_by is the dimension it belongs to "
+    "(SUBSCRIBER, ORG_UNIT, MODEL and so on). Sending either one alone is "
+    "refused upstream with a 422, so it is refused here before the request. "
+    "Send back the group_value these endpoints returned - hashed for an "
+    "ORG_UNIT group, raw otherwise."
+)
+
+ENFORCEMENT_LEVEL_MODE_NOTE = (
+    "level picks the tier (HARD, the list's default, is cap breaches; WARN is "
+    "warning-line crossings; ALL is both) and mode picks whether the rows are "
+    "real enforcement actions (ENFORCED), a shadow rule's would-have-done rows "
+    "(SHADOW) or both (ALL, the default). They compose rather than replace each "
+    "other, so mode='SHADOW' alone still returns shadow cap breaches only - add "
+    "level='ALL' for shadow warnings too. get_enforcement_events_summary accepts "
+    "both for query-string compatibility and deliberately does NOT apply them to "
+    "its counts, so selecting a tier there leaves the counts where they were "
+    "instead of zeroing the buckets it excludes."
+)
+
+ENFORCEMENT_EVENT_ROW_FIELDS_NOTE = (
+    "Event rows reach the caller unmodified and carry level (which tier fired), "
+    "isShadow (whether the rule was only evaluating), groupBy and groupValue "
+    "(the dimension and the affected person or object) with groupLabel as its "
+    "display name, transactionId (the request that tripped the rule), ruleId and "
+    "ruleDeleted (the rule fired but has since been removed), plus outcome and "
+    "subscriberEmail. Every one of those except groupLabel, ruleDeleted, outcome "
+    "and subscriberEmail is also a filter on this action."
+)
+
+# The three sub-reads answer with a single object and no page: summary is one
+# set of counts, history one set of bars, affected one capped list whose
+# `total` - not a page count - says whether it is showing everybody.
+ENFORCEMENT_SUBREADS_UNPAGED_NOTE = (
+    "get_enforcement_events_summary, get_enforcement_events_history and "
+    "get_enforcement_events_affected are unpaged: each answers with one object "
+    "rather than a page, so page and size are ignored. affected caps its rows "
+    "upstream and reports the real count in total; reach somebody below the cap "
+    "with affected_search rather than by asking for another page."
+)
+
+ENFORCEMENT_ROSTER_NOTE = (
+    "get_enforcement_rule_roster needs a rule_id and pages one grouped rule's "
+    "roster: who or which department it measures, each one's spend against the "
+    "rule's own threshold, and the whole-roster blockedCount, warnedCount and "
+    "underCount, which ignore search, band, page and size so pressing one band "
+    "cannot zero the other two. A pooled rule groups on nothing, has no roster "
+    "and answers 404. dimension is a guard, not a selector: one that disagrees "
+    "with the rule's own grouping is refused rather than answered with the "
+    "other kind of row."
+)
+
+
+def _build_enforcement_event_filters(
+    arguments: Dict[str, Any], extra: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    """Build the enforcement-event query params by name from tool arguments.
+
+    ``extra`` folds in the names only one sub-read declares, so no endpoint is
+    sent a filter it does not know.
+    """
+    mapping = dict(_ENFORCEMENT_EVENT_FILTER_MAP)
+    if extra:
+        mapping.update(extra)
+    filters: Dict[str, Any] = {}
+    for tool_name, query_name in mapping.items():
+        if arguments.get(tool_name) is not None:
+            filters[query_name] = arguments[tool_name]
+
+    has_group_by = "groupBy" in filters
+    has_group_value = "groupValue" in filters
+    if has_group_by != has_group_value:
+        missing = "group_value" if has_group_by else "group_by"
+        raise create_structured_missing_parameter_error(
+            parameter_name=missing,
+            action="filter enforcement events by group",
+            examples={
+                "usage": "list_enforcement_events(group_by='SUBSCRIBER', group_value='alex@example.com')",
+                "valid_format": ENFORCEMENT_GROUP_PAIR_NOTE,
+            },
+        )
+    return filters
 
 # Department budgets sit behind two per-tenant flags: the ORG_UNIT_BUDGETS
 # feature gate on the preview endpoint and the org-unit-attribution check
@@ -499,23 +607,14 @@ class CostControlsManager:
     async def list_enforcement_events(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """List enforcement events emitted when cost controls fire.
 
-        The `since` and `rule_id` arguments map to the API's `since` and
-        `ruleId` query params; both are optional.
+        Every filter is optional and built by name through
+        ``_build_enforcement_event_filters``; see
+        ``ENFORCEMENT_EVENT_ROW_FIELDS_NOTE`` for what the returned rows carry.
         """
         arguments = validate_pagination_params(arguments, action="list enforcement events")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        # Already bounded: the two names below are built here rather than
-        # splatted from a caller dict. Verified 2026-08-28 against hypercurrent
-        # origin/develop EnforcementEventController.list — `since` is a
-        # declared @RequestParam; `ruleId` is read off the raw request via
-        # currentRequestParam("ruleId") instead of being annotated, so it is
-        # consumed by the endpoint but absent from its declared set.
-        filters: Dict[str, Any] = {}
-        if arguments.get("since") is not None:
-            filters["since"] = arguments["since"]
-        if arguments.get("rule_id") is not None:
-            filters["ruleId"] = arguments["rule_id"]
+        filters = _build_enforcement_event_filters(arguments)
         response = await self.client.get_enforcement_events(page=page, size=size, **filters)
         events = self.client._extract_embedded_data(response)
         page_info = self.client._extract_pagination_info(response)
@@ -527,12 +626,96 @@ class CostControlsManager:
             "page": page,
         }
 
+    async def get_enforcement_events_summary(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Count the matching enforcement events by outcome, over one window.
+
+        Unpaged by contract (``ENFORCEMENT_SUBREADS_UNPAGED_NOTE``), and
+        ``level``/``mode`` are accepted but not applied to the counts upstream
+        (``ENFORCEMENT_LEVEL_MODE_NOTE``). The response is returned unmodified.
+        """
+        filters = _build_enforcement_event_filters(arguments)
+        return await self.client.get_enforcement_events_summary(**filters)
+
+    async def get_enforcement_events_history(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Bucket the matching enforcement events over time.
+
+        Unpaged (``ENFORCEMENT_SUBREADS_UNPAGED_NOTE``). A bucket with no
+        events is absent rather than zero, so nothing here fills gaps in: an
+        absent bar means no events, which the caller can render as it likes.
+        The ``zone`` on the answer is the one actually used and can differ from
+        the one asked for, so it is the label to read.
+        """
+        filters = _build_enforcement_event_filters(arguments, extra=_HISTORY_ONLY_FILTER_MAP)
+        return await self.client.get_enforcement_events_history(**filters)
+
+    async def get_enforcement_events_affected(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """List the people and objects the matching enforcement events name.
+
+        Unpaged and capped upstream (``ENFORCEMENT_SUBREADS_UNPAGED_NOTE``):
+        ``total`` is what says whether the rows are everybody, and
+        ``affected_search`` — not a second page — is how somebody below the cap
+        is reached. The response is returned unmodified.
+        """
+        filters = _build_enforcement_event_filters(arguments, extra=_AFFECTED_ONLY_FILTER_MAP)
+        return await self.client.get_enforcement_events_affected(**filters)
+
+    async def get_enforcement_rule_roster(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Page one grouped rule's roster (``ENFORCEMENT_ROSTER_NOTE``).
+
+        ``rule_id`` is required: a roster belongs to one rule, and the query
+        parameter is required upstream.
+        """
+        rule_id = arguments.get("rule_id")
+        if not rule_id:
+            raise create_structured_missing_parameter_error(
+                parameter_name="rule_id",
+                action="read an enforcement rule roster",
+                examples={
+                    "usage": "get_enforcement_rule_roster(rule_id='cc_123')",
+                    "valid_format": ENFORCEMENT_ROSTER_NOTE,
+                },
+            )
+        arguments = validate_pagination_params(arguments, action="read an enforcement rule roster")
+        try:
+            return await self.client.get_enforcement_rule_roster(
+                rule_id=rule_id,
+                page=arguments.get("page", 0),
+                size=arguments.get("size", 20),
+                search=arguments.get("search"),
+                band=arguments.get("band"),
+                sort=arguments.get("sort"),
+                dimension=arguments.get("dimension"),
+            )
+        except ReveniumAPIError as e:
+            # A pooled rule has no roster at all, and so does an id no rule
+            # carries; upstream answers 404 to both, which reads as a missing
+            # endpoint unless it is translated.
+            if e.status_code == 404:
+                raise ToolError(
+                    message=f"No roster for rule {rule_id}",
+                    error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+                    field="rule_id",
+                    value=rule_id,
+                    suggestions=[
+                        "A pooled cost control groups on nothing and has no roster; "
+                        "check the rule's groupBy with get_enforcement_rules(rule_id=...).",
+                        "Confirm the rule id exists on this team with get_enforcement_rules().",
+                    ],
+                )
+            raise
+
     async def get_enforcement_rules(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get the compiled enforcement rule set for the current team.
 
         The team id is the path parameter (from the client's configured
         team_id); the response is the compiled ruleset, e.g.
         {"rules": [...], "compiledAt": ...}.
+
+        An optional ``rule_id`` narrows the answer to one rule. Upstream
+        answers an id it does not know with 200 and an empty ``rules`` list
+        rather than 404, so the action boundary has to say "no compiled rule
+        with this id" instead of reporting a team with no rules — which is why
+        the narrowing is recorded on the result.
 
         The compiled payload is returned unmodified. Read-only response fields
         such as ``groupBreakdown`` (shape documented on the Enforcement
@@ -545,7 +728,7 @@ class CostControlsManager:
         ``_summarize_org_unit_blocks`` and ``_summarize_org_unit_warnings`` are
         what turn them into readable prose at the action boundary.
         """
-        return await self.client.get_enforcement_rules()
+        return await self.client.get_enforcement_rules(rule_id=arguments.get("rule_id"))
 
     async def preview_org_unit_group(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Preview the org units under a parent before creating an ORG_UNIT rule.
@@ -636,9 +819,12 @@ class CostControlsManager:
 class CostControlsManagement(ToolBase):
     """Consolidated AI cost-controls management MCP tool.
 
-    Exposes the Revenium AI Cost Controls API with 11 actions:
+    Exposes the Revenium AI Cost Controls API with 15 actions:
     - 5 CRUD: list, get, create, update, delete
-    - 2 enforcement visibility: list_enforcement_events, get_enforcement_rules
+    - 6 enforcement visibility: list_enforcement_events,
+      get_enforcement_events_summary, get_enforcement_events_history,
+      get_enforcement_events_affected, get_enforcement_rules,
+      get_enforcement_rule_roster
     - 1 org-unit scoping: preview_org_unit_group
     - 3 introspection: get_capabilities, get_examples, get_tool_metadata
     """
@@ -654,8 +840,15 @@ class CostControlsManagement(ToolBase):
         "before a rule is written - note the created ORG_UNIT rule itself is "
         "organization-wide, capping every attributed org unit, so the preview "
         "can understate the rule's real fan-out. "
+        "Enforcement events can be narrowed by window, tier, mode, group, "
+        "transaction and free text, counted with get_enforcement_events_summary, "
+        "bucketed over time with get_enforcement_events_history and reduced to who "
+        "they name with get_enforcement_events_affected; get_enforcement_rule_roster "
+        "pages one grouped rule's people or departments against its cap. "
         "Key actions: list, get, create, update, delete, list_enforcement_events, "
-        "get_enforcement_rules, preview_org_unit_group. "
+        "get_enforcement_events_summary, get_enforcement_events_history, "
+        "get_enforcement_events_affected, get_enforcement_rules, "
+        "get_enforcement_rule_roster, preview_org_unit_group. "
         "Use get_capabilities for full action list."
     )
     business_category = "Core Business Management Tools"
@@ -824,16 +1017,140 @@ class CostControlsManagement(ToolBase):
                 },
                 "rule_id": {
                     "type": "string",
-                    "description": "Optional cost-control (rule) ID to filter list_enforcement_events by",
+                    "description": (
+                        "Cost-control (rule) ID. Optional on the enforcement-event "
+                        "actions and on get_enforcement_rules (which narrows to that "
+                        "one compiled rule); REQUIRED for get_enforcement_rule_roster."
+                    ),
                 },
                 "since": {
                     "type": "string",
-                    "description": "Optional lower time bound for list_enforcement_events (ISO-8601)",
+                    "description": (
+                        "Optional lower time bound for the enforcement-event actions "
+                        "(a full ISO-8601 timestamp, inclusive, measured on when the event was "
+                        "written). A date alone is refused with a 422 naming the format - "
+                        "verified on dev 2026-09-23. Omitted, the range starts 30 days "
+                        "before its end."
+                    ),
+                },
+                "until": {
+                    "type": "string",
+                    "description": (
+                        "Optional upper time bound for the enforcement-event actions "
+                        "(a full ISO-8601 timestamp, inclusive, not a bare date). Omitted, the "
+                        "range ends now. A range "
+                        "longer than 30 days that ends in the past is refused with 422 "
+                        "rather than trimmed."
+                    ),
+                },
+                "level": {
+                    "type": "string",
+                    "description": (
+                        "Which tier of enforcement events to return: HARD, WARN or ALL. "
+                        + ENFORCEMENT_LEVEL_MODE_NOTE
+                    ),
+                },
+                "mode": {
+                    "type": "string",
+                    "description": (
+                        "Whether to return real enforcement actions (ENFORCED), a shadow "
+                        "rule's would-have-done rows (SHADOW) or both (ALL). "
+                        + ENFORCEMENT_LEVEL_MODE_NOTE
+                    ),
+                },
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Optional free-text search over an enforcement event's details "
+                        "string (rule name, tenant, group, masked API-key hint), matched "
+                        "case-insensitively. This is the enforcement-event search; the "
+                        "cost-control list searches names through filters={'query': ...}."
+                    ),
+                },
+                "group_by": {
+                    "type": "string",
+                    "description": (
+                        "Dimension the group_value belongs to (SUBSCRIBER, ORG_UNIT, MODEL, "
+                        "...). " + ENFORCEMENT_GROUP_PAIR_NOTE
+                    ),
+                },
+                "group_value": {
+                    "type": "string",
+                    "description": (
+                        "Exact affected person or object to narrow the enforcement-event "
+                        "actions to. " + ENFORCEMENT_GROUP_PAIR_NOTE
+                    ),
+                },
+                "transaction_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional exact match on the request that tripped a rule, for the "
+                        "enforcement-event actions."
+                    ),
+                },
+                "bucket": {
+                    "type": "string",
+                    "description": (
+                        "Bar width for get_enforcement_events_history: HOUR, DAY (the "
+                        "default) or WEEK. HOUR is what keeps a one-day window from "
+                        "drawing a single bar."
+                    ),
+                },
+                "zone": {
+                    "type": "string",
+                    "description": (
+                        "IANA region id the history buckets are cut in, e.g. "
+                        "'America/Denver'; defaults to UTC. An offset such as 'UTC+01:00' "
+                        "is not a zone name and is refused with 422. Read the zone on the "
+                        "answer, not this one: an unrecognised region falls back to UTC."
+                    ),
+                },
+                "affected_search": {
+                    "type": "string",
+                    "description": (
+                        "Case-insensitive substring of the affected person or object for "
+                        "get_enforcement_events_affected, narrowing the rows and the total "
+                        "together so somebody below the row cap can still be reached. "
+                        "Unlike query, it searches the affected value alone."
+                    ),
+                },
+                "search": {
+                    "type": "string",
+                    "description": (
+                        "Case-insensitive substring over a roster row's key, label and "
+                        "email for get_enforcement_rule_roster; narrows the rows and the "
+                        "total together."
+                    ),
+                },
+                "band": {
+                    "type": "string",
+                    "description": (
+                        "Narrow get_enforcement_rule_roster to one band: BLOCKED, WARNED, "
+                        "UNDER or ALL. The whole-roster counts on the answer ignore it."
+                    ),
+                },
+                "sort": {
+                    "type": "string",
+                    "description": (
+                        "Roster sort field for get_enforcement_rule_roster: PERCENT, SPEND, "
+                        "NAME or LAST_EVENT."
+                    ),
+                },
+                "dimension": {
+                    "type": "string",
+                    "description": (
+                        "Roster grouping guard for get_enforcement_rule_roster: SUBSCRIBER "
+                        "or ORG_UNIT. A dimension that disagrees with the rule's own "
+                        "grouping is refused rather than answered with the other kind of row."
+                    ),
                 },
                 "page": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Page number for pagination (0-based)",
+                    "description": (
+                        "Page number for pagination (0-based). "
+                        + ENFORCEMENT_SUBREADS_UNPAGED_NOTE
+                    ),
                 },
                 "size": {
                     "type": "integer",
@@ -863,7 +1180,11 @@ class CostControlsManagement(ToolBase):
             "delete",
             # Enforcement visibility
             "list_enforcement_events",
+            "get_enforcement_events_summary",
+            "get_enforcement_events_history",
+            "get_enforcement_events_affected",
             "get_enforcement_rules",
+            "get_enforcement_rule_roster",
             # Org-unit (department) scoping
             "preview_org_unit_group",
             # Introspection
@@ -930,24 +1251,71 @@ class CostControlsManagement(ToolBase):
                     "get_enforcement_rules summarizes into who is blocked and by which rule. "
                     "That output therefore contains subscriber email addresses. "
                     + ORG_UNIT_ENFORCEMENT_MAPS_NOTE
+                    + " "
+                    + ENFORCEMENT_EVENT_ROW_FIELDS_NOTE
                 ),
                 parameters={
                     "list_enforcement_events": {
                         "page": "int (optional)",
                         "size": "int (optional)",
                         "since": "str (optional, ISO-8601 lower time bound)",
+                        "until": "str (optional, ISO-8601 upper time bound)",
                         "rule_id": "str (optional, filters events to one cost control)",
+                        "level": "str (optional, HARD|WARN|ALL tier selector)",
+                        "mode": "str (optional, ENFORCED|SHADOW|ALL)",
+                        "query": "str (optional, free-text search over the event details)",
+                        "group_by": "str (optional, dimension of group_value; sent with it)",
+                        "group_value": "str (optional, exact affected person or object)",
+                        "transaction_id": "str (optional, the request that tripped the rule)",
                     },
-                    "get_enforcement_rules": {},
+                    "get_enforcement_events_summary": {
+                        "same filters as list_enforcement_events": "unpaged; level and mode are not applied to the counts",
+                    },
+                    "get_enforcement_events_history": {
+                        "same filters as list_enforcement_events": "unpaged",
+                        "bucket": "str (optional, HOUR|DAY|WEEK bar width)",
+                        "zone": "str (optional, IANA region id the bars are cut in)",
+                    },
+                    "get_enforcement_events_affected": {
+                        "same filters as list_enforcement_events": "unpaged and row-capped",
+                        "affected_search": "str (optional, substring of the affected person or object)",
+                    },
+                    "get_enforcement_rules": {
+                        "rule_id": "str (optional, narrows the compiled set to one rule)",
+                    },
+                    "get_enforcement_rule_roster": {
+                        "rule_id": "str (required)",
+                        "page": "int (optional)",
+                        "size": "int (optional)",
+                        "search": "str (optional, over a row's key, label and email)",
+                        "band": "str (optional, BLOCKED|WARNED|UNDER|ALL)",
+                        "sort": "str (optional, PERCENT|SPEND|NAME|LAST_EVENT)",
+                        "dimension": "str (optional guard, SUBSCRIBER|ORG_UNIT)",
+                    },
                 },
                 examples=[
                     "list_enforcement_events(page=0, size=20)",
-                    "list_enforcement_events(since='2026-01-01', rule_id='cc_123')",
+                    "list_enforcement_events(since='2026-01-01T00:00:00Z', rule_id='cc_123')",
+                    "list_enforcement_events(since='2026-09-01T00:00:00Z', until='2026-09-23T00:00:00Z', level='ALL', mode='SHADOW')",
+                    "list_enforcement_events(group_by='SUBSCRIBER', group_value='alex@example.com')",
+                    "list_enforcement_events(transaction_id='txn_abc')",
+                    "get_enforcement_events_summary(since='2026-09-01T00:00:00Z', rule_id='cc_123')",
+                    "get_enforcement_events_history(since='2026-09-22T00:00:00Z', bucket='HOUR', zone='America/Denver')",
+                    "get_enforcement_events_affected(rule_id='cc_123', affected_search='data')",
                     "get_enforcement_rules()",
+                    "get_enforcement_rules(rule_id='cc_123')",
+                    "get_enforcement_rule_roster(rule_id='cc_123', band='BLOCKED', sort='PERCENT')",
                 ],
                 limitations=[
-                    "Both actions are read-only",
+                    "Every action here is read-only",
+                    ENFORCEMENT_SUBREADS_UNPAGED_NOTE,
+                    ENFORCEMENT_GROUP_PAIR_NOTE,
+                    ENFORCEMENT_LEVEL_MODE_NOTE,
+                    ENFORCEMENT_ROSTER_NOTE,
                     "get_enforcement_rules returns the compiled ruleset for the configured team only",
+                    "get_enforcement_rules(rule_id=...) answers an id no rule carries with an "
+                    "empty rules list rather than a 404, so an empty narrowed read means "
+                    "'no compiled rule with this id', never 'this team has no rules'",
                     "get_enforcement_rules output includes subscriber email addresses when "
                     "department budgets are blocking anyone (see this capability's description)",
                     "orgUnitBudgetBlocks is absent on tenants without department budgets; the "
@@ -1036,10 +1404,48 @@ class CostControlsManagement(ToolBase):
                         "delete": {"action": "delete", "control_id": "cc_123"},
                         "list_enforcement_events": {
                             "action": "list_enforcement_events",
-                            "since": "2026-01-01",
+                            "since": "2026-01-01T00:00:00Z",
                             "rule_id": "cc_123",
                         },
+                        "narrow_enforcement_events": {
+                            "action": "list_enforcement_events",
+                            "since": "2026-09-01T00:00:00Z",
+                            "until": "2026-09-23T00:00:00Z",
+                            "level": "ALL",
+                            "mode": "SHADOW",
+                        },
+                        "one_persons_enforcement_events": {
+                            "action": "list_enforcement_events",
+                            "group_by": "SUBSCRIBER",
+                            "group_value": "alex@example.com",
+                        },
+                        "get_enforcement_events_summary": {
+                            "action": "get_enforcement_events_summary",
+                            "since": "2026-09-01T00:00:00Z",
+                            "rule_id": "cc_123",
+                        },
+                        "get_enforcement_events_history": {
+                            "action": "get_enforcement_events_history",
+                            "since": "2026-09-22T00:00:00Z",
+                            "bucket": "HOUR",
+                            "zone": "America/Denver",
+                        },
+                        "get_enforcement_events_affected": {
+                            "action": "get_enforcement_events_affected",
+                            "rule_id": "cc_123",
+                            "affected_search": "data",
+                        },
                         "get_enforcement_rules": {"action": "get_enforcement_rules"},
+                        "get_one_compiled_rule": {
+                            "action": "get_enforcement_rules",
+                            "rule_id": "cc_123",
+                        },
+                        "get_enforcement_rule_roster": {
+                            "action": "get_enforcement_rule_roster",
+                            "rule_id": "cc_123",
+                            "band": "BLOCKED",
+                            "sort": "PERCENT",
+                        },
                         "create_per_department_guardrail": {
                             "action": "create",
                             "control_data": {
@@ -1092,6 +1498,13 @@ class CostControlsManagement(ToolBase):
                         },
                     },
                     "filter_notes": [FILTER_IN_OPERATOR_NOTE],
+                    "enforcement_notes": [
+                        ENFORCEMENT_EVENT_ROW_FIELDS_NOTE,
+                        ENFORCEMENT_GROUP_PAIR_NOTE,
+                        ENFORCEMENT_LEVEL_MODE_NOTE,
+                        ENFORCEMENT_SUBREADS_UNPAGED_NOTE,
+                        ENFORCEMENT_ROSTER_NOTE,
+                    ],
                     "org_unit_notes": [
                         ORG_UNIT_ID_SOURCE_NOTE,
                         ORG_UNIT_DIMENSION_SCOPE_NOTE,
@@ -1104,7 +1517,7 @@ class CostControlsManagement(ToolBase):
                     return [
                         TextContent(
                             type="text",
-                            text=f"Cost Controls Management Examples:\n{json.dumps({'action': 'get_examples', 'examples': capabilities['examples'], 'filter_notes': capabilities['filter_notes'], 'org_unit_notes': capabilities['org_unit_notes']}, indent=2)}",
+                            text=f"Cost Controls Management Examples:\n{json.dumps({'action': 'get_examples', 'examples': capabilities['examples'], 'filter_notes': capabilities['filter_notes'], 'enforcement_notes': capabilities['enforcement_notes'], 'org_unit_notes': capabilities['org_unit_notes']}, indent=2)}",
                         )
                     ]
                 return [
@@ -1156,11 +1569,77 @@ class CostControlsManagement(ToolBase):
                     )
                 ]
 
+            elif action == "get_enforcement_events_summary":
+                result = await manager.get_enforcement_events_summary(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            self._summarize_enforcement_counts(result)
+                            + "\n\n"
+                            + json.dumps(result, indent=2)
+                        ),
+                    )
+                ]
+
+            elif action == "get_enforcement_events_history":
+                result = await manager.get_enforcement_events_history(arguments)
+                buckets = result.get("buckets") if isinstance(result, dict) else None
+                bucket_count = len(buckets) if isinstance(buckets, list) else 0
+                zone = result.get("zone") if isinstance(result, dict) else None
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            f"Enforcement event history: {bucket_count} non-empty bucket(s) "
+                            f"cut in {zone}. A bucket with no events is absent, not zero:\n\n"
+                            + json.dumps(result, indent=2)
+                        ),
+                    )
+                ]
+
+            elif action == "get_enforcement_events_affected":
+                result = await manager.get_enforcement_events_affected(arguments)
+                header = self._affected_header(result, arguments)
+                return [TextContent(type="text", text=header + "\n\n" + json.dumps(result, indent=2))]
+
+            elif action == "get_enforcement_rule_roster":
+                result = await manager.get_enforcement_rule_roster(arguments)
+                if not result:
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"No compiled roster is available for rule {arguments.get('rule_id')} "
+                                "yet; the reading is produced by the next compile."
+                            ),
+                        )
+                    ]
+                header = self._roster_header(result)
+                return [TextContent(type="text", text=header + "\n\n" + json.dumps(result, indent=2))]
+
             elif action == "get_enforcement_rules":
                 result = await manager.get_enforcement_rules(arguments)
                 rules = result.get("rules", []) if isinstance(result, dict) else []
+                requested_rule_id = arguments.get("rule_id")
+                if requested_rule_id and not rules:
+                    # Upstream answers an unknown ruleId with 200 and an empty
+                    # list; rendering that as "0 rules" would read as a team
+                    # with no cost controls at all.
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"No compiled rule with id {requested_rule_id} on this team. "
+                                "The team may still have other rules - call "
+                                "get_enforcement_rules() without a rule_id to list them.\n\n"
+                                + json.dumps(result, indent=2)
+                            ),
+                        )
+                    ]
+                scope = f" for rule {requested_rule_id}" if requested_rule_id else ""
                 header = (
-                    f"Compiled enforcement rules ({len(rules)} rules, "
+                    f"Compiled enforcement rules{scope} ({len(rules)} rules, "
                     f"compiledAt={result.get('compiledAt') if isinstance(result, dict) else None}):"
                 )
                 # Extra lines, never a blank one: callers (and tests) split the
@@ -1226,6 +1705,84 @@ class CostControlsManagement(ToolBase):
         except Exception as e:
             logger.error(f"Unexpected error in manage_cost_controls action '{action}': {e}")
             raise e
+
+    @staticmethod
+    def _summarize_enforcement_counts(result: Any) -> str:
+        """Render the summary counts as a sentence, stating what they ignore.
+
+        A reader who has just filtered by tier or mode would otherwise read
+        these counts as the filtered ones; upstream deliberately leaves them
+        unfiltered by both, so the header has to say so.
+        """
+        if not isinstance(result, dict):
+            return (
+                "The enforcement-events summary answered with an unexpected shape "
+                "(expected an object of counts):"
+            )
+        counts = CostControlsManagement._present_count_clauses(result)
+        return (
+            f"Enforcement events {result.get('resolvedSince')} to {result.get('resolvedUntil')}: "
+            f"{', '.join(counts) if counts else 'the response carried no counts'}. "
+            "These counts ignore level and mode by design, so a tier or mode filter "
+            "does not move them:"
+        )
+
+    @staticmethod
+    def _present_count_clauses(result: Dict[str, Any]) -> List[str]:
+        """Phrase only the counts the response carries; the contract requires none."""
+
+        def phrase(field: str, label: str) -> List[str]:
+            value = result.get(field)
+            return [] if value is None else [f"{value} {label}"]
+
+        shadow = phrase("wouldBlock", "would have been blocked") + phrase(
+            "wouldWarn", "would have been warned"
+        )
+        shadow_clause = [f"{' and '.join(shadow)} in shadow mode"] if shadow else []
+        return (
+            phrase("blocked", "blocked")
+            + phrase("warned", "warned")
+            + shadow_clause
+            + phrase("distinctAffected", "distinct people or objects affected")
+        )
+
+    @staticmethod
+    def _affected_header(result: Any, arguments: Dict[str, Any]) -> str:
+        """Say which scope ``rows`` and ``total`` each describe.
+
+        Upstream applies level and mode to the rows but not to ``total``, so
+        the two only read as one result set when neither selector is active.
+        """
+        payload = result if isinstance(result, dict) else {}
+        rows = payload.get("rows")
+        shown = len(rows) if isinstance(rows, list) else 0
+        total = payload.get("total")
+        cap_note = (
+            "The rows are capped upstream, so narrow with affected_search rather "
+            "than paging:"
+        )
+        active_selectors = [
+            f"{name}={arguments[name]}" for name in ("level", "mode") if arguments.get(name)
+        ]
+        if not active_selectors:
+            return f"{shown} affected person/object row(s) shown of {total} matching. {cap_note}"
+        return (
+            f"{shown} affected person/object row(s) shown (filtered by "
+            f"{', '.join(active_selectors)}); total matching before the level/mode "
+            f"filter: {total}. {cap_note}"
+        )
+
+    @staticmethod
+    def _roster_header(result: Any) -> str:
+        payload = result if isinstance(result, dict) else {}
+        rows = payload.get("rows")
+        shown = len(rows) if isinstance(rows, list) else 0
+        return (
+            f"Roster for rule {payload.get('ruleId')} ({payload.get('dimension')}): "
+            f"{shown} row(s) of {payload.get('total')} matching; whole roster "
+            f"{payload.get('blockedCount')} blocked, {payload.get('warnedCount')} warned, "
+            f"{payload.get('underCount')} under. This listing names people or departments:"
+        )
 
     @staticmethod
     def _compact_list(result: Dict[str, Any]) -> Dict[str, Any]:

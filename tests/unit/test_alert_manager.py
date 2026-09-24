@@ -8,7 +8,11 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 from datetime import datetime, timezone
 
-from src.revenium_mcp_server.alerts.alert_manager import AlertManager
+from src.revenium_mcp_server.alerts.alert_manager import (
+    PRE_RULE_ACTIVITY_LABEL,
+    PRE_RULE_ACTIVITY_VALUE,
+    AlertManager,
+)
 from src.revenium_mcp_server.client import ReveniumAPIError
 
 
@@ -767,3 +771,90 @@ class TestAcknowledgeAlert:
         call_args = client.update_alert.call_args
         update_data = call_args[0][1]
         assert update_data["status"] == "acknowledged"
+
+
+# ---------------------------------------------------------------------------
+# includesPreRuleActivity: tells a reader a first-day alert apart from a
+# steady-state one (BACK-3350)
+# ---------------------------------------------------------------------------
+
+
+def _alert_with_pre_rule_activity(value=None):
+    alert = {
+        "id": "alert-pra",
+        "resolved": False,
+        "anomaly": {"name": "Cost Alert", "metricType": "TOTAL_COST"},
+        "triggeredValue": 150,
+    }
+    if value is not None:
+        alert["includesPreRuleActivity"] = value
+    return alert
+
+
+def _list_client(alert):
+    client = MagicMock()
+    client.get_alerts = AsyncMock(return_value={})
+    client._extract_embedded_data = MagicMock(return_value=[alert])
+    client._extract_pagination_info = MagicMock(
+        return_value={"totalPages": 1, "totalElements": 1}
+    )
+    return client
+
+
+class TestExtractPreRuleActivity:
+    def test_true_returns_the_qualifier(self, manager):
+        assert (
+            manager._extract_pre_rule_activity({"includesPreRuleActivity": True})
+            == PRE_RULE_ACTIVITY_VALUE
+        )
+
+    def test_false_returns_none(self, manager):
+        assert manager._extract_pre_rule_activity({"includesPreRuleActivity": False}) is None
+
+    def test_absent_returns_none(self, manager):
+        assert manager._extract_pre_rule_activity({}) is None
+
+
+class TestPreRuleActivityRendering:
+    @pytest.mark.asyncio
+    async def test_list_names_the_qualifier_when_true(self, manager):
+        result = await manager.list_alerts(_list_client(_alert_with_pre_rule_activity(True)))
+        text = result[0].text
+        assert "Pre-Rule Activity: Counted (usage from before the rule was created)" in text
+
+    @pytest.mark.asyncio
+    async def test_list_omits_the_qualifier_when_false(self, manager):
+        result = await manager.list_alerts(_list_client(_alert_with_pre_rule_activity(False)))
+        assert PRE_RULE_ACTIVITY_LABEL not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_list_omits_the_qualifier_when_absent(self, manager):
+        result = await manager.list_alerts(_list_client(_alert_with_pre_rule_activity()))
+        assert PRE_RULE_ACTIVITY_LABEL not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_detail_names_the_qualifier_when_true(self, manager):
+        client = MagicMock()
+        client.get_alert_by_id = AsyncMock(return_value=_alert_with_pre_rule_activity(True))
+
+        result = await manager.get_alert(client, "alert-pra")
+        assert (
+            "**Pre-Rule Activity:** Counted (usage from before the rule was created)"
+            in result[0].text
+        )
+
+    @pytest.mark.asyncio
+    async def test_detail_omits_the_qualifier_when_false(self, manager):
+        client = MagicMock()
+        client.get_alert_by_id = AsyncMock(return_value=_alert_with_pre_rule_activity(False))
+
+        result = await manager.get_alert(client, "alert-pra")
+        assert PRE_RULE_ACTIVITY_LABEL not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_detail_omits_the_qualifier_when_absent(self, manager):
+        client = MagicMock()
+        client.get_alert_by_id = AsyncMock(return_value=_alert_with_pre_rule_activity())
+
+        result = await manager.get_alert(client, "alert-pra")
+        assert PRE_RULE_ACTIVITY_LABEL not in result[0].text

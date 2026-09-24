@@ -1363,7 +1363,7 @@ class TestNormalizeReturnDataParameter:
         assert self.mm._normalize_return_data_parameter({"return_transaction_data": "complete"}) == "full"
 
     def test_boolean_true(self):
-        assert self.mm._normalize_return_data_parameter({"return_transaction_data": True}) == "summary"
+        assert self.mm._normalize_return_data_parameter({"return_transaction_data": True}) == "full"
 
     def test_boolean_false(self):
         assert self.mm._normalize_return_data_parameter({"return_transaction_data": False}) == "no"

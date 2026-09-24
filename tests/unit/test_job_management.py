@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.tools_decomposed import job_management as job_management_module
 from src.revenium_mcp_server.tools_decomposed.job_management import (
+    _ROI_ROW_FIELDS,
     JobManager,
     JobManagement,
     _SESSION_ATTRIBUTION_FIELDS,
@@ -40,6 +41,7 @@ ROI_SUMMARY_RESPONSE = {
             "totalJobs": 2,
             "totalCost": 3.5,
             "tokenCost": 2.0,
+            "modalityCost": 0.0,
             "externalToolCost": 1.0,
             "humanCost": 0.5,
             "conversions": 1,
@@ -57,6 +59,7 @@ ROI_SUMMARY_RESPONSE = {
             "totalJobs": 1,
             "totalCost": 0.5,
             "tokenCost": 0.5,
+            "modalityCost": 0.0,
             "externalToolCost": 0.0,
             "humanCost": 0.0,
             "conversions": 0,
@@ -555,6 +558,29 @@ class TestJobManagerGetRoiSummary:
             await job_manager.get_roi_summary({"filters": {"jobType": "LEAD"}})
 
         mock_client.get_jobs_roi_summary.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_roi_summary_carries_modality_cost(self, job_manager, mock_client):
+        """The fourth cost category (image, video, audio) is a published field.
+
+        BACK-3074: isotope's roi-summary now reports modalityCost beside
+        tokenCost, externalToolCost and humanCost, and totalCost is the sum of
+        all four. A row that carries it must surface it labeled, and a row that
+        omits it must read as unavailable, never as 0 or as a missing key.
+        """
+        response = json.loads(json.dumps(ROI_SUMMARY_RESPONSE))
+        response["byJobType"][0]["modalityCost"] = 0.75
+        response["byJobType"][0]["totalCost"] = 4.25
+        del response["byJobType"][1]["modalityCost"]
+        mock_client.get_jobs_roi_summary = AsyncMock(return_value=response)
+
+        result = await job_manager.get_roi_summary({})
+
+        with_media, without_media = result["by_job_type"]
+        assert with_media["modalityCost"] == 0.75
+        assert with_media["totalCost"] == 4.25
+        assert without_media["modalityCost"] == "unavailable"
+        assert "modalityCost" in _ROI_ROW_FIELDS
 
     @pytest.mark.asyncio
     async def test_get_roi_summary_absent_fields_are_unavailable(self, job_manager, mock_client):
@@ -2346,3 +2372,1492 @@ class TestAmendOutcomeNestedVersionCannotBypassValidation:
         mock_client.amend_job_outcome.assert_not_called()
 # BACK-3094 — the reason-category fields, and what a null reason means
 # ====================================================================
+
+
+# ===========================================================================
+# BACK-3090 — job type economics, baselines and period facts
+# ===========================================================================
+
+# The economics declaration as the platform returns it, including the two
+# fields the PUT does not accept (jobType, currentBaseline). Built once so a
+# test that narrows it is visibly narrowing this shape.
+ECONOMICS_RESOURCE = {
+    "jobType": "mcp-test-claims",
+    "unitMetricKey": "completed_claims",
+    "unitLabel": "claim",
+    "metrics": [
+        {
+            "key": "completed_claims",
+            "type": "COUNT",
+            "direction": "HIGHER_IS_BETTER",
+            "aggregation": "SUM",
+            "resolution": "PER_JOB",
+        }
+    ],
+    "dimensions": [{"key": "region", "allowedValues": ["us", "ca"]}],
+    "monetization": {
+        "metricKey": "completed_claims",
+        "valuePerUnit": 4.25,
+        "currency": "USD",
+        "category": "COST_AVOIDED",
+        "basis": "REALIZED",
+    },
+    "overheadPerUnit": None,
+    "overheadCurrency": None,
+    "currentBaseline": {
+        "version": 1,
+        "effectiveFrom": "2026-08-01T00:00:00Z",
+        "costPerUnit": 4.5,
+        "currency": "USD",
+        "provenance": "CUSTOMER_DECLARED",
+    },
+}
+
+BASELINE_VERSIONS = [
+    {
+        "version": 2,
+        "effectiveFrom": "2026-09-01T00:00:00Z",
+        "costPerUnit": 4.1,
+        "currency": "USD",
+        "provenance": "MEASURED",
+    },
+    {
+        "version": 1,
+        "effectiveFrom": "2026-08-01T00:00:00Z",
+        "costPerUnit": 4.5,
+        "currency": "USD",
+        "provenance": "CUSTOMER_DECLARED",
+    },
+]
+
+PERIOD_FACT = {
+    "periodStart": "2026-08-01T00:00:00Z",
+    "periodEnd": "2026-09-01T00:00:00Z",
+    "dimensionKey": "region",
+    "dimensionValue": "us",
+    "key": "manual_rework_minutes",
+    "value": 420,
+}
+
+JOB_TYPE_ECONOMICS_ACTIONS = (
+    "get_job_type_economics",
+    "upsert_job_type_economics",
+    "list_job_type_baselines",
+    "create_job_type_baseline",
+    "report_period_facts",
+    "append_outcome_metrics",
+)
+
+
+@pytest.fixture
+def economics_client(mock_client):
+    """The mock client with the BACK-3090 methods attached."""
+    mock_client.get_job_type_economics = AsyncMock()
+    mock_client.put_job_type_economics = AsyncMock()
+    mock_client.list_job_type_baselines = AsyncMock()
+    mock_client.create_job_type_baseline = AsyncMock()
+    mock_client.append_job_type_facts = AsyncMock()
+    mock_client.append_job_outcome_metrics = AsyncMock()
+    return mock_client
+
+
+class TestGetJobTypeEconomics:
+    """The read that was missing: the declaration ROI is measured against."""
+
+    @pytest.mark.asyncio
+    async def test_reads_the_declaration_for_the_type(self, job_manager, economics_client):
+        economics_client.get_job_type_economics.return_value = dict(ECONOMICS_RESOURCE)
+
+        result = await job_manager.get_job_type_economics({"job_type": "mcp-test-claims"})
+
+        economics_client.get_job_type_economics.assert_awaited_once_with("mcp-test-claims")
+        assert result["action"] == "get_job_type_economics"
+        assert result["job_type"] == "mcp-test-claims"
+        assert result["data"]["unitMetricKey"] == "completed_claims"
+        assert result["data"]["currentBaseline"]["version"] == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("job_type", [None, "", "   ", 7])
+    async def test_blank_job_type_is_refused_before_the_request(
+        self, job_manager, economics_client, job_type
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.get_job_type_economics({"job_type": job_type})
+
+        assert exc_info.value.field == "job_type"
+        assert exc_info.value.error_code == ErrorCodes.VALIDATION_ERROR
+        economics_client.get_job_type_economics.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_404_becomes_a_named_not_found(self, job_manager, economics_client):
+        economics_client.get_job_type_economics.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.get_job_type_economics(
+                {"job_type": "mcp-test-nonexistent-type"}
+            )
+
+        assert exc_info.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert "mcp-test-nonexistent-type" in exc_info.value.message
+        assert "no economics declaration" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_platform_400_detail_is_surfaced_verbatim(
+        self, job_manager, economics_client
+    ):
+        economics_client.get_job_type_economics.side_effect = ReveniumAPIError(
+            "job type not registered", status_code=400
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.get_job_type_economics({"job_type": "mcp-test-claims"})
+
+        assert "job type not registered" in exc_info.value.message
+        assert exc_info.value.context["upstream_message"] == "job type not registered"
+
+    @pytest.mark.asyncio
+    async def test_other_api_errors_are_left_alone(self, job_manager, economics_client):
+        economics_client.get_job_type_economics.side_effect = ReveniumAPIError(
+            "boom", status_code=500
+        )
+
+        with pytest.raises(ReveniumAPIError):
+            await job_manager.get_job_type_economics({"job_type": "mcp-test-claims"})
+
+
+class TestUpsertJobTypeEconomicsReadsBeforeItWrites:
+    """PUT replaces the whole declaration upstream, so a partial edit has to be
+    merged over the stored one or it clears the baseline assumptions."""
+
+    @pytest.mark.asyncio
+    async def test_an_omitted_field_is_carried_over_not_cleared(
+        self, job_manager, economics_client
+    ):
+        economics_client.get_job_type_economics.return_value = dict(ECONOMICS_RESOURCE)
+        economics_client.put_job_type_economics.return_value = {"jobType": "mcp-test-claims"}
+
+        result = await job_manager.upsert_job_type_economics(
+            {
+                "job_type": "mcp-test-claims",
+                "economics": {"unitLabel": "processed claim"},
+            }
+        )
+
+        sent = economics_client.put_job_type_economics.await_args[0][1]
+        assert sent["unitLabel"] == "processed claim"
+        # Everything the caller did not name survives the replace.
+        assert sent["unitMetricKey"] == "completed_claims"
+        assert sent["monetization"]["valuePerUnit"] == 4.25
+        assert sent["dimensions"] == [{"key": "region", "allowedValues": ["us", "ca"]}]
+        assert result["preserved_fields"] == ["dimensions", "metrics", "monetization", "unitMetricKey"]
+        assert result["fields_set"] == ["unitLabel"]
+        assert result["created"] is False
+
+    @pytest.mark.asyncio
+    async def test_the_read_only_resource_fields_are_not_sent_back(
+        self, job_manager, economics_client
+    ):
+        economics_client.get_job_type_economics.return_value = dict(ECONOMICS_RESOURCE)
+        economics_client.put_job_type_economics.return_value = {}
+
+        await job_manager.upsert_job_type_economics(
+            {"job_type": "mcp-test-claims", "economics": {"unitLabel": "claim"}}
+        )
+
+        sent = economics_client.put_job_type_economics.await_args[0][1]
+        assert "jobType" not in sent
+        assert "currentBaseline" not in sent
+        # A null optional is dropped rather than echoed back as an explicit null.
+        assert "overheadPerUnit" not in sent
+
+    @pytest.mark.asyncio
+    async def test_404_on_the_read_is_the_create_case(self, job_manager, economics_client):
+        economics_client.get_job_type_economics.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+        economics_client.put_job_type_economics.return_value = {"jobType": "mcp-test-new"}
+
+        result = await job_manager.upsert_job_type_economics(
+            {
+                "job_type": "mcp-test-new",
+                "economics": {"unitMetricKey": "completed_claims", "unitLabel": "claim"},
+            }
+        )
+
+        assert result["created"] is True
+        assert result["preserved_fields"] == []
+        assert economics_client.put_job_type_economics.await_args[0][1] == {
+            "unitMetricKey": "completed_claims",
+            "unitLabel": "claim",
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_create_missing_the_required_fields_is_refused(
+        self, job_manager, economics_client
+    ):
+        economics_client.get_job_type_economics.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.upsert_job_type_economics(
+                {"job_type": "mcp-test-new", "economics": {"unitLabel": "claim"}}
+            )
+
+        assert "unitMetricKey" in exc_info.value.message
+        economics_client.put_job_type_economics.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_non_404_read_failure_stops_the_write(
+        self, job_manager, economics_client
+    ):
+        """A 500 on the read means the stored declaration is unknown, and
+        writing then would replace it with a partial one."""
+        economics_client.get_job_type_economics.side_effect = ReveniumAPIError(
+            "boom", status_code=500
+        )
+
+        with pytest.raises(ReveniumAPIError):
+            await job_manager.upsert_job_type_economics(
+                {"job_type": "mcp-test-claims", "economics": {"unitLabel": "claim"}}
+            )
+
+        economics_client.put_job_type_economics.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_snake_case_field_is_translated_not_ignored(
+        self, job_manager, economics_client
+    ):
+        economics_client.get_job_type_economics.return_value = dict(ECONOMICS_RESOURCE)
+        economics_client.put_job_type_economics.return_value = {}
+
+        await job_manager.upsert_job_type_economics(
+            {"job_type": "mcp-test-claims", "economics": {"unit_label": "processed claim"}}
+        )
+
+        sent = economics_client.put_job_type_economics.await_args[0][1]
+        assert sent["unitLabel"] == "processed claim"
+        assert "unit_label" not in sent
+
+    @pytest.mark.asyncio
+    async def test_nested_snake_case_fields_are_translated(
+        self, job_manager, economics_client
+    ):
+        """The capability text promises a declared field's snake_case spelling is
+        translated. That has to hold one level down too: a PUT that REPLACES the
+        declaration is the worst place for a key to be silently dropped."""
+        economics_client.get_job_type_economics.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+        economics_client.put_job_type_economics.return_value = {}
+
+        await job_manager.upsert_job_type_economics(
+            {
+                "job_type": "mcp-test-claims",
+                "economics": {
+                    "unit_metric_key": "completed_claims",
+                    "unit_label": "claim",
+                    "metrics": [
+                        {
+                            "key": "completed_claims",
+                            "type": "COUNT",
+                            "direction": "HIGHER_IS_BETTER",
+                            "aggregation": "SUM",
+                            "resolution": "PER_JOB",
+                        }
+                    ],
+                    "dimensions": [{"key": "region", "allowed_values": ["us", "ca"]}],
+                    "monetization": {
+                        "metric_key": "completed_claims",
+                        "value_per_unit": 4.25,
+                        "currency": "USD",
+                        "category": "COST_AVOIDED",
+                        "basis": "REALIZED",
+                    },
+                },
+            }
+        )
+
+        sent = economics_client.put_job_type_economics.await_args[0][1]
+        assert sent["unitMetricKey"] == "completed_claims"
+        assert sent["dimensions"] == [{"key": "region", "allowedValues": ["us", "ca"]}]
+        assert sent["monetization"]["metricKey"] == "completed_claims"
+        assert sent["monetization"]["valuePerUnit"] == 4.25
+        # Not one snake_case key survives anywhere in the body.
+        assert "allowed_values" not in sent["dimensions"][0]
+        assert "metric_key" not in sent["monetization"]
+        assert "value_per_unit" not in sent["monetization"]
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_nested_key_still_rides_along(
+        self, job_manager, economics_client
+    ):
+        """Translation must not turn into an allowlist: a field the contract
+        adds has to reach the API without a release here."""
+        economics_client.get_job_type_economics.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+        economics_client.put_job_type_economics.return_value = {}
+
+        await job_manager.upsert_job_type_economics(
+            {
+                "job_type": "mcp-test-claims",
+                "economics": {
+                    "unitMetricKey": "completed_claims",
+                    "unitLabel": "claim",
+                    "dimensions": [{"key": "region", "somethingNew": True}],
+                },
+            }
+        )
+
+        sent = economics_client.put_job_type_economics.await_args[0][1]
+        assert sent["dimensions"][0]["somethingNew"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "economics,field",
+        [
+            (
+                {"dimensions": [{"key": "region", "allowedValues": [], "allowed_values": []}]},
+                "economics.dimensions[0]",
+            ),
+            (
+                {"monetization": {"metricKey": "a", "metric_key": "b"}},
+                "economics.monetization",
+            ),
+        ],
+    )
+    async def test_both_spellings_of_a_nested_field_is_refused(
+        self, job_manager, economics_client, economics, field
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.upsert_job_type_economics(
+                {"job_type": "mcp-test-claims", "economics": economics}
+            )
+
+        assert exc_info.value.field == field
+        assert "twice" in exc_info.value.message
+        economics_client.get_job_type_economics.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_both_spellings_at_once_is_refused(self, job_manager, economics_client):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.upsert_job_type_economics(
+                {
+                    "job_type": "mcp-test-claims",
+                    "economics": {"unitLabel": "a", "unit_label": "b"},
+                }
+            )
+
+        assert "twice" in exc_info.value.message
+        economics_client.get_job_type_economics.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("economics", [None, {}, "unitLabel=claim", 7])
+    async def test_an_empty_economics_body_is_refused(
+        self, job_manager, economics_client, economics
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.upsert_job_type_economics(
+                {"job_type": "mcp-test-claims", "economics": economics}
+            )
+
+        assert exc_info.value.field == "economics"
+        economics_client.get_job_type_economics.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "metrics", ["not-a-list", [{"type": "COUNT"}], [{"key": "  "}], ["completed"]]
+    )
+    async def test_a_malformed_metric_declaration_is_refused(
+        self, job_manager, economics_client, metrics
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.upsert_job_type_economics(
+                {"job_type": "mcp-test-claims", "economics": {"metrics": metrics}}
+            )
+
+        assert exc_info.value.field.startswith("economics.metrics")
+        economics_client.get_job_type_economics.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_platform_400_on_the_write_is_surfaced_verbatim(
+        self, job_manager, economics_client
+    ):
+        economics_client.get_job_type_economics.return_value = dict(ECONOMICS_RESOURCE)
+        economics_client.put_job_type_economics.side_effect = ReveniumAPIError(
+            "monetization.metricKey completed_claims is not declared", status_code=400
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.upsert_job_type_economics(
+                {"job_type": "mcp-test-claims", "economics": {"unitLabel": "claim"}}
+            )
+
+        assert "is not declared" in exc_info.value.message
+
+
+class TestUpsertDisclosesTheLostUpdateWindow:
+    """The read-modify-write closes one hole and opens a narrower one: the
+    resource carries no version token, so two concurrent editors revert each
+    other silently. No client-side lock is invented for that — the window is
+    disclosed."""
+
+    @pytest.mark.asyncio
+    async def test_the_response_carries_the_note(self, job_manager, economics_client):
+        economics_client.get_job_type_economics.return_value = dict(ECONOMICS_RESOURCE)
+        economics_client.put_job_type_economics.return_value = {}
+
+        result = await job_manager.upsert_job_type_economics(
+            {"job_type": "mcp-test-claims", "economics": {"unitLabel": "claim"}}
+        )
+
+        assert "no version or ETag" in result["concurrency_note"]
+        assert "reverted silently" in result["concurrency_note"]
+
+    @pytest.mark.asyncio
+    async def test_the_capability_text_states_it(self, job_mgmt, mock_mgmt_client):
+        result = await job_mgmt.handle_action("get_capabilities", {})
+        payload = json.loads(result[0].text)
+
+        assert "no version or ETag" in (
+            payload["parameters"]["upsert_job_type_economics"]["concurrency"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_note_names_the_known_second_writer(self, job_manager, economics_client):
+        """BACK-3090 iteration 4: the concurrent writer is not hypothetical.
+        The dashboard's Job Type editor saves a full replacement from its
+        drawer-open snapshot and rebuilds metrics with PER_JOB/COUNT/SUM
+        defaults, so it can downgrade a PERIOD metric this tool declared - and
+        the next report_period_facts is then refused for a reason that has
+        nothing to do with the call that failed. A caller who is told only
+        'concurrent writes are possible' cannot act on that; one who is told
+        where the other writer lives can."""
+        economics_client.get_job_type_economics.return_value = dict(ECONOMICS_RESOURCE)
+        economics_client.put_job_type_economics.return_value = {}
+
+        result = await job_manager.upsert_job_type_economics(
+            {"job_type": "mcp-test-claims", "economics": {"unitLabel": "claim"}}
+        )
+
+        note = result["concurrency_note"]
+        assert "dashboard's Job Type editor" in note
+        assert "report_period_facts" in note
+        assert "immediately before an upsert" in note
+
+    @pytest.mark.asyncio
+    async def test_no_client_side_lock_was_invented(self, job_manager, economics_client):
+        """A lock the server does not honour would read as a guarantee. The
+        upsert must take no version argument and send none."""
+        economics_client.get_job_type_economics.return_value = dict(ECONOMICS_RESOURCE)
+        economics_client.put_job_type_economics.return_value = {}
+
+        await job_manager.upsert_job_type_economics(
+            {
+                "job_type": "mcp-test-claims",
+                "economics": {"unitLabel": "claim"},
+                "expected_entity_version": 3,
+            }
+        )
+
+        sent = economics_client.put_job_type_economics.await_args[0][1]
+        assert "expectedEntityVersion" not in sent
+        assert "entityVersion" not in sent
+
+
+class TestJobTypeBaselines:
+    """Baselines are append-only versions, newest first."""
+
+    @pytest.mark.asyncio
+    async def test_list_returns_the_versions_newest_first(
+        self, job_manager, economics_client
+    ):
+        economics_client.list_job_type_baselines.return_value = list(BASELINE_VERSIONS)
+
+        result = await job_manager.list_job_type_baselines({"job_type": "mcp-test-claims"})
+
+        economics_client.list_job_type_baselines.assert_awaited_once_with("mcp-test-claims")
+        assert result["count"] == 2
+        assert result["data"][0]["version"] == 2
+
+    @pytest.mark.asyncio
+    async def test_no_baseline_is_an_answer_not_a_failure(
+        self, job_manager, economics_client
+    ):
+        """An empty ARRAY is the one empty result that is an answer."""
+        economics_client.list_job_type_baselines.return_value = []
+
+        result = await job_manager.list_job_type_baselines({"job_type": "mcp-test-claims"})
+
+        assert result["count"] == 0
+        assert result["data"] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", [{}, {"error": "nope"}, "text", None, 7])
+    async def test_a_non_list_body_is_refused_not_reported_as_no_baselines(
+        self, job_manager, economics_client, body
+    ):
+        """A contract failure must not read as "this job type declared none" --
+        declaring a fresh baseline on top of history you failed to read is how a
+        version gets superseded by accident."""
+        economics_client.list_job_type_baselines.return_value = body
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.list_job_type_baselines({"job_type": "mcp-test-claims"})
+
+        assert exc_info.value.error_code == ErrorCodes.API_ERROR
+        assert "mcp-test-claims" in exc_info.value.message
+        assert "NOT the same as the job type having none" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_names_the_keys_it_saw(self, job_manager, economics_client):
+        economics_client.list_job_type_baselines.return_value = {"page": 1, "items": []}
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.list_job_type_baselines({"job_type": "mcp-test-claims"})
+
+        assert "'items', 'page'" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_create_sends_the_baseline_and_reports_it(
+        self, job_manager, economics_client
+    ):
+        economics_client.create_job_type_baseline.return_value = {"version": 3}
+
+        result = await job_manager.create_job_type_baseline(
+            {
+                "job_type": "mcp-test-claims",
+                "baseline": {
+                    "effectiveFrom": "2026-10-01T00:00:00Z",
+                    "costPerUnit": 3.9,
+                    "currency": "USD",
+                },
+            }
+        )
+
+        economics_client.create_job_type_baseline.assert_awaited_once_with(
+            "mcp-test-claims",
+            {
+                "effectiveFrom": "2026-10-01T00:00:00Z",
+                "costPerUnit": 3.9,
+                "currency": "USD",
+            },
+        )
+        assert result["data"]["version"] == 3
+        assert "not idempotent" in result["append_note"]
+
+    @pytest.mark.asyncio
+    async def test_effective_from_snake_case_is_accepted(
+        self, job_manager, economics_client
+    ):
+        economics_client.create_job_type_baseline.return_value = {}
+
+        await job_manager.create_job_type_baseline(
+            {
+                "job_type": "mcp-test-claims",
+                "baseline": {"effective_from": "2026-10-01T00:00:00Z"},
+            }
+        )
+
+        sent = economics_client.create_job_type_baseline.await_args[0][1]
+        assert sent == {"effectiveFrom": "2026-10-01T00:00:00Z"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "baseline",
+        [None, {}, {"costPerUnit": 4.5}, {"effectiveFrom": ""}, {"effectiveFrom": 2026}],
+    )
+    async def test_a_baseline_without_effective_from_is_refused(
+        self, job_manager, economics_client, baseline
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.create_job_type_baseline(
+                {"job_type": "mcp-test-claims", "baseline": baseline}
+            )
+
+        assert exc_info.value.field.startswith("baseline")
+        economics_client.create_job_type_baseline.assert_not_called()
+
+
+class TestReportPeriodFacts:
+    """PERIOD facts on the job type, as a bare JSON array."""
+
+    @pytest.mark.asyncio
+    async def test_the_array_is_the_body(self, job_manager, economics_client):
+        economics_client.append_job_type_facts.return_value = {}
+
+        result = await job_manager.report_period_facts(
+            {"job_type": "mcp-test-claims", "facts": [dict(PERIOD_FACT)]}
+        )
+
+        economics_client.append_job_type_facts.assert_awaited_once_with(
+            "mcp-test-claims", [dict(PERIOD_FACT)]
+        )
+        assert result["appended"] == 1
+        assert "PERIOD" in result["resolution_note"]
+
+    @pytest.mark.asyncio
+    async def test_snake_case_entry_fields_are_translated(
+        self, job_manager, economics_client
+    ):
+        economics_client.append_job_type_facts.return_value = {}
+
+        await job_manager.report_period_facts(
+            {
+                "job_type": "mcp-test-claims",
+                "facts": [
+                    {
+                        "period_start": "2026-08-01T00:00:00Z",
+                        "period_end": "2026-09-01T00:00:00Z",
+                        "dimension_key": "region",
+                        "dimension_value": "us",
+                        "key": "manual_rework_minutes",
+                        "value": 420,
+                    }
+                ],
+            }
+        )
+
+        sent = economics_client.append_job_type_facts.await_args[0][1]
+        assert sent == [dict(PERIOD_FACT)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("facts", [None, [], {}, "facts", [42], [{"value": 1}]])
+    async def test_a_malformed_fact_body_is_refused_before_the_request(
+        self, job_manager, economics_client, facts
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.report_period_facts(
+                {"job_type": "mcp-test-claims", "facts": facts}
+            )
+
+        assert exc_info.value.error_code in (
+            ErrorCodes.VALIDATION_ERROR,
+            ErrorCodes.INVALID_PARAMETER,
+        )
+        economics_client.append_job_type_facts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_missing_value_is_refused(self, job_manager, economics_client):
+        entry = dict(PERIOD_FACT)
+        entry["value"] = None
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.report_period_facts(
+                {"job_type": "mcp-test-claims", "facts": [entry]}
+            )
+
+        assert "value" in exc_info.value.message
+        economics_client.append_job_type_facts.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", ["", "   ", 7])
+    async def test_a_blank_reason_is_refused(self, job_manager, economics_client, reason):
+        entry = dict(PERIOD_FACT)
+        entry["reason"] = reason
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.report_period_facts(
+                {"job_type": "mcp-test-claims", "facts": [entry]}
+            )
+
+        assert "reason" in exc_info.value.message
+        economics_client.append_job_type_facts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_resolution_400_is_surfaced_verbatim(
+        self, job_manager, economics_client
+    ):
+        economics_client.append_job_type_facts.side_effect = ReveniumAPIError(
+            "metric manual_rework_minutes is not declared PERIOD", status_code=400
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.report_period_facts(
+                {"job_type": "mcp-test-claims", "facts": [dict(PERIOD_FACT)]}
+            )
+
+        assert "is not declared PERIOD" in exc_info.value.message
+        assert exc_info.value.context["upstream_status"] == 400
+
+
+class TestAppendOutcomeMetrics:
+    """PER_JOB facts appended to a reported outcome, without rewriting it."""
+
+    @pytest.mark.asyncio
+    async def test_the_array_is_the_body(self, job_manager, economics_client):
+        economics_client.append_job_outcome_metrics.return_value = {}
+
+        result = await job_manager.append_outcome_metrics(
+            {
+                "job_id": "job_123",
+                "metrics": [{"key": "quality_rate", "value": 0.93, "provenance": "MEASURED"}],
+            }
+        )
+
+        economics_client.append_job_outcome_metrics.assert_awaited_once_with(
+            "job_123", [{"key": "quality_rate", "value": 0.93, "provenance": "MEASURED"}]
+        )
+        assert result["appended"] == 1
+        assert "entityVersion" in result["entity_version_note"]
+
+    @pytest.mark.asyncio
+    async def test_missing_job_id_is_refused(self, job_manager, economics_client):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.append_outcome_metrics(
+                {"metrics": [{"key": "quality_rate", "value": 0.93}]}
+            )
+
+        assert exc_info.value.field == "job_id"
+        economics_client.append_job_outcome_metrics.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("metrics", [None, [], [{"key": "  ", "value": 1}]])
+    async def test_a_malformed_metric_body_is_refused(
+        self, job_manager, economics_client, metrics
+    ):
+        with pytest.raises(ToolError):
+            await job_manager.append_outcome_metrics(
+                {"job_id": "job_123", "metrics": metrics}
+            )
+
+        economics_client.append_job_outcome_metrics.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_404_names_the_job_not_the_job_type(self, job_manager, economics_client):
+        economics_client.append_job_outcome_metrics.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.append_outcome_metrics(
+                {"job_id": "job_123", "metrics": [{"key": "quality_rate", "value": 0.93}]}
+            )
+
+        assert exc_info.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert exc_info.value.field == "job_id"
+        assert "Job 'job_123'" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_the_undeclared_metric_400_is_surfaced_verbatim(
+        self, job_manager, economics_client
+    ):
+        economics_client.append_job_outcome_metrics.side_effect = ReveniumAPIError(
+            "metric quality_rate is not declared PER_JOB", status_code=400
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.append_outcome_metrics(
+                {"job_id": "job_123", "metrics": [{"key": "quality_rate", "value": 0.93}]}
+            )
+
+        assert "is not declared PER_JOB" in exc_info.value.message
+        assert exc_info.value.field == "job_id"
+
+
+class TestJobTypeEconomicsThroughHandleAction:
+    """Every new action has a dispatch route and is advertised."""
+
+    @pytest.fixture
+    def economics_mgmt_client(self, mock_mgmt_client):
+        mock_mgmt_client.get_job_type_economics = AsyncMock()
+        mock_mgmt_client.put_job_type_economics = AsyncMock()
+        mock_mgmt_client.list_job_type_baselines = AsyncMock()
+        mock_mgmt_client.create_job_type_baseline = AsyncMock()
+        mock_mgmt_client.append_job_type_facts = AsyncMock()
+        mock_mgmt_client.append_job_outcome_metrics = AsyncMock()
+        return mock_mgmt_client
+
+    @pytest.mark.asyncio
+    async def test_every_action_is_advertised(self, job_mgmt):
+        supported = await job_mgmt._get_supported_actions()
+        for action in JOB_TYPE_ECONOMICS_ACTIONS:
+            assert action in supported
+
+    @pytest.mark.asyncio
+    async def test_capabilities_name_every_action(self, job_mgmt, mock_mgmt_client):
+        result = await job_mgmt.handle_action("get_capabilities", {})
+        payload = json.loads(result[0].text)
+        for action in JOB_TYPE_ECONOMICS_ACTIONS:
+            assert action in payload["business_actions"]
+            assert action in payload["parameters"]
+
+    @pytest.mark.asyncio
+    async def test_examples_cover_every_action(self, job_mgmt, mock_mgmt_client):
+        result = await job_mgmt.handle_action("get_examples", {})
+        payload = json.loads(result[0].text)
+        for action in JOB_TYPE_ECONOMICS_ACTIONS:
+            assert action in payload
+
+    @pytest.mark.asyncio
+    async def test_get_economics_dispatches(self, job_mgmt, economics_mgmt_client):
+        economics_mgmt_client.get_job_type_economics.return_value = dict(ECONOMICS_RESOURCE)
+
+        result = await job_mgmt.handle_action(
+            "get_job_type_economics", {"job_type": "mcp-test-claims"}
+        )
+
+        assert "mcp-test-claims" in result[0].text
+        assert "completed_claims" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_upsert_dispatches_and_reports_the_merge(
+        self, job_mgmt, economics_mgmt_client
+    ):
+        economics_mgmt_client.get_job_type_economics.return_value = dict(ECONOMICS_RESOURCE)
+        economics_mgmt_client.put_job_type_economics.return_value = {}
+
+        result = await job_mgmt.handle_action(
+            "upsert_job_type_economics",
+            {"job_type": "mcp-test-claims", "economics": {"unitLabel": "processed claim"}},
+        )
+
+        assert "Economics updated" in result[0].text
+        assert "preserved_fields" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_list_baselines_dispatches(self, job_mgmt, economics_mgmt_client):
+        economics_mgmt_client.list_job_type_baselines.return_value = list(BASELINE_VERSIONS)
+
+        result = await job_mgmt.handle_action(
+            "list_job_type_baselines", {"job_type": "mcp-test-claims"}
+        )
+
+        assert "newest first" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_create_baseline_dispatches(self, job_mgmt, economics_mgmt_client):
+        economics_mgmt_client.create_job_type_baseline.return_value = {"version": 3}
+
+        result = await job_mgmt.handle_action(
+            "create_job_type_baseline",
+            {
+                "job_type": "mcp-test-claims",
+                "baseline": {"effectiveFrom": "2026-10-01T00:00:00Z"},
+            },
+        )
+
+        assert "Baseline version appended" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_report_period_facts_dispatches(self, job_mgmt, economics_mgmt_client):
+        economics_mgmt_client.append_job_type_facts.return_value = {}
+
+        result = await job_mgmt.handle_action(
+            "report_period_facts",
+            {"job_type": "mcp-test-claims", "facts": [dict(PERIOD_FACT)]},
+        )
+
+        assert "Appended 1 period fact(s)" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_append_outcome_metrics_dispatches(self, job_mgmt, economics_mgmt_client):
+        economics_mgmt_client.append_job_outcome_metrics.return_value = {}
+
+        result = await job_mgmt.handle_action(
+            "append_outcome_metrics",
+            {"job_id": "job_123", "metrics": [{"key": "quality_rate", "value": 0.93}]},
+        )
+
+        assert "Appended 1 outcome metric fact(s)" in result[0].text
+
+    def test_registry_closure_declares_the_economics_parameters(self):
+        """FastMCP derives the public schema from the closure signature, so a
+        parameter missing there is rejected before handle_action runs."""
+        import inspect
+
+        from src.revenium_mcp_server.tool_configuration import registry as registry_module
+
+        source = inspect.getsource(
+            registry_module.ToolConfigurationRegistry._register_manage_jobs
+        )
+        for name in ("job_type", "economics", "baseline", "facts", "metrics"):
+            assert f"{name}: Optional[" in source
+            assert f'"{name}": {name},' in source
+
+
+class TestJobTypeEconomicsDecisionIsRecorded:
+    """The BACK-3091 docstring declined POST .../outcome/metrics. The reversal
+    has to be written down where that decline is, or the module contradicts
+    itself."""
+
+    def test_the_decision_block_is_present(self):
+        doc = job_management_module.__doc__ or ""
+        assert "Decision (BACK-3090)" in doc
+        assert "read-modify-write" in doc
+        assert "not idempotent" in doc
+
+    def test_the_replace_semantics_are_stated_to_the_caller(self):
+        assert "replaces the whole declaration" in (
+            job_management_module._ECONOMICS_REPLACE_NOTE
+        )
+        assert "preserved_fields" in job_management_module._ECONOMICS_REPLACE_NOTE
+
+    def test_the_request_field_set_excludes_the_read_only_resource_fields(self):
+        fields = job_management_module._ECONOMICS_REQUEST_FIELDS
+        assert "jobType" not in fields
+        assert "currentBaseline" not in fields
+        assert "unitMetricKey" in fields
+
+
+# ===========================================================================
+# BACK-3090 iteration 2 - a refusal is an error, and a write's 404 is its own
+# ===========================================================================
+
+class TestManageJobsJsonArgumentsRaiseOnBadInput:
+    """FastMCP sets the response's error flag only when the tool raises, so a
+    decode failure that RETURNS TextContent reports a write that never happened
+    as a completed call - the BACK-2937 shape, which was still open in this
+    closure. All six JSON-string arguments now share one raising rule."""
+
+    @staticmethod
+    async def _closure():
+        from src.revenium_mcp_server.tool_configuration.config import ToolConfig
+        from src.revenium_mcp_server.tool_configuration.registry import (
+            ToolConfigurationRegistry,
+        )
+
+        captured = {}
+
+        class _CapturingMCP:
+            def tool(self, *args, **kwargs):
+                def decorator(fn):
+                    captured["fn"] = fn
+                    return fn
+
+                return decorator
+
+        registry = ToolConfigurationRegistry(ToolConfig())
+        await registry._register_manage_jobs(_CapturingMCP())
+        return captured["fn"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "argument",
+        ["outcome_data", "filters", "economics", "baseline", "facts", "metrics"],
+    )
+    async def test_a_malformed_json_string_raises_rather_than_returning_text(
+        self, argument
+    ):
+        manage_jobs = await self._closure()
+
+        with pytest.raises(ToolError) as exc_info:
+            await manage_jobs(action="get_capabilities", **{argument: "{not json"})
+
+        assert exc_info.value.error_code == ErrorCodes.VALIDATION_ERROR
+        assert exc_info.value.field == argument
+        assert f"Invalid JSON for {argument}" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_an_empty_filters_string_raises_like_any_other_bad_json(self):
+        """Raised in review: `filters or {}` ran BEFORE the decode loop, so
+        filters="" was already {} by the time the loop looked for a string --
+        list_jobs then ran unfiltered and returned every job as though the
+        filter had been applied. The default now lands after the loop."""
+        manage_jobs = await self._closure()
+
+        with pytest.raises(ToolError) as exc_info:
+            await manage_jobs(action="list_jobs", filters="")
+
+        assert exc_info.value.field == "filters"
+        assert "Invalid JSON for filters" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "argument", ["economics", "baseline", "facts", "metrics", "outcome_data"]
+    )
+    async def test_an_empty_string_raises_on_every_other_json_argument_too(
+        self, argument
+    ):
+        manage_jobs = await self._closure()
+
+        with pytest.raises(ToolError) as exc_info:
+            await manage_jobs(action="get_capabilities", **{argument: ""})
+
+        assert exc_info.value.field == argument
+
+    @pytest.mark.asyncio
+    async def test_omitted_filters_still_defaults_to_an_empty_dict(self):
+        """The default is delayed, not removed: a caller who sends no filters
+        must still reach the tool with {} rather than None."""
+        from unittest.mock import AsyncMock as _AsyncMock
+
+        manage_jobs = await self._closure()
+        captured = {}
+
+        async def fake_execution(*, tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return []
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=_AsyncMock(side_effect=fake_execution),
+        ):
+            await manage_jobs(action="list_jobs")
+
+        assert captured["filters"] == {}
+
+    @pytest.mark.asyncio
+    async def test_the_caller_facing_wording_is_unchanged(self):
+        """The conversion changed the mechanism, not the guidance."""
+        manage_jobs = await self._closure()
+
+        with pytest.raises(ToolError) as exc_info:
+            await manage_jobs(action="list_jobs", filters="{not json")
+        assert 'e.g. {"type": "loan_processing"}' in exc_info.value.message
+
+        with pytest.raises(ToolError) as exc_info:
+            await manage_jobs(action="report_outcome", outcome_data="{not json")
+        assert "with outcome, revenue, etc." in exc_info.value.message
+
+    def test_every_json_argument_is_in_one_table(self):
+        """The three hand-copied decode blocks are gone; a seventh JSON argument
+        must be added to the table rather than to a fourth block."""
+        import inspect
+
+        from src.revenium_mcp_server.tool_configuration import registry as registry_module
+
+        source = inspect.getsource(
+            registry_module.ToolConfigurationRegistry._register_manage_jobs
+        )
+        assert "MANAGE_JOBS_JSON_ARGUMENTS" in source
+        assert "TextContent as TC" not in source
+        assert [name for name, _ in registry_module.MANAGE_JOBS_JSON_ARGUMENTS] == [
+            "outcome_data",
+            "filters",
+            "economics",
+            "baseline",
+            "facts",
+            "metrics",
+        ]
+
+
+class TestUpsertWriteNotFoundIsNotTheReadNotFound:
+    """Routing the PUT's 404 through the read's branch told the caller the type
+    'has nothing to read' and advised fixing it with upsert_job_type_economics
+    - the action that had just failed."""
+
+    @pytest.mark.asyncio
+    async def test_the_write_404_names_the_write_and_does_not_advise_the_failed_action(
+        self, job_manager, economics_client
+    ):
+        economics_client.get_job_type_economics.return_value = dict(ECONOMICS_RESOURCE)
+        economics_client.put_job_type_economics.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.upsert_job_type_economics(
+                {"job_type": "mcp-test-claims", "economics": {"unitLabel": "claim"}}
+            )
+
+        error = exc_info.value
+        assert error.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert "rejected the upsert_job_type_economics write" in error.message
+        assert "nothing was stored" in error.message
+        assert error.context["phase"] == "write"
+        # The read branch's advice must not appear: it points at this action.
+        assert "has nothing to read" not in error.message
+        assert not any(
+            "Declare the economics first with upsert_job_type_economics" in s
+            for s in error.suggestions
+        )
+        assert any("removed between" in s for s in error.suggestions)
+
+    @pytest.mark.asyncio
+    async def test_the_read_404_keeps_its_own_text(self, job_manager, economics_client):
+        """The read path is unchanged: there, 'declare it with
+        upsert_job_type_economics' is exactly the right advice."""
+        economics_client.get_job_type_economics.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.get_job_type_economics({"job_type": "mcp-test-claims"})
+
+        error = exc_info.value
+        assert "has nothing to read" in error.message
+        assert any(
+            "Declare the economics first with upsert_job_type_economics" in s
+            for s in error.suggestions
+        )
+        # All three builders label their phase now; what matters is that the
+        # read is labelled as a read, not as a write or an append.
+        assert error.context["phase"] == "read"
+
+    @pytest.mark.asyncio
+    async def test_the_write_400_is_still_the_verbatim_platform_sentence(
+        self, job_manager, economics_client
+    ):
+        """Splitting the 404 out must not take the 400 with it."""
+        economics_client.get_job_type_economics.return_value = dict(ECONOMICS_RESOURCE)
+        economics_client.put_job_type_economics.side_effect = ReveniumAPIError(
+            "unitMetricKey completed_claims is not among the declared metrics",
+            status_code=400,
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.upsert_job_type_economics(
+                {"job_type": "mcp-test-claims", "economics": {"unitLabel": "claim"}}
+            )
+
+        assert "is not among the declared metrics" in exc_info.value.message
+        assert exc_info.value.context["upstream_status"] == 400
+
+    @pytest.mark.asyncio
+    async def test_a_write_500_still_reaches_the_caller_untranslated(
+        self, job_manager, economics_client
+    ):
+        economics_client.get_job_type_economics.return_value = dict(ECONOMICS_RESOURCE)
+        economics_client.put_job_type_economics.side_effect = ReveniumAPIError(
+            "boom", status_code=500
+        )
+
+        with pytest.raises(ReveniumAPIError):
+            await job_manager.upsert_job_type_economics(
+                {"job_type": "mcp-test-claims", "economics": {"unitLabel": "claim"}}
+            )
+
+
+# ===========================================================================
+# BACK-3090 iteration 3 - the write 404s, the read the upsert builds on, and
+# the summary surface
+# ===========================================================================
+
+class TestAppendNotFoundIsItsOwnMessage:
+    """An append performs no read, so the upsert's "removed between your read
+    and your write" advice is noise there, and the READ's advice - declare it
+    with upsert_job_type_economics - is the only useful half."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action,arguments,client_method",
+        [
+            (
+                "create_job_type_baseline",
+                {
+                    "job_type": "mcp-test-claims",
+                    "baseline": {"effectiveFrom": "2026-10-01T00:00:00Z"},
+                },
+                "create_job_type_baseline",
+            ),
+            (
+                "report_period_facts",
+                {"job_type": "mcp-test-claims", "facts": [dict(PERIOD_FACT)]},
+                "append_job_type_facts",
+            ),
+        ],
+    )
+    async def test_the_append_404_says_nothing_was_appended(
+        self, job_manager, economics_client, action, arguments, client_method
+    ):
+        getattr(economics_client, client_method).side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await getattr(job_manager, action)(arguments)
+
+        error = exc_info.value
+        assert error.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert f"rejected the {action} append" in error.message
+        assert "nothing was appended" in error.message
+        assert error.context["phase"] == "append"
+        # The read's wording must not appear...
+        assert "has nothing to read" not in error.message
+        # ...nor the upsert's read-then-write race, which an append cannot have.
+        assert not any("removed between" in s for s in error.suggestions)
+        assert not any("no version or ETag" in s for s in error.suggestions)
+        # ...but "declare the economics first" is still the useful advice here.
+        assert any("Declare the economics first" in s for s in error.suggestions)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action,arguments,client_method",
+        [
+            (
+                "create_job_type_baseline",
+                {
+                    "job_type": "mcp-test-claims",
+                    "baseline": {"effectiveFrom": "2026-10-01T00:00:00Z"},
+                },
+                "create_job_type_baseline",
+            ),
+            (
+                "report_period_facts",
+                {"job_type": "mcp-test-claims", "facts": [dict(PERIOD_FACT)]},
+                "append_job_type_facts",
+            ),
+        ],
+    )
+    async def test_the_append_400_is_still_the_platform_sentence(
+        self, job_manager, economics_client, action, arguments, client_method
+    ):
+        getattr(economics_client, client_method).side_effect = ReveniumAPIError(
+            "metric manual_rework_minutes is not declared PERIOD", status_code=400
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await getattr(job_manager, action)(arguments)
+
+        assert "is not declared PERIOD" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_the_read_404_keeps_pointing_at_the_declaration(
+        self, job_manager, economics_client
+    ):
+        """The read builder is unchanged by the split."""
+        economics_client.list_job_type_baselines.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.list_job_type_baselines({"job_type": "mcp-test-claims"})
+
+        assert "has nothing to read" in exc_info.value.message
+        assert exc_info.value.context["phase"] == "read"
+
+
+class TestUpsertWillNotBuildOnABodyItCouldNotRead:
+    """Only an explicit 404 means "no declaration yet". Inferring it from a
+    malformed 200 would REPLACE a declaration nobody read with whatever fields
+    the caller happened to name - the exact loss the read-modify-write exists
+    to prevent."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {},
+            [],
+            [{"unitLabel": "claim"}],
+            "unitLabel=claim",
+            None,
+            {"error": "something went wrong"},
+        ],
+    )
+    async def test_a_malformed_read_refuses_and_never_writes(
+        self, job_manager, economics_client, body
+    ):
+        economics_client.get_job_type_economics.return_value = body
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.upsert_job_type_economics(
+                {"job_type": "mcp-test-claims", "economics": {"unitLabel": "claim"}}
+            )
+
+        assert exc_info.value.error_code == ErrorCodes.API_ERROR
+        assert "Nothing was written" in exc_info.value.message
+        assert "which the platform reports as a 404" in exc_info.value.message
+        economics_client.put_job_type_economics.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_names_what_it_saw(self, job_manager, economics_client):
+        economics_client.get_job_type_economics.return_value = {"error": "nope"}
+
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.upsert_job_type_economics(
+                {"job_type": "mcp-test-claims", "economics": {"unitLabel": "claim"}}
+            )
+
+        assert "['error']" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_declaration_carrying_one_request_field_is_accepted(
+        self, job_manager, economics_client
+    ):
+        """The check is the weakest one that separates a declaration from an
+        error envelope: which fields a tenant's declaration carries is the
+        platform's business, not this tool's."""
+        economics_client.get_job_type_economics.return_value = {
+            "jobType": "mcp-test-claims",
+            "unitMetricKey": "completed_claims",
+        }
+        economics_client.put_job_type_economics.return_value = {}
+
+        result = await job_manager.upsert_job_type_economics(
+            {"job_type": "mcp-test-claims", "economics": {"unitLabel": "claim"}}
+        )
+
+        assert result["created"] is False
+        assert result["preserved_fields"] == ["unitMetricKey"]
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_404_is_still_the_create_case(
+        self, job_manager, economics_client
+    ):
+        economics_client.get_job_type_economics.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+        economics_client.put_job_type_economics.return_value = {}
+
+        result = await job_manager.upsert_job_type_economics(
+            {
+                "job_type": "mcp-test-new",
+                "economics": {"unitMetricKey": "completed_claims", "unitLabel": "claim"},
+            }
+        )
+
+        assert result["created"] is True
+        economics_client.put_job_type_economics.assert_awaited_once()
+
+
+class TestBaselineResponseCarriesTheCurrencyConstraint:
+    """A baseline carries costPerUnit and hourlyRate, so USD-only belongs on
+    its response as much as on the upsert's."""
+
+    @pytest.mark.asyncio
+    async def test_currency_note_is_on_the_response(self, job_manager, economics_client):
+        economics_client.create_job_type_baseline.return_value = {"version": 1}
+
+        result = await job_manager.create_job_type_baseline(
+            {
+                "job_type": "mcp-test-claims",
+                "baseline": {"effectiveFrom": "2026-10-01T00:00:00Z"},
+            }
+        )
+
+        assert "USD only" in result["currency_note"]
+
+
+class TestOneTranslatorForEveryEconomicsCall:
+    """The try/except/translate/re-raise block was written out verbatim at four
+    sites, which is four places to route a 404 to the wrong builder - the
+    mistake that actually happened twice on this branch."""
+
+    def test_the_verbatim_blocks_are_gone(self):
+        import inspect
+
+        source = inspect.getsource(job_management_module.JobManager)
+        # One helper, used at five economics call sites.
+        assert source.count("_translated_economics_call(") == 5
+        # The removed read-path translator must not come back by name.
+        assert "_job_type_economics_error" not in source
+
+    def test_each_phase_has_its_own_builder(self):
+        for builder, phase in (
+            (job_management_module._job_type_read_not_found_error, "read"),
+            (job_management_module._job_type_write_not_found_error, "write"),
+            (job_management_module._job_type_append_not_found_error, "append"),
+        ):
+            error = builder(
+                ReveniumAPIError("Not Found", status_code=404),
+                action="an_action",
+                job_type="a-type",
+            )
+            assert error.context["phase"] == phase
+            assert error.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+
+
+class TestAgentSummaryNamesTheNewActions:
+    """PR #384 shipped with this exact gap: the agent summary is the surface an
+    agent reads first, and an action missing from it is an action it will not
+    call."""
+
+    @pytest.mark.asyncio
+    async def test_key_actions_lists_all_six(self, job_mgmt):
+        summary = await job_mgmt._get_agent_summary()
+
+        for action in JOB_TYPE_ECONOMICS_ACTIONS:
+            assert f"• {action} —" in summary, action
+
+    @pytest.mark.asyncio
+    async def test_the_summary_states_the_two_write_rules(self, job_mgmt):
+        summary = await job_mgmt._get_agent_summary()
+
+        assert "replaces the whole declaration" in summary
+        assert "Append-only and never retried" in summary
+
+
+# ===========================================================================
+# BACK-3090 iteration 5 - dot-segment job types, and the create branch through
+# dispatch
+# ===========================================================================
+
+class TestDotSegmentJobTypeIsRefused:
+    """Percent-encoding keeps a value inside one path segment, but '.' is
+    unreserved and survives it, so these two reach the URL as real dot-segments
+    and URL resolution removes them - '..' turns .../jobs/types/{type}/economics
+    into .../jobs/economics, a different endpoint called silently."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("job_type", ["..", ".", "  ..  "])
+    @pytest.mark.parametrize(
+        "action,extra",
+        [
+            ("get_job_type_economics", {}),
+            ("list_job_type_baselines", {}),
+            ("upsert_job_type_economics", {"economics": {"unitLabel": "claim"}}),
+            (
+                "create_job_type_baseline",
+                {"baseline": {"effectiveFrom": "2026-10-01T00:00:00Z"}},
+            ),
+            ("report_period_facts", {"facts": [dict(PERIOD_FACT)]}),
+        ],
+    )
+    async def test_every_action_refuses_it_before_any_request(
+        self, job_manager, economics_client, job_type, action, extra
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await getattr(job_manager, action)({"job_type": job_type, **extra})
+
+        assert exc_info.value.error_code == ErrorCodes.INVALID_PARAMETER
+        assert exc_info.value.field == "job_type"
+        assert "dot-segment is normalised out of the URL path" in exc_info.value.message
+        economics_client.get_job_type_economics.assert_not_called()
+        economics_client.put_job_type_economics.assert_not_called()
+        economics_client.list_job_type_baselines.assert_not_called()
+        economics_client.create_job_type_baseline.assert_not_called()
+        economics_client.append_job_type_facts.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("job_type", ["claims.v2", "x..y", ".hidden", "v1."])
+    async def test_a_dot_inside_a_name_is_still_a_valid_job_type(
+        self, job_manager, economics_client, job_type
+    ):
+        """Only a name that is ENTIRELY '.' or '..' is a dot-segment."""
+        economics_client.get_job_type_economics.return_value = dict(ECONOMICS_RESOURCE)
+
+        result = await job_manager.get_job_type_economics({"job_type": job_type})
+
+        assert result["job_type"] == job_type
+
+
+class TestUpsertCreateBranchThroughDispatch:
+    """The dispatch tests only ever drove created=False, so the "declared"
+    half of `"declared" if result["created"] else "updated"` was never rendered
+    through handle_action."""
+
+    @pytest.fixture
+    def economics_mgmt_client(self, mock_mgmt_client):
+        mock_mgmt_client.get_job_type_economics = AsyncMock()
+        mock_mgmt_client.put_job_type_economics = AsyncMock()
+        return mock_mgmt_client
+
+    @pytest.mark.asyncio
+    async def test_a_create_renders_declared_not_updated(
+        self, job_mgmt, economics_mgmt_client
+    ):
+        economics_mgmt_client.get_job_type_economics.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+        economics_mgmt_client.put_job_type_economics.return_value = {}
+
+        result = await job_mgmt.handle_action(
+            "upsert_job_type_economics",
+            {
+                "job_type": "mcp-test-new",
+                "economics": {
+                    "unitMetricKey": "completed_claims",
+                    "unitLabel": "claim",
+                },
+            },
+        )
+
+        text = result[0].text
+        assert "Economics declared for job type mcp-test-new" in text
+        assert "Economics updated" not in text
+        assert '"created": true' in text

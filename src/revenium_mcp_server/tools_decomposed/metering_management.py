@@ -684,6 +684,83 @@ _CACHE_TOKEN_FIELDS: Tuple[str, ...] = tuple(field for field, _ in _CACHE_TOKEN_
 _CACHE_TOKEN_UNAVAILABLE = "unavailable"
 
 
+# What the Session Tracking section renders, in order: the trace grouping
+# first, then what the call was, then what it belongs to. `ticketId` is listed
+# although the completions endpoint does not declare it yet (BACK-2640) - the
+# name is fixed by the metering submission spec, so the row renders it the day
+# the platform starts returning it.
+_SESSION_TRACKING_LABELS: Tuple[Tuple[str, str], ...] = (
+    ("traceId", "Trace ID"),
+    ("traceType", "Trace Type"),
+    ("traceName", "Trace Name"),
+    ("parentTransactionId", "Parent Transaction ID"),
+    ("operationType", "Operation Type"),
+    ("operationSubtype", "Operation Subtype"),
+    ("agenticJobId", "Agentic Job ID"),
+    ("agenticJobName", "Agentic Job Name"),
+    ("agenticJobType", "Agentic Job Type"),
+    ("agenticJobVersion", "Agentic Job Version"),
+    ("ticketId", "Ticket ID"),
+)
+
+# The prompt-context attributes as (submission argument, wire name, label).
+# One table serves the submission payload, the dry-run echo, the read-back
+# comparison and the full-detail Prompt Context section, so a field added here
+# reaches all four.
+_PROMPT_CONTEXT_FIELDS: Tuple[Tuple[str, str, str], ...] = (
+    ("prompt_id", "promptId", "Prompt ID"),
+    ("prompt_length", "promptLength", "Prompt Length"),
+    ("query_source", "querySource", "Query Source"),
+    ("speed", "speed", "Speed"),
+    ("subagent_type", "subagentType", "Subagent Type"),
+)
+_PROMPT_CONTEXT_WIRE_NAMES: Dict[str, str] = {
+    argument: wire_name for argument, wire_name, _ in _PROMPT_CONTEXT_FIELDS
+}
+_PROMPT_CONTEXT_LABELS: Tuple[Tuple[str, str], ...] = tuple(
+    (wire_name, label) for _, wire_name, label in _PROMPT_CONTEXT_FIELDS
+)
+
+
+# Accepted spellings of the return_transaction_data detail level. `true` sits
+# with `full` rather than with `summary`: a caller who asks for the transaction
+# data the obvious way is asking for the record, and the summary answer
+# withheld the trace grouping, cost and cache fields they came for (BACK-3222).
+_RETURN_DATA_LEVELS: Dict[str, str] = {
+    "no": "no",
+    "false": "no",
+    "0": "no",
+    "none": "no",
+    "summary": "summary",
+    "yes": "summary",
+    "1": "summary",
+    "basic": "summary",
+    "true": "full",
+    "full": "full",
+    "detailed": "full",
+    "verbose": "full",
+    "complete": "full",
+    "all": "full",
+}
+
+
+def _normalize_return_data_level(arguments: Dict[str, Any]) -> str:
+    """Normalize `return_transaction_data` to "no", "summary" or "full".
+
+    Accepts the legacy boolean alongside the string enum; anything else falls
+    back to "no" rather than guessing a detail level for a caller.
+    """
+    value = arguments.get("return_transaction_data", "no")
+
+    if isinstance(value, bool):
+        return "full" if value else "no"
+
+    if isinstance(value, str):
+        return _RETURN_DATA_LEVELS.get(value.lower().strip(), "no")
+
+    return "no"
+
+
 # Fields analyze_recent_transactions measures presence for. These are the
 # RESPONSE spellings declared on AICompletionMetricResource in
 # specs/openapi/hypercurrent.json, not the submission spellings, and that
@@ -718,6 +795,7 @@ _COMPLETIONS_REPORTED_FIELDS: Tuple[str, ...] = (
     "skillMarketplaceName",
     "skillInvocationTrigger",
     "effort",
+    *_PROMPT_CONTEXT_WIRE_NAMES.values(),
     "modelHost",
     "subscriberEmail",
     "subscriberId",
@@ -741,6 +819,11 @@ _COMPLETIONS_RESPONSE_FIELD_ALIASES: Dict[str, str] = {
     "subscriber.email": "subscriberEmail",
     "subscriber.id": "subscriberId",
     "subscriber.credential": "subscriberCredential",
+    **{
+        argument: wire_name
+        for argument, wire_name in _PROMPT_CONTEXT_WIRE_NAMES.items()
+        if argument != wire_name
+    },
 }
 
 # Submission fields AICompletionMetricResource does not declare at all. A
@@ -785,6 +868,9 @@ def _extract_completions_filters(arguments: Dict[str, Any]) -> Dict[str, Any]:
 #   - effort / model_host / subscriber_email_source: metering spec
 #     AICompletionMetadataResource.effort / .modelHost / .subscriberEmailSource
 #     maxLength — the API rejects the whole submission over them
+#   - prompt_id / query_source / speed / subagent_type: hypercurrent
+#     AICompletionMetadataResource @Size caps (BACK-3134), same whole-submission
+#     rejection
 _OPTIONAL_STRING_MAX_LENGTH = 500
 _OPTIONAL_STRING_MAX_LENGTH_OVERRIDES: Dict[str, int] = {
     "ticket_id": 256,
@@ -795,6 +881,10 @@ _OPTIONAL_STRING_MAX_LENGTH_OVERRIDES: Dict[str, int] = {
     "effort": 16,
     "model_host": 50,
     "subscriber_email_source": 20,
+    "prompt_id": 64,
+    "query_source": 128,
+    "speed": 16,
+    "subagent_type": 128,
 }
 
 # Completion provenance fields (metering spec AICompletionMetadataResource,
@@ -826,7 +916,32 @@ _DEPRECATED_SUBMISSION_ALIASES: Dict[str, str] = {
 # unrecognised but well-formed value is stored verbatim — so only the shape the
 # platform enforces is checked here (hypercurrent AICompletionMetadataResource),
 # never an allow-list, which would reject valid new levels.
-_EFFORT_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_SHORT_SLUG_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_EFFORT_PATTERN = _SHORT_SLUG_PATTERN
+
+# Prompt-context shapes, mirrored from hypercurrent AICompletionMetadataResource
+# (BACK-3134), which rejects the whole submission over any one of them. As with
+# effort, the vocabularies of speed, query_source and subagent_type are open
+# (Claude Code emits new values as it evolves), so only the shape is checked.
+# query_source and subagent_type take a wider class than the short slug because
+# real values carry ':' and '.' (repl_main_thread:outputStyle:custom).
+_CALL_ORIGIN_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
+_PROMPT_CONTEXT_STRING_PATTERNS: Dict[str, "re.Pattern[str]"] = {
+    "prompt_id": _SHORT_SLUG_PATTERN,
+    "query_source": _CALL_ORIGIN_PATTERN,
+    "speed": _SHORT_SLUG_PATTERN,
+    "subagent_type": _CALL_ORIGIN_PATTERN,
+}
+# promptLength is a Kotlin Int on the platform: a larger count fails
+# deserialization and 400s the submission.
+_PROMPT_LENGTH_MAX = 2**31 - 1
+_PROMPT_CONTEXT_EXAMPLES: Dict[str, Any] = {
+    "prompt_id": "0f2b8a54-6c31-4d7e-9a10-b5c7d2e84f63",
+    "prompt_length": 412,
+    "query_source": "repl_main_thread",
+    "speed": "fast",
+    "subagent_type": "general-purpose",
+}
 
 # Closed vocabularies. skill_source and skill_kind land in a shared skill
 # catalog row that is written once from whichever submission arrives first and
@@ -889,6 +1004,7 @@ _VALIDATION_CACHE_FIELDS: Tuple[str, ...] = (
     "subscriber",
     "is_streamed",
     *_SYNC_VALIDATED_OPTIONAL_STRING_FIELDS,
+    *_PROMPT_CONTEXT_WIRE_NAMES,
 )
 
 
@@ -916,6 +1032,86 @@ def _effort_format_errors(arguments: Dict[str, Any]) -> List[str]:
             "(letters, digits, underscore and hyphen only)"
         ]
     return []
+
+
+def _slug_violation(value: Any, pattern: "re.Pattern[str]", max_length: int) -> Optional[str]:
+    """Why `value` is not a well-formed slug of at most `max_length` characters, or None."""
+    if not isinstance(value, str):
+        return f"Expected string, got {type(value).__name__}"
+    if len(value) > max_length:
+        return f"Too long (max {max_length} characters), got {len(value)}"
+    if not pattern.fullmatch(value):
+        return f"Invalid format '{value}', must match {pattern.pattern}"
+    return None
+
+
+def _prompt_length_violation(value: Any) -> Optional[str]:
+    """Why `value` is not a non-negative character count, or None."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return f"Expected a non-negative integer character count, got {type(value).__name__}"
+    if not 0 <= value <= _PROMPT_LENGTH_MAX:
+        return f"Must be between 0 and {_PROMPT_LENGTH_MAX}, got {value}"
+    return None
+
+
+def _prompt_context_violations(arguments: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """(field, reason) for every prompt-context argument the platform would reject.
+
+    Shared by every validation path so `validate`, the sync fast path and the
+    submit pre-flight reach the same verdict. Absent fields are never violations.
+    """
+    violations = []
+    for field, pattern in _PROMPT_CONTEXT_STRING_PATTERNS.items():
+        value = arguments.get(field)
+        reason = None if value is None else _slug_violation(
+            value, pattern, _optional_string_max_length(field)
+        )
+        if reason:
+            violations.append((field, reason))
+    prompt_length = arguments.get("prompt_length")
+    length_reason = None if prompt_length is None else _prompt_length_violation(prompt_length)
+    if length_reason:
+        violations.append(("prompt_length", length_reason))
+    return violations
+
+
+def _prompt_context_errors(arguments: Dict[str, Any]) -> List[str]:
+    """Prompt-context violations in the bullet format of the validation reports."""
+    return [f"• {field}: {reason}" for field, reason in _prompt_context_violations(arguments)]
+
+
+_PROMPT_CONTEXT_DESCRIPTIONS: Dict[str, str] = {
+    "prompt_id": "Opaque id of the human prompt that caused this call; several calls share one. Never the prompt text.",
+    "query_source": "Which subsystem of the coding assistant issued this call (Claude Code: 'main', 'repl_main_thread', 'compact', 'subagent', or a subagent name).",
+    "speed": "Speed mode this call ran in ('fast' or 'normal' for Claude Code).",
+    "subagent_type": "Subagent type that made this call; distinct from agent, which names the coding assistant itself.",
+}
+
+
+def _prompt_context_input_schema() -> Dict[str, Dict[str, Any]]:
+    """Input-schema properties for the prompt-context submission fields."""
+    properties: Dict[str, Dict[str, Any]] = {
+        field: {
+            "type": "string",
+            "description": (
+                f"{_PROMPT_CONTEXT_DESCRIPTIONS[field]} "
+                f"E.g. '{_PROMPT_CONTEXT_EXAMPLES[field]}'. "
+                f"Max {_optional_string_max_length(field)} characters, must match {pattern.pattern}; "
+                "open vocabulary, stored verbatim. Submission field for submit_ai_transaction."
+            ),
+        }
+        for field, pattern in _PROMPT_CONTEXT_STRING_PATTERNS.items()
+    }
+    properties["prompt_length"] = {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": _PROMPT_LENGTH_MAX,
+        "description": (
+            "Character count of the human prompt that caused this call - a count, never the text. "
+            f"E.g. {_PROMPT_CONTEXT_EXAMPLES['prompt_length']}. Submission field for submit_ai_transaction."
+        ),
+    }
+    return properties
 
 
 def _email_source_shape_errors(arguments: Dict[str, Any]) -> List[str]:
@@ -1346,6 +1542,12 @@ class MeteringTransactionManager:
             effort_errors = _effort_format_errors(arguments) + _email_source_shape_errors(arguments)
             if effort_errors:
                 logger.warning(f"Rejected completion provenance: {'; '.join(effort_errors)}")
+                return False
+
+            prompt_context_violations = _prompt_context_violations(arguments)
+            if prompt_context_violations:
+                rejected = ", ".join(field for field, _ in prompt_context_violations)
+                logger.warning(f"Rejected prompt context: {rejected}; values withheld")
                 return False
 
             # Validate subscriber object if provided
@@ -1779,6 +1981,7 @@ The subscriber data structure has been updated. The old individual fields are no
         errors.extend(_skill_vocabulary_errors(arguments))
         errors.extend(_effort_format_errors(arguments))
         errors.extend(_email_source_shape_errors(arguments))
+        errors.extend(_prompt_context_errors(arguments))
 
         # Validate trace string fields from BOTH top-level AND usage_metadata
         # These fields support both snake_case and camelCase aliases
@@ -2294,6 +2497,7 @@ The subscriber data structure has been updated. The old individual fields are no
             errors.extend(_skill_vocabulary_errors(arguments))
             errors.extend(_effort_format_errors(arguments))
             errors.extend(_email_source_shape_errors(arguments))
+            errors.extend(_prompt_context_errors(arguments))
 
             # Validate response_quality_score (critical missing validation!)
             if (
@@ -2826,6 +3030,8 @@ The subscriber data structure has been updated. The old individual fields are no
                 },
             )
 
+        self._reject_invalid_prompt_context(arguments)
+
         # Build payload matching EXACT Revenium API requirements
         payload = {
             "transactionId": transaction_id,
@@ -2877,6 +3083,10 @@ The subscriber data structure has been updated. The old individual fields are no
             "effort": arguments.get("effort"),
             "modelHost": arguments.get("model_host"),
             "subscriberEmailSource": arguments.get("subscriber_email_source"),
+            **{
+                wire_name: arguments.get(argument)
+                for argument, wire_name in _PROMPT_CONTEXT_WIRE_NAMES.items()
+            },
         }
 
         # Add non-None optional fields
@@ -2971,6 +3181,25 @@ The subscriber data structure has been updated. The old individual fields are no
             "tokens": f"{arguments['input_tokens']} input + {arguments['output_tokens']} output",
             "duration_ms": arguments["duration_ms"],
         }
+
+    def _reject_invalid_prompt_context(self, arguments: Dict[str, Any]) -> None:
+        """Raise a structured error naming the first prompt-context field the platform would 400."""
+        violations = _prompt_context_violations(arguments)
+        if not violations:
+            return
+        field, reason = violations[0]
+        example = _PROMPT_CONTEXT_EXAMPLES[field]
+        raise create_structured_validation_error(
+            message=f"Invalid {field}: {reason}",
+            field=field,
+            value=arguments.get(field),
+            suggestions=[
+                f"Send {field} in the shape the platform accepts, e.g. {example!r}",
+                "The vocabulary is open: any well-formed value is stored verbatim",
+                f"Or omit {field} when the source does not report it",
+            ],
+            examples={"valid_format": example},
+        )
 
     async def get_transaction_status(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get status of a specific transaction."""
@@ -3258,34 +3487,8 @@ The subscriber data structure has been updated. The old individual fields are no
         }
 
     def _normalize_return_data_parameter(self, arguments: Dict[str, Any]) -> str:
-        """Convert legacy boolean or new string values to normalized string enum.
-
-        Supports backward compatibility for boolean values while enabling new string enum options.
-
-        Args:
-            arguments: Raw arguments dictionary
-
-        Returns:
-            Normalized string: "no", "summary", or "full"
-        """
-        value = arguments.get("return_transaction_data", "no")
-
-        # Handle legacy boolean values for backward compatibility
-        if isinstance(value, bool):
-            return "summary" if value else "no"
-
-        # Handle string values (case-insensitive)
-        if isinstance(value, str):
-            value = value.lower().strip()
-            if value in ["no", "false", "0", "none"]:
-                return "no"
-            elif value in ["summary", "yes", "true", "1", "basic"]:
-                return "summary"
-            elif value in ["full", "detailed", "verbose", "complete", "all"]:
-                return "full"
-
-        # Default fallback for invalid values
-        return "no"
+        """Normalize `return_transaction_data`; see `_normalize_return_data_level`."""
+        return _normalize_return_data_level(arguments)
 
     def _extract_lookup_parameters(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Extract and validate lookup_transactions parameters."""
@@ -3671,34 +3874,8 @@ class MeteringManagement(ToolBase):
         self.validator = MeteringValidator(self.transaction_manager)  # Share transaction manager
 
     def _normalize_return_data_parameter(self, arguments: Dict[str, Any]) -> str:
-        """Convert legacy boolean or new string values to normalized string enum.
-
-        Supports backward compatibility for boolean values while enabling new string enum options.
-
-        Args:
-            arguments: Raw arguments dictionary
-
-        Returns:
-            Normalized string: "no", "summary", or "full"
-        """
-        value = arguments.get("return_transaction_data", "no")
-
-        # Handle legacy boolean values for backward compatibility
-        if isinstance(value, bool):
-            return "summary" if value else "no"
-
-        # Handle string values (case-insensitive)
-        if isinstance(value, str):
-            value = value.lower().strip()
-            if value in ["no", "false", "0", "none"]:
-                return "no"
-            elif value in ["summary", "yes", "true", "1", "basic"]:
-                return "summary"
-            elif value in ["full", "detailed", "verbose", "complete", "all"]:
-                return "full"
-
-        # Default fallback for invalid values
-        return "no"
+        """Normalize `return_transaction_data`; see `_normalize_return_data_level`."""
+        return _normalize_return_data_level(arguments)
 
     async def handle_action(
         self,
@@ -3784,6 +3961,10 @@ class MeteringManagement(ToolBase):
                             ("effort", "Effort"),
                             ("model_host", "Model Host"),
                             ("subscriber_email_source", "Subscriber Email Source"),
+                            *(
+                                (argument, label)
+                                for argument, _, label in _PROMPT_CONTEXT_FIELDS
+                            ),
                         ]
 
                         for field_key, field_label in optional_fields_display:
@@ -3946,7 +4127,11 @@ class MeteringManagement(ToolBase):
                             )
 
                             # Use shared method for core fields display
-                            response_text += self._format_transaction_summary(data, include_timestamp=False)
+                            response_text += self._format_transaction_summary(
+                                data,
+                                include_timestamp=False,
+                                include_trace_type=return_transaction_data != "full",
+                            )
 
                             # Show additional fields only in full mode
                             if return_transaction_data == "full":
@@ -4146,7 +4331,11 @@ class MeteringManagement(ToolBase):
 
                 if return_transaction_data in ["summary", "full"]:
                     # Use shared method for core fields display (includes timestamp for recent transactions)
-                    response_text += self._format_transaction_summary(transaction, include_timestamp=True)
+                    response_text += self._format_transaction_summary(
+                        transaction,
+                        include_timestamp=True,
+                        include_trace_type=return_transaction_data != "full",
+                    )
 
                     if return_transaction_data == "full":
                         response_text += self._format_full_transaction_details(transaction)
@@ -4269,6 +4458,7 @@ class MeteringManagement(ToolBase):
         details += self._format_performance_metrics(data)
         details += self._format_attribution_details(data)
         details += self._format_session_tracking(data)
+        details += self._format_prompt_context(data)
         details += self._format_quality_streaming(data)
         details += self._format_timestamps(data)
 
@@ -4531,20 +4721,39 @@ class MeteringManagement(ToolBase):
         return details
 
     def _format_session_tracking(self, data: Dict[str, Any]) -> str:
-        """Format session tracking section."""
-        session_fields = ['traceId', 'operationType']
-        if not any(data.get(field) for field in session_fields):
+        """Format the session tracking section.
+
+        A field the row does not carry is left out entirely rather than
+        rendered as 0 or N/A: every one of these is a free-form identifier the
+        caller either chose or did not, and a placeholder reads like a value
+        the platform stored.
+        """
+        lines = "".join(
+            f"  - **{label}**: {data.get(field)}\n"
+            for field, label in _SESSION_TRACKING_LABELS
+            if data.get(field)
+        )
+        if not lines:
             return ""
 
-        details = "- **Session Tracking**:\n"
+        return "- **Session Tracking**:\n" + lines
 
-        if data.get('traceId'):
-            details += f"  - **Trace ID**: {data.get('traceId')}\n"
+    def _format_prompt_context(self, data: Dict[str, Any]) -> str:
+        """Format the prompt-context section: which prompt caused the call and who issued it.
 
-        if data.get('operationType'):
-            details += f"  - **Operation Type**: {data.get('operationType')}\n"
+        Gated on presence, not truthiness: a promptLength of 0 is a reported
+        count, while a field the row does not carry is left out rather than
+        rendered as 0 or N/A.
+        """
+        lines = "".join(
+            f"  - **{label}**: {data[field]}\n"
+            for field, label in _PROMPT_CONTEXT_LABELS
+            if data.get(field) is not None and data.get(field) != ""
+        )
+        if not lines:
+            return ""
 
-        return details
+        return "- **Prompt Context**:\n" + lines
 
     def _format_quality_streaming(self, data: Dict[str, Any]) -> str:
         """Format quality and streaming section with proper boolean formatting."""
@@ -4635,7 +4844,12 @@ class MeteringManagement(ToolBase):
 
         return details
 
-    def _format_transaction_summary(self, transaction_data: Dict[str, Any], include_timestamp: bool = False) -> str:
+    def _format_transaction_summary(
+        self,
+        transaction_data: Dict[str, Any],
+        include_timestamp: bool = False,
+        include_trace_type: bool = True,
+    ) -> str:
         """Format core transaction fields for summary display.
 
         Extracts common summary formatting logic to eliminate code duplication
@@ -4644,6 +4858,8 @@ class MeteringManagement(ToolBase):
         Args:
             transaction_data: Transaction data dictionary from API response
             include_timestamp: Whether to include request time field
+            include_trace_type: Whether to include the trace type line; the
+                full rendering passes False because Session Tracking carries it
 
         Returns:
             Formatted string with core transaction fields
@@ -4653,6 +4869,15 @@ class MeteringManagement(ToolBase):
         summary += f"- **Provider**: {transaction_data.get('provider', 'N/A')}\n"
         summary += f"- **Input Tokens**: {transaction_data.get('inputTokenCount', 'N/A')}\n"
         summary += f"- **Output Tokens**: {transaction_data.get('outputTokenCount', 'N/A')}\n"
+
+        # The summary is what a lookup returns by default, and "which
+        # traceType did the platform store for this workflow?" is answerable
+        # from it only if the value is here. Shown only when the row carries
+        # one, so untraced transactions keep the six-field summary; the full
+        # rendering that follows the summary carries it in Session Tracking.
+        trace_type = transaction_data.get('traceType')
+        if include_trace_type and trace_type:
+            summary += f"- **Trace Type**: {trace_type}\n"
 
         if include_timestamp:
             summary += f"- **Request Time**: {transaction_data.get('requestTime', 'N/A')}\n"
@@ -4705,7 +4930,13 @@ class MeteringManagement(ToolBase):
         # Note: Migration guidance removed as legacy fields are no longer supported in MCP interface
         migration_guidance = ""
 
-        return [TextContent(type="text", text=capabilities_text + migration_guidance)]
+        # BACK-3170: this tool's advertised MCP schema lists only action, the
+        # paging parameters and a params object, so the per-action names have
+        # to be documented here.
+        return [
+            TextContent(type="text", text=capabilities_text + migration_guidance),
+            *await self.parameter_reference_block(),
+        ]
 
     async def _handle_analyze_recent_transactions(
         self,
@@ -5107,6 +5338,11 @@ get_field_documentation()
 - `effort` (optional) - Reasoning effort the model was asked for
 - `model_host` (optional) - Billing infrastructure hosting the model
 - `subscriber_email_source` (optional) - How the subscriber email was resolved
+- `prompt_id` (optional) - Opaque id of the human prompt that caused the call (never the prompt text)
+- `prompt_length` (optional) - Character count of that prompt (a count only, never the text)
+- `query_source` (optional) - Which subsystem of the coding assistant issued the call
+- `speed` (optional) - Speed mode the call ran in, e.g. `fast` or `normal`
+- `subagent_type` (optional) - Subagent type that made the call, e.g. `general-purpose`
 
 ### **Field Validation Rules**
 
@@ -5130,6 +5366,10 @@ get_field_documentation()
 - `effort`: String, 1-16 characters matching `^[A-Za-z0-9_-]+$` (e.g. `high`) — open vocabulary, any well-formed value is stored verbatim
 - `model_host`: String, 1-50 characters (e.g. `bedrock`, `vertex`, `anthropic`)
 - `subscriber_email_source`: String, 1-20 characters — how the email was resolved (e.g. `jwt`), never an email address
+- `prompt_id`: String, 1-64 characters matching `^[A-Za-z0-9_-]+$` (e.g. a UUID)
+- `speed`: String, 1-16 characters matching `^[A-Za-z0-9_-]+$` (e.g. `fast`) — open vocabulary
+- `query_source`, `subagent_type`: String, 1-128 characters matching `^[A-Za-z0-9._:-]+$` (e.g. `repl_main_thread`, `general-purpose`) — open vocabulary
+- `prompt_length`: Non-negative integer (character count)
 - `response_quality_score`: Float between 0.0 and 1.0 (inclusive)
 - `is_streamed`: Boolean (true/false, accepts string conversion)
 - `time_to_first_token`: Non-negative integer in milliseconds (≥ 0, ≤ 60,000ms)
@@ -5175,7 +5415,12 @@ validate(model="<model>", provider="<provider>", input_tokens=3000, output_token
   "skill_invocation_trigger": "user-slash",
   "effort": "high",
   "model_host": "bedrock",
-  "subscriber_email_source": "jwt"
+  "subscriber_email_source": "jwt",
+  "prompt_id": "0f2b8a54-6c31-4d7e-9a10-b5c7d2e84f63",
+  "prompt_length": 412,
+  "query_source": "repl_main_thread",
+  "speed": "fast",
+  "subagent_type": "general-purpose"
 }
 ```
 
@@ -5211,7 +5456,9 @@ get_agent_summary()                                            # Get tool overvi
 
 ## **Transaction Lookup with Detail Control**
 Summary: return_transaction_data accepts values of no, summary, or full and returns
-increasingly verbose responses for the respective choices.
+increasingly verbose responses for the respective choices. Boolean `true` and the
+string `"true"` select `full` - asking for the transaction data returns the whole
+record, not the summary.
 
 ```json
 {
@@ -5221,6 +5468,22 @@ increasingly verbose responses for the respective choices.
 }
 ```
 *This example returns only verification status (✅ Found/❌ Not Found)*
+
+### **Session Tracking (full detail only)**
+`return_transaction_data="full"` (or `true`) renders a **Session Tracking** section
+carrying every trace, operation and job identifier the transaction holds:
+`traceId`, `traceType`, `traceName`, `parentTransactionId`, `operationType`,
+`operationSubtype`, `agenticJobId`, `agenticJobName`, `agenticJobType`,
+`agenticJobVersion` and `ticketId`. A field the transaction does not
+carry is omitted rather than shown as 0 or N/A. `traceType` also appears in the
+summary rendering whenever the transaction carries one.
+
+### **Prompt Context (full detail only)**
+`return_transaction_data="full"` (or `true`) renders a **Prompt Context** section
+carrying `promptId`, `promptLength`, `querySource`, `speed` and `subagentType`:
+which human prompt caused the call, how long it was, which subsystem issued it,
+the speed mode it ran in and the subagent type that made it. A field the
+transaction does not carry is omitted rather than shown as 0 or N/A.
 
 ### **Cache Tokens (full detail only)**
 `return_transaction_data="full"` adds a **Cache Tokens** section carrying
@@ -5260,9 +5523,9 @@ lookup_transactions(transaction_ids=["tx_abc123"], max_retries=5)
   - Default: true (for lookup_transactions)
 - `return_transaction_data` (string|boolean) - Transaction data detail level:
   - "no": Show only verification status (✅ Found/❌ Not Found) - default
-  - "summary": Show core fields (Model, Provider, Input/Output Tokens)
-  - "full": Show comprehensive details including metadata, costs, attribution and cache tokens
-  - Legacy boolean support: true="summary", false="no"
+  - "summary": Show core fields (Model, Provider, Input/Output Tokens, plus Trace Type when the transaction carries one)
+  - "full": Show comprehensive details including metadata, costs, attribution, cache tokens, session tracking (traceId, traceType, traceName, parentTransactionId, operationType, operationSubtype, agenticJobId, agenticJobName, agenticJobType, agenticJobVersion, ticketId) and prompt context (promptId, promptLength, querySource, speed, subagentType)
+  - Boolean support: true="full", false="no"
 - `wait_seconds` (integer) - Wait time for transaction verification (0-300):
   - Default: 30 seconds
 
@@ -5321,7 +5584,7 @@ Browse recent transactions without needing specific transaction IDs. Perfect for
 ### **Parameters for Recent Transactions**
 - `page` (optional): Page number (0-based, default: 0)
 - `page_size` (optional): Transactions per page (1-50, default: 20)
-- `return_transaction_data` (optional): Detail level - "no", "summary", "full" (default: "summary")
+- `return_transaction_data` (optional): Detail level - "no", "summary", "full" (default: "summary"); boolean true selects "full"
 - `include_coding_assistants` (optional): Include coding-assistant records such as Claude Code and Gemini CLI (default: true)
 
 ## **Field Analysis of Recent Transactions**
@@ -5552,6 +5815,7 @@ main();
 - **Capped string fields**: `ticket_id` (1-256 chars), `skill_name` / `skill_plugin_name` / `skill_marketplace_name` (1-256 chars), `skill_invocation_trigger` (1-32 chars)
 - **Closed-vocabulary fields**: `skill_source` (`bundled`, `projectSettings`, `userSettings`, `plugin`), `skill_kind` (`workflow`)
 - **Completion provenance fields**: `effort` (1-16 chars, `^[A-Za-z0-9_-]+$`, open vocabulary), `model_host` (1-50 chars, e.g. `bedrock`), `subscriber_email_source` (1-20 chars, how the email was resolved — never an address)
+- **Prompt-context fields**: `prompt_id` (1-64 chars, `^[A-Za-z0-9_-]+$`), `prompt_length` (non-negative integer), `query_source` / `subagent_type` (1-128 chars, `^[A-Za-z0-9._:-]+$`), `speed` (1-16 chars, `^[A-Za-z0-9_-]+$`) — open vocabularies, shape-checked only
 - **Numeric fields**: `response_quality_score` (float 0.0-1.0), `time_to_first_token` (integer ≤ 60,000ms)
 - **Boolean fields**: `is_streamed` (true/false, string conversion supported)
 
@@ -5640,6 +5904,11 @@ report the flag. The pin is read-only here - it is set by a platform operator.
 - `effort` (string, 1-16 chars, `^[A-Za-z0-9_-]+$`) - reasoning effort asked for, e.g. `high`; open vocabulary
 - `model_host` (string, 1-50 chars) - billing infrastructure, e.g. `bedrock`, `vertex`, `anthropic`
 - `subscriber_email_source` (string, 1-20 chars) - how the subscriber email was resolved, e.g. `jwt`; never an email address
+- `prompt_id` (string, 1-64 chars, `^[A-Za-z0-9_-]+$`) - opaque id of the prompt that caused the call
+- `prompt_length` (integer, ≥ 0) - character count of that prompt
+- `query_source` (string, 1-128 chars, `^[A-Za-z0-9._:-]+$`) - subsystem that issued the call, e.g. `repl_main_thread`
+- `speed` (string, 1-16 chars, `^[A-Za-z0-9_-]+$`) - speed mode, e.g. `fast`
+- `subagent_type` (string, 1-128 chars, `^[A-Za-z0-9._:-]+$`) - subagent type, e.g. `general-purpose`
 - `response_quality_score` (float, 0.0-1.0)
 - `is_streamed` (boolean)
 - `time_to_first_token` (integer, ≤ 60,000ms)
@@ -5662,7 +5931,7 @@ report the flag. The pin is read-only here - it is set by a platform operator.
 - `search_page_range` (integer/array) - Pages to search (default: 5)
 - `page_size` (integer) - Transactions per call (1-1000, default: 1000)
 - `early_termination` (boolean) - Stop when found (default: true)
-- `return_transaction_data` (string|boolean) - Detail level: "no" (default), "summary", "full"
+- `return_transaction_data` (string|boolean) - Detail level: "no" (default), "summary", "full"; true="full"
 - `wait_seconds` (integer) - Wait time (0-300, default: 30)
 
 ## **Field Groups**
@@ -5673,6 +5942,7 @@ report the flag. The pin is read-only here - it is set by a platform operator.
 - **Billing**: + `product_name`, `subscription_id`, `subscriber`
 - **Ticket / Skill**: + `ticket_id`, `skill_name`, `skill_source`, `skill_kind`, `skill_plugin_name`, `skill_marketplace_name`, `skill_invocation_trigger`
 - **Completion provenance**: + `effort`, `model_host`, `subscriber_email_source`
+- **Prompt context**: + `prompt_id`, `prompt_length`, `query_source`, `speed`, `subagent_type`
 - **Timestamps**: + `request_time`, `response_time`, `completion_start_time`
 
 ## **Validation**
@@ -7695,7 +7965,7 @@ Use `validate()` before submission."""
                 parameters={
                     "page": "int (optional) - Page number for pagination (0-based, default: 0)",
                     "page_size": "int (optional) - Number of transactions per page (1-50, default: 20)",
-                    "return_transaction_data": "str (optional) - Detail level: 'no', 'summary', 'full' (default: 'summary')",
+                    "return_transaction_data": "str|bool (optional) - Detail level: 'no', 'summary', 'full' (default: 'summary'); true selects 'full'",
                     "include_coding_assistants": "bool (optional) - Include coding-assistant records such as Claude Code and Gemini CLI (default: true)",
                 },
                 examples=[
@@ -7862,6 +8132,7 @@ Use `validate()` before submission."""
                     "type": "string",
                     "description": f"How the subscriber email was resolved (e.g. '{_COMPLETION_PROVENANCE_EXAMPLES['subscriber_email_source']}'), never an email address. Max {_optional_string_max_length('subscriber_email_source')} characters. Submission field for submit_ai_transaction.",
                 },
+                **_prompt_context_input_schema(),
                 # Pagination and Search Control Parameters
                 "search_page_range": {
                     "type": ["integer", "array"],
@@ -7880,11 +8151,11 @@ Use `validate()` before submission."""
                 # Verification Control Parameters
                 "return_transaction_data": {
                     "oneOf": [
-                        {"type": "boolean", "description": "Legacy: true=summary, false=no"},
+                        {"type": "boolean", "description": "true=full, false=no"},
                         {"type": "string", "enum": ["no", "summary", "full"]}
                     ],
                     "default": "no",
-                    "description": "Transaction data detail level: 'no' (status only), 'summary' (core fields), 'full' (all metadata). Legacy boolean values supported for backward compatibility.",
+                    "description": "Transaction data detail level: 'no' (status only), 'summary' (core fields plus trace type), 'full' (all metadata, including the session tracking identifiers). Boolean true selects 'full', false selects 'no'.",
                 },
                 "wait_seconds": {
                     "type": "integer",
@@ -8061,6 +8332,37 @@ Use `validate()` before submission."""
                 "output_token_cost_max": {
                     "type": "number",
                     "description": "Maximum output token cost (inclusive).",
+                },
+                # Submission timestamps and streaming/quality flags. BACK-3170:
+                # declared here because this is the reference get_capabilities
+                # renders, and the advertised MCP schema no longer lists them.
+                "request_time": {
+                    "type": "string",
+                    "description": "ISO 8601 UTC timestamp ('Z'-suffixed) of when the request was sent. Auto-populated for submit_ai_transaction when omitted; send it with response_time when you have real timings.",
+                },
+                "response_time": {
+                    "type": "string",
+                    "description": "ISO 8601 UTC timestamp ('Z'-suffixed) of when the response completed. Auto-populated for submit_ai_transaction when omitted.",
+                },
+                "completion_start_time": {
+                    "type": "string",
+                    "description": "ISO 8601 UTC timestamp ('Z'-suffixed) of the first streamed token. Worth sending for streamed responses; auto-populated when omitted.",
+                },
+                "is_streamed": {
+                    "type": "boolean",
+                    "description": "Whether the response was streamed. Submission field for submit_ai_transaction.",
+                },
+                "response_quality_score": {
+                    "type": "number",
+                    "description": "Caller-assigned quality rating for the response (0.0-1.0). Submission field for submit_ai_transaction; pair it with is_streamed when tracking quality on streamed calls.",
+                },
+                "transaction_id": {
+                    "type": "string",
+                    "description": "A single transaction id — a UUID or 'tx_' + 12 lowercase hex characters. Filters lookup_transactions and verify_transaction; on submit_ai_transaction it overrides the auto-generated id.",
+                },
+                "organization_id": {
+                    "type": "string",
+                    "description": "Deprecated spelling of organization_name; declared only so the submit path can answer it with the rename message. Use organization_name.",
                 },
                 # Streaming performance
                 "time_to_first_token": {

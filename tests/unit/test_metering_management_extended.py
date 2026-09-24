@@ -845,6 +845,59 @@ class TestHandleActionLookupTransactions:
         text = result[0].text
         assert "Found" in text or "found" in text.lower()
 
+    @pytest.mark.asyncio
+    async def test_lookup_with_boolean_true_renders_full_details(self):
+        """BACK-3222: `true` returns the record, trace grouping included."""
+        mgmt, _ = _make_mgmt_with_client()
+        lookup_result = {
+            "summary": {
+                "total_requested": 1,
+                "found_count": 1,
+                "missing_count": 0,
+                "sources": {"session": 0, "api": 1},
+            },
+            "results": [
+                {
+                    "transaction_id": "tx_trace",
+                    "found": True,
+                    "source": "api",
+                    "transaction_data": {
+                        "model": "gpt-4o",
+                        "provider": "OPENAI",
+                        "inputTokenCount": 1000,
+                        "outputTokenCount": 500,
+                        "totalCost": 0.05,
+                        "traceId": "trace_abc123",
+                        "traceType": "document_analysis",
+                        "traceName": "Customer Onboarding - Acme Corp",
+                        "parentTransactionId": "tx_parent_9",
+                        "operationType": "completion",
+                        "operationSubtype": "summarize",
+                        "agenticJobId": "job-abc-123",
+                    },
+                },
+            ],
+            "configuration": {},
+        }
+        with patch.object(
+            mgmt.transaction_manager,
+            "lookup_transactions",
+            new_callable=AsyncMock,
+            return_value=lookup_result,
+        ):
+            result = await mgmt.handle_action(
+                "lookup_transactions",
+                {"transaction_ids": ["tx_trace"], "return_transaction_data": True},
+            )
+        text = result[0].text
+        assert "Cost Breakdown" in text
+        assert "Session Tracking" in text
+        assert text.count("**Trace Type**: document_analysis") == 1
+        assert "**Trace Name**: Customer Onboarding - Acme Corp" in text
+        assert "**Parent Transaction ID**: tx_parent_9" in text
+        assert "**Operation Subtype**: summarize" in text
+        assert "**Agentic Job ID**: job-abc-123" in text
+
 
 # ===========================================================================
 # handle_action — lookup_recent_transactions

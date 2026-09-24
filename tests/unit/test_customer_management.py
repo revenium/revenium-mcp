@@ -23,7 +23,10 @@ from src.revenium_mcp_server.tools_decomposed.customer_management import (
     PR_HEALTH_DIVERGENCE_NOTE,
     PR_HEALTH_REPORT_NOTE,
     PR_HEALTH_SEMANTICS_NOTE,
+    ORG_UNIT_ASSIGNMENT_CLEAR_NOTE,
+    ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE,
     ORG_UNIT_ID_STRING_NOTE,
+    ORG_UNIT_PERSON_DELETE_NOTE,
     ORG_UNIT_UNEXPECTED_SHAPE_NOTE,
     VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE,
     VERIFIED_DOMAIN_ADD_SEMANTICS_NOTE,
@@ -40,8 +43,14 @@ from src.revenium_mcp_server.tools_decomposed.customer_management import (
     TeamManager,
     UserManager,
     _format_create_warnings,
+    _format_org_unit_removal_text,
     _format_org_units_text,
     org_unit_id_to_filter_value,
+)
+from src.revenium_mcp_server.tools_decomposed.pr_health_settings_fields import (
+    PR_HEALTH_DISPLAY_FIELDS,
+    PR_HEALTH_FIELDS_NOTE,
+    PR_HEALTH_OMITTED_FIELDS_NOTE,
 )
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
@@ -120,6 +129,9 @@ def mock_client():
 
     # Org-unit methods
     client.get_org_units = AsyncMock(return_value=[])
+    client.delete_org_unit_person = AsyncMock(return_value={})
+    client.delete_org_unit_person_by_email = AsyncMock(return_value={})
+    client.clear_org_unit_assignment_by_email = AsyncMock(return_value={})
 
     # Helpers
     client._extract_embedded_data = MagicMock(return_value=[])
@@ -1576,6 +1588,350 @@ class TestTeamPrHealthSettingsRead:
         )
         with pytest.raises(ReveniumAPIError):
             await team_manager.get_pr_health_settings({"team_id": "jR2kmLs"})
+
+    @pytest.mark.asyncio
+    async def test_renders_every_stored_and_derived_field(self, team_manager, mock_client):
+        mock_client.get_team_pr_health_settings.return_value = FULL_PR_HEALTH_SETTINGS
+
+        result = await team_manager.get_pr_health_settings({"team_id": "jR2kmLs"})
+
+        for camel in PR_HEALTH_DISPLAY_FIELDS:
+            assert result[camel] == FULL_PR_HEALTH_SETTINGS[camel]
+        assert result["field_semantics"] == PR_HEALTH_FIELDS_NOTE
+
+    @pytest.mark.asyncio
+    async def test_absent_new_fields_are_not_rendered(self, team_manager, mock_client):
+        """A platform that predates the fields must not read as an empty exclusion list."""
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+        }
+
+        result = await team_manager.get_pr_health_settings({"team_id": "jR2kmLs"})
+
+        for camel in PR_HEALTH_DISPLAY_FIELDS:
+            assert camel not in result
+
+    @pytest.mark.asyncio
+    async def test_null_cutoff_is_rendered_as_no_cutoff(self, team_manager, mock_client):
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+            "cutoffDate": None,
+            "cutoffDateIsDefault": None,
+        }
+
+        result = await team_manager.get_pr_health_settings({"team_id": "jR2kmLs"})
+
+        assert result["cutoffDate"] is None
+        assert result["cutoffDateIsDefault"] is None
+
+    @pytest.mark.asyncio
+    async def test_rendered_text_carries_the_exclusions(self, mock_client):
+        tool = CustomerManagement(ucm_helper=None)
+        mock_client.get_team_pr_health_settings.return_value = FULL_PR_HEALTH_SETTINGS
+        with patch.object(tool, "get_client", AsyncMock(return_value=mock_client)):
+            result = await tool.handle_action("get_pr_health_settings", {"team_id": "jR2kmLs"})
+        assert "excludedRepos" in result[0].text
+        assert "acme/legacy-app" in result[0].text
+
+
+FULL_PR_HEALTH_SETTINGS = {
+    "agingDays": 14,
+    "rottingDays": 30,
+    "cutoffDate": "2026-04-07",
+    "cutoffDateIsDefault": True,
+    "defaultCutoffDate": "2026-04-07",
+    "excludedRepos": ["acme/legacy-app"],
+    "automationPatterns": ["^release-bot$"],
+    "builtInAutomationPatterns": ["^\\[Snyk\\]"],
+    "assistedOnly": False,
+}
+
+
+class TestTeamPrHealthSettingsOptionalFields:
+    """update_pr_health_settings sends the non-threshold fields only when supplied,
+    because the platform leaves an omitted field unchanged."""
+
+    @pytest.fixture(autouse=True)
+    def _stored(self, mock_client):
+        mock_client.get_team_pr_health_settings.return_value = dict(FULL_PR_HEALTH_SETTINGS)
+        mock_client.update_team_pr_health_settings.side_effect = (
+            lambda team_id, body: {**FULL_PR_HEALTH_SETTINGS, **body}
+        )
+
+    def _sent_body(self, mock_client):
+        mock_client.update_team_pr_health_settings.assert_called_once()
+        return mock_client.update_team_pr_health_settings.call_args[0][1]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "snake,camel,value",
+        [
+            ("assisted_only", "assistedOnly", True),
+            ("automation_patterns", "automationPatterns", ["^deploy-bot$", "chore: sync"]),
+            ("cutoff_date", "cutoffDate", "2025-03-01"),
+            ("excluded_repos", "excludedRepos", ["acme/legacy-app", "Acme.Org/my_repo-2"]),
+        ],
+    )
+    async def test_each_field_sent_under_its_wire_name_only(
+        self, team_manager, mock_client, snake, camel, value
+    ):
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", snake: value}
+        )
+
+        body = self._sent_body(mock_client)
+        assert body == {"agingDays": 14, "rottingDays": 30, camel: value}
+        assert result["updated_fields"] == [camel]
+        assert result["read_merged"] == ["agingDays", "rottingDays"]
+        assert result["previous_settings"] == {camel: FULL_PR_HEALTH_SETTINGS[camel]}
+        assert result[camel] == value
+
+    @pytest.mark.asyncio
+    async def test_threshold_only_update_sends_no_other_field(self, team_manager, mock_client):
+        await team_manager.update_pr_health_settings({"team_id": "jR2kmLs", "aging_days": 7})
+
+        assert self._sent_body(mock_client) == {"agingDays": 7, "rottingDays": 30}
+
+    @pytest.mark.asyncio
+    async def test_read_only_echoes_are_never_sent(self, team_manager, mock_client):
+        await team_manager.update_pr_health_settings({
+            "team_id": "jR2kmLs",
+            "excluded_repos": [],
+            "builtInAutomationPatterns": ["x"],
+            "cutoffDateIsDefault": True,
+            "defaultCutoffDate": "2024-01-01",
+        })
+
+        assert self._sent_body(mock_client) == {
+            "agingDays": 14,
+            "rottingDays": 30,
+            "excludedRepos": [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_empty_list_is_sent_to_clear(self, team_manager, mock_client):
+        await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "automation_patterns": []}
+        )
+        assert self._sent_body(mock_client)["automationPatterns"] == []
+
+    @pytest.mark.asyncio
+    async def test_resorted_and_recased_repo_echo_is_not_divergence(
+        self, team_manager, mock_client
+    ):
+        """The platform returns excludedRepos sorted and matches them case-insensitively."""
+        mock_client.update_team_pr_health_settings.side_effect = (
+            lambda team_id, body: {**FULL_PR_HEALTH_SETTINGS, "excludedRepos": ["acme/app", "zeta/Web"]}
+        )
+
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "excluded_repos": ["Zeta/web", "acme/app"]}
+        )
+
+        assert "divergence_warning" not in result
+        assert "divergence_detail" not in result
+
+    @pytest.mark.asyncio
+    async def test_repo_echo_missing_an_entry_warns_with_both_values(
+        self, team_manager, mock_client
+    ):
+        mock_client.update_team_pr_health_settings.side_effect = (
+            lambda team_id, body: {**FULL_PR_HEALTH_SETTINGS, "excludedRepos": ["acme/app"]}
+        )
+
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "excluded_repos": ["acme/app", "zeta/web"]}
+        )
+
+        assert result["divergence_warning"] == PR_HEALTH_DIVERGENCE_NOTE
+        assert result["diverged_fields"] == ["excludedRepos"]
+        assert result["divergence_detail"] == {
+            "excludedRepos": {"sent": ["acme/app", "zeta/web"], "stored": ["acme/app"]}
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "snake,camel,sent,stored",
+        [
+            ("assisted_only", "assistedOnly", True, False),
+            ("cutoff_date", "cutoffDate", "2025-03-01", "2025-04-01"),
+            ("automation_patterns", "automationPatterns", ["^a$", "^b$"], ["^b$", "^a$"]),
+        ],
+    )
+    async def test_other_optional_field_divergence_warns(
+        self, team_manager, mock_client, snake, camel, sent, stored
+    ):
+        mock_client.update_team_pr_health_settings.side_effect = (
+            lambda team_id, body: {**FULL_PR_HEALTH_SETTINGS, camel: stored}
+        )
+
+        result = await team_manager.update_pr_health_settings({"team_id": "jR2kmLs", snake: sent})
+
+        assert result["diverged_fields"] == [camel]
+        assert result["divergence_detail"][camel] == {"sent": sent, "stored": stored}
+
+    @pytest.mark.asyncio
+    async def test_threshold_and_optional_divergence_are_reported_together(
+        self, team_manager, mock_client
+    ):
+        mock_client.update_team_pr_health_settings.side_effect = (
+            lambda team_id, body: {**FULL_PR_HEALTH_SETTINGS, "rottingDays": 45, "assistedOnly": True}
+        )
+
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "assisted_only": False}
+        )
+
+        assert result["diverged_fields"] == ["rottingDays", "assistedOnly"]
+
+    @pytest.mark.asyncio
+    async def test_echo_omitting_an_optional_field_is_not_divergence(
+        self, team_manager, mock_client
+    ):
+        mock_client.update_team_pr_health_settings.side_effect = (
+            lambda team_id, body: {"agingDays": 14, "rottingDays": 30}
+        )
+
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "cutoff_date": "2025-03-01"}
+        )
+
+        assert "divergence_warning" not in result
+
+    @pytest.mark.asyncio
+    async def test_all_fields_together(self, team_manager, mock_client):
+        await team_manager.update_pr_health_settings({
+            "team_id": "jR2kmLs",
+            "aging_days": 7,
+            "rotting_days": 21,
+            "assisted_only": False,
+            "automation_patterns": ["^bot$"],
+            "cutoff_date": "2024-02-29",
+            "excluded_repos": ["acme/app"],
+        })
+        assert self._sent_body(mock_client) == {
+            "agingDays": 7,
+            "rottingDays": 21,
+            "assistedOnly": False,
+            "automationPatterns": ["^bot$"],
+            "cutoffDate": "2024-02-29",
+            "excludedRepos": ["acme/app"],
+        }
+
+    @pytest.mark.asyncio
+    async def test_response_states_the_omitted_fields_contract(self, team_manager, mock_client):
+        result = await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "cutoff_date": "2025-03-01"}
+        )
+        assert result["omitted_fields_note"] == PR_HEALTH_OMITTED_FIELDS_NOTE
+
+    @pytest.mark.asyncio
+    async def test_ordering_check_still_applies_to_the_merged_pair(
+        self, team_manager, mock_client
+    ):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_settings(
+                {"team_id": "jR2kmLs", "aging_days": 30, "excluded_repos": ["acme/app"]}
+            )
+        assert exc.value.field == "aging_days"
+        mock_client.update_team_pr_health_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_threshold_bounds_still_apply(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_settings(
+                {"team_id": "jR2kmLs", "rotting_days": 366, "assisted_only": True}
+            )
+        assert exc.value.field == "rotting_days"
+        mock_client.update_team_pr_health_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "snake,value",
+        [
+            ("assisted_only", "yes please"),
+            ("assisted_only", 1),
+            ("automation_patterns", "^bot$"),
+            ("automation_patterns", ["ok", "  "]),
+            ("automation_patterns", ["x" * 201]),
+            ("automation_patterns", [f"p{i}" for i in range(21)]),
+            ("automation_patterns", [3]),
+            ("automation_patterns", [".*"]),
+            ("automation_patterns", ["^$"]),
+            ("automation_patterns", ["^bot$", "(release)?"]),
+            ("cutoff_date", "2025-03-01\n"),
+            ("cutoff_date", "2099-01-01"),
+            ("cutoff_date", "2007-12-31"),
+            ("cutoff_date", "03/01/2025"),
+            ("cutoff_date", "20250301"),
+            ("cutoff_date", "2025-02-30"),
+            ("cutoff_date", 20250301),
+            ("excluded_repos", "acme/app"),
+            ("excluded_repos", ["not-a-repo"]),
+            ("excluded_repos", ["acme/app/extra"]),
+            ("excluded_repos", ["acme/my repo"]),
+            ("excluded_repos", ["acme/app\n"]),
+            ("excluded_repos", [f"acme/r{i}" for i in range(201)]),
+        ],
+    )
+    async def test_invalid_value_rejected_locally_naming_the_field(
+        self, team_manager, mock_client, snake, value
+    ):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_settings({"team_id": "jR2kmLs", snake: value})
+
+        assert exc.value.field == snake
+        assert snake in exc.value.message
+        mock_client.get_team_pr_health_settings.assert_not_called()
+        mock_client.update_team_pr_health_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_string_match_names_the_reason(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_settings(
+                {"team_id": "jR2kmLs", "automation_patterns": [".*"]}
+            )
+        assert exc.value.field == "automation_patterns"
+        assert "empty string" in exc.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "^dependabot\\[bot\\]$",
+            # \p{Lu} is valid in Java but a bad escape for Python's re: the server decides.
+            "^\\p{Lu}+-bot$",
+        ],
+    )
+    async def test_non_empty_matching_or_python_uncompilable_pattern_passes(
+        self, team_manager, mock_client, pattern
+    ):
+        await team_manager.update_pr_health_settings(
+            {"team_id": "jR2kmLs", "automation_patterns": [pattern]}
+        )
+        assert self._sent_body(mock_client)["automationPatterns"] == [pattern]
+
+    @pytest.mark.asyncio
+    async def test_today_is_an_accepted_cutoff(self, team_manager, mock_client):
+        from datetime import datetime, timezone
+
+        today = datetime.now(timezone.utc).date().isoformat()
+        await team_manager.update_pr_health_settings({"team_id": "jR2kmLs", "cutoff_date": today})
+        assert self._sent_body(mock_client)["cutoffDate"] == today
+
+    @pytest.mark.asyncio
+    async def test_limits_at_the_boundary_are_accepted(self, team_manager, mock_client):
+        await team_manager.update_pr_health_settings({
+            "team_id": "jR2kmLs",
+            "cutoff_date": "2008-01-01",
+            "excluded_repos": [f"acme/r{i}" for i in range(200)],
+            "automation_patterns": ["x" * 200] + [f"p{i}" for i in range(19)],
+        })
+        body = self._sent_body(mock_client)
+        assert len(body["excludedRepos"]) == 200
+        assert len(body["automationPatterns"]) == 20
 
 
 class TestTeamPrHealthSettingsUpdate:
@@ -3580,6 +3936,401 @@ class TestCustomerManagementOrgUnitAction:
         )
         assert org_unit_capability is not None
         assert ORG_UNIT_ID_STRING_NOTE in org_unit_capability.limitations
+
+
+class TestOrgUnitRemovalConfirmGate:
+    """BACK-3353: no removal DELETE is sent without a literal confirm=True."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("confirm", [None, False, "true", 1])
+    async def test_unconfirmed_delete_previews_without_calling_the_client(
+        self, org_unit_manager, mock_client, confirm
+    ):
+        arguments = {"person_id": 97}
+        if confirm is not None:
+            arguments["confirm"] = confirm
+
+        result = await org_unit_manager.delete_org_unit_person(arguments)
+
+        assert result["confirmation_required"] is True
+        assert result["effect"] == ORG_UNIT_PERSON_DELETE_NOTE
+        assert "deleted" not in result
+        mock_client.delete_org_unit_person.assert_not_awaited()
+        mock_client.delete_org_unit_person_by_email.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_clear_previews_without_calling_the_client(
+        self, org_unit_manager, mock_client
+    ):
+        result = await org_unit_manager.clear_org_unit_assignment({"email": "ash@acme.com"})
+
+        assert result["confirmation_required"] is True
+        assert result["effect"] == ORG_UNIT_ASSIGNMENT_CLEAR_NOTE
+        mock_client.clear_org_unit_assignment_by_email.assert_not_awaited()
+
+    def test_preview_text_names_the_target_and_the_confirming_call(self):
+        text = _format_org_unit_removal_text(
+            {
+                "action": "delete_org_unit_person",
+                "resource_type": "org_unit_persons",
+                "team_id": "jR2kmLs",
+                "person_id": 97,
+                "effect": ORG_UNIT_PERSON_DELETE_NOTE,
+                "confirmation_required": True,
+            }
+        )
+
+        assert "Confirmation Required - Delete directory person 97 in team jR2kmLs" in text
+        assert "No request was sent" in text
+        assert "`delete_org_unit_person(person_id=97, team_id='jR2kmLs', confirm=true)`" in text
+
+
+class TestOrgUnitRemovalConfirmed:
+    """Confirmed removals reach the right client method, scoped by team."""
+
+    @pytest.mark.asyncio
+    async def test_delete_by_person_id(self, org_unit_manager, mock_client):
+        result = await org_unit_manager.delete_org_unit_person(
+            {"person_id": "97", "team_id": " jR2kmLs ", "confirm": True}
+        )
+
+        mock_client.delete_org_unit_person.assert_awaited_once_with(97, "jR2kmLs")
+        mock_client.delete_org_unit_person_by_email.assert_not_awaited()
+        assert result["deleted"] is True
+        assert result["person_id"] == 97
+        assert result["team_id"] == "jR2kmLs"
+        assert result["resource_type"] == "org_unit_persons"
+
+    @pytest.mark.asyncio
+    async def test_delete_by_email_uses_the_ambient_team_when_omitted(
+        self, org_unit_manager, mock_client
+    ):
+        result = await org_unit_manager.delete_org_unit_person(
+            {"email": " ash@acme.com ", "confirm": True}
+        )
+
+        mock_client.delete_org_unit_person_by_email.assert_awaited_once_with("ash@acme.com", None)
+        mock_client.delete_org_unit_person.assert_not_awaited()
+        assert result["email"] == "ash@acme.com"
+        assert result["team_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_clear_assignment_by_email(self, org_unit_manager, mock_client):
+        result = await org_unit_manager.clear_org_unit_assignment(
+            {"email": "ash@acme.com", "team_id": "jR2kmLs", "confirm": True}
+        )
+
+        mock_client.clear_org_unit_assignment_by_email.assert_awaited_once_with(
+            "ash@acme.com", "jR2kmLs"
+        )
+        assert result["cleared"] is True
+        assert result["resource_type"] == "org_unit_assignments"
+
+    def test_confirmation_text_reports_the_removal_without_inventing_a_payload(self):
+        text = _format_org_unit_removal_text(
+            {
+                "action": "clear_org_unit_assignment",
+                "resource_type": "org_unit_assignments",
+                "team_id": None,
+                "email": "ash@acme.com",
+                "effect": ORG_UNIT_ASSIGNMENT_CLEAR_NOTE,
+                "cleared": True,
+            }
+        )
+
+        assert text.startswith(
+            "Cleared the org-unit assignment of the directory person for ash@acme.com "
+            "in the ambient team."
+        )
+        assert "Confirmation Required" not in text
+
+
+class TestOrgUnitRemovalIdentifierValidation:
+    """Bad identifiers are refused before any request, with the field named."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("person_id", ["abc", "-3", 0, True, 9.5, "", "\u00b2"])
+    async def test_invalid_person_id_names_person_id(self, org_unit_manager, mock_client, person_id):
+        with pytest.raises(ToolError) as excinfo:
+            await org_unit_manager.delete_org_unit_person(
+                {"person_id": person_id, "confirm": True}
+            )
+
+        assert excinfo.value.field == "person_id"
+        mock_client.delete_org_unit_person.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_identifier_names_person_id(self, org_unit_manager, mock_client):
+        with pytest.raises(ToolError) as excinfo:
+            await org_unit_manager.delete_org_unit_person({"confirm": True})
+
+        assert excinfo.value.field == "person_id"
+        mock_client.delete_org_unit_person.assert_not_awaited()
+        mock_client.delete_org_unit_person_by_email.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_both_identifiers_are_refused(self, org_unit_manager, mock_client):
+        with pytest.raises(ToolError) as excinfo:
+            await org_unit_manager.delete_org_unit_person(
+                {"person_id": 97, "email": "ash@acme.com", "confirm": True}
+            )
+
+        assert excinfo.value.field == "person_id"
+        assert "not both" in excinfo.value.message
+        mock_client.delete_org_unit_person.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("email", [None, "", "not-an-email", "a@b@c"])
+    async def test_clear_rejects_a_missing_or_malformed_email(
+        self, org_unit_manager, mock_client, email
+    ):
+        arguments = {"confirm": True}
+        if email is not None:
+            arguments["email"] = email
+
+        with pytest.raises(ToolError) as excinfo:
+            await org_unit_manager.clear_org_unit_assignment(arguments)
+
+        assert excinfo.value.field == "email"
+        mock_client.clear_org_unit_assignment_by_email.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["delete_org_unit_person", "clear_org_unit_assignment"])
+    @pytest.mark.parametrize("team_id", ["", "  ", 123])
+    async def test_supplied_but_unusable_team_id_is_refused(
+        self, org_unit_manager, mock_client, action, team_id
+    ):
+        arguments = {"email": "ash@acme.com", "team_id": team_id, "confirm": True}
+
+        with pytest.raises(ToolError) as excinfo:
+            await getattr(org_unit_manager, action)(arguments)
+
+        assert excinfo.value.field == "team_id"
+        mock_client.delete_org_unit_person_by_email.assert_not_awaited()
+        mock_client.clear_org_unit_assignment_by_email.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_none_team_id_falls_back_to_the_ambient_team(self, org_unit_manager, mock_client):
+        await org_unit_manager.clear_org_unit_assignment(
+            {"email": "ash@acme.com", "team_id": None, "confirm": True}
+        )
+
+        mock_client.clear_org_unit_assignment_by_email.assert_awaited_once_with(
+            "ash@acme.com", None
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_org_units_keeps_its_lenient_team_id(self, org_unit_manager, mock_client):
+        await org_unit_manager.list_org_units({"team_id": "  "})
+
+        mock_client.get_org_units.assert_awaited_once_with(None)
+
+    @pytest.mark.asyncio
+    async def test_invalid_identifier_is_refused_even_when_unconfirmed(
+        self, org_unit_manager
+    ):
+        with pytest.raises(ToolError) as excinfo:
+            await org_unit_manager.delete_org_unit_person({"person_id": "abc"})
+
+        assert excinfo.value.field == "person_id"
+
+
+class TestOrgUnitRemovalErrors:
+    """Upstream 4xx answers become caller guidance; everything else propagates."""
+
+    @pytest.mark.asyncio
+    async def test_403_maps_to_the_feature_flag_explanation(self, org_unit_manager, mock_client):
+        mock_client.delete_org_unit_person.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+
+        with pytest.raises(ToolError) as excinfo:
+            await org_unit_manager.delete_org_unit_person({"person_id": 97, "confirm": True})
+
+        assert excinfo.value.message == "Org units are not enabled for this tenant"
+        assert excinfo.value.error_code == ErrorCodes.API_AUTHORIZATION
+        assert any("org-unit-attribution-enabled" in s for s in excinfo.value.suggestions)
+        assert any("retry delete_org_unit_person" in s for s in excinfo.value.suggestions)
+
+    @pytest.mark.asyncio
+    async def test_403_on_clear_maps_to_the_feature_flag_explanation(
+        self, org_unit_manager, mock_client
+    ):
+        mock_client.clear_org_unit_assignment_by_email.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+
+        with pytest.raises(ToolError) as excinfo:
+            await org_unit_manager.clear_org_unit_assignment(
+                {"email": "ash@acme.com", "confirm": True}
+            )
+
+        assert excinfo.value.message == "Org units are not enabled for this tenant"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "upstream",
+        [
+            "HTTP 404: Directory person 97 not found in current organization",
+            "HTTP 404: Person not found in current organization",
+        ],
+    )
+    async def test_unknown_person_404_names_the_identifier(
+        self, org_unit_manager, mock_client, upstream
+    ):
+        mock_client.delete_org_unit_person.side_effect = ReveniumAPIError(
+            upstream, status_code=404
+        )
+
+        with pytest.raises(ToolError) as excinfo:
+            await org_unit_manager.delete_org_unit_person({"person_id": 97, "confirm": True})
+
+        assert excinfo.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert excinfo.value.field == "person_id"
+        assert excinfo.value.value == 97
+        assert any("earlier attempt" in s for s in excinfo.value.suggestions)
+
+    @pytest.mark.asyncio
+    async def test_unclassifiable_404_names_both_fields_without_guessing(
+        self, org_unit_manager, mock_client
+    ):
+        mock_client.delete_org_unit_person.side_effect = ReveniumAPIError(
+            "HTTP 404: Not Found", status_code=404
+        )
+
+        with pytest.raises(ToolError) as excinfo:
+            await org_unit_manager.delete_org_unit_person(
+                {"person_id": 97, "team_id": "jR2kmLs", "confirm": True}
+            )
+
+        assert excinfo.value.field is None
+        assert any(
+            "person_id=97" in s and "team_id='jR2kmLs'" in s for s in excinfo.value.suggestions
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_team_404_names_team_id(self, org_unit_manager, mock_client):
+        mock_client.clear_org_unit_assignment_by_email.side_effect = ReveniumAPIError(
+            "HTTP 404: Organization not found for ID: zzzzzz", status_code=404
+        )
+
+        with pytest.raises(ToolError) as excinfo:
+            await org_unit_manager.clear_org_unit_assignment(
+                {"email": "ash@acme.com", "team_id": "zzzzzz", "confirm": True}
+            )
+
+        assert excinfo.value.field == "team_id"
+        assert excinfo.value.value == "zzzzzz"
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_email_400_points_at_person_id(self, org_unit_manager, mock_client):
+        mock_client.delete_org_unit_person_by_email.side_effect = ReveniumAPIError(
+            "HTTP 400: email matches more than one directory person", status_code=400
+        )
+
+        with pytest.raises(ToolError) as excinfo:
+            await org_unit_manager.delete_org_unit_person(
+                {"email": "ash@acme.com", "confirm": True}
+            )
+
+        assert excinfo.value.field == "email"
+        assert any("person_id" in s for s in excinfo.value.suggestions)
+        assert not any("Revenium UI" in s for s in excinfo.value.suggestions)
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_email_400_on_clear_explains_there_is_no_id_route(
+        self, org_unit_manager, mock_client
+    ):
+        mock_client.clear_org_unit_assignment_by_email.side_effect = ReveniumAPIError(
+            "HTTP 400: email matches more than one directory person", status_code=400
+        )
+
+        with pytest.raises(ToolError) as excinfo:
+            await org_unit_manager.clear_org_unit_assignment(
+                {"email": "ash@acme.com", "confirm": True}
+            )
+
+        hint = excinfo.value.suggestions[-1]
+        assert "no id-addressed clear route" in hint
+        assert "Revenium UI" not in hint
+
+    @pytest.mark.asyncio
+    async def test_other_statuses_propagate(self, org_unit_manager, mock_client):
+        mock_client.delete_org_unit_person.side_effect = ReveniumAPIError("boom", status_code=500)
+
+        with pytest.raises(ReveniumAPIError):
+            await org_unit_manager.delete_org_unit_person({"person_id": 97, "confirm": True})
+
+
+class TestCustomerManagementOrgUnitRemovalActions:
+    """The removal actions on manage_customers."""
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_action_renders_a_preview_and_sends_nothing(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_client.delete_org_unit_person = AsyncMock(return_value={})
+            mock_gc.return_value = mock_client
+
+            result = await customer_mgmt.handle_action(
+                "delete_org_unit_person", {"person_id": 97}
+            )
+
+        assert "Confirmation Required" in result[0].text
+        mock_client.delete_org_unit_person.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_confirmed_action_is_dispatched(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_client.clear_org_unit_assignment_by_email = AsyncMock(return_value={})
+            mock_gc.return_value = mock_client
+
+            result = await customer_mgmt.handle_action(
+                "clear_org_unit_assignment",
+                {"email": "ash@acme.com", "team_id": "jR2kmLs", "confirm": True},
+            )
+
+        mock_client.clear_org_unit_assignment_by_email.assert_awaited_once_with(
+            "ash@acme.com", "jR2kmLs"
+        )
+        assert result[0].text.startswith("Cleared the org-unit assignment")
+
+    @pytest.mark.asyncio
+    async def test_actions_are_advertised_and_in_the_schema(self, customer_mgmt):
+        actions = await customer_mgmt._get_supported_actions()
+        schema = await customer_mgmt._get_input_schema()
+
+        assert {"delete_org_unit_person", "clear_org_unit_assignment"} <= set(actions)
+        assert {"person_id", "email", "confirm"} <= set(schema["properties"])
+
+    @pytest.mark.asyncio
+    async def test_unknown_action_lists_the_removals_as_org_unit_actions(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock):
+            with pytest.raises(ToolError) as excinfo:
+                await customer_mgmt.handle_action("no_such_action", {})
+
+        assert excinfo.value.examples["org_unit_actions"] == [
+            "list_org_units",
+            "delete_org_unit_person",
+            "clear_org_unit_assignment",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_capability_states_that_csv_import_stays_outside_the_mcp(self, customer_mgmt):
+        capabilities = await customer_mgmt._get_tool_capabilities()
+        org_unit_capability = next(c for c in capabilities if "Org Unit" in c.name)
+
+        assert ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE in org_unit_capability.limitations
+        assert "removeMissing" in ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE
+        assert "membershipsRemoved" in ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE
+
+    def test_capabilities_text_documents_the_confirm_gate_and_csv_exclusion(self, customer_mgmt):
+        text = customer_mgmt._format_capabilities_response({})[0].text
+
+        assert "delete_org_unit_person(person_id=97, confirm=true)" in text
+        assert "clear_org_unit_assignment(email='ash@acme.com', confirm=true)" in text
+        assert ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE in text
 
 
 class TestCustomerManagementAutoGeneration:

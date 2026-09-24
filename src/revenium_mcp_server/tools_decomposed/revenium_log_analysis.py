@@ -9,7 +9,7 @@ This tool provides log analysis capabilities including:
 """
 
 import json
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, NamedTuple, Optional, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -18,6 +18,7 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
+from ..client import ReveniumAPIError
 from ..common.error_handling import ErrorCodes, ToolError
 from ..introspection.metadata import ToolType
 from .log_analysis_constants import (
@@ -33,19 +34,152 @@ from .log_filters import LogFilter
 from .log_formatters import LogResponseFormatter
 from .unified_tool_base import ToolBase
 
-# The attribution-detail-text flag has no published read-only endpoint: the
+# Three of the four tenant flags have no published read-only endpoint: the
 # platform hides GET /v2/api/tenants/{id} from its API contract, so the only
-# two places it reports the value are the responses of this PATCH and of the
-# sibling strict-ingestion-mode PATCH. (The hidden route still answered on dev
-# when this was written; it is deliberately not wrapped, because an
-# undocumented route can be withdrawn without a contract change.) A caller who
-# wants to check the setting without changing it has nowhere to look, which is
-# worth saying on the response rather than leaving them to discover it.
-ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE = (
-    "Reading this flag: the platform publishes no read-only endpoint for it "
-    "(the tenant GET is hidden from the API contract), so this response and "
-    "the set_strict_ingestion_mode response are the only places it is reported."
+# places they are reported are the responses of the tenant toggles, each of
+# which answers with the whole tenant resource. (The hidden route still
+# answered on dev when this was written; it is deliberately not wrapped,
+# because an undocumented route can be withdrawn without a contract change.)
+# usageBillingEnabled is the exception: the platform publishes it on the tenant
+# stub of GET /v2/api/users/me, so it gets its own note pointing there.
+TOGGLE_ONLY_TENANT_FLAGS_READ_PATH_NOTE = (
+    "Reading strictIngestionMode, strictIngestionAllowTicketJobs and "
+    "attributionDetailTextEnabled: the platform publishes no read-only endpoint "
+    "for these flags (the tenant GET is hidden from the API contract), so the "
+    "tenant toggle responses are the only places they are reported."
 )
+
+USAGE_BILLING_READ_PATH_NOTE = (
+    "Reading usageBillingEnabled: get_usage_billing reports it without changing "
+    "anything - the platform publishes it on the tenant stub of "
+    "GET /v2/api/users/me."
+)
+
+USAGE_BILLING_FLAG = "usageBillingEnabled"
+
+# PRODUCT-3245: the platform gates this toggle on canManageUsageBilling, which
+# deliberately drops the organization-admin grant canManageTenant gives the
+# other two toggles, because the flag hides billing for every organization in
+# the account.
+USAGE_BILLING_GATE_NOTE = (
+    "set_usage_billing requires a platform admin or the tenant's own tenant admin "
+    "(and a key that is not read-only); an organization admin key passes the other "
+    "tenant toggles but not this one."
+)
+
+
+class TenantFlag(NamedTuple):
+    field: str
+    label: str
+    on: str
+    off: str
+    has_published_read_path: bool
+
+
+_TENANT_FLAGS_IN_RENDER_ORDER: tuple[TenantFlag, ...] = (
+    TenantFlag("strictIngestionMode", "Strict ingestion mode", "enabled", "disabled", False),
+    TenantFlag("strictIngestionAllowTicketJobs", "Ticket-grain Jobs", "allowed", "suppressed", False),
+    TenantFlag("attributionDetailTextEnabled", "Attribution detail text", "enabled", "disabled", False),
+    TenantFlag(USAGE_BILLING_FLAG, "Usage billing", "enabled", "disabled", True),
+)
+
+_TOGGLE_ONLY_TENANT_FLAGS = frozenset(
+    flag.field for flag in _TENANT_FLAGS_IN_RENDER_ORDER if not flag.has_published_read_path
+)
+
+
+def _tenant_sibling_flag_lines(result: Dict[str, Any], flag_being_set: str) -> str:
+    """Render every tenant flag the response carried except the one being set.
+
+    Every tenant toggle answers with the whole tenant resource, so each
+    response co-reports the sibling flags — for all but usageBillingEnabled the
+    only way to see a flag without writing it. An absent
+    field stays absent: guessing at it would be indistinguishable from a
+    reading.
+    """
+    return "".join(
+        f"- **{flag.label}**: {flag.on if result[flag.field] else flag.off}\n"
+        for flag in _TENANT_FLAGS_IN_RENDER_ORDER
+        if flag.field != flag_being_set and isinstance(result.get(flag.field), bool)
+    )
+
+
+def _read_path_notes(result: Dict[str, Any], flag_being_set: str) -> str:
+    """Say where each flag this response concerns can be read without a write."""
+    concerned = {flag_being_set} | {
+        flag.field
+        for flag in _TENANT_FLAGS_IN_RENDER_ORDER
+        if isinstance(result.get(flag.field), bool)
+    }
+    notes = []
+    if concerned & _TOGGLE_ONLY_TENANT_FLAGS:
+        notes.append(TOGGLE_ONLY_TENANT_FLAGS_READ_PATH_NOTE)
+    if USAGE_BILLING_FLAG in concerned:
+        notes.append(USAGE_BILLING_READ_PATH_NOTE)
+    return "".join(f"\n\n{note}" for note in notes)
+
+
+USAGE_BILLING_FORBIDDEN_MESSAGE = (
+    "Permission denied: this toggle requires a platform admin or the tenant's own "
+    "tenant admin; an organization admin key passes the other tenant toggles but "
+    "not this one"
+)
+
+
+def _usage_billing_failure(error: Exception) -> ToolError:
+    logger.error(f"Failed to set usage billing: {error}")
+    return ToolError(
+        message=f"Failed to set usage billing: {str(error)}",
+        error_code=ErrorCodes.API_ERROR,
+        field="usage_billing",
+        suggestions=[
+            "Verify the tenant id is available (auto-discovered from the API key)",
+            USAGE_BILLING_GATE_NOTE,
+        ],
+    )
+
+
+def _usage_billing_state_line(state: Any) -> str:
+    if isinstance(state, bool):
+        return f"- **State**: {'enabled' if state else 'disabled'}\n"
+    return "- **State**: not reported (the tenant stub carried no usageBillingEnabled)\n"
+
+
+def _roles_line(roles: Any) -> str:
+    if not isinstance(roles, list):
+        return ""
+    return f"- **Roles on this key's user**: {', '.join(map(str, roles)) or 'none'}\n"
+
+
+def _normalised_tenant_id(tenant_id: Any) -> str:
+    return "" if tenant_id is None else str(tenant_id).strip()
+
+
+def _foreign_tenant_warning(reported_tenant_id: str, configured_tenant_id: str) -> str:
+    if not configured_tenant_id:
+        return ""
+    if not reported_tenant_id:
+        return (
+            "\n**Tenant not reported**: the /users/me tenant stub did not report a tenant "
+            "id, so this reading cannot be matched to the configured tenant "
+            f"{configured_tenant_id} that set_usage_billing writes to.\n"
+        )
+    if reported_tenant_id == configured_tenant_id:
+        return ""
+    return (
+        f"\n**Different tenant**: this key belongs to tenant {reported_tenant_id}, while "
+        f"set_usage_billing writes to the configured tenant {configured_tenant_id}. "
+        "The state above is the key's own tenant, not the configured one.\n"
+    )
+
+
+def _unconfirmed_sibling_report(sibling_flag_lines: str) -> str:
+    if not sibling_flag_lines:
+        return ""
+    return (
+        "\n\nThe response did carry the tenant's other settings:\n\n"
+        f"{sibling_flag_lines}"
+    )
 
 
 class ReveniumLogAnalysis(ToolBase):
@@ -57,7 +191,7 @@ class ReveniumLogAnalysis(ToolBase):
 
     tool_name: ClassVar[str] = "revenium_log_analysis"
     tool_description: ClassVar[str] = (
-        "Revenium log analysis for system troubleshooting and diagnostic investigation. Key actions: get_internal_logs, get_integration_logs, get_recent_logs, search_logs, analyze_operations, get_ingestion_failures, set_strict_ingestion_mode, set_attribution_detail_text. Default size: 200 records (max: 1000). Use get_examples() for usage guidance and get_capabilities() for status."
+        "Revenium log analysis for system troubleshooting and diagnostic investigation. Key actions: get_internal_logs, get_integration_logs, get_recent_logs, search_logs, analyze_operations, get_ingestion_failures, set_strict_ingestion_mode, set_attribution_detail_text, set_usage_billing, get_usage_billing. Default size: 200 records (max: 1000). Use get_examples() for usage guidance and get_capabilities() for status."
     )
     business_category: ClassVar[str] = "System & Monitoring Tools"
     tool_type: ClassVar[ToolType] = ToolType.UTILITY
@@ -416,6 +550,10 @@ No log entries found for analysis. This may be expected for integration logs.
             return await self._handle_set_strict_ingestion_mode(arguments, ctx=ctx)
         elif action == "set_attribution_detail_text":
             return await self._handle_set_attribution_detail_text(arguments, ctx=ctx)
+        elif action == "set_usage_billing":
+            return await self._handle_set_usage_billing(arguments, ctx=ctx)
+        elif action == "get_usage_billing":
+            return await self._handle_get_usage_billing(arguments, ctx=ctx)
         else:
             return await self._handle_unsupported_action(action)
 
@@ -650,35 +788,18 @@ No log entries found for analysis. This may be expected for integration logs.
                 enabled, allow_ticket_jobs=allow_ticket_jobs
             )
             new_state = result.get("strictIngestionMode")
-            new_allow_ticket_jobs = result.get("strictIngestionAllowTicketJobs")
-            # Same tenant resource, so this PATCH echoes the
-            # attribution-detail-text flag too, and this is one of only two
-            # responses that carry it (see
-            # ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE). The line is therefore
-            # built BEFORE the missing-strict-state branch below and rendered
-            # by both: a response carrying the flag but not strictIngestionMode
-            # has told the caller exactly one thing, and dropping it there
-            # would lose state nothing else can report.
-            attribution_detail_text = result.get("attributionDetailTextEnabled")
-            attribution_line = (
-                f"- **Attribution detail text**: "
-                f"{'enabled' if attribution_detail_text else 'disabled'}\n"
-                if isinstance(attribution_detail_text, bool)
-                else ""
+            # Built BEFORE the missing-strict-state branch below and rendered
+            # by both: a response carrying a sibling flag but not
+            # strictIngestionMode has told the caller exactly one thing, and
+            # dropping it there would lose state nothing else can report.
+            sibling_flag_lines = _tenant_sibling_flag_lines(
+                result, "strictIngestionMode"
             )
-            attribution_note = (
-                f"\n\n{ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE}" if attribution_line else ""
-            )
+            read_path_note = _read_path_notes(result, "strictIngestionMode")
             if not isinstance(new_state, bool):
                 # The PATCH succeeded but the response did not carry the
                 # field — report that honestly instead of echoing the
                 # requested value back as the server's confirmed state.
-                reported_attribution = (
-                    f"\n\nThe response did carry the tenant's other setting:\n\n"
-                    f"{attribution_line}"
-                    if attribution_line
-                    else ""
-                )
                 return [
                     TextContent(
                         type="text",
@@ -687,19 +808,11 @@ No log entries found for analysis. This may be expected for integration logs.
                             "The server accepted the request but its response did not include "
                             "strictIngestionMode, so the resulting state could not be verified. "
                             "Check the tenant's current state before relying on it."
-                            + reported_attribution
-                            + attribution_note
+                            + _unconfirmed_sibling_report(sibling_flag_lines)
+                            + read_path_note
                         ),
                     )
                 ]
-            # Same honesty rule as strictIngestionMode: only report the
-            # ticket-jobs opt-in when the server actually echoed it back.
-            ticket_jobs_line = (
-                f"- **Ticket-grain Jobs**: "
-                f"{'allowed' if new_allow_ticket_jobs else 'suppressed'}\n"
-                if isinstance(new_allow_ticket_jobs, bool)
-                else ""
-            )
             follow_up = (
                 "Transactions referencing unknown entities will now be "
                 "rejected — monitor them with get_ingestion_failures."
@@ -714,11 +827,10 @@ No log entries found for analysis. This may be expected for integration logs.
                     text=(
                         f"**Strict Ingestion Mode Updated**\n\n"
                         f"- **State**: {'enabled' if new_state else 'disabled'}\n"
-                        f"{ticket_jobs_line}"
-                        f"{attribution_line}"
+                        f"{sibling_flag_lines}"
                         f"- **Tenant**: {result.get('id', 'current')}\n\n"
                         + follow_up
-                        + attribution_note
+                        + read_path_note
                     ),
                 )
             ]
@@ -776,6 +888,10 @@ No log entries found for analysis. This may be expected for integration logs.
             client = await self.get_client(ctx=ctx)
             result = await client.set_attribution_detail_text(enabled)
             new_state = result.get("attributionDetailTextEnabled")
+            sibling_flag_lines = _tenant_sibling_flag_lines(
+                result, "attributionDetailTextEnabled"
+            )
+            read_path_note = _read_path_notes(result, "attributionDetailTextEnabled")
             if not isinstance(new_state, bool):
                 # The PATCH succeeded but the response did not carry the
                 # field. Report that instead of echoing the requested value
@@ -788,8 +904,9 @@ No log entries found for analysis. This may be expected for integration logs.
                             "**Attribution Detail Text - change accepted, state not "
                             "confirmed**\n\nThe server accepted the request but its "
                             "response did not include attributionDetailTextEnabled, so "
-                            "the resulting state could not be verified.\n\n"
-                            + ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE
+                            "the resulting state could not be verified."
+                            + _unconfirmed_sibling_report(sibling_flag_lines)
+                            + read_path_note
                         ),
                     )
                 ]
@@ -809,8 +926,9 @@ No log entries found for analysis. This may be expected for integration logs.
                     text=(
                         f"**Attribution Detail Text Updated**\n\n"
                         f"- **State**: {'enabled' if new_state else 'disabled'}\n"
+                        f"{sibling_flag_lines}"
                         f"- **Tenant**: {result.get('id', 'current')}\n\n"
-                        f"{follow_up}\n\n" + ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE
+                        f"{follow_up}" + read_path_note
                     ),
                 )
             ]
@@ -830,6 +948,178 @@ No log entries found for analysis. This may be expected for integration logs.
                     "Check that your API key can manage the tenant",
                 ],
             )
+
+    async def _handle_set_usage_billing(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Show or hide the tenant's billing screens, guarded by confirm.
+
+        The flag is presentation-only: invoices, payment methods, plan and
+        subscription screens appear or disappear, while ingestion, rating and
+        invoicing keep running untouched and every stored amount stays put.
+        The platform default is on.
+
+        It is confirm-gated even though nothing is destroyed, because the
+        change lands on every user of the tenant at once and, once the billing
+        screens are gone, the people who would notice have no screen left to
+        notice it on. The state reported is the one the server returned, never
+        the requested value.
+        """
+        enabled = arguments.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ToolError(
+                message="set_usage_billing requires 'enabled' (boolean)",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="enabled",
+                value=enabled,
+                suggestions=[
+                    "Pass enabled=true to show the tenant's billing screens",
+                    "Pass enabled=false to hide them (billing itself keeps running)",
+                    "Add confirm=true to apply the change",
+                ],
+            )
+
+        # Only the boolean True applies the change — loosely typed MCP
+        # arguments (confirm="false", confirm=1) must not bypass the guard.
+        if arguments.get("confirm") is not True:
+            state = "SHOW" if enabled else "HIDE"
+            effect = (
+                "Every billing surface becomes visible again for the whole "
+                "tenant: invoices, payment methods, plan and subscription "
+                "screens. Nothing is recalculated — the invoices were being "
+                "produced while the screens were hidden."
+                if enabled
+                else "Every billing surface is HIDDEN for the whole tenant: "
+                "invoices, payment methods, plan and subscription screens. "
+                "This is presentation only — ingestion, rating and invoicing "
+                "keep running and no stored amount changes, but no user of the "
+                "tenant can reach a billing screen until the flag is turned "
+                "back on."
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"**Confirmation Required — {state} the tenant's billing screens**\n\n"
+                        f"This changes what every user of the tenant sees:\n\n{effect}\n\n"
+                        f"**Who can apply it**: {USAGE_BILLING_GATE_NOTE}\n\n"
+                        f"Read the current value first with `get_usage_billing()`. "
+                        f"To apply, repeat the call with confirm=true:\n"
+                        f"`set_usage_billing(enabled={str(enabled).lower()}, confirm=true)`"
+                    ),
+                )
+            ]
+
+        try:
+            client = await self.get_client(ctx=ctx)
+            result = await client.set_usage_billing(enabled)
+            new_state = result.get(USAGE_BILLING_FLAG)
+            sibling_flag_lines = _tenant_sibling_flag_lines(result, USAGE_BILLING_FLAG)
+            read_path_note = _read_path_notes(result, USAGE_BILLING_FLAG)
+            if not isinstance(new_state, bool):
+                # The PATCH succeeded but the response did not carry the
+                # field. Report that instead of echoing the requested value
+                # back as the server's confirmed state; get_usage_billing is
+                # the read that settles it.
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            "**Usage Billing - change accepted, state not confirmed**\n\n"
+                            "The server accepted the request but its response did not "
+                            "include usageBillingEnabled, so the resulting state could "
+                            "not be verified."
+                            + _unconfirmed_sibling_report(sibling_flag_lines)
+                            + read_path_note
+                        ),
+                    )
+                ]
+            follow_up = (
+                "Billing screens are visible to the tenant's users again."
+                if new_state
+                else "Billing screens are hidden from the tenant's users. Metering, "
+                "rating and invoicing are unaffected: invoices keep being produced "
+                "and will be there when the flag is turned back on."
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"**Usage Billing Updated**\n\n"
+                        f"- **State**: {'enabled' if new_state else 'disabled'}\n"
+                        f"{sibling_flag_lines}"
+                        f"- **Tenant**: {result.get('id', 'current')}\n\n"
+                        f"{follow_up}" + read_path_note
+                    ),
+                )
+            ]
+        except ToolError:
+            raise
+        except PermissionError:
+            # Auth failures must fail closed - never mask as a tool-error envelope.
+            raise
+        except ReveniumAPIError as e:
+            if e.status_code == 403:
+                raise ToolError(
+                    message=USAGE_BILLING_FORBIDDEN_MESSAGE,
+                    error_code=ErrorCodes.API_AUTHORIZATION,
+                    field="usage_billing",
+                    value=enabled,
+                    suggestions=[
+                        USAGE_BILLING_GATE_NOTE,
+                        "Ask the tenant's own tenant admin (or a platform admin) to run the change",
+                        "get_usage_billing() reads the current value without this permission",
+                    ],
+                ) from e
+            raise _usage_billing_failure(e) from e
+        except Exception as e:
+            raise _usage_billing_failure(e) from e
+
+    async def _handle_get_usage_billing(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Read usageBillingEnabled from the tenant stub of GET /users/me.
+
+        The stub describes the key's own tenant. When that is not the tenant
+        the toggles write to (an explicit REVENIUM_TENANT_ID), the reading is
+        labelled rather than presented as the target tenant's state.
+        """
+        try:
+            client = await self.get_client(ctx=ctx)
+            user = await client.get_users_me()
+        except ToolError:
+            raise
+        except PermissionError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to read usage billing: {e}")
+            raise ToolError(
+                message=f"Failed to read usage billing: {str(e)}",
+                error_code=ErrorCodes.API_ERROR,
+                field="usage_billing",
+                suggestions=["Verify the API key is valid for this environment"],
+            ) from e
+
+        user = user if isinstance(user, dict) else {}
+        tenant = user.get("tenant")
+        tenant = tenant if isinstance(tenant, dict) else {}
+        tenant_id = _normalised_tenant_id(tenant.get("id"))
+        configured_tenant_id = _normalised_tenant_id(getattr(client, "tenant_id", None))
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    "**Usage Billing**\n\n"
+                    f"{_usage_billing_state_line(tenant.get(USAGE_BILLING_FLAG))}"
+                    f"- **Tenant**: {tenant_id or 'not reported'}\n"
+                    f"{_roles_line(user.get('roles'))}"
+                    f"{_foreign_tenant_warning(tenant_id, configured_tenant_id)}"
+                    "\nRead from the tenant stub of GET /v2/api/users/me; nothing was "
+                    f"changed.\n\n**Who can change it**: {USAGE_BILLING_GATE_NOTE}"
+                ),
+            )
+        ]
+
 
     async def _handle_get_internal_logs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None

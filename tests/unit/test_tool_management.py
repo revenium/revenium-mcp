@@ -1004,8 +1004,11 @@ class TestToolManagementHandleAction:
     @pytest.mark.asyncio
     async def test_get_capabilities_returns_actions(self, tool_mgmt):
         result = await tool_mgmt.handle_action("get_capabilities", {})
-        assert len(result) == 1
+        # BACK-3170: a second block carries the per-action parameter reference,
+        # which the advertised MCP schema no longer lists.
+        assert len(result) == 2
         assert isinstance(result[0], TextContent)
+        assert "## Parameters" in result[1].text
         assert "get_cost_breakdown" in result[0].text
         assert "meter_event" in result[0].text
         assert "get_by_tool_id" in result[0].text

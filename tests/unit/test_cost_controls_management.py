@@ -2,8 +2,9 @@
 
 Tests the CostControlsManager and CostControlsManagement classes from the
 decomposed tools module. Covers CRUD (list, get, create, update, delete),
-the enforcement-visibility actions (list_enforcement_events,
-get_enforcement_rules), and the introspection actions.
+the enforcement-visibility actions (list_enforcement_events and its
+summary/history/affected sub-reads, get_enforcement_rules and
+get_enforcement_rule_roster), and the introspection actions.
 """
 
 import json
@@ -12,9 +13,14 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.tools_decomposed.cost_controls_management import (
+    ENFORCEMENT_EVENT_ROW_FIELDS_NOTE,
+    ENFORCEMENT_GROUP_PAIR_NOTE,
+    ENFORCEMENT_ROSTER_NOTE,
+    ENFORCEMENT_SUBREADS_UNPAGED_NOTE,
     ORG_UNIT_ENFORCEMENT_MAPS_NOTE,
     CostControlsManager,
     CostControlsManagement,
+    _build_enforcement_event_filters,
     _coerce_parent_org_unit_id,
     _summarize_org_unit_blocks,
     _summarize_org_unit_warnings,
@@ -39,7 +45,11 @@ def mock_client():
     client.update_cost_control = AsyncMock()
     client.delete_cost_control = AsyncMock()
     client.get_enforcement_events = AsyncMock()
+    client.get_enforcement_events_summary = AsyncMock()
+    client.get_enforcement_events_history = AsyncMock()
+    client.get_enforcement_events_affected = AsyncMock()
     client.get_enforcement_rules = AsyncMock()
+    client.get_enforcement_rule_roster = AsyncMock()
     client.preview_org_unit_group = AsyncMock()
     client._extract_embedded_data = MagicMock()
     client._extract_pagination_info = MagicMock()
@@ -351,7 +361,7 @@ class TestCostControlsManagerEnforcementRules:
             "compiledAt": "2026-01-01T00:00:00Z",
         }
         result = await cc_manager.get_enforcement_rules({})
-        mock_client.get_enforcement_rules.assert_called_once_with()
+        mock_client.get_enforcement_rules.assert_called_once_with(rule_id=None)
         assert result["rules"][0]["id"] == "cc_1"
         assert result["compiledAt"] == "2026-01-01T00:00:00Z"
 
@@ -465,7 +475,7 @@ class TestCostControlsManagementMetadata:
         caps = await cc_mgmt._get_tool_capabilities()
         enforcement = next(c for c in caps if "get_enforcement_rules" in c.parameters)
 
-        assert enforcement.parameters["get_enforcement_rules"] == {}
+        assert set(enforcement.parameters["get_enforcement_rules"]) == {"rule_id"}
         assert "groupBreakdown" not in json.dumps(enforcement.parameters)
 
     @pytest.mark.asyncio
@@ -484,7 +494,10 @@ class TestCostControlsManagementMetadata:
         )
 
         assert rendered.count("usagePercent") == 1
-        assert rendered.count("groupValue") == 1
+        # The entry tuple, not the bare name: groupValue is also an event row
+        # field and a list filter, so counting the name alone would now fail
+        # for a reason that has nothing to do with groupBreakdown drifting.
+        assert rendered.count("groupValue, displayName, currentValue, usagePercent, breached") == 1
 
 
 class TestCostControlsManagementActions:
@@ -1275,3 +1288,631 @@ class TestEnforcementRulesWarnSummaryRendering:
         assert ORG_UNIT_ENFORCEMENT_MAPS_NOTE in enforcement.description
         rendered = (await cc_mgmt.handle_action("get_capabilities", {}))[0].text
         assert json.dumps(ORG_UNIT_ENFORCEMENT_MAPS_NOTE)[1:-1] in rendered
+
+
+# ===========================================================================
+# BACK-3351: enforcement-event filtering and the summary/history/affected reads
+# ===========================================================================
+
+
+_ALL_EVENT_FILTER_ARGS = {
+    "since": "2026-09-01T00:00:00Z",
+    "until": "2026-09-23T00:00:00Z",
+    "rule_id": "cc_123",
+    "level": "ALL",
+    "mode": "SHADOW",
+    "query": "gpt",
+    "group_by": "SUBSCRIBER",
+    "group_value": "alex@example.com",
+    "transaction_id": "txn_abc",
+}
+
+_ALL_EVENT_FILTER_PARAMS = {
+    "since": "2026-09-01T00:00:00Z",
+    "until": "2026-09-23T00:00:00Z",
+    "ruleId": "cc_123",
+    "level": "ALL",
+    "mode": "SHADOW",
+    "query": "gpt",
+    "groupBy": "SUBSCRIBER",
+    "groupValue": "alex@example.com",
+    "transactionId": "txn_abc",
+}
+
+
+class TestEnforcementEventFilterBuilding:
+    """Every filter name maps to the query parameter the endpoint declares."""
+
+    @pytest.mark.parametrize(
+        "tool_name,query_name",
+        [
+            ("since", "since"),
+            ("until", "until"),
+            ("rule_id", "ruleId"),
+            ("level", "level"),
+            ("mode", "mode"),
+            ("query", "query"),
+            ("transaction_id", "transactionId"),
+        ],
+    )
+    def test_each_scalar_filter_maps_by_name(self, tool_name, query_name):
+        built = _build_enforcement_event_filters({tool_name: "x"})
+        assert built == {query_name: "x"}
+
+    def test_the_group_pair_maps_together(self):
+        built = _build_enforcement_event_filters(
+            {"group_by": "ORG_UNIT", "group_value": "aB3xQ"}
+        )
+        assert built == {"groupBy": "ORG_UNIT", "groupValue": "aB3xQ"}
+
+    def test_every_filter_at_once(self):
+        assert _build_enforcement_event_filters(_ALL_EVENT_FILTER_ARGS) == _ALL_EVENT_FILTER_PARAMS
+
+    def test_absent_filters_are_not_sent(self):
+        assert _build_enforcement_event_filters({"page": 0, "size": 20, "action": "x"}) == {}
+
+    def test_group_by_without_group_value_is_refused_before_the_request(self):
+        with pytest.raises(ToolError) as exc_info:
+            _build_enforcement_event_filters({"group_by": "SUBSCRIBER"})
+        assert "group_value" in exc_info.value.message
+
+    def test_group_value_without_group_by_is_refused_before_the_request(self):
+        with pytest.raises(ToolError) as exc_info:
+            _build_enforcement_event_filters({"group_value": "alex@example.com"})
+        assert "group_by" in exc_info.value.message
+
+    def test_history_only_filters_are_folded_in_for_history(self):
+        built = _build_enforcement_event_filters(
+            {"bucket": "HOUR", "zone": "America/Denver"},
+            extra={"bucket": "bucket", "zone": "zone"},
+        )
+        assert built == {"bucket": "HOUR", "zone": "America/Denver"}
+
+    def test_history_only_filters_never_reach_the_shared_set(self):
+        """bucket/zone are not declared on the list, so the list must not send them."""
+        assert _build_enforcement_event_filters({"bucket": "HOUR", "zone": "UTC"}) == {}
+
+    def test_affected_search_never_reaches_the_shared_set(self):
+        assert _build_enforcement_event_filters({"affected_search": "data"}) == {}
+
+
+class TestListEnforcementEventsForwardsEveryFilter:
+    """The list handler forwards the whole filter set, not only since/ruleId."""
+
+    @pytest.mark.asyncio
+    async def test_all_filters_reach_the_client(self, cc_manager, mock_client):
+        mock_client.get_enforcement_events.return_value = {}
+        mock_client._extract_embedded_data.return_value = []
+        mock_client._extract_pagination_info.return_value = {}
+
+        await cc_manager.list_enforcement_events(
+            {"page": 1, "size": 5, **_ALL_EVENT_FILTER_ARGS}
+        )
+
+        mock_client.get_enforcement_events.assert_awaited_once_with(
+            page=1, size=5, **_ALL_EVENT_FILTER_PARAMS
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_filters_sends_only_paging(self, cc_manager, mock_client):
+        mock_client.get_enforcement_events.return_value = {}
+        mock_client._extract_embedded_data.return_value = []
+        mock_client._extract_pagination_info.return_value = {}
+
+        await cc_manager.list_enforcement_events({})
+
+        mock_client.get_enforcement_events.assert_awaited_once_with(page=0, size=20)
+
+    @pytest.mark.asyncio
+    async def test_half_a_group_pair_never_reaches_the_api(self, cc_manager, mock_client):
+        with pytest.raises(ToolError):
+            await cc_manager.list_enforcement_events({"group_by": "SUBSCRIBER"})
+        mock_client.get_enforcement_events.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rows_reach_the_caller_unmodified(self, cc_manager, mock_client):
+        """The retyped row fields are a passthrough, not a formatter's allowlist."""
+        row = {
+            "level": "HARD",
+            "isShadow": True,
+            "groupBy": "SUBSCRIBER",
+            "groupValue": "alex@example.com",
+            "groupLabel": "Alex",
+            "transactionId": "txn_abc",
+            "ruleId": "cc_123",
+            "ruleDeleted": True,
+            "outcome": "ENFORCEMENT_VIOLATION",
+            "subscriberEmail": "alex@example.com",
+        }
+        mock_client.get_enforcement_events.return_value = {}
+        mock_client._extract_embedded_data.return_value = [row]
+        mock_client._extract_pagination_info.return_value = {}
+
+        result = await cc_manager.list_enforcement_events({})
+
+        assert result["enforcement_events"][0] == row
+
+
+class TestEnforcementEventSubReads:
+    """summary, history and affected: same filters, no paging, unmodified payload."""
+
+    @pytest.mark.asyncio
+    async def test_summary_forwards_the_shared_filters_and_no_paging(
+        self, cc_manager, mock_client
+    ):
+        mock_client.get_enforcement_events_summary.return_value = {"blocked": 1}
+
+        result = await cc_manager.get_enforcement_events_summary(
+            {"page": 3, "size": 7, **_ALL_EVENT_FILTER_ARGS}
+        )
+
+        mock_client.get_enforcement_events_summary.assert_awaited_once_with(
+            **_ALL_EVENT_FILTER_PARAMS
+        )
+        assert result == {"blocked": 1}
+
+    @pytest.mark.asyncio
+    async def test_history_forwards_bucket_and_zone(self, cc_manager, mock_client):
+        mock_client.get_enforcement_events_history.return_value = {"buckets": []}
+
+        await cc_manager.get_enforcement_events_history(
+            {"since": "2026-09-22T00:00:00Z", "bucket": "HOUR", "zone": "America/Denver"}
+        )
+
+        mock_client.get_enforcement_events_history.assert_awaited_once_with(
+            since="2026-09-22T00:00:00Z", bucket="HOUR", zone="America/Denver"
+        )
+
+    @pytest.mark.asyncio
+    async def test_affected_forwards_affected_search(self, cc_manager, mock_client):
+        mock_client.get_enforcement_events_affected.return_value = {"rows": [], "total": 0}
+
+        await cc_manager.get_enforcement_events_affected(
+            {"rule_id": "cc_123", "affected_search": "data"}
+        )
+
+        mock_client.get_enforcement_events_affected.assert_awaited_once_with(
+            ruleId="cc_123", affectedSearch="data"
+        )
+
+    @pytest.mark.asyncio
+    async def test_summary_never_sends_bucket_or_affected_search(
+        self, cc_manager, mock_client
+    ):
+        """A filter only a sibling declares must not be forwarded here."""
+        mock_client.get_enforcement_events_summary.return_value = {}
+
+        await cc_manager.get_enforcement_events_summary(
+            {"bucket": "HOUR", "zone": "UTC", "affected_search": "data"}
+        )
+
+        mock_client.get_enforcement_events_summary.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_affected_never_sends_bucket_or_zone(self, cc_manager, mock_client):
+        mock_client.get_enforcement_events_affected.return_value = {}
+
+        await cc_manager.get_enforcement_events_affected({"bucket": "HOUR", "zone": "UTC"})
+
+        mock_client.get_enforcement_events_affected.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_the_group_pair_is_enforced_on_every_sub_read(
+        self, cc_manager, mock_client
+    ):
+        for call in (
+            cc_manager.get_enforcement_events_summary,
+            cc_manager.get_enforcement_events_history,
+            cc_manager.get_enforcement_events_affected,
+        ):
+            with pytest.raises(ToolError):
+                await call({"group_value": "alex@example.com"})
+
+
+class TestEnforcementSubReadRendering:
+    """handle_action dispatch for the three sub-reads."""
+
+    @pytest.mark.asyncio
+    async def test_summary_header_states_the_counts_and_what_they_ignore(
+        self, cc_mgmt, mock_client
+    ):
+        mock_client.get_enforcement_events_summary.return_value = {
+            "blocked": 42,
+            "warned": 8,
+            "wouldBlock": 3,
+            "wouldWarn": 4,
+            "distinctAffected": 12,
+            "resolvedSince": "2026-08-15T18:30:00Z",
+            "resolvedUntil": "2026-09-14T18:30:00Z",
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_events_summary", {})
+
+        header = result[0].text.split("\n\n")[0]
+        assert "42 blocked" in header
+        assert "8 warned" in header
+        assert "3 would have been blocked and 4 would have been warned in shadow mode" in header
+        assert "12 distinct" in header
+        assert "ignore level and mode" in header
+
+    @pytest.mark.asyncio
+    async def test_summary_header_without_would_warn_drops_the_shadow_warn_clause(
+        self, cc_mgmt, mock_client
+    ):
+        mock_client.get_enforcement_events_summary.return_value = {
+            "blocked": 42,
+            "warned": 8,
+            "wouldBlock": 3,
+            "distinctAffected": 12,
+            "resolvedSince": "2026-08-15T18:30:00Z",
+            "resolvedUntil": "2026-09-14T18:30:00Z",
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_events_summary", {})
+
+        header = result[0].text.split("\n\n")[0]
+        assert "None" not in header
+        assert "would have been warned" not in header
+        assert (
+            "42 blocked, 8 warned, 3 would have been blocked in shadow mode, "
+            "12 distinct people or objects affected." in header
+        )
+
+    @pytest.mark.asyncio
+    async def test_summary_header_leaves_out_every_count_the_response_omits(
+        self, cc_mgmt, mock_client
+    ):
+        mock_client.get_enforcement_events_summary.return_value = {
+            "warned": 8,
+            "wouldWarn": 4,
+            "resolvedSince": "2026-08-15T18:30:00Z",
+            "resolvedUntil": "2026-09-14T18:30:00Z",
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_events_summary", {})
+
+        header = result[0].text.split("\n\n")[0]
+        assert "None" not in header
+        assert "8 warned, 4 would have been warned in shadow mode." in header
+        assert "blocked" not in header
+        assert "distinct" not in header
+
+    @pytest.mark.asyncio
+    async def test_summary_of_an_unexpected_shape_is_reported_not_rendered(
+        self, cc_mgmt, mock_client
+    ):
+        mock_client.get_enforcement_events_summary.return_value = []
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_events_summary", {})
+
+        assert "unexpected shape" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_history_header_names_the_zone_actually_used(self, cc_mgmt, mock_client):
+        mock_client.get_enforcement_events_history.return_value = {
+            "buckets": [{"start": "2026-09-22T00:00:00Z", "count": 2}],
+            "zone": "UTC",
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action(
+            "get_enforcement_events_history", {"zone": "America/Denver"}
+        )
+
+        header = result[0].text.split("\n\n")[0]
+        assert "1 non-empty bucket(s) cut in UTC" in header
+        assert "absent, not zero" in header
+
+    @pytest.mark.asyncio
+    async def test_affected_header_says_rows_are_capped_not_paged(self, cc_mgmt, mock_client):
+        mock_client.get_enforcement_events_affected.return_value = {
+            "rows": [{"value": "alex@example.com", "count": 9}],
+            "total": 312,
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_events_affected", {})
+
+        header = result[0].text.split("\n\n")[0]
+        assert "1 affected person/object row(s) shown of 312" in header
+        assert "affected_search" in header
+
+    @pytest.mark.asyncio
+    async def test_affected_header_reads_as_one_set_without_a_selector(
+        self, cc_mgmt, mock_client
+    ):
+        mock_client.get_enforcement_events_affected.return_value = {
+            "rows": [{"value": "alex@example.com"}],
+            "total": 312,
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_events_affected", {})
+
+        header = result[0].text.split("\n\n")[0]
+        assert "shown of 312 matching" in header
+        assert "before the level/mode filter" not in header
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "selectors, rendered",
+        [
+            ({"level": "HARD"}, "filtered by level=HARD"),
+            ({"mode": "SHADOW"}, "filtered by mode=SHADOW"),
+            ({"level": "WARN", "mode": "SHADOW"}, "filtered by level=WARN, mode=SHADOW"),
+        ],
+    )
+    async def test_affected_header_separates_filtered_rows_from_unfiltered_total(
+        self, cc_mgmt, mock_client, selectors, rendered
+    ):
+        mock_client.get_enforcement_events_affected.return_value = {
+            "rows": [{"value": "alex@example.com"}],
+            "total": 312,
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_events_affected", selectors)
+
+        header = result[0].text.split("\n\n")[0]
+        assert f"1 affected person/object row(s) shown ({rendered})" in header
+        assert "total matching before the level/mode filter: 312" in header
+        assert "shown of 312" not in header
+        assert "affected_search" in header
+
+    @pytest.mark.asyncio
+    async def test_sub_read_payloads_are_recoverable_after_the_header(
+        self, cc_mgmt, mock_client
+    ):
+        payload = {"rows": [{"value": "alex@example.com"}], "total": 1}
+        mock_client.get_enforcement_events_affected.return_value = payload
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_events_affected", {})
+
+        assert json.loads(result[0].text.split("\n\n", 1)[1]) == payload
+
+
+class TestEnforcementEventDocumentationSurface:
+    """The new actions and filters are discoverable, and the row fields labelled."""
+
+    @pytest.mark.asyncio
+    async def test_every_new_action_is_supported(self, cc_mgmt):
+        actions = await cc_mgmt._get_supported_actions()
+        for name in (
+            "get_enforcement_events_summary",
+            "get_enforcement_events_history",
+            "get_enforcement_events_affected",
+            "get_enforcement_rule_roster",
+        ):
+            assert name in actions
+
+    @pytest.mark.asyncio
+    async def test_every_new_filter_is_declared_on_the_input_schema(self, cc_mgmt):
+        schema = await cc_mgmt._get_input_schema()
+        for name in (
+            "until", "level", "mode", "query", "group_by", "group_value",
+            "transaction_id", "bucket", "zone", "affected_search",
+            "search", "band", "sort", "dimension",
+        ):
+            assert name in schema["properties"], name
+
+    @pytest.mark.asyncio
+    async def test_the_new_row_fields_are_labelled_in_the_capability_text(self, cc_mgmt):
+        caps = await cc_mgmt._get_tool_capabilities()
+        enforcement = next(c for c in caps if "get_enforcement_rules" in c.parameters)
+        for field in (
+            "level", "isShadow", "groupBy", "groupValue", "groupLabel",
+            "transactionId", "ruleId", "ruleDeleted",
+        ):
+            assert field in enforcement.description, field
+
+    @pytest.mark.asyncio
+    async def test_the_row_field_note_is_stated_once(self, cc_mgmt):
+        """One authoritative spelling: a second copy is what drifts."""
+        caps = await cc_mgmt._get_tool_capabilities()
+        rendered = json.dumps([c.description for c in caps])
+        assert rendered.count(ENFORCEMENT_EVENT_ROW_FIELDS_NOTE[:60]) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_capability_publishes_the_new_conventions(self, cc_mgmt):
+        caps = await cc_mgmt._get_tool_capabilities()
+        enforcement = next(c for c in caps if "get_enforcement_rules" in c.parameters)
+        for note in (
+            ENFORCEMENT_GROUP_PAIR_NOTE,
+            ENFORCEMENT_SUBREADS_UNPAGED_NOTE,
+            ENFORCEMENT_ROSTER_NOTE,
+        ):
+            assert note in enforcement.limitations
+
+    @pytest.mark.asyncio
+    async def test_get_examples_publishes_the_enforcement_notes(self, cc_mgmt):
+        result = await cc_mgmt.handle_action("get_examples", {})
+        assert ENFORCEMENT_GROUP_PAIR_NOTE in result[0].text
+        assert "get_enforcement_rule_roster" in result[0].text
+
+
+# ===========================================================================
+# BACK-3352: one rule's compiled entry and its roster
+# ===========================================================================
+
+
+class TestGetEnforcementRulesNarrowedToOneRule:
+    """rule_id narrows the compiled read, and an unknown id is not an empty team."""
+
+    @pytest.mark.asyncio
+    async def test_rule_id_is_forwarded(self, cc_manager, mock_client):
+        mock_client.get_enforcement_rules.return_value = {"rules": []}
+
+        await cc_manager.get_enforcement_rules({"rule_id": "cc_123"})
+
+        mock_client.get_enforcement_rules.assert_awaited_once_with(rule_id="cc_123")
+
+    @pytest.mark.asyncio
+    async def test_empty_rules_for_a_known_id_render_as_no_such_rule(
+        self, cc_mgmt, mock_client
+    ):
+        mock_client.get_enforcement_rules.return_value = {"rules": [], "compiledAt": None}
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action(
+            "get_enforcement_rules", {"rule_id": "cc_nope"}
+        )
+
+        assert "No compiled rule with id cc_nope" in result[0].text
+        assert "0 rules" not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_an_empty_unnarrowed_read_still_reads_as_an_empty_team(
+        self, cc_mgmt, mock_client
+    ):
+        mock_client.get_enforcement_rules.return_value = {"rules": [], "compiledAt": None}
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_rules", {})
+
+        assert "0 rules" in result[0].text
+        assert "No compiled rule with id" not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_a_narrowed_hit_names_the_rule_it_was_narrowed_to(
+        self, cc_mgmt, mock_client
+    ):
+        mock_client.get_enforcement_rules.return_value = {
+            "rules": [{"ruleId": "cc_123", "name": "Monthly cap"}],
+            "compiledAt": "2026-09-23T00:00:00Z",
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action(
+            "get_enforcement_rules", {"rule_id": "cc_123"}
+        )
+
+        assert "for rule cc_123" in result[0].text
+        assert "1 rules" in result[0].text
+
+
+class TestGetEnforcementRuleRoster:
+    """The per-rule roster read."""
+
+    @pytest.mark.asyncio
+    async def test_every_selector_is_forwarded(self, cc_manager, mock_client):
+        mock_client.get_enforcement_rule_roster.return_value = {"rows": []}
+
+        await cc_manager.get_enforcement_rule_roster(
+            {
+                "rule_id": "cc_123",
+                "page": 2,
+                "size": 50,
+                "search": "data",
+                "band": "BLOCKED",
+                "sort": "PERCENT",
+                "dimension": "SUBSCRIBER",
+            }
+        )
+
+        mock_client.get_enforcement_rule_roster.assert_awaited_once_with(
+            rule_id="cc_123",
+            page=2,
+            size=50,
+            search="data",
+            band="BLOCKED",
+            sort="PERCENT",
+            dimension="SUBSCRIBER",
+        )
+
+    @pytest.mark.asyncio
+    async def test_defaults_when_only_a_rule_id_is_given(self, cc_manager, mock_client):
+        mock_client.get_enforcement_rule_roster.return_value = {"rows": []}
+
+        await cc_manager.get_enforcement_rule_roster({"rule_id": "cc_123"})
+
+        mock_client.get_enforcement_rule_roster.assert_awaited_once_with(
+            rule_id="cc_123", page=0, size=20, search=None, band=None, sort=None, dimension=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_rule_id_is_refused_before_the_request(
+        self, cc_manager, mock_client
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await cc_manager.get_enforcement_rule_roster({})
+
+        assert "rule_id" in exc_info.value.message
+        mock_client.get_enforcement_rule_roster.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_pooled_rule_404_is_explained_not_passed_through(
+        self, cc_manager, mock_client
+    ):
+        mock_client.get_enforcement_rule_roster.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await cc_manager.get_enforcement_rule_roster({"rule_id": "cc_pooled"})
+
+        assert exc_info.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert "pooled" in json.dumps(exc_info.value.suggestions)
+
+    @pytest.mark.asyncio
+    async def test_other_api_errors_propagate(self, cc_manager, mock_client):
+        mock_client.get_enforcement_rule_roster.side_effect = ReveniumAPIError(
+            "Boom", status_code=500
+        )
+
+        with pytest.raises(ReveniumAPIError):
+            await cc_manager.get_enforcement_rule_roster({"rule_id": "cc_123"})
+
+    @pytest.mark.asyncio
+    async def test_roster_header_reports_the_whole_roster_counts(self, cc_mgmt, mock_client):
+        mock_client.get_enforcement_rule_roster.return_value = {
+            "ruleId": "cc_123",
+            "dimension": "SUBSCRIBER",
+            "rows": [{"key": "alex@example.com"}],
+            "total": 42,
+            "blockedCount": 3,
+            "warnedCount": 5,
+            "underCount": 34,
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action(
+            "get_enforcement_rule_roster", {"rule_id": "cc_123"}
+        )
+
+        header = result[0].text.split("\n\n")[0]
+        assert "Roster for rule cc_123 (SUBSCRIBER)" in header
+        assert "1 row(s) of 42 matching" in header
+        assert "3 blocked, 5 warned, 34 under" in header
+        assert "names people or departments" in header
+
+    @pytest.mark.asyncio
+    async def test_a_204_roster_renders_as_not_yet_compiled(self, cc_mgmt, mock_client):
+        # ReveniumClient._request maps a 204 or any empty body to {}.
+        mock_client.get_enforcement_rule_roster.return_value = {}
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action(
+            "get_enforcement_rule_roster", {"rule_id": "cc_123"}
+        )
+
+        assert result[0].text == (
+            "No compiled roster is available for rule cc_123 yet; "
+            "the reading is produced by the next compile."
+        )
+
+    @pytest.mark.asyncio
+    async def test_roster_payload_is_recoverable_after_the_header(self, cc_mgmt, mock_client):
+        payload = {"ruleId": "cc_123", "rows": [{"key": "alex@example.com"}], "total": 1}
+        mock_client.get_enforcement_rule_roster.return_value = payload
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action(
+            "get_enforcement_rule_roster", {"rule_id": "cc_123"}
+        )
+
+        assert json.loads(result[0].text.split("\n\n", 1)[1]) == payload

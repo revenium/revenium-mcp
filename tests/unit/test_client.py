@@ -6,7 +6,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 
-from src.revenium_mcp_server.client import ReveniumClient, ReveniumAPIError
+from src.revenium_mcp_server.client import PrHealthSettingsPayload, ReveniumAPIError, ReveniumClient
 from src.revenium_mcp_server.auth import AuthConfig
 
 
@@ -266,6 +266,46 @@ class TestTeamPrHealthSettings:
         assert mock_put.call_args[1]["params"] == client._add_tenant_id_to_params()
 
     @pytest.mark.asyncio
+    async def test_update_team_pr_health_settings_forwards_optional_fields_verbatim(
+        self, mock_env_vars
+    ):
+        """The wider body reaches the PUT unchanged, and nothing is added to it."""
+        client = ReveniumClient()
+        settings: PrHealthSettingsPayload = {
+            "agingDays": 7,
+            "rottingDays": 21,
+            "assistedOnly": True,
+            "automationPatterns": ["^bot$"],
+            "cutoffDate": "2025-03-01",
+            "excludedRepos": ["acme/app"],
+        }
+
+        with patch.object(
+            client, "put", new_callable=AsyncMock, return_value=settings
+        ) as mock_put:
+            await client.update_team_pr_health_settings("jR2kmLs", settings)
+
+        assert mock_put.call_args[1]["data"] == settings
+
+    @pytest.mark.asyncio
+    async def test_get_team_pr_health_settings_returns_the_wider_resource(self, mock_env_vars):
+        client = ReveniumClient()
+        payload = {
+            "agingDays": 14,
+            "rottingDays": 30,
+            "cutoffDate": "2026-04-07",
+            "cutoffDateIsDefault": True,
+            "defaultCutoffDate": "2026-04-07",
+            "excludedRepos": [],
+            "automationPatterns": [],
+            "builtInAutomationPatterns": ["^snyk-bot$"],
+            "assistedOnly": False,
+        }
+
+        with patch.object(client, "get", new_callable=AsyncMock, return_value=payload):
+            assert await client.get_team_pr_health_settings("jR2kmLs") == payload
+
+    @pytest.mark.asyncio
     async def test_update_team_pr_health_settings_propagates_api_error(self, mock_env_vars):
         """Permission failures surface as ReveniumAPIError for the tool layer to translate."""
         client = ReveniumClient()
@@ -481,6 +521,86 @@ class TestGetVcsPrHealth:
                 await client.get_vcs_pr_health("github", "2026-01-01", "2027-01-05")
 
         assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_forwards_the_org_unit_scope_under_its_wire_names(self, mock_env_vars):
+        client = ReveniumClient()
+
+        with patch.object(client, "get", new_callable=AsyncMock, return_value={}) as mock_get:
+            await client.get_vcs_pr_health(
+                "github", "2026-01-01", "2026-01-31", org_unit_id=42, include_descendants=True
+            )
+
+        assert mock_get.call_args[1]["params"] == {
+            "source": "github",
+            "startDate": "2026-01-01",
+            "endDate": "2026-01-31",
+            "orgUnitId": 42,
+            "includeDescendants": True,
+        }
+
+
+class TestVcsPrHealthScopedSubReads:
+    """BACK-3387: the drill-downs forward the org-unit scope and assistedOnly, never a team id."""
+
+    SCOPE = {"org_unit_id": 7, "include_descendants": False, "assisted_only": True}
+    WIRE_SCOPE = {"orgUnitId": 7, "includeDescendants": False, "assistedOnly": True}
+    WINDOW = {"source": "github", "startDate": "2026-05-17", "endDate": "2026-08-17"}
+
+    @staticmethod
+    async def _params_sent(read, *args, **kwargs):
+        client = ReveniumClient()
+        with patch.object(client, "get", new_callable=AsyncMock, return_value={}) as mock_get:
+            await getattr(client, read)(*args, **kwargs)
+        return mock_get.call_args[0][0], mock_get.call_args[1]["params"]
+
+    @pytest.mark.asyncio
+    async def test_engineers(self, mock_env_vars):
+        path, params = await self._params_sent(
+            "get_vcs_pr_health_engineers", "github", "2026-05-17", "2026-08-17", page=1, **self.SCOPE
+        )
+        assert path.endswith("/vcs-pr-health/engineers")
+        assert params == {**self.WINDOW, "page": 1, **self.WIRE_SCOPE}
+
+    @pytest.mark.asyncio
+    async def test_prs(self, mock_env_vars):
+        path, params = await self._params_sent(
+            "get_vcs_pr_health_prs", "github", "2026-05-17", "2026-08-17", "alice", **self.SCOPE
+        )
+        assert path.endswith("/vcs-pr-health/prs")
+        assert params == {**self.WINDOW, "author": "alice", **self.WIRE_SCOPE}
+
+    @pytest.mark.asyncio
+    async def test_pull_requests(self, mock_env_vars):
+        path, params = await self._params_sent(
+            "get_vcs_pr_health_pull_requests", "github", "2026-05-17", "2026-08-17",
+            bucket="ROTTING", **self.SCOPE,
+        )
+        assert path.endswith("/vcs-pr-health/pull-requests")
+        assert params == {**self.WINDOW, "bucket": "ROTTING", **self.WIRE_SCOPE}
+
+    @pytest.mark.asyncio
+    async def test_unset_scope_sends_only_the_window(self, mock_env_vars):
+        _, params = await self._params_sent(
+            "get_vcs_pr_health_prs", "github", "2026-05-17", "2026-08-17", "alice"
+        )
+        assert params == {**self.WINDOW, "author": "alice"}
+
+
+class TestGetVcsPrHealthRepositories:
+    @pytest.mark.asyncio
+    async def test_sends_source_only_with_no_team_or_window(self, mock_env_vars):
+        client = ReveniumClient()
+        payload = {"source": "github", "repositories": [{"repoName": "acme/api", "openPrs": 3}]}
+
+        with patch.object(client, "get", new_callable=AsyncMock, return_value=payload) as mock_get:
+            result = await client.get_vcs_pr_health_repositories("github")
+
+        assert result == payload
+        assert mock_get.call_args[0][0] == (
+            "/profitstream/v2/api/billing/users/vcs-pr-health/repositories"
+        )
+        assert mock_get.call_args[1]["params"] == {"source": "github"}
 
 
 class TestGetProviderCoverage:
@@ -821,6 +941,50 @@ class TestOrgUnits:
                 await client.get_org_units()
 
         assert exc_info.value.status_code == 403
+
+
+class TestOrgUnitMembershipRemovals:
+    """The three org-unit DELETE routes (BACK-3353)."""
+
+    @pytest.mark.asyncio
+    async def test_delete_person_by_id_puts_the_id_in_the_path(self, mock_env_vars):
+        client = ReveniumClient()
+
+        with patch.object(client, "delete", new_callable=AsyncMock, return_value={}) as mock_delete:
+            result = await client.delete_org_unit_person(97, "jR2kmLs")
+
+        mock_delete.assert_awaited_once_with(
+            "/profitstream/v2/api/org-units/persons/97",
+            params={"teamId": "jR2kmLs"},
+            use_retry=False,
+        )
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_delete_person_by_email_sends_email_and_ambient_team(self, mock_env_vars):
+        client = ReveniumClient()
+
+        with patch.object(client, "delete", new_callable=AsyncMock, return_value={}) as mock_delete:
+            await client.delete_org_unit_person_by_email("ash@acme.com")
+
+        mock_delete.assert_awaited_once_with(
+            "/profitstream/v2/api/org-units/persons",
+            params={**client._add_team_id_to_params(), "email": "ash@acme.com"},
+            use_retry=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_clear_assignment_by_email_targets_the_assignments_route(self, mock_env_vars):
+        client = ReveniumClient()
+
+        with patch.object(client, "delete", new_callable=AsyncMock, return_value={}) as mock_delete:
+            await client.clear_org_unit_assignment_by_email("ash@acme.com", "jR2kmLs")
+
+        mock_delete.assert_awaited_once_with(
+            "/profitstream/v2/api/org-units/assignments",
+            params={"teamId": "jR2kmLs", "email": "ash@acme.com"},
+            use_retry=False,
+        )
 
 
 class TestGetSeatUtilization:

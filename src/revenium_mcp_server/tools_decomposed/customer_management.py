@@ -6,7 +6,7 @@ tool with internal composition, following the proven alert/source management tem
 
 import json
 import unicodedata
-from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional, Union, cast
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -15,7 +15,7 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
-from ..client import ReveniumAPIError, ReveniumClient
+from ..client import PrHealthSettingsPayload, ReveniumAPIError, ReveniumClient
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
@@ -33,6 +33,14 @@ from ..introspection.metadata import (
     ToolDependency,
     ToolType,
     UsagePattern,
+)
+from .pr_health_settings_fields import (
+    PR_HEALTH_FIELDS_NOTE,
+    PR_HEALTH_OMITTED_FIELDS_NOTE,
+    PR_HEALTH_OPTIONAL_FIELDS,
+    collect_optional_updates,
+    diverged_optional_fields,
+    present_display_fields,
 )
 from .unified_tool_base import ToolBase
 
@@ -459,11 +467,11 @@ PR_HEALTH_CONCURRENCY_NOTE = (
     "PUT wins. Re-read with get_pr_health_settings to confirm the stored thresholds."
 )
 
-# Raised into the response when the API's echoed pair disagrees with the pair that was
-# sent, which is the only in-band evidence of a lost update this endpoint can give.
+# Raised into the response when the API's echo disagrees with what was sent, which is
+# the only in-band evidence of a lost update this endpoint can give.
 PR_HEALTH_DIVERGENCE_NOTE = (
-    "The thresholds the API stored differ from the pair this action sent, so another "
-    "update landed between the read and the write. The stored pair is authoritative; "
+    "The settings the API stored differ from the values this action sent, so another "
+    "update landed between the read and the write. The stored values are authoritative; "
     "re-read the settings and re-apply the intended change if it is still needed."
 )
 
@@ -937,6 +945,30 @@ ORG_UNIT_FEATURE_FLAG_NOTE = (
     "Revenium enables it. This is a tenant-configuration state, not a "
     "permissions problem with your key."
 )
+ORG_UNIT_PERSON_DELETE_NOTE = (
+    "Deleting a directory person closes their open org-unit assignment effective "
+    "now, removes every email mapping that points at them and deletes the person, in "
+    "one transaction. Assignment history is kept, so usage recorded before the "
+    "removal stays attributed to the org unit. Re-importing the same email later "
+    "creates a new person."
+)
+ORG_UNIT_ASSIGNMENT_CLEAR_NOTE = (
+    "Clearing an assignment closes the person's open primary org-unit assignment "
+    "effective now. The person and their email mappings stay, usage recorded before "
+    "stays attributed to the org unit, and the call succeeds whether or not an "
+    "assignment was open."
+)
+ORG_UNIT_REMOVAL_BUDGET_NOTE = (
+    "An ORG_UNIT cost control caps whoever is attributed to the department when it "
+    "evaluates, so from now on this person's usage no longer counts toward, or is "
+    "capped by, that department's budget."
+)
+ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE = (
+    "CSV import of org units and memberships stays outside the MCP: run it in the "
+    "Revenium UI. That includes its removeMissing switch, which ends the assignment "
+    "of everyone missing from the file, and the membershipsRemoved / removalsSkipped "
+    "counters the import reports."
+)
 
 
 def org_unit_id_to_filter_value(unit_id: Any) -> Optional[str]:
@@ -1012,6 +1044,190 @@ def _format_org_units_text(result: Dict[str, Any]) -> str:
         )
     text += f"\nNote: {ORG_UNIT_ID_STRING_NOTE}\n\n"
     return text + json.dumps(result, indent=2)
+
+
+def _org_unit_feature_disabled_error(team_id: Optional[str], action: str) -> ToolError:
+    return ToolError(
+        message="Org units are not enabled for this tenant",
+        error_code=ErrorCodes.API_AUTHORIZATION,
+        field="team_id",
+        value=team_id or "(ambient team)",
+        suggestions=[
+            ORG_UNIT_FEATURE_FLAG_NOTE,
+            "Ask Revenium to enable org-unit attribution for this "
+            f"tenant, then retry {action}.",
+        ],
+    )
+
+
+def _optional_team_id(arguments: Dict[str, Any]) -> Optional[str]:
+    team_id = arguments.get("team_id")
+    return team_id.strip() if isinstance(team_id, str) and team_id.strip() else None
+
+
+def _removal_team_id(arguments: Dict[str, Any], action: str) -> Optional[str]:
+    """Team scope for a removal: absent means the ambient team, anything supplied must be usable.
+
+    Stricter than _optional_team_id on purpose: a blank team_id silently falling
+    back to the ambient team would run a confirmed DELETE against a team the
+    caller never named.
+    """
+    team_id = arguments.get("team_id")
+    if team_id is None:
+        return None
+    if isinstance(team_id, str) and team_id.strip():
+        return team_id.strip()
+    raise create_structured_validation_error(
+        message=f"Invalid team_id: {team_id!r}",
+        field="team_id",
+        value=team_id,
+        suggestions=[
+            "team_id must be a non-empty Revenium team hashid string",
+            "Omit team_id entirely to use the ambient team from the auth config",
+        ],
+        examples={"usage": f"{action}(team_id='jR2kmLs', confirm=true)"},
+    )
+
+
+def _validate_person_id(value: Any, action: str) -> int:
+    """Accept a directory person id as a positive int or a digit string."""
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    if isinstance(value, str) and value.strip().isdecimal() and int(value.strip()) > 0:
+        return int(value.strip())
+    raise create_structured_validation_error(
+        message=f"Invalid person_id: {value!r}",
+        field="person_id",
+        value=value,
+        suggestions=[
+            "person_id is the numeric directory person id (e.g. 97), not a user or "
+            "subscriber hashid",
+            f"Or address the person by email instead: {action}(email='ash@acme.com')",
+        ],
+        examples={"usage": f"{action}(person_id=97, confirm=true)"},
+    )
+
+
+def _describe_removal_target(result: Dict[str, Any]) -> str:
+    if result.get("person_id") is not None:
+        return f"directory person {result['person_id']}"
+    return f"the directory person for {result['email']}"
+
+
+def _removal_call_example(result: Dict[str, Any]) -> str:
+    identifier = (
+        f"person_id={result['person_id']}"
+        if result.get("person_id") is not None
+        else f"email='{result['email']}'"
+    )
+    team = f", team_id='{result['team_id']}'" if result.get("team_id") else ""
+    return f"{result['action']}({identifier}{team}, confirm=true)"
+
+
+def _raise_org_unit_removal_error(
+    error: ReveniumAPIError, action: str, team_id: Optional[str], target: Dict[str, Any]
+) -> NoReturn:
+    """Translate the removal routes' documented 4xx answers into caller guidance."""
+    # The org-unit routes share list_org_units' default-OFF feature flag, so a 403
+    # is a tenant-configuration state before it is a permissions problem.
+    if error.status_code == 403:
+        raise _org_unit_feature_disabled_error(team_id, action)
+    field, value = (
+        ("person_id", target["person_id"])
+        if target.get("person_id") is not None
+        else ("email", target.get("email"))
+    )
+    upstream = str(error.message)
+    if error.status_code == 404:
+        raise _org_unit_removal_not_found_error(upstream, team_id, field, value)
+    if error.status_code == 400 and field == "email":
+        raise ToolError(
+            message=f"Email {value} does not resolve to exactly one directory person",
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="email",
+            value=value,
+            suggestions=[upstream, _AMBIGUOUS_EMAIL_HINTS[action]],
+        )
+    raise error
+
+
+_AMBIGUOUS_EMAIL_HINTS = {
+    "delete_org_unit_person": (
+        "delete_org_unit_person(person_id=...) addresses one directory person exactly"
+    ),
+    "clear_org_unit_assignment": (
+        "The email must resolve to exactly one directory person, and there is no "
+        "id-addressed clear route: fix the directory's email mapping first, or delete "
+        "the person with delete_org_unit_person(person_id=...)"
+    ),
+}
+
+_ALREADY_REMOVED_HINT = (
+    "The person may already be gone - removed by an earlier attempt or another "
+    "administrator - or belong to another team"
+)
+_AMBIENT_TEAM_HINT = "Check team_id; omitted, the ambient team from the auth config is used"
+
+
+def _org_unit_removal_not_found_error(
+    upstream: str, team_id: Optional[str], person_field: str, person_value: Any
+) -> ToolError:
+    """Attribute a removal 404 to the person or the team from upstream's own message.
+
+    The documented person 404s read "Directory person ... not found" and "Person
+    not found in current organization"; an unknown team reads "Organization not
+    found for ID". Any mention of a person wins; a message naming neither is not
+    guessed at.
+    """
+    text = upstream.lower()
+    team_value = team_id or "(ambient team)"
+    if "person" in text:
+        field, value = person_field, person_value
+        suggestions = [_ALREADY_REMOVED_HINT, _AMBIENT_TEAM_HINT]
+    elif "organization" in text or "team" in text:
+        field, value, suggestions = "team_id", team_value, [_AMBIENT_TEAM_HINT]
+    else:
+        field, value = None, None
+        suggestions = [
+            f"Either {person_field}={person_value!r} or team_id={team_value!r} was not found",
+            _ALREADY_REMOVED_HINT,
+            _AMBIENT_TEAM_HINT,
+        ]
+    return ToolError(
+        message=f"Not found: {upstream}",
+        error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+        field=field,
+        value=value,
+        suggestions=suggestions,
+    )
+
+
+_REMOVAL_HEADLINES = {
+    "delete_org_unit_person": ("Delete {target}", "Deleted {target}"),
+    "clear_org_unit_assignment": (
+        "Clear the org-unit assignment of {target}",
+        "Cleared the org-unit assignment of {target}",
+    ),
+}
+
+
+def _format_org_unit_removal_text(result: Dict[str, Any]) -> str:
+    """Render a removal preview or its confirmation; the 204 carries no payload to show."""
+    preview_headline, done_headline = _REMOVAL_HEADLINES[result["action"]]
+    target = _describe_removal_target(result)
+    team_id = result.get("team_id")
+    scope = f"team {team_id}" if team_id else "the ambient team"
+    if result.get("confirmation_required"):
+        return (
+            f"**Confirmation Required - {preview_headline.format(target=target)} in {scope}**\n\n"
+            f"{result['effect']}\n\n{ORG_UNIT_REMOVAL_BUDGET_NOTE}\n\n"
+            "No request was sent. To apply, repeat the call with confirm=true:\n"
+            f"`{_removal_call_example(result)}`"
+        )
+    return (
+        f"{done_headline.format(target=target)} in {scope}.\n\n{result['effect']}\n\n"
+        + json.dumps(result, indent=2)
+    )
 
 
 class BaseManager:
@@ -2117,22 +2333,21 @@ class TeamManager(BaseManager):
 
         return result
 
-    async def _read_pr_health_thresholds(
-        self, team_id: str, action: str
-    ) -> Dict[str, Optional[int]]:
-        """Read the team's current PR-health thresholds."""
+    async def _read_pr_health_settings(self, team_id: str, action: str) -> Dict[str, Any]:
+        """Read the team's current PR-health settings payload."""
         try:
             settings = await self.client.get_team_pr_health_settings(team_id)
         except ReveniumAPIError as e:
             _raise_pr_health_settings_error(e, team_id, action)
-        return _extract_pr_health_thresholds(settings)
+        return settings if isinstance(settings, dict) else {}
 
     async def get_pr_health_settings(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Get the team's PR-health aging/rotting inactivity thresholds."""
+        """Get the team's PR-health settings: the thresholds and the stored filters."""
         action = "get_pr_health_settings"
         team_id = self._require_team_id(arguments, action)
 
-        thresholds = await self._read_pr_health_thresholds(team_id, action)
+        settings = await self._read_pr_health_settings(team_id, action)
+        thresholds = _extract_pr_health_thresholds(settings)
 
         return {
             "action": action,
@@ -2140,25 +2355,28 @@ class TeamManager(BaseManager):
             "team_id": team_id,
             "agingDays": thresholds["agingDays"],
             "rottingDays": thresholds["rottingDays"],
+            **present_display_fields(settings),
             "threshold_bounds": (
                 f"{PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS} days, "
                 "with agingDays lower than rottingDays"
             ),
             "semantics": PR_HEALTH_SEMANTICS_NOTE,
+            "field_semantics": PR_HEALTH_FIELDS_NOTE,
             "report_impact": PR_HEALTH_REPORT_NOTE,
         }
 
     async def update_pr_health_settings(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Change the team's PR-health aging/rotting inactivity thresholds.
+        """Change the team's PR-health thresholds, cutoff date, exclusions or patterns.
 
-        The upstream PUT deserializes both fields or none, so a caller who names only
-        one threshold gets the other read-merged from the current settings; the local
-        bounds and ordering checks run before the write so the platform's constraints
-        arrive as guidance rather than as an upstream 400.
+        The upstream PUT deserializes both thresholds or none, so a caller who names only
+        one threshold (or none) gets the missing half read-merged from the current
+        settings; the local bounds and ordering checks run before the write so the
+        platform's constraints arrive as guidance rather than as an upstream 400. The
+        other fields are sent only when supplied (PR_HEALTH_OMITTED_FIELDS_NOTE).
 
         The read and the PUT cannot be made atomic - the resource carries no version or
         ETag - so the response states that (PR_HEALTH_CONCURRENCY_NOTE) and compares the
-        echoed pair against the pair sent, raising divergence_warning and naming the
+        echoed settings against the values sent, raising divergence_warning and naming the
         fields that came back different. Neither prevents an interleaving between the
         read and the write; they make one visible after the fact.
         """
@@ -2171,8 +2389,9 @@ class TeamManager(BaseManager):
                 supplied[camel] = _validate_pr_health_threshold(
                     arguments.get(snake), snake=snake, action=action
                 )
+        optional_updates = collect_optional_updates(arguments)
 
-        if not supplied:
+        if not supplied and not optional_updates:
             raise create_structured_missing_parameter_error(
                 parameter_name="aging_days",
                 action=action,
@@ -2180,15 +2399,17 @@ class TeamManager(BaseManager):
                     "usage": f"{action}(team_id='jR2kmLs', aging_days=14, rotting_days=30)",
                     "valid_formats": [
                         "aging_days and rotting_days are whole days of inactivity, "
-                        f"{PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS}"
+                        f"{PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS}",
+                        *(f"{spec.snake}: {spec.description}" for spec in PR_HEALTH_OPTIONAL_FIELDS),
                     ],
-                    "partial_update": "Name just one of them and the other is read-merged from the current settings",
+                    "partial_update": PR_HEALTH_OMITTED_FIELDS_NOTE,
                     "ordering": "aging_days must be lower than rotting_days",
                     "semantics": PR_HEALTH_SEMANTICS_NOTE,
                 },
             )
 
-        current = await self._read_pr_health_thresholds(team_id, action)
+        current_settings = await self._read_pr_health_settings(team_id, action)
+        current = _extract_pr_health_thresholds(current_settings)
         merged: Dict[str, int] = {}
         for snake, camel in PR_HEALTH_THRESHOLD_FIELDS:
             value = supplied.get(camel, current[camel])
@@ -2230,8 +2451,9 @@ class TeamManager(BaseManager):
                 },
             )
 
+        body = cast(PrHealthSettingsPayload, {**merged, **optional_updates})
         try:
-            updated = await self.client.update_team_pr_health_settings(team_id, merged)
+            updated = await self.client.update_team_pr_health_settings(team_id, body)
         except ReveniumAPIError as e:
             _raise_pr_health_settings_error(e, team_id, action)
 
@@ -2253,9 +2475,15 @@ class TeamManager(BaseManager):
             "requested_rottingDays": merged["rottingDays"],
             "agingDays": applied["agingDays"],
             "rottingDays": applied["rottingDays"],
+            **present_display_fields(updated),
             "read_merged": sorted(
                 camel for _, camel in PR_HEALTH_THRESHOLD_FIELDS if camel not in supplied
             ),
+            "updated_fields": sorted([*supplied, *optional_updates]),
+            "previous_settings": {
+                camel: current_settings.get(camel) for camel in optional_updates
+            },
+            "omitted_fields_note": PR_HEALTH_OMITTED_FIELDS_NOTE,
             "full_replacement_note": PR_HEALTH_FULL_REPLACEMENT_NOTE,
             "concurrency_note": PR_HEALTH_CONCURRENCY_NOTE,
             "semantics": PR_HEALTH_SEMANTICS_NOTE,
@@ -2265,18 +2493,16 @@ class TeamManager(BaseManager):
         # Per field, because either half can be the one an interleaved write moved: the
         # read-merged half is the obvious casualty, but a supplied half can be overwritten
         # too. An absent echo is unknown rather than changed, so it is not divergence.
-        diverged = [
-            camel
+        divergence_detail: Dict[str, Dict[str, Any]] = {
+            camel: {"sent": merged[camel], "stored": applied[camel]}
             for _, camel in PR_HEALTH_THRESHOLD_FIELDS
             if echoed[camel] is not None and echoed[camel] != merged[camel]
-        ]
-        if diverged:
+        }
+        divergence_detail.update(diverged_optional_fields(optional_updates, updated))
+        if divergence_detail:
             result["divergence_warning"] = PR_HEALTH_DIVERGENCE_NOTE
-            result["diverged_fields"] = diverged
-            result["divergence_detail"] = {
-                camel: {"sent": merged[camel], "stored": applied[camel]}
-                for camel in diverged
-            }
+            result["diverged_fields"] = list(divergence_detail)
+            result["divergence_detail"] = divergence_detail
 
         return result
 
@@ -2482,17 +2708,16 @@ class TeamManager(BaseManager):
 
 
 class OrgUnitManager(BaseManager):
-    """Internal manager for org-unit (department) lookups.
+    """Internal manager for org units (departments) and their memberships.
 
-    Read-only by design: org units are created and imported in the Revenium UI, and
-    BACK-2767 exposes only the listing the ORG_UNIT dimension needs to resolve a
-    department name to an id.
+    Org units themselves are created and CSV-imported in the Revenium UI; the MCP
+    lists them (BACK-2767) and detaches people from them (BACK-3353), with every
+    detach gated behind an explicit confirm=true.
     """
 
     async def list_org_units(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """List the active org units, optionally scoped to one team."""
-        team_id = arguments.get("team_id")
-        team_id = team_id.strip() if isinstance(team_id, str) and team_id.strip() else None
+        team_id = _optional_team_id(arguments)
 
         # Typed as Any on purpose: the client's return annotation promises a list, but
         # that promise is a cast over an untyped JSON body, so the shape check below is
@@ -2505,17 +2730,7 @@ class OrgUnitManager(BaseManager):
             # means "not enabled for this tenant", not "bad credentials" —
             # surface that instead of a raw permission error.
             if e.status_code == 403:
-                raise ToolError(
-                    message="Org units are not enabled for this tenant",
-                    error_code=ErrorCodes.API_AUTHORIZATION,
-                    field="team_id",
-                    value=team_id or "(ambient team)",
-                    suggestions=[
-                        ORG_UNIT_FEATURE_FLAG_NOTE,
-                        "Ask Revenium to enable org-unit attribution for this "
-                        "tenant, then retry list_org_units.",
-                    ],
-                )
+                raise _org_unit_feature_disabled_error(team_id, "list_org_units")
             raise
 
         warning: Optional[str] = None
@@ -2563,6 +2778,99 @@ class OrgUnitManager(BaseManager):
             result["warning"] = warning
         if skipped:
             result["skipped_malformed_entries"] = skipped
+        return result
+
+    async def delete_org_unit_person(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Delete one directory person, addressed by person_id or by email."""
+        action = "delete_org_unit_person"
+        team_id = _removal_team_id(arguments, action)
+        person = self._person_identifier(arguments, action)
+        result = self._removal_result(
+            action, "org_unit_persons", team_id, ORG_UNIT_PERSON_DELETE_NOTE,
+            **({"person_id": person} if isinstance(person, int) else {"email": person}),
+        )
+        if arguments.get("confirm") is not True:
+            return {**result, "confirmation_required": True}
+
+        try:
+            if isinstance(person, int):
+                await self.client.delete_org_unit_person(person, team_id)
+            else:
+                await self.client.delete_org_unit_person_by_email(person, team_id)
+        except ReveniumAPIError as e:
+            _raise_org_unit_removal_error(e, action, team_id, result)
+        return {**result, "deleted": True}
+
+    async def clear_org_unit_assignment(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Close the open primary org-unit assignment of the person an email resolves to."""
+        action = "clear_org_unit_assignment"
+        team_id = _removal_team_id(arguments, action)
+        email = _validate_lookup_email(arguments.get("email"), action)
+        result = self._removal_result(
+            action, "org_unit_assignments", team_id, ORG_UNIT_ASSIGNMENT_CLEAR_NOTE,
+            email=email,
+        )
+        if arguments.get("confirm") is not True:
+            return {**result, "confirmation_required": True}
+
+        try:
+            await self.client.clear_org_unit_assignment_by_email(email, team_id)
+        except ReveniumAPIError as e:
+            _raise_org_unit_removal_error(e, action, team_id, result)
+        return {**result, "cleared": True}
+
+    @staticmethod
+    def _person_identifier(
+        arguments: Dict[str, Any], action: str
+    ) -> Union[int, str]:
+        """Resolve exactly one of person_id (int) or email (str), one per upstream route."""
+        raw_person_id = arguments.get("person_id")
+        raw_email = arguments.get("email")
+        if raw_person_id is not None and raw_email is not None:
+            raise create_structured_validation_error(
+                message="Pass either person_id or email, not both",
+                field="person_id",
+                value=raw_person_id,
+                suggestions=[
+                    "person_id addresses one directory person exactly; email is resolved "
+                    "to a person upstream",
+                    f"{action}(person_id=97, confirm=true) or "
+                    f"{action}(email='ash@acme.com', confirm=true)",
+                ],
+            )
+        if raw_person_id is not None:
+            return _validate_person_id(raw_person_id, action)
+        if raw_email is None:
+            raise create_structured_missing_parameter_error(
+                parameter_name="person_id",
+                action=action,
+                examples={
+                    "usage": f"{action}(person_id=97, confirm=true)",
+                    "by_email": f"{action}(email='ash@acme.com', confirm=true)",
+                },
+            )
+        return _validate_lookup_email(raw_email, action)
+
+    @staticmethod
+    def _removal_result(
+        action: str,
+        resource_type: str,
+        team_id: Optional[str],
+        effect: str,
+        *,
+        person_id: Optional[int] = None,
+        email: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "action": action,
+            "resource_type": resource_type,
+            "team_id": team_id,
+            "effect": effect,
+        }
+        if person_id is not None:
+            result["person_id"] = person_id
+        if email is not None:
+            result["email"] = email
         return result
 
 
@@ -3121,7 +3429,7 @@ class CustomerManagement(ToolBase):
                                 "teams",
                             ],
                             "usage": "list(resource_type='organizations')",
-                            "org_units": "Org units (departments) have their own read-only action: list_org_units()",
+                            "org_units": "Org units (departments) have their own actions: list_org_units(), delete_org_unit_person(), clear_org_unit_assignment()",
                             "example_calls": [
                                 "list(resource_type='organizations')",
                                 "list(resource_type='subscribers')",
@@ -3470,7 +3778,7 @@ class CustomerManagement(ToolBase):
             elif action == "update_pr_health_settings":
                 result = await team_manager.update_pr_health_settings(arguments)
                 text = f"PR health settings updated for team {result['team_id']}:\n\n"
-                # A divergence between the pair sent and the pair stored is a lost-update
+                # A divergence between what was sent and what was stored is a lost-update
                 # signal, so it leads the rendered text instead of sitting in the JSON.
                 pr_divergence = result.get("divergence_warning")
                 if pr_divergence:
@@ -3573,10 +3881,17 @@ class CustomerManagement(ToolBase):
                     )
                 ]
 
-            # Org-unit (department) lookup - read-only
             elif action == "list_org_units":
                 result = await org_unit_manager.list_org_units(arguments)
                 return [TextContent(type="text", text=_format_org_units_text(result))]
+
+            elif action == "delete_org_unit_person":
+                result = await org_unit_manager.delete_org_unit_person(arguments)
+                return [TextContent(type="text", text=_format_org_unit_removal_text(result))]
+
+            elif action == "clear_org_unit_assignment":
+                result = await org_unit_manager.clear_org_unit_assignment(arguments)
+                return [TextContent(type="text", text=_format_org_unit_removal_text(result))]
 
             # Analytics and relationship operations
             elif action == "analyze":
@@ -3680,7 +3995,11 @@ class CustomerManagement(ToolBase):
                             "add_verified_domain",
                             "remove_verified_domain",
                         ],
-                        "org_unit_actions": ["list_org_units"],
+                        "org_unit_actions": [
+                            "list_org_units",
+                            "delete_org_unit_person",
+                            "clear_org_unit_assignment",
+                        ],
                         "analysis_actions": ["analyze", "get_relationships"],
                         "discovery_actions": [
                             "get_capabilities",
@@ -3697,6 +4016,8 @@ class CustomerManagement(ToolBase):
                             "lookup_subscriber": "lookup_subscriber(email='joao@acme.com')",
                             "lookup_user": "lookup_user(email='admin@acme.com')",
                             "list_org_units": "list_org_units()",
+                            "delete_org_unit_person": "delete_org_unit_person(person_id=97, confirm=true)",
+                            "clear_org_unit_assignment": "clear_org_unit_assignment(email='ash@acme.com', confirm=true)",
                             "get_marketplace_settings": "get_marketplace_settings(team_id='jR2kmLs')",
                             "update_marketplace_settings": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'], operation='add')",
                             "get_pr_health_settings": "get_pr_health_settings(team_id='jR2kmLs')",
@@ -3820,10 +4141,13 @@ class CustomerManagement(ToolBase):
         result_text += f"- **Limitation**: {MARKETPLACE_CONCURRENCY_NOTE}\n\n"
 
         result_text += "## **Team PR-Health Settings**\n"
-        result_text += "The inactivity thresholds behind the PR-health report's aging/rotting labels.\n\n"
-        result_text += "- `get_pr_health_settings(team_id='jR2kmLs')` - read the effective `agingDays` / `rottingDays`\n"
+        result_text += "The team PR-health settings: the aging/rotting inactivity thresholds, the cutoff date and excluded repositories that narrow which pull requests the report counts, the automation patterns that put matching pull requests in the automation bucket, and the assisted-only default view for pricing and listing AI-assisted pull requests.\n\n"
+        result_text += "- `get_pr_health_settings(team_id='jR2kmLs')` - read the effective `agingDays` / `rottingDays` plus `assistedOnly`, `automationPatterns`, `builtInAutomationPatterns`, `cutoffDate`, `cutoffDateIsDefault`, `defaultCutoffDate` and `excludedRepos`\n"
         result_text += "- `update_pr_health_settings(team_id='jR2kmLs', aging_days=14, rotting_days=30)` - name one threshold and the other is read-merged from the current settings\n"
+        result_text += "- `update_pr_health_settings(team_id='jR2kmLs', excluded_repos=['acme/legacy-app'], cutoff_date='2025-03-01')` - also accepts `automation_patterns` and `assisted_only`\n"
+        result_text += f"- **Omitted fields**: {PR_HEALTH_OMITTED_FIELDS_NOTE}\n"
         result_text += f"- **Semantics**: {PR_HEALTH_SEMANTICS_NOTE}\n"
+        result_text += f"- **Fields**: {PR_HEALTH_FIELDS_NOTE}\n"
         result_text += f"- **Bounds**: {PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS} days each, with `aging_days` lower than `rotting_days`\n"
         result_text += f"- **Why both fields are sent**: {PR_HEALTH_FULL_REPLACEMENT_NOTE}\n"
         result_text += "- Updates require team-management permissions on the target team\n"
@@ -3849,12 +4173,19 @@ class CustomerManagement(ToolBase):
         result_text += f"- **Together**: {ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE}\n\n"
 
         result_text += "## **Org Units (Departments)**\n"
-        result_text += "Read-only lookup that resolves a department name to the id the `ORG_UNIT` filter dimension expects.\n\n"
+        result_text += "Resolve a department name to the id the `ORG_UNIT` filter dimension expects, and detach people from departments.\n\n"
         result_text += "- `list_org_units()` - every active org unit for the caller's team/organization\n"
         result_text += "- `list_org_units(team_id='jR2kmLs')` - restrict the listing to one team\n"
         result_text += "- Each unit reports `name`, `id`, `parentId`, `path` (materialized ancestor-id path, e.g. `/12/40/173/`) and `source`\n"
         result_text += f"- **Types**: {ORG_UNIT_ID_STRING_NOTE}\n"
-        result_text += "- Org units are created and imported in the Revenium UI; this tool cannot create, change or delete them\n\n"
+        result_text += "- `delete_org_unit_person(person_id=97, confirm=true)` or `delete_org_unit_person(email='ash@acme.com', confirm=true)` - delete one directory person\n"
+        result_text += "- `clear_org_unit_assignment(email='ash@acme.com', confirm=true)` - end one person's primary assignment, keeping the person\n"
+        result_text += "- **Confirm gate**: without `confirm=true` both removals only preview what would change; no request is sent\n"
+        result_text += f"- **Delete**: {ORG_UNIT_PERSON_DELETE_NOTE}\n"
+        result_text += f"- **Clear**: {ORG_UNIT_ASSIGNMENT_CLEAR_NOTE}\n"
+        result_text += f"- **Budgets**: {ORG_UNIT_REMOVAL_BUDGET_NOTE}\n"
+        result_text += "- Org units are created, renamed and deleted in the Revenium UI; this tool cannot change the units themselves\n"
+        result_text += f"- **CSV import**: {ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE}\n\n"
 
         result_text += "## **Business Rules**\n"
         for rule in capabilities.get("business_rules", []):
@@ -4125,6 +4456,11 @@ class CustomerManagement(ToolBase):
                 "example": "update_pr_health_settings(team_id='jR2kmLs', aging_days=14, rotting_days=30)",
             },
             {
+                "title": "Exclude a Repository from PR Health",
+                "description": "Leave repositories out of every PR-health figure for a team; the list replaces the stored one, and the thresholds and other settings stay as they are",
+                "example": "update_pr_health_settings(team_id='jR2kmLs', excluded_repos=['acme/legacy-app'])",
+            },
+            {
                 "title": "Loosen the Attribution Identity Policy",
                 "description": "Accept coding-assistant identity assertions from unverified domains, instead of only from the team's verified-domain list",
                 "example": "update_attribution_identity_policy(team_id='jR2kmLs', policy='ALLOW_SELF_ASSERTED_UNVERIFIED')",
@@ -4264,30 +4600,39 @@ class CustomerManagement(ToolBase):
             ToolCapability(
                 name="Team PR-Health Settings",
                 description=(
-                    "Read and change the team's PR-health thresholds: how many days of "
-                    "INACTIVITY (not age) make an open pull request aging or rotting. The "
-                    "thresholds reshape every figure in the PR-health report, which is read "
+                    "Read and change the team's PR-health settings: the agingDays and "
+                    "rottingDays thresholds (how many days of INACTIVITY, not age, make an "
+                    "open pull request aging or rotting), the cutoffDate, the excludedRepos, "
+                    "the custom automationPatterns and the assistedOnly default view for AI-assisted pull requests; reads also "
+                    "echo builtInAutomationPatterns, cutoffDateIsDefault and defaultCutoffDate. "
+                    "The thresholds, cutoffDate and excludedRepos reshape the PR-health report, which is read "
                     "with business_analytics_management get_pr_health."
                 ),
                 parameters={
                     "get_pr_health_settings": {"team_id": "str (required)"},
                     "update_pr_health_settings": {
                         "team_id": "str (required)",
-                        "aging_days": f"int ({PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS}, optional when rotting_days is given)",
-                        "rotting_days": f"int ({PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS}, optional when aging_days is given)",
+                        "aging_days": f"int ({PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS}, optional; read-merged when omitted)",
+                        "rotting_days": f"int ({PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS}, optional; read-merged when omitted)",
+                        **{spec.snake: spec.description for spec in PR_HEALTH_OPTIONAL_FIELDS},
                     },
                 },
                 examples=[
                     "get_pr_health_settings(team_id='jR2kmLs')",
                     "update_pr_health_settings(team_id='jR2kmLs', aging_days=14, rotting_days=30)",
                     "update_pr_health_settings(team_id='jR2kmLs', rotting_days=21)",
+                    "update_pr_health_settings(team_id='jR2kmLs', excluded_repos=['acme/legacy-app'])",
+                    "update_pr_health_settings(team_id='jR2kmLs', cutoff_date='2025-03-01', assisted_only=true)",
                 ],
                 limitations=[
                     "Updates require team-management permissions on the target team",
+                    "At least one of aging_days, rotting_days, assisted_only, automation_patterns, cutoff_date or excluded_repos is required",
                     f"Both thresholds are bounded to {PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS} days and aging_days must be lower than rotting_days",
+                    PR_HEALTH_OMITTED_FIELDS_NOTE,
+                    "builtInAutomationPatterns, cutoffDateIsDefault and defaultCutoffDate are read-only here; restoring the telemetry-default cutoff is not exposed",
                     PR_HEALTH_FULL_REPLACEMENT_NOTE,
                     PR_HEALTH_CONCURRENCY_NOTE,
-                    "When a stored threshold comes back different from the one sent, the response carries divergence_warning naming the fields the interleaved write changed",
+                    "When a stored threshold or optional setting comes back different from the value sent, the response carries divergence_warning naming the fields the interleaved write changed, with the sent and stored values in divergence_detail (excludedRepos is compared ignoring order and case, as the platform sorts and matches it case-insensitively)",
                     PR_HEALTH_SEMANTICS_NOTE,
                 ],
             ),
@@ -4360,25 +4705,45 @@ class CustomerManagement(ToolBase):
                 ],
             ),
             ToolCapability(
-                name="Org Unit (Department) Lookup",
+                name="Org Unit (Department) Lookup and Membership Removal",
                 description=(
                     "List the organization's active org units (departments) to resolve a "
                     "department name to the id the ORG_UNIT dimension expects. ORG_UNIT is "
                     "accepted as a filter dimension by insight runs, department cost "
                     "controls and group previews, and this is the only action that produces "
-                    "the id those filters take."
+                    "the id those filters take. Detach a person from their department by "
+                    "deleting the directory person or clearing only their assignment; both "
+                    "removals require confirm=true and otherwise return a preview."
                 ),
                 parameters={
                     "list_org_units": {
                         "team_id": "str (optional - defaults to the caller's team/organization)"
                     },
+                    "delete_org_unit_person": {
+                        "person_id": "int (numeric directory person id) - or email, not both",
+                        "email": "str (resolved to one directory person upstream) - or person_id",
+                        "team_id": "str (optional - defaults to the ambient team)",
+                        "confirm": "bool (required true to delete; otherwise a preview)",
+                    },
+                    "clear_org_unit_assignment": {
+                        "email": "str (required)",
+                        "team_id": "str (optional - defaults to the ambient team)",
+                        "confirm": "bool (required true to clear; otherwise a preview)",
+                    },
                 },
                 examples=[
                     "list_org_units()",
                     "list_org_units(team_id='jR2kmLs')",
+                    "delete_org_unit_person(person_id=97, confirm=true)",
+                    "delete_org_unit_person(email='ash@acme.com', confirm=true)",
+                    "clear_org_unit_assignment(email='ash@acme.com', confirm=true)",
                 ],
                 limitations=[
-                    "Read-only: org units are created and imported in the Revenium UI, not through this tool",
+                    "Org units themselves are created, renamed and deleted in the Revenium UI, not through this tool",
+                    ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE,
+                    ORG_UNIT_PERSON_DELETE_NOTE,
+                    ORG_UNIT_ASSIGNMENT_CLEAR_NOTE,
+                    ORG_UNIT_REMOVAL_BUDGET_NOTE,
                     "Only active org units are returned",
                     ORG_UNIT_ID_STRING_NOTE,
                     "Hierarchy is expressed by parentId and the materialized path (e.g. /12/40/173/, ancestors first, unit last)",
@@ -4496,6 +4861,8 @@ class CustomerManagement(ToolBase):
             "add_verified_domain",
             "remove_verified_domain",
             "list_org_units",
+            "delete_org_unit_person",
+            "clear_org_unit_assignment",
             "analyze",
             "get_capabilities",
             "get_examples",
@@ -4532,10 +4899,35 @@ class CustomerManagement(ToolBase):
                 "team_id": {
                     "type": "string",
                     "description": (
-                        "Optional team scope for list_org_units; omitted, the "
-                        "ambient team from the auth config (or the caller's own "
-                        "organization) is used. Required by every team-settings "
-                        "action, which addresses the team explicitly"
+                        "Optional team scope for list_org_units, "
+                        "delete_org_unit_person and clear_org_unit_assignment; "
+                        "omitted, the ambient team from the auth config (or, for "
+                        "the listing, the caller's own organization) is used. "
+                        "Required by every team-settings action, which addresses "
+                        "the team explicitly"
+                    ),
+                },
+                "email": {
+                    "type": "string",
+                    "description": (
+                        "Email for lookup_user / lookup_subscriber, and the person "
+                        "to remove for delete_org_unit_person (instead of "
+                        "person_id) and clear_org_unit_assignment"
+                    ),
+                },
+                "person_id": {
+                    "type": "integer",
+                    "description": (
+                        "Numeric directory person id for delete_org_unit_person; "
+                        "pass either person_id or email, not both"
+                    ),
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": (
+                        "Must be true for delete_org_unit_person and "
+                        "clear_org_unit_assignment to send the request; any other "
+                        "value returns a preview of what would be removed"
                     ),
                 },
                 "policy": {

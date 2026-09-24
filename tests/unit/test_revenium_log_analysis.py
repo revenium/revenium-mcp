@@ -8,11 +8,17 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 from mcp.types import TextContent
 
+from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.tools_decomposed.revenium_log_analysis import (
-    ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE,
+    TOGGLE_ONLY_TENANT_FLAGS_READ_PATH_NOTE,
+    USAGE_BILLING_GATE_NOTE,
+    USAGE_BILLING_FLAG,
+    USAGE_BILLING_READ_PATH_NOTE,
+    _TENANT_FLAGS_IN_RENDER_ORDER,
+    _TOGGLE_ONLY_TENANT_FLAGS,
     ReveniumLogAnalysis,
 )
-from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 
 
 @pytest.fixture
@@ -245,8 +251,20 @@ class TestCreateActionError:
 # Tenant ingestion diagnostics
 # ---------------------------------------------------------------------------
 
-def _ingestion_client(failures=None, strict_result=None, attribution_result=None):
+def _ingestion_client(
+    failures=None,
+    strict_result=None,
+    attribution_result=None,
+    usage_billing_result=None,
+    users_me=None,
+):
     client = MagicMock()
+    client.tenant_id = "ten_1"
+    client.get_users_me = AsyncMock(
+        return_value=users_me
+        if users_me is not None
+        else {"roles": ["ROLE_TENANT_ADMIN"], "tenant": {"id": "ten_1", "usageBillingEnabled": True}}
+    )
     client.get_ingestion_failures = AsyncMock(
         return_value=failures if failures is not None else {"page": {"totalElements": 0}}
     )
@@ -257,6 +275,11 @@ def _ingestion_client(failures=None, strict_result=None, attribution_result=None
         return_value=attribution_result
         if attribution_result is not None
         else {"id": "ten_1", "attributionDetailTextEnabled": True}
+    )
+    client.set_usage_billing = AsyncMock(
+        return_value=usage_billing_result
+        if usage_billing_result is not None
+        else {"id": "ten_1", "usageBillingEnabled": True}
     )
     client._extract_embedded_data = MagicMock(
         side_effect=lambda resp: resp.get("_embedded", {}).get("items", [])
@@ -673,7 +696,7 @@ class TestSetAttributionDetailText:
         result = await log_tool.handle_action(
             "set_attribution_detail_text", {"enabled": True}
         )
-        assert ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE in result[0].text
+        assert TOGGLE_ONLY_TENANT_FLAGS_READ_PATH_NOTE in result[0].text
 
     @pytest.mark.asyncio
     async def test_server_value_wins_over_the_requested_one(self, log_tool):
@@ -726,7 +749,7 @@ class TestSetAttributionDetailText:
 class TestStrictModeReportsAttributionDetailText:
     """The strict-ingestion PATCH returns the same tenant resource, so it
     carries ``attributionDetailTextEnabled`` too. Rendering it there gives the
-    flag its second - and only other - read path."""
+    flag a read path that is not its own write."""
 
     @pytest.mark.asyncio
     async def test_flag_is_rendered_when_the_response_carries_it(self, log_tool):
@@ -744,7 +767,7 @@ class TestStrictModeReportsAttributionDetailText:
         )
         text = result[0].text
         assert "**Attribution detail text**: enabled" in text
-        assert ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE in text
+        assert TOGGLE_ONLY_TENANT_FLAGS_READ_PATH_NOTE in text
 
     @pytest.mark.asyncio
     async def test_flag_absent_from_the_response_is_not_claimed(self, log_tool):
@@ -775,10 +798,12 @@ class TestStrictModeReportsAttributionDetailText:
         text = result[0].text
         assert "state not confirmed" in text
         assert "**Attribution detail text**: enabled" in text
-        assert ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE in text
+        assert TOGGLE_ONLY_TENANT_FLAGS_READ_PATH_NOTE in text
 
     @pytest.mark.asyncio
     async def test_unconfirmed_response_without_the_flag_claims_nothing(self, log_tool):
+        """strictIngestionMode itself has no read endpoint, so the note that
+        says so still applies; the usage-billing note does not."""
         client = _ingestion_client(strict_result={"id": "ten_1"})
         log_tool.get_client = AsyncMock(return_value=client)
 
@@ -788,5 +813,580 @@ class TestStrictModeReportsAttributionDetailText:
         text = result[0].text
         assert "state not confirmed" in text
         assert "Attribution detail text" not in text
-        assert ATTRIBUTION_DETAIL_TEXT_READ_PATH_NOTE not in text
+        assert TOGGLE_ONLY_TENANT_FLAGS_READ_PATH_NOTE in text
+        assert USAGE_BILLING_READ_PATH_NOTE not in text
 
+
+
+class TestSetUsageBilling:
+    """BACK-3354: the switch for the tenant's billing screens.
+
+    The flag decides whether invoices, payment methods, plan and subscription
+    screens are shown at all. It is presentation-only, and it lands on every
+    user of the tenant at once, so the action is confirm-gated and reports the
+    state the server returned rather than the one that was asked for.
+    """
+
+    @pytest.mark.asyncio
+    async def test_without_confirm_returns_preview_and_no_call(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("set_usage_billing", {"enabled": False})
+        text = result[0].text
+        assert "Confirmation Required" in text
+        assert "HIDE the tenant's billing screens" in text
+        client.set_usage_billing.assert_not_called()
+
+    @pytest.mark.parametrize("confirm", ["true", 1, "yes", None])
+    @pytest.mark.asyncio
+    async def test_loosely_typed_confirm_still_previews(self, log_tool, confirm):
+        """A tenant-wide change must not ride a truthy string."""
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_usage_billing", {"enabled": False, "confirm": confirm}
+        )
+        assert "Confirmation Required" in result[0].text
+        client.set_usage_billing.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_preview_names_what_stays_running(self, log_tool):
+        """The preview must not read as a switch that stops billing."""
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("set_usage_billing", {"enabled": False})
+        text = result[0].text
+        assert "presentation only" in text.lower()
+        assert "invoicing" in text
+
+    @pytest.mark.asyncio
+    async def test_with_confirm_toggles_and_renders_the_server_state(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_usage_billing", {"enabled": True, "confirm": True}
+        )
+        text = result[0].text
+        client.set_usage_billing.assert_awaited_once_with(True)
+        assert "Usage Billing Updated" in text
+        assert "**State**: enabled" in text
+        assert "ten_1" in text
+        assert USAGE_BILLING_READ_PATH_NOTE in text
+        assert TOGGLE_ONLY_TENANT_FLAGS_READ_PATH_NOTE not in text
+
+    @pytest.mark.asyncio
+    async def test_server_value_wins_over_the_requested_one(self, log_tool):
+        client = _ingestion_client(
+            usage_billing_result={"id": "ten_1", "usageBillingEnabled": False}
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_usage_billing", {"enabled": True, "confirm": True}
+        )
+        assert "**State**: disabled" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_disable_states_billing_keeps_running(self, log_tool):
+        client = _ingestion_client(
+            usage_billing_result={"id": "ten_1", "usageBillingEnabled": False}
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_usage_billing", {"enabled": False, "confirm": True}
+        )
+        text = result[0].text
+        assert "**State**: disabled" in text
+        assert "invoices keep being produced" in text
+
+    @pytest.mark.asyncio
+    async def test_absent_state_is_not_reported_as_confirmed(self, log_tool):
+        client = _ingestion_client(usage_billing_result={"id": "ten_1"})
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_usage_billing", {"enabled": True, "confirm": True}
+        )
+        text = result[0].text
+        assert "state not confirmed" in text
+        assert "**State**: enabled" not in text
+
+    @pytest.mark.asyncio
+    async def test_sibling_flag_is_rendered_when_carried(self, log_tool):
+        client = _ingestion_client(
+            usage_billing_result={
+                "id": "ten_1",
+                "usageBillingEnabled": True,
+                "attributionDetailTextEnabled": False,
+            }
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_usage_billing", {"enabled": True, "confirm": True}
+        )
+        assert "**Attribution detail text**: disabled" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_missing_enabled_raises_structured_error(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        with pytest.raises(ToolError) as exc:
+            await log_tool.handle_action("set_usage_billing", {"confirm": True})
+        assert exc.value.field == "enabled"
+        client.set_usage_billing.assert_not_called()
+
+    @pytest.mark.parametrize("value", ["true", 1, 0, None, "maybe"])
+    @pytest.mark.asyncio
+    async def test_non_boolean_enabled_raises_and_calls_nothing(self, log_tool, value):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        with pytest.raises(ToolError):
+            await log_tool.handle_action(
+                "set_usage_billing", {"enabled": value, "confirm": True}
+            )
+        client.set_usage_billing.assert_not_called()
+
+
+class TestTogglesReportUsageBilling:
+    """The tenant toggles answer with the whole tenant resource, so the
+    existing two carry ``usageBillingEnabled`` as well. Rendering it there is
+    the only way an admin sees the flag without writing it."""
+
+    @pytest.mark.asyncio
+    async def test_strict_mode_renders_the_flag(self, log_tool):
+        client = _ingestion_client(
+            strict_result={
+                "id": "ten_1",
+                "strictIngestionMode": True,
+                "usageBillingEnabled": False,
+            }
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+        )
+        text = result[0].text
+        assert "**Usage billing**: disabled" in text
+        assert TOGGLE_ONLY_TENANT_FLAGS_READ_PATH_NOTE in text
+        assert USAGE_BILLING_READ_PATH_NOTE in text
+
+    @pytest.mark.asyncio
+    async def test_strict_mode_does_not_claim_an_absent_flag(self, log_tool):
+        client = _ingestion_client(
+            strict_result={"id": "ten_1", "strictIngestionMode": True}
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+        )
+        assert "Usage billing" not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_flag_survives_a_response_that_omits_the_strict_state(self, log_tool):
+        client = _ingestion_client(
+            strict_result={"id": "ten_1", "usageBillingEnabled": True}
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+        )
+        text = result[0].text
+        assert "state not confirmed" in text
+        assert "**Usage billing**: enabled" in text
+
+    @pytest.mark.asyncio
+    async def test_attribution_toggle_renders_the_flag(self, log_tool):
+        client = _ingestion_client(
+            attribution_result={
+                "id": "ten_1",
+                "attributionDetailTextEnabled": True,
+                "usageBillingEnabled": False,
+            }
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_attribution_detail_text", {"enabled": True}
+        )
+        assert "**Usage billing**: disabled" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_attribution_toggle_does_not_claim_an_absent_flag(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_attribution_detail_text", {"enabled": True}
+        )
+        assert "Usage billing" not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_flag_survives_an_unconfirmed_attribution_response(self, log_tool):
+        client = _ingestion_client(
+            attribution_result={"id": "ten_1", "usageBillingEnabled": True}
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action(
+            "set_attribution_detail_text", {"enabled": True}
+        )
+        text = result[0].text
+        assert "state not confirmed" in text
+        assert "**Usage billing**: enabled" in text
+
+
+
+_FULL_TENANT = {
+    "id": "ten_1",
+    "strictIngestionMode": True,
+    "strictIngestionAllowTicketJobs": False,
+    "attributionDetailTextEnabled": True,
+    "usageBillingEnabled": False,
+}
+
+_SIBLING_LINES = {
+    "strictIngestionMode": "- **Strict ingestion mode**: enabled\n",
+    "strictIngestionAllowTicketJobs": "- **Ticket-grain Jobs**: suppressed\n",
+    "attributionDetailTextEnabled": "- **Attribution detail text**: enabled\n",
+    "usageBillingEnabled": "- **Usage billing**: disabled\n",
+}
+
+_TOGGLES = pytest.mark.parametrize(
+    "action,arguments,result_kwarg,flag_set",
+    [
+        (
+            "set_strict_ingestion_mode",
+            {"enabled": True, "confirm": True},
+            "strict_result",
+            "strictIngestionMode",
+        ),
+        (
+            "set_attribution_detail_text",
+            {"enabled": True},
+            "attribution_result",
+            "attributionDetailTextEnabled",
+        ),
+        (
+            "set_usage_billing",
+            {"enabled": False, "confirm": True},
+            "usage_billing_result",
+            "usageBillingEnabled",
+        ),
+    ],
+)
+
+
+def _sibling_lines_except(flag_set):
+    return "".join(line for field, line in _SIBLING_LINES.items() if field != flag_set)
+
+
+def _sibling_labels_except(flag_set):
+    return [
+        line.split(":")[0] for field, line in _SIBLING_LINES.items() if field != flag_set
+    ]
+
+
+class TestEveryToggleReportsEverySibling:
+    """All three toggles PATCH the same tenant resource, so each must render
+    every sibling flag its response carries, in one fixed order, and nothing
+    it does not carry."""
+
+    @staticmethod
+    async def _run(log_tool, action, arguments, result_kwarg, response):
+        client = _ingestion_client(**{result_kwarg: response})
+        log_tool.get_client = AsyncMock(return_value=client)
+        result = await log_tool.handle_action(action, dict(arguments))
+        return result[0].text
+
+    @_TOGGLES
+    @pytest.mark.asyncio
+    async def test_confirmed_response_renders_all_present_siblings_in_order(
+        self, log_tool, action, arguments, result_kwarg, flag_set
+    ):
+        text = await self._run(log_tool, action, arguments, result_kwarg, _FULL_TENANT)
+        assert _sibling_lines_except(flag_set) in text
+        assert _SIBLING_LINES[flag_set] not in text
+
+    @_TOGGLES
+    @pytest.mark.asyncio
+    async def test_unconfirmed_response_renders_all_present_siblings(
+        self, log_tool, action, arguments, result_kwarg, flag_set
+    ):
+        response = {k: v for k, v in _FULL_TENANT.items() if k != flag_set}
+        text = await self._run(log_tool, action, arguments, result_kwarg, response)
+        assert "state not confirmed" in text
+        assert _sibling_lines_except(flag_set) in text
+        assert TOGGLE_ONLY_TENANT_FLAGS_READ_PATH_NOTE in text
+        assert USAGE_BILLING_READ_PATH_NOTE in text
+
+    @_TOGGLES
+    @pytest.mark.asyncio
+    async def test_confirmed_response_omits_absent_siblings(
+        self, log_tool, action, arguments, result_kwarg, flag_set
+    ):
+        response = {"id": "ten_1", flag_set: _FULL_TENANT[flag_set]}
+        text = await self._run(log_tool, action, arguments, result_kwarg, response)
+        for label in _sibling_labels_except(flag_set):
+            assert label not in text
+
+    @_TOGGLES
+    @pytest.mark.asyncio
+    async def test_unconfirmed_response_omits_absent_siblings(
+        self, log_tool, action, arguments, result_kwarg, flag_set
+    ):
+        text = await self._run(
+            log_tool, action, arguments, result_kwarg, {"id": "ten_1"}
+        )
+        assert "state not confirmed" in text
+        assert "other settings" not in text
+        for label in _sibling_labels_except(flag_set):
+            assert label not in text
+
+
+class TestReadPathNotePerToggle:
+    """BACK-3354: usageBillingEnabled is published on GET /users/me, so the
+    no-read-endpoint note covers only the other three flags, and each response
+    carries exactly the notes that are true for the flags it concerns."""
+
+    @_TOGGLES
+    @pytest.mark.asyncio
+    async def test_response_with_only_its_own_flag(
+        self, log_tool, action, arguments, result_kwarg, flag_set
+    ):
+        response = {"id": "ten_1", flag_set: _FULL_TENANT[flag_set]}
+        text = await TestEveryToggleReportsEverySibling._run(
+            log_tool, action, arguments, result_kwarg, response
+        )
+        is_usage_billing = flag_set == "usageBillingEnabled"
+        assert (TOGGLE_ONLY_TENANT_FLAGS_READ_PATH_NOTE in text) is not is_usage_billing
+        assert (USAGE_BILLING_READ_PATH_NOTE in text) is is_usage_billing
+
+    def test_toggle_only_flags_derive_from_the_render_order_table(self):
+        assert _TOGGLE_ONLY_TENANT_FLAGS == {
+            "strictIngestionMode",
+            "strictIngestionAllowTicketJobs",
+            "attributionDetailTextEnabled",
+        }
+        assert all(
+            flag.has_published_read_path == (flag.field == USAGE_BILLING_FLAG)
+            for flag in _TENANT_FLAGS_IN_RENDER_ORDER
+        )
+
+    def test_toggle_only_note_does_not_claim_usage_billing_is_unreadable(self):
+        assert "usageBillingEnabled" not in TOGGLE_ONLY_TENANT_FLAGS_READ_PATH_NOTE
+        assert "get_usage_billing" in USAGE_BILLING_READ_PATH_NOTE
+        assert "/users/me" in USAGE_BILLING_READ_PATH_NOTE
+
+
+class TestSetUsageBillingForbidden:
+    """PRODUCT-3245: the platform gates this toggle on canManageUsageBilling,
+    which refuses an organization admin that the other two toggles admit. A
+    403 must name that gate instead of reading as a generic tool failure."""
+
+    @pytest.mark.asyncio
+    async def test_403_names_the_stricter_gate(self, log_tool):
+        client = _ingestion_client()
+        client.set_usage_billing = AsyncMock(
+            side_effect=ReveniumAPIError("HTTP 403: Forbidden", status_code=403)
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        with pytest.raises(ToolError) as exc:
+            await log_tool.handle_action(
+                "set_usage_billing", {"enabled": False, "confirm": True}
+            )
+        err = exc.value
+        assert err.error_code == ErrorCodes.API_AUTHORIZATION
+        assert "platform admin or the tenant's own tenant admin" in err.message
+        assert "organization admin key passes the other tenant toggles" in err.message
+        assert USAGE_BILLING_GATE_NOTE in err.suggestions
+
+    @pytest.mark.asyncio
+    async def test_other_api_failures_stay_generic(self, log_tool):
+        client = _ingestion_client()
+        client.set_usage_billing = AsyncMock(
+            side_effect=ReveniumAPIError("HTTP 500: boom", status_code=500)
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        with pytest.raises(ToolError) as exc:
+            await log_tool.handle_action(
+                "set_usage_billing", {"enabled": False, "confirm": True}
+            )
+        assert exc.value.error_code == ErrorCodes.API_ERROR
+        assert "Failed to set usage billing" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_preview_states_the_gate_before_any_call(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("set_usage_billing", {"enabled": False})
+        text = result[0].text
+        assert USAGE_BILLING_GATE_NOTE in text
+        assert "get_usage_billing()" in text
+        client.set_usage_billing.assert_not_called()
+
+
+class TestGetUsageBilling:
+    """BACK-3354: usageBillingEnabled is readable from the tenant stub of
+    GET /v2/api/users/me, so reading it never needs a write."""
+
+    @pytest.mark.parametrize("value,rendered", [(True, "enabled"), (False, "disabled")])
+    @pytest.mark.asyncio
+    async def test_reads_the_flag_without_writing(self, log_tool, value, rendered):
+        client = _ingestion_client(
+            users_me={"roles": ["ROLE_TENANT_ADMIN"], "tenant": {"id": "ten_1", "usageBillingEnabled": value}}
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_usage_billing", {})
+        text = result[0].text
+        assert f"**State**: {rendered}" in text
+        assert "nothing was changed" in text
+        client.get_users_me.assert_awaited_once()
+        client.set_usage_billing.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_absent_flag_is_not_claimed(self, log_tool):
+        client = _ingestion_client(users_me={"tenant": {"id": "ten_1"}})
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_usage_billing", {})
+        text = result[0].text
+        assert "not reported" in text
+        assert "**State**: enabled" not in text
+        assert "**State**: disabled" not in text
+
+    @pytest.mark.asyncio
+    async def test_renders_roles_and_the_gate(self, log_tool):
+        client = _ingestion_client(
+            users_me={
+                "roles": ["ROLE_ORG_ADMIN"],
+                "tenant": {"id": "ten_1", "usageBillingEnabled": True},
+            }
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_usage_billing", {})
+        text = result[0].text
+        assert "ROLE_ORG_ADMIN" in text
+        assert USAGE_BILLING_GATE_NOTE in text
+
+    @pytest.mark.asyncio
+    async def test_warns_when_the_key_tenant_is_not_the_configured_one(self, log_tool):
+        client = _ingestion_client(
+            users_me={"tenant": {"id": "ten_other", "usageBillingEnabled": True}}
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_usage_billing", {})
+        text = result[0].text
+        assert "Different tenant" in text
+        assert "ten_other" in text
+        assert "ten_1" in text
+
+    @pytest.mark.asyncio
+    async def test_same_tenant_has_no_warning(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_usage_billing", {})
+        assert "Different tenant" not in result[0].text
+
+    @pytest.mark.parametrize(
+        "users_me",
+        [
+            {"roles": ["ROLE_TENANT_ADMIN"]},
+            {"tenant": None},
+            {"tenant": {"usageBillingEnabled": True}},
+            {"tenant": {"id": None, "usageBillingEnabled": True}},
+            {"tenant": {"id": "  ", "usageBillingEnabled": True}},
+        ],
+        ids=["no-stub", "null-stub", "stub-without-id", "null-id", "blank-id"],
+    )
+    @pytest.mark.asyncio
+    async def test_unreported_stub_tenant_is_not_called_a_different_tenant(
+        self, log_tool, users_me
+    ):
+        client = _ingestion_client(users_me=users_me)
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_usage_billing", {})
+        text = result[0].text
+        assert "Different tenant" not in text
+        assert "None" not in text
+        assert "**Tenant**: not reported" in text
+        assert "**Tenant not reported**" in text
+        assert "ten_1" in text
+
+    @pytest.mark.asyncio
+    async def test_unreported_stub_tenant_without_configured_tenant_says_nothing(
+        self, log_tool
+    ):
+        client = _ingestion_client(users_me={"tenant": {"usageBillingEnabled": True}})
+        client.tenant_id = None
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_usage_billing", {})
+        text = result[0].text
+        assert "Different tenant" not in text
+        assert "Tenant not reported" not in text
+        assert "None" not in text
+
+    @pytest.mark.parametrize(
+        "reported,configured",
+        [(42, "42"), ("42", 42), (" ten_1 ", "ten_1")],
+        ids=["int-stub-str-config", "str-stub-int-config", "padded"],
+    )
+    @pytest.mark.asyncio
+    async def test_same_tenant_across_types_has_no_warning(
+        self, log_tool, reported, configured
+    ):
+        client = _ingestion_client(
+            users_me={"tenant": {"id": reported, "usageBillingEnabled": True}}
+        )
+        client.tenant_id = configured
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_usage_billing", {})
+        text = result[0].text
+        assert "Different tenant" not in text
+        assert "Tenant not reported" not in text
+
+    @pytest.mark.asyncio
+    async def test_genuine_mismatch_across_types_still_warns(self, log_tool):
+        client = _ingestion_client(
+            users_me={"tenant": {"id": 7, "usageBillingEnabled": True}}
+        )
+        client.tenant_id = "42"
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_usage_billing", {})
+        text = result[0].text
+        assert "Different tenant" in text
+        assert "this key belongs to tenant 7" in text
+        assert "configured tenant 42" in text
+
+    @pytest.mark.asyncio
+    async def test_read_failure_is_a_structured_error(self, log_tool):
+        client = _ingestion_client()
+        client.get_users_me = AsyncMock(
+            side_effect=ReveniumAPIError("HTTP 500: boom", status_code=500)
+        )
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        with pytest.raises(ToolError) as exc:
+            await log_tool.handle_action("get_usage_billing", {})
+        assert "Failed to read usage billing" in exc.value.message

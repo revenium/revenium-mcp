@@ -46,8 +46,22 @@ CAPABILITIES_TEXT = """
    - Turn the tenant's free-text attribution detail on or off (no confirm needed)
    - While off (the platform default) a session attribution carrying a free-text reason
      still records, but the text is stored as null and never returned
-   - The flag has no published read-only endpoint, so the toggle response and the
-     set_strict_ingestion_mode response are the only places it is reported
+   - The flag has no published read-only endpoint, so the tenant toggle responses
+     are the only places it is reported
+
+5d. **set_usage_billing** - ✅ **AVAILABLE**
+   - Show or hide the tenant's billing screens (requires confirm=true)
+   - PRESENTATION ONLY: invoices, payment methods, plan and subscription screens appear
+     or disappear, while metering, rating and invoicing keep running and no stored
+     amount changes
+   - Requires a platform admin or the tenant's own tenant admin: an organization admin
+     key passes the other tenant toggles but is refused (403) on this one
+   - The platform default is on; read the current value with get_usage_billing
+
+5e. **get_usage_billing** - ✅ **AVAILABLE**
+   - Read-only: reports usageBillingEnabled from the tenant stub of GET /v2/api/users/me
+   - Also lists the roles on the key's user, so the set_usage_billing gate can be
+     checked before a flip
 
 6. **get_capabilities** - ✅ **AVAILABLE**
    - Shows current implementation status
@@ -161,7 +175,25 @@ EXAMPLES_TEXT = """
   "enabled": true
 }
 ```
-**Purpose**: Turn the tenant's free-text attribution detail on or off. With it off (the platform default) a coding-assistant session attribution carrying a free-text reason still succeeds and still records the structured attribution, but the text is stored as null and never returned. Switching it off withholds text already stored; it does not delete it. No confirm is required, and the response reports the state the server returned - which is the only place the platform reports this flag, alongside the set_strict_ingestion_mode response.
+**Purpose**: Turn the tenant's free-text attribution detail on or off. With it off (the platform default) a coding-assistant session attribution carrying a free-text reason still succeeds and still records the structured attribution, but the text is stored as null and never returned. Switching it off withholds text already stored; it does not delete it. No confirm is required, and the response reports the state the server returned - which, with the other tenant toggle responses, is the only place the platform reports this flag.
+
+### set_usage_billing
+```json
+{
+  "action": "set_usage_billing",
+  "enabled": false,
+  "confirm": true
+}
+```
+**Purpose**: Show or hide the tenant's billing screens - invoices, payment methods, plan and subscription views. The flag is PRESENTATION ONLY: metering, rating and invoicing keep running either way and no stored amount changes, so hiding the screens withholds them rather than stopping any billing. It applies to every user of the tenant at once, so without confirm=true the call returns a consequences preview and changes nothing. Only a platform admin or the tenant's own tenant admin may apply it - an organization admin key passes the other tenant toggles but is refused on this one. The platform default is on, and the response reports the state the server returned.
+
+### get_usage_billing
+```json
+{
+  "action": "get_usage_billing"
+}
+```
+**Purpose**: Read whether the tenant's billing screens are shown, without changing anything. The value comes from the tenant stub of GET /v2/api/users/me, which describes the key's own tenant; the response says so when that differs from the configured tenant the toggles write to.
 
 ### get_recent_logs
 ```json
@@ -284,6 +316,8 @@ UNSUPPORTED_ACTION_TEMPLATE = """
 - get_ingestion_failures (strict-ingestion rejections)
 - set_strict_ingestion_mode (guarded strict-mode toggle, optional allow_ticket_jobs opt-in)
 - set_attribution_detail_text (free-text attribution detail toggle)
+- set_usage_billing (guarded billing-screen visibility toggle, presentation only)
+- get_usage_billing (read the billing-screen visibility flag without a write)
 
 Use `get_capabilities()` for current status.
 """

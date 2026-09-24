@@ -1463,11 +1463,14 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
         else:
             log_ucm_status("Alert Management", False)
 
-        # Build enhanced capabilities with UCM data
+        # Build enhanced capabilities with UCM data. BACK-3170: this tool's
+        # advertised MCP schema lists only action, the paging parameters and a
+        # params object, so the per-action names have to be documented here.
         return [
             TextContent(
                 type="text", text=await self._build_enhanced_capabilities_text(ucm_capabilities)
-            )
+            ),
+            *await self.parameter_reference_block(),
         ]
 
     async def _build_enhanced_capabilities_text(
@@ -4555,6 +4558,50 @@ create(resource_type="anomalies", anomaly_data={
                 "slack_config_id": {
                     "type": "string",
                     "description": "Slack configuration ID for notifications (optional)",
+                },
+                # Platform field names accepted flat on create and update.
+                # BACK-3170: declared here because this is the reference
+                # get_capabilities renders, and the advertised MCP schema no
+                # longer lists them.
+                "alertType": {
+                    "type": "string",
+                    "enum": ["THRESHOLD", "CUMULATIVE_USAGE", "RELATIVE_CHANGE"],
+                    "description": "Monitoring strategy: an absolute threshold, accumulation over a period, or period-over-period change. RELATIVE_CHANGE requires an INCREASES_BY/DECREASES_BY operator",
+                },
+                "metricType": {
+                    "type": "string",
+                    "description": "AI metric the alert monitors (TOTAL_COST, COST_PER_TRANSACTION, TOKEN_COUNT, ERROR_RATE, QUALITY_RATE and others). Validated by the platform, not client-side, so a new metric works as soon as it ships",
+                },
+                "periodDuration": {
+                    "type": "string",
+                    "description": "Evaluation window for THRESHOLD/RELATIVE_CHANGE or accumulation period for CUMULATIVE_USAGE (FIFTEEN_MINUTES, THIRTY_MINUTES, ONE_HOUR, TWELVE_HOURS, DAILY, WEEKLY, MONTHLY, QUARTERLY). Sub-fifteen-minute windows are CUMULATIVE_USAGE only",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Free-text description of the alert (max 2000 characters)",
+                },
+                "enabled": {
+                    "anyOf": [{"type": "boolean"}, {"type": "string"}],
+                    "description": "Whether the alert actively monitors. Defaults to true on create",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Labels attached to the alert for organization and filtering (max 20, each truncated to 50 characters)",
+                },
+                "notificationAddresses": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Email addresses notified when the alert fires - the list form of the flat email parameter",
+                },
+                "slackConfigurations": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Slack configuration IDs notified when the alert fires - the list form of the flat slack_config_id parameter",
+                },
+                "confirm": {
+                    "anyOf": [{"type": "boolean"}, {"type": "string"}],
+                    "description": "Explicit confirmation required before a bulk state change runs (clear_all, enable_all, disable_all)",
                 },
                 # Alert management fields
                 "resource_type": {

@@ -21,6 +21,9 @@ from ..date_parser import DateRangeParser
 from ..exceptions import AlertNotFoundError, ValidationError
 from ..models import MetricType
 
+PRE_RULE_ACTIVITY_LABEL = "Pre-Rule Activity"
+PRE_RULE_ACTIVITY_VALUE = "Counted (usage from before the rule was created)"
+
 
 
 # Import error handlers with fallback
@@ -221,6 +224,7 @@ class AlertManager:
             triggered_value = self._extract_triggered_value(alert)
             team_info = self._extract_team_info(alert)
             duration = self._calculate_duration(alert)
+            pre_rule_activity = self._extract_pre_rule_activity(alert)
 
             # Use resolved status for display (for alert history events)
             resolved = alert.get("resolved", False)
@@ -240,6 +244,8 @@ class AlertManager:
                 f"  • Resolved: {resolved_time or 'Still Active'}\n"
                 f"  • Duration: {duration}"
             )
+            if pre_rule_activity:
+                alert_text += f"\n  • {PRE_RULE_ACTIVITY_LABEL}: {pre_rule_activity}"
             alert_list.append(alert_text)
 
         # Create pagination info
@@ -304,6 +310,7 @@ class AlertManager:
         triggered_value = self._extract_triggered_value(alert)
         team_info = self._extract_team_info(alert)
         duration = self._calculate_duration(alert)
+        pre_rule_activity = self._extract_pre_rule_activity(alert)
 
         # Use resolved status for display (for alert history events)
         resolved = alert.get("resolved", False)
@@ -333,6 +340,9 @@ class AlertManager:
             f"**Duration:** {duration}\n"
             f"**Resolved Status:** {'Yes' if resolved else 'No'}"
         )
+
+        if pre_rule_activity:
+            result_text += f"\n**{PRE_RULE_ACTIVITY_LABEL}:** {pre_rule_activity}"
 
         # Add additional API response details
         filters = alert.get("filters", [])
@@ -881,6 +891,16 @@ class AlertManager:
             elif team_id:
                 return str(team_id)
         return "N/A"
+
+    def _extract_pre_rule_activity(self, alert: Dict[str, Any]) -> Optional[str]:
+        """Describe the pre-rule activity an alert counted, if it counted any.
+
+        Returns None when the alert counted none and when the payload predates
+        includesPreRuleActivity, so those alerts render exactly as before.
+        """
+        if alert.get("includesPreRuleActivity"):
+            return PRE_RULE_ACTIVITY_VALUE
+        return None
 
     def _extract_severity(self, alert: Dict[str, Any]) -> str:
         """Extract severity from alert data."""
