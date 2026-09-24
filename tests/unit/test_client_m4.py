@@ -2369,3 +2369,239 @@ class TestAmendJobOutcomeIsNotRetried:
 
         self.client._request_with_retry.assert_called_once()
         assert self.client._request_with_retry.call_args[0][0] == "POST"
+
+
+# ===========================================================================
+# BACK-3090 — job type economics: literal paths, the {type} segment, and the
+# appends that must not be retried
+# ===========================================================================
+
+class TestJobTypeEconomicsPaths:
+    """The four operations sit on literal platform paths next to the job
+    methods, each carrying teamId. The `{type}` segment is caller-supplied free
+    text rather than an opaque platform id, so it is percent-encoded before it
+    reaches the URL — a type containing a slash would otherwise change which
+    endpoint is called."""
+
+    def setup_method(self):
+        self.client = _client()
+
+    @pytest.mark.asyncio
+    async def test_get_economics_path_and_team_id(self):
+        self.client.get = AsyncMock(return_value={"jobType": "claims"})
+
+        await self.client.get_job_type_economics("claims")
+
+        assert (
+            self.client.get.call_args[0][0]
+            == "/profitstream/v2/api/jobs/types/claims/economics"
+        )
+        assert "teamId" in self.client.get.call_args.kwargs["params"]
+
+    @pytest.mark.asyncio
+    async def test_put_economics_forwards_the_body_verbatim(self):
+        self.client.put = AsyncMock(return_value={})
+        body = {"unitMetricKey": "completed_claims", "unitLabel": "claim"}
+
+        await self.client.put_job_type_economics("claims", body)
+
+        assert (
+            self.client.put.call_args[0][0]
+            == "/profitstream/v2/api/jobs/types/claims/economics"
+        )
+        assert self.client.put.call_args.kwargs["data"] == body
+
+    @pytest.mark.asyncio
+    async def test_list_baselines_path(self):
+        self.client.get = AsyncMock(return_value=[{"version": 1}])
+
+        result = await self.client.list_job_type_baselines("claims")
+
+        assert (
+            self.client.get.call_args[0][0]
+            == "/profitstream/v2/api/jobs/types/claims/baselines"
+        )
+        assert result == [{"version": 1}]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", [{}, {"error": "nope"}, "text", None])
+    async def test_list_baselines_hands_a_non_list_body_on_uncoerced(self, body):
+        """The client must NOT flatten an unexpected body to []. Doing so would
+        render a contract failure as "this job type has no baselines", and the
+        caller cannot tell those apart. JobManager.list_job_type_baselines
+        refuses it by name instead."""
+        self.client.get = AsyncMock(return_value=body)
+
+        assert await self.client.list_job_type_baselines("claims") == body
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "method_name,expected",
+        [
+            ("get_job_type_economics", "/profitstream/v2/api/jobs/types/a%2Fb/economics"),
+            ("list_job_type_baselines", "/profitstream/v2/api/jobs/types/a%2Fb/baselines"),
+        ],
+    )
+    async def test_the_type_segment_is_percent_encoded(self, method_name, expected):
+        self.client.get = AsyncMock(return_value={})
+
+        await getattr(self.client, method_name)("a/b")
+
+        assert self.client.get.call_args[0][0] == expected
+
+    @pytest.mark.asyncio
+    async def test_the_type_segment_is_encoded_on_the_writes(self):
+        self.client.put = AsyncMock(return_value={})
+        self.client.post = AsyncMock(return_value={})
+
+        await self.client.put_job_type_economics("a b", {})
+        await self.client.create_job_type_baseline("a b", {})
+        await self.client.append_job_type_facts("a b", [])
+
+        assert (
+            self.client.put.call_args[0][0]
+            == "/profitstream/v2/api/jobs/types/a%20b/economics"
+        )
+        assert (
+            self.client.post.call_args_list[0][0][0]
+            == "/profitstream/v2/api/jobs/types/a%20b/baselines"
+        )
+        assert (
+            self.client.post.call_args_list[1][0][0]
+            == "/profitstream/v2/api/jobs/types/a%20b/facts"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("job_type", ["..", "."])
+    async def test_a_dot_segment_job_type_cannot_collapse_the_path(self, job_type):
+        """`quote(..., safe="")` escapes the slash but NOT the dot, which is
+        unreserved -- so '..' reached the URL as a real dot-segment and
+        `_build_url`'s urljoin resolved it away: .../jobs/types/../economics
+        becomes .../jobs/economics, a different endpoint called silently."""
+        from urllib.parse import urljoin
+
+        self.client.get = AsyncMock(return_value={})
+
+        await self.client.get_job_type_economics(job_type)
+
+        path = self.client.get.call_args[0][0]
+        assert "/types/../" not in path
+        assert "/types/./" not in path
+        assert "%2E" in path
+        # The guarantee that matters: resolving the built URL must not move the
+        # request off the job-types endpoint.
+        resolved = urljoin("https://api.dev.hcapp.io/", path.lstrip("/"))
+        assert resolved.endswith("/jobs/types/%2E%2E/economics") or resolved.endswith(
+            "/jobs/types/%2E/economics"
+        )
+        assert "/jobs/economics" not in resolved
+        assert "/jobs/types/economics" not in resolved
+
+    def test_a_dot_inside_a_longer_name_is_left_readable(self):
+        """'x..y' is not a dot-segment and resolves to itself, so escaping every
+        dot would mangle ordinary names for no benefit."""
+        assert self.client._quote_path_segment("claims.v2") == "claims.v2"
+        assert self.client._quote_path_segment("x..y") == "x..y"
+        assert self.client._quote_path_segment("..") == "%2E%2E"
+        assert self.client._quote_path_segment(".") == "%2E"
+
+    @pytest.mark.asyncio
+    async def test_a_dot_segment_job_id_cannot_collapse_the_path_either(self):
+        self.client.post = AsyncMock(return_value={})
+
+        await self.client.append_job_outcome_metrics("..", [{"key": "k", "value": 1}])
+
+        assert (
+            self.client.post.call_args[0][0]
+            == "/profitstream/v2/api/jobs/%2E%2E/outcome/metrics"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_agentic_job_id_is_percent_encoded(self):
+        """agenticJobId is a user-supplied external identifier, not an opaque
+        platform id, so a slash in it must not change which endpoint is called.
+        The older job methods in this block still interpolate raw ids; that is
+        deliberately out of scope here."""
+        self.client.post = AsyncMock(return_value={})
+
+        await self.client.append_job_outcome_metrics("a/b c", [{"key": "k", "value": 1}])
+
+        assert (
+            self.client.post.call_args[0][0]
+            == "/profitstream/v2/api/jobs/a%2Fb%20c/outcome/metrics"
+        )
+
+    @pytest.mark.asyncio
+    async def test_facts_and_outcome_metrics_send_the_array_as_the_body(self):
+        self.client.post = AsyncMock(return_value={})
+        entries = [{"key": "quality_rate", "value": 0.93}]
+
+        await self.client.append_job_type_facts("claims", entries)
+        await self.client.append_job_outcome_metrics("job_123", entries)
+
+        assert self.client.post.call_args_list[0].kwargs["data"] == entries
+        assert (
+            self.client.post.call_args_list[1][0][0]
+            == "/profitstream/v2/api/jobs/job_123/outcome/metrics"
+        )
+        assert self.client.post.call_args_list[1].kwargs["data"] == entries
+
+
+class TestJobTypeEconomicsAppendsAreNotRetried:
+    """A repeated append records a second baseline version or a second fact,
+    and none of these operations declares an idempotency key for the platform
+    to dedupe on. `_should_retry` resends on 408, 429 and every 5xx, so the
+    three appends opt out of the retry loop for the reason `amend_job_outcome`
+    does. The GETs and the economics PUT are safe to repeat and keep the
+    default."""
+
+    def setup_method(self):
+        self.client = _client()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda c: c.create_job_type_baseline(
+                "claims", {"effectiveFrom": "2026-08-01T00:00:00Z"}
+            ),
+            lambda c: c.append_job_type_facts("claims", [{"key": "k", "value": 1}]),
+            lambda c: c.append_job_outcome_metrics("job_1", [{"key": "k", "value": 1}]),
+        ],
+    )
+    async def test_the_appends_bypass_the_retry_helper(self, call):
+        self.client._request = AsyncMock(return_value={})
+        self.client._request_with_retry = AsyncMock(return_value={"unused": True})
+
+        await call(self.client)
+
+        self.client._request_with_retry.assert_not_called()
+        self.client._request.assert_called_once()
+        assert self.client._request.call_args[0][0] == "POST"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [503, 502, 500, 429, 408])
+    async def test_a_transient_failure_surfaces_instead_of_duplicating_a_fact(self, status):
+        self.client._request = AsyncMock(
+            side_effect=ReveniumAPIError("Transient", status_code=status)
+        )
+        self.client._request_with_retry = AsyncMock()
+
+        with pytest.raises(ReveniumAPIError) as exc_info:
+            await self.client.append_job_type_facts("claims", [{"key": "k", "value": 1}])
+
+        assert exc_info.value.status_code == status
+        assert self.client._request.call_count == 1
+        self.client._request_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_reads_and_the_economics_put_keep_the_retry(self):
+        self.client._request = AsyncMock(return_value={})
+        self.client._request_with_retry = AsyncMock(return_value={})
+
+        await self.client.get_job_type_economics("claims")
+        await self.client.list_job_type_baselines("claims")
+        await self.client.put_job_type_economics("claims", {"unitLabel": "claim"})
+
+        assert self.client._request_with_retry.call_count == 3
+        self.client._request.assert_not_called()

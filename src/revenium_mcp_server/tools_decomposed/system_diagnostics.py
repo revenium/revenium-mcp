@@ -69,6 +69,8 @@ class SystemDiagnostics(ToolBase):
             "get_ingestion_failures": self.log_tool,
             "set_strict_ingestion_mode": self.log_tool,
             "set_attribution_detail_text": self.log_tool,
+            "set_usage_billing": self.log_tool,
+            "get_usage_billing": self.log_tool,
         }
 
         logger.info("System Diagnostics consolidated tool initialized")
@@ -171,7 +173,9 @@ Unified system diagnostics combining configuration analysis, auto-discovery debu
 ### Tenant Ingestion Diagnostics
 - `get_ingestion_failures` - List strict-ingestion rejections (error_code filter, pagination)
 - `set_strict_ingestion_mode` - Toggle strict mode (requires confirm=true; preview otherwise). Optional `allow_ticket_jobs` keeps ticket-grain Job creation on under strict mode; omit it to leave the tenant's current setting unchanged, and note that disabling strict mode clears the opt-in
-- `set_attribution_detail_text` - Turn the tenant's free-text attribution detail on or off (`enabled`, no confirm). While off (the platform default) a coding-assistant session attribution carrying a free-text reason still records, but the text is stored as null and never returned. The flag has no published read-only endpoint: this response and the `set_strict_ingestion_mode` response are the only places the platform reports it
+- `set_attribution_detail_text` - Turn the tenant's free-text attribution detail on or off (`enabled`, no confirm). While off (the platform default) a coding-assistant session attribution carrying a free-text reason still records, but the text is stored as null and never returned. The flag has no published read-only endpoint: the tenant toggle responses are the only places the platform reports it
+- `set_usage_billing` - Show or hide the tenant's billing screens (`enabled`, requires confirm=true; preview otherwise). Presentation only: invoices, payment methods, plan and subscription screens appear or disappear while metering, rating and invoicing keep running and no stored amount changes. Default is on. Requires a platform admin or the tenant's own tenant admin - an organization admin key passes the other tenant toggles but not this one
+- `get_usage_billing` - Read the billing-screen flag without a write (tenant stub of `GET /v2/api/users/me`), with the roles on the key's user
 
 ### Meta Actions
 - `get_capabilities` - Show this capabilities overview
@@ -252,7 +256,7 @@ Use `get_examples()` for detailed usage examples and parameter guidance.
 
 ## **Tenant Ingestion Settings**
 
-These two actions WRITE a tenant-wide setting; everything else in this tool reads.
+These actions WRITE a tenant-wide setting; everything else in this tool reads.
 
 ### Toggle Strict Ingestion Mode
 ```json
@@ -264,7 +268,20 @@ Without `confirm: true` the call returns a consequences preview and changes noth
 ```json
 {"action": "set_attribution_detail_text", "enabled": true}
 ```
-Applies immediately (no confirm): it rejects nothing and deletes nothing. While the setting is off - the platform default - a coding-assistant session attribution carrying a free-text reason still succeeds and still records the structured attribution, but the text is stored as null and never returned. Both actions report the state the server returned, which for `attributionDetailTextEnabled` is the only place the platform reports it.
+Applies immediately (no confirm): it rejects nothing and deletes nothing. While the setting is off - the platform default - a coding-assistant session attribution carrying a free-text reason still succeeds and still records the structured attribution, but the text is stored as null and never returned.
+
+### Show or Hide the Billing Screens
+```json
+{"action": "set_usage_billing", "enabled": false, "confirm": true}
+```
+Presentation only: it decides whether the tenant's users can reach invoices, payment methods, plan and subscription screens. Metering, rating and invoicing keep running either way and no stored amount changes. It lands on every user of the tenant at once, so without `confirm: true` the call returns a consequences preview and changes nothing. Only a platform admin or the tenant's own tenant admin may apply it; an organization admin key passes the other two toggles but is refused here.
+
+```json
+{"action": "get_usage_billing"}
+```
+Reads the current value without changing it.
+
+Every one of these writes reports the state the server returned. `strictIngestionMode`, `strictIngestionAllowTicketJobs` and `attributionDetailTextEnabled` have no published read-only endpoint, so the toggle responses are the only places the platform reports them; `usageBillingEnabled` is read by `get_usage_billing`.
 
 ## **Troubleshooting Workflows**
 

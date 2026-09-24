@@ -8,6 +8,7 @@ Covers:
 - _format_performance_metrics
 - _format_attribution_details
 - _format_session_tracking
+- _format_prompt_context
 - _format_quality_streaming
 - _format_timestamps
 - _format_subscriber_details
@@ -912,3 +913,278 @@ class TestCacheFieldsTrackedByPresenceDiagnostic:
         assert not set(_CACHE_TOKEN_FIELDS) & set(
             _COMPLETIONS_RESPONSE_FIELD_ALIASES.values()
         )
+
+
+# ===========================================================================
+# BACK-3222: the trace grouping fields on the read path.
+#
+# The completions row carries the identifiers BACK-3125 added
+# (traceType, traceName, parentTransactionId, operationSubtype, agenticJobId)
+# and the detail rendering showed only traceId and operationType. ticketId is
+# not returned by this endpoint yet (BACK-2640) and renders when it is.
+#
+# BACK-3355: the row also names the job behind the completion
+# (agenticJobName, agenticJobType, agenticJobVersion), which the block dropped
+# in favour of the opaque agenticJobId.
+# ===========================================================================
+
+
+TRACE_TRANSACTION = {
+    "traceId": "trace_abc123",
+    "traceType": "document_analysis",
+    "traceName": "Customer Onboarding - Acme Corp",
+    "parentTransactionId": "tx_parent_9",
+    "operationType": "completion",
+    "operationSubtype": "summarize",
+    "agenticJobId": "job-abc-123",
+    "agenticJobName": "Invoice reconciliation",
+    "agenticJobType": "reconciliation",
+    "agenticJobVersion": "v2",
+    "ticketId": "BACK-3222",
+}
+
+
+class TestSessionTrackingTraceFields:
+    """Every identifier the row carries reaches the Session Tracking block."""
+
+    def setup_method(self):
+        self.mm = make_mm()
+
+    def test_every_field_renders(self):
+        result = self.mm._format_session_tracking(TRACE_TRANSACTION)
+        assert "- **Session Tracking**:\n" in result
+        assert "  - **Trace ID**: trace_abc123\n" in result
+        assert "  - **Trace Type**: document_analysis\n" in result
+        assert "  - **Trace Name**: Customer Onboarding - Acme Corp\n" in result
+        assert "  - **Parent Transaction ID**: tx_parent_9\n" in result
+        assert "  - **Operation Type**: completion\n" in result
+        assert "  - **Operation Subtype**: summarize\n" in result
+        assert "  - **Agentic Job ID**: job-abc-123\n" in result
+        assert "  - **Agentic Job Name**: Invoice reconciliation\n" in result
+        assert "  - **Agentic Job Type**: reconciliation\n" in result
+        assert "  - **Agentic Job Version**: v2\n" in result
+        assert "  - **Ticket ID**: BACK-3222\n" in result
+
+    def test_fields_render_in_trace_operation_job_order(self):
+        result = self.mm._format_session_tracking(TRACE_TRANSACTION)
+        positions = [
+            result.index(label)
+            for label in (
+                "Trace ID",
+                "Trace Type",
+                "Trace Name",
+                "Parent Transaction ID",
+                "Operation Type",
+                "Operation Subtype",
+                "Agentic Job ID",
+                "Agentic Job Name",
+                "Agentic Job Type",
+                "Agentic Job Version",
+                "Ticket ID",
+            )
+        ]
+        assert positions == sorted(positions)
+
+    def test_absent_fields_are_omitted(self):
+        result = self.mm._format_session_tracking({"traceId": "t_only"})
+        assert result == "- **Session Tracking**:\n  - **Trace ID**: t_only\n"
+        assert "N/A" not in result
+
+    def test_ticket_id_alone_opens_the_section(self):
+        result = self.mm._format_session_tracking({"ticketId": "BACK-2640"})
+        assert result == "- **Session Tracking**:\n  - **Ticket ID**: BACK-2640\n"
+
+    def test_trace_type_alone_opens_the_section(self):
+        result = self.mm._format_session_tracking({"traceType": "write_script"})
+        assert "**Trace Type**: write_script" in result
+        assert "Trace ID" not in result
+
+    def test_job_name_type_and_version_are_omitted_when_only_the_id_arrives(self):
+        result = self.mm._format_session_tracking({"agenticJobId": "job-abc-123"})
+        assert result == (
+            "- **Session Tracking**:\n  - **Agentic Job ID**: job-abc-123\n"
+        )
+
+    def test_full_details_carry_the_section(self):
+        result = self.mm._format_full_transaction_details(TRACE_TRANSACTION)
+        assert "**Agentic Job ID**: job-abc-123" in result
+        assert "**Agentic Job Name**: Invoice reconciliation" in result
+        assert "**Agentic Job Type**: reconciliation" in result
+        assert "**Agentic Job Version**: v2" in result
+
+
+class TestSummaryTraceType:
+    """The default lookup rendering answers which traceType was stored."""
+
+    def setup_method(self):
+        self.mm = make_mm()
+
+    def test_trace_type_renders_when_present(self):
+        result = self.mm._format_transaction_summary(
+            {"model": "gpt-4", "traceType": "document_analysis"}
+        )
+        assert "- **Trace Type**: document_analysis\n" in result
+
+    def test_trace_type_omitted_when_absent(self):
+        result = self.mm._format_transaction_summary(FULL_TRANSACTION)
+        assert "Trace Type" not in result
+
+    def test_trace_type_left_to_session_tracking_when_full_details_follow(self):
+        result = self.mm._format_transaction_summary(
+            {"model": "gpt-4", "traceType": "document_analysis"},
+            include_trace_type=False,
+        )
+        assert "Trace Type" not in result
+
+    def test_summary_carries_no_other_trace_field(self):
+        result = self.mm._format_transaction_summary(TRACE_TRANSACTION)
+        assert "Trace Name" not in result
+        assert "Agentic Job ID" not in result
+
+
+class TestReturnDataLevelNormalization:
+    """`true` asks for the transaction data, so it selects the full rendering."""
+
+    def setup_method(self):
+        self.mm = make_mm()
+
+    def test_boolean_true_selects_full(self):
+        assert (
+            self.mm._normalize_return_data_parameter({"return_transaction_data": True})
+            == "full"
+        )
+
+    def test_string_true_selects_full(self):
+        assert (
+            self.mm._normalize_return_data_parameter({"return_transaction_data": "TRUE"})
+            == "full"
+        )
+
+    def test_summary_aliases_still_select_summary(self):
+        for value in ("summary", "yes", "1", "basic"):
+            assert (
+                self.mm._normalize_return_data_parameter(
+                    {"return_transaction_data": value}
+                )
+                == "summary"
+            )
+
+    def test_no_aliases_are_unchanged(self):
+        for value in (False, "no", "false", "0", "none"):
+            assert (
+                self.mm._normalize_return_data_parameter(
+                    {"return_transaction_data": value}
+                )
+                == "no"
+            )
+
+    def test_the_transaction_manager_agrees_with_the_tool(self):
+        """Both classes read the same table, so the two lookup paths cannot
+        disagree about what a caller asked for."""
+        from src.revenium_mcp_server.tools_decomposed.metering_management import (
+            MeteringTransactionManager,
+        )
+
+        manager = MeteringTransactionManager()
+        for value in (True, "true", "full", "summary", False, "no", 42):
+            assert manager._normalize_return_data_parameter(
+                {"return_transaction_data": value}
+            ) == self.mm._normalize_return_data_parameter(
+                {"return_transaction_data": value}
+            )
+
+
+# ---------------------------------------------------------------------------
+# Prompt Context (BACK-3386)
+# ---------------------------------------------------------------------------
+
+PROMPT_CONTEXT_TRANSACTION = {
+    "model": "claude-haiku-4-5-20251001",
+    "provider": "ANTHROPIC",
+    "inputTokenCount": 12,
+    "outputTokenCount": 3,
+    "promptId": "0f2b8a54-6c31-4d7e-9a10-b5c7d2e84f63",
+    "promptLength": 412,
+    "querySource": "repl_main_thread:outputStyle:custom",
+    "speed": "fast",
+    "subagentType": "general-purpose",
+}
+PROMPT_CONTEXT_WIRE_NAMES = ("promptId", "promptLength", "querySource", "speed", "subagentType")
+
+
+class TestPromptContextRendering:
+    """The full-detail lookup shows the five prompt-context attributes."""
+
+    def setup_method(self):
+        self.mm = make_mm()
+
+    def test_renders_every_field_when_set(self):
+        result = self.mm._format_prompt_context(PROMPT_CONTEXT_TRANSACTION)
+        assert result.startswith("- **Prompt Context**:\n")
+        assert "**Prompt ID**: 0f2b8a54-6c31-4d7e-9a10-b5c7d2e84f63" in result
+        assert "**Prompt Length**: 412" in result
+        assert "**Query Source**: repl_main_thread:outputStyle:custom" in result
+        assert "**Speed**: fast" in result
+        assert "**Subagent Type**: general-purpose" in result
+
+    def test_section_absent_when_no_field_is_set(self):
+        assert self.mm._format_prompt_context({"model": "gpt-4"}) == ""
+
+    def test_null_and_blank_fields_are_omitted_not_placeholdered(self):
+        result = self.mm._format_prompt_context(
+            {"speed": "normal", "promptId": None, "subagentType": "", "querySource": None}
+        )
+        assert "**Speed**: normal" in result
+        for label in ("Prompt ID", "Subagent Type", "Query Source", "Prompt Length"):
+            assert label not in result
+        assert "N/A" not in result
+
+    def test_zero_prompt_length_is_a_reported_count(self):
+        result = self.mm._format_prompt_context({"promptLength": 0})
+        assert "**Prompt Length**: 0" in result
+
+    def test_full_details_include_the_section(self):
+        result = self.mm._format_full_transaction_details(PROMPT_CONTEXT_TRANSACTION)
+        assert "- **Prompt Context**:" in result
+        assert "**Subagent Type**: general-purpose" in result
+
+    def test_full_details_omit_the_section_when_absent(self):
+        result = self.mm._format_full_transaction_details(FULL_TRANSACTION)
+        assert "Prompt Context" not in result
+
+    def test_summary_row_is_unchanged(self):
+        """BACK-3222 keeps the summary narrow; prompt context is full detail only."""
+        result = self.mm._format_transaction_summary(PROMPT_CONTEXT_TRANSACTION)
+        assert "Prompt" not in result
+        assert "Speed" not in result
+
+    def test_presence_diagnostic_measures_every_field(self):
+        for field in PROMPT_CONTEXT_WIRE_NAMES:
+            assert field in _COMPLETIONS_REPORTED_FIELDS, field
+
+
+class TestPromptContextHelpText:
+    """return_transaction_data="full" documents the prompt-context set."""
+
+    async def test_lookup_capabilities_name_the_set_under_full_detail(self):
+        text = await make_mm()._build_lookup_capabilities_content(None)
+        assert "### **Prompt Context (full detail only)**" in text
+        full_line = next(
+            line for line in text.splitlines() if line.strip().startswith('- "full":')
+        )
+        for field in PROMPT_CONTEXT_WIRE_NAMES:
+            assert field in full_line, field
+
+
+class TestPromptContextSubmissionAliases:
+    """The Submission Field Names section translates each prompt-context
+    response name back to the argument a caller submits it under."""
+
+    def test_alias_table_maps_the_four_renamed_fields(self):
+        assert _COMPLETIONS_RESPONSE_FIELD_ALIASES["prompt_id"] == "promptId"
+        assert _COMPLETIONS_RESPONSE_FIELD_ALIASES["prompt_length"] == "promptLength"
+        assert _COMPLETIONS_RESPONSE_FIELD_ALIASES["query_source"] == "querySource"
+        assert _COMPLETIONS_RESPONSE_FIELD_ALIASES["subagent_type"] == "subagentType"
+
+    def test_speed_is_spelled_the_same_and_needs_no_alias(self):
+        assert "speed" not in _COMPLETIONS_RESPONSE_FIELD_ALIASES

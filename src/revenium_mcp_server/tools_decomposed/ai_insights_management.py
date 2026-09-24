@@ -489,7 +489,7 @@ class AIInsightsManagement(ToolBase):
     async def _handle_get_capabilities(
         self,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        return self.formatter.format_success_response(
+        response = self.formatter.format_success_response(
             message="Capabilities for manage_ai_insights",
             data={
                 "tool_name": self.tool_name,
@@ -501,6 +501,9 @@ class AIInsightsManagement(ToolBase):
             },
             action="get_capabilities",
         )
+        # BACK-3170: this tool's advertised MCP schema lists only action and a
+        # params object, so the per-action names have to be documented here.
+        return [*response, *await self.parameter_reference_block()]
 
     async def _handle_get_examples(
         self,
@@ -601,7 +604,10 @@ class AIInsightsManagement(ToolBase):
                 "triggered_by": {"type": "string"},
                 "dismissal_reason": {"type": "string"},
                 "confidence_rating": {"type": "integer", "minimum": -1, "maximum": 1},
-                "realized_savings": {},
+                "realized_savings": {
+                    "type": "number",
+                    "description": "Savings realized by implementing the recommendation, in realized_savings_currency (default USD); used with feedback_action=implemented",
+                },
                 "realized_savings_currency": {"type": "string"},
                 "realized_savings_measured_at": {"type": "string"},
             },

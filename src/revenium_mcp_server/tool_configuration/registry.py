@@ -23,6 +23,11 @@ from ..common.validation import (
     validate_string_params,
 )
 from ..tools_decomposed.dynamic_decorators import dynamic_mcp_tool
+from .schema_slimming import (
+    apply_schema_slimming,
+    apply_thin_tool_defaults,
+    merge_params_argument,
+)
 
 
 # Tool registration priority order following logical user journey hierarchy
@@ -37,6 +42,20 @@ from ..tools_decomposed.dynamic_decorators import dynamic_mcp_tool
 # for each profile are defined in PROFILE_DEFINITIONS (profiles.py) as the single
 # source of truth. This registry uses PROFILE_DEFINITIONS to determine which tools
 # to register, then presents them in this priority order.
+# BACK-3090 (raised in review): the JSON-string arguments `manage_jobs` accepts
+# from agent interfaces that cannot send structured values, paired with the
+# guidance each malformed value gets. The wording is caller-facing and unchanged
+# from when each decode carried its own copy; the table exists so the closure has
+# ONE rule for all six rather than three hand-copied blocks that drifted.
+MANAGE_JOBS_JSON_ARGUMENTS = (
+    ("outcome_data", "Send as a proper JSON object with outcome, revenue, etc."),
+    ("filters", 'Send as a proper JSON object, e.g. {"type": "loan_processing"}.'),
+    ("economics", "Send it as a proper JSON value."),
+    ("baseline", "Send it as a proper JSON value."),
+    ("facts", "Send it as a proper JSON value."),
+    ("metrics", "Send it as a proper JSON value."),
+)
+
 TOOL_REGISTRATION_PRIORITY_ORDER = [
     # Group 1: Setup & Onboarding (First-time user experience)
     "system_setup",                    # Initial setup and configuration
@@ -130,6 +149,12 @@ class ToolConfigurationRegistry:
 
         logger.info(f"Successfully registered {registered_count} tools in priority order")
 
+        # BACK-3170: the advertised schemas are derived from the closure
+        # signatures above, which spell every accepted argument out as an
+        # Optional union. Rewrite them once, after registration, so the tool
+        # list agents load on connect carries the shape rather than the noise.
+        await apply_schema_slimming(mcp, sorted(self._registered_tools))
+
     async def _register_single_tool(self, mcp: FastMCP, tool_name: str) -> None:
         """Register a single tool following architecture guide patterns.
 
@@ -204,8 +229,11 @@ class ToolConfigurationRegistry:
             period: Optional[str] = None,
             group: Optional[str] = None,
             filters: Optional[dict] = None,
-            page: Union[int, str] = 0,
-            size: Union[int, str] = 20,
+            # BACK-3170: page/size default after the params merge, not here.
+            # A signature default lands in `arguments` before the merge runs
+            # and would silently outrank a value sent inside params.
+            page: Optional[Union[int, str]] = None,
+            size: Optional[Union[int, str]] = None,
             threshold: Optional[Union[float, str]] = None,
             min_impact_threshold: Optional[Union[float, str]] = None,
             include_dimensions: Optional[Union[List[str], str]] = None,
@@ -239,6 +267,21 @@ class ToolConfigurationRegistry:
             # PR-health report: get_pr_health (start_date/end_date are declared above,
             # shared with the billing reads)
             source: Optional[str] = None,
+            # PR-health drill-downs and get_merged_prs (group_by is declared above)
+            author: Optional[str] = None,
+            bucket: Optional[str] = None,
+            sort_by: Optional[str] = None,
+            sort_dir: Optional[str] = None,
+            granularity: Optional[str] = None,
+            email: Optional[str] = None,
+            include_members: Optional[Union[bool, str]] = None,
+            include_pull_requests: Optional[Union[bool, str]] = None,
+            pr_limit: Optional[Union[int, str]] = None,
+            pr_offset: Optional[Union[int, str]] = None,
+            # PR-health org-unit narrowing, and the drill-downs' AI-assisted filter
+            org_unit_id: Optional[Union[int, str]] = None,
+            include_descendants: Optional[Union[bool, str]] = None,
+            assisted_only: Optional[Union[bool, str]] = None,
             # Provider metering-coverage report: get_coverage_ratio
             provider: Optional[str] = None,
             # Claude Enterprise seat census: get_seat_utilization. Named
@@ -249,7 +292,11 @@ class ToolConfigurationRegistry:
             # team on the caller's credentials.
             from_date: Optional[str] = None,
             to_date: Optional[str] = None,
-            team_id: Optional[str] = None
+            team_id: Optional[str] = None,
+            # BACK-3170: per-action parameters may also arrive as one object so
+            # the advertised schema does not have to list them all. See
+            # schema_slimming.merge_params_argument.
+            params: Optional[dict] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
 
             arguments = {
@@ -291,6 +338,19 @@ class ToolConfigurationRegistry:
                 "sort": sort,
                 # PR-health report
                 "source": source,
+                "author": author,
+                "bucket": bucket,
+                "sort_by": sort_by,
+                "sort_dir": sort_dir,
+                "granularity": granularity,
+                "email": email,
+                "include_members": include_members,
+                "include_pull_requests": include_pull_requests,
+                "pr_limit": pr_limit,
+                "pr_offset": pr_offset,
+                "org_unit_id": org_unit_id,
+                "include_descendants": include_descendants,
+                "assisted_only": assisted_only,
                 # Provider metering-coverage report
                 "provider": provider,
                 # Claude Enterprise seat census
@@ -298,6 +358,8 @@ class ToolConfigurationRegistry:
                 "to_date": to_date,
                 "team_id": team_id
             }
+            arguments = merge_params_argument(arguments, params)
+            arguments = apply_thin_tool_defaults("business_analytics_management", arguments)
 
             # NUMERIC PREPROCESSING: Convert string numeric parameters to appropriate types
             numeric_params = {
@@ -314,7 +376,14 @@ class ToolConfigurationRegistry:
             arguments = preprocess_numeric_parameters(arguments, numeric_params)
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
-            boolean_params = ["dry_run", "detect_new_entities"]
+            boolean_params = [
+                "dry_run",
+                "detect_new_entities",
+                "include_members",
+                "include_pull_requests",
+                "include_descendants",
+                "assisted_only",
+            ]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
 
             # ARRAY PREPROCESSING: Convert string array parameters to actual Python lists.
@@ -357,14 +426,16 @@ class ToolConfigurationRegistry:
             triggerAfterPersistsDuration: Optional[str] = None,
             periodDuration: Optional[str] = None,
             filters: Optional[dict] = None,
-            page: int = 0,
-            size: int = 20,
+            # BACK-3170: page/size/resource_type default after the params
+            # merge, not here — see apply_thin_tool_defaults.
+            page: Optional[int] = None,
+            size: Optional[int] = None,
             dry_run: Optional[Union[bool, str]] = None,
             confirm: Optional[Union[bool, str]] = None,
             alert_type: Optional[str] = None,
             text: Optional[str] = None,
             query: Optional[str] = None,
-            resource_type: str = "anomalies",
+            resource_type: Optional[str] = None,
             anomaly_id: Optional[str] = None,
             anomaly_ids: Optional[Union[List[str], str]] = None,
             anomaly_data: Optional[Union[dict, str]] = None,
@@ -378,62 +449,9 @@ class ToolConfigurationRegistry:
             metricType: Optional[str] = None,
             slackConfigurations: Optional[List[str]] = None,
             notificationAddresses: Optional[List[str]] = None,
+            # BACK-3170: per-action parameters may also arrive as one object.
+            params: Optional[dict] = None,
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-
-            # SMART INPUT PREPROCESSING: Handle agent interface serialization issues for anomaly_data
-            processed_anomaly_data = anomaly_data
-            if isinstance(anomaly_data, str):
-                try:
-                    import json
-                    processed_anomaly_data = json.loads(anomaly_data)
-                except json.JSONDecodeError:
-                    # Return helpful error message for malformed JSON
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**Invalid JSON String for anomaly_data**\n\n"
-                             f"**Error**: anomaly_data appears to be malformed JSON: `{anomaly_data}`\n\n"
-                             f"**Solution**: Send anomaly_data as proper JSON object:\n"
-                             f"```json\n"
-                             f'{{\n'
-                             f'  \"action\": \"create\",\n'
-                             f'  \"anomaly_data\": {{\n'
-                             f'    \"name\": \"Alert Name\",\n'
-                             f'    \"alertType\": \"THRESHOLD\",\n'
-                             f'    \"metricType\": \"TOTAL_COST\",\n'
-                             f'    \"threshold\": 100\n'
-                             f'  }}\n'
-                             f'}}\n'
-                             f"```\n\n"
-                             f"**Alternative**: Use convenience methods like `create_threshold_alert(name=\"Alert\", threshold=100)`\n\n"
-                             f"**Not as string**: `\"anomaly_data\": \"{{\\\"name\\\": \\\"Alert\\\"}}\"`"
-                    )]
-
-            # SMART INPUT PREPROCESSING: anomaly_ids may arrive as a JSON-string
-            # array (agent serialization). Parse it and require a list so the
-            # bulk get_budget_progress path never receives a non-list.
-            processed_anomaly_ids = anomaly_ids
-            if isinstance(anomaly_ids, str):
-                import json
-                try:
-                    processed_anomaly_ids = json.loads(anomaly_ids)
-                except json.JSONDecodeError:
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**Invalid JSON String for anomaly_ids**\n\n"
-                             f"**Error**: anomaly_ids appears to be malformed JSON: `{anomaly_ids}`\n\n"
-                             f"**Solution**: Send anomaly_ids as a JSON array of strings, "
-                             f'e.g. `["anom_1", "anom_2"]`.'
-                    )]
-                if not isinstance(processed_anomaly_ids, list):
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**Invalid anomaly_ids**\n\n"
-                             f"**Error**: expected a JSON array of ids, got `{anomaly_ids}`\n\n"
-                             f'**Solution**: Send anomaly_ids as a JSON array, e.g. `["anom_1", "anom_2"]`.'
-                    )]
 
             arguments = {
                 "action": action,
@@ -458,8 +476,8 @@ class ToolConfigurationRegistry:
                 "query": query,
                 "resource_type": resource_type,
                 "anomaly_id": anomaly_id,
-                "anomaly_ids": processed_anomaly_ids,  # Use processed list
-                "anomaly_data": processed_anomaly_data,  # Use processed data
+                "anomaly_ids": anomaly_ids,
+                "anomaly_data": anomaly_data,
                 "include_trend": include_trend,
                 "now": now,
                 # P2 Enhancement: Direct update parameters
@@ -471,6 +489,71 @@ class ToolConfigurationRegistry:
                 "slackConfigurations": slackConfigurations,
                 "notificationAddresses": notificationAddresses,
             }
+            arguments = merge_params_argument(arguments, params)
+
+            # SMART INPUT PREPROCESSING: agent interfaces serialize these two as
+            # JSON strings. BACK-3170: decode AFTER the params merge, so a value
+            # that arrived inside `params` is decoded too rather than reaching
+            # AlertManagement as a raw string.
+            anomaly_data_value = arguments.get("anomaly_data")
+            if isinstance(anomaly_data_value, str):
+                try:
+                    import json
+                    arguments["anomaly_data"] = json.loads(anomaly_data_value)
+                except json.JSONDecodeError:
+                    # Return helpful error message for malformed JSON
+                    from mcp.types import TextContent
+                    return [TextContent(
+                        type="text",
+                        text=f"**Invalid JSON String for anomaly_data**\n\n"
+                             f"**Error**: anomaly_data appears to be malformed JSON: `{anomaly_data_value}`\n\n"
+                             f"**Solution**: Send anomaly_data as proper JSON object:\n"
+                             f"```json\n"
+                             f'{{\n'
+                             f'  \"action\": \"create\",\n'
+                             f'  \"anomaly_data\": {{\n'
+                             f'    \"name\": \"Alert Name\",\n'
+                             f'    \"alertType\": \"THRESHOLD\",\n'
+                             f'    \"metricType\": \"TOTAL_COST\",\n'
+                             f'    \"threshold\": 100\n'
+                             f'  }}\n'
+                             f'}}\n'
+                             f"```\n\n"
+                             f"**Alternative**: Use convenience methods like `create_threshold_alert(name=\"Alert\", threshold=100)`\n\n"
+                             f"**Not as string**: `\"anomaly_data\": \"{{\\\"name\\\": \\\"Alert\\\"}}\"`"
+                    )]
+
+            # anomaly_ids must end up a list so the bulk get_budget_progress
+            # path never receives a non-list.
+            anomaly_ids_value = arguments.get("anomaly_ids")
+            if isinstance(anomaly_ids_value, str):
+                import json
+                try:
+                    decoded_anomaly_ids = json.loads(anomaly_ids_value)
+                except json.JSONDecodeError:
+                    from mcp.types import TextContent
+                    return [TextContent(
+                        type="text",
+                        text=f"**Invalid JSON String for anomaly_ids**\n\n"
+                             f"**Error**: anomaly_ids appears to be malformed JSON: `{anomaly_ids_value}`\n\n"
+                             f"**Solution**: Send anomaly_ids as a JSON array of strings, "
+                             f'e.g. `["anom_1", "anom_2"]`.'
+                    )]
+                if not isinstance(decoded_anomaly_ids, list):
+                    from mcp.types import TextContent
+                    return [TextContent(
+                        type="text",
+                        text=f"**Invalid anomaly_ids**\n\n"
+                             f"**Error**: expected a JSON array of ids, got `{anomaly_ids_value}`\n\n"
+                             f'**Solution**: Send anomaly_ids as a JSON array, e.g. `["anom_1", "anom_2"]`.'
+                    )]
+                arguments["anomaly_ids"] = decoded_anomaly_ids
+
+            arguments = apply_thin_tool_defaults("manage_alerts", arguments)
+
+            # NUMERIC PREPROCESSING: page/size may arrive as strings from the
+            # params bag, which pydantic never sees.
+            arguments = preprocess_numeric_parameters(arguments, {'page': int, 'size': int})
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
             boolean_params = ["dry_run", "confirm", "enabled", "include_trend"]
@@ -525,6 +608,8 @@ class ToolConfigurationRegistry:
             realized_savings: Optional[Union[str, float, int]] = None,
             realized_savings_currency: Optional[str] = None,
             realized_savings_measured_at: Optional[str] = None,
+            # BACK-3170: per-action parameters may also arrive as one object.
+            params: Optional[dict] = None,
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
 
             arguments = {
@@ -561,6 +646,8 @@ class ToolConfigurationRegistry:
                 "realized_savings_currency": realized_savings_currency,
                 "realized_savings_measured_at": realized_savings_measured_at,
             }
+            arguments = merge_params_argument(arguments, params)
+            arguments = apply_thin_tool_defaults("manage_ai_insights", arguments)
             arguments = {k: v for k, v in arguments.items() if v is not None}
 
             from ..tools_decomposed.ai_insights_management import AIInsightsManagement
@@ -688,11 +775,12 @@ class ToolConfigurationRegistry:
             search_term: Optional[str] = None,
             status_filter: Optional[str] = None,
             # Tenant-setting toggles (set_strict_ingestion_mode,
-            # set_attribution_detail_text): the closure signature is this
-            # tool's public schema, so their arguments must be declared here
-            # for FastMCP to bind them at all. `enabled` carries the desired
-            # state for both; `confirm` and `allow_ticket_jobs` are read only
-            # by the strict-ingestion toggle.
+            # set_attribution_detail_text, set_usage_billing): the closure
+            # signature is this tool's public schema, so their arguments must
+            # be declared here for FastMCP to bind them at all. `enabled`
+            # carries the desired state for all three; `confirm` guards the
+            # strict-ingestion and usage-billing toggles, and
+            # `allow_ticket_jobs` is read only by the strict-ingestion one.
             enabled: Optional[Union[bool, str]] = None,
             allow_ticket_jobs: Optional[Union[bool, str]] = None,
             confirm: Optional[Union[bool, str]] = None
@@ -718,8 +806,8 @@ class ToolConfigurationRegistry:
             }
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values.
-            # "confirm" is deliberately excluded: set_strict_ingestion_mode applies the change
-            # only for a literal boolean True, so a loosely typed confirm must stay a preview.
+            # "confirm" is deliberately excluded: the guarded toggles apply the change only
+            # for a literal boolean True, so a loosely typed confirm must stay a preview.
             boolean_params = [
                 "include_recommendations", "include_sensitive", "show_detailed_analysis",
                 "search_all_pages", "enabled", "allow_ticket_jobs"
@@ -820,11 +908,22 @@ class ToolConfigurationRegistry:
             effort: Optional[str] = None,
             model_host: Optional[str] = None,
             subscriber_email_source: Optional[str] = None,
+            # Prompt-context parameters (submission only), declared for the
+            # same FastMCP reason as the two blocks above.
+            prompt_id: Optional[str] = None,
+            prompt_length: Optional[Union[int, str]] = None,
+            query_source: Optional[str] = None,
+            speed: Optional[str] = None,
+            subagent_type: Optional[str] = None,
             # Scope switch for the completions read actions. None means "use the
             # MCP default" (include - see _DEFAULT_INCLUDE_CODING_ASSISTANTS in
             # tools_decomposed/metering_management.py); an explicit False is a
             # real caller choice and is forwarded as false.
-            include_coding_assistants: Optional[Union[bool, str]] = None
+            include_coding_assistants: Optional[Union[bool, str]] = None,
+            # BACK-3170: per-action parameters may also arrive as one object so
+            # the advertised schema does not have to list all 52 of them. See
+            # schema_slimming.merge_params_argument.
+            params: Optional[dict] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
             # Map arguments
             arguments = {
@@ -887,9 +986,17 @@ class ToolConfigurationRegistry:
                 "effort": effort,
                 "model_host": model_host,
                 "subscriber_email_source": subscriber_email_source,
+                # Prompt-context parameters
+                "prompt_id": prompt_id,
+                "prompt_length": prompt_length,
+                "query_source": query_source,
+                "speed": speed,
+                "subagent_type": subagent_type,
                 # Scope switch for the completions read actions
                 "include_coding_assistants": include_coding_assistants
             }
+            arguments = merge_params_argument(arguments, params)
+            arguments = apply_thin_tool_defaults("manage_metering", arguments)
 
             # NUMERIC PREPROCESSING: Convert string numeric parameters to appropriate types
             numeric_params = {
@@ -903,14 +1010,14 @@ class ToolConfigurationRegistry:
                 'retry_interval': int,
                 'page_size': int,
                 'response_quality_score': float,
-                'time_to_first_token': int
+                'time_to_first_token': int,
+                'prompt_length': int,
             }
             arguments = preprocess_numeric_parameters(arguments, numeric_params)
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
             boolean_params = [
                 "dry_run",
-                "return_transaction_data",
                 "early_termination",
                 "is_streamed",
                 "include_coding_assistants",
@@ -1376,12 +1483,19 @@ class ToolConfigurationRegistry:
             # Team internal-marketplace settings actions
             marketplace_names: Optional[Union[List[str], str]] = None,
             operation: Optional[str] = None,
-            # Team PR-health threshold settings actions
+            # Team PR-health settings actions
             aging_days: Optional[Union[int, str]] = None,
             rotting_days: Optional[Union[int, str]] = None,
+            assisted_only: Optional[Union[bool, str]] = None,
+            automation_patterns: Optional[Union[List[str], str]] = None,
+            cutoff_date: Optional[str] = None,
+            excluded_repos: Optional[Union[List[str], str]] = None,
             # Team attribution-identity-policy and verified-domain actions
             policy: Optional[str] = None,
             domain: Optional[str] = None,
+            # Org-unit membership removals (delete_org_unit_person, clear_org_unit_assignment)
+            person_id: Optional[Union[int, str]] = None,
+            confirm: Optional[Union[bool, str]] = None,
             page: Union[int, str] = 0,
             size: Union[int, str] = 20,
             filters: Optional[dict] = None,
@@ -1403,8 +1517,14 @@ class ToolConfigurationRegistry:
                 "operation": operation,
                 "aging_days": aging_days,
                 "rotting_days": rotting_days,
+                "assisted_only": assisted_only,
+                "automation_patterns": automation_patterns,
+                "cutoff_date": cutoff_date,
+                "excluded_repos": excluded_repos,
                 "policy": policy,
                 "domain": domain,
+                "person_id": person_id,
+                "confirm": confirm,
                 "page": page,
                 "size": size,
                 "filters": filters or {},
@@ -1489,13 +1609,17 @@ class ToolConfigurationRegistry:
             }
             arguments = preprocess_numeric_parameters(arguments, numeric_params)
 
-            # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
-            boolean_params = ["auto_generate", "dry_run"]
+            # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values.
+            # "confirm" is deliberately excluded: the org-unit removals run only for a
+            # literal boolean True, so a loosely typed confirm must stay a preview.
+            boolean_params = ["auto_generate", "dry_run", "assisted_only"]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
 
             # ARRAY PREPROCESSING: Convert string array parameters to actual Python lists.
             # A non-array string is left as-is so the tool raises its own structured error.
-            arguments = preprocess_array_parameters(arguments, ["marketplace_names"])
+            arguments = preprocess_array_parameters(
+                arguments, ["marketplace_names", "automation_patterns", "excluded_repos"]
+            )
 
             # Remove None values
             arguments = {k: v for k, v in arguments.items() if v is not None}
@@ -1710,10 +1834,12 @@ class ToolConfigurationRegistry:
 
         FastMCP derives this tool's public input schema from the signature
         below, not from anything the handler reads, so every parameter an
-        action accepts must be declared here — `session_id` (BACK-2769) and
-        `expected_entity_version` (BACK-3091) included. A parameter the handler
-        understands but this signature omits is rejected at the MCP boundary
-        before `handle_action` runs.
+        action accepts must be declared here — `session_id` (BACK-2769),
+        `expected_entity_version` (BACK-3091) and the job-type economics
+        parameters (BACK-3090: `job_type`, `economics`, `baseline`, `facts`,
+        `metrics`) included. A parameter the handler understands but this
+        signature omits is rejected at the MCP boundary before `handle_action`
+        runs.
         """
         @mcp.tool()
         @dynamic_mcp_tool("manage_jobs")
@@ -1726,6 +1852,12 @@ class ToolConfigurationRegistry:
             page: Union[int, str] = 0,
             size: Union[int, str] = 20,
             filters: Optional[Union[dict, str]] = None,
+            # BACK-3090 — job type economics, baselines and facts.
+            job_type: Optional[str] = None,
+            economics: Optional[Union[dict, str]] = None,
+            baseline: Optional[Union[dict, str]] = None,
+            facts: Optional[Union[list, str]] = None,
+            metrics: Optional[Union[list, str]] = None,
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
             # Map arguments
             arguments = {
@@ -1736,33 +1868,54 @@ class ToolConfigurationRegistry:
                 "expected_entity_version": expected_entity_version,
                 "page": page,
                 "size": size,
-                "filters": filters or {},
+                # Raised in review: this used to read `filters or {}`, which
+                # turned filters="" into {} BEFORE the decode loop below could
+                # see a string -- so an empty string stopped raising "Invalid
+                # JSON for filters" and list_jobs quietly ran unfiltered,
+                # returning every job as though the filter had been applied. The
+                # raw value is seeded here and the default applied after the
+                # loop, so every malformed string reaches the same refusal.
+                "filters": filters,
+                "job_type": job_type,
+                "economics": economics,
+                "baseline": baseline,
+                "facts": facts,
+                "metrics": metrics,
             }
 
-            # SMART INPUT PREPROCESSING: Handle agent interface serialization
-            if isinstance(outcome_data, str):
-                try:
-                    import json
-                    arguments["outcome_data"] = json.loads(outcome_data)
-                except json.JSONDecodeError:
-                    from mcp.types import TextContent as TC
-                    return [TC(
-                        type="text",
-                        text=f"Invalid JSON for outcome_data: `{outcome_data}`. "
-                             f"Send as a proper JSON object with outcome, revenue, etc."
-                    )]
+            # SMART INPUT PREPROCESSING: Handle agent interface serialization.
+            #
+            # A malformed value RAISES. FastMCP only sets the response's error
+            # flag when the tool raises, so the `return [TextContent(...)]` these
+            # decodes used to do reported a write that never happened as a
+            # completed call - a human reads the prose, an agent reads the flag
+            # and moves on. That is the BACK-2937 shape, closed inside the tools
+            # and still open here. The economics arguments arrived with the same
+            # defect copied from its neighbours (BACK-3090), so all six are
+            # converted together and the closure now has one rule; the
+            # caller-facing wording is unchanged.
+            import json
 
-            if isinstance(filters, str):
+            for name, hint in MANAGE_JOBS_JSON_ARGUMENTS:
+                raw = arguments.get(name)
+                if not isinstance(raw, str):
+                    continue
                 try:
-                    import json
-                    arguments["filters"] = json.loads(filters)
-                except json.JSONDecodeError:
-                    from mcp.types import TextContent as TC
-                    return [TC(
-                        type="text",
-                        text=f"Invalid JSON for filters: `{filters}`. "
-                             f"Send as a proper JSON object, e.g. {{\"type\": \"loan_processing\"}}."
-                    )]
+                    arguments[name] = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    from ..common.error_handling import ErrorCodes, ToolError
+                    raise ToolError(
+                        message=f"Invalid JSON for {name}: `{raw}`. {hint}",
+                        error_code=ErrorCodes.VALIDATION_ERROR,
+                        field=name,
+                        value=raw,
+                        suggestions=[hint],
+                    ) from exc
+
+            # The filters default, applied only after every string has had its
+            # chance to be refused above.
+            if arguments.get("filters") is None:
+                arguments["filters"] = {}
 
             # NUMERIC PREPROCESSING
             numeric_params = {'page': int, 'size': int}
@@ -1804,8 +1957,9 @@ class ToolConfigurationRegistry:
             event_data: Optional[Union[dict, str]] = None,
             event_type: Optional[_JSONScalar] = None,
             query: Optional[_JSONScalar] = None,
-            page: Union[int, str] = 0,
-            size: Union[int, str] = 20,
+            # BACK-3170: page/size default after the params merge, not here.
+            page: Optional[Union[int, str]] = None,
+            size: Optional[Union[int, str]] = None,
             filters: Optional[Union[dict, str]] = None,
             start_date: Optional[_JSONScalar] = None,
             end_date: Optional[_JSONScalar] = None,
@@ -1817,6 +1971,8 @@ class ToolConfigurationRegistry:
             tool_provider: Optional[_JSONScalar] = None,
             period: Optional[_JSONScalar] = None,
             group: Optional[_JSONScalar] = None,
+            # BACK-3170: per-action parameters may also arrive as one object.
+            params: Optional[dict] = None,
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
             arguments = {
                 "action": action,
@@ -1828,7 +1984,7 @@ class ToolConfigurationRegistry:
                 "query": query,
                 "page": page,
                 "size": size,
-                "filters": filters or {},
+                "filters": filters,
                 "start_date": start_date,
                 "end_date": end_date,
                 "granularity": granularity,
@@ -1840,6 +1996,9 @@ class ToolConfigurationRegistry:
                 "period": period,
                 "group": group,
             }
+            # Merge before filters is defaulted: an empty dict is not None, so a
+            # filters value sent inside params would otherwise be dropped.
+            arguments = merge_params_argument(arguments, params)
 
             arguments = validate_string_params(
                 arguments,
@@ -1876,6 +2035,13 @@ class ToolConfigurationRegistry:
                             text=f"Invalid JSON for {dict_param}: `{val}`. "
                                  f"Send as a proper JSON object."
                         )]
+
+            # Default filters only AFTER the decode loop: `or {}` would swallow
+            # filters="" and the refusal above would never fire (BACK-3090's
+            # lesson, applied here).
+            arguments["filters"] = arguments.get("filters") or {}
+
+            arguments = apply_thin_tool_defaults("manage_tools", arguments)
 
             # NUMERIC PREPROCESSING
             numeric_params = {'page': int, 'size': int}
@@ -2002,6 +2168,20 @@ class ToolConfigurationRegistry:
             parent_org_unit_id: Optional[Union[int, str]] = None,
             rule_id: Optional[_JSONScalar] = None,
             since: Optional[_JSONScalar] = None,
+            until: Optional[_JSONScalar] = None,
+            level: Optional[_JSONScalar] = None,
+            mode: Optional[_JSONScalar] = None,
+            query: Optional[_JSONScalar] = None,
+            group_by: Optional[_JSONScalar] = None,
+            group_value: Optional[_JSONScalar] = None,
+            transaction_id: Optional[_JSONScalar] = None,
+            bucket: Optional[_JSONScalar] = None,
+            zone: Optional[_JSONScalar] = None,
+            affected_search: Optional[_JSONScalar] = None,
+            search: Optional[_JSONScalar] = None,
+            band: Optional[_JSONScalar] = None,
+            sort: Optional[_JSONScalar] = None,
+            dimension: Optional[_JSONScalar] = None,
             page: Union[int, str] = 0,
             size: Union[int, str] = 20,
             filters: Optional[Union[dict, str]] = None,
@@ -2017,6 +2197,20 @@ class ToolConfigurationRegistry:
                 "parent_org_unit_id": parent_org_unit_id,
                 "rule_id": rule_id,
                 "since": since,
+                "until": until,
+                "level": level,
+                "mode": mode,
+                "query": query,
+                "group_by": group_by,
+                "group_value": group_value,
+                "transaction_id": transaction_id,
+                "bucket": bucket,
+                "zone": zone,
+                "affected_search": affected_search,
+                "search": search,
+                "band": band,
+                "sort": sort,
+                "dimension": dimension,
                 "page": page,
                 "size": size,
                 "filters": filters or {},
@@ -2024,7 +2218,26 @@ class ToolConfigurationRegistry:
 
             arguments = validate_string_params(
                 arguments,
-                string_fields=["action", "control_id", "rule_id", "since"],
+                string_fields=[
+                    "action",
+                    "control_id",
+                    "rule_id",
+                    "since",
+                    "until",
+                    "level",
+                    "mode",
+                    "query",
+                    "group_by",
+                    "group_value",
+                    "transaction_id",
+                    "bucket",
+                    "zone",
+                    "affected_search",
+                    "search",
+                    "band",
+                    "sort",
+                    "dimension",
+                ],
                 action=action if isinstance(action, str) else str(action),
             )
 

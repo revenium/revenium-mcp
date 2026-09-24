@@ -1326,10 +1326,14 @@ class ToolManagement(ToolBase):
                             text=f"Tool Registry Examples:\n{json.dumps({'action': 'get_examples', 'examples': capabilities['examples']}, indent=2)}",
                         )
                     ]
+                # BACK-3170: this tool's advertised MCP schema lists only
+                # action, the paging parameters and a params object, so the
+                # per-action names have to be readable here.
                 return [
                     TextContent(
                         type="text", text=f"Tool Registry Management Capabilities:\n{json.dumps(capabilities, indent=2)}"
-                    )
+                    ),
+                    *await self.parameter_reference_block(),
                 ]
 
             if action == "restore":

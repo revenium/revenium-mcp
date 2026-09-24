@@ -5,6 +5,27 @@ All notable changes to the Revenium MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-09-24
+
+### Added
+- `manage_metering`: transactions can be submitted with prompt id, prompt length, query source, speed mode and subagent type; the full-detail lookup renders them in a Prompt Context block, and also shows the agentic job name, type and version and the trace grouping fields (trace type, transaction name, parent transaction)
+- `business_analytics_management`: PR Health can be scoped to one org unit (optionally with its descendants) and shows the cutoff date, excluded repositories and AI-assisted, merged and automation totals it applied; four drill-downs (get_pr_health_engineers, get_pr_health_prs, get_pr_health_pull_requests, get_pr_health_repositories) page every engineer, open one engineer's pull requests, list the bucketed pull requests and the repositories covered; get_merged_prs counts merged pull requests per person or per repository
+- `manage_customers`: PR-health settings read and write repository exclusions, automation patterns, the assisted-only default and the cutoff date, with a warning when the platform stores something other than what was sent; org-unit memberships can be removed (delete_org_unit_person, clear_org_unit_assignment) behind an explicit confirm
+- `system_diagnostics`: tenant admins can read and change whether billing screens are shown (get_usage_billing / set_usage_billing)
+- `manage_cost_controls`: enforcement events can be narrowed by rule, level, mode and window, with summary, history and affected-subscriber reads; one compiled rule and the roster of who it covers can be read
+- `manage_jobs`: job type economics, baselines and period facts; the job-type ROI row carries modalityCost with the four-way cost split
+- `manage_alerts`: alert reads say whether the count includes activity recorded before the rule existed
+
+### Changed
+- Tool schemas advertised on connect are ~3x smaller (18.7K -> 6.0K tokens for the 20-tool business profile): nullable unions are collapsed to the type callers actually send, and the five heaviest tools (`manage_metering`, `business_analytics_management`, `manage_alerts`, `manage_ai_insights`, `manage_tools`) now advertise `action`, their paging/filter parameters and a `params` object. Existing calls are unaffected — every named argument these tools accepted before is still accepted, at the top level or inside `params`; a top-level argument wins over the same name inside `params`, and `params` wins over the tool's default
+- `get_capabilities` on those five tools now ends with a reference for every parameter the advertised schema no longer lists: name, type, accepted values and meaning, generated from each tool's own schema declaration
+- `manage_ai_insights`: realized_savings carries its type and meaning in the get_capabilities parameter reference
+- Upstream contract snapshots and generated models refreshed through 2026-09-24
+
+### Fixed
+- `manage_jobs`: a job type containing a dot segment no longer collapses the request path; a malformed JSON argument is refused instead of silently ignored; the economics write discloses its lost-update window
+- `manage_metering`: the submit-then-read-back field comparison checks the prompt-context fields under the names the platform stores
+
 ## [0.6.0] - 2026-09-10
 
 ### Added
@@ -343,5 +364,6 @@ No functional changes. Changelog formatting update only.
 [0.2.0]: https://github.com/revenium/revenium-mcp/compare/v0.1.27...v0.2.0
 [0.1.27]: https://github.com/revenium/revenium-mcp/releases/tag/v0.1.27
 
+[0.7.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.7.0
 [0.6.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.6.0
 [0.5.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.5.0

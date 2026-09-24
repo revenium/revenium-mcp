@@ -1834,3 +1834,894 @@ class TestPerPersonSpendDecision:
             f"(BACK-2765) but these call sites reach it: {hits}. If it is now "
             "wrapped on purpose, update the decision record and this test together."
         )
+
+
+# ── BACK-3356: PR-health drill-downs ────────────────────────────────────────
+
+WINDOW = {"source": "github", "start_date": "2026-05-17", "end_date": "2026-08-17"}
+
+PR_ROW = {
+    "repoName": "acme/api",
+    "prNumber": 412,
+    "title": "Refactor billing",
+    "url": "https://github.com/acme/api/pull/412",
+    "authorLogin": "alice",
+    "mappedEmail": "alice@acme.com",
+    "bucket": "ROTTING",
+    "draft": False,
+    "codingToolAssisted": True,
+    "reviewDecision": "CHANGES_REQUESTED",
+    "ageDays": 60,
+    "inactiveDays": 41,
+    "lastCommitAtVcs": "2026-07-07T10:00:00Z",
+    "closedAtVcs": None,
+    "lastSyncedAt": "2026-08-17T06:00:00Z",
+}
+
+ENGINEERS_PAGE = {
+    "source": "github",
+    "startDate": "2026-05-17",
+    "endDate": "2026-08-17",
+    "agingDays": 14,
+    "rottingDays": 30,
+    "page": 0,
+    "size": 20,
+    "totalElements": 45,
+    "totalPages": 3,
+    "sortBy": "rottingPrs",
+    "sortDir": "desc",
+    "engineers": [PR_HEALTH_PAYLOAD["engineers"][0]],
+}
+
+PRS_PAYLOAD = {
+    "source": "github",
+    "startDate": "2026-05-17",
+    "endDate": "2026-08-17",
+    "agingDays": 14,
+    "rottingDays": 30,
+    "author": "alice",
+    "mappedEmail": "alice@acme.com",
+    "counts": {"rotting": 1, "aging": 0, "active": 2, "draft": 1, "closedUnmerged": 1},
+    "openTruncated": True,
+    "closedUnmergedTruncated": False,
+    "open": [PR_ROW],
+    "closedUnmerged": [
+        {**PR_ROW, "prNumber": 7, "bucket": "CLOSED_UNMERGED", "closedAtVcs": "2026-08-01T00:00:00Z"}
+    ],
+}
+
+PULL_REQUESTS_PAGE = {
+    "source": "github",
+    "startDate": "2026-05-17",
+    "endDate": "2026-08-17",
+    "agingDays": 14,
+    "rottingDays": 30,
+    "bucket": "ROTTING",
+    "page": 0,
+    "size": 20,
+    "totalElements": 1,
+    "totalPages": 1,
+    "sortBy": "inactivity",
+    "sortDir": "desc",
+    "pullRequests": [PR_ROW],
+}
+
+
+def _vcs_client(**payloads):
+    client = MagicMock()
+    for method, payload in payloads.items():
+        setattr(client, method, AsyncMock(return_value=payload))
+    return client
+
+
+async def _call(tool, action, args, client):
+    with patch.object(tool, "get_client", AsyncMock(return_value=client)):
+        return (await tool.handle_action(action, args))[0].text
+
+
+class TestPrHealthOldestRowFields:
+    @pytest.mark.asyncio
+    async def test_bucket_draft_and_ai_assisted_are_rendered(self, analytics_tool):
+        payload = json.loads(json.dumps(PR_HEALTH_PAYLOAD))
+        payload["oldest"] = [{**PR_ROW, "bucket": "DRAFT", "draft": True, "codingToolAssisted": False}]
+        text = await _call(
+            analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=payload)
+        )
+        assert "[DRAFT]" in text
+        assert "AI-assisted: no" in text
+        assert "last commit 2026-07-07T10:00:00Z" in text
+        assert "inactive 41 days, age 60 days" in text
+
+    @pytest.mark.asyncio
+    async def test_draft_flag_is_shown_when_bucket_differs(self, analytics_tool):
+        payload = json.loads(json.dumps(PR_HEALTH_PAYLOAD))
+        payload["oldest"] = [{**PR_ROW, "draft": True, "codingToolAssisted": None}]
+        text = await _call(
+            analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=payload)
+        )
+        assert "[ROTTING, draft]" in text
+        assert "AI-assisted: unknown" in text
+
+    @pytest.mark.asyncio
+    async def test_truncation_line_points_at_the_paged_action(self, analytics_tool):
+        payload = json.loads(json.dumps(PR_HEALTH_PAYLOAD))
+        payload["engineers"] = [
+            {"authorLogin": f"dev{i}", "openPrs": 1} for i in range(55)
+        ]
+        text = await _call(
+            analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=payload)
+        )
+        assert "5 more were returned and are not shown" in text
+        assert "get_pr_health_engineers(source='github'" in text
+
+    @pytest.mark.asyncio
+    async def test_guidance_appears_when_the_report_reaches_its_cap(self, analytics_tool):
+        """The platform caps the report at 50 engineers, so exactly 50 is the truncated case."""
+        payload = json.loads(json.dumps(PR_HEALTH_PAYLOAD))
+        payload["engineers"] = [{"authorLogin": f"dev{i}", "openPrs": 1} for i in range(50)]
+        text = await _call(
+            analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=payload)
+        )
+        assert "The report lists at most 50 engineers" in text
+        assert "get_pr_health_engineers(source='github'" in text
+        assert "more were returned" not in text
+
+    @pytest.mark.asyncio
+    async def test_no_guidance_below_the_cap(self, analytics_tool):
+        text = await _call(
+            analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=PR_HEALTH_PAYLOAD)
+        )
+        assert "lists at most" not in text
+
+
+class TestPrHealthEngineers:
+    @pytest.mark.asyncio
+    async def test_sends_window_paging_and_canonical_sort(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_engineers=ENGINEERS_PAGE)
+        text = await _call(
+            analytics_tool,
+            "get_pr_health_engineers",
+            {**WINDOW, "page": 0, "size": 20, "sort_by": "ROTTINGPRS", "sort_dir": "DESC", "team_id": "t1"},
+            client,
+        )
+        client.get_vcs_pr_health_engineers.assert_awaited_once_with(
+            "github", "2026-05-17", "2026-08-17", page=0, size=20, sort_by="rottingPrs", sort_dir="desc"
+        )
+        assert "alice" in text
+        assert "45 engineers in total" in text
+        assert "page=1)" in text
+
+    @pytest.mark.asyncio
+    async def test_unknown_sort_by_rejected_pre_flight(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action(
+                "get_pr_health_engineers", {**WINDOW, "sort_by": "bogus"}
+            )
+        assert exc.value.field == "sort_by"
+
+    @pytest.mark.asyncio
+    async def test_reuses_the_pr_health_window_rule(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action(
+                "get_pr_health_engineers",
+                {"source": "github", "start_date": "2025-01-01", "end_date": "2026-01-02"},
+            )
+        assert exc.value.field == "end_date"
+        assert "366" in exc.value.message
+
+
+class TestPrHealthPrs:
+    @pytest.mark.asyncio
+    async def test_author_is_required(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("get_pr_health_prs", WINDOW)
+        assert exc.value.field == "author"
+
+    @pytest.mark.asyncio
+    async def test_sends_exact_params_and_renders_both_lists(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_prs=PRS_PAYLOAD)
+        text = await _call(
+            analytics_tool, "get_pr_health_prs", {**WINDOW, "author": " alice ", "team_id": "t1"}, client
+        )
+        assert client.get_vcs_pr_health_prs.await_args.args == (
+            "github", "2026-05-17", "2026-08-17", "alice"
+        )
+        assert client.get_vcs_pr_health_prs.await_args.kwargs == {}
+        assert "alice (alice@acme.com)" in text
+        assert "rotting 1, aging 0, active 2" in text
+        assert "acme/api#7" in text and "closed 2026-08-01T00:00:00Z" in text
+        assert "open list is truncated" in text
+
+    @pytest.mark.asyncio
+    async def test_window_validation_runs_before_the_author_check(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action(
+                "get_pr_health_prs", {"source": "bitbucket", "start_date": "2026-05-17", "end_date": "2026-08-17"}
+            )
+        assert exc.value.field == "source"
+
+
+class TestPrHealthPullRequests:
+    @pytest.mark.asyncio
+    async def test_sends_filters_and_renders_rows(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_pull_requests=PULL_REQUESTS_PAGE)
+        text = await _call(
+            analytics_tool,
+            "get_pr_health_pull_requests",
+            {**WINDOW, "bucket": "rotting", "sort_by": "AGE", "sort_dir": "asc", "page": 0, "size": 20},
+            client,
+        )
+        client.get_vcs_pr_health_pull_requests.assert_awaited_once_with(
+            "github", "2026-05-17", "2026-08-17", bucket="ROTTING", author=None,
+            page=0, size=20, sort_by="age", sort_dir="asc",
+        )
+        assert "acme/api#412" in text
+        assert "[ROTTING]" in text
+        assert "AI-assisted: yes" in text
+
+    @pytest.mark.asyncio
+    async def test_unknown_bucket_rejected(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action(
+                "get_pr_health_pull_requests", {**WINDOW, "bucket": "STALE"}
+            )
+        assert exc.value.field == "bucket"
+
+    @pytest.mark.asyncio
+    async def test_api_failure_renders_guidance_not_a_crash(self, analytics_tool):
+        client = MagicMock()
+        client.get_vcs_pr_health_pull_requests = AsyncMock(
+            side_effect=ReveniumAPIError("Bad request", status_code=400)
+        )
+        text = await _call(analytics_tool, "get_pr_health_pull_requests", WINDOW, client)
+        assert "Failed" in text and "366" in text
+
+
+# ── BACK-3357: merged pull-request report ───────────────────────────────────
+
+MERGED_WINDOW = {"source": "github", "start_date": "2026-08-01", "end_date": "2026-08-31"}
+
+DISCONNECTED_SCOPE = {
+    "source": "github",
+    "connected": False,
+    "credentialCount": 0,
+    "deliveringCredentialCount": 0,
+    "filterActive": False,
+    "syncedRepositoryCount": None,
+    "totalRepositoryCount": None,
+    "repositoryBreakdownSupported": True,
+    "unsupportedReason": None,
+    "lastSyncedAt": None,
+}
+
+DEV_REPOSITORY_SHAPE = {
+    "source": "github",
+    "granularity": "window",
+    "members": None,
+    "dailyRows": None,
+    "totalPrsMerged": 0,
+    "totalPrsMergedWithCodingTool": 0,
+    "historyStartDate": None,
+    "groupBy": "repository",
+    "repositories": [],
+    "repositoriesTruncated": False,
+    "syncScope": DISCONNECTED_SCOPE,
+}
+
+CONNECTED_REPOSITORY_REPORT = {
+    "source": "github",
+    "granularity": "window",
+    "totalPrsMerged": 250,
+    "totalPrsMergedWithCodingTool": 90,
+    "historyStartDate": "2026-01-10",
+    "groupBy": "repository",
+    "repositories": [
+        {
+            "repository": "acme/api",
+            "repositoryDisplay": "Acme/API",
+            "prsMerged": 120,
+            "prsMergedWithCodingTool": 40,
+            "members": [
+                {"platformLogin": "alice", "mappedEmail": "alice@acme.com", "prsMerged": 70, "prsMergedWithCodingTool": 30}
+            ],
+        }
+    ],
+    "repositoriesTruncated": True,
+    "pullRequests": [
+        {
+            "repository": "acme/api",
+            "repositoryDisplay": "Acme/API",
+            "prNumber": 9,
+            "platformLogin": "alice",
+            "mappedEmail": "alice@acme.com",
+            "mergedAt": "2026-08-30T12:00:00Z",
+            "codingToolAssisted": True,
+            "codingToolVendors": ["ClaudeCode"],
+            "title": "Ship it",
+            "url": "https://github.com/acme/api/pull/9",
+        }
+    ],
+    "pullRequestsTotal": 250,
+    "pullRequestsLimit": 1,
+    "pullRequestsOffset": 0,
+    "pullRequestsTruncated": True,
+    "syncScope": {**DISCONNECTED_SCOPE, "connected": True, "credentialCount": 1, "lastSyncedAt": "2026-09-23T00:00:00Z"},
+}
+
+PER_PERSON_REPORT = {
+    "source": "github",
+    "granularity": "window",
+    "members": [{"platformLogin": "bob", "prsMerged": 5, "prsMergedWithCodingTool": 2}],
+    "dailyRows": None,
+    "totalPrsMerged": 5,
+    "totalPrsMergedWithCodingTool": 2,
+    "historyStartDate": "2026-01-10",
+    "syncScope": {**DISCONNECTED_SCOPE, "connected": True, "credentialCount": 1},
+}
+
+
+class TestMergedPrsValidation:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra", [{"email": "a@b.com"}, {"include_members": True}, {"include_pull_requests": True}]
+    )
+    async def test_repository_only_params_need_group_by_repository(self, analytics_tool, extra):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("get_merged_prs", {**MERGED_WINDOW, **extra})
+        assert exc.value.field == next(iter(extra))
+        assert "group_by='repository'" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_repository_grouping_needs_window_granularity(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action(
+                "get_merged_prs", {**MERGED_WINDOW, "group_by": "repository", "granularity": "day"}
+            )
+        assert exc.value.field == "granularity"
+
+    @pytest.mark.asyncio
+    async def test_pr_paging_needs_include_pull_requests(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action(
+                "get_merged_prs", {**MERGED_WINDOW, "group_by": "repository", "pr_offset": 100}
+            )
+        assert exc.value.field == "pr_offset"
+
+    @pytest.mark.asyncio
+    async def test_pr_limit_is_bounded(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action(
+                "get_merged_prs",
+                {**MERGED_WINDOW, "group_by": "repository", "include_pull_requests": True, "pr_limit": 500},
+            )
+        assert exc.value.field == "pr_limit"
+
+    @pytest.mark.asyncio
+    async def test_day_granularity_caps_the_span_at_35_days(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action(
+                "get_merged_prs",
+                {"source": "github", "start_date": "2026-08-01", "end_date": "2026-09-05", "granularity": "day"},
+            )
+        assert exc.value.field == "end_date"
+
+    @pytest.mark.asyncio
+    async def test_reuses_the_window_validation(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action(
+                "get_merged_prs", {"source": "github", "start_date": "2026-09-01", "end_date": "2026-08-01"}
+            )
+        assert exc.value.field == "start_date"
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("get_merged_prs", {"start_date": "2026-08-01", "end_date": "2026-08-31"})
+        assert exc.value.field == "source"
+
+    @pytest.mark.asyncio
+    async def test_window_granularity_is_not_capped(self, analytics_tool):
+        client = _vcs_client(get_vcs_prs=PER_PERSON_REPORT)
+        await _call(
+            analytics_tool,
+            "get_merged_prs",
+            {"source": "github", "start_date": "2020-01-01", "end_date": "2026-08-31"},
+            client,
+        )
+        client.get_vcs_prs.assert_awaited_once()
+
+
+class TestMergedPrsRendering:
+    @pytest.mark.asyncio
+    async def test_sends_exact_params_without_team_id(self, analytics_tool):
+        client = _vcs_client(get_vcs_prs=CONNECTED_REPOSITORY_REPORT)
+        await _call(
+            analytics_tool,
+            "get_merged_prs",
+            {
+                **MERGED_WINDOW,
+                "source": "GitHub",
+                "group_by": "Repository",
+                "include_members": True,
+                "include_pull_requests": True,
+                "email": "alice@acme.com",
+                "pr_limit": "1",
+                "pr_offset": 0,
+                "team_id": "t1",
+            },
+            client,
+        )
+        assert client.get_vcs_prs.await_args.args == ()
+        assert client.get_vcs_prs.await_args.kwargs == {
+            "source": "github",
+            "start_date": "2026-08-01",
+            "end_date": "2026-08-31",
+            "granularity": None,
+            "group_by": "repository",
+            "include_members": True,
+            "email": "alice@acme.com",
+            "include_pull_requests": True,
+            "pr_limit": 1,
+            "pr_offset": 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_truncation_flags_are_always_reported(self, analytics_tool):
+        text = await _call(
+            analytics_tool,
+            "get_merged_prs",
+            {**MERGED_WINDOW, "group_by": "repository", "include_pull_requests": True},
+            _vcs_client(get_vcs_prs=CONNECTED_REPOSITORY_REPORT),
+        )
+        assert "Repository list truncated" in text
+        assert "Pull-request list truncated" in text
+        assert "showing 1-1 of 250" in text
+        assert "pr_offset=1" in text
+        assert "Acme/API | merged=120 with-coding-tool=40" in text
+        assert "alice (alice@acme.com) | merged=70" in text
+        assert "Acme/API#9 by alice" in text and "(ClaudeCode)" in text
+
+    @pytest.mark.asyncio
+    async def test_untruncated_report_says_nothing_about_truncation(self, analytics_tool):
+        report = {**CONNECTED_REPOSITORY_REPORT, "repositoriesTruncated": False, "pullRequestsTruncated": False}
+        text = await _call(
+            analytics_tool,
+            "get_merged_prs",
+            {**MERGED_WINDOW, "group_by": "repository"},
+            _vcs_client(get_vcs_prs=report),
+        )
+        assert "truncated" not in text
+
+    @pytest.mark.asyncio
+    async def test_disconnected_sync_scope_is_stated_not_an_empty_table(self, analytics_tool):
+        text = await _call(
+            analytics_tool,
+            "get_merged_prs",
+            {**MERGED_WINDOW, "group_by": "repository"},
+            _vcs_client(get_vcs_prs=DEV_REPOSITORY_SHAPE),
+        )
+        assert "No VCS credential connected" in text
+        assert "no VCS credential is connected" in text
+        assert "No merged pull requests in this window" not in text
+
+    @pytest.mark.asyncio
+    async def test_per_person_grouping_renders_members(self, analytics_tool):
+        text = await _call(
+            analytics_tool, "get_merged_prs", MERGED_WINDOW, _vcs_client(get_vcs_prs=PER_PERSON_REPORT)
+        )
+        assert "**By person**" in text
+        assert "bob | merged=5 with-coding-tool=2" in text
+        assert "No VCS credential connected" not in text
+
+    @pytest.mark.asyncio
+    async def test_daily_rows_render_per_bucket(self, analytics_tool):
+        report = {
+            **PER_PERSON_REPORT,
+            "granularity": "day",
+            "members": None,
+            "dailyRows": [{"date": "2026-08-02", "platformLogin": "bob", "prsMerged": 1, "prsMergedWithCodingTool": 0}],
+        }
+        text = await _call(
+            analytics_tool,
+            "get_merged_prs",
+            {**MERGED_WINDOW, "end_date": "2026-08-20", "granularity": "day"},
+            _vcs_client(get_vcs_prs=report),
+        )
+        assert "2026-08-02 | bob | merged=1" in text
+
+
+class TestVcsActionsAreDiscoverable:
+    ACTIONS = [
+        "get_pr_health_engineers",
+        "get_pr_health_prs",
+        "get_pr_health_pull_requests",
+        "get_pr_health_repositories",
+        "get_merged_prs",
+    ]
+
+    @pytest.mark.asyncio
+    async def test_supported_described_and_documented(self, analytics_tool):
+        supported = await analytics_tool._get_supported_actions()
+        capabilities = (await analytics_tool.handle_action("get_capabilities", {}))[0].text
+        examples = (await analytics_tool.handle_action("get_examples", {}))[0].text
+        for action in self.ACTIONS:
+            assert action in supported
+            assert action in analytics_tool.tool_description
+            assert action in capabilities
+            assert action in examples
+
+    def test_registry_closure_declares_the_new_parameters(self):
+        import inspect
+
+        from src.revenium_mcp_server.tool_configuration import registry as registry_module
+
+        source = inspect.getsource(
+            registry_module.ToolConfigurationRegistry._register_business_analytics_management
+        )
+        for name in [
+            "author", "bucket", "sort_by", "sort_dir", "granularity", "email",
+            "include_members", "include_pull_requests", "pr_limit", "pr_offset",
+            "org_unit_id", "include_descendants", "assisted_only",
+        ]:
+            assert f'"{name}": {name}' in source
+
+
+class TestPrHealthPagingValidation:
+    ACTIONS = ["get_pr_health_engineers", "get_pr_health_pull_requests"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ACTIONS)
+    @pytest.mark.parametrize(
+        "extra, field",
+        [({"page": -1}, "page"), ({"size": "fifty"}, "size"), ({"size": 500}, "size")],
+    )
+    async def test_bad_paging_is_refused_through_the_tool(self, analytics_tool, action, extra, field):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action(action, {**WINDOW, **extra})
+        assert exc.value.field == field
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "handler", ["_handle_get_pr_health_engineers", "_handle_get_pr_health_pull_requests"]
+    )
+    @pytest.mark.parametrize(
+        "extra, field",
+        [({"page": -1}, "page"), ({"size": "fifty"}, "size"), ({"size": 201}, "size"), ({"size": 0}, "size")],
+    )
+    async def test_handlers_enforce_the_sub_resource_bounds_themselves(
+        self, analytics_tool, handler, extra, field
+    ):
+        client = MagicMock()
+        with patch.object(analytics_tool, "get_client", AsyncMock(return_value=client)):
+            with pytest.raises(ToolError) as exc:
+                await getattr(analytics_tool, handler)({**WINDOW, **extra})
+        assert exc.value.field == field
+
+    @pytest.mark.asyncio
+    async def test_largest_platform_page_is_accepted_by_the_handler(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_engineers=ENGINEERS_PAGE)
+        with patch.object(analytics_tool, "get_client", AsyncMock(return_value=client)):
+            await analytics_tool._handle_get_pr_health_engineers({**WINDOW, "page": "2", "size": 200})
+        assert client.get_vcs_pr_health_engineers.await_args.kwargs["page"] == 2
+        assert client.get_vcs_pr_health_engineers.await_args.kwargs["size"] == 200
+
+
+class TestMergedPrsFullPage:
+    @pytest.mark.asyncio
+    async def test_every_titled_pr_is_rendered_and_the_offset_advances_by_what_was_shown(
+        self, analytics_tool
+    ):
+        pulls = [
+            {
+                "repository": "acme/api",
+                "repositoryDisplay": "acme/api",
+                "prNumber": 1000 + i,
+                "platformLogin": "alice",
+                "mergedAt": "2026-08-30T12:00:00Z",
+                "codingToolAssisted": False,
+                "title": f"Change {i}",
+                "url": f"https://github.com/acme/api/pull/{1000 + i}",
+            }
+            for i in range(200)
+        ]
+        report = {
+            **CONNECTED_REPOSITORY_REPORT,
+            "pullRequests": pulls,
+            "pullRequestsTotal": 450,
+            "pullRequestsLimit": 200,
+            "pullRequestsOffset": 200,
+            "pullRequestsTruncated": True,
+        }
+        text = await _call(
+            analytics_tool,
+            "get_merged_prs",
+            {**MERGED_WINDOW, "group_by": "repository", "include_pull_requests": True, "pr_limit": 200, "pr_offset": 200},
+            _vcs_client(get_vcs_prs=report),
+        )
+        for i in range(200):
+            assert f"acme/api#{1000 + i} by alice" in text
+            assert f"Change {i} " in text
+        assert "more rows not shown" not in text
+        assert "showing 201-400 of 450" in text
+        assert "pr_offset=400" in text
+
+
+# ── BACK-3387: org-unit scope, applied settings and the repositories read ───
+SCOPED_REPORT = {
+    **PR_HEALTH_PAYLOAD,
+    "orgUnitId": 42,
+    "includeDescendants": True,
+    "cutoffDate": "2026-04-07",
+    "cutoffDateIsDefault": True,
+    "excludedRepos": ["acme/legacy", "acme/sandbox"],
+    "totals": {
+        **PR_HEALTH_PAYLOAD["totals"],
+        "openPrsAssisted": 9,
+        "draftPrsAssisted": 1,
+        "agingPrsAssisted": 3,
+        "mergedPrs": 20,
+        "mergedPrsAssisted": 11,
+        "automationPrs": 4,
+    },
+    "engineers": [{**PR_HEALTH_PAYLOAD["engineers"][0], "mergedPrs": 6}],
+}
+
+REPOSITORIES_PAYLOAD = {
+    "source": "github",
+    "repositories": [
+        {"repoName": "acme/api", "openPrs": 7, "excluded": False},
+        {"repoName": "acme/legacy", "openPrs": 0, "excluded": True},
+    ],
+}
+
+DRILL_DOWNS = {
+    "get_pr_health_engineers": ("get_vcs_pr_health_engineers", ENGINEERS_PAGE, {}),
+    "get_pr_health_prs": ("get_vcs_pr_health_prs", PRS_PAYLOAD, {"author": "alice"}),
+    "get_pr_health_pull_requests": ("get_vcs_pr_health_pull_requests", PULL_REQUESTS_PAGE, {}),
+}
+
+
+class TestPrHealthOrgUnitScope:
+    @pytest.mark.asyncio
+    async def test_report_forwards_org_unit_and_descendants_but_no_team(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health=PR_HEALTH_PAYLOAD)
+        await _call(
+            analytics_tool,
+            "get_pr_health",
+            {**WINDOW, "org_unit_id": "42", "include_descendants": True, "team_id": "t1"},
+            client,
+        )
+        assert client.get_vcs_pr_health.await_args.args == ("github", "2026-05-17", "2026-08-17")
+        assert client.get_vcs_pr_health.await_args.kwargs == {
+            "org_unit_id": 42,
+            "include_descendants": True,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", list(DRILL_DOWNS))
+    async def test_drill_downs_forward_scope_and_assisted_only(self, analytics_tool, action):
+        method, payload, extra = DRILL_DOWNS[action]
+        client = _vcs_client(**{method: payload})
+        await _call(
+            analytics_tool,
+            action,
+            {**WINDOW, **extra, "org_unit_id": 7, "include_descendants": False, "assisted_only": True},
+            client,
+        )
+        kwargs = getattr(client, method).await_args.kwargs
+        assert kwargs["org_unit_id"] == 7
+        assert kwargs["include_descendants"] is False
+        assert kwargs["assisted_only"] is True
+        assert "team_id" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_include_descendants_without_org_unit_is_refused(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("get_pr_health", {**WINDOW, "include_descendants": True})
+        assert exc.value.field == "include_descendants"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("field", ["include_descendants", "assisted_only"])
+    async def test_non_boolean_flags_are_refused(self, analytics_tool, field):
+        """The registry turns 'true'/'false' strings into booleans; anything else reaching the tool is refused."""
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action(
+                "get_pr_health_engineers", {**WINDOW, "org_unit_id": 7, field: "sometimes"}
+            )
+        assert exc.value.field == field
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", [0, -3, "abc", True])
+    async def test_org_unit_id_must_be_a_positive_integer(self, analytics_tool, bad):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("get_pr_health", {**WINDOW, "org_unit_id": bad})
+        assert exc.value.field == "org_unit_id"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "given, sent",
+        [
+            ("1234567890123", 1234567890123),
+            (1234567890123, 1234567890123),
+            ("9223372036854775807", 9223372036854775807),
+            (9223372036854775807, 9223372036854775807),
+        ],
+    )
+    async def test_org_unit_id_accepts_any_positive_int64(self, analytics_tool, given, sent):
+        client = _vcs_client(get_vcs_pr_health=PR_HEALTH_PAYLOAD)
+        await _call(analytics_tool, "get_pr_health", {**WINDOW, "org_unit_id": given}, client)
+        assert client.get_vcs_pr_health.await_args.kwargs["org_unit_id"] == sent
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", ["9223372036854775808", 9223372036854775808, "12345678901234567890"])
+    async def test_org_unit_id_over_int64_is_refused(self, analytics_tool, bad):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("get_pr_health", {**WINDOW, "org_unit_id": bad})
+        assert exc.value.field == "org_unit_id"
+
+    @pytest.mark.asyncio
+    async def test_report_capability_shares_the_org_unit_wording(self, analytics_tool):
+        capabilities = await analytics_tool._get_tool_capabilities()
+        report = next(c for c in capabilities if "get_pr_health" in c.parameters)
+        shared = analytics_tool._PR_HEALTH_ORG_UNIT_CAPABILITY_PARAMS
+        assert {k: report.parameters["get_pr_health"][k] for k in shared} == shared
+        assert "assisted_only" not in report.parameters["get_pr_health"]
+
+    @pytest.mark.asyncio
+    async def test_report_refuses_assisted_only(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("get_pr_health", {**WINDOW, "assisted_only": True})
+        assert exc.value.field == "assisted_only"
+
+    @pytest.mark.asyncio
+    async def test_next_page_call_keeps_the_scope(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_engineers=ENGINEERS_PAGE)
+        text = await _call(
+            analytics_tool, "get_pr_health_engineers", {**WINDOW, "org_unit_id": 7, "assisted_only": True}, client
+        )
+        assert "org_unit_id=7, assisted_only=True" in text
+        assert "page=1)" in text
+
+    @pytest.mark.asyncio
+    async def test_api_failure_names_the_org_unit_rule(self, analytics_tool):
+        client = MagicMock()
+        client.get_vcs_pr_health = AsyncMock(side_effect=ReveniumAPIError("Org unit 9 not found", status_code=404))
+        text = await _call(analytics_tool, "get_pr_health", {**WINDOW, "org_unit_id": 9}, client)
+        assert "Failed" in text
+        assert "org_unit_id must be a department of your own organization" in text
+
+    def test_registry_preprocesses_the_new_flags_as_booleans(self):
+        import inspect
+
+        from src.revenium_mcp_server.tool_configuration import registry as registry_module
+
+        source = inspect.getsource(
+            registry_module.ToolConfigurationRegistry._register_business_analytics_management
+        )
+        boolean_block = source.split("boolean_params = [", 1)[1].split("]", 1)[0]
+        assert '"include_descendants"' in boolean_block
+        assert '"assisted_only"' in boolean_block
+
+
+class TestPrHealthAppliedSettingsRendering:
+    @pytest.mark.asyncio
+    async def test_header_echoes_scope_cutoff_and_exclusions(self, analytics_tool):
+        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=SCOPED_REPORT))
+        assert "narrowed to org unit 42 and its descendant departments" in text
+        assert "avgCostPerMergedPr stays organization-wide" in text
+        assert "opened before 2026-04-07 are left out" in text
+        assert "(the default cutoff)" in text
+        assert "**Excluded repositories**: acme/legacy, acme/sandbox" in text
+
+    @pytest.mark.asyncio
+    async def test_team_set_cutoff_and_no_descendants(self, analytics_tool):
+        payload = {
+            **SCOPED_REPORT,
+            "includeDescendants": False,
+            "cutoffDateIsDefault": False,
+            "excludedRepos": [],
+        }
+        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=payload))
+        assert "org unit 42 only (descendant departments not included)" in text
+        assert "(set in the team's PR-health settings)" in text
+        assert "**Excluded repositories**: none" in text
+
+    @pytest.mark.asyncio
+    async def test_header_is_unchanged_without_the_new_fields(self, analytics_tool):
+        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=PR_HEALTH_PAYLOAD))
+        for absent in ("**Org unit**", "**Cutoff**", "**Excluded repositories**", "**AI-assisted only**"):
+            assert absent not in text
+
+    @pytest.mark.asyncio
+    async def test_unscoped_echo_renders_no_org_unit_line(self, analytics_tool):
+        payload = {**PR_HEALTH_PAYLOAD, "orgUnitId": None, "includeDescendants": None}
+        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=payload))
+        assert "**Org unit**" not in text
+
+    @pytest.mark.asyncio
+    async def test_new_totals_are_rendered(self, analytics_tool):
+        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=SCOPED_REPORT))
+        assert "Open PRs (drafts excluded): 12 (9 AI-assisted)" in text
+        assert "excluded from aging/rotting): 3 (1 AI-assisted)" in text
+        assert "Aging: 4 (3 AI-assisted)" in text
+        assert "Merged in the window: 20 (11 AI-assisted)" in text
+        assert "Automation PRs (open, drafts included; left out of every other figure): 4" in text
+
+    @pytest.mark.asyncio
+    async def test_totals_without_the_new_fields_add_no_lines(self, analytics_tool):
+        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=PR_HEALTH_PAYLOAD))
+        assert "Open PRs (drafts excluded): 12\n" in text
+        assert "Merged in the window" not in text
+        assert "Automation PRs" not in text
+
+    @pytest.mark.asyncio
+    async def test_engineer_row_shows_merged_and_keeps_inactivity_separate(self, analytics_tool):
+        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=SCOPED_REPORT))
+        assert "wasted=2 merged=6 | longest inactivity: 41 days" in text
+
+    @pytest.mark.asyncio
+    async def test_engineer_row_without_merged_is_unchanged(self, analytics_tool):
+        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=PR_HEALTH_PAYLOAD))
+        assert "wasted=2 | longest inactivity: 41 days" in text
+        assert "merged=" not in text
+
+    @pytest.mark.asyncio
+    async def test_drill_down_echoes_assisted_only(self, analytics_tool):
+        page = {**ENGINEERS_PAGE, "orgUnitId": 7, "includeDescendants": False, "assistedOnly": True}
+        text = await _call(
+            analytics_tool,
+            "get_pr_health_engineers",
+            {**WINDOW, "org_unit_id": 7, "assisted_only": True},
+            _vcs_client(get_vcs_pr_health_engineers=page),
+        )
+        assert "narrowed to org unit 7 only" in text
+        assert "**AI-assisted only**" in text
+
+
+class TestPrHealthRepositories:
+    @pytest.mark.asyncio
+    async def test_lists_repositories_with_open_count_and_exclusion(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_repositories=REPOSITORIES_PAYLOAD)
+        text = await _call(analytics_tool, "get_pr_health_repositories", {"source": "GitHub", "team_id": "t1"}, client)
+        client.get_vcs_pr_health_repositories.assert_awaited_once_with("github")
+        assert "(2 listed, 1 excluded)" in text
+        assert "- acme/api | open=7" in text
+        assert "- acme/legacy | open=0 | EXCLUDED" in text
+        assert "NOT applied" in text
+
+    @pytest.mark.asyncio
+    async def test_window_arguments_are_not_forwarded(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_repositories=REPOSITORIES_PAYLOAD)
+        await _call(analytics_tool, "get_pr_health_repositories", WINDOW, client)
+        assert client.get_vcs_pr_health_repositories.await_args.args == ("github",)
+        assert client.get_vcs_pr_health_repositories.await_args.kwargs == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source, gitlab_note", [("github", False), ("gitlab", True)])
+    async def test_empty_state(self, analytics_tool, source, gitlab_note):
+        client = _vcs_client(get_vcs_pr_health_repositories={"source": source, "repositories": []})
+        text = await _call(analytics_tool, "get_pr_health_repositories", {"source": source}, client)
+        assert "(0 listed, 0 excluded)" in text
+        assert "No repository holds an open pull request" in text
+        assert ("GitLab writes no per-pull-request rows" in text) is gitlab_note
+
+    @pytest.mark.asyncio
+    async def test_cap_is_stated_when_reached(self, analytics_tool):
+        rows = [{"repoName": f"acme/r{i}", "openPrs": 1, "excluded": False} for i in range(2000)]
+        client = _vcs_client(get_vcs_pr_health_repositories={"source": "github", "repositories": rows})
+        text = await _call(analytics_tool, "get_pr_health_repositories", {"source": "github"}, client)
+        assert "lists at most 2000 repositories; an organization with more will not see the rest here" in text
+        assert "not shown" not in text
+
+    @pytest.mark.asyncio
+    async def test_source_is_required(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("get_pr_health_repositories", {})
+        assert exc.value.field == "source"
+
+    @pytest.mark.asyncio
+    async def test_api_failure_renders_guidance(self, analytics_tool):
+        client = MagicMock()
+        client.get_vcs_pr_health_repositories = AsyncMock(
+            side_effect=ReveniumAPIError("Bad request", status_code=400)
+        )
+        text = await _call(analytics_tool, "get_pr_health_repositories", {"source": "github"}, client)
+        assert "PR Health Repositories Failed" in text
+        assert "this read takes no window" in text

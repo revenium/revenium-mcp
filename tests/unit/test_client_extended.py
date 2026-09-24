@@ -827,6 +827,43 @@ class TestTenantIngestionAPIMethods:
             await client.set_attribution_detail_text(True)
         client.patch.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_set_usage_billing_patches_body(self):
+        client = self._client_with_tenant()
+        await client.set_usage_billing(False)
+        assert (
+            client.patch.call_args[0][0]
+            == "/profitstream/v2/api/tenants/ten_1/usage-billing"
+        )
+        assert client.patch.call_args.kwargs.get("data") == {"usageBillingEnabled": False}
+
+    @pytest.mark.asyncio
+    async def test_set_usage_billing_sends_true(self):
+        """The platform rejects a null, so the value is always sent."""
+        client = self._client_with_tenant()
+        await client.set_usage_billing(True)
+        assert client.patch.call_args.kwargs.get("data") == {"usageBillingEnabled": True}
+
+    @pytest.mark.asyncio
+    async def test_get_users_me_reads_the_published_path(self):
+        """usageBillingEnabled rides the tenant stub of this response."""
+        client = _make_client()
+        client.get = AsyncMock(
+            return_value={"tenant": {"id": "ten_1", "usageBillingEnabled": False}}
+        )
+        result = await client.get_users_me()
+        client.get.assert_awaited_once_with("/profitstream/v2/api/users/me")
+        assert result["tenant"]["usageBillingEnabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_set_usage_billing_requires_tenant_id(self):
+        client = _make_client()
+        client.patch = AsyncMock(return_value={})
+        with pytest.raises(ValueError, match="tenant"):
+            await client.set_usage_billing(True)
+        client.patch.assert_not_called()
+
+
 
 # ===========================================================================
 # API convenience methods — AI Cost Controls

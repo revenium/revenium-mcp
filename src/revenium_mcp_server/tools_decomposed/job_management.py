@@ -1,7 +1,8 @@
 """Job management tool for Revenium Jobs & Outcomes system.
 
-Exposes 7 API endpoints under /v2/api/jobs for tracking job performance,
-ROI, conversion funnels, and reporting outcomes, plus the read side of
+Exposes the /v2/api/jobs endpoints for tracking job performance, ROI,
+conversion funnels, reporting outcomes and declaring the economics a job type's
+ROI is measured against, plus the read side of
 coding-session ticket attribution
 (GET /v2/api/sessions/{sessionId}/attribution) — the write that produces the
 ticket-grain jobs this tool already reads. get_roi_summary is the one
@@ -88,12 +89,82 @@ append-only fact endpoint (sdk#110). A fact measured later can ride the
 origin already committed appends a duplicate fact) are a transport concern the
 shared MCP client does not model. Revisit when a caller needs to append facts
 without touching the outcome row.
+
+Decision (BACK-3090): REVISITED, and the paragraph above is superseded. The
+condition it set — "when a caller needs to append facts without touching the
+outcome row" — is exactly the case this tool now has to serve, because the
+economics contract those facts are declared on became readable and writable
+here at the same time. A fact appended through ``amend_outcome`` costs a
+revision on the outcome and advances the job's ``entityVersion``, which is the
+wrong trade for a quality score measured after the job closed: it makes a
+correction out of an addition, and invalidates a version another caller is
+holding. The transport concern was the real blocker and it is now answered the
+same way BACK-3091 answered it — ``ReveniumClient`` passes ``use_retry=False``
+on every append in this family (``append_job_outcome_metrics``,
+``append_job_type_facts``, ``create_job_type_baseline``), so a transient error
+surfaces instead of duplicating a row.
+
+This tool therefore also exposes the job *type* economics surface the platform
+publishes under ``JobTypeEconomicsController``: ``get_job_type_economics`` and
+``upsert_job_type_economics`` (the declaration), ``list_job_type_baselines``
+and ``create_job_type_baseline`` (the immutable baseline versions), and
+``report_period_facts`` (PERIOD facts on the type). Without them an MCP caller
+could read a job type's ROI through ``get_roi_summary`` and had no way to see —
+let alone set — the unit, the metrics, the monetization rule or the baseline
+that ROI was computed from.
+
+Two decisions are load-bearing and are stated once here:
+
+1. The upsert is a read-modify-write. The platform's PUT REPLACES the whole
+   declaration, so an edit that sent only the changed field would clear every
+   other one, including the baseline assumptions expressed through
+   ``unitMetricKey`` and ``monetization``. ``JobManager.upsert_job_type_economics``
+   reads the stored declaration, merges the caller's fields over the subset the
+   PUT accepts (``_ECONOMICS_REQUEST_FIELDS`` — the resource also echoes back
+   ``jobType`` and a resolved ``currentBaseline``, which the request does not
+   take), and reports what it carried over under ``preserved_fields``. A 404 on
+   that read is the create case, not a failure. What it does NOT do is make the
+   sequence atomic: the resource carries no version or ETag, so two concurrent
+   editors silently revert each other. That window is disclosed
+   (``_ECONOMICS_LOST_UPDATE_NOTE``, on every upsert response and in the
+   capability text) rather than papered over with a client-side lock the server
+   would not honour.
+2. The appends are not idempotent and are never retried, at either layer. A
+   repeated append records a second baseline version or a second fact — there
+   is no idempotency key on any of these operations for the platform to dedupe
+   on — so ``_NON_IDEMPOTENT_APPEND_NOTE`` is stated to the caller and the
+   transport retry is off in ``client.py``. The Python SDK draws the same line
+   on the same endpoints (``_NON_IDEMPOTENT_RETRY_STATUSES`` in
+   ``revenium_middleware/_core/outcomes.py`` keeps only the 429 that proves the
+   origin never processed the request; this transport cannot express a
+   per-status policy, so it gives that one up too).
+
+Where a fact belongs is the platform's rule, not this tool's: a metric declared
+``PER_JOB`` takes facts through ``append_outcome_metrics``, one declared
+``PERIOD`` through ``report_period_facts``, and the platform answers the wrong
+pairing with a 400 naming the metric. That sentence is surfaced verbatim
+(``_platform_rejection_error``) rather than replaced with a generic failure,
+because it is the only part of the answer that says what to change. Client-side
+validation stops at shape — a non-blank ``key``, a present ``value``, a
+non-blank ``reason`` when one is given — for the reason the SDK stops there:
+which keys a job type declares is server state, and a copy of it here would
+drift.
 """
 
 import json
 import re
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -379,6 +450,7 @@ _ROI_ROW_FIELDS: Tuple[str, ...] = (
     "totalJobs",
     "totalCost",
     "tokenCost",
+    "modalityCost",
     "externalToolCost",
     "humanCost",
     "conversions",
@@ -414,6 +486,840 @@ _TOOL_COST_ATTRIBUTION_NOTES: Dict[str, str] = {
         "via the agent that incurred it, not measured per job type directly."
     ),
 }
+
+
+# ===========================================================================
+# BACK-3090 - job type economics: the declaration ROI is measured against
+# ===========================================================================
+
+# The fields JobTypeEconomicsRequest declares, in the snapshot's order. The GET
+# answers with JobTypeEconomicsResource, which carries two fields the PUT does
+# not accept -- ``jobType`` (the path parameter, echoed back) and
+# ``currentBaseline`` (resolved from the baselines collection, not part of the
+# declaration) -- so the read half of upsert_job_type_economics is filtered
+# through this tuple before it is sent back. Only the read half is bounded: a
+# key the caller supplies is forwarded whether or not it is listed here, so a
+# field the contract adds reaches the API without a release.
+_ECONOMICS_REQUEST_FIELDS: Tuple[str, ...] = (
+    "unitMetricKey",
+    "unitLabel",
+    "metrics",
+    "dimensions",
+    "monetization",
+    "overheadPerUnit",
+    "overheadCurrency",
+)
+
+# The fields the platform requires on every declaration. Checked after the
+# merge rather than on the caller's input: on an edit they come from the stored
+# declaration, so only a create has to supply them.
+_ECONOMICS_REQUIRED_FIELDS: Tuple[str, ...] = ("unitMetricKey", "unitLabel")
+
+# BaselineRequest, field for field. ``effectiveFrom`` is the only one the
+# platform requires -- a baseline without it is a guaranteed 400, so it is
+# refused here instead.
+_BASELINE_REQUEST_FIELDS: Tuple[str, ...] = (
+    "effectiveFrom",
+    "costPerUnit",
+    "minutesPerUnit",
+    "qualityRate",
+    "hourlyRate",
+    "currency",
+    "provenance",
+    "declaredBy",
+    "evidenceUrl",
+)
+
+# The nested declaration blocks, field for field, so the snake_case spelling of
+# a nested key is translated exactly as a top-level one is. Without these the
+# capability text's promise ("the snake_case spelling of a declared field is
+# accepted and translated") held only one level deep, and allowed_values,
+# metric_key and value_per_unit reached the platform unrecognised -- dropped
+# from a declaration that REPLACES the stored one, which is the worst place for
+# a silent drop. JobTypeMetricDefinition declares no camelCase field today, so
+# its entry is a no-op; it is listed anyway, because the normalizer is then the
+# one place a future camelCase addition has to be named.
+_METRIC_DEFINITION_FIELDS: Tuple[str, ...] = (
+    "key",
+    "type",
+    "direction",
+    "aggregation",
+    "resolution",
+)
+_DIMENSION_DEFINITION_FIELDS: Tuple[str, ...] = ("key", "allowedValues")
+_MONETIZATION_FIELDS: Tuple[str, ...] = (
+    "metricKey",
+    "valuePerUnit",
+    "currency",
+    "category",
+    "basis",
+)
+
+# PeriodFactEntry and OutcomeMetricEntry, field for field. The two differ only
+# in the period/dimension coordinates the period fact carries and the
+# ``recordedAt`` the per-job entry does.
+_PERIOD_FACT_FIELDS: Tuple[str, ...] = (
+    "periodStart",
+    "periodEnd",
+    "dimensionKey",
+    "dimensionValue",
+    "key",
+    "value",
+    "provenance",
+    "recordedBy",
+    "source",
+    "reason",
+)
+_OUTCOME_METRIC_FIELDS: Tuple[str, ...] = (
+    "key",
+    "value",
+    "provenance",
+    "recordedBy",
+    "source",
+    "reason",
+    "recordedAt",
+)
+
+# Stated on every write action. The platform replaces the whole declaration on
+# PUT, so an edit that sent only the changed field would clear every other one
+# -- including the unit definition the baseline assumptions are expressed in.
+# upsert_job_type_economics therefore reads the stored declaration first and
+# sends the merge, and says which fields it carried over.
+_ECONOMICS_REPLACE_NOTE = (
+    "PUT .../economics replaces the whole declaration upstream, so this action "
+    "reads the stored one first and sends your fields merged over it. Fields "
+    "you do not name are carried over unchanged and reported under "
+    "preserved_fields. The merge is by top-level field: supplying metrics "
+    "replaces the entire metrics array rather than adding to it, because the "
+    "array is the declaration, not a patch of it."
+)
+
+# BACK-3090, raised in review: the read-modify-write closes the "a partial edit
+# clears the rest" hole and opens a narrower one. Tessie's cross-repo pass then
+# found the concurrent writer was not hypothetical: isotope's Job Type editor
+# (``useJobTypeEditor.ts``) PUTs a full replacement assembled from the snapshot
+# its drawer opened with, and reconstructs ``metrics`` with PER_JOB/COUNT/SUM
+# defaults rather than preserving what it read -- so a dashboard save can drop a
+# metric this tool declared, or silently re-declare a PERIOD metric as PER_JOB,
+# and the next report_period_facts is then refused by the platform for a reason
+# that has nothing to do with the call that failed. Isotope owns the fix on
+# their side; what this tool owes the caller is to name the writer. The economics resource carries
+# no version or ETag -- nothing like the entityVersion amend_outcome locks on --
+# so two editors who read the same declaration and write different fields will
+# each send a full body built on their own read, and the second PUT reverts the
+# first editor's change without either of them seeing a conflict. No client-side
+# lock is invented for this: a lock the server does not honour would be worse
+# than none, because it would read as a guarantee. The window is stated instead,
+# on every upsert response and in the capability text, exactly as
+# MARKETPLACE_CONCURRENCY_NOTE states it for the other read-then-write action in
+# this codebase.
+_ECONOMICS_LOST_UPDATE_NOTE = (
+    "Concurrency: this declaration carries no version or ETag, so the "
+    "read-modify-write cannot be made atomic. If another editor writes between "
+    "this action's read and its PUT, their change is reverted silently -- "
+    "neither side sees a conflict. The Revenium dashboard's Job Type editor is "
+    "a known second writer: it saves a full replacement built from the snapshot "
+    "taken when its drawer was opened, and rebuilds the metric list with "
+    "PER_JOB/COUNT/SUM defaults, so a save there can drop or downgrade a metric "
+    "declared here in between -- after which report_period_facts on a metric "
+    "that is no longer PERIOD is refused. Re-read with get_job_type_economics "
+    "immediately before an upsert on any job type that is also managed in the "
+    "dashboard, and coordinate edits to it rather than relying on the merge."
+)
+
+# Stated on the three appends. The platform has no idempotency key on any of
+# them, and ReveniumClient turns the transport retry off for that reason --
+# see the block comment above get_job_type_economics in client.py.
+_NON_IDEMPOTENT_APPEND_NOTE = (
+    "This append is not idempotent and is never retried automatically: a "
+    "second delivery records a second baseline version or a second fact, and "
+    "the operation declares no idempotency key for the platform to dedupe on. "
+    "A transient failure therefore reaches you rather than being resent -- "
+    "read the current state back before deciding to send it again."
+)
+
+# The rule that decides which endpoint a fact belongs on, and the 400 the
+# platform answers when it is broken. Stated once and reused by both append
+# actions so the two cannot drift.
+_METRIC_RESOLUTION_NOTE = (
+    "A metric's resolution decides where its facts go: a metric declared "
+    "PER_JOB is appended to one job with append_outcome_metrics, and a metric "
+    "declared PERIOD is appended to the job type with report_period_facts. "
+    "Sending a fact to the wrong one, or naming a key the job type does not "
+    "declare at all, is answered with a 400 naming the metric; that message is "
+    "surfaced to you verbatim rather than replaced with a generic failure. "
+    "Declare the metric first with upsert_job_type_economics."
+)
+
+# append_outcome_metrics does not touch the outcome row, so the optimistic-lock
+# token a caller is holding for amend_outcome stays valid across it. Worth
+# saying, because the neighbouring write (amend_outcome, which also carries a
+# metrics array) does advance it.
+_OUTCOME_METRICS_VERSION_NOTE = (
+    "Appending outcome metrics does not advance the job's entityVersion: the "
+    "facts hang off the reported outcome rather than rewriting it, so a "
+    "version read before this call is still current after it. Use "
+    "amend_outcome instead when the outcome row itself is what changes."
+)
+
+# Currency is not a caller choice yet: both the baseline and the monetization
+# rule declare USD as the only accepted value upstream.
+_ECONOMICS_CURRENCY_NOTE = (
+    "Currency values are USD only; the platform does not support "
+    "multi-currency on this contract yet."
+)
+
+
+def _snake_spellings(fields: Tuple[str, ...]) -> Dict[str, str]:
+    """Map the snake_case spelling of each declared field to its wire name.
+
+    The wire names on this contract are camelCase, and a snake_case key is
+    ignored upstream without an error -- the caller believes it set
+    ``unit_metric_key`` and the declaration keeps whatever it had. Accepting the
+    spelling and translating it beats a silent no-op, and beats a rejection,
+    because both spellings are in circulation: the platform declares camelCase
+    and the Python SDK's dataclasses (revenium_middleware/job_type_economics.py)
+    use snake_case.
+    """
+    return {re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower(): name for name in fields}
+
+
+_ECONOMICS_SNAKE_SPELLINGS = _snake_spellings(_ECONOMICS_REQUEST_FIELDS)
+_BASELINE_SNAKE_SPELLINGS = _snake_spellings(_BASELINE_REQUEST_FIELDS)
+_PERIOD_FACT_SNAKE_SPELLINGS = _snake_spellings(_PERIOD_FACT_FIELDS)
+_OUTCOME_METRIC_SNAKE_SPELLINGS = _snake_spellings(_OUTCOME_METRIC_FIELDS)
+_METRIC_SPELLINGS = _snake_spellings(_METRIC_DEFINITION_FIELDS)
+_DIMENSION_SPELLINGS = _snake_spellings(_DIMENSION_DEFINITION_FIELDS)
+_MONETIZATION_SPELLINGS = _snake_spellings(_MONETIZATION_FIELDS)
+
+
+def _normalize_wire_keys(
+    payload: Dict[str, Any], spellings: Dict[str, str], *, field: str
+) -> Dict[str, Any]:
+    """Translate the snake_case spelling of a declared field to its wire name.
+
+    A key that is neither spelling of a declared field is forwarded verbatim, so
+    a field the contract adds needs no release here. Naming one field under both
+    spellings at once is refused rather than resolved by dict order: which value
+    won would be invisible to the caller.
+    """
+    normalized: Dict[str, Any] = {}
+    source_of: Dict[str, str] = {}
+    for key, value in payload.items():
+        wire_name = spellings.get(key, key)
+        if wire_name in normalized:
+            raise ToolError(
+                message=(
+                    f"{field} names {wire_name} twice, as '{source_of[wire_name]}' "
+                    f"and as '{key}'. Refusing to guess which value you meant"
+                ),
+                error_code=ErrorCodes.INVALID_PARAMETER,
+                field=field,
+                value=key,
+                suggestions=[f"Pass {wire_name} once, in either spelling"],
+            )
+        normalized[wire_name] = value
+        source_of[wire_name] = key
+    return normalized
+
+
+# The two path segments URL resolution removes rather than sends. A job type of
+# exactly one of these is refused; a dot INSIDE a longer name is not a
+# dot-segment and is left alone ('x..y' resolves to itself).
+_PATH_DOT_SEGMENTS = frozenset({".", ".."})
+
+
+def _require_job_type(job_type: Any, action: str) -> str:
+    """A job type is a non-blank string, checked before any request.
+
+    The path segment is percent-encoded downstream, so a blank one would reach
+    the API as a request for a different endpoint rather than as an error.
+    """
+    if not isinstance(job_type, str) or not job_type.strip():
+        raise ToolError(
+            message=(
+                f"job_type is required for {action} action and must be a "
+                "non-blank string"
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="job_type",
+            value=job_type,
+            examples={action: {"action": action, "job_type": "mcp-test-claims"}},
+            suggestions=[
+                "Use get_job_types to list the job types this tenant has recorded",
+                "The job type is the key the jobs themselves carry, not a display name",
+            ],
+        )
+    if job_type.strip() in _PATH_DOT_SEGMENTS:
+        # Raised in review. Percent-encoding keeps the value inside one path
+        # segment, but '.' is unreserved and survives it, so these two reach the
+        # URL as real dot-segments and urljoin resolves them away -- '..' turns
+        # .../jobs/types/{type}/economics into .../jobs/economics, a different
+        # endpoint that would be called silently. The client escapes them too;
+        # they are refused here as well so the caller is told, rather than
+        # having a nonsensical job type quietly sent.
+        raise ToolError(
+            message=(
+                f"job_type must not be '{job_type.strip()}' for {action} action: "
+                "a dot-segment is normalised out of the URL path, so the request "
+                "would be sent to a different endpoint than the one this action "
+                "names."
+            ),
+            error_code=ErrorCodes.INVALID_PARAMETER,
+            field="job_type",
+            value=job_type,
+            suggestions=[
+                "Use get_job_types to list the job types this tenant has recorded",
+                "A job type containing dots is fine -- only a name that is "
+                "entirely '.' or '..' is refused",
+            ],
+        )
+    return job_type
+
+
+def _require_entry_list(
+    value: Any,
+    *,
+    action: str,
+    field: str,
+    entry_label: str,
+    spellings: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """Shape-check an append body -- a non-empty array of key/value facts.
+
+    Only the shape is checked. Which keys a job type declares, which resolution
+    each was declared with, and the 0..1 range on a rate belong to the platform,
+    which owns the economics contract; a copy of those rules here would drift
+    from it, and its 400 is surfaced verbatim instead.
+
+    A blank ``reason`` is the one content rule enforced here: the platform
+    requires a reason when a fact supersedes one already recorded, and an empty
+    string satisfies neither that check nor an auditor reading the trail later.
+    """
+    if isinstance(value, dict):
+        raise ToolError(
+            message=(
+                f"{field} must be a list of {entry_label} entries for {action} "
+                "action, not a single object -- the endpoint's body is a JSON array"
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field=field,
+            suggestions=[f"Wrap the entry in a list: {field}=[{{...}}]"],
+        )
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ToolError(
+            message=(
+                f"{field} is required for {action} action and must contain at "
+                f"least one {entry_label} entry"
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field=field,
+            value=value,
+            suggestions=[
+                f"Pass a list of {entry_label} entries, each with a key and a value",
+                _METRIC_RESOLUTION_NOTE,
+            ],
+        )
+    entries: List[Dict[str, Any]] = []
+    for index, raw_entry in enumerate(value):
+        if not isinstance(raw_entry, dict):
+            raise ToolError(
+                message=(
+                    f"{field}[{index}] must be an object with 'key' and 'value', "
+                    f"got {type(raw_entry).__name__}"
+                ),
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=f"{field}[{index}]",
+                value=raw_entry,
+            )
+        entry = _normalize_wire_keys(raw_entry, spellings, field=f"{field}[{index}]")
+        key = entry.get("key")
+        if not isinstance(key, str) or not key.strip():
+            raise ToolError(
+                message=(
+                    f"{field}[{index}]['key'] must be a non-blank string naming a "
+                    "declared metric"
+                ),
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=f"{field}[{index}].key",
+                value=key,
+                suggestions=[
+                    "Read the declared metric keys with get_job_type_economics",
+                    _METRIC_RESOLUTION_NOTE,
+                ],
+            )
+        if entry.get("value") is None:
+            raise ToolError(
+                message=f"{field}[{index}]['value'] is required and must not be null",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=f"{field}[{index}].value",
+                suggestions=[
+                    "A fact with no value is not a fact; omit the entry instead "
+                    "of sending a null",
+                ],
+            )
+        if "reason" in entry and (
+            not isinstance(entry["reason"], str) or not entry["reason"].strip()
+        ):
+            raise ToolError(
+                message=(
+                    f"{field}[{index}]['reason'] must be a non-blank string when it "
+                    "is given -- it is what the platform requires to accept a fact "
+                    "that supersedes one already recorded"
+                ),
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=f"{field}[{index}].reason",
+                value=entry["reason"],
+                suggestions=[
+                    "Say why the earlier value is being restated, or omit reason "
+                    "entirely",
+                ],
+            )
+        entries.append(entry)
+    return entries
+
+
+def _validate_economics_changes(economics: Any, action: str) -> Dict[str, Any]:
+    """Shape-check the economics fields a caller wants to set.
+
+    Partial by design -- this is the caller's half of a read-modify-write, not
+    the whole declaration -- so nothing is required here beyond naming at least
+    one field. The platform's required fields are checked on the merged body,
+    where they can be satisfied by what is already stored.
+    """
+    if not isinstance(economics, dict) or not economics:
+        raise ToolError(
+            message=(
+                f"economics is required for {action} action and must name at "
+                "least one field to set"
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="economics",
+            value=economics,
+            examples={
+                "declare_a_unit_and_one_metric": {
+                    "action": action,
+                    "job_type": "mcp-test-claims",
+                    "economics": {
+                        "unitMetricKey": "completed_claims",
+                        "unitLabel": "claim",
+                        "metrics": [
+                            {
+                                "key": "completed_claims",
+                                "type": "COUNT",
+                                "direction": "HIGHER_IS_BETTER",
+                                "aggregation": "SUM",
+                                "resolution": "PER_JOB",
+                            }
+                        ],
+                    },
+                }
+            },
+            suggestions=[
+                "Supported fields: " + ", ".join(_ECONOMICS_REQUEST_FIELDS),
+                _ECONOMICS_REPLACE_NOTE,
+            ],
+        )
+    changes = _normalize_wire_keys(
+        economics, _ECONOMICS_SNAKE_SPELLINGS, field="economics"
+    )
+    for name in ("metrics", "dimensions"):
+        if name not in changes:
+            continue
+        declarations = changes[name]
+        if not isinstance(declarations, list):
+            raise ToolError(
+                message=f"economics['{name}'] must be a list of declarations",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=f"economics.{name}",
+                value=declarations,
+                suggestions=[_ECONOMICS_REPLACE_NOTE],
+            )
+        nested_spellings = (
+            _METRIC_SPELLINGS if name == "metrics" else _DIMENSION_SPELLINGS
+        )
+        normalized_declarations: List[Any] = []
+        for index, declaration in enumerate(declarations):
+            if not isinstance(declaration, dict) or not str(
+                declaration.get("key") or ""
+            ).strip():
+                raise ToolError(
+                    message=(
+                        f"economics['{name}'][{index}] must be an object with a "
+                        "non-blank 'key'"
+                    ),
+                    error_code=ErrorCodes.VALIDATION_ERROR,
+                    field=f"economics.{name}[{index}]",
+                    value=declaration,
+                    suggestions=[
+                        "A metric declares key, type, direction, aggregation and "
+                        "resolution (PER_JOB or PERIOD); a dimension declares key "
+                        "and allowedValues",
+                    ],
+                )
+            # One level down, the same rule: a declared field's snake_case
+            # spelling is translated, an undeclared key rides along, and naming
+            # one field twice is refused rather than resolved by dict order.
+            normalized_declarations.append(
+                _normalize_wire_keys(
+                    declaration, nested_spellings, field=f"economics.{name}[{index}]"
+                )
+            )
+        changes[name] = normalized_declarations
+    monetization = changes.get("monetization")
+    if isinstance(monetization, dict):
+        changes["monetization"] = _normalize_wire_keys(
+            monetization, _MONETIZATION_SPELLINGS, field="economics.monetization"
+        )
+    elif monetization is not None:
+        raise ToolError(
+            message="economics['monetization'] must be an object",
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="economics.monetization",
+            value=monetization,
+            suggestions=[
+                "A monetization rule names metricKey, valuePerUnit, currency, "
+                "category (REVENUE|COST_AVOIDED|TIME_SAVED|LEADING_VALUE) and "
+                "basis (REALIZED|EXPECTED)",
+                _ECONOMICS_CURRENCY_NOTE,
+            ],
+        )
+    return changes
+
+
+def _validate_baseline(baseline: Any, action: str) -> Dict[str, Any]:
+    """Shape-check a baseline version. ``effectiveFrom`` is the one hard rule.
+
+    It is the only field the platform declares as required, so a baseline
+    without it is a guaranteed 400; every other field is optional and the
+    platform owns its meaning.
+    """
+    if not isinstance(baseline, dict):
+        raise ToolError(
+            message=(
+                f"baseline is required for {action} action and must be an object, "
+                f"got {type(baseline).__name__}"
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="baseline",
+            value=baseline,
+            suggestions=[
+                "Supported fields: " + ", ".join(_BASELINE_REQUEST_FIELDS),
+            ],
+        )
+    body = _normalize_wire_keys(baseline, _BASELINE_SNAKE_SPELLINGS, field="baseline")
+    effective_from = body.get("effectiveFrom")
+    if not isinstance(effective_from, str) or not effective_from.strip():
+        raise ToolError(
+            message=(
+                f"baseline['effectiveFrom'] is required for {action} action -- it "
+                "is the only field the platform requires, and it is the date from "
+                "which this version supersedes the one before it"
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="baseline.effectiveFrom",
+            value=effective_from,
+            examples={
+                action: {
+                    "action": action,
+                    "job_type": "mcp-test-claims",
+                    "baseline": {
+                        "effectiveFrom": "2026-08-01T00:00:00Z",
+                        "costPerUnit": 4.5,
+                        "currency": "USD",
+                        "provenance": "CUSTOMER_DECLARED",
+                    },
+                }
+            },
+            suggestions=[
+                "Pass an ISO 8601 timestamp, e.g. '2026-08-01T00:00:00Z' "
+                "(effective_from is accepted and sent as effectiveFrom)",
+                _NON_IDEMPOTENT_APPEND_NOTE,
+            ],
+        )
+    return body
+
+
+def _platform_rejection_error(
+    error: ReveniumAPIError, *, action: str, subject: str, subject_label: str, field: str
+) -> Optional[ToolError]:
+    """Carry the platform's own 400 sentence through, or leave the error alone.
+
+    A 400 on this family is always a content rejection the platform explains in
+    its own words ("metric X is not declared PERIOD", "job type not
+    registered"). That sentence is the only part of the answer that says what to
+    change, so it is surfaced verbatim rather than replaced with a generic "the
+    request failed".
+    """
+    if error.status_code != 400:
+        return None
+    return ToolError(
+        message=(
+            f"The platform rejected {action} for {subject_label} '{subject}': "
+            f"{error.message}"
+        ),
+        error_code=ErrorCodes.VALIDATION_ERROR,
+        field=field,
+        value=subject,
+        context={
+            field: subject,
+            "upstream_status": 400,
+            "upstream_message": error.message,
+        },
+        suggestions=[
+            "The sentence above is the platform's own, verbatim -- it names the "
+            "field or metric it refused",
+            _METRIC_RESOLUTION_NOTE,
+            "Read the current declaration with get_job_type_economics",
+        ],
+    )
+
+
+def _require_baseline_collection(job_type: str, response: Any) -> List[Any]:
+    """Return ``response`` once it is the published baseline collection.
+
+    The operation declares a bare JSON array of BaselineResource, newest first.
+    Anything else raises, for the reason ``_require_roi_summary_envelope``
+    raises: coercing an unexpected body to ``[]`` would report a contract
+    failure as "this job type has declared no baseline", and the two are
+    indistinguishable to the caller while only one of them is safe to act on --
+    declaring a fresh baseline on top of history you failed to read is how a
+    version gets superseded by accident.
+
+    A genuinely empty array is still the answer and is returned unchanged; it
+    is the one empty result this function accepts.
+
+    Raises:
+        ToolError: when the body is not a list. The message names what arrived
+            -- the observed top-level keys for an object, or the type -- so the
+            failure can be diagnosed without re-running the call.
+    """
+    if isinstance(response, list):
+        return response
+    if isinstance(response, dict):
+        observed = f"the body is an object with top-level keys {sorted(response.keys())}"
+    else:
+        observed = f"the body is a {type(response).__name__}, not an array"
+    raise ToolError(
+        message=(
+            f"The baselines endpoint answered for job type '{job_type}' with "
+            f"something other than the published array; {observed}. No baselines "
+            "were returned, and this is NOT the same as the job type having none."
+        ),
+        error_code=ErrorCodes.API_ERROR,
+        field="job_type",
+        value=job_type,
+        context={"job_type": job_type, "observed_type": type(response).__name__},
+        suggestions=[
+            "Retry the request; a truncated or proxied response can produce this",
+            "Do not read this as an empty baseline history -- read it again before "
+            "declaring a new baseline with create_job_type_baseline",
+            "If it persists, the endpoint's response contract has changed and the "
+            "MCP needs updating",
+        ],
+    )
+
+
+def _job_type_read_not_found_error(
+    error: ReveniumAPIError, *, action: str, job_type: str
+) -> ToolError:
+    """The 404 a READ gets back: the job type has no declaration.
+
+    A fact about the tenant rather than a transport failure, and it reads far
+    better as one. Its advice -- declare the economics with
+    ``upsert_job_type_economics`` -- is right for a read and wrong for every
+    write, which is why the writes have their own builders below rather than
+    borrowing this one.
+    """
+    return ToolError(
+        message=(
+            f"Job type '{job_type}' has no economics declaration on this "
+            f"tenant, so {action} has nothing to read."
+        ),
+        error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+        field="job_type",
+        value=job_type,
+        context={
+            "job_type": job_type,
+            "upstream_status": 404,
+            "upstream_message": error.message,
+            "phase": "read",
+        },
+        suggestions=[
+            "Use get_job_types to list the job types this tenant has recorded",
+            "Declare the economics first with upsert_job_type_economics -- it "
+            "creates the declaration when there is none",
+        ],
+    )
+
+
+def _job_type_write_not_found_error(
+    error: ReveniumAPIError, *, action: str, job_type: str
+) -> ToolError:
+    """The 404 the economics PUT gets back.
+
+    Raised in review: routing it through the read's builder told the caller the
+    type "has nothing to read" and advised fixing it by calling
+    ``upsert_job_type_economics`` -- the action that had just failed. A 404 on
+    the PUT means the platform refused the write itself, so the recovery is
+    different: check the type name, and check whether the declaration was
+    removed between this action's read and its write, which the resource's
+    missing version token makes invisible at the time it happens. That last
+    possibility is why this builder carries the lost-update note and the append
+    builder does not -- only the upsert has a read to be raced.
+    """
+    return ToolError(
+        message=(
+            f"The platform rejected the {action} write for job type "
+            f"'{job_type}' with a 404, so nothing was stored."
+        ),
+        error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+        field="job_type",
+        value=job_type,
+        context={
+            "job_type": job_type,
+            "upstream_status": 404,
+            "upstream_message": error.message,
+            "phase": "write",
+        },
+        suggestions=[
+            f"Check the job type name: '{job_type}' is sent as the path segment "
+            "verbatim, and get_job_types lists the ones this tenant has recorded",
+            "The declaration may have been removed between this action's read and "
+            "its write -- re-read with get_job_type_economics and send the write "
+            "again if it is still the change you mean to make",
+            _ECONOMICS_LOST_UPDATE_NOTE,
+        ],
+    )
+
+
+def _job_type_append_not_found_error(
+    error: ReveniumAPIError, *, action: str, job_type: str
+) -> ToolError:
+    """The 404 an APPEND gets back: baselines and period facts.
+
+    Lighter than the upsert's. An append performs no read of its own, so there
+    is no read-then-write window to warn about and the lost-update note would
+    be noise -- the two things worth checking are the type name and whether the
+    economics have been declared at all, since the platform registers a job
+    type's fact and baseline surface through that declaration.
+    """
+    return ToolError(
+        message=(
+            f"The platform rejected the {action} append for job type "
+            f"'{job_type}' with a 404, so nothing was appended."
+        ),
+        error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+        field="job_type",
+        value=job_type,
+        context={
+            "job_type": job_type,
+            "upstream_status": 404,
+            "upstream_message": error.message,
+            "phase": "append",
+        },
+        suggestions=[
+            f"Check the job type name: '{job_type}' is sent as the path segment "
+            "verbatim, and get_job_types lists the ones this tenant has recorded",
+            "Declare the economics first with upsert_job_type_economics -- a job "
+            "type with no declaration has nothing to append against",
+            "Nothing was appended, so this is safe to send again once the type is "
+            "declared; the append is not retried automatically",
+        ],
+    )
+
+
+# Every 404 builder above takes the same keyword-only shape, so the call helper
+# can treat "which 404 does this path mean" as a parameter instead of a branch
+# repeated at each site.
+_NotFoundBuilder = Callable[..., ToolError]
+
+
+async def _translated_economics_call(
+    call: Awaitable[Any],
+    *,
+    action: str,
+    job_type: str,
+    on_not_found: _NotFoundBuilder,
+) -> Any:
+    """Await an economics call and translate the platform's two refusals.
+
+    Extracted in review: the same try/except/translate/re-raise block was
+    written out verbatim at four call sites, which is four places for the 404
+    to be routed to the wrong builder -- the mistake that actually happened
+    twice on this branch. The 404 builder is the one thing that differs between
+    a read, the upsert's write and an append, so it is the parameter; the
+    verbatim 400 (``_platform_rejection_error``) and the rule that everything
+    else propagates untouched are the same everywhere and live here.
+    """
+    try:
+        return await call
+    except ReveniumAPIError as exc:
+        if exc.status_code == 404:
+            raise on_not_found(exc, action=action, job_type=job_type) from exc
+        translated = _platform_rejection_error(
+            exc,
+            action=action,
+            subject=job_type,
+            subject_label="job type",
+            field="job_type",
+        )
+        if translated is None:
+            raise
+        raise translated from exc
+
+
+def _require_economics_declaration(job_type: str, response: Any) -> Dict[str, Any]:
+    """Return ``response`` once it is a job type's economics declaration.
+
+    The upsert reads before it writes, and the read's answer decides whether the
+    PUT is a create or an edit. Raised in review: treating any non-dict or empty
+    body as "no declaration yet" made a malformed 200 indistinguishable from an
+    explicit 404, so a declaration that failed to parse would be REPLACED by
+    whatever fields the caller happened to name -- the exact loss the
+    read-modify-write exists to prevent. Only an explicit 404 may take the
+    create path; a 200 has to look like a declaration or nothing is written.
+
+    A declaration is a non-empty object carrying at least one of the fields the
+    request accepts. That is deliberately the weakest check that still
+    distinguishes a declaration from ``{}``, an error envelope or a list --
+    which fields a given tenant's declaration carries is the platform's business.
+
+    Raises:
+        ToolError: API_ERROR naming what arrived, so the failure can be
+            diagnosed without re-running the call.
+    """
+    if isinstance(response, dict) and response:
+        if any(name in response for name in _ECONOMICS_REQUEST_FIELDS):
+            return response
+        observed = (
+            f"the body is an object with top-level keys {sorted(response.keys())}, "
+            "none of which the declaration declares"
+        )
+    elif isinstance(response, dict):
+        observed = "the body is an empty object"
+    else:
+        observed = f"the body is a {type(response).__name__}, not an object"
+    raise ToolError(
+        message=(
+            f"The economics endpoint answered for job type '{job_type}' with "
+            f"something other than a declaration; {observed}. Nothing was "
+            "written: this is NOT the same as the job type having no "
+            "declaration, which the platform reports as a 404."
+        ),
+        error_code=ErrorCodes.API_ERROR,
+        field="job_type",
+        value=job_type,
+        context={"job_type": job_type, "observed_type": type(response).__name__},
+        suggestions=[
+            "Retry the request; a truncated or proxied response can produce this",
+            "Read the declaration with get_job_type_economics before writing again "
+            "-- the upsert replaces the whole declaration, so it must not be built "
+            "on a body it could not parse",
+            "If it persists, the endpoint's response contract has changed and the "
+            "MCP needs updating",
+        ],
+    )
 
 
 def _coerce_expected_entity_version(
@@ -967,7 +1873,8 @@ class JobManager:
         """Get the published ROI summary by job type (BACK-2915).
 
         One request to the analytics host's job-type ROI summary, which returns
-        the per-type cost breakdown (tokenCost, externalToolCost, humanCost),
+        the per-type cost breakdown (tokenCost, modalityCost, externalToolCost,
+        humanCost -- modalityCost is image, video and audio generation spend),
         the outcome counts, the derived ROI figures, and the
         ``toolCostAttribution`` qualifier saying how external tool cost reached
         each job type. This used to be a get_job_types call plus one
@@ -1271,6 +2178,293 @@ class JobManager:
             raise
         return {"action": "amend_outcome", "job_id": job_id, "data": _strip_links(result)}
 
+
+    # --- Job type economics (BACK-3090) ---
+
+    async def get_job_type_economics(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Read a job type's economics declaration and its current baseline.
+
+        This is the contract every ROI figure in get_roi_summary and get_job_roi
+        is computed against -- the unit a job produces, the metrics it declares
+        and at what resolution, the dimensions period facts may be cut by, the
+        monetization rule that turns a metric into money, and the baseline the
+        improvement is measured from. Until this action existed an MCP caller
+        could read the ROI and not the assumptions behind it.
+        """
+        job_type = _require_job_type(arguments.get("job_type"), "get_job_type_economics")
+        result = await _translated_economics_call(
+            self.client.get_job_type_economics(job_type),
+            action="get_job_type_economics",
+            job_type=job_type,
+            on_not_found=_job_type_read_not_found_error,
+        )
+        return {
+            "action": "get_job_type_economics",
+            "job_type": job_type,
+            "data": _strip_links(result),
+        }
+
+    async def upsert_job_type_economics(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Create or edit a job type's economics declaration (read-modify-write).
+
+        The platform's PUT replaces the whole declaration, so sending only the
+        changed field would clear every other one -- including the unit
+        definition and the monetization rule the stored baseline assumptions are
+        expressed in. This action therefore reads the stored declaration first
+        and PUTs the caller's fields merged over it, and reports which fields it
+        carried over so the merge is visible rather than implied.
+
+        A 404 on the read is not an error here: it means the type has no
+        declaration yet, which is exactly the create case, and the merge simply
+        starts from nothing. Only then do the platform's two required fields
+        have to come from the caller.
+        """
+        job_type = _require_job_type(
+            arguments.get("job_type"), "upsert_job_type_economics"
+        )
+        changes = _validate_economics_changes(
+            arguments.get("economics"), "upsert_job_type_economics"
+        )
+
+        stored: Dict[str, Any] = {}
+        created = True
+        # An EXPLICIT 404 is the only thing that means "no declaration yet", and
+        # it is tracked with its own flag rather than inferred from the body.
+        # Raised in review: inferring it made a malformed 200 take the create
+        # path, and the PUT would then replace a declaration nobody had read
+        # with whatever fields the caller named. A flag also keeps a literal
+        # null body -- itself malformed -- from reading as a 404.
+        declaration_absent = False
+        current: Any = None
+        try:
+            current = await self.client.get_job_type_economics(job_type)
+        except ReveniumAPIError as exc:
+            if exc.status_code != 404:
+                raise
+            declaration_absent = True
+        if not declaration_absent:
+            created = False
+            # Only the fields the PUT accepts: the resource echoes back jobType
+            # and the resolved currentBaseline, and neither is part of the
+            # declaration the PUT takes. A null is dropped rather than echoed,
+            # so an unset optional field stays unset instead of being re-sent.
+            stored = {
+                name: value
+                for name, value in _strip_links(
+                    _require_economics_declaration(job_type, current)
+                ).items()
+                if name in _ECONOMICS_REQUEST_FIELDS and value is not None
+            }
+
+        body: Dict[str, Any] = {**stored, **changes}
+        missing = [
+            name
+            for name in _ECONOMICS_REQUIRED_FIELDS
+            if not str(body.get(name) or "").strip()
+        ]
+        if missing:
+            raise ToolError(
+                message=(
+                    "The economics declaration is incomplete: "
+                    + ", ".join(missing)
+                    + " must be set. "
+                    + (
+                        f"Job type '{job_type}' has no stored declaration to take "
+                        "them from, so this call is creating one and has to supply "
+                        "them."
+                        if created
+                        else "The stored declaration does not carry them either."
+                    )
+                ),
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="economics",
+                value=sorted(changes),
+                suggestions=[
+                    "unitMetricKey names the declared metric that counts units of "
+                    "work; unitLabel is what one of them is called, e.g. 'claim'",
+                    _ECONOMICS_REPLACE_NOTE,
+                ],
+            )
+
+        # The write's 404 is its own fact and gets its own builder: the read's
+        # would advise declaring the economics with this very action.
+        result = await _translated_economics_call(
+            self.client.put_job_type_economics(job_type, body),
+            action="upsert_job_type_economics",
+            job_type=job_type,
+            on_not_found=_job_type_write_not_found_error,
+        )
+
+        return {
+            "action": "upsert_job_type_economics",
+            "job_type": job_type,
+            "created": created,
+            "fields_set": sorted(changes),
+            # Named, not merely merged: this is the evidence that an omitted
+            # field was carried over rather than cleared.
+            "preserved_fields": sorted(name for name in stored if name not in changes),
+            "sent": body,
+            "data": _strip_links(result),
+            "replace_note": _ECONOMICS_REPLACE_NOTE,
+            "concurrency_note": _ECONOMICS_LOST_UPDATE_NOTE,
+        }
+
+    async def list_job_type_baselines(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """List a job type's immutable baseline versions, newest first.
+
+        Baselines are append-only versions rather than a single editable row, so
+        the history is the answer: element 0 is what ROI is measured against now,
+        and the ones after it are what it was measured against before. An empty
+        list means no baseline has been declared, which is an answer and not a
+        failure.
+        """
+        job_type = _require_job_type(arguments.get("job_type"), "list_job_type_baselines")
+        result = await _translated_economics_call(
+            self.client.list_job_type_baselines(job_type),
+            action="list_job_type_baselines",
+            job_type=job_type,
+            on_not_found=_job_type_read_not_found_error,
+        )
+        baselines = _strip_links(_require_baseline_collection(job_type, result))
+        return {
+            "action": "list_job_type_baselines",
+            "job_type": job_type,
+            "count": len(baselines),
+            "data": baselines,
+            "order": "newest first; element 0 is the version in force",
+        }
+
+    async def create_job_type_baseline(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Append the next immutable baseline version for a job type.
+
+        This never edits the baseline in force -- it declares a new version that
+        supersedes it from ``effectiveFrom``, and the previous one stays
+        readable through list_job_type_baselines. The append is not idempotent
+        and is not retried; see _NON_IDEMPOTENT_APPEND_NOTE.
+        """
+        job_type = _require_job_type(arguments.get("job_type"), "create_job_type_baseline")
+        baseline = _validate_baseline(
+            arguments.get("baseline"), "create_job_type_baseline"
+        )
+        result = await _translated_economics_call(
+            self.client.create_job_type_baseline(job_type, baseline),
+            action="create_job_type_baseline",
+            job_type=job_type,
+            on_not_found=_job_type_append_not_found_error,
+        )
+        return {
+            "action": "create_job_type_baseline",
+            "job_type": job_type,
+            "sent": baseline,
+            "data": _strip_links(result),
+            "append_note": _NON_IDEMPOTENT_APPEND_NOTE,
+            # A baseline carries costPerUnit and hourlyRate, so the currency
+            # constraint belongs on this response as much as on the upsert's.
+            "currency_note": _ECONOMICS_CURRENCY_NOTE,
+        }
+
+    async def report_period_facts(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Append PERIOD metric facts to a job type.
+
+        The facts a job type accumulates outside any single job -- the measured
+        volume, cost or quality of a period, cut by a declared dimension. The
+        array is the request body itself, and each entry's key must already be
+        declared on the economics with ``resolution: PERIOD``; the platform's
+        refusal when it is not reaches the caller verbatim.
+        """
+        job_type = _require_job_type(arguments.get("job_type"), "report_period_facts")
+        facts = _require_entry_list(
+            arguments.get("facts"),
+            action="report_period_facts",
+            field="facts",
+            entry_label="period fact",
+            spellings=_PERIOD_FACT_SNAKE_SPELLINGS,
+        )
+        result = await _translated_economics_call(
+            self.client.append_job_type_facts(job_type, facts),
+            action="report_period_facts",
+            job_type=job_type,
+            on_not_found=_job_type_append_not_found_error,
+        )
+        return {
+            "action": "report_period_facts",
+            "job_type": job_type,
+            "appended": len(facts),
+            "sent": facts,
+            "data": _strip_links(result),
+            "append_note": _NON_IDEMPOTENT_APPEND_NOTE,
+            "resolution_note": _METRIC_RESOLUTION_NOTE,
+        }
+
+    async def append_outcome_metrics(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Append PER_JOB metric facts to a job that already reported an outcome.
+
+        The correction path that does not rewrite the outcome. amend_outcome
+        carries a metrics array too, but it amends the outcome row and advances
+        the job's entityVersion; this appends facts alongside it and leaves the
+        row, and the version, untouched.
+        """
+        job_id = arguments.get("job_id")
+        if not job_id:
+            raise ToolError(
+                message="job_id is required for append_outcome_metrics action",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="job_id",
+                suggestions=[
+                    "Use list_jobs to find valid job IDs",
+                    "The job must already have a reported outcome for facts to "
+                    "hang off; report_outcome first if it does not",
+                ],
+            )
+        metrics = _require_entry_list(
+            arguments.get("metrics"),
+            action="append_outcome_metrics",
+            field="metrics",
+            entry_label="outcome metric",
+            spellings=_OUTCOME_METRIC_SNAKE_SPELLINGS,
+        )
+        try:
+            result = await self.client.append_job_outcome_metrics(job_id, metrics)
+        except ReveniumAPIError as exc:
+            # The not-found here is about a job, not a job type, so it is named
+            # as one rather than routed through the job-type 404 builders.
+            if exc.status_code == 404:
+                raise ToolError(
+                    message=(
+                        f"Job '{job_id}' was not found, so there is no outcome to "
+                        "append metric facts to."
+                    ),
+                    error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+                    field="job_id",
+                    value=job_id,
+                    context={"job_id": job_id, "upstream_status": 404},
+                    suggestions=[
+                        "Use list_jobs to find valid job IDs",
+                        "A job created moments ago may not be readable yet -- this "
+                        "append is never retried, so re-read the job first",
+                    ],
+                ) from exc
+            translated = _platform_rejection_error(
+                exc,
+                action="append_outcome_metrics",
+                subject=str(job_id),
+                subject_label="job",
+                field="job_id",
+            )
+            if translated is None:
+                raise
+            raise translated from exc
+        return {
+            "action": "append_outcome_metrics",
+            "job_id": job_id,
+            "appended": len(metrics),
+            "sent": metrics,
+            "data": _strip_links(result),
+            "append_note": _NON_IDEMPOTENT_APPEND_NOTE,
+            "entity_version_note": _OUTCOME_METRICS_VERSION_NOTE,
+            "resolution_note": _METRIC_RESOLUTION_NOTE,
+        }
+
     @staticmethod
     def _outcome_conflict_error(
         job_id: str, error: ReveniumAPIError, sent_version: Any
@@ -1327,6 +2521,10 @@ class JobManagement(ToolBase):
         "amend_outcome (correct an outcome already reported), "
         "list_session_attributions (read the ticket a coding session was "
         "attributed to). "
+        "Job type economics: get_job_type_economics, "
+        "upsert_job_type_economics, list_job_type_baselines, "
+        "create_job_type_baseline, report_period_facts, "
+        "append_outcome_metrics. "
         "Use get_capabilities() for full details or get_examples() for usage templates."
     )
     business_category = "Core Business Management Tools"
@@ -1364,6 +2562,12 @@ class JobManagement(ToolBase):
                         "report_outcome",
                         "amend_outcome",
                         "list_session_attributions",
+                        "get_job_type_economics",
+                        "upsert_job_type_economics",
+                        "list_job_type_baselines",
+                        "create_job_type_baseline",
+                        "report_period_facts",
+                        "append_outcome_metrics",
                     ],
                     "meta_actions": [
                         "get_capabilities",
@@ -1429,7 +2633,8 @@ class JobManagement(ToolBase):
                             ),
                             "returns": (
                                 "One row per job type (by_job_type): totalJobs, totalCost "
-                                "split into tokenCost, externalToolCost and humanCost, "
+                                "split into tokenCost, modalityCost (image, video and audio "
+                                "generation), externalToolCost and humanCost, "
                                 "conversions, deflections, totalValue, averageValue, "
                                 "costPerConversion, costPerOutcome, roi, successRate, and "
                                 "toolCostAttribution. Plus a summary block (totalJobTypes, "
@@ -1491,6 +2696,111 @@ class JobManagement(ToolBase):
                                 "amendments are append-only: each one adds a revision "
                                 "with a sequence to the outcome history rather than "
                                 "erasing the previous value"
+                            ),
+                        },
+                        "get_job_type_economics": {
+                            "job_type": "str (required) — the job type key, e.g. 'claims_processing'",
+                            "returns": (
+                                "the declaration every ROI figure is measured against: "
+                                "unitMetricKey and unitLabel (what one unit of work is), "
+                                "metrics (each with key, type COUNT|DURATION|PERCENT|MONEY|SCORE, "
+                                "direction HIGHER_IS_BETTER|LOWER_IS_BETTER, aggregation "
+                                "SUM|AVG|LAST and resolution PER_JOB|PERIOD), dimensions "
+                                "(key plus allowedValues) that period facts may be cut by, "
+                                "monetization (metricKey, valuePerUnit, currency, category, "
+                                "basis), overheadPerUnit/overheadCurrency, and currentBaseline "
+                                "— the baseline version in force. A job type with no "
+                                "declaration is reported as a named not-found, not as an "
+                                "empty declaration."
+                            ),
+                        },
+                        "upsert_job_type_economics": {
+                            "job_type": "str (required)",
+                            "economics": (
+                                "dict (required, at least one field): "
+                                + ", ".join(_ECONOMICS_REQUEST_FIELDS)
+                                + ". unitMetricKey and unitLabel must end up set — on an "
+                                "edit they come from the stored declaration, on a create "
+                                "you supply them. camelCase is the wire spelling; the "
+                                "snake_case spelling of a declared field is accepted and "
+                                "translated rather than silently ignored, nested fields "
+                                "included (allowed_values, metric_key, value_per_unit). "
+                                "Naming one field in both spellings at once is refused "
+                                "rather than resolved by order."
+                            ),
+                            "read_modify_write": _ECONOMICS_REPLACE_NOTE,
+                            "concurrency": _ECONOMICS_LOST_UPDATE_NOTE,
+                            "currency": _ECONOMICS_CURRENCY_NOTE,
+                            "returns": (
+                                "the stored declaration, plus created (true when there was "
+                                "none before), fields_set (what you named) and "
+                                "preserved_fields (what was carried over from the stored "
+                                "declaration rather than cleared)"
+                            ),
+                        },
+                        "list_job_type_baselines": {
+                            "job_type": "str (required)",
+                            "returns": (
+                                "the immutable baseline versions, newest first — element 0 "
+                                "is the one in force. Each carries version, effectiveFrom, "
+                                "costPerUnit, minutesPerUnit, qualityRate, hourlyRate, "
+                                "currency, provenance "
+                                "(CUSTOMER_DECLARED|MEASURED|SIGNED_OFF), declaredBy, "
+                                "evidenceUrl and created. An empty list means no baseline "
+                                "has been declared, which is an answer and not an error."
+                            ),
+                        },
+                        "create_job_type_baseline": {
+                            "job_type": "str (required)",
+                            "baseline": (
+                                "dict (required): "
+                                + ", ".join(_BASELINE_REQUEST_FIELDS)
+                                + ". effectiveFrom (ISO 8601) is the only field the "
+                                "platform requires and is refused here when missing; "
+                                "effective_from is accepted and sent as effectiveFrom. "
+                                "provenance defaults to CUSTOMER_DECLARED and declaredBy "
+                                "to the calling principal, so leave them out unless they "
+                                "are genuinely known."
+                            ),
+                            "append_only": (
+                                "this never edits the baseline in force — it appends the "
+                                "next version, which supersedes the previous one from "
+                                "effectiveFrom while leaving it readable. "
+                                + _NON_IDEMPOTENT_APPEND_NOTE
+                            ),
+                            "currency": _ECONOMICS_CURRENCY_NOTE,
+                        },
+                        "report_period_facts": {
+                            "job_type": "str (required)",
+                            "facts": (
+                                "list (required, at least one entry), each entry: "
+                                + ", ".join(_PERIOD_FACT_FIELDS)
+                                + ". key and value are required on every entry and are "
+                                "checked here; periodStart/periodEnd and "
+                                "dimensionKey/dimensionValue locate the fact, provenance "
+                                "defaults to SELF_REPORTED, recordedBy to the calling "
+                                "principal and source to 'api'. reason is required by the "
+                                "platform when the fact restates a period already "
+                                "recorded, and a blank one is refused here."
+                            ),
+                            "resolution": _METRIC_RESOLUTION_NOTE,
+                            "append_only": _NON_IDEMPOTENT_APPEND_NOTE,
+                        },
+                        "append_outcome_metrics": {
+                            "job_id": "str (required) — a job that already reported an outcome",
+                            "metrics": (
+                                "list (required, at least one entry), each entry: "
+                                + ", ".join(_OUTCOME_METRIC_FIELDS)
+                                + ". Same shape as the metrics array on report_outcome "
+                                "and amend_outcome, and the same defaults."
+                            ),
+                            "resolution": _METRIC_RESOLUTION_NOTE,
+                            "entity_version": _OUTCOME_METRICS_VERSION_NOTE,
+                            "append_only": _NON_IDEMPOTENT_APPEND_NOTE,
+                            "vs_amend_outcome": (
+                                "use amend_outcome when the outcome row itself is wrong "
+                                "(its value, type or reason); use this when the outcome "
+                                "stands and a declared PER_JOB fact was measured later"
                             ),
                         },
                         "list_session_attributions": {
@@ -1586,7 +2896,8 @@ class JobManagement(ToolBase):
                     "get_roi_summary": {
                         "description": (
                             "Published ROI summary, one row per job type: cost split into "
-                            "tokenCost, externalToolCost and humanCost, outcome counts, "
+                            "tokenCost, modalityCost (image, video and audio generation), "
+                            "externalToolCost and humanCost, outcome counts, "
                             "value, roi, successRate, and toolCostAttribution. "
                             "toolCostAttribution=ALLOCATED_BY_AGENT means externalToolCost "
                             "was apportioned to the job type via the agent that incurred "
@@ -1706,6 +3017,173 @@ class JobManagement(ToolBase):
                             "retried automatically: the amendment is not idempotent"
                         ),
                     },
+                    "get_job_type_economics": {
+                        "description": (
+                            "Read the economics declaration a job type's ROI is measured "
+                            "against: the unit of work, the declared metrics and their "
+                            "resolution, the dimensions, the monetization rule and the "
+                            "baseline in force"
+                        ),
+                        "example": {
+                            "action": "get_job_type_economics",
+                            "job_type": "mcp-test-claims",
+                        },
+                        "not_found": (
+                            "a job type with no declaration is reported as a named "
+                            "not-found naming the type, not as an empty declaration"
+                        ),
+                    },
+                    "upsert_job_type_economics": {
+                        "description": (
+                            "Declare or edit a job type's economics. Read-modify-write: "
+                            "the stored declaration is read first and your fields are "
+                            "merged over it, so an omitted field is carried over rather "
+                            "than cleared by the platform's replacing PUT"
+                        ),
+                        "read_modify_write": _ECONOMICS_REPLACE_NOTE,
+                        "concurrency": _ECONOMICS_LOST_UPDATE_NOTE,
+                        "example_declare": {
+                            "action": "upsert_job_type_economics",
+                            "job_type": "mcp-test-claims",
+                            "economics": {
+                                "unitMetricKey": "completed_claims",
+                                "unitLabel": "claim",
+                                "metrics": [
+                                    {
+                                        "key": "completed_claims",
+                                        "type": "COUNT",
+                                        "direction": "HIGHER_IS_BETTER",
+                                        "aggregation": "SUM",
+                                        "resolution": "PER_JOB",
+                                    },
+                                    {
+                                        "key": "manual_rework_minutes",
+                                        "type": "DURATION",
+                                        "direction": "LOWER_IS_BETTER",
+                                        "aggregation": "SUM",
+                                        "resolution": "PERIOD",
+                                    },
+                                ],
+                                "dimensions": [
+                                    {"key": "region", "allowedValues": ["us", "ca"]}
+                                ],
+                                "monetization": {
+                                    "metricKey": "completed_claims",
+                                    "valuePerUnit": 4.25,
+                                    "currency": "USD",
+                                    "category": "COST_AVOIDED",
+                                    "basis": "REALIZED",
+                                },
+                            },
+                        },
+                        "example_edit_one_field": {
+                            "action": "upsert_job_type_economics",
+                            "job_type": "mcp-test-claims",
+                            "economics": {
+                                "monetization": {
+                                    "metricKey": "completed_claims",
+                                    "valuePerUnit": 5.10,
+                                    "currency": "USD",
+                                    "category": "COST_AVOIDED",
+                                    "basis": "REALIZED",
+                                }
+                            },
+                        },
+                    },
+                    "list_job_type_baselines": {
+                        "description": (
+                            "List the immutable baseline versions for a job type, newest "
+                            "first. Element 0 is what ROI is measured against now; the "
+                            "ones after it are what it was measured against before"
+                        ),
+                        "example": {
+                            "action": "list_job_type_baselines",
+                            "job_type": "mcp-test-claims",
+                        },
+                    },
+                    "create_job_type_baseline": {
+                        "description": (
+                            "Append the next baseline version — the pre-AI cost, time and "
+                            "quality the job type is compared against. Append-only: this "
+                            "supersedes the version in force from effectiveFrom and "
+                            "leaves it readable"
+                        ),
+                        "append_only": _NON_IDEMPOTENT_APPEND_NOTE,
+                        "example": {
+                            "action": "create_job_type_baseline",
+                            "job_type": "mcp-test-claims",
+                            "baseline": {
+                                "effectiveFrom": "2026-08-01T00:00:00Z",
+                                "costPerUnit": 4.5,
+                                "minutesPerUnit": 12.0,
+                                "qualityRate": 0.91,
+                                "currency": "USD",
+                                "provenance": "CUSTOMER_DECLARED",
+                            },
+                        },
+                    },
+                    "report_period_facts": {
+                        "description": (
+                            "Append PERIOD metric facts to a job type — the measured "
+                            "volume, cost or quality of a period, cut by a declared "
+                            "dimension. The metric must already be declared with "
+                            "resolution PERIOD"
+                        ),
+                        "resolution": _METRIC_RESOLUTION_NOTE,
+                        "append_only": _NON_IDEMPOTENT_APPEND_NOTE,
+                        "example": {
+                            "action": "report_period_facts",
+                            "job_type": "mcp-test-claims",
+                            "facts": [
+                                {
+                                    "periodStart": "2026-08-01T00:00:00Z",
+                                    "periodEnd": "2026-09-01T00:00:00Z",
+                                    "dimensionKey": "region",
+                                    "dimensionValue": "us",
+                                    "key": "manual_rework_minutes",
+                                    "value": 420,
+                                    "provenance": "MEASURED",
+                                }
+                            ],
+                        },
+                        "example_restating_a_period": {
+                            "action": "report_period_facts",
+                            "job_type": "mcp-test-claims",
+                            "facts": [
+                                {
+                                    "periodStart": "2026-08-01T00:00:00Z",
+                                    "periodEnd": "2026-09-01T00:00:00Z",
+                                    "dimensionKey": "region",
+                                    "dimensionValue": "us",
+                                    "key": "manual_rework_minutes",
+                                    "value": 385,
+                                    "provenance": "MEASURED",
+                                    "reason": "Restated after the warehouse reload",
+                                }
+                            ],
+                        },
+                    },
+                    "append_outcome_metrics": {
+                        "description": (
+                            "Append declared PER_JOB metric facts to a job whose outcome "
+                            "is already reported, without rewriting the outcome row. Use "
+                            "amend_outcome when the outcome itself is what changes"
+                        ),
+                        "resolution": _METRIC_RESOLUTION_NOTE,
+                        "entity_version": _OUTCOME_METRICS_VERSION_NOTE,
+                        "append_only": _NON_IDEMPOTENT_APPEND_NOTE,
+                        "example": {
+                            "action": "append_outcome_metrics",
+                            "job_id": "job_123",
+                            "metrics": [
+                                {
+                                    "key": "quality_rate",
+                                    "value": 0.93,
+                                    "provenance": "MEASURED",
+                                }
+                            ],
+                        },
+                    },
                     "list_session_attributions": {
                         "description": (
                             "Read the ticket attributions recorded for a coding-assistant "
@@ -1820,6 +3298,77 @@ class JobManagement(ToolBase):
                     )
                 ]
 
+
+            elif action == "get_job_type_economics":
+                result = await job_manager.get_job_type_economics(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Economics for job type {result['job_type']}:\n\n"
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "upsert_job_type_economics":
+                result = await job_manager.upsert_job_type_economics(arguments)
+                verb = "declared" if result["created"] else "updated"
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Economics {verb} for job type {result['job_type']}:\n\n"
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "list_job_type_baselines":
+                result = await job_manager.list_job_type_baselines(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            f"Baseline versions for job type {result['job_type']} "
+                            f"({result['count']}, newest first):\n\n"
+                        )
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "create_job_type_baseline":
+                result = await job_manager.create_job_type_baseline(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Baseline version appended for job type {result['job_type']}:\n\n"
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "report_period_facts":
+                result = await job_manager.report_period_facts(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            f"Appended {result['appended']} period fact(s) to job type "
+                            f"{result['job_type']}:\n\n"
+                        )
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "append_outcome_metrics":
+                result = await job_manager.append_outcome_metrics(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            f"Appended {result['appended']} outcome metric fact(s) to job "
+                            f"{result['job_id']}:\n\n"
+                        )
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
             elif action == "list_session_attributions":
                 result = await job_manager.list_session_attributions(arguments)
                 return [
@@ -1861,6 +3410,12 @@ class JobManagement(ToolBase):
             "report_outcome",
             "amend_outcome",
             "list_session_attributions",
+            "get_job_type_economics",
+            "upsert_job_type_economics",
+            "list_job_type_baselines",
+            "create_job_type_baseline",
+            "report_period_facts",
+            "append_outcome_metrics",
         ]
 
     async def _get_tool_capabilities(self) -> List[ToolCapability]:
@@ -1892,8 +3447,8 @@ class JobManagement(ToolBase):
                     "get_roi_summary": {
                         "filters": "dict (optional: startDate, endDate, environment)",
                         "returns": (
-                            "per-job-type cost breakdown (tokenCost, externalToolCost, "
-                            "humanCost), outcomes, roi, and toolCostAttribution"
+                            "per-job-type cost breakdown (tokenCost, modalityCost, "
+                            "externalToolCost, humanCost), outcomes, roi, and toolCostAttribution"
                         ),
                     },
                 },
@@ -1955,6 +3510,61 @@ class JobManagement(ToolBase):
                 limitations=[
                     _SESSION_ATTRIBUTION_SPLITS_NOTE,
                     _SESSION_ATTRIBUTION_REASON_NOTE,
+                ],
+            ),
+            ToolCapability(
+                name="Job Type Economics and Baselines",
+                description=(
+                    "Read and set the economics declaration a job type's ROI is "
+                    "measured against — the unit of work, the declared metrics and "
+                    "their PER_JOB or PERIOD resolution, the dimensions, the "
+                    "monetization rule — plus its immutable baseline versions, its "
+                    "PERIOD facts, and the PER_JOB facts appended to one job's "
+                    "reported outcome"
+                ),
+                parameters={
+                    "get_job_type_economics": {"job_type": "str (required)"},
+                    "upsert_job_type_economics": {
+                        "job_type": "str (required)",
+                        "economics": "dict (required, at least one field)",
+                    },
+                    "list_job_type_baselines": {"job_type": "str (required)"},
+                    "create_job_type_baseline": {
+                        "job_type": "str (required)",
+                        "baseline": "dict (required, effectiveFrom required)",
+                    },
+                    "report_period_facts": {
+                        "job_type": "str (required)",
+                        "facts": "list (required, at least one entry)",
+                    },
+                    "append_outcome_metrics": {
+                        "job_id": "str (required)",
+                        "metrics": "list (required, at least one entry)",
+                    },
+                },
+                examples=[
+                    "get_job_type_economics(job_type='mcp-test-claims')",
+                    "upsert_job_type_economics(job_type='mcp-test-claims', "
+                    "economics={'unitMetricKey': 'completed_claims', 'unitLabel': "
+                    "'claim'})",
+                    "list_job_type_baselines(job_type='mcp-test-claims')",
+                    "create_job_type_baseline(job_type='mcp-test-claims', "
+                    "baseline={'effectiveFrom': '2026-08-01T00:00:00Z', "
+                    "'costPerUnit': 4.5, 'currency': 'USD'})",
+                    "report_period_facts(job_type='mcp-test-claims', facts=[{"
+                    "'periodStart': '2026-08-01T00:00:00Z', 'periodEnd': "
+                    "'2026-09-01T00:00:00Z', 'dimensionKey': 'region', "
+                    "'dimensionValue': 'us', 'key': 'manual_rework_minutes', "
+                    "'value': 420}])",
+                    "append_outcome_metrics(job_id='job_123', metrics=[{'key': "
+                    "'quality_rate', 'value': 0.93, 'provenance': 'MEASURED'}])",
+                ],
+                limitations=[
+                    _ECONOMICS_REPLACE_NOTE,
+                    _ECONOMICS_LOST_UPDATE_NOTE,
+                    _NON_IDEMPOTENT_APPEND_NOTE,
+                    _METRIC_RESOLUTION_NOTE,
+                    _ECONOMICS_CURRENCY_NOTE,
                 ],
             ),
         ]
@@ -2027,12 +3637,26 @@ Track and analyze job performance in the Revenium Jobs & Outcomes system.
 • get_job_roi — Get ROI metrics for a job
 • get_job_types — List available job types
 • get_conversion_funnel — View conversion funnel data
-• get_roi_summary — Published ROI per job type: tokenCost / externalToolCost / humanCost, outcomes, roi, and toolCostAttribution (ALLOCATED_BY_AGENT = tool cost apportioned via the agent, not measured per job type)
+• get_roi_summary — Published ROI per job type: tokenCost / modalityCost / externalToolCost / humanCost, outcomes, roi, and toolCostAttribution (ALLOCATED_BY_AGENT = tool cost apportioned via the agent, not measured per job type)
 • report_outcome — Report a job outcome (executionStatus plus optional outcomeType,
   outcomeReason, and a metrics array of per-job facts; 409 = already reported)
 • amend_outcome — Correct an outcome already reported (reason, any outcome field,
   metrics). Pass expected_entity_version, read from get_job, to be told about a
   concurrent amendment instead of overwriting it
+• get_job_type_economics — Read the declaration a job type's ROI is measured
+  against: the unit of work, the declared metrics and their PER_JOB/PERIOD
+  resolution, the dimensions, the monetization rule and the baseline in force
+• upsert_job_type_economics — Declare or edit it. Read-modify-write, because the
+  platform's PUT replaces the whole declaration; fields you do not name are
+  carried over and reported under preserved_fields
+• list_job_type_baselines — The immutable baseline versions, newest first;
+  element 0 is the one ROI is measured against now
+• create_job_type_baseline — Append the next baseline version (effectiveFrom
+  required). Append-only and never retried
+• report_period_facts — Append PERIOD facts to a job type (the metric must be
+  declared PERIOD). Append-only and never retried
+• append_outcome_metrics — Append PER_JOB facts to a job whose outcome is already
+  reported, without rewriting the outcome row or advancing its entityVersion
 • list_session_attributions — Read the tickets a coding-assistant session was
   attributed to, current first, with the opt-out reason category recorded for
   each interval. Read-only, and the read exposes no splits, so a weighted

@@ -345,8 +345,8 @@ class TestNormalizeReturnDataParameter:
     def setup_method(self):
         self.mgr = MeteringTransactionManager()
 
-    def test_boolean_true_maps_to_summary(self):
-        assert self.mgr._normalize_return_data_parameter({"return_transaction_data": True}) == "summary"
+    def test_boolean_true_maps_to_full(self):
+        assert self.mgr._normalize_return_data_parameter({"return_transaction_data": True}) == "full"
 
     def test_boolean_false_maps_to_no(self):
         assert self.mgr._normalize_return_data_parameter({"return_transaction_data": False}) == "no"
@@ -1206,8 +1206,8 @@ class TestMeteringManagementNormalizeParam:
     def setup_method(self):
         self.mgmt = MeteringManagement()
 
-    def test_true_maps_to_summary(self):
-        assert self.mgmt._normalize_return_data_parameter({"return_transaction_data": True}) == "summary"
+    def test_true_maps_to_full(self):
+        assert self.mgmt._normalize_return_data_parameter({"return_transaction_data": True}) == "full"
 
     def test_false_maps_to_no(self):
         assert self.mgmt._normalize_return_data_parameter({"return_transaction_data": False}) == "no"
@@ -1217,3 +1217,203 @@ class TestMeteringManagementNormalizeParam:
 
     def test_missing_defaults_to_no(self):
         assert self.mgmt._normalize_return_data_parameter({}) == "no"
+
+
+# ===========================================================================
+# submit_ai_transaction — prompt-context fields (BACK-3383)
+# ===========================================================================
+
+PROMPT_CONTEXT_ARGS = {
+    "prompt_id": "0f2b8a54-6c31-4d7e-9a10-b5c7d2e84f63",
+    "prompt_length": 412,
+    "query_source": "repl_main_thread:outputStyle:custom",
+    "speed": "fast",
+    "subagent_type": "general-purpose",
+}
+PROMPT_CONTEXT_WIRE = {
+    "prompt_id": "promptId",
+    "prompt_length": "promptLength",
+    "query_source": "querySource",
+    "speed": "speed",
+    "subagent_type": "subagentType",
+}
+
+
+def _submitted_payload(client):
+    call_args = client.post.call_args
+    return call_args[1]["data"] if "data" in (call_args[1] or {}) else call_args[0][1]
+
+
+async def _submit_without_async_validation(mgmt, args):
+    """Submit through handle_action with only the submit path's own pre-flight."""
+    with patch.object(
+        mgmt.transaction_manager,
+        "_validate_transaction_inputs_async",
+        new_callable=AsyncMock,
+        return_value={"valid": True, "message": "ok"},
+    ):
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+        ) as rc:
+            rc.clear_request_cache = MagicMock()
+            rc.get_cached_response = AsyncMock(return_value=None)
+            rc.set_cached_response = AsyncMock()
+            return await mgmt.handle_action("submit_ai_transaction", args)
+
+
+def _mgmt_with_client():
+    mgmt = MeteringManagement()
+    client = make_client()
+    mgmt.get_client = AsyncMock(return_value=client)
+    return mgmt, client
+
+
+class TestSubmitPromptContextFields:
+    """The five prompt-context fields ride the submission payload opt-in only."""
+
+    @pytest.mark.asyncio
+    async def test_each_field_is_sent_under_its_wire_name(self):
+        mgmt, client = _mgmt_with_client()
+        await _submit_without_async_validation(mgmt, {**VALID_TRANSACTION, **PROMPT_CONTEXT_ARGS})
+        payload = _submitted_payload(client)
+        for argument, wire_name in PROMPT_CONTEXT_WIRE.items():
+            assert payload[wire_name] == PROMPT_CONTEXT_ARGS[argument], wire_name
+
+    @pytest.mark.asyncio
+    async def test_absent_fields_are_not_sent(self):
+        """Existing submissions keep byte-identical payloads: no key, never null."""
+        mgmt, client = _mgmt_with_client()
+        await _submit_without_async_validation(mgmt, VALID_TRANSACTION.copy())
+        payload = _submitted_payload(client)
+        for wire_name in PROMPT_CONTEXT_WIRE.values():
+            assert wire_name not in payload
+
+    @pytest.mark.asyncio
+    async def test_zero_prompt_length_is_sent(self):
+        mgmt, client = _mgmt_with_client()
+        await _submit_without_async_validation(mgmt, {**VALID_TRANSACTION, "prompt_length": 0})
+        assert _submitted_payload(client)["promptLength"] == 0
+
+    @pytest.mark.parametrize("bad_length", [-1, "412", 1.5, True, 2**31])
+    @pytest.mark.asyncio
+    async def test_invalid_prompt_length_is_rejected_naming_the_field(self, bad_length):
+        mgmt, client = _mgmt_with_client()
+        with pytest.raises(ToolError) as exc_info:
+            await _submit_without_async_validation(
+                mgmt, {**VALID_TRANSACTION, "prompt_length": bad_length}
+            )
+        assert "prompt_length" in str(exc_info.value)
+        client.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "field, bad_value",
+        [
+            ("prompt_id", "has space"),
+            ("prompt_id", "p" * 65),
+            ("speed", "fast.mode"),
+            ("speed", "s" * 17),
+            ("query_source", "main thread"),
+            ("query_source", "q" * 129),
+            ("subagent_type", ""),
+            ("subagent_type", 42),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_malformed_string_field_is_rejected_naming_the_field(self, field, bad_value):
+        mgmt, client = _mgmt_with_client()
+        with pytest.raises(ToolError) as exc_info:
+            await _submit_without_async_validation(mgmt, {**VALID_TRANSACTION, field: bad_value})
+        assert field in str(exc_info.value)
+        client.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("speed", "normal"),
+            ("speed", "turbo_2"),
+            ("query_source", "compact"),
+            ("query_source", "agent.v2:custom"),
+            ("subagent_type", "plugin:reviewer.v1"),
+            ("prompt_id", "p" * 64),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_open_vocabulary_values_are_accepted(self, field, value):
+        """No allow-list: the platform stores any well-formed value verbatim."""
+        mgmt, client = _mgmt_with_client()
+        await _submit_without_async_validation(mgmt, {**VALID_TRANSACTION, field: value})
+        assert _submitted_payload(client)[PROMPT_CONTEXT_WIRE[field]] == value
+
+    @pytest.mark.asyncio
+    async def test_input_schema_declares_the_fields(self):
+        mgmt, _ = _mgmt_with_client()
+        properties = (await mgmt._get_input_schema())["properties"]
+        for field in ("prompt_id", "query_source", "speed", "subagent_type"):
+            assert properties[field]["type"] == "string", field
+            assert properties[field]["description"], field
+        assert properties["prompt_length"]["type"] == "integer"
+        assert properties["prompt_length"]["minimum"] == 0
+
+    @pytest.mark.asyncio
+    async def test_submission_guidance_lists_the_fields(self):
+        mgmt, _ = _mgmt_with_client()
+        result = await mgmt.handle_action("get_capabilities", {})
+        text = "".join(item.text for item in result)
+        for field in PROMPT_CONTEXT_WIRE:
+            assert f"`{field}`" in text, field
+
+
+class TestValidatePromptContextFields:
+    """validate and the sync fast path reach the same verdict as submit."""
+
+    @staticmethod
+    async def _validate(args):
+        mgmt, _ = _mgmt_with_client()
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+        ) as rc:
+            rc.clear_request_cache = MagicMock()
+            rc.get_cached_response = AsyncMock(return_value=None)
+            rc.set_cached_response = AsyncMock()
+            result = await mgmt.handle_action("validate", args)
+        return result[0].text
+
+    @pytest.mark.asyncio
+    async def test_validate_accepts_well_formed_fields(self):
+        text = await self._validate({**VALID_TRANSACTION, **PROMPT_CONTEXT_ARGS})
+        assert "Validation Successful" in text
+
+    @pytest.mark.asyncio
+    async def test_validate_rejects_negative_prompt_length(self):
+        text = await self._validate({**VALID_TRANSACTION, "prompt_length": -3})
+        assert "Validation Failed" in text
+        assert "prompt_length" in text
+
+    @pytest.mark.asyncio
+    async def test_validate_rejects_malformed_query_source(self):
+        text = await self._validate({**VALID_TRANSACTION, "query_source": "main thread"})
+        assert "Validation Failed" in text
+        assert "query_source" in text
+
+    @pytest.mark.parametrize(
+        "args, expected",
+        [
+            (PROMPT_CONTEXT_ARGS, True),
+            ({"prompt_length": -1}, False),
+            ({"speed": "s" * 17}, False),
+            ({"subagent_type": "bad value"}, False),
+        ],
+    )
+    def test_fast_path_agrees(self, args, expected):
+        manager = MeteringTransactionManager()
+        assert manager._validate_transaction_inputs({**VALID_TRANSACTION, **args}) is expected
+
+    def test_validation_cache_key_covers_the_fields(self):
+        """A cached verdict for one payload must not be reused for a variant
+        that differs only in a prompt-context field."""
+        manager = MeteringTransactionManager()
+        assert manager._validate_transaction_inputs(VALID_TRANSACTION.copy()) is True
+        assert (
+            manager._validate_transaction_inputs({**VALID_TRANSACTION, "prompt_length": -1})
+            is False
+        )

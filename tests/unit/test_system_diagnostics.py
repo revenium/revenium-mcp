@@ -203,3 +203,56 @@ class TestIngestionDiagnosticsRouting:
     ):
         actions = await diagnostics_tool._get_supported_actions()
         assert "set_attribution_detail_text" in actions
+
+    @pytest.mark.asyncio
+    async def test_set_usage_billing_routes_to_log_tool(self):
+        """BACK-3354: an action the tool documents but does not route answers
+        the unknown-action error, so the route is the capability."""
+        from unittest.mock import AsyncMock
+        from mcp.types import TextContent
+
+        tool = SystemDiagnostics()
+        tool.log_tool.handle_action = AsyncMock(
+            return_value=[TextContent(type="text", text="usage billing toggled")]
+        )
+        result = await tool.handle_action(
+            "set_usage_billing", {"enabled": False, "confirm": True}
+        )
+        tool.log_tool.handle_action.assert_called_once()
+        assert result[0].text == "usage billing toggled"
+
+    @pytest.mark.asyncio
+    async def test_capabilities_document_the_usage_billing_toggle(
+        self, diagnostics_tool
+    ):
+        """system_diagnostics carries its own action documentation, and the
+        switch is only discoverable from it."""
+        result = await diagnostics_tool.handle_action("get_capabilities", {})
+        text = result[0].text
+        assert "set_usage_billing" in text
+
+    @pytest.mark.asyncio
+    async def test_usage_billing_is_an_advertised_action(self, diagnostics_tool):
+        actions = await diagnostics_tool._get_supported_actions()
+        assert "set_usage_billing" in actions
+        assert "get_usage_billing" in actions
+
+    @pytest.mark.asyncio
+    async def test_get_usage_billing_routes_to_log_tool(self):
+        from unittest.mock import AsyncMock
+        from mcp.types import TextContent
+
+        tool = SystemDiagnostics()
+        tool.log_tool.handle_action = AsyncMock(
+            return_value=[TextContent(type="text", text="usage billing read")]
+        )
+        result = await tool.handle_action("get_usage_billing", {})
+        tool.log_tool.handle_action.assert_called_once()
+        assert result[0].text == "usage billing read"
+
+    @pytest.mark.asyncio
+    async def test_capabilities_state_the_usage_billing_gate(self, diagnostics_tool):
+        result = await diagnostics_tool.handle_action("get_capabilities", {})
+        text = result[0].text
+        assert "get_usage_billing" in text
+        assert "organization admin key passes the other tenant toggles but not this one" in text

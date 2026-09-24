@@ -302,6 +302,31 @@ class TestDataGenerator:
         ]
 
 
+# Prompt-context submission argument -> wire name (metering spec
+# AICompletionMetadataResource, BACK-3383 — nullable, optional). The same name
+# is what the completions read returns.
+PROMPT_CONTEXT_SUBMISSION_FIELDS: Dict[str, str] = {
+    "prompt_id": "promptId",
+    "prompt_length": "promptLength",
+    "query_source": "querySource",
+    "speed": "speed",
+    "subagent_type": "subagentType",
+}
+
+
+def _submitted_payload_key(submitted_field: str, api_field: str) -> str:
+    """The key a stored submission payload holds `submitted_field` under.
+
+    The prompt-context fields are stored under their wire names, so looking them
+    up by argument name would skip them and report a mismatch as a match. The
+    older entries keep their argument-name lookup: switching them would start
+    comparing timestamps and token fields the report has never compared.
+    """
+    if submitted_field in PROMPT_CONTEXT_SUBMISSION_FIELDS:
+        return api_field
+    return submitted_field
+
+
 class FieldMappingAnalyzer:
     """Analyzer for field presence and mapping accuracy using Revenium reporting API."""
 
@@ -586,6 +611,7 @@ class FieldMappingAnalyzer:
             "effort": "effort",
             "model_host": "modelHost",
             "subscriber_email_source": "subscriberEmailSource",
+            **PROMPT_CONTEXT_SUBMISSION_FIELDS,
             # Note: Subscriber data now passed as subscriber object, not separate fields
             # Model and provider details
             "model_source": "modelSource",
@@ -923,9 +949,10 @@ class FieldMappingAnalyzer:
         mismatches = []
 
         for submitted_field, api_field in self.expected_field_mappings.items():
+            payload_key = _submitted_payload_key(submitted_field, api_field)
             # Check if field exists in both submitted and retrieved data
-            if submitted_field in submitted_payload and api_field in retrieved_transaction:
-                submitted_value = submitted_payload[submitted_field]
+            if payload_key in submitted_payload and api_field in retrieved_transaction:
+                submitted_value = submitted_payload[payload_key]
                 retrieved_value = retrieved_transaction[api_field]
 
                 # Compare values with intelligent type handling

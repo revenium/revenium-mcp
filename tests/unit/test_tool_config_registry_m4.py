@@ -956,6 +956,30 @@ class TestManageProductsCreateSimpleParams:
 
 class TestManageCustomersJsonPreprocessing:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("confirm", [True, "true"])
+    async def test_org_unit_removal_arguments_reach_the_tool_with_confirm_untouched(
+        self, confirm
+    ):
+        """person_id and confirm are bound; a string confirm is not coerced into True."""
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_customers")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="delete_org_unit_person", person_id=97, confirm=confirm)
+
+        assert captured_args["person_id"] == 97
+        assert captured_args["confirm"] is confirm
+
+    @pytest.mark.asyncio
     async def test_malformed_resource_data_returns_error_text(self):
         """Malformed resource_data JSON returns a TextContent error."""
         from mcp.types import TextContent
@@ -2691,6 +2715,50 @@ class TestSystemDiagnosticsStrictIngestionClosure:
             await fn(action="set_attribution_detail_text", enabled="false")
         assert captured["enabled"] is False
 
+    @pytest.mark.asyncio
+    async def test_usage_billing_reaches_the_handler_with_its_confirm(self):
+        """BACK-3354: the third tenant toggle rides the same `enabled`, and it
+        is confirm-gated, so both must arrive together - a guard the closure
+        cannot carry is a guard nobody can satisfy."""
+        registry = _make_registry()
+        fn = await _get_registered_closure(registry, "_register_system_diagnostics")
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await fn(action="set_usage_billing", enabled=False, confirm=True)
+        assert captured["action"] == "set_usage_billing"
+        assert captured["enabled"] is False
+        assert captured["confirm"] is True
+        # The strict-mode-only argument must not be invented for this action.
+        assert "allow_ticket_jobs" not in captured
+
+    @pytest.mark.asyncio
+    async def test_usage_billing_confirm_is_not_coerced(self):
+        """`confirm` stays out of the boolean preprocessing, so a loosely typed
+        confirm reaches the handler as itself and is refused there."""
+        registry = _make_registry()
+        fn = await _get_registered_closure(registry, "_register_system_diagnostics")
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await fn(action="set_usage_billing", enabled="false", confirm="true")
+        assert captured["enabled"] is False
+        assert captured["confirm"] == "true"
+
 
 # ---------------------------------------------------------------------------
 # manage_metering closure — completion provenance forwarding
@@ -2824,6 +2892,69 @@ class TestPrHealthClosureParameters:
         assert captured["aging_days"] == 7
         assert "rotting_days" not in captured
 
+    @pytest.mark.asyncio
+    async def test_customers_signature_declares_pr_health_field_params(self):
+        import inspect
+
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_customers")
+        params = inspect.signature(fn).parameters
+        for name in ("assisted_only", "automation_patterns", "cutoff_date", "excluded_repos"):
+            assert name in params
+        for read_only in ("built_in_automation_patterns", "cutoff_date_is_default", "default_cutoff_date"):
+            assert read_only not in params
+
+    @pytest.mark.asyncio
+    async def test_pr_health_field_params_forwarded(self):
+        captured = await self._run(
+            "_register_manage_customers",
+            action="update_pr_health_settings",
+            team_id="jR2kmLs",
+            assisted_only=True,
+            automation_patterns=["^bot$"],
+            cutoff_date="2025-03-01",
+            excluded_repos=["acme/app"],
+        )
+        assert captured["assisted_only"] is True
+        assert captured["automation_patterns"] == ["^bot$"]
+        assert captured["cutoff_date"] == "2025-03-01"
+        assert captured["excluded_repos"] == ["acme/app"]
+
+    @pytest.mark.asyncio
+    async def test_serialized_pr_health_fields_are_decoded(self):
+        captured = await self._run(
+            "_register_manage_customers",
+            action="update_pr_health_settings",
+            team_id="jR2kmLs",
+            assisted_only="false",
+            automation_patterns='["^bot$"]',
+            excluded_repos='["acme/app"]',
+        )
+        assert captured["assisted_only"] is False
+        assert captured["automation_patterns"] == ["^bot$"]
+        assert captured["excluded_repos"] == ["acme/app"]
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_boolean_left_for_the_tool_to_reject(self):
+        captured = await self._run(
+            "_register_manage_customers",
+            action="update_pr_health_settings",
+            team_id="jR2kmLs",
+            assisted_only="sometimes",
+        )
+        assert captured["assisted_only"] == "sometimes"
+
+    @pytest.mark.asyncio
+    async def test_pr_health_fields_omitted_when_not_supplied(self):
+        captured = await self._run(
+            "_register_manage_customers",
+            action="update_pr_health_settings",
+            team_id="jR2kmLs",
+            aging_days=7,
+        )
+        for name in ("assisted_only", "automation_patterns", "cutoff_date", "excluded_repos"):
+            assert name not in captured
+
 
 # ---------------------------------------------------------------------------
 # manage_metering closure — completion provenance forwarding
@@ -2928,3 +3059,61 @@ class TestSubscriberCredentialsClosureParameters:
         assert "organizationId" in params
         assert "organization_id" in params
         assert "filters" in params
+
+
+class TestManageMeteringPromptContextForwarding:
+    """BACK-3383: the closure signature is manage_metering's public schema, so
+    the prompt-context fields are unreachable until declared there."""
+
+    PROMPT_CONTEXT = {
+        "prompt_id": "0f2b8a54-6c31-4d7e-9a10-b5c7d2e84f63",
+        "prompt_length": 412,
+        "query_source": "repl_main_thread",
+        "speed": "fast",
+        "subagent_type": "general-purpose",
+    }
+
+    @staticmethod
+    async def _call(**kwargs):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_metering")
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="submit_ai_transaction", **kwargs)
+        return captured_args
+
+    @pytest.mark.asyncio
+    async def test_signature_declares_prompt_context_parameters(self):
+        import inspect
+
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_metering")
+        params = inspect.signature(registered_fn).parameters
+        for key in self.PROMPT_CONTEXT:
+            assert key in params, key
+
+    @pytest.mark.asyncio
+    async def test_prompt_context_forwarded_to_execution(self):
+        captured_args = await self._call(**self.PROMPT_CONTEXT)
+        for key, value in self.PROMPT_CONTEXT.items():
+            assert captured_args.get(key) == value, key
+
+    @pytest.mark.asyncio
+    async def test_string_prompt_length_is_coerced_to_int(self):
+        captured_args = await self._call(prompt_length="412")
+        assert captured_args["prompt_length"] == 412
+
+    @pytest.mark.asyncio
+    async def test_absent_prompt_context_is_not_forwarded(self):
+        captured_args = await self._call(speed="fast")
+        assert captured_args["speed"] == "fast"
+        for key in ("prompt_id", "prompt_length", "query_source", "subagent_type"):
+            assert key not in captured_args

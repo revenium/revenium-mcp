@@ -6,7 +6,7 @@ the dual hierarchy and reducing abstraction layers.
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Any, ClassVar, Dict, List, Optional, TYPE_CHECKING, Union
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -31,6 +31,87 @@ from ..introspection.metadata import (
     ToolType,
     UsagePattern,
 )
+
+#: Longest description kept on a parameter-reference line. The reference is an
+#: index, not the manual — a tool's get_examples and per-action guidance still
+#: carry the long form.
+_PARAMETER_DESCRIPTION_MAX = 150
+
+
+def _schema_branches(prop: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """The non-null alternatives of a ``oneOf``/``anyOf`` property, if any.
+
+    A tool that declares a parameter as a union — ``return_transaction_data``
+    is a boolean or one of three strings — carries its type and its accepted
+    values on the branches, not at the top level.
+    """
+    for keyword in ("oneOf", "anyOf"):
+        branches = prop.get(keyword)
+        if isinstance(branches, list):
+            return [
+                branch
+                for branch in branches
+                if isinstance(branch, Mapping) and branch.get("type") != "null"
+            ]
+    return []
+
+
+def _dedupe(values: Sequence[str]) -> List[str]:
+    """Order-preserving de-duplication, so `bool or bool` reads as `bool`."""
+    return list(dict.fromkeys(values))
+
+
+def _format_parameter_type(prop: Mapping[str, Any]) -> str:
+    """Name a property's JSON type the way a caller would say it."""
+    declared = prop.get("type")
+    if declared == "array":
+        items = prop.get("items")
+        item_type = items.get("type") if isinstance(items, Mapping) else None
+        return f"array of {item_type}" if item_type else "array"
+    if isinstance(declared, str):
+        return declared
+    if isinstance(declared, list):
+        return " or ".join(_dedupe([str(entry) for entry in declared if entry != "null"])) or "any"
+
+    branches = _schema_branches(prop)
+    if branches:
+        names = _dedupe([_format_parameter_type(branch) for branch in branches])
+        if names and "any" not in names:
+            return " or ".join(names)
+
+    return "any"
+
+
+def _collect_enum_values(prop: Mapping[str, Any]) -> List[str]:
+    """Accepted values for a property, from the top level or from its branches."""
+    values: List[str] = []
+    for source in (prop, *_schema_branches(prop)):
+        enum = source.get("enum")
+        if isinstance(enum, list):
+            values.extend(str(value) for value in enum)
+    return _dedupe(values)
+
+
+def _format_parameter_line(name: str, prop: Any) -> str:
+    """One markdown bullet for one parameter: name, type, accepted values, meaning."""
+    if not isinstance(prop, Mapping):  # pragma: no cover - defensive
+        return f"- `{name}`"
+
+    line = f"- `{name}` ({_format_parameter_type(prop)})"
+
+    enum = _collect_enum_values(prop)
+    if enum:
+        line += f": one of {', '.join(enum)}"
+
+    description = prop.get("description")
+    if isinstance(description, str) and description.strip():
+        text = " ".join(description.split())
+        if len(text) > _PARAMETER_DESCRIPTION_MAX:
+            text = text[:_PARAMETER_DESCRIPTION_MAX].rsplit(" ", 1)[0] + "..."
+        line += f" - {text}"
+
+    return line
+
 
 class ToolBase(ABC, MetadataProvider):
     """Unified base class for all MCP tools with metadata provider capabilities.
@@ -441,6 +522,53 @@ class ToolBase(ABC, MetadataProvider):
     async def _get_supported_actions(self) -> List[str]:
         """Get supported actions. Override in subclasses."""
         return []
+
+    async def parameter_reference_block(
+        self, skip: Optional[Sequence[str]] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Render this tool's parameters as a terse markdown reference.
+
+        BACK-3170: the MCP schema advertised for the heaviest tools lists only
+        ``action``, the paging parameters and a ``params`` object, so a caller
+        looking for a per-action parameter name is sent here, to
+        ``get_capabilities``. The reference is generated from the tool's own
+        ``_get_input_schema()`` rather than written out a second time, so it
+        cannot drift from the declaration the tool already maintains.
+
+        Returns a one-element content list to append to a capabilities
+        response, or an empty list when the tool declares no parameters beyond
+        ``action``.
+        """
+        try:
+            schema = await self._get_input_schema()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"Could not build parameter reference for {self.tool_name}: {exc}")
+            return []
+
+        properties = schema.get("properties", {})
+        if not isinstance(properties, dict):  # pragma: no cover - defensive
+            return []
+
+        omit = {"action", "params"} | set(skip or ())
+        lines = [
+            _format_parameter_line(name, prop)
+            for name, prop in properties.items()
+            if name not in omit
+        ]
+        if not lines:
+            return []
+
+        body = "\n".join(
+            [
+                "## Parameters",
+                "",
+                "Pass any of these as a top-level argument, or together inside the "
+                "`params` object. A top-level value wins over the same name in `params`.",
+                "",
+                *lines,
+            ]
+        )
+        return [TextContent(type="text", text=body)]
 
     async def _get_input_schema(self) -> Dict[str, Any]:
         """Generate simple input schema using UCM capabilities when available."""

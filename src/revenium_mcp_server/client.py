@@ -14,8 +14,8 @@ import re
 import uuid as _uuid
 from datetime import datetime
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
-from urllib.parse import urljoin
+from typing import Any, Dict, List, Optional, Required, Tuple, TypedDict, Union, cast
+from urllib.parse import quote, urljoin
 
 import httpx
 from loguru import logger
@@ -40,6 +40,21 @@ from .logging_config import async_operation_context
 # PR-health window, whose bound is exclusive). Shared with the tool layer so the
 # pre-flight check and the client guard cannot drift apart.
 SEAT_UTILIZATION_MAX_RANGE_DAYS = 366
+
+
+class PrHealthSettingsPayload(TypedDict, total=False):
+    """PUT body for a team's PR-health settings, under the API's wire names.
+
+    Only the threshold pair is required; the server leaves every other stored
+    field unchanged when it is absent from the body.
+    """
+
+    agingDays: Required[int]
+    rottingDays: Required[int]
+    assistedOnly: bool
+    automationPatterns: List[str]
+    cutoffDate: str
+    excludedRepos: List[str]
 
 
 def _new_idempotency_key() -> str:
@@ -1708,7 +1723,8 @@ class ReveniumClient:
         Args:
             page: Page number (0-based)
             size: Number of items per page
-            **filters: Additional filter parameters (e.g. since, ruleId)
+            **filters: Additional filter parameters — since, until, ruleId,
+                level, mode, query, groupBy, groupValue, transactionId
 
         Returns:
             Response containing enforcement events and pagination info
@@ -1718,16 +1734,133 @@ class ReveniumClient:
         params = self._add_team_id_to_params(params)
         return cast(Dict[str, Any], await self.get("/profitstream/v2/api/ai/enforcement-events", params=params))
 
-    async def get_enforcement_rules(self) -> Dict[str, Any]:
+    async def get_enforcement_events_summary(self, **filters: Any) -> Dict[str, Any]:
+        """Count the enforcement events matching a filter, by outcome.
+
+        Takes the same filters as ``get_enforcement_events`` and no paging:
+        the answer is a single object of counts, not a page.
+
+        ``level`` and ``mode`` are accepted for query-string compatibility
+        with the list and deliberately NOT applied to the counts upstream, so
+        a tier or mode selector leaves them where they were instead of zeroing
+        the buckets it excludes.
+
+        Args:
+            **filters: since, until, ruleId, level, mode, query, groupBy,
+                groupValue, transactionId
+
+        Returns:
+            ``{"blocked": int, "warned": int, "wouldBlock": int,
+            "distinctAffected": int, "resolvedSince": str, "resolvedUntil": str}``
+        """
+        params = self._add_team_id_to_params(dict(filters))
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/ai/enforcement-events/summary", params=params
+        ))
+
+    async def get_enforcement_events_history(self, **filters: Any) -> Dict[str, Any]:
+        """Bucket the enforcement events matching a filter over time.
+
+        Takes the same filters as ``get_enforcement_events`` plus ``bucket``
+        and ``zone``, and no paging: the answer is one object carrying every
+        bar. A bucket with no events is absent rather than returned as a zero.
+
+        Args:
+            **filters: since, until, ruleId, level, mode, query, groupBy,
+                groupValue, transactionId, bucket, zone
+
+        Returns:
+            ``{"buckets": [...], "zone": str, "resolvedSince": str,
+            "resolvedUntil": str}``
+        """
+        params = self._add_team_id_to_params(dict(filters))
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/ai/enforcement-events/history", params=params
+        ))
+
+    async def get_enforcement_events_affected(self, **filters: Any) -> Dict[str, Any]:
+        """List the people and objects the matching enforcement events name.
+
+        Takes the same filters as ``get_enforcement_events`` plus
+        ``affectedSearch``, and no paging: the rows are capped upstream and
+        somebody below the cap is reached with ``affectedSearch`` rather than
+        by asking for a second page, which is why ``total`` and not a page
+        count is what says whether the list is showing everybody.
+
+        Args:
+            **filters: since, until, ruleId, level, mode, query, groupBy,
+                groupValue, transactionId, affectedSearch
+
+        Returns:
+            ``{"rows": [...], "total": int, "resolvedSince": str,
+            "resolvedUntil": str}``
+        """
+        params = self._add_team_id_to_params(dict(filters))
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/ai/enforcement-events/affected", params=params
+        ))
+
+    async def get_enforcement_rules(self, rule_id: Optional[str] = None) -> Dict[str, Any]:
         """Get the compiled enforcement rules for the current team.
 
         The team id is the path parameter (not a query param) for this
         endpoint; it comes from the client's configured team_id.
 
+        Args:
+            rule_id: Optional rule hashid sent as ``ruleId``, narrowing the
+                answer to at most that one rule. An id no rule on the team
+                carries answers 200 with an empty ``rules`` list rather than
+                404, so an empty answer to a narrowed read means "no such
+                rule", not "no rules on this team".
+
         Returns:
             Compiled enforcement rules, e.g. {"rules": [...], "compiledAt": ...}
         """
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/ai/enforcement-rules/{self.team_id}"))
+        params: Dict[str, Any] = {}
+        if rule_id is not None:
+            params["ruleId"] = rule_id
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/ai/enforcement-rules/{self.team_id}", params=params
+        ))
+
+    async def get_enforcement_rule_roster(
+        self,
+        rule_id: str,
+        page: int = 0,
+        size: int = 20,
+        search: Optional[str] = None,
+        band: Optional[str] = None,
+        sort: Optional[str] = None,
+        dimension: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Page one grouped rule's roster: who it measures and where each sits.
+
+        The team id is the path parameter, as it is for ``get_enforcement_rules``;
+        ``ruleId`` is a REQUIRED query parameter here, because a roster belongs
+        to one rule. A rule that groups on nothing has no roster and the
+        endpoint answers 404 rather than an empty page.
+
+        Args:
+            rule_id: Rule hashid whose roster to read
+            page: Page number (0-based)
+            size: Rows per page
+            search: Case-insensitive substring over a row's key, label and email
+            band: BLOCKED, WARNED, UNDER or ALL
+            sort: PERCENT, SPEND, NAME or LAST_EVENT
+            dimension: SUBSCRIBER or ORG_UNIT — a guard, not a selector: one
+                that does not match the rule's own grouping is refused
+
+        Returns:
+            ``{"rows": [...], "total": int, "threshold": float,
+            "blockedCount": int, "warnedCount": int, "underCount": int, ...}``
+        """
+        params: Dict[str, Any] = {"ruleId": rule_id, "page": page, "size": size}
+        for name, value in (("search", search), ("band", band), ("sort", sort), ("dimension", dimension)):
+            if value is not None:
+                params[name] = value
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/ai/enforcement-rules/{self.team_id}/roster", params=params
+        ))
 
     # Invoices API methods
     async def get_unpaid_invoice_totals(self) -> Dict[str, Any]:
@@ -1927,17 +2060,24 @@ class ReveniumClient:
 
     # Developer PR-health report API methods
     async def get_vcs_pr_health(
-        self, source: str, start_date: str, end_date: str
+        self,
+        source: str,
+        start_date: str,
+        end_date: str,
+        org_unit_id: Optional[int] = None,
+        include_descendants: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Get the PR-health report for the caller's own organization.
 
         All three query parameters are required by the endpoint. The report is
         principal-scoped: the platform resolves the organization from the
         authenticated caller and accepts no team or tenant identifier, which is
-        why no team/tenant scope is attached to the request.
+        why no team/tenant scope is attached to the request. An org unit narrows
+        within that organization; one outside it answers 404.
 
         The response is a flat VcsPrHealthResponse (source, startDate, endDate,
-        the echoed agingDays/rottingDays, totals, engineers, oldest) - there is
+        the echoed agingDays/rottingDays, the applied cutoff, excluded
+        repositories and org-unit scope, totals, engineers, oldest) - there is
         no HAL ``_embedded`` envelope and no pagination.
 
         The endpoint answers 400 when startDate is after endDate and when the
@@ -1948,17 +2088,171 @@ class ReveniumClient:
             source: VCS source - ``github`` or ``gitlab``
             start_date: Start of the closed/merged window (ISO ``yyyy-MM-dd``)
             end_date: End of the closed/merged window, inclusive (ISO ``yyyy-MM-dd``)
+            org_unit_id: Department to narrow every figure to (omit for the whole organization)
+            include_descendants: Also cover the department's descendants; needs org_unit_id
 
         Returns:
             Flat PR-health report payload
+        """
+        params = self._vcs_window_params(
+            source, start_date, end_date,
+            **self._vcs_org_unit_params(org_unit_id, include_descendants),
+        )
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/billing/users/vcs-pr-health", params=params
+        ))
+
+    @staticmethod
+    def _vcs_window_params(
+        source: str, start_date: str, end_date: str, **optional: Any
+    ) -> Dict[str, Any]:
+        """Build the source/startDate/endDate triple plus the optional params that were set.
+
+        Every VCS report read is principal-scoped, so no team or tenant id is
+        ever added here (see ``get_vcs_pr_health``).
         """
         params: Dict[str, Any] = {
             "source": source,
             "startDate": start_date,
             "endDate": end_date,
         }
+        params.update({name: value for name, value in optional.items() if value is not None})
+        return params
+
+    @staticmethod
+    def _vcs_org_unit_params(
+        org_unit_id: Optional[int], include_descendants: Optional[bool]
+    ) -> Dict[str, Any]:
+        return {"orgUnitId": org_unit_id, "includeDescendants": include_descendants}
+
+    async def get_vcs_pr_health_engineers(
+        self,
+        source: str,
+        start_date: str,
+        end_date: str,
+        page: Optional[int] = None,
+        size: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_dir: Optional[str] = None,
+        org_unit_id: Optional[int] = None,
+        include_descendants: Optional[bool] = None,
+        assisted_only: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Get one server-sorted page of the PR-health report's engineer rows.
+
+        Principal-scoped like ``get_vcs_pr_health``. The response is a flat page
+        (page, size, totalElements, totalPages, sortBy, sortDir, engineers) whose
+        rows match the report's engineers[] exactly.
+        """
+        params = self._vcs_window_params(
+            source, start_date, end_date,
+            page=page, size=size, sortBy=sort_by, sortDir=sort_dir,
+            assistedOnly=assisted_only,
+            **self._vcs_org_unit_params(org_unit_id, include_descendants),
+        )
         return cast(Dict[str, Any], await self.get(
-            "/profitstream/v2/api/billing/users/vcs-pr-health", params=params
+            "/profitstream/v2/api/billing/users/vcs-pr-health/engineers", params=params
+        ))
+
+    async def get_vcs_pr_health_prs(
+        self,
+        source: str,
+        start_date: str,
+        end_date: str,
+        author: str,
+        org_unit_id: Optional[int] = None,
+        include_descendants: Optional[bool] = None,
+        assisted_only: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Get the pull requests behind one engineer's PR-health row.
+
+        Principal-scoped like ``get_vcs_pr_health``. ``author`` is required by the
+        endpoint (it answers 400 without it) and is the provider login exactly as
+        the report's engineers[].authorLogin spells it. The response carries
+        bucket counts plus ``open`` and ``closedUnmerged`` lists, each capped
+        upstream and flagged by ``openTruncated`` / ``closedUnmergedTruncated``.
+        """
+        params = self._vcs_window_params(
+            source, start_date, end_date,
+            author=author, assistedOnly=assisted_only,
+            **self._vcs_org_unit_params(org_unit_id, include_descendants),
+        )
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/billing/users/vcs-pr-health/prs", params=params
+        ))
+
+    async def get_vcs_pr_health_pull_requests(
+        self,
+        source: str,
+        start_date: str,
+        end_date: str,
+        bucket: Optional[str] = None,
+        author: Optional[str] = None,
+        page: Optional[int] = None,
+        size: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_dir: Optional[str] = None,
+        org_unit_id: Optional[int] = None,
+        include_descendants: Optional[bool] = None,
+        assisted_only: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Get one page of the flat, bucketed pull-request list behind the PR-health report.
+
+        Principal-scoped like ``get_vcs_pr_health``. The response is a flat page
+        (page, size, totalElements, totalPages, sortBy, sortDir, pullRequests).
+        """
+        params = self._vcs_window_params(
+            source, start_date, end_date,
+            bucket=bucket, author=author, page=page, size=size,
+            sortBy=sort_by, sortDir=sort_dir, assistedOnly=assisted_only,
+            **self._vcs_org_unit_params(org_unit_id, include_descendants),
+        )
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/billing/users/vcs-pr-health/pull-requests", params=params
+        ))
+
+    async def get_vcs_pr_health_repositories(self, source: str) -> Dict[str, Any]:
+        """Get the repositories holding open pull requests, with their open count and exclusion flag.
+
+        Principal-scoped like ``get_vcs_pr_health``. Unlike the other PR-health
+        reads it takes no window and no org unit: the endpoint declares
+        ``source`` only, and deliberately ignores the team's cutoff, exclusions
+        and automation patterns so an excluded repository is still listed.
+        """
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/billing/users/vcs-pr-health/repositories",
+            params={"source": source},
+        ))
+
+    async def get_vcs_prs(
+        self,
+        source: str,
+        start_date: str,
+        end_date: str,
+        granularity: Optional[str] = None,
+        group_by: Optional[str] = None,
+        include_members: Optional[bool] = None,
+        email: Optional[str] = None,
+        include_pull_requests: Optional[bool] = None,
+        pr_limit: Optional[int] = None,
+        pr_offset: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Get the merged pull-request report, per login or per repository.
+
+        Principal-scoped like ``get_vcs_pr_health``. The response is flat and
+        always carries ``syncScope``, which is what tells a tenant with no VCS
+        credential apart from one with a quiet window. The platform silently
+        ignores ``includeMembers``, ``email`` and ``includePullRequests`` unless
+        ``groupBy=repository``; the tool layer rejects them instead.
+        """
+        params = self._vcs_window_params(
+            source, start_date, end_date,
+            granularity=granularity, groupBy=group_by, includeMembers=include_members,
+            email=email, includePullRequests=include_pull_requests,
+            prLimit=pr_limit, prOffset=pr_offset,
+        )
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/billing/users/vcs-prs", params=params
         ))
 
     # Provider metering-coverage report API methods
@@ -2126,6 +2420,46 @@ class ReveniumClient:
             f"/profitstream/v2/api/tenants/{tenant_id}/attribution-detail-text",
             data={"attributionDetailTextEnabled": enabled},
         ))
+
+    async def set_usage_billing(self, enabled: bool) -> Dict[str, Any]:
+        """Toggle whether the tenant's billing screens are shown.
+
+        The flag decides whether the product presents the tenant's billing
+        surfaces at all: invoices, payment methods, plan and subscription
+        screens. It is presentation only — ingestion, rating and invoicing are
+        not gated on it, so turning it off hides those screens without
+        changing a single amount, and turning it back on reveals the invoices
+        that were being produced all along. The platform default is on.
+
+        Args:
+            enabled: Desired state of the tenant's billing screens
+
+        Returns:
+            The updated tenant resource (includes usageBillingEnabled and the
+            sibling tenant flags). Unlike those siblings, usageBillingEnabled
+            can also be read without a write: see get_users_me.
+
+        Raises:
+            ReveniumAPIError: 403 unless the key is a platform admin or the
+                tenant's own tenant admin. The platform deliberately gates this
+                toggle more tightly than the other tenant toggles, which also
+                admit an organization admin (PRODUCT-3245).
+        """
+        tenant_id = self._require_tenant_id()
+        return cast(Dict[str, Any], await self.patch(
+            f"/profitstream/v2/api/tenants/{tenant_id}/usage-billing",
+            data={"usageBillingEnabled": enabled},
+        ))
+
+    async def get_users_me(self) -> Dict[str, Any]:
+        """Return the user resource behind the configured credentials.
+
+        Its ``tenant`` stub carries ``usageBillingEnabled``, which makes this
+        the one published read path for a tenant flag: the tenant GET is hidden
+        from the contract. The stub describes the key's own tenant, which is
+        not necessarily the configured ``tenant_id`` the toggles write to.
+        """
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/users/me"))
 
     # Squads API methods
     #
@@ -2795,17 +3129,20 @@ class ReveniumClient:
         ))
 
     async def get_team_pr_health_settings(self, team_id: str) -> Dict[str, Any]:
-        """Get the team's PR-health aging/rotting inactivity thresholds.
+        """Get the team's PR-health settings.
 
         The response carries the *effective* values: the platform substitutes its
-        own defaults when the team has never configured them, so this never
-        answers with a missing field.
+        own defaults when the team has never configured them, including a
+        cutoffDate that falls back to the organization's first AI-telemetry day
+        (flagged by cutoffDateIsDefault).
 
         Args:
             team_id: The team ID
 
         Returns:
-            Settings data carrying agingDays and rottingDays
+            Settings data carrying agingDays, rottingDays, assistedOnly,
+            automationPatterns, builtInAutomationPatterns, cutoffDate,
+            cutoffDateIsDefault, defaultCutoffDate and excludedRepos
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.get(
@@ -2813,16 +3150,21 @@ class ReveniumClient:
         ))
 
     async def update_team_pr_health_settings(
-        self, team_id: str, settings: Dict[str, Any]
+        self, team_id: str, settings: PrHealthSettingsPayload
     ) -> Dict[str, Any]:
-        """Replace the team's PR-health aging/rotting thresholds.
+        """Update the team's PR-health settings.
 
-        The endpoint is a full replacement, not a merge: both agingDays and
-        rottingDays are non-nullable with no server-side defaults, so a body
-        carrying only one of them fails deserialization and the API answers 400.
-        Nothing is silently reset — the write simply does not land. Callers must
-        send the complete pair, read-merged from a prior GET when they only mean
-        to change one.
+        The threshold pair is a full replacement: both agingDays and rottingDays
+        are non-nullable with no server-side defaults, so a body carrying only one
+        of them fails deserialization and the API answers 400. Nothing is silently
+        reset — the write simply does not land. Callers must send the complete
+        pair, read-merged from a prior GET when they only mean to change one.
+
+        Every other field is optional: the server leaves assistedOnly,
+        automationPatterns, cutoffDate and excludedRepos unchanged when they are
+        absent or null, and an empty list clears automationPatterns or
+        excludedRepos. builtInAutomationPatterns and defaultCutoffDate are
+        read-only.
 
         The server also enforces agingDays < rottingDays and clamps both fields
         to 1..365; violating either is a 400.
@@ -2837,7 +3179,7 @@ class ReveniumClient:
 
         Args:
             team_id: The team ID
-            settings: Full settings payload, i.e. {"agingDays": int, "rottingDays": int}
+            settings: The complete threshold pair plus any optional fields to change
 
         Returns:
             Updated PR-health settings data
@@ -2845,7 +3187,7 @@ class ReveniumClient:
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.put(
             f"/profitstream/v2/api/teams/{team_id}/settings/pr-health",
-            data=settings,
+            data=dict(settings),
             params=params,
         ))
     async def get_team_attribution_identity_policy(self, team_id: str) -> Dict[str, Any]:
@@ -3003,12 +3345,71 @@ class ReveniumClient:
             where ``path`` is the materialized ancestor-id path including the unit
             itself (e.g. ``/12/40/173/``) and ``id``/``parentId`` are JSON numbers.
         """
-        params: Dict[str, Any] = (
-            {"teamId": team_id} if team_id else self._add_team_id_to_params()
-        )
         return cast(
             List[Dict[str, Any]],
-            await self.get("/profitstream/v2/api/org-units", params=params),
+            await self.get(
+                "/profitstream/v2/api/org-units", params=self._org_unit_team_params(team_id)
+            ),
+        )
+
+    def _org_unit_team_params(self, team_id: Optional[str]) -> Dict[str, Any]:
+        """Scope an org-unit call to ``team_id``, or to the ambient team when omitted."""
+        return {"teamId": team_id} if team_id else self._add_team_id_to_params()
+
+    async def delete_org_unit_person(
+        self, person_id: int, team_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Delete one directory person by id.
+
+        The three org-unit deletes run once (``use_retry=False``): a delete that
+        committed before a retryable 5xx would be replayed into a 404, reporting
+        failure for a removal that happened.
+
+        Upstream closes the person's open org-unit assignment effective now,
+        removes every email mapping pointing at them and deletes the person in one
+        transaction; assignment history is kept. Answers 204, so the result is ``{}``.
+        """
+        return cast(
+            Dict[str, Any],
+            await self.delete(
+                f"/profitstream/v2/api/org-units/persons/{person_id}",
+                params=self._org_unit_team_params(team_id),
+                use_retry=False,
+            ),
+        )
+
+    async def delete_org_unit_person_by_email(
+        self, email: str, team_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Delete the directory person an email resolves to (same effect as by id).
+
+        The email never creates a person; an address matching more than one
+        directory person is rejected with 400. Answers 204, so the result is ``{}``.
+        """
+        params = self._org_unit_team_params(team_id)
+        params["email"] = email
+        return cast(
+            Dict[str, Any],
+            await self.delete(
+                "/profitstream/v2/api/org-units/persons", params=params, use_retry=False
+            ),
+        )
+
+    async def clear_org_unit_assignment_by_email(
+        self, email: str, team_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Close the open primary org-unit assignment of the person an email resolves to.
+
+        The person and their email mappings stay. Answers 204 whether or not an
+        assignment was open, so the result is ``{}``.
+        """
+        params = self._org_unit_team_params(team_id)
+        params["email"] = email
+        return cast(
+            Dict[str, Any],
+            await self.delete(
+                "/profitstream/v2/api/org-units/assignments", params=params, use_retry=False
+            ),
         )
 
     # AI Anomaly and Alert Management API methods
@@ -3699,6 +4100,202 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params({})
         return cast(Dict[str, Any], await self.patch(f"/profitstream/v2/api/jobs/{job_id}/outcome", data=outcome_data, params=params, use_retry=False))
+
+    @staticmethod
+    def _quote_path_segment(value: str) -> str:
+        """Percent-encode a caller-supplied value so it stays ONE path segment.
+
+        ``quote(value, safe="")`` is not enough on its own. It escapes the
+        slash, but ``.`` is an unreserved character and survives, so a value of
+        ``.`` or ``..`` reaches the URL as a literal dot-segment -- and
+        ``_build_url``'s ``urljoin`` then resolves it away, exactly as a browser
+        would: ``/v2/api/jobs/types/../economics`` becomes
+        ``/v2/api/jobs/economics``, a DIFFERENT endpoint, and
+        ``/v2/api/jobs/types/./economics`` drops the segment entirely. Raised in
+        review against the comment below, which promised the encoding kept the
+        endpoint fixed.
+
+        Only the two dot-only segments are further encoded, and only as a whole:
+        escaping every ``.`` would mangle ordinary names like ``claims.v2`` into
+        unreadable URLs for no benefit, because a dot inside a longer segment is
+        not a dot-segment (``x..y`` resolves to itself). ``JobManager`` refuses
+        these two values before a request is built; this is the transport-level
+        guarantee for callers that reach the client directly.
+        """
+        quoted = quote(value, safe="")
+        if quoted in (".", ".."):
+            return quoted.replace(".", "%2E")
+        return quoted
+
+    # --- Job type economics (BACK-3090) ---
+    #
+    # The declaration a job type's ROI is measured against:
+    # GET/PUT .../economics, GET/POST .../baselines, POST .../facts, plus the
+    # per-job POST .../outcome/metrics. Shaped like the job methods above --
+    # literal platform path plus _add_team_id_to_params -- with two rules that
+    # are not shared with them:
+    #
+    # 1. The ``{type}`` path segment is caller-supplied free text, not an
+    #    opaque platform id, so it is percent-encoded before it reaches the
+    #    URL by _quote_path_segment. A job type containing a slash, a space or
+    #    a dot-segment would otherwise change which endpoint is called.
+    # 2. The three appends pass ``use_retry=False`` for the reason
+    #    ``amend_job_outcome`` does: they are not idempotent. A second delivery
+    #    of a baseline is a second version, and a second delivery of a fact is
+    #    a second fact (or a 409 against the active-fact constraint for a write
+    #    that already landed), and neither operation declares an idempotency
+    #    key for the platform to dedupe on. ``_should_retry`` resends on 408,
+    #    429 and every 5xx, so a transient error arriving after the origin
+    #    committed would duplicate the row while the caller saw one success.
+    #    The revenium-python-sdk draws the same line on the same endpoints
+    #    (``_NON_IDEMPOTENT_RETRY_STATUSES`` in
+    #    ``revenium_middleware/_core/outcomes.py`` keeps only 429, which this
+    #    transport has no way to express, so it gives that one up too).
+    #    GET and the economics PUT are safe to repeat and keep the default.
+
+    async def get_job_type_economics(self, job_type: str) -> Dict[str, Any]:
+        """Read a job type's economics declaration and its current baseline.
+
+        Args:
+            job_type: The job type key, e.g. "mcp-test-claims"
+
+        Returns:
+            JobTypeEconomicsResource: unitMetricKey, unitLabel, metrics,
+            dimensions, monetization, overheadPerUnit/overheadCurrency and the
+            embedded currentBaseline
+
+        Raises:
+            ReveniumAPIError: With status_code 404 when the type has no
+                declaration
+        """
+        params = self._add_team_id_to_params({})
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/jobs/types/{self._quote_path_segment(job_type)}/economics", params=params))
+
+    async def put_job_type_economics(self, job_type: str, economics: Dict[str, Any]) -> Dict[str, Any]:
+        """Create or REPLACE a job type's economics declaration.
+
+        The platform replaces the whole declaration, so a field omitted from
+        ``economics`` is cleared rather than left alone. The read-modify-write
+        that keeps a partial edit from wiping a declaration lives one layer up,
+        in ``JobManager.upsert_job_type_economics`` -- this method sends what it
+        is given, verbatim, so a field the contract adds reaches the API
+        without a client release.
+
+        Args:
+            job_type: The job type key
+            economics: The complete JobTypeEconomicsRequest body
+
+        Returns:
+            The stored declaration
+        """
+        params = self._add_team_id_to_params({})
+        return cast(Dict[str, Any], await self.put(f"/profitstream/v2/api/jobs/types/{self._quote_path_segment(job_type)}/economics", data=economics, params=params))
+
+    async def list_job_type_baselines(self, job_type: str) -> Any:
+        """List a job type's immutable baseline versions, newest first.
+
+        Returns whatever the endpoint answered, uncoerced, for the reason
+        ``get_jobs_roi_summary`` returns its body uncoerced: the operation
+        declares a bare JSON array, and quietly turning a body of another shape
+        into ``[]`` here would render a contract failure as "this job type has
+        no baselines" -- a wrong answer that reads exactly like a right one.
+        ``JobManager.list_job_type_baselines`` refuses the unexpected envelope
+        by name through ``_require_baseline_collection``, the way
+        ``_require_roi_summary_envelope`` refuses the ROI summary's.
+
+        Args:
+            job_type: The job type key
+
+        Returns:
+            The decoded body. The published shape is a list of BaselineResource
+            objects, newest first; an empty list means no baseline has been
+            declared, which is an answer rather than an error.
+        """
+        params = self._add_team_id_to_params({})
+        return await self.get(f"/profitstream/v2/api/jobs/types/{self._quote_path_segment(job_type)}/baselines", params=params)
+
+    async def create_job_type_baseline(self, job_type: str, baseline: Dict[str, Any]) -> Dict[str, Any]:
+        """Append the next immutable baseline version for a job type.
+
+        Append-only: this never replaces the active baseline, it declares a new
+        version that supersedes it from ``effectiveFrom``. ``use_retry=False``
+        for the reason given in the block comment above -- a replayed POST is a
+        second version, and the platform has no dedup key to reject it with.
+
+        Args:
+            job_type: The job type key
+            baseline: BaselineRequest body; ``effectiveFrom`` is the only field
+                the platform requires
+
+        Returns:
+            The stored baseline version
+        """
+        params = self._add_team_id_to_params({})
+        return cast(Dict[str, Any], await self.post(f"/profitstream/v2/api/jobs/types/{self._quote_path_segment(job_type)}/baselines", data=baseline, params=params, use_retry=False))
+
+    async def append_job_type_facts(self, job_type: str, facts: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Append PERIOD metric facts to a job type.
+
+        ``facts`` is the request body itself -- the operation declares a bare
+        JSON array of PeriodFactEntry, not an object wrapping one. Each entry's
+        ``key`` must already be declared on the type's economics with
+        ``resolution: PERIOD``; an undeclared key, or one declared PER_JOB, is
+        a 400 naming the metric. Append-only, so ``use_retry=False``.
+
+        Args:
+            job_type: The job type key
+            facts: PeriodFactEntry objects, forwarded verbatim
+
+        Returns:
+            Whatever the endpoint answered. The platform answers a bodiless
+            201, which decodes to ``{}``.
+        """
+        params = self._add_team_id_to_params({})
+        return cast(
+            Dict[str, Any],
+            await self.post(
+                f"/profitstream/v2/api/jobs/types/{self._quote_path_segment(job_type)}/facts",
+                data=cast(Any, facts),
+                params=params,
+                use_retry=False,
+            ),
+        )
+
+    async def append_job_outcome_metrics(self, job_id: str, metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Append PER_JOB metric facts to a job that already reported an outcome.
+
+        The array is the body, as on the facts append. Each ``key`` must be
+        declared PER_JOB on the job type's economics. This does NOT advance the
+        job's ``entityVersion``: the facts hang off the outcome rather than
+        rewriting it, so a caller holding a version for ``amend_job_outcome``
+        still holds a current one afterwards. Append-only, so
+        ``use_retry=False``.
+
+        ``job_id`` is percent-encoded for the reason the ``{type}`` segment is:
+        ``agenticJobId`` is a user-supplied external identifier, not an opaque
+        platform id, so a value carrying a slash would otherwise change which
+        endpoint is called. The older job methods in this block still
+        interpolate their ids raw; they are deliberately out of scope here --
+        changing the URL those produce is a behaviour change for every existing
+        caller and belongs in its own ticket, not smuggled into this one.
+
+        Args:
+            job_id: The agentic job identifier
+            metrics: OutcomeMetricEntry objects, forwarded verbatim
+
+        Returns:
+            Whatever the endpoint answered; the platform answers a bodiless 201
+        """
+        params = self._add_team_id_to_params({})
+        return cast(
+            Dict[str, Any],
+            await self.post(
+                f"/profitstream/v2/api/jobs/{self._quote_path_segment(job_id)}/outcome/metrics",
+                data=cast(Any, metrics),
+                params=params,
+                use_retry=False,
+            ),
+        )
 
     async def get_session_attributions(self, session_id: str) -> Dict[str, Any]:
         """List the recorded ticket attributions for a coding-assistant session.

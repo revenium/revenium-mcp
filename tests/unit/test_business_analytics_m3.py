@@ -222,9 +222,12 @@ class TestHandleActionRouting:
     @pytest.mark.asyncio
     async def test_get_capabilities_action(self, _mock_engine_cls, _mock_analyzer_cls, tool):
         result = await tool.handle_action("get_capabilities", {})
-        assert len(result) == 1
+        # BACK-3170: a second block carries the per-action parameter reference,
+        # which the advertised MCP schema no longer lists.
+        assert len(result) == 2
         assert isinstance(result[0], TextContent)
         assert "Business Analytics" in result[0].text
+        assert "## Parameters" in result[1].text
 
     @pytest.mark.asyncio
     async def test_get_examples_action(self, _mock_engine_cls, _mock_analyzer_cls, tool):
