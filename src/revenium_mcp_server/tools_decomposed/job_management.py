@@ -14,19 +14,17 @@ Decision (BACK-2769): the MCP exposes the READ half of session attribution as
 POST /v2/api/sessions/{sessionId}/attribution. Two reasons, both standing:
 
 1. The write already has a shipped owner, on the plane the endpoint was
-   designed for. The ticket-gate CLI (``src/claude-code/ticket/
-   association-client.ts`` in revenium-cli-node-internal, anchors
-   ``buildAssociationUrl`` / ``postAssociation``) POSTs the attribution from
-   the developer machine with a fleet-distributed METERING-scoped API key,
+   designed for. A separate metering-plane client owns the write: it POSTs
+   the attribution from the developer machine with a METERING-scoped API key,
    where the platform resolves ``teamId`` from the key itself and writes are
    append-only. Adding a second writer here would re-implement a working path
    on the management plane, which is not the plane it was built for.
 2. An MCP model has no reliable source for its own coding-session UUID. The
-   CLI reads it from the Claude Code hook payload; an MCP tool would have to
-   ask the model to supply an identifier it cannot observe, and no session
-   listing or discovery endpoint exists to look it up. Revisit this decision
-   when such a source appears — not merely because the endpoint shows up
-   again in the next drift run.
+   metering-plane client observes it from the coding assistant directly; an
+   MCP tool would have to ask the model to supply an identifier it cannot
+   observe, and no session listing or discovery endpoint exists to look it
+   up. Revisit this decision when such a source appears — not merely because
+   the endpoint shows up again in the next drift run.
 
 Write-side error semantics, recorded here so they are not re-derived if that
 day comes: 422 UnprocessableEntityException covers ticketId/splits
@@ -388,8 +386,8 @@ _SESSION_ATTRIBUTION_SPLITS_NOTE = (
     "declares no splits field, so a weighted multi-ticket split written "
     "through another plane reads back here single-valued, as the interval's "
     "scalar ticketId — that is not evidence the split write failed. The MCP "
-    "offers no write action for session attribution: the ticket-gate CLI owns "
-    "that write on the metering plane (see the Decision (BACK-2769) note at "
+    "offers no write action for session attribution: a separate metering-plane "
+    "client owns that write (see the Decision (BACK-2769) note at "
     "the top of job_management.py)."
 )
 
@@ -2832,8 +2830,8 @@ class JobManagement(ToolBase):
                             "reason": _SESSION_ATTRIBUTION_REASON_NOTE,
                             "splits": _SESSION_ATTRIBUTION_SPLITS_NOTE,
                             "write": (
-                                "read-only by decision (BACK-2769): the ticket-gate CLI "
-                                "owns the POST on the metering plane, and an MCP model "
+                                "read-only by decision (BACK-2769): a separate metering-plane "
+                                "client owns the POST, and an MCP model "
                                 "has no source for its own session UUID. See the module "
                                 "docstring of job_management.py"
                             ),
@@ -3497,8 +3495,8 @@ class JobManagement(ToolBase):
                 description=(
                     "Read the ticket attributions recorded for a coding-assistant "
                     "session, current interval first. Read-only by decision "
-                    "(BACK-2769): the ticket-gate CLI owns the write on the metering "
-                    "plane and an MCP model has no source for its own session UUID"
+                    "(BACK-2769): a separate metering-plane client owns the write "
+                    "and an MCP model has no source for its own session UUID"
                 ),
                 parameters={
                     "list_session_attributions": {"session_id": "str (required)"},

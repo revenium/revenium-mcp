@@ -1788,7 +1788,7 @@ class TestSessionAttributionDecisionIsRecorded:
         doc = job_management.__doc__ or ""
         assert "Decision (BACK-2769)" in doc
         assert "does NOT expose" in doc
-        assert "association-client.ts" in doc
+        assert "separate metering-plane client owns the write" in doc
         assert "422" in doc and "400" in doc
         assert "CodingAssistantSource" in doc
 
