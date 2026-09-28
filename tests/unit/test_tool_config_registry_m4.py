@@ -957,7 +957,7 @@ class TestManageProductsCreateSimpleParams:
 class TestManageCustomersJsonPreprocessing:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("confirm", [True, "true"])
-    async def test_org_unit_removal_arguments_reach_the_tool_with_confirm_untouched(
+    async def test_department_removal_arguments_reach_the_tool_with_confirm_untouched(
         self, confirm
     ):
         """person_id and confirm are bound; a string confirm is not coerced into True."""
@@ -974,7 +974,7 @@ class TestManageCustomersJsonPreprocessing:
             "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
             new=fake_execution,
         ):
-            await registered_fn(action="delete_org_unit_person", person_id=97, confirm=confirm)
+            await registered_fn(action="delete_department_person", person_id=97, confirm=confirm)
 
         assert captured_args["person_id"] == 97
         assert captured_args["confirm"] is confirm
@@ -1995,22 +1995,22 @@ class TestManageCostControlsNumericPreprocessing:
         assert captured_args["size"] == 5
 
 
-class TestManageCostControlsOrgUnitPreviewForwarding:
-    """parent_org_unit_id must be declared on the closure or FastMCP rejects it
+class TestManageCostControlsDepartmentPreviewForwarding:
+    """parent_department_id must be declared on the closure or FastMCP rejects it
     before the tool ever sees it (the signature, not get_schema(), is the model)."""
 
     @pytest.mark.asyncio
-    async def test_signature_declares_parent_org_unit_id(self):
+    async def test_signature_declares_parent_department_id(self):
         import inspect
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
 
-        assert "parent_org_unit_id" in inspect.signature(registered_fn).parameters
+        assert "parent_department_id" in inspect.signature(registered_fn).parameters
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("value", [173, "173"])
-    async def test_parent_org_unit_id_forwarded_unchanged(self, value):
+    async def test_parent_department_id_forwarded_unchanged(self, value):
         """Both an int and a digit string are legitimate, so the closure must
         forward the value as sent and leave coercion to the tool."""
         registry = _make_registry()
@@ -2026,12 +2026,12 @@ class TestManageCostControlsOrgUnitPreviewForwarding:
             "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
             new=fake_execution,
         ):
-            await registered_fn(action="preview_org_unit_group", parent_org_unit_id=value)
+            await registered_fn(action="preview_department_group", parent_department_id=value)
 
-        assert captured_args["parent_org_unit_id"] == value
+        assert captured_args["parent_department_id"] == value
 
     @pytest.mark.asyncio
-    async def test_parent_org_unit_id_none_is_stripped(self):
+    async def test_parent_department_id_none_is_stripped(self):
         """An unset optional must not reach the tool as an explicit None."""
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
@@ -2048,7 +2048,7 @@ class TestManageCostControlsOrgUnitPreviewForwarding:
         ):
             await registered_fn(action="list")
 
-        assert "parent_org_unit_id" not in captured_args
+        assert "parent_department_id" not in captured_args
 
 
 class TestBusinessAnalyticsAggregationForwarding:
@@ -2442,18 +2442,18 @@ class TestManageProductsQueryParameter:
         assert "query" not in captured
 
 
-class TestManageAiInsightsOrgUnitParameters:
-    """BACK-2757: the org-unit filters must be reachable through the MCP boundary.
+class TestManageAiInsightsDepartmentParameters:
+    """BACK-2757: the department filters must be reachable through the MCP boundary.
 
     FastMCP derives the tool's accepted arguments from this closure's
-    signature, so a handler reading arguments["filter_org_unit_id"] is dead
+    signature, so a handler reading arguments["filter_department_id"] is dead
     code until the parameter is declared here — the caller gets a binding
     error instead of a department-scoped run.
     """
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "param", ["filter_org_unit_id", "filter_include_descendants"],
+        "param", ["filter_department_id", "filter_include_descendants"],
     )
     async def test_signature_declares_param(self, param):
         import inspect
@@ -2464,7 +2464,7 @@ class TestManageAiInsightsOrgUnitParameters:
         assert param in inspect.signature(fn).parameters
 
     @pytest.mark.asyncio
-    async def test_org_unit_filters_forwarded_through_closure(self):
+    async def test_department_filters_forwarded_through_closure(self):
         registry = _make_registry(profile="business")
         fn = await _get_registered_closure(registry, "_register_manage_ai_insights")
 
@@ -2482,11 +2482,11 @@ class TestManageAiInsightsOrgUnitParameters:
                 action="trigger_run",
                 period_start="2026-01-01T00:00:00Z",
                 period_end="2026-01-31T23:59:59Z",
-                filter_org_unit_id="173",
+                filter_department_id="173",
                 filter_include_descendants=False,
             )
 
-        assert captured["filter_org_unit_id"] == "173"
+        assert captured["filter_department_id"] == "173"
         assert captured["filter_include_descendants"] is False
 
     @pytest.mark.asyncio

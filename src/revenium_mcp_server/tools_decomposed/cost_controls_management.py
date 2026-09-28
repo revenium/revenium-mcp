@@ -14,12 +14,12 @@ evaluates and logs a control without enforcing it; ``enabled`` toggles the
 control on or off. The enforcement surface exposes the events emitted when a
 control fires and the compiled rule set the enforcer evaluates.
 
-A guardrail can be scoped per organizational unit (department) by setting
-``groupBy`` to ORG_UNIT, which turns one control into one independent budget
-per department; ``preview_org_unit_group`` reports that fan-out before the
-control is written. ORG_UNIT is cost-control-only (see
-``ORG_UNIT_DIMENSION_SCOPE_NOTE``) and is gated per tenant (see
-``ORG_UNIT_BUDGETS_FEATURE_NOTE``).
+A guardrail can be scoped per department by setting
+``groupBy`` to DEPARTMENT, which turns one control into one independent budget
+per department; ``preview_department_group`` reports that fan-out before the
+control is written. DEPARTMENT is cost-control-only (see
+``DEPARTMENT_DIMENSION_SCOPE_NOTE``) and is gated per tenant (see
+``DEPARTMENT_BUDGETS_FEATURE_NOTE``).
 """
 
 import json
@@ -32,6 +32,10 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..client import ReveniumAPIError, ReveniumClient
+from ..common.department_aliases import (
+    deprecated_aliases_note,
+    deprecated_argument_properties,
+)
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
@@ -88,10 +92,10 @@ _AFFECTED_ONLY_FILTER_MAP: Dict[str, str] = {"affected_search": "affectedSearch"
 ENFORCEMENT_GROUP_PAIR_NOTE = (
     "group_by and group_value travel together: group_value is the exact "
     "affected person or object and group_by is the dimension it belongs to "
-    "(SUBSCRIBER, ORG_UNIT, MODEL and so on). Sending either one alone is "
+    "(SUBSCRIBER, DEPARTMENT, MODEL and so on). Sending either one alone is "
     "refused upstream with a 422, so it is refused here before the request. "
-    "Send back the group_value these endpoints returned - hashed for an "
-    "ORG_UNIT group, raw otherwise."
+    "Send back the group_value these endpoints returned - hashed for a "
+    "DEPARTMENT group, raw otherwise."
 )
 
 ENFORCEMENT_LEVEL_MODE_NOTE = (
@@ -169,68 +173,68 @@ def _build_enforcement_event_filters(
         )
     return filters
 
-# Department budgets sit behind two per-tenant flags: the ORG_UNIT_BUDGETS
-# feature gate on the preview endpoint and the org-unit-attribution check
+# Department budgets sit behind two per-tenant flags: the org-unit-budgets-enabled
+# feature gate on the preview endpoint and the org-unit-attribution-enabled check
 # nested beneath it. A tenant without them is refused before any counting
 # happens — dev answers 403 "Feature not available" (verified 2026-08-26)
 # while a tenant with attribution but no budget feature answers 422
 # "Department budgets not enabled for this team". Neither is a credential
 # problem, so both are translated instead of passed through raw.
-ORG_UNIT_PREVIEW_SEMANTICS_NOTE = (
-    "preview_org_unit_group's target_count is the number of DIRECT CHILDREN of "
-    "the given parent org unit — NOT how many budgets the rule creates. A "
-    "groupBy=ORG_UNIT rule is organization-wide and unscoped by that parent: it "
-    "caps every attributed org unit in the organization, so the preview can "
-    "understate the real fan-out of a BLOCK rule. ORG_UNIT filter entries "
-    "accept only the IS operator upstream: an IN row naming several org units "
+DEPARTMENT_PREVIEW_SEMANTICS_NOTE = (
+    "preview_department_group's target_count is the number of DIRECT CHILDREN of "
+    "the given parent department — NOT how many budgets the rule creates. A "
+    "groupBy=DEPARTMENT rule is organization-wide and unscoped by that parent: it "
+    "caps every attributed department in the organization, so the preview can "
+    "understate the real fan-out of a BLOCK rule. DEPARTMENT filter entries "
+    "accept only the IS operator upstream: an IN row naming several departments "
     "in values is refused for this dimension even though every other dimension "
     "takes one (re-verified 2026-09-09), because the ancestor-cap evaluation "
-    "assumes exactly one org-unit id. To cap several departments, use "
-    "groupBy=ORG_UNIT (one budget per department) or one control per "
+    "assumes exactly one department id. To cap several departments, use "
+    "groupBy=DEPARTMENT (one budget per department) or one control per "
     "department."
 )
 
 # What the three department-budget maps on the compiled ruleset mean. Stated
 # once because two surfaces need it: the Enforcement Visibility capability and
 # the notes get_capabilities/get_examples publish. The distinction that matters
-# is which of them is a verdict — orgUnitBudgetBlockUnits is not.
-ORG_UNIT_ENFORCEMENT_MAPS_NOTE = (
-    "orgUnitBudgetWarnings is the same subscriber email -> rule-id shape as "
-    "orgUnitBudgetBlocks, for the people who crossed a rule's WARN tier and "
+# is which of them is a verdict — departmentBudgetBlockUnits is not.
+DEPARTMENT_ENFORCEMENT_MAPS_NOTE = (
+    "departmentBudgetWarnings is the same subscriber email -> rule-id shape as "
+    "departmentBudgetBlocks, for the people who crossed a rule's WARN tier and "
     "are not blocked yet; the two maps are disjoint, and get_enforcement_rules "
     "summarizes the warnings per rule - the rule name, how many people it is "
-    "warning, and their balances from orgUnitBudgetBlockBalances (subscriber "
+    "warning, and their balances from departmentBudgetBlockBalances (subscriber "
     "email -> the balance that rule's threshold was compared against for them, "
     "which is neither the rule's own currentValue nor a per-department total) - "
     "leaving the email addresses in the payload rather than in the summary "
-    "line. orgUnitBudgetBlockUnits (subscriber email -> the org unit whose cap "
+    "line. departmentBudgetBlockUnits (subscriber email -> the department whose cap "
     "named them) covers warned and blocked people alike: it is an attribution "
     "helper for notification routing, NOT a verdict, so an entry there does "
     "not mean that person is blocked and nothing summarizes it as one."
 )
 
-ORG_UNIT_BUDGETS_FEATURE_NOTE = (
-    "Department (org-unit) budgets are gated per tenant by the org-unit-budgets "
-    "feature flag and the org-unit-attribution flag beneath it, both OFF by "
+DEPARTMENT_BUDGETS_FEATURE_NOTE = (
+    "Department budgets are gated per tenant by the org-unit-budgets-enabled "
+    "feature flag and the org-unit-attribution-enabled flag beneath it, both OFF by "
     "default. A 403 or 422 here means the tenant does not have them enabled — "
     "it is a tenant-configuration state, not a permissions problem with your key."
 )
 
 # Single authoritative statement of the dimension's blast radius. BACK-2760
 # closed with the decision that the alert/anomaly surface does not support
-# ORG_UNIT (the anomaly API throws on it), so an agent that discovers the
+# DEPARTMENT (the anomaly API throws on it), so an agent that discovers the
 # dimension here must not carry it over to manage_alerts.
-ORG_UNIT_DIMENSION_SCOPE_NOTE = (
-    "ORG_UNIT is a cost-control-only dimension: manage_alerts (anomaly "
+DEPARTMENT_DIMENSION_SCOPE_NOTE = (
+    "DEPARTMENT is a cost-control-only dimension: manage_alerts (anomaly "
     "detection) deliberately does not support it and the anomaly API throws "
-    "when given ORG_UNIT, so never send it as an alert filter or group_by."
+    "when given DEPARTMENT, so never send it as an alert filter or group_by."
 )
 
-# ORG_UNIT ids are raw numbers, not the hashids used for most Revenium
+# DEPARTMENT ids are raw numbers, not the hashids used for most Revenium
 # resources, and this tool has no listing of its own to resolve them.
-ORG_UNIT_ID_SOURCE_NOTE = (
-    "ORG_UNIT ids are raw numeric org-unit ids (not hashids); list them with "
-    "manage_customers(action='list_org_units')."
+DEPARTMENT_ID_SOURCE_NOTE = (
+    "DEPARTMENT ids are raw numeric department ids (not hashids); list them with "
+    "manage_customers(action='list_departments')."
 )
 
 # Blocked-subscriber lists are unbounded (one entry per blocked person), so the
@@ -254,11 +258,11 @@ FILTER_IN_OPERATOR_NOTE = (
 )
 
 
-def _coerce_parent_org_unit_id(raw: Any) -> int:
+def _coerce_parent_department_id(raw: Any) -> int:
     """Return ``raw`` as the whole number the preview endpoint expects.
 
     Accepts an int or a numeric string because both reach the tool: the
-    org-unit listing hands out ids as strings while a caller reading the raw
+    department listing hands out ids as strings while a caller reading the raw
     API sees JSON numbers. Anything else is rejected here rather than sent, so
     the caller learns the id is wrong instead of reading an upstream 400.
     """
@@ -281,12 +285,12 @@ def _coerce_parent_org_unit_id(raw: Any) -> int:
 
     if candidate is None or candidate < 0:
         raise ToolError(
-            message=f"parent_org_unit_id must be a numeric org-unit id, got {raw!r}",
+            message=f"parent_department_id must be a numeric department id, got {raw!r}",
             error_code=ErrorCodes.INVALID_PARAMETER,
-            field="parent_org_unit_id",
+            field="parent_department_id",
             value=raw,
             suggestions=[
-                ORG_UNIT_ID_SOURCE_NOTE,
+                DEPARTMENT_ID_SOURCE_NOTE,
                 "Pass the id as a number or a digit string, e.g. 173 or '173'.",
             ],
         )
@@ -296,7 +300,7 @@ def _coerce_parent_org_unit_id(raw: Any) -> int:
 def _rule_names_by_id(result: Any) -> Dict[str, Any]:
     """Map ``rules[].ruleId`` to ``rules[].name``, keyed as strings.
 
-    Both org-unit summaries resolve rule ids the same way, and the keys are
+    Both department summaries resolve rule ids the same way, and the keys are
     stringified because the id maps' values and ``ruleId`` are not guaranteed
     to share a JSON type.
     """
@@ -331,15 +335,15 @@ def _balance_sort_key(raw: Any) -> Any:
     return (1, 0.0)
 
 
-def _summarize_org_unit_warnings(result: Any) -> Optional[str]:
-    """Render ``orgUnitBudgetWarnings`` as which rules are warning how many people.
+def _summarize_department_warnings(result: Any) -> Optional[str]:
+    """Render ``departmentBudgetWarnings`` as which rules are warning how many people.
 
     The key is a flat map of subscriber email -> the id of the rule whose warn
-    tier that person crossed, disjoint from ``orgUnitBudgetBlocks`` (a person
+    tier that person crossed, disjoint from ``departmentBudgetBlocks`` (a person
     already blocked is not warned). It answers "who is about to be blocked by a
     department budget", which the raw map does not: the same rule id repeats
     once per person, and the number that was compared against the threshold
-    lives in a second map, ``orgUnitBudgetBlockBalances``.
+    lives in a second map, ``departmentBudgetBlockBalances``.
 
     The summary is per rule, not per person: it names the rule, counts the
     people it is warning and lists their compared balances, and leaves the
@@ -349,19 +353,19 @@ def _summarize_org_unit_warnings(result: Any) -> Optional[str]:
     """
     if not isinstance(result, dict):
         return None
-    if result.get("orgUnitBudgetWarnings") is None:
+    if result.get("departmentBudgetWarnings") is None:
         return None
-    warnings = result["orgUnitBudgetWarnings"]
+    warnings = result["departmentBudgetWarnings"]
     if not isinstance(warnings, dict):
         return (
-            "orgUnitBudgetWarnings was not the expected subscriber-email -> rule-id "
+            "departmentBudgetWarnings was not the expected subscriber-email -> rule-id "
             "map; read it from the payload below."
         )
     if not warnings:
         return "No subscribers have crossed a department budget warn threshold."
 
     rule_names = _rule_names_by_id(result)
-    balances = result.get("orgUnitBudgetBlockBalances")
+    balances = result.get("departmentBudgetBlockBalances")
     if not isinstance(balances, dict):
         # A missing or malformed balance map costs the balances, never the
         # warning: the counts are what tell an operator someone is at risk.
@@ -398,16 +402,16 @@ def _summarize_org_unit_warnings(result: Any) -> Optional[str]:
     subject = "subscriber is" if total == 1 else "subscribers are"
     header = (
         f"{total} {subject} approaching a department budget (warned, not blocked); "
-        "see orgUnitBudgetWarnings in the payload below for who:"
+        "see departmentBudgetWarnings in the payload below for who:"
     )
     return "\n".join([header] + lines)
 
 
-def _summarize_org_unit_blocks(result: Any) -> Optional[str]:
-    """Render ``orgUnitBudgetBlocks`` as the people it says are blocked.
+def _summarize_department_blocks(result: Any) -> Optional[str]:
+    """Render ``departmentBudgetBlocks`` as the people it says are blocked.
 
     The key is a flat map of subscriber email -> the id of the rule currently
-    blocking that person, compiled server-side from org-unit membership. It is
+    blocking that person, compiled server-side from department membership. It is
     NOT a per-department block count, so the summary resolves each value
     against ``rules`` to recover the rule name and lists the people.
 
@@ -416,12 +420,12 @@ def _summarize_org_unit_blocks(result: Any) -> Optional[str]:
     """
     if not isinstance(result, dict):
         return None
-    if result.get("orgUnitBudgetBlocks") is None:
+    if result.get("departmentBudgetBlocks") is None:
         return None
-    blocks = result["orgUnitBudgetBlocks"]
+    blocks = result["departmentBudgetBlocks"]
     if not isinstance(blocks, dict):
         return (
-            "orgUnitBudgetBlocks was not the expected subscriber-email -> rule-id "
+            "departmentBudgetBlocks was not the expected subscriber-email -> rule-id "
             "map; read it from the payload below."
         )
     if not blocks:
@@ -436,7 +440,7 @@ def _summarize_org_unit_blocks(result: Any) -> Optional[str]:
     remaining = len(blocks) - len(rendered)
     listing = ", ".join(rendered)
     if remaining > 0:
-        listing += f", and {remaining} more (see orgUnitBudgetBlocks in the payload below)"
+        listing += f", and {remaining} more (see departmentBudgetBlocks in the payload below)"
 
     subject = "subscriber is" if len(blocks) == 1 else "subscribers are"
     return (
@@ -723,56 +727,56 @@ class CostControlsManager:
         missing or null groupBreakdown means the rule is pooled, which is not
         the same thing as a grouped rule with zero groups.
 
-        The payload also carries ``orgUnitBudgetBlocks`` and
-        ``orgUnitBudgetWarnings`` on tenants with department budgets;
-        ``_summarize_org_unit_blocks`` and ``_summarize_org_unit_warnings`` are
+        The payload also carries ``departmentBudgetBlocks`` and
+        ``departmentBudgetWarnings`` on tenants with department budgets;
+        ``_summarize_department_blocks`` and ``_summarize_department_warnings`` are
         what turn them into readable prose at the action boundary.
         """
         return await self.client.get_enforcement_rules(rule_id=arguments.get("rule_id"))
 
-    async def preview_org_unit_group(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Preview the org units under a parent before creating an ORG_UNIT rule.
+    async def preview_department_group(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Preview the departments under a parent before creating a DEPARTMENT rule.
 
         Read-only and never called implicitly from create/update. Read
         targetCount for what it is: the DIRECT CHILDREN of the given
-        parent. The groupBy=ORG_UNIT rule this previews is organization-wide
-        and unscoped by that parent — it caps every attributed org unit in
+        parent. The groupBy=DEPARTMENT rule this previews is organization-wide
+        and unscoped by that parent — it caps every attributed department in
         the organization, so the preview can materially understate the
         created rule's fan-out (upstream's own contract note).
         """
-        raw_parent_id = arguments.get("parent_org_unit_id")
+        raw_parent_id = arguments.get("parent_department_id")
         if raw_parent_id is None or (isinstance(raw_parent_id, str) and not raw_parent_id.strip()):
             raise create_structured_missing_parameter_error(
-                parameter_name="parent_org_unit_id",
-                action="preview org unit group",
+                parameter_name="parent_department_id",
+                action="preview department group",
                 examples={
-                    "usage": "preview_org_unit_group(parent_org_unit_id=173)",
-                    "valid_format": ORG_UNIT_ID_SOURCE_NOTE,
+                    "usage": "preview_department_group(parent_department_id=173)",
+                    "valid_format": DEPARTMENT_ID_SOURCE_NOTE,
                 },
             )
-        parent_org_unit_id = _coerce_parent_org_unit_id(raw_parent_id)
+        parent_department_id = _coerce_parent_department_id(raw_parent_id)
 
         # Typed as Any on purpose: the client's return annotation promises a dict,
         # but that promise is a cast over an untyped JSON body, so the shape check
         # below is a real runtime guard rather than dead code.
         response: Any
         try:
-            response = await self.client.preview_org_unit_group(parent_org_unit_id)
+            response = await self.client.preview_department_group(parent_department_id)
         except ReveniumAPIError as e:
             # The endpoint refuses an ungated tenant before it counts anything:
-            # 403 from the feature gate, 422 from the org-unit-attribution check
+            # 403 from the feature gate, 422 from the org-unit-attribution-enabled check
             # nested under it. Both mean "not enabled", which is a different
             # answer from "your key cannot do this" and must read that way.
             if e.status_code in (403, 422):
                 raise ToolError(
-                    message="Department (org-unit) budgets are not enabled for this team",
+                    message="Department budgets are not enabled for this team",
                     error_code=ErrorCodes.API_AUTHORIZATION,
-                    field="parent_org_unit_id",
-                    value=parent_org_unit_id,
+                    field="parent_department_id",
+                    value=parent_department_id,
                     suggestions=[
-                        ORG_UNIT_BUDGETS_FEATURE_NOTE,
+                        DEPARTMENT_BUDGETS_FEATURE_NOTE,
                         "Ask Revenium to enable department budgets for this tenant, "
-                        "then retry preview_org_unit_group.",
+                        "then retry preview_department_group.",
                     ],
                 )
             raise
@@ -781,8 +785,8 @@ class CostControlsManager:
             # Documented as {targetCount, targets}; anything else is an upstream
             # contract change, and saying so beats reporting a fabricated zero.
             return {
-                "action": "preview_org_unit_group",
-                "parent_org_unit_id": str(parent_org_unit_id),
+                "action": "preview_department_group",
+                "parent_department_id": str(parent_department_id),
                 "warning": (
                     "The preview endpoint answered with an unexpected shape "
                     "(expected an object with targetCount and targets)."
@@ -798,8 +802,8 @@ class CostControlsManager:
             # "None per-department budgets" would present a contract change as
             # an answer.
             return {
-                "action": "preview_org_unit_group",
-                "parent_org_unit_id": str(parent_org_unit_id),
+                "action": "preview_department_group",
+                "parent_department_id": str(parent_department_id),
                 "warning": (
                     "The preview endpoint answered with an unexpected shape "
                     "(expected an object with an integer targetCount and a "
@@ -809,8 +813,8 @@ class CostControlsManager:
             }
 
         return {
-            "action": "preview_org_unit_group",
-            "parent_org_unit_id": str(parent_org_unit_id),
+            "action": "preview_department_group",
+            "parent_department_id": str(parent_department_id),
             "target_count": target_count,
             "targets": targets,
         }
@@ -825,7 +829,7 @@ class CostControlsManagement(ToolBase):
       get_enforcement_events_summary, get_enforcement_events_history,
       get_enforcement_events_affected, get_enforcement_rules,
       get_enforcement_rule_roster
-    - 1 org-unit scoping: preview_org_unit_group
+    - 1 department scoping: preview_department_group
     - 3 introspection: get_capabilities, get_examples, get_tool_metadata
     """
 
@@ -835,10 +839,10 @@ class CostControlsManagement(ToolBase):
         "a warn threshold and a hard limit over a spend window with an enforcement "
         "action taken when the limit is crossed; the enforcement surface exposes "
         "the events fired and the compiled rules evaluated. "
-        "Guardrails can be scoped per department with groupBy=ORG_UNIT, and "
-        "preview_org_unit_group reports the direct children of a parent org unit "
-        "before a rule is written - note the created ORG_UNIT rule itself is "
-        "organization-wide, capping every attributed org unit, so the preview "
+        "Guardrails can be scoped per department with groupBy=DEPARTMENT, and "
+        "preview_department_group reports the direct children of a parent department "
+        "before a rule is written - note the created DEPARTMENT rule itself is "
+        "organization-wide, capping every attributed department, so the preview "
         "can understate the rule's real fan-out. "
         "Enforcement events can be narrowed by window, tier, mode, group, "
         "transaction and free text, counted with get_enforcement_events_summary, "
@@ -848,7 +852,7 @@ class CostControlsManagement(ToolBase):
         "Key actions: list, get, create, update, delete, list_enforcement_events, "
         "get_enforcement_events_summary, get_enforcement_events_history, "
         "get_enforcement_events_affected, get_enforcement_rules, "
-        "get_enforcement_rule_roster, preview_org_unit_group. "
+        "get_enforcement_rule_roster, preview_department_group. "
         "Use get_capabilities for full action list."
     )
     business_category = "Core Business Management Tools"
@@ -935,12 +939,14 @@ class CostControlsManagement(ToolBase):
                             "description": (
                                 "Optional dimension to scope the guardrail per group, giving one "
                                 "independent budget per group value instead of a single pooled one. "
-                                "SUBSCRIBER caps each person; ORG_UNIT caps each organizational unit "
-                                "(department). Free string — the server validates the accepted set. "
-                                "Use preview_org_unit_group to see the direct children of a parent org unit "
-                                "before creating an ORG_UNIT rule; note the created rule caps every "
-                                "attributed org unit organization-wide, not only the units under that parent. "
-                                + ORG_UNIT_DIMENSION_SCOPE_NOTE
+                                "SUBSCRIBER caps each person; DEPARTMENT caps each department. "
+                                "Free string — the server validates the accepted set. "
+                                "Use preview_department_group to see the direct children of a parent department "
+                                "before creating a DEPARTMENT rule; note the created rule caps every "
+                                "attributed department organization-wide, not only the departments under that parent. "
+                                + DEPARTMENT_DIMENSION_SCOPE_NOTE
+                                + " "
+                                + deprecated_aliases_note("DEPARTMENT")
                             ),
                         },
                         "filters": {
@@ -949,7 +955,7 @@ class CostControlsManagement(ToolBase):
                                 "Optional filters narrowing which spend the control tracks. On update "
                                 "the list replaces the existing set (an empty list clears every "
                                 "filter); it is never merged. "
-                                + ORG_UNIT_ID_SOURCE_NOTE
+                                + DEPARTMENT_ID_SOURCE_NOTE
                             ),
                             "items": {
                                 "type": "object",
@@ -957,9 +963,11 @@ class CostControlsManagement(ToolBase):
                                     "dimension": {
                                         "type": "string",
                                         "description": (
-                                            "Spend dimension the filter matches on, e.g. ORG_UNIT for a "
+                                            "Spend dimension the filter matches on, e.g. DEPARTMENT for a "
                                             "department. Free string — the server validates. "
-                                            + ORG_UNIT_DIMENSION_SCOPE_NOTE
+                                            + DEPARTMENT_DIMENSION_SCOPE_NOTE
+                                            + " "
+                                            + deprecated_aliases_note("DEPARTMENT")
                                         ),
                                     },
                                     "operator": {
@@ -967,7 +975,7 @@ class CostControlsManagement(ToolBase):
                                         "description": (
                                             "Comparison applied to value (server-validated). "
                                             + FILTER_IN_OPERATOR_NOTE
-                                            + " ORG_UNIT is the exception: it accepts only IS, so "
+                                            + " DEPARTMENT is the exception: it accepts only IS, so "
                                             "one control cannot cover several departments through "
                                             "an IN row."
                                         ),
@@ -976,8 +984,8 @@ class CostControlsManagement(ToolBase):
                                         "type": "string",
                                         "description": (
                                             "Value matched on this dimension, for every operator "
-                                            "except IN (which uses values). For ORG_UNIT this is "
-                                            "the raw numeric org-unit id as a string, e.g. '173'."
+                                            "except IN (which uses values). For DEPARTMENT this is "
+                                            "the raw numeric department id as a string, e.g. '173'."
                                         ),
                                     },
                                     "values": {
@@ -993,10 +1001,10 @@ class CostControlsManagement(ToolBase):
                                     "includeDescendants": {
                                         "type": "boolean",
                                         "description": (
-                                            "Meaningful only when this filter's dimension is ORG_UNIT: "
-                                            "when true the filter also counts spend attributed to org "
-                                            "units nested beneath the one named by value, instead of "
-                                            "that unit alone."
+                                            "Meaningful only when this filter's dimension is DEPARTMENT: "
+                                            "when true the filter also counts spend attributed to "
+                                            "departments nested beneath the one named by value, instead of "
+                                            "that department alone."
                                         ),
                                     },
                                 },
@@ -1008,13 +1016,14 @@ class CostControlsManagement(ToolBase):
                         },
                     },
                 },
-                "parent_org_unit_id": {
+                "parent_department_id": {
                     "type": ["string", "integer"],
                     "description": (
-                        "Org unit whose descendants preview_org_unit_group counts. "
-                        + ORG_UNIT_ID_SOURCE_NOTE
+                        "Department whose descendants preview_department_group counts. "
+                        + DEPARTMENT_ID_SOURCE_NOTE
                     ),
                 },
+                **deprecated_argument_properties("parent_department_id", ["string", "integer"]),
                 "rule_id": {
                     "type": "string",
                     "description": (
@@ -1070,7 +1079,7 @@ class CostControlsManagement(ToolBase):
                 "group_by": {
                     "type": "string",
                     "description": (
-                        "Dimension the group_value belongs to (SUBSCRIBER, ORG_UNIT, MODEL, "
+                        "Dimension the group_value belongs to (SUBSCRIBER, DEPARTMENT, MODEL, "
                         "...). " + ENFORCEMENT_GROUP_PAIR_NOTE
                     ),
                 },
@@ -1140,7 +1149,7 @@ class CostControlsManagement(ToolBase):
                     "type": "string",
                     "description": (
                         "Roster grouping guard for get_enforcement_rule_roster: SUBSCRIBER "
-                        "or ORG_UNIT. A dimension that disagrees with the rule's own "
+                        "or DEPARTMENT. A dimension that disagrees with the rule's own "
                         "grouping is refused rather than answered with the other kind of row."
                     ),
                 },
@@ -1185,8 +1194,8 @@ class CostControlsManagement(ToolBase):
             "get_enforcement_events_affected",
             "get_enforcement_rules",
             "get_enforcement_rule_roster",
-            # Org-unit (department) scoping
-            "preview_org_unit_group",
+            # Department scoping
+            "preview_department_group",
             # Introspection
             "get_capabilities",
             "get_examples",
@@ -1245,12 +1254,12 @@ class CostControlsManagement(ToolBase):
                     "Rules in that set carry a groupBreakdown array of per-group balances "
                     "(groupValue, displayName, currentValue, usagePercent, breached) when the "
                     "rule is subscriber-grouped, and a null groupBreakdown when it is pooled. "
-                    "The compiled payload also carries orgUnitBudgetBlocks on tenants with "
+                    "The compiled payload also carries departmentBudgetBlocks on tenants with "
                     "department budgets: a flat map of subscriber email -> the id of the rule "
                     "currently blocking that person (not a per-department count), which "
                     "get_enforcement_rules summarizes into who is blocked and by which rule. "
                     "That output therefore contains subscriber email addresses. "
-                    + ORG_UNIT_ENFORCEMENT_MAPS_NOTE
+                    + DEPARTMENT_ENFORCEMENT_MAPS_NOTE
                     + " "
                     + ENFORCEMENT_EVENT_ROW_FIELDS_NOTE
                 ),
@@ -1290,7 +1299,7 @@ class CostControlsManagement(ToolBase):
                         "search": "str (optional, over a row's key, label and email)",
                         "band": "str (optional, BLOCKED|WARNED|UNDER|ALL)",
                         "sort": "str (optional, PERCENT|SPEND|NAME|LAST_EVENT)",
-                        "dimension": "str (optional guard, SUBSCRIBER|ORG_UNIT)",
+                        "dimension": "str (optional guard, SUBSCRIBER|DEPARTMENT)",
                     },
                 },
                 examples=[
@@ -1318,9 +1327,9 @@ class CostControlsManagement(ToolBase):
                     "'no compiled rule with this id', never 'this team has no rules'",
                     "get_enforcement_rules output includes subscriber email addresses when "
                     "department budgets are blocking anyone (see this capability's description)",
-                    "orgUnitBudgetBlocks is absent on tenants without department budgets; the "
+                    "departmentBudgetBlocks is absent on tenants without department budgets; the "
                     "summary omits the line rather than reporting zero blocked subscribers",
-                    "orgUnitBudgetWarnings is treated the same way - absent means no warn "
+                    "departmentBudgetWarnings is treated the same way - absent means no warn "
                     "summary at all, not zero warned - and its summary counts people per rule "
                     "instead of naming them",
                     "groupBreakdown (see this capability's description) is a response field, never "
@@ -1328,37 +1337,40 @@ class CostControlsManagement(ToolBase):
                 ],
             ),
             ToolCapability(
-                name="Org Unit (Department) Scoping",
+                name="Department Scoping",
                 description=(
-                    "Scope a guardrail per organizational unit: control_data.groupBy='ORG_UNIT' "
+                    "Scope a guardrail per department: control_data.groupBy='DEPARTMENT' "
                     "turns one control into one independent budget per department, and a "
-                    "control_data.filters entry with dimension='ORG_UNIT' (optionally "
-                    "includeDescendants=true to include nested units) narrows a control to one "
-                    "department's spend. preview_org_unit_group reports the fan-out - "
-                    "target_count is the number of DIRECT CHILDREN of the given parent org unit "
-                    "— NOT how many budgets the rule creates: a groupBy=ORG_UNIT rule is "
+                    "control_data.filters entry with dimension='DEPARTMENT' (optionally "
+                    "includeDescendants=true to include nested departments) narrows a control to one "
+                    "department's spend. preview_department_group reports the fan-out - "
+                    "target_count is the number of DIRECT CHILDREN of the given parent department "
+                    "— NOT how many budgets the rule creates: a groupBy=DEPARTMENT rule is "
                     "organization-wide and unscoped by the parent, capping every attributed "
-                    "org unit, so the preview can understate the rule's real fan-out. The "
+                    "department, so the preview can understate the rule's real fan-out. The "
                     "preview itself creates nothing. "
-                    + ORG_UNIT_ID_SOURCE_NOTE
+                    + DEPARTMENT_ID_SOURCE_NOTE
                     + " "
-                    + ORG_UNIT_DIMENSION_SCOPE_NOTE
+                    + DEPARTMENT_DIMENSION_SCOPE_NOTE
                 ),
                 parameters={
-                    "preview_org_unit_group": {
-                        "parent_org_unit_id": "str|int (required, raw numeric org-unit id)",
+                    "preview_department_group": {
+                        "parent_department_id": "str|int (required, raw numeric department id)",
                     },
                 },
                 examples=[
-                    "preview_org_unit_group(parent_org_unit_id=173)",
-                    "create(control_data={'name': 'Per-department monthly cap', 'metricType': 'TOTAL_COST', 'hardLimit': 500, 'windowType': 'MONTHLY', 'action': 'BLOCK', 'groupBy': 'ORG_UNIT'})",
-                    "create(control_data={'name': 'Engineering cap', 'metricType': 'TOTAL_COST', 'hardLimit': 500, 'windowType': 'MONTHLY', 'action': 'BLOCK', 'filters': [{'dimension': 'ORG_UNIT', 'operator': 'IS', 'value': '173', 'includeDescendants': True}]})",
+                    "preview_department_group(parent_department_id=173)",
+                    "create(control_data={'name': 'Per-department monthly cap', 'metricType': 'TOTAL_COST', 'hardLimit': 500, 'windowType': 'MONTHLY', 'action': 'BLOCK', 'groupBy': 'DEPARTMENT'})",
+                    "create(control_data={'name': 'Engineering cap', 'metricType': 'TOTAL_COST', 'hardLimit': 500, 'windowType': 'MONTHLY', 'action': 'BLOCK', 'filters': [{'dimension': 'DEPARTMENT', 'operator': 'IS', 'value': '173', 'includeDescendants': True}]})",
                 ],
                 limitations=[
-                    "preview_org_unit_group is read-only and is never called implicitly by "
+                    "preview_department_group is read-only and is never called implicitly by "
                     "create or update",
-                    ORG_UNIT_BUDGETS_FEATURE_NOTE,
-                    ORG_UNIT_PREVIEW_SEMANTICS_NOTE,
+                    DEPARTMENT_BUDGETS_FEATURE_NOTE,
+                    DEPARTMENT_PREVIEW_SEMANTICS_NOTE,
+                    deprecated_aliases_note(
+                        "preview_department_group", "parent_department_id", "DEPARTMENT"
+                    ),
                 ],
             ),
         ]
@@ -1454,7 +1466,7 @@ class CostControlsManagement(ToolBase):
                                 "hardLimit": 500,
                                 "windowType": "MONTHLY",
                                 "action": "BLOCK",
-                                "groupBy": "ORG_UNIT",
+                                "groupBy": "DEPARTMENT",
                             },
                         },
                         "filter_one_department": {
@@ -1467,7 +1479,7 @@ class CostControlsManagement(ToolBase):
                                 "action": "BLOCK",
                                 "filters": [
                                     {
-                                        "dimension": "ORG_UNIT",
+                                        "dimension": "DEPARTMENT",
                                         "operator": "IS",
                                         "value": "173",
                                         "includeDescendants": True,
@@ -1492,9 +1504,9 @@ class CostControlsManagement(ToolBase):
                                 ],
                             },
                         },
-                        "preview_org_unit_group": {
-                            "action": "preview_org_unit_group",
-                            "parent_org_unit_id": 173,
+                        "preview_department_group": {
+                            "action": "preview_department_group",
+                            "parent_department_id": 173,
                         },
                     },
                     "filter_notes": [FILTER_IN_OPERATOR_NOTE],
@@ -1505,19 +1517,22 @@ class CostControlsManagement(ToolBase):
                         ENFORCEMENT_SUBREADS_UNPAGED_NOTE,
                         ENFORCEMENT_ROSTER_NOTE,
                     ],
-                    "org_unit_notes": [
-                        ORG_UNIT_ID_SOURCE_NOTE,
-                        ORG_UNIT_DIMENSION_SCOPE_NOTE,
-                        ORG_UNIT_BUDGETS_FEATURE_NOTE,
-                        ORG_UNIT_PREVIEW_SEMANTICS_NOTE,
-                        ORG_UNIT_ENFORCEMENT_MAPS_NOTE,
+                    "department_notes": [
+                        DEPARTMENT_ID_SOURCE_NOTE,
+                        DEPARTMENT_DIMENSION_SCOPE_NOTE,
+                        DEPARTMENT_BUDGETS_FEATURE_NOTE,
+                        DEPARTMENT_PREVIEW_SEMANTICS_NOTE,
+                        DEPARTMENT_ENFORCEMENT_MAPS_NOTE,
+                        deprecated_aliases_note(
+                            "preview_department_group", "parent_department_id", "DEPARTMENT"
+                        ),
                     ],
                 }
                 if action == "get_examples":
                     return [
                         TextContent(
                             type="text",
-                            text=f"Cost Controls Management Examples:\n{json.dumps({'action': 'get_examples', 'examples': capabilities['examples'], 'filter_notes': capabilities['filter_notes'], 'enforcement_notes': capabilities['enforcement_notes'], 'org_unit_notes': capabilities['org_unit_notes']}, indent=2)}",
+                            text=f"Cost Controls Management Examples:\n{json.dumps({'action': 'get_examples', 'examples': capabilities['examples'], 'filter_notes': capabilities['filter_notes'], 'enforcement_notes': capabilities['enforcement_notes'], 'department_notes': capabilities['department_notes']}, indent=2)}",
                         )
                     ]
                 return [
@@ -1644,13 +1659,13 @@ class CostControlsManagement(ToolBase):
                 )
                 # Extra lines, never a blank one: callers (and tests) split the
                 # first blank line to recover the JSON payload.
-                blocks_summary = _summarize_org_unit_blocks(result)
+                blocks_summary = _summarize_department_blocks(result)
                 if blocks_summary:
                     header = f"{header}\n{blocks_summary}"
                 # Blocks first, then warnings: the two maps are disjoint
                 # upstream, and what is already enforced outranks what is
                 # merely approaching.
-                warnings_summary = _summarize_org_unit_warnings(result)
+                warnings_summary = _summarize_department_warnings(result)
                 if warnings_summary:
                     header = f"{header}\n{warnings_summary}"
                 return [
@@ -1660,8 +1675,8 @@ class CostControlsManagement(ToolBase):
                     )
                 ]
 
-            elif action == "preview_org_unit_group":
-                result = await manager.preview_org_unit_group(arguments)
+            elif action == "preview_department_group":
+                result = await manager.preview_department_group(arguments)
                 if "warning" in result:
                     # The manager could not extract a preview from the response;
                     # a summary sentence with target_count=None would present the
@@ -1680,10 +1695,10 @@ class CostControlsManagement(ToolBase):
                     TextContent(
                         type="text",
                         text=(
-                            f"Org unit {result.get('parent_org_unit_id')} has "
-                            f"{target_count} direct child org unit(s) (targets below). "
-                            "Note: a groupBy=ORG_UNIT rule is organization-wide — it "
-                            "caps every attributed org unit, not only these:\n\n"
+                            f"Department {result.get('parent_department_id')} has "
+                            f"{target_count} direct child department(s) (targets below). "
+                            "Note: a groupBy=DEPARTMENT rule is organization-wide — it "
+                            "caps every attributed department, not only these:\n\n"
                             + json.dumps(result, indent=2)
                         ),
                     )

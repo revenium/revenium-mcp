@@ -17,13 +17,13 @@ from src.revenium_mcp_server.tools_decomposed.cost_controls_management import (
     ENFORCEMENT_GROUP_PAIR_NOTE,
     ENFORCEMENT_ROSTER_NOTE,
     ENFORCEMENT_SUBREADS_UNPAGED_NOTE,
-    ORG_UNIT_ENFORCEMENT_MAPS_NOTE,
+    DEPARTMENT_ENFORCEMENT_MAPS_NOTE,
     CostControlsManager,
     CostControlsManagement,
     _build_enforcement_event_filters,
-    _coerce_parent_org_unit_id,
-    _summarize_org_unit_blocks,
-    _summarize_org_unit_warnings,
+    _coerce_parent_department_id,
+    _summarize_department_blocks,
+    _summarize_department_warnings,
 )
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
@@ -50,7 +50,7 @@ def mock_client():
     client.get_enforcement_events_affected = AsyncMock()
     client.get_enforcement_rules = AsyncMock()
     client.get_enforcement_rule_roster = AsyncMock()
-    client.preview_org_unit_group = AsyncMock()
+    client.preview_department_group = AsyncMock()
     client._extract_embedded_data = MagicMock()
     client._extract_pagination_info = MagicMock()
     return client
@@ -592,56 +592,56 @@ class TestCostControlsManagementActions:
 
 
 # ===========================================================================
-# BACK-2764: ORG_UNIT (department) scoping
+# BACK-2764: DEPARTMENT (department) scoping
 # ===========================================================================
 
 
-class TestCoerceParentOrgUnitId:
-    """The raw numeric org-unit id arrives as an int or as a digit string."""
+class TestCoerceParentDepartmentId:
+    """The raw numeric department id arrives as an int or as a digit string."""
 
     @pytest.mark.parametrize(
         "raw,expected",
         [(173, 173), ("173", 173), ("  173 ", 173), (173.0, 173), (0, 0)],
     )
     def test_numeric_forms_are_accepted(self, raw, expected):
-        assert _coerce_parent_org_unit_id(raw) == expected
+        assert _coerce_parent_department_id(raw) == expected
 
     @pytest.mark.parametrize("raw", [True, False, "abc", "17.5", "", "-1", -1, None, [], {}])
     def test_non_ids_are_rejected_before_the_call(self, raw):
-        """Rejecting here means the caller reads "not a numeric org-unit id"
+        """Rejecting here means the caller reads "not a numeric department id"
         instead of an upstream 400 about a field they cannot see."""
         with pytest.raises(ToolError) as exc:
-            _coerce_parent_org_unit_id(raw)
+            _coerce_parent_department_id(raw)
         assert exc.value.error_code == ErrorCodes.INVALID_PARAMETER
 
-    def test_rejection_points_at_the_org_unit_listing(self):
+    def test_rejection_points_at_the_department_listing(self):
         with pytest.raises(ToolError) as exc:
-            _coerce_parent_org_unit_id("engineering")
-        assert "list_org_units" in json.dumps(exc.value.suggestions)
+            _coerce_parent_department_id("engineering")
+        assert "list_departments" in json.dumps(exc.value.suggestions)
 
 
-class TestSummarizeOrgUnitBlocks:
-    """orgUnitBudgetBlocks is subscriber email -> the id of the blocking rule."""
+class TestSummarizeDepartmentBlocks:
+    """departmentBudgetBlocks is subscriber email -> the id of the blocking rule."""
 
     def test_absent_key_produces_no_line(self):
         """An older tenant never sends the map; reporting "0 blocked" from its
         absence would be an invented fact."""
-        assert _summarize_org_unit_blocks({"rules": [], "compiledAt": None}) is None
+        assert _summarize_department_blocks({"rules": [], "compiledAt": None}) is None
 
     def test_explicit_null_produces_no_line(self):
-        assert _summarize_org_unit_blocks({"orgUnitBudgetBlocks": None}) is None
+        assert _summarize_department_blocks({"departmentBudgetBlocks": None}) is None
 
     def test_non_dict_payload_produces_no_line(self):
-        assert _summarize_org_unit_blocks("not a payload") is None
+        assert _summarize_department_blocks("not a payload") is None
 
     def test_empty_map_says_nobody_is_blocked(self):
-        summary = _summarize_org_unit_blocks({"orgUnitBudgetBlocks": {}, "rules": []})
+        summary = _summarize_department_blocks({"departmentBudgetBlocks": {}, "rules": []})
         assert summary == "No subscribers are currently blocked by a department budget."
 
     def test_rule_id_is_resolved_to_the_rule_name(self):
-        summary = _summarize_org_unit_blocks(
+        summary = _summarize_department_blocks(
             {
-                "orgUnitBudgetBlocks": {"ada@example.com": 42, "grace@example.com": 42},
+                "departmentBudgetBlocks": {"ada@example.com": 42, "grace@example.com": 42},
                 "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
             }
         )
@@ -650,9 +650,9 @@ class TestSummarizeOrgUnitBlocks:
         assert "grace@example.com (Engineering monthly cap)" in summary
 
     def test_single_block_reads_as_singular(self):
-        summary = _summarize_org_unit_blocks(
+        summary = _summarize_department_blocks(
             {
-                "orgUnitBudgetBlocks": {"ada@example.com": 42},
+                "departmentBudgetBlocks": {"ada@example.com": 42},
                 "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
             }
         )
@@ -661,9 +661,9 @@ class TestSummarizeOrgUnitBlocks:
     def test_string_rule_ids_still_resolve_to_names(self):
         """The map's values and rules[].ruleId are not guaranteed to share a
         JSON type, so the lookup compares them as strings."""
-        summary = _summarize_org_unit_blocks(
+        summary = _summarize_department_blocks(
             {
-                "orgUnitBudgetBlocks": {"ada@example.com": "42"},
+                "departmentBudgetBlocks": {"ada@example.com": "42"},
                 "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
             }
         )
@@ -672,77 +672,77 @@ class TestSummarizeOrgUnitBlocks:
     def test_unresolvable_rule_id_falls_back_to_the_id(self):
         """A block whose rule is not in the compiled set still names someone
         blocked — dropping the entry would hide a real block."""
-        summary = _summarize_org_unit_blocks(
-            {"orgUnitBudgetBlocks": {"ada@example.com": 99}, "rules": []}
+        summary = _summarize_department_blocks(
+            {"departmentBudgetBlocks": {"ada@example.com": 99}, "rules": []}
         )
         assert "ada@example.com (rule 99)" in summary
 
     def test_long_block_lists_are_bounded_and_point_at_the_payload(self):
         blocks = {f"user{i}@example.com": 42 for i in range(15)}
-        summary = _summarize_org_unit_blocks(
-            {"orgUnitBudgetBlocks": blocks, "rules": [{"ruleId": 42, "name": "Cap"}]}
+        summary = _summarize_department_blocks(
+            {"departmentBudgetBlocks": blocks, "rules": [{"ruleId": 42, "name": "Cap"}]}
         )
         assert "15 subscribers are currently blocked" in summary
         assert "and 5 more" in summary
         assert "user14@example.com" not in summary
 
     def test_unexpected_shape_is_reported_not_silently_dropped(self):
-        summary = _summarize_org_unit_blocks({"orgUnitBudgetBlocks": ["ada@example.com"]})
+        summary = _summarize_department_blocks({"departmentBudgetBlocks": ["ada@example.com"]})
         assert "not the expected" in summary
 
     def test_summary_warns_that_it_names_people(self):
-        summary = _summarize_org_unit_blocks(
-            {"orgUnitBudgetBlocks": {"ada@example.com": 42}, "rules": []}
+        summary = _summarize_department_blocks(
+            {"departmentBudgetBlocks": {"ada@example.com": 42}, "rules": []}
         )
         assert "subscriber email addresses" in summary
 
 
-class TestCostControlsManagerPreviewOrgUnitGroup:
-    """preview_org_unit_group counts the per-department fan-out, read-only."""
+class TestCostControlsManagerPreviewDepartmentGroup:
+    """preview_department_group counts the per-department fan-out, read-only."""
 
     @pytest.mark.asyncio
     async def test_missing_parent_id_raises(self, cc_manager):
         with pytest.raises(ToolError) as exc:
-            await cc_manager.preview_org_unit_group({})
+            await cc_manager.preview_department_group({})
         assert exc.value.error_code == ErrorCodes.MISSING_PARAMETER
 
     @pytest.mark.asyncio
     async def test_blank_parent_id_raises_missing_not_invalid(self, cc_manager):
         with pytest.raises(ToolError) as exc:
-            await cc_manager.preview_org_unit_group({"parent_org_unit_id": "   "})
+            await cc_manager.preview_department_group({"parent_department_id": "   "})
         assert exc.value.error_code == ErrorCodes.MISSING_PARAMETER
 
     @pytest.mark.asyncio
     async def test_digit_string_is_sent_as_a_number(self, cc_manager, mock_client):
-        mock_client.preview_org_unit_group.return_value = {"targetCount": 3, "targets": []}
+        mock_client.preview_department_group.return_value = {"targetCount": 3, "targets": []}
 
-        await cc_manager.preview_org_unit_group({"parent_org_unit_id": "173"})
+        await cc_manager.preview_department_group({"parent_department_id": "173"})
 
-        mock_client.preview_org_unit_group.assert_awaited_once_with(173)
+        mock_client.preview_department_group.assert_awaited_once_with(173)
 
     @pytest.mark.asyncio
     async def test_returns_target_count_and_targets(self, cc_manager, mock_client):
         targets = [{"id": "ou_1", "name": "Engineering"}]
-        mock_client.preview_org_unit_group.return_value = {"targetCount": 1, "targets": targets}
+        mock_client.preview_department_group.return_value = {"targetCount": 1, "targets": targets}
 
-        result = await cc_manager.preview_org_unit_group({"parent_org_unit_id": 173})
+        result = await cc_manager.preview_department_group({"parent_department_id": 173})
 
-        assert result["action"] == "preview_org_unit_group"
-        assert result["parent_org_unit_id"] == "173"
+        assert result["action"] == "preview_department_group"
+        assert result["parent_department_id"] == "173"
         assert result["target_count"] == 1
         assert result["targets"] == targets
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", [403, 422])
     async def test_feature_flag_refusal_is_explained(self, cc_manager, mock_client, status):
-        """403 (feature gate) and 422 (org-unit attribution check beneath it)
+        """403 (feature gate) and 422 (department attribution check beneath it)
         both mean "not enabled for this tenant", not "your key is wrong"."""
-        mock_client.preview_org_unit_group.side_effect = ReveniumAPIError(
+        mock_client.preview_department_group.side_effect = ReveniumAPIError(
             "Feature not available", status_code=status
         )
 
         with pytest.raises(ToolError) as exc:
-            await cc_manager.preview_org_unit_group({"parent_org_unit_id": 173})
+            await cc_manager.preview_department_group({"parent_department_id": 173})
 
         assert "not enabled for this team" in exc.value.message
         assert "feature flag" in json.dumps(exc.value.suggestions)
@@ -750,29 +750,29 @@ class TestCostControlsManagerPreviewOrgUnitGroup:
     @pytest.mark.asyncio
     async def test_other_api_errors_propagate(self, cc_manager, mock_client):
         """A 500 is a server failure, not evidence the feature is off."""
-        mock_client.preview_org_unit_group.side_effect = ReveniumAPIError(
+        mock_client.preview_department_group.side_effect = ReveniumAPIError(
             "boom", status_code=500
         )
         with pytest.raises(ReveniumAPIError):
-            await cc_manager.preview_org_unit_group({"parent_org_unit_id": 173})
+            await cc_manager.preview_department_group({"parent_department_id": 173})
 
     @pytest.mark.asyncio
     async def test_unexpected_response_shape_is_reported(self, cc_manager, mock_client):
         """Reporting the shape beats rendering a fabricated count of zero."""
-        mock_client.preview_org_unit_group.return_value = [1, 2, 3]
+        mock_client.preview_department_group.return_value = [1, 2, 3]
 
-        result = await cc_manager.preview_org_unit_group({"parent_org_unit_id": 173})
+        result = await cc_manager.preview_department_group({"parent_department_id": 173})
 
         assert "unexpected shape" in result["warning"]
         assert "target_count" not in result
 
 
-class TestOrgUnitDocumentationSurface:
-    """An agent must be able to discover ORG_UNIT without reading the wire format."""
+class TestDepartmentDocumentationSurface:
+    """An agent must be able to discover DEPARTMENT without reading the wire format."""
 
     @pytest.mark.asyncio
     async def test_preview_action_is_supported(self, cc_mgmt):
-        assert "preview_org_unit_group" in await cc_mgmt._get_supported_actions()
+        assert "preview_department_group" in await cc_mgmt._get_supported_actions()
 
     @pytest.mark.asyncio
     async def test_capabilities_document_the_preview_action(self, cc_mgmt):
@@ -780,32 +780,32 @@ class TestOrgUnitDocumentationSurface:
         documented = set()
         for cap in caps:
             documented.update(cap.parameters.keys())
-        assert "preview_org_unit_group" in documented
+        assert "preview_department_group" in documented
 
     @pytest.mark.asyncio
-    async def test_group_by_names_org_unit(self, cc_mgmt):
+    async def test_group_by_names_department(self, cc_mgmt):
         schema = await cc_mgmt._get_input_schema()
         group_by = schema["properties"]["control_data"]["properties"]["groupBy"]
-        assert "ORG_UNIT" in group_by["description"]
+        assert "DEPARTMENT" in group_by["description"]
 
     @pytest.mark.asyncio
     async def test_include_descendants_is_documented_on_the_filter_item(self, cc_mgmt):
         """The flag lives on each filter entry and only means something for
-        ORG_UNIT, so documenting it as a top-level field would mislead."""
+        DEPARTMENT, so documenting it as a top-level field would mislead."""
         schema = await cc_mgmt._get_input_schema()
         control_data = schema["properties"]["control_data"]["properties"]
         assert "includeDescendants" not in control_data
         item = control_data["filters"]["items"]["properties"]["includeDescendants"]
-        assert "ORG_UNIT" in item["description"]
+        assert "DEPARTMENT" in item["description"]
 
     @pytest.mark.asyncio
-    async def test_parent_org_unit_id_is_declared(self, cc_mgmt):
+    async def test_parent_department_id_is_declared(self, cc_mgmt):
         schema = await cc_mgmt._get_input_schema()
-        assert "parent_org_unit_id" in schema["properties"]
+        assert "parent_department_id" in schema["properties"]
 
     @pytest.mark.asyncio
-    async def test_org_unit_is_documented_as_cost_control_only(self, cc_mgmt):
-        """BACK-2760 closed with the alert/anomaly API throwing on ORG_UNIT, so
+    async def test_department_is_documented_as_cost_control_only(self, cc_mgmt):
+        """BACK-2760 closed with the alert/anomaly API throwing on DEPARTMENT, so
         the tool that teaches the dimension must also fence it off."""
         caps = await cc_mgmt._get_tool_capabilities()
         rendered = json.dumps([c.description for c in caps])
@@ -813,9 +813,9 @@ class TestOrgUnitDocumentationSurface:
         assert "cost-control-only" in rendered
 
     @pytest.mark.asyncio
-    async def test_examples_teach_the_org_unit_notes(self, cc_mgmt):
+    async def test_examples_teach_the_department_notes(self, cc_mgmt):
         result = await cc_mgmt.handle_action("get_examples", {})
-        assert "preview_org_unit_group" in result[0].text
+        assert "preview_department_group" in result[0].text
         assert "manage_alerts" in result[0].text
 
 
@@ -827,7 +827,7 @@ class TestEnforcementRulesBlockSummaryRendering:
         mock_client.get_enforcement_rules.return_value = {
             "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
             "compiledAt": "2026-08-26T00:00:00Z",
-            "orgUnitBudgetBlocks": {"ada@example.com": 42},
+            "departmentBudgetBlocks": {"ada@example.com": 42},
         }
         cc_mgmt.get_client = AsyncMock(return_value=mock_client)
 
@@ -844,7 +844,7 @@ class TestEnforcementRulesBlockSummaryRendering:
         payload = {
             "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
             "compiledAt": "2026-08-26T00:00:00Z",
-            "orgUnitBudgetBlocks": {"ada@example.com": 42},
+            "departmentBudgetBlocks": {"ada@example.com": 42},
         }
         mock_client.get_enforcement_rules.return_value = payload
         cc_mgmt.get_client = AsyncMock(return_value=mock_client)
@@ -864,18 +864,18 @@ class TestEnforcementRulesBlockSummaryRendering:
 
     @pytest.mark.asyncio
     async def test_preview_action_reports_the_fan_out(self, cc_mgmt, mock_client):
-        mock_client.preview_org_unit_group.return_value = {
+        mock_client.preview_department_group.return_value = {
             "targetCount": 4,
             "targets": [],
         }
         cc_mgmt.get_client = AsyncMock(return_value=mock_client)
 
         result = await cc_mgmt.handle_action(
-            "preview_org_unit_group", {"parent_org_unit_id": 173}
+            "preview_department_group", {"parent_department_id": 173}
         )
 
         text = result[0].text
-        assert "4 direct child org unit(s)" in text
+        assert "4 direct child department(s)" in text
         assert "organization-wide" in text
 
 
@@ -885,21 +885,21 @@ class TestPreviewResponseShapeGuards:
     @pytest.mark.asyncio
     async def test_unicode_digit_string_gets_the_structured_error(self, cc_manager):
         with pytest.raises(ToolError) as excinfo:
-            await cc_manager.preview_org_unit_group({"parent_org_unit_id": "\u00b2"})
-        assert "numeric org-unit id" in str(excinfo.value.message)
+            await cc_manager.preview_department_group({"parent_department_id": "\u00b2"})
+        assert "numeric department id" in str(excinfo.value.message)
 
     @pytest.mark.asyncio
     async def test_dict_without_expected_fields_takes_the_warning_path(self, cc_manager):
-        cc_manager.client.preview_org_unit_group = AsyncMock(return_value={"ok": True})
-        result = await cc_manager.preview_org_unit_group({"parent_org_unit_id": 42})
+        cc_manager.client.preview_department_group = AsyncMock(return_value={"ok": True})
+        result = await cc_manager.preview_department_group({"parent_department_id": 42})
         assert "warning" in result and "target_count" not in result
 
     @pytest.mark.asyncio
     async def test_wrong_typed_fields_take_the_warning_path(self, cc_manager):
-        cc_manager.client.preview_org_unit_group = AsyncMock(
+        cc_manager.client.preview_department_group = AsyncMock(
             return_value={"targetCount": "3", "targets": "nope"}
         )
-        result = await cc_manager.preview_org_unit_group({"parent_org_unit_id": 42})
+        result = await cc_manager.preview_department_group({"parent_department_id": 42})
         assert "warning" in result
 
     @pytest.mark.asyncio
@@ -907,15 +907,15 @@ class TestPreviewResponseShapeGuards:
         from unittest.mock import patch
 
         with patch.object(
-            CostControlsManager, "preview_org_unit_group",
+            CostControlsManager, "preview_department_group",
             new=AsyncMock(return_value={
-                "action": "preview_org_unit_group",
-                "parent_org_unit_id": "42",
+                "action": "preview_department_group",
+                "parent_department_id": "42",
                 "warning": "The preview endpoint answered with an unexpected shape",
                 "raw_response": {},
             }),
         ):
-            out = await cc_mgmt.handle_action("preview_org_unit_group", {"parent_org_unit_id": 42})
+            out = await cc_mgmt.handle_action("preview_department_group", {"parent_department_id": 42})
         text = out[0].text
         assert text.startswith("WARNING:")
         assert "None per-department" not in text and "would create None" not in text
@@ -925,22 +925,22 @@ class TestPreviewResponseShapeGuards:
         from unittest.mock import patch
 
         with patch.object(
-            CostControlsManager, "preview_org_unit_group",
+            CostControlsManager, "preview_department_group",
             new=AsyncMock(return_value={
-                "action": "preview_org_unit_group",
-                "parent_org_unit_id": "42",
+                "action": "preview_department_group",
+                "parent_department_id": "42",
                 "target_count": 6,
                 "targets": [],
             }),
         ):
-            out = await cc_mgmt.handle_action("preview_org_unit_group", {"parent_org_unit_id": 42})
+            out = await cc_mgmt.handle_action("preview_department_group", {"parent_department_id": 42})
         text = out[0].text
-        assert "direct child org unit" in text
+        assert "direct child department" in text
         assert "organization-wide" in text
         assert "would create" not in text
 
 
-class TestOrgUnitDocsMatchUpstreamContract:
+class TestDepartmentDocsMatchUpstreamContract:
     """PR #331 cross-repo review: examples agents copy must not 400, and the
     preview semantics must not invite under-sizing a BLOCK rule's fan-out."""
 
@@ -998,13 +998,13 @@ class TestFilterValuesOnTheItemSchema:
         assert "OR within one row only" in rendered
 
     @pytest.mark.asyncio
-    async def test_org_unit_is_fenced_off_from_in(self, cc_mgmt):
-        """Upstream refuses IN for ORG_UNIT (CostControlService.toEntity), so
+    async def test_department_is_fenced_off_from_in(self, cc_mgmt):
+        """Upstream refuses IN for DEPARTMENT (CostControlService.toEntity), so
         the surface that teaches the dimension must not invite it."""
         schema = await cc_mgmt._get_input_schema()
         item = schema["properties"]["control_data"]["properties"]["filters"]["items"]
         operator_doc = item["properties"]["operator"]["description"]
-        assert "ORG_UNIT" in operator_doc
+        assert "DEPARTMENT" in operator_doc
         assert "only IS" in operator_doc
 
     @pytest.mark.asyncio
@@ -1020,32 +1020,32 @@ class TestFilterValuesOnTheItemSchema:
         assert "either value or values, never both" in rendered
 
     @pytest.mark.asyncio
-    async def test_org_unit_capability_carries_the_is_only_rule(self, cc_mgmt):
+    async def test_department_capability_carries_the_is_only_rule(self, cc_mgmt):
         caps = await cc_mgmt.handle_action("get_capabilities", {})
         assert "only the IS operator" in caps[0].text
 
 
-class TestSummarizeOrgUnitWarnings:
-    """orgUnitBudgetWarnings is subscriber email -> the rule whose warn tier
-    they crossed, disjoint from orgUnitBudgetBlocks."""
+class TestSummarizeDepartmentWarnings:
+    """departmentBudgetWarnings is subscriber email -> the rule whose warn tier
+    they crossed, disjoint from departmentBudgetBlocks."""
 
     def test_absent_key_produces_no_line(self):
-        assert _summarize_org_unit_warnings({"rules": [], "compiledAt": None}) is None
+        assert _summarize_department_warnings({"rules": [], "compiledAt": None}) is None
 
     def test_explicit_null_produces_no_line(self):
-        assert _summarize_org_unit_warnings({"orgUnitBudgetWarnings": None}) is None
+        assert _summarize_department_warnings({"departmentBudgetWarnings": None}) is None
 
     def test_non_dict_payload_produces_no_line(self):
-        assert _summarize_org_unit_warnings("not a payload") is None
+        assert _summarize_department_warnings("not a payload") is None
 
     def test_empty_map_says_nobody_crossed_a_warn_threshold(self):
-        summary = _summarize_org_unit_warnings({"orgUnitBudgetWarnings": {}, "rules": []})
+        summary = _summarize_department_warnings({"departmentBudgetWarnings": {}, "rules": []})
         assert summary == "No subscribers have crossed a department budget warn threshold."
 
     def test_rule_ids_are_resolved_to_names_and_counted(self):
-        summary = _summarize_org_unit_warnings(
+        summary = _summarize_department_warnings(
             {
-                "orgUnitBudgetWarnings": {
+                "departmentBudgetWarnings": {
                     "ada@example.com": 42,
                     "grace@example.com": 42,
                     "alan@example.com": 43,
@@ -1064,21 +1064,21 @@ class TestSummarizeOrgUnitWarnings:
         """The block summary names people because a block is an incident about
         one person; the warn summary is per rule, so it must not widen the PII
         footprint of the same action."""
-        summary = _summarize_org_unit_warnings(
+        summary = _summarize_department_warnings(
             {
-                "orgUnitBudgetWarnings": {"ada@example.com": 42},
+                "departmentBudgetWarnings": {"ada@example.com": 42},
                 "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
             }
         )
         assert "ada@example.com" not in summary
         assert "1 subscriber is approaching" in summary
-        assert "orgUnitBudgetWarnings in the payload below" in summary
+        assert "departmentBudgetWarnings in the payload below" in summary
 
     def test_balances_are_shown_when_the_map_carries_them(self):
-        summary = _summarize_org_unit_warnings(
+        summary = _summarize_department_warnings(
             {
-                "orgUnitBudgetWarnings": {"ada@example.com": 42, "grace@example.com": 42},
-                "orgUnitBudgetBlockBalances": {
+                "departmentBudgetWarnings": {"ada@example.com": 42, "grace@example.com": 42},
+                "departmentBudgetBlockBalances": {
                     "ada@example.com": 455.25,
                     "grace@example.com": 480.5,
                 },
@@ -1089,9 +1089,9 @@ class TestSummarizeOrgUnitWarnings:
         assert "balances compared: 480.5, 455.25" in summary
 
     def test_missing_balance_map_still_reports_the_counts(self):
-        summary = _summarize_org_unit_warnings(
+        summary = _summarize_department_warnings(
             {
-                "orgUnitBudgetWarnings": {"ada@example.com": 42},
+                "departmentBudgetWarnings": {"ada@example.com": 42},
                 "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
             }
         )
@@ -1099,10 +1099,10 @@ class TestSummarizeOrgUnitWarnings:
         assert "balances compared" not in summary
 
     def test_malformed_balance_map_does_not_break_rendering(self):
-        summary = _summarize_org_unit_warnings(
+        summary = _summarize_department_warnings(
             {
-                "orgUnitBudgetWarnings": {"ada@example.com": 42},
-                "orgUnitBudgetBlockBalances": ["455.25"],
+                "departmentBudgetWarnings": {"ada@example.com": 42},
+                "departmentBudgetBlockBalances": ["455.25"],
                 "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
             }
         )
@@ -1112,10 +1112,10 @@ class TestSummarizeOrgUnitWarnings:
     def test_unparseable_balance_is_kept_and_sorted_last(self):
         """A balance the caller cannot read is still evidence someone is at
         risk, so it is rendered rather than dropped."""
-        summary = _summarize_org_unit_warnings(
+        summary = _summarize_department_warnings(
             {
-                "orgUnitBudgetWarnings": {"ada@example.com": 42, "grace@example.com": 42},
-                "orgUnitBudgetBlockBalances": {
+                "departmentBudgetWarnings": {"ada@example.com": 42, "grace@example.com": 42},
+                "departmentBudgetBlockBalances": {
                     "ada@example.com": "not-a-number",
                     "grace@example.com": 10,
                 },
@@ -1125,33 +1125,33 @@ class TestSummarizeOrgUnitWarnings:
         assert "balances compared: 10, not-a-number" in summary
 
     def test_string_rule_ids_still_resolve_to_names(self):
-        summary = _summarize_org_unit_warnings(
+        summary = _summarize_department_warnings(
             {
-                "orgUnitBudgetWarnings": {"ada@example.com": "42"},
+                "departmentBudgetWarnings": {"ada@example.com": "42"},
                 "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
             }
         )
         assert "- Engineering monthly cap: 1 subscriber warned" in summary
 
     def test_unresolvable_rule_id_falls_back_to_the_id(self):
-        summary = _summarize_org_unit_warnings(
-            {"orgUnitBudgetWarnings": {"ada@example.com": 99}, "rules": []}
+        summary = _summarize_department_warnings(
+            {"departmentBudgetWarnings": {"ada@example.com": 99}, "rules": []}
         )
         assert "- rule 99: 1 subscriber warned" in summary
 
     def test_unexpected_shape_is_reported_not_silently_dropped(self):
-        summary = _summarize_org_unit_warnings(
-            {"orgUnitBudgetWarnings": ["ada@example.com"]}
+        summary = _summarize_department_warnings(
+            {"departmentBudgetWarnings": ["ada@example.com"]}
         )
         assert "not the expected" in summary
 
     def test_long_balance_lists_are_bounded(self):
         warned = {f"user{i}@example.com": 42 for i in range(15)}
         balances = {f"user{i}@example.com": float(i) for i in range(15)}
-        summary = _summarize_org_unit_warnings(
+        summary = _summarize_department_warnings(
             {
-                "orgUnitBudgetWarnings": warned,
-                "orgUnitBudgetBlockBalances": balances,
+                "departmentBudgetWarnings": warned,
+                "departmentBudgetBlockBalances": balances,
                 "rules": [{"ruleId": 42, "name": "Cap"}],
             }
         )
@@ -1161,9 +1161,9 @@ class TestSummarizeOrgUnitWarnings:
     def test_summary_never_contains_a_blank_line(self):
         """get_enforcement_rules splits the first blank line to recover the
         JSON payload, so a multi-line summary must stay one block."""
-        summary = _summarize_org_unit_warnings(
+        summary = _summarize_department_warnings(
             {
-                "orgUnitBudgetWarnings": {"ada@example.com": 42, "alan@example.com": 43},
+                "departmentBudgetWarnings": {"ada@example.com": 42, "alan@example.com": 43},
                 "rules": [{"ruleId": 42, "name": "A"}, {"ruleId": 43, "name": "B"}],
             }
         )
@@ -1179,8 +1179,8 @@ class TestEnforcementRulesWarnSummaryRendering:
         mock_client.get_enforcement_rules.return_value = {
             "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
             "compiledAt": "2026-09-09T00:00:00Z",
-            "orgUnitBudgetWarnings": {"ada@example.com": 42, "grace@example.com": 42},
-            "orgUnitBudgetBlockBalances": {"ada@example.com": 480.5},
+            "departmentBudgetWarnings": {"ada@example.com": 42, "grace@example.com": 42},
+            "departmentBudgetBlockBalances": {"ada@example.com": 480.5},
         }
         cc_mgmt.get_client = AsyncMock(return_value=mock_client)
 
@@ -1198,8 +1198,8 @@ class TestEnforcementRulesWarnSummaryRendering:
         mock_client.get_enforcement_rules.return_value = {
             "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
             "compiledAt": None,
-            "orgUnitBudgetBlocks": {"ada@example.com": 42},
-            "orgUnitBudgetWarnings": {"grace@example.com": 42},
+            "departmentBudgetBlocks": {"ada@example.com": 42},
+            "departmentBudgetWarnings": {"grace@example.com": 42},
         }
         cc_mgmt.get_client = AsyncMock(return_value=mock_client)
 
@@ -1215,9 +1215,9 @@ class TestEnforcementRulesWarnSummaryRendering:
         payload = {
             "rules": [{"ruleId": 42, "name": "Engineering monthly cap"}],
             "compiledAt": "2026-09-09T00:00:00Z",
-            "orgUnitBudgetBlocks": {"ada@example.com": 42},
-            "orgUnitBudgetWarnings": {"grace@example.com": 42, "alan@example.com": 42},
-            "orgUnitBudgetBlockBalances": {"grace@example.com": 12.5},
+            "departmentBudgetBlocks": {"ada@example.com": 42},
+            "departmentBudgetWarnings": {"grace@example.com": 42, "alan@example.com": 42},
+            "departmentBudgetBlockBalances": {"grace@example.com": 12.5},
         }
         mock_client.get_enforcement_rules.return_value = payload
         cc_mgmt.get_client = AsyncMock(return_value=mock_client)
@@ -1245,12 +1245,12 @@ class TestEnforcementRulesWarnSummaryRendering:
     async def test_block_units_map_is_never_summarized_as_a_verdict(
         self, cc_mgmt, mock_client
     ):
-        """orgUnitBudgetBlockUnits covers warned and blocked people alike - it
+        """departmentBudgetBlockUnits covers warned and blocked people alike - it
         is attribution for notification routing, not a block list."""
         mock_client.get_enforcement_rules.return_value = {
             "rules": [],
             "compiledAt": None,
-            "orgUnitBudgetBlockUnits": {"ada@example.com": 173},
+            "departmentBudgetBlockUnits": {"ada@example.com": 173},
         }
         cc_mgmt.get_client = AsyncMock(return_value=mock_client)
 
@@ -1264,8 +1264,8 @@ class TestEnforcementRulesWarnSummaryRendering:
     async def test_capabilities_explain_the_three_maps(self, cc_mgmt):
         caps = await cc_mgmt._get_tool_capabilities()
         rendered = json.dumps([c.description for c in caps])
-        assert "orgUnitBudgetWarnings" in rendered
-        assert "orgUnitBudgetBlockBalances" in rendered
+        assert "departmentBudgetWarnings" in rendered
+        assert "departmentBudgetBlockBalances" in rendered
         assert "NOT a verdict" in rendered
 
     @pytest.mark.asyncio
@@ -1276,7 +1276,7 @@ class TestEnforcementRulesWarnSummaryRendering:
         caps = await cc_mgmt.handle_action("get_capabilities", {})
         examples = await cc_mgmt.handle_action("get_examples", {})
         for text in (caps[0].text, examples[0].text):
-            assert "orgUnitBudgetWarnings" in text
+            assert "departmentBudgetWarnings" in text
             assert "NOT a verdict" in text
 
     @pytest.mark.asyncio
@@ -1285,9 +1285,9 @@ class TestEnforcementRulesWarnSummaryRendering:
         capability text and the notes list drift apart."""
         caps = await cc_mgmt._get_tool_capabilities()
         enforcement = [c for c in caps if c.name == "Enforcement Visibility"][0]
-        assert ORG_UNIT_ENFORCEMENT_MAPS_NOTE in enforcement.description
+        assert DEPARTMENT_ENFORCEMENT_MAPS_NOTE in enforcement.description
         rendered = (await cc_mgmt.handle_action("get_capabilities", {}))[0].text
-        assert json.dumps(ORG_UNIT_ENFORCEMENT_MAPS_NOTE)[1:-1] in rendered
+        assert json.dumps(DEPARTMENT_ENFORCEMENT_MAPS_NOTE)[1:-1] in rendered
 
 
 # ===========================================================================
@@ -1341,9 +1341,9 @@ class TestEnforcementEventFilterBuilding:
 
     def test_the_group_pair_maps_together(self):
         built = _build_enforcement_event_filters(
-            {"group_by": "ORG_UNIT", "group_value": "aB3xQ"}
+            {"group_by": "DEPARTMENT", "group_value": "aB3xQ"}
         )
-        assert built == {"groupBy": "ORG_UNIT", "groupValue": "aB3xQ"}
+        assert built == {"groupBy": "DEPARTMENT", "groupValue": "aB3xQ"}
 
     def test_every_filter_at_once(self):
         assert _build_enforcement_event_filters(_ALL_EVENT_FILTER_ARGS) == _ALL_EVENT_FILTER_PARAMS

@@ -2358,7 +2358,7 @@ class TestVcsActionsAreDiscoverable:
         for name in [
             "author", "bucket", "sort_by", "sort_dir", "granularity", "email",
             "include_members", "include_pull_requests", "pr_limit", "pr_offset",
-            "org_unit_id", "include_descendants", "assisted_only",
+            "department_id", "include_descendants", "assisted_only",
         ]:
             assert f'"{name}": {name}' in source
 
@@ -2443,10 +2443,10 @@ class TestMergedPrsFullPage:
         assert "pr_offset=400" in text
 
 
-# ── BACK-3387: org-unit scope, applied settings and the repositories read ───
+# ── BACK-3387: department scope, applied settings and the repositories read ───
 SCOPED_REPORT = {
     **PR_HEALTH_PAYLOAD,
-    "orgUnitId": 42,
+    "departmentId": 42,
     "includeDescendants": True,
     "cutoffDate": "2026-04-07",
     "cutoffDateIsDefault": True,
@@ -2478,19 +2478,19 @@ DRILL_DOWNS = {
 }
 
 
-class TestPrHealthOrgUnitScope:
+class TestPrHealthDepartmentScope:
     @pytest.mark.asyncio
-    async def test_report_forwards_org_unit_and_descendants_but_no_team(self, analytics_tool):
+    async def test_report_forwards_department_and_descendants_but_no_team(self, analytics_tool):
         client = _vcs_client(get_vcs_pr_health=PR_HEALTH_PAYLOAD)
         await _call(
             analytics_tool,
             "get_pr_health",
-            {**WINDOW, "org_unit_id": "42", "include_descendants": True, "team_id": "t1"},
+            {**WINDOW, "department_id": "42", "include_descendants": True, "team_id": "t1"},
             client,
         )
         assert client.get_vcs_pr_health.await_args.args == ("github", "2026-05-17", "2026-08-17")
         assert client.get_vcs_pr_health.await_args.kwargs == {
-            "org_unit_id": 42,
+            "department_id": 42,
             "include_descendants": True,
         }
 
@@ -2502,17 +2502,17 @@ class TestPrHealthOrgUnitScope:
         await _call(
             analytics_tool,
             action,
-            {**WINDOW, **extra, "org_unit_id": 7, "include_descendants": False, "assisted_only": True},
+            {**WINDOW, **extra, "department_id": 7, "include_descendants": False, "assisted_only": True},
             client,
         )
         kwargs = getattr(client, method).await_args.kwargs
-        assert kwargs["org_unit_id"] == 7
+        assert kwargs["department_id"] == 7
         assert kwargs["include_descendants"] is False
         assert kwargs["assisted_only"] is True
         assert "team_id" not in kwargs
 
     @pytest.mark.asyncio
-    async def test_include_descendants_without_org_unit_is_refused(self, analytics_tool):
+    async def test_include_descendants_without_department_is_refused(self, analytics_tool):
         with pytest.raises(ToolError) as exc:
             await analytics_tool.handle_action("get_pr_health", {**WINDOW, "include_descendants": True})
         assert exc.value.field == "include_descendants"
@@ -2523,16 +2523,16 @@ class TestPrHealthOrgUnitScope:
         """The registry turns 'true'/'false' strings into booleans; anything else reaching the tool is refused."""
         with pytest.raises(ToolError) as exc:
             await analytics_tool.handle_action(
-                "get_pr_health_engineers", {**WINDOW, "org_unit_id": 7, field: "sometimes"}
+                "get_pr_health_engineers", {**WINDOW, "department_id": 7, field: "sometimes"}
             )
         assert exc.value.field == field
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("bad", [0, -3, "abc", True])
-    async def test_org_unit_id_must_be_a_positive_integer(self, analytics_tool, bad):
+    async def test_department_id_must_be_a_positive_integer(self, analytics_tool, bad):
         with pytest.raises(ToolError) as exc:
-            await analytics_tool.handle_action("get_pr_health", {**WINDOW, "org_unit_id": bad})
-        assert exc.value.field == "org_unit_id"
+            await analytics_tool.handle_action("get_pr_health", {**WINDOW, "department_id": bad})
+        assert exc.value.field == "department_id"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2544,23 +2544,23 @@ class TestPrHealthOrgUnitScope:
             (9223372036854775807, 9223372036854775807),
         ],
     )
-    async def test_org_unit_id_accepts_any_positive_int64(self, analytics_tool, given, sent):
+    async def test_department_id_accepts_any_positive_int64(self, analytics_tool, given, sent):
         client = _vcs_client(get_vcs_pr_health=PR_HEALTH_PAYLOAD)
-        await _call(analytics_tool, "get_pr_health", {**WINDOW, "org_unit_id": given}, client)
-        assert client.get_vcs_pr_health.await_args.kwargs["org_unit_id"] == sent
+        await _call(analytics_tool, "get_pr_health", {**WINDOW, "department_id": given}, client)
+        assert client.get_vcs_pr_health.await_args.kwargs["department_id"] == sent
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("bad", ["9223372036854775808", 9223372036854775808, "12345678901234567890"])
-    async def test_org_unit_id_over_int64_is_refused(self, analytics_tool, bad):
+    async def test_department_id_over_int64_is_refused(self, analytics_tool, bad):
         with pytest.raises(ToolError) as exc:
-            await analytics_tool.handle_action("get_pr_health", {**WINDOW, "org_unit_id": bad})
-        assert exc.value.field == "org_unit_id"
+            await analytics_tool.handle_action("get_pr_health", {**WINDOW, "department_id": bad})
+        assert exc.value.field == "department_id"
 
     @pytest.mark.asyncio
-    async def test_report_capability_shares_the_org_unit_wording(self, analytics_tool):
+    async def test_report_capability_shares_the_department_wording(self, analytics_tool):
         capabilities = await analytics_tool._get_tool_capabilities()
         report = next(c for c in capabilities if "get_pr_health" in c.parameters)
-        shared = analytics_tool._PR_HEALTH_ORG_UNIT_CAPABILITY_PARAMS
+        shared = analytics_tool._PR_HEALTH_DEPARTMENT_CAPABILITY_PARAMS
         assert {k: report.parameters["get_pr_health"][k] for k in shared} == shared
         assert "assisted_only" not in report.parameters["get_pr_health"]
 
@@ -2574,18 +2574,18 @@ class TestPrHealthOrgUnitScope:
     async def test_next_page_call_keeps_the_scope(self, analytics_tool):
         client = _vcs_client(get_vcs_pr_health_engineers=ENGINEERS_PAGE)
         text = await _call(
-            analytics_tool, "get_pr_health_engineers", {**WINDOW, "org_unit_id": 7, "assisted_only": True}, client
+            analytics_tool, "get_pr_health_engineers", {**WINDOW, "department_id": 7, "assisted_only": True}, client
         )
-        assert "org_unit_id=7, assisted_only=True" in text
+        assert "department_id=7, assisted_only=True" in text
         assert "page=1)" in text
 
     @pytest.mark.asyncio
-    async def test_api_failure_names_the_org_unit_rule(self, analytics_tool):
+    async def test_api_failure_names_the_department_rule(self, analytics_tool):
         client = MagicMock()
-        client.get_vcs_pr_health = AsyncMock(side_effect=ReveniumAPIError("Org unit 9 not found", status_code=404))
-        text = await _call(analytics_tool, "get_pr_health", {**WINDOW, "org_unit_id": 9}, client)
+        client.get_vcs_pr_health = AsyncMock(side_effect=ReveniumAPIError("Department 9 not found", status_code=404))
+        text = await _call(analytics_tool, "get_pr_health", {**WINDOW, "department_id": 9}, client)
         assert "Failed" in text
-        assert "org_unit_id must be a department of your own organization" in text
+        assert "department_id must be a department of your own organization" in text
 
     def test_registry_preprocesses_the_new_flags_as_booleans(self):
         import inspect
@@ -2604,7 +2604,7 @@ class TestPrHealthAppliedSettingsRendering:
     @pytest.mark.asyncio
     async def test_header_echoes_scope_cutoff_and_exclusions(self, analytics_tool):
         text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=SCOPED_REPORT))
-        assert "narrowed to org unit 42 and its descendant departments" in text
+        assert "narrowed to department 42 and its descendant departments" in text
         assert "avgCostPerMergedPr stays organization-wide" in text
         assert "opened before 2026-04-07 are left out" in text
         assert "(the default cutoff)" in text
@@ -2619,21 +2619,21 @@ class TestPrHealthAppliedSettingsRendering:
             "excludedRepos": [],
         }
         text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=payload))
-        assert "org unit 42 only (descendant departments not included)" in text
+        assert "department 42 only (descendant departments not included)" in text
         assert "(set in the team's PR-health settings)" in text
         assert "**Excluded repositories**: none" in text
 
     @pytest.mark.asyncio
     async def test_header_is_unchanged_without_the_new_fields(self, analytics_tool):
         text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=PR_HEALTH_PAYLOAD))
-        for absent in ("**Org unit**", "**Cutoff**", "**Excluded repositories**", "**AI-assisted only**"):
+        for absent in ("**Department**", "**Cutoff**", "**Excluded repositories**", "**AI-assisted only**"):
             assert absent not in text
 
     @pytest.mark.asyncio
-    async def test_unscoped_echo_renders_no_org_unit_line(self, analytics_tool):
-        payload = {**PR_HEALTH_PAYLOAD, "orgUnitId": None, "includeDescendants": None}
+    async def test_unscoped_echo_renders_no_department_line(self, analytics_tool):
+        payload = {**PR_HEALTH_PAYLOAD, "departmentId": None, "includeDescendants": None}
         text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=payload))
-        assert "**Org unit**" not in text
+        assert "**Department**" not in text
 
     @pytest.mark.asyncio
     async def test_new_totals_are_rendered(self, analytics_tool):
@@ -2664,14 +2664,14 @@ class TestPrHealthAppliedSettingsRendering:
 
     @pytest.mark.asyncio
     async def test_drill_down_echoes_assisted_only(self, analytics_tool):
-        page = {**ENGINEERS_PAGE, "orgUnitId": 7, "includeDescendants": False, "assistedOnly": True}
+        page = {**ENGINEERS_PAGE, "departmentId": 7, "includeDescendants": False, "assistedOnly": True}
         text = await _call(
             analytics_tool,
             "get_pr_health_engineers",
-            {**WINDOW, "org_unit_id": 7, "assisted_only": True},
+            {**WINDOW, "department_id": 7, "assisted_only": True},
             _vcs_client(get_vcs_pr_health_engineers=page),
         )
-        assert "narrowed to org unit 7 only" in text
+        assert "narrowed to department 7 only" in text
         assert "**AI-assisted only**" in text
 
 

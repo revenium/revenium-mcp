@@ -2301,11 +2301,11 @@ class ApiV2InsightsRunsPostRequest(BaseModel):
     excludeInvestigatorIds: Optional[list[str]] = None
     filterAgent: Optional[list[str]] = []
     filterConsumingOrgId: Optional[list[str]] = []
+    filterDepartmentId: Optional[str] = None
     filterEnvironment: Optional[str] = ''
     filterIncludeCodingAssistants: Optional[bool] = True
     filterIncludeCodingAssistantsForCostDetectors: Optional[bool] = False
     filterIncludeDescendants: Optional[bool] = True
-    filterOrgUnitId: Optional[str] = None
     filterProductId: Optional[list[str]] = []
     filterTraceType: Optional[list[str]] = []
     periodEnd: str
@@ -2335,6 +2335,11 @@ class ApiV2InsightsRunsPostResponse1(BaseModel):
 
 class ApiV2InsightsRunsRunIdGetParametersQuery(BaseModel):
     slim: Optional[Union[bool, str]] = False
+
+
+class AnalyzedSegment(StrEnum):
+    metered_api = 'metered_api'
+    metered_api_and_coding_assistants = 'metered_api_and_coding_assistants'
 
 
 class FeedbackItem(BaseModel):
@@ -2473,19 +2478,23 @@ class Status2(StrEnum):
 
 
 class ApiV2InsightsRunsRunIdGetResponse(BaseModel):
+    analyzedCostUsd: float
+    analyzedSegment: AnalyzedSegment
+    analyzedSegmentStatement: str
     batchMetadataJson: Optional[str] = '{}'
     created: str
     dashboard_url: Optional[str] = None
     engineVersion: str
+    excludedCodingAssistantCostUsd: float
     failedInvestigators: Optional[list[str]] = []
     feedback: list[FeedbackItem]
     filterAgent: list[str]
     filterConsumingOrgId: list[str]
+    filterDepartmentId: Optional[str] = ''
     filterEnvironment: str
     filterIncludeCodingAssistants: float
     filterIncludeCodingAssistantsForCostDetectors: float
     filterIncludeDescendants: Optional[float] = 1
-    filterOrgUnitId: Optional[str] = ''
     filterProductId: list[str]
     filterTraceType: list[str]
     findingsConsideredCount: Optional[float] = 0
@@ -2498,6 +2507,7 @@ class ApiV2InsightsRunsRunIdGetResponse(BaseModel):
     llmInputTokens: float
     llmModel: str
     llmOutputTokens: float
+    meteredOnlyInvestigatorIds: list[str]
     modelPricingVersion: str
     parsedBatchMetadata: Optional[dict[str, Any]] = None
     parsedFindings: Optional[list[dict[str, Any]]] = None

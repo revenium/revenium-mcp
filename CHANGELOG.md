@@ -5,6 +5,15 @@ All notable changes to the Revenium MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-09-28
+
+### Changed
+- Org units are now departments, following the platform rename: `manage_customers` lists them with list_departments and removes memberships with delete_department_person / clear_department_assignment; `manage_cost_controls` previews a parent's children with preview_department_group and takes DEPARTMENT as the group-by and filter dimension; PR Health in `business_analytics_management` and analysis runs in `manage_ai_insights` are scoped with department_id / filter_department_id. The org-unit names (list_org_units, delete_org_unit_person, clear_org_unit_assignment, preview_org_unit_group, org_unit_id, parent_org_unit_id, filter_org_unit_id, ORG_UNIT) are still accepted for this release, flagged deprecated on the advertised schemas, and will be removed in the next one
+- Upstream contract snapshots and generated models refreshed through 2026-09-28
+
+### Fixed
+- Every org-unit read and write answered 404 after the platform renamed its endpoints on 2026-09-27; the tools now call the department endpoints, and the compiled-rule warnings summary in `manage_cost_controls` reads the department budget keys the platform now returns
+
 ## [0.7.0] - 2026-09-24
 
 ### Added
@@ -364,6 +373,7 @@ No functional changes. Changelog formatting update only.
 [0.2.0]: https://github.com/revenium/revenium-mcp/compare/v0.1.27...v0.2.0
 [0.1.27]: https://github.com/revenium/revenium-mcp/releases/tag/v0.1.27
 
+[0.7.1]: https://github.com/revenium/revenium-mcp/releases/tag/v0.7.1
 [0.7.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.7.0
 [0.6.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.6.0
 [0.5.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.5.0

@@ -98,6 +98,8 @@ def _format_parameter_line(name: str, prop: Any) -> str:
         return f"- `{name}`"
 
     line = f"- `{name}` ({_format_parameter_type(prop)})"
+    if prop.get("deprecated") is True:
+        line += " (deprecated)"
 
     enum = _collect_enum_values(prop)
     if enum:

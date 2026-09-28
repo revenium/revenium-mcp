@@ -1654,11 +1654,11 @@ class ReveniumClient:
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.post("/profitstream/v2/api/ai/cost-controls", data=control_data, params=params))
 
-    async def preview_org_unit_group(self, parent_org_unit_id: int) -> Dict[str, Any]:
-        """Preview the per-department fan-out of an ORG_UNIT-grouped cost control.
+    async def preview_department_group(self, parent_department_id: int) -> Dict[str, Any]:
+        """Preview the per-department fan-out of a DEPARTMENT-grouped cost control.
 
-        Read-only: the endpoint counts the org units a guardrail grouped by
-        ORG_UNIT under ``parent_org_unit_id`` would produce a cap for. It
+        Read-only: the endpoint counts the departments a guardrail grouped by
+        DEPARTMENT under ``parent_department_id`` would produce a cap for. It
         creates nothing, and it is never called implicitly from create/update.
 
         ``teamId`` travels in the request BODY, not the query string. The
@@ -1669,21 +1669,21 @@ class ReveniumClient:
         ``400 {"teamId": "teamId is required"}``.
 
         Args:
-            parent_org_unit_id: Raw numeric org-unit id (NOT a hashid) whose
+            parent_department_id: Raw numeric department id (NOT a hashid) whose
                 descendants are counted. ``manage_customers(action=
-                'list_org_units')`` is the lookup that yields these ids.
+                'list_departments')`` is the lookup that yields these ids.
 
         Returns:
             ``{"targetCount": int, "targets": [ResourceMetadata]}``
 
         Raises:
-            ReveniumAPIError: 403/422 when the tenant lacks the org-unit budget
+            ReveniumAPIError: 403/422 when the tenant lacks the department budget
                 feature; the tool boundary translates that into an explanation.
         """
-        body = {"teamId": self.team_id, "parentOrgUnitId": parent_org_unit_id}
+        body = {"teamId": self.team_id, "parentDepartmentId": parent_department_id}
         return cast(
             Dict[str, Any],
-            await self.post("/profitstream/v2/api/ai/cost-controls/org-unit-group-preview", data=body),
+            await self.post("/profitstream/v2/api/ai/cost-controls/department-group-preview", data=body),
         )
 
     async def update_cost_control(self, control_id: str, control_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1847,7 +1847,7 @@ class ReveniumClient:
             search: Case-insensitive substring over a row's key, label and email
             band: BLOCKED, WARNED, UNDER or ALL
             sort: PERCENT, SPEND, NAME or LAST_EVENT
-            dimension: SUBSCRIBER or ORG_UNIT — a guard, not a selector: one
+            dimension: SUBSCRIBER or DEPARTMENT — a guard, not a selector: one
                 that does not match the rule's own grouping is refused
 
         Returns:
@@ -2064,7 +2064,7 @@ class ReveniumClient:
         source: str,
         start_date: str,
         end_date: str,
-        org_unit_id: Optional[int] = None,
+        department_id: Optional[int] = None,
         include_descendants: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Get the PR-health report for the caller's own organization.
@@ -2072,12 +2072,12 @@ class ReveniumClient:
         All three query parameters are required by the endpoint. The report is
         principal-scoped: the platform resolves the organization from the
         authenticated caller and accepts no team or tenant identifier, which is
-        why no team/tenant scope is attached to the request. An org unit narrows
+        why no team/tenant scope is attached to the request. A department narrows
         within that organization; one outside it answers 404.
 
         The response is a flat VcsPrHealthResponse (source, startDate, endDate,
         the echoed agingDays/rottingDays, the applied cutoff, excluded
-        repositories and org-unit scope, totals, engineers, oldest) - there is
+        repositories and department scope, totals, engineers, oldest) - there is
         no HAL ``_embedded`` envelope and no pagination.
 
         The endpoint answers 400 when startDate is after endDate and when the
@@ -2088,15 +2088,15 @@ class ReveniumClient:
             source: VCS source - ``github`` or ``gitlab``
             start_date: Start of the closed/merged window (ISO ``yyyy-MM-dd``)
             end_date: End of the closed/merged window, inclusive (ISO ``yyyy-MM-dd``)
-            org_unit_id: Department to narrow every figure to (omit for the whole organization)
-            include_descendants: Also cover the department's descendants; needs org_unit_id
+            department_id: Department to narrow every figure to (omit for the whole organization)
+            include_descendants: Also cover the department's descendants; needs department_id
 
         Returns:
             Flat PR-health report payload
         """
         params = self._vcs_window_params(
             source, start_date, end_date,
-            **self._vcs_org_unit_params(org_unit_id, include_descendants),
+            **self._vcs_department_params(department_id, include_descendants),
         )
         return cast(Dict[str, Any], await self.get(
             "/profitstream/v2/api/billing/users/vcs-pr-health", params=params
@@ -2120,10 +2120,10 @@ class ReveniumClient:
         return params
 
     @staticmethod
-    def _vcs_org_unit_params(
-        org_unit_id: Optional[int], include_descendants: Optional[bool]
+    def _vcs_department_params(
+        department_id: Optional[int], include_descendants: Optional[bool]
     ) -> Dict[str, Any]:
-        return {"orgUnitId": org_unit_id, "includeDescendants": include_descendants}
+        return {"departmentId": department_id, "includeDescendants": include_descendants}
 
     async def get_vcs_pr_health_engineers(
         self,
@@ -2134,7 +2134,7 @@ class ReveniumClient:
         size: Optional[int] = None,
         sort_by: Optional[str] = None,
         sort_dir: Optional[str] = None,
-        org_unit_id: Optional[int] = None,
+        department_id: Optional[int] = None,
         include_descendants: Optional[bool] = None,
         assisted_only: Optional[bool] = None,
     ) -> Dict[str, Any]:
@@ -2148,7 +2148,7 @@ class ReveniumClient:
             source, start_date, end_date,
             page=page, size=size, sortBy=sort_by, sortDir=sort_dir,
             assistedOnly=assisted_only,
-            **self._vcs_org_unit_params(org_unit_id, include_descendants),
+            **self._vcs_department_params(department_id, include_descendants),
         )
         return cast(Dict[str, Any], await self.get(
             "/profitstream/v2/api/billing/users/vcs-pr-health/engineers", params=params
@@ -2160,7 +2160,7 @@ class ReveniumClient:
         start_date: str,
         end_date: str,
         author: str,
-        org_unit_id: Optional[int] = None,
+        department_id: Optional[int] = None,
         include_descendants: Optional[bool] = None,
         assisted_only: Optional[bool] = None,
     ) -> Dict[str, Any]:
@@ -2175,7 +2175,7 @@ class ReveniumClient:
         params = self._vcs_window_params(
             source, start_date, end_date,
             author=author, assistedOnly=assisted_only,
-            **self._vcs_org_unit_params(org_unit_id, include_descendants),
+            **self._vcs_department_params(department_id, include_descendants),
         )
         return cast(Dict[str, Any], await self.get(
             "/profitstream/v2/api/billing/users/vcs-pr-health/prs", params=params
@@ -2192,7 +2192,7 @@ class ReveniumClient:
         size: Optional[int] = None,
         sort_by: Optional[str] = None,
         sort_dir: Optional[str] = None,
-        org_unit_id: Optional[int] = None,
+        department_id: Optional[int] = None,
         include_descendants: Optional[bool] = None,
         assisted_only: Optional[bool] = None,
     ) -> Dict[str, Any]:
@@ -2205,7 +2205,7 @@ class ReveniumClient:
             source, start_date, end_date,
             bucket=bucket, author=author, page=page, size=size,
             sortBy=sort_by, sortDir=sort_dir, assistedOnly=assisted_only,
-            **self._vcs_org_unit_params(org_unit_id, include_descendants),
+            **self._vcs_department_params(department_id, include_descendants),
         )
         return cast(Dict[str, Any], await self.get(
             "/profitstream/v2/api/billing/users/vcs-pr-health/pull-requests", params=params
@@ -2215,7 +2215,7 @@ class ReveniumClient:
         """Get the repositories holding open pull requests, with their open count and exclusion flag.
 
         Principal-scoped like ``get_vcs_pr_health``. Unlike the other PR-health
-        reads it takes no window and no org unit: the endpoint declares
+        reads it takes no window and no department: the endpoint declares
         ``source`` only, and deliberately ignores the team's cutoff, exclusions
         and automation patterns so an excluded repository is still listed.
         """
@@ -3323,10 +3323,10 @@ class ReveniumClient:
         ))
 
     # Organizational Unit (department) API methods
-    async def get_org_units(self, team_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get the active organizational units (departments) for a team.
+    async def get_departments(self, team_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get the active departments for a team.
 
-        Read-only lookup used to resolve a department name to the id the ORG_UNIT
+        Read-only lookup used to resolve a department name to the id the DEPARTMENT
         dimension expects (insight-run filters, cost-control scopes, group previews).
 
         The endpoint answers with a bare JSON array rather than a HAL page, so the
@@ -3341,44 +3341,44 @@ class ReveniumClient:
                 to the caller's own organization when no teamId reaches it.
 
         Returns:
-            List of org units, each ``{id, name, parentId, path, source, externalRef}``
+            List of departments, each ``{id, name, parentId, path, source, externalRef}``
             where ``path`` is the materialized ancestor-id path including the unit
             itself (e.g. ``/12/40/173/``) and ``id``/``parentId`` are JSON numbers.
         """
         return cast(
             List[Dict[str, Any]],
             await self.get(
-                "/profitstream/v2/api/org-units", params=self._org_unit_team_params(team_id)
+                "/profitstream/v2/api/departments", params=self._department_team_params(team_id)
             ),
         )
 
-    def _org_unit_team_params(self, team_id: Optional[str]) -> Dict[str, Any]:
-        """Scope an org-unit call to ``team_id``, or to the ambient team when omitted."""
+    def _department_team_params(self, team_id: Optional[str]) -> Dict[str, Any]:
+        """Scope a department call to ``team_id``, or to the ambient team when omitted."""
         return {"teamId": team_id} if team_id else self._add_team_id_to_params()
 
-    async def delete_org_unit_person(
+    async def delete_department_person(
         self, person_id: int, team_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Delete one directory person by id.
 
-        The three org-unit deletes run once (``use_retry=False``): a delete that
+        The three department deletes run once (``use_retry=False``): a delete that
         committed before a retryable 5xx would be replayed into a 404, reporting
         failure for a removal that happened.
 
-        Upstream closes the person's open org-unit assignment effective now,
+        Upstream closes the person's open department assignment effective now,
         removes every email mapping pointing at them and deletes the person in one
         transaction; assignment history is kept. Answers 204, so the result is ``{}``.
         """
         return cast(
             Dict[str, Any],
             await self.delete(
-                f"/profitstream/v2/api/org-units/persons/{person_id}",
-                params=self._org_unit_team_params(team_id),
+                f"/profitstream/v2/api/departments/persons/{person_id}",
+                params=self._department_team_params(team_id),
                 use_retry=False,
             ),
         )
 
-    async def delete_org_unit_person_by_email(
+    async def delete_department_person_by_email(
         self, email: str, team_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Delete the directory person an email resolves to (same effect as by id).
@@ -3386,29 +3386,29 @@ class ReveniumClient:
         The email never creates a person; an address matching more than one
         directory person is rejected with 400. Answers 204, so the result is ``{}``.
         """
-        params = self._org_unit_team_params(team_id)
+        params = self._department_team_params(team_id)
         params["email"] = email
         return cast(
             Dict[str, Any],
             await self.delete(
-                "/profitstream/v2/api/org-units/persons", params=params, use_retry=False
+                "/profitstream/v2/api/departments/persons", params=params, use_retry=False
             ),
         )
 
-    async def clear_org_unit_assignment_by_email(
+    async def clear_department_assignment_by_email(
         self, email: str, team_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Close the open primary org-unit assignment of the person an email resolves to.
+        """Close the open primary department assignment of the person an email resolves to.
 
         The person and their email mappings stay. Answers 204 whether or not an
         assignment was open, so the result is ``{}``.
         """
-        params = self._org_unit_team_params(team_id)
+        params = self._department_team_params(team_id)
         params["email"] = email
         return cast(
             Dict[str, Any],
             await self.delete(
-                "/profitstream/v2/api/org-units/assignments", params=params, use_retry=False
+                "/profitstream/v2/api/departments/assignments", params=params, use_retry=False
             ),
         )
 
@@ -4875,7 +4875,7 @@ class ReveniumClient:
         filter_trace_type: Optional[List[str]] = None,
         filter_consuming_org_id: Optional[List[str]] = None,
         filter_environment: str = "",
-        filter_org_unit_id: str = "",
+        filter_department_id: str = "",
         filter_include_descendants: bool = True,
         filter_include_coding_assistants: bool = True,
         filter_include_coding_assistants_for_cost_detectors: bool = False,
@@ -4887,10 +4887,10 @@ class ReveniumClient:
             period_start, period_end: ISO 8601 strings. Backend enforces
                 ``period_end > period_start`` and a 90-day max span.
             filter_*: optional whitelist/scoping arrays — empty list = unfiltered.
-            filter_org_unit_id: single org-unit (department) id — "" = tenant-wide.
+            filter_department_id: single department id — "" = tenant-wide.
                 Single-valued, unlike the neighbouring filter arrays; resolve the
-                id with manage_customers' ``list_org_units``.
-            filter_include_descendants: include the org unit's sub-units. Always
+                id with manage_customers' ``list_departments``.
+            filter_include_descendants: include the department's sub-departments. Always
                 sent, defaulting to the backend's own default of True — sending
                 False would narrow the run to the department's own rows.
             exclude_investigator_ids: skip specific detectors; None = run all.
@@ -4915,7 +4915,7 @@ class ReveniumClient:
             "filterTraceType": filter_trace_type or [],
             "filterConsumingOrgId": filter_consuming_org_id or [],
             "filterEnvironment": filter_environment,
-            "filterOrgUnitId": filter_org_unit_id,
+            "filterDepartmentId": filter_department_id,
             "filterIncludeDescendants": filter_include_descendants,
             "filterIncludeCodingAssistants": filter_include_coding_assistants,
             "filterIncludeCodingAssistantsForCostDetectors":

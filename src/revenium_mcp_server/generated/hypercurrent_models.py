@@ -29,6 +29,7 @@ from pydantic import (
     AwareDatetime,
     Base64Str,
     BaseModel,
+    EmailStr,
     Field,
     RootModel,
     confloat,
@@ -52,7 +53,7 @@ class Dimension(StrEnum):
     TASK_TYPE = 'TASK_TYPE'
     WORKSPACE = 'WORKSPACE'
     API_KEY = 'API_KEY'
-    ORG_UNIT = 'ORG_UNIT'
+    DEPARTMENT = 'DEPARTMENT'
 
 
 class Operator(StrEnum):
@@ -174,7 +175,7 @@ class GroupBy(Enum):
     TASK_TYPE = 'TASK_TYPE'
     WORKSPACE = 'WORKSPACE'
     API_KEY = 'API_KEY'
-    ORG_UNIT = 'ORG_UNIT'
+    DEPARTMENT = 'DEPARTMENT'
 
 
 class MetricType(StrEnum):
@@ -631,7 +632,7 @@ class GroupBy3(Enum):
     TASK_TYPE = 'TASK_TYPE'
     WORKSPACE = 'WORKSPACE'
     API_KEY = 'API_KEY'
-    ORG_UNIT = 'ORG_UNIT'
+    DEPARTMENT = 'DEPARTMENT'
 
 
 class MetricType5(StrEnum):
@@ -723,7 +724,7 @@ class Dimension3(Enum):
     TASK_TYPE = 'TASK_TYPE'
     WORKSPACE = 'WORKSPACE'
     API_KEY = 'API_KEY'
-    ORG_UNIT = 'ORG_UNIT'
+    DEPARTMENT = 'DEPARTMENT'
 
 
 class Operator3(Enum):
@@ -749,7 +750,7 @@ class CostControlFilterResource(BaseModel):
     )
     includeDescendants: Optional[bool] = Field(
         None,
-        description='"Include sub-teams" — meaningful only when dimension=ORG_UNIT. true (default) covers the org unit\'s entire subtree; false scopes the filter to that exact org unit only. Ignored for every other dimension.',
+        description='"Include sub-teams" — meaningful only when dimension=DEPARTMENT. true (default) covers the department\'s entire subtree; false scopes the filter to that exact department only. Ignored for every other dimension.',
         examples=[True],
     )
     operator: Optional[Operator3] = Field(
@@ -854,25 +855,6 @@ class State(StrEnum):
     DATA_UNAVAILABLE = 'DATA_UNAVAILABLE'
 
 
-class CreateOrgUnitRequestRead(BaseModel):
-    """
-    Request to create an org unit. Always created with source=MANUAL; CSV import and directory sync create units through other paths.
-    """
-
-    externalRef: Optional[str] = Field(
-        None,
-        description='Optional external reference id for cross-referencing with a synced source',
-    )
-    name: Optional[str] = Field(
-        None,
-        description='Org unit name, unique among siblings under the same parent',
-        examples=['Payments'],
-    )
-    parentId: Optional[int] = Field(
-        None, description='Parent org unit id; omit or null to create a root unit'
-    )
-
-
 class DataSourceConnectionResourceRead(BaseModel):
     """
     Whether at least one event has been received from a given data source, and when the most recent one arrived
@@ -907,12 +889,12 @@ class EnforcementEventAffectedRowResourceRead(BaseModel):
     )
     groupLabel: Optional[str] = Field(
         None,
-        description="Display name of the person or object `groupValue` identifies. On an org-unit row this is the department's name. For every other dimension, and whenever the org unit cannot be resolved (renamed away, deleted, or owned by another team), it repeats `groupValue` byte for byte, so a client can compare the two and print the identifier once rather than twice. Display only: `groupValue` is still what the picker hands back as its filter.",
+        description="Display name of the person or object `groupValue` identifies. On a department row this is the department's name. For every other dimension, and whenever the department cannot be resolved (renamed away, deleted, or owned by another team), it repeats `groupValue` byte for byte, so a client can compare the two and print the identifier once rather than twice. Display only: `groupValue` is still what the picker hands back as its filter.",
         examples=['Data Science'],
     )
     groupValue: Optional[str] = Field(
         None,
-        description='The person or object, in the same form the list returns it: the Revenium identifier of an org unit, or the raw subscriber key (usually an email address) otherwise',
+        description='The person or object, in the same form the list returns it: the Revenium identifier of a department, or the raw subscriber key (usually an email address) otherwise',
         examples=['jane@acme.com'],
     )
     subscriberEmail: Optional[str] = Field(
@@ -1019,7 +1001,7 @@ class EnforcementRuleRosterRowResource(BaseModel):
     )
     displayName: Optional[str] = Field(
         None,
-        description="The directory's own name for the person, null when the directory does not name them. On a department row it is the org unit's name, so it equals label.",
+        description="The directory's own name for the person, null when the directory does not name them. On a department row it is the department's name, so it equals label.",
         examples=['Jane Smith'],
     )
     email: Optional[str] = Field(
@@ -1029,7 +1011,7 @@ class EnforcementRuleRosterRowResource(BaseModel):
     )
     key: Optional[str] = Field(
         None,
-        description="The exact filter value. On a SUBSCRIBER roster the raw subscriber key as stored, which is the subscriber id when there is one and the email otherwise. On an ORG_UNIT roster the department's Revenium hashid.",
+        description="The exact filter value. On a SUBSCRIBER roster the raw subscriber key as stored, which is the subscriber id when there is one and the email otherwise. On an DEPARTMENT roster the department's Revenium hashid.",
         examples=['jane@acme.com'],
     )
     label: Optional[str] = Field(
@@ -1069,7 +1051,7 @@ class GroupBy4(Enum):
     TASK_TYPE = 'TASK_TYPE'
     WORKSPACE = 'WORKSPACE'
     API_KEY = 'API_KEY'
-    ORG_UNIT = 'ORG_UNIT'
+    DEPARTMENT = 'DEPARTMENT'
 
 
 class MetricType9(StrEnum):
@@ -1274,7 +1256,7 @@ class GroupBy5(Enum):
     """
 
     SUBSCRIBER = 'SUBSCRIBER'
-    ORG_UNIT = 'ORG_UNIT'
+    DEPARTMENT = 'DEPARTMENT'
 
 
 class Level(Enum):
@@ -1313,6 +1295,15 @@ class Outcome(Enum):
     WARNED = 'WARNED'
     WOULD_BLOCK = 'WOULD_BLOCK'
     WOULD_WARN = 'WOULD_WARN'
+
+
+class Tier(Enum):
+    """
+    Which line this event crossed: `HARD` for the cap, `WARN` for the warning line. Differs from `level` only when a non-blocking rule crosses its cap: nothing was blocked, so `level` is `WARN`.
+    """
+
+    HARD = 'HARD'
+    WARN = 'WARN'
 
 
 class AccountState(Enum):
@@ -2187,60 +2178,6 @@ class Type6(StrEnum):
     NUMBER = 'NUMBER'
 
 
-class OrgUnitBudgetGroupPreviewRequest(BaseModel):
-    """
-    Counts the direct sub-teams of an org unit, for the "group by Department" confirmation UI ("this will independently cap N teams"). Read-only — creates nothing.
-    """
-
-    parentOrgUnitId: Optional[str] = Field(
-        ...,
-        description="The org unit whose DIRECT sub-teams would each receive an independent cap, as its RAW numeric id (stringified) — see CostControlResource.orgUnitId's doc for why org-unit ids are never hashed, unlike teamId above.",
-        examples=['40'],
-    )
-    teamId: Optional[str] = Field(
-        ...,
-        description='The Revenium-generated identifier of the team',
-        examples=['a91XJp'],
-    )
-
-
-class Source9(StrEnum):
-    """
-    How this org unit was created
-    """
-
-    SYNCED = 'SYNCED'
-    MANUAL = 'MANUAL'
-    CSV = 'CSV'
-
-
-class OrgUnitResponseRead(BaseModel):
-    """
-    A node in the org-unit tree (surfaced in the UI as "Department" / "Org Unit")
-    """
-
-    externalRef: Optional[str] = Field(
-        None,
-        description='External reference id (set when source=SYNCED)',
-        examples=['entra-group-8842'],
-    )
-    id: Optional[int] = Field(None, description='Org unit id', examples=[173])
-    name: Optional[str] = Field(
-        None, description='Org unit name', examples=['Payments']
-    )
-    parentId: Optional[int] = Field(
-        None, description='Parent org unit id, null for a root unit', examples=[40]
-    )
-    path: Optional[str] = Field(
-        None,
-        description='Materialized ancestor-id path, including self',
-        examples=['/12/40/173/'],
-    )
-    source: Optional[Source9] = Field(
-        None, description='How this org unit was created', examples=['MANUAL']
-    )
-
-
 class Currency4(Enum):
     """
     The organization's currency
@@ -2592,6 +2529,11 @@ class Type14(StrEnum):
     SUBSCRIPTION = 'SUBSCRIPTION'
 
 
+class PrHealthDepartmentNodeRead(BaseModel):
+    id: Optional[int] = None
+    name: Optional[str] = None
+
+
 class PrHealthSettingsResource(BaseModel):
     """
     Team-level PR Health configuration settings
@@ -2617,17 +2559,17 @@ class PrHealthSettingsResource(BaseModel):
     )
     cutoffDate: Optional[date_aliased] = Field(
         None,
-        description="Pull requests opened before this UTC date are left out of every PR Health figure. On read, the effective cutoff: the team's own date, else the organization's first AI-telemetry day, else null (no cutoff). On write, a custom date between 2008-01-01 and today UTC; absent or null leaves the stored date unchanged.",
+        description="The team's own cutoff: pull requests opened before this UTC date are left out of every PR Health figure, counts and dollar estimates alike. Null on read when the team has not set one: counts then cover the whole synced git history, and dollar estimates start at defaultCutoffDate. On write, a custom date between 2008-01-01 and today UTC; absent or null leaves the stored date unchanged.",
         examples=['2025-03-01'],
     )
     cutoffDateIsDefault: Optional[bool] = Field(
         None,
-        description="True when cutoffDate is the organization's first AI-telemetry day rather than a custom date; null when there is no cutoff at all. On write, true clears the custom date and restores the default, and any cutoffDate in the same body is ignored.",
+        description="False when cutoffDate is the team's own date; true when the team has none and the default applies (counts over full history, dollar estimates from defaultCutoffDate); null when the team has no date and the organization no AI telemetry. On write, true clears the custom date and restores the default, and any cutoffDate in the same body is ignored.",
         examples=[True],
     )
     defaultCutoffDate: Optional[date_aliased] = Field(
         None,
-        description="The organization's first AI-telemetry day, returned even while a custom cutoffDate overrides it; null when the organization has no AI telemetry.",
+        description="The organization's first AI-telemetry day (metering start): without a team cutoffDate, dollar estimates leave out pull requests opened before it, while counts do not. Returned even while a custom cutoffDate overrides it; null when the organization has no AI telemetry.",
         examples=['2025-02-14'],
     )
     excludedRepos: Optional[list[str]] = Field(
@@ -4441,6 +4383,11 @@ class TeamResource(BaseModel):
         description='The number of time periods to hold invoices before processing',
         examples=[3],
     )
+    isDemo: Optional[bool] = Field(
+        None,
+        description='Whether this team is a demo or test account. Set it with PUT /teams/{teamId}/settings/demo.',
+        examples=[False],
+    )
     label: Optional[str] = Field(
         None,
         description="The team's label (automatically set to the team name for display purposes)",
@@ -4603,6 +4550,11 @@ class TeamResourceRead(BaseModel):
         None,
         description='The number of time periods to hold invoices before processing',
         examples=[3],
+    )
+    isDemo: Optional[bool] = Field(
+        None,
+        description='Whether this team is a demo or test account. Set it with PUT /teams/{teamId}/settings/demo.',
+        examples=[False],
     )
     label: Optional[str] = Field(
         None,
@@ -4914,7 +4866,7 @@ class TermsRead(BaseModel):
     )
 
 
-class Tier(BaseModel):
+class TierModel(BaseModel):
     """
     Volume-based pricing tier that defines different rates based on usage levels. Tiers enable graduated or volume pricing where the rate changes as usage increases. Each tier specifies a usage range and corresponding pricing. Tiers are primarily used within RatingAggregation for modern usage-based billing. They also appear in PeriodChargeResource to show which tier was applied to a specific charge
     """
@@ -5207,6 +5159,18 @@ class UpdateOutcomeRequestRead(BaseModel):
     )
 
 
+class UsageBillingRequestRead(BaseModel):
+    """
+    Request to toggle usage-based billing for a tenant
+    """
+
+    usageBillingEnabled: Optional[bool] = Field(
+        ...,
+        description='Whether usage-based billing should be enabled for the tenant. When false the UI hides every billing surface: invoices, payment methods, plan and subscription screens. Nothing in ingestion, rating or invoicing is gated on this flag. Required: omitting it or sending null is rejected with a 400.',
+        examples=[True],
+    )
+
+
 class UsageTypeBillingRead(BaseModel):
     billing: Optional[float] = Field(
         None,
@@ -5496,15 +5460,69 @@ class UserResourceWrite(BaseModel):
     )
 
 
+class VcsPrDailyMemberRead(BaseModel):
+    date: Optional[date_aliased] = None
+    mappedEmail: Optional[str] = None
+    platformLogin: Optional[str] = None
+    prsMerged: Optional[int] = None
+    prsMergedByVendor: Optional[dict[str, Any]] = None
+    prsMergedWithCodingTool: Optional[int] = None
+
+
+class Cause(StrEnum):
+    AUTOMATION = 'AUTOMATION'
+    STUCK_DRAFT = 'STUCK_DRAFT'
+    AUTHOR_GONE = 'AUTHOR_GONE'
+    APPROVED_NOT_MERGED = 'APPROVED_NOT_MERGED'
+    CHANGES_REQUESTED_QUIET = 'CHANGES_REQUESTED_QUIET'
+    WAITING_ON_REVIEW = 'WAITING_ON_REVIEW'
+    ON_PACE = 'ON_PACE'
+
+
+class VcsPrHealthCauseCountRead(BaseModel):
+    cause: Optional[Cause] = None
+    pricedPrs: Optional[int] = None
+    pricedPrsAssisted: Optional[int] = None
+    prs: Optional[int] = None
+    prsAssisted: Optional[int] = None
+
+
 class VcsPrHealthEngineerRead(BaseModel):
+    activeMappedEmail: Optional[str] = None
     agingPrs: Optional[int] = None
     authorLogin: Optional[str] = None
     closedUnmerged: Optional[int] = None
+    departmentId: Optional[int] = None
+    departmentLabel: Optional[str] = None
+    departmentPath: Optional[list[PrHealthDepartmentNodeRead]] = None
     mappedEmail: Optional[str] = None
     mergedPrs: Optional[int] = None
+    mergedPrsAssisted: Optional[int] = None
     oldestInactiveDays: Optional[int] = None
     openPrs: Optional[int] = None
+    pricedClosedUnmerged: Optional[int] = None
+    pricedPrsInWindow: Optional[int] = None
+    pricedRottingPrs: Optional[int] = None
+    prsInWindow: Optional[int] = None
     rottingPrs: Optional[int] = None
+
+
+class VcsPrHealthEngineersPageResponseRead(BaseModel):
+    agingDays: Optional[int] = None
+    assistedOnly: Optional[bool] = None
+    departmentId: Optional[int] = None
+    endDate: Optional[date_aliased] = None
+    engineers: Optional[list[VcsPrHealthEngineerRead]] = None
+    includeDescendants: Optional[bool] = None
+    page: Optional[int] = None
+    rottingDays: Optional[int] = None
+    size: Optional[int] = None
+    sortBy: Optional[str] = None
+    sortDir: Optional[str] = None
+    source: Optional[str] = None
+    startDate: Optional[date_aliased] = None
+    totalElements: Optional[int] = None
+    totalPages: Optional[int] = None
 
 
 class Bucket(Enum):
@@ -5516,31 +5534,52 @@ class Bucket(Enum):
     CLOSED_UNMERGED = 'CLOSED_UNMERGED'
 
 
-class VcsPrHealthOpenPrRead(BaseModel):
-    ageDays: Optional[int] = None
-    authorLogin: Optional[str] = None
-    bucket: Optional[Bucket] = None
-    closedAtVcs: Optional[AwareDatetime] = None
-    codingToolAssisted: Optional[bool] = None
-    createdAtVcs: Optional[AwareDatetime] = None
-    draft: Optional[bool] = None
-    inactiveDays: Optional[int] = None
-    lastCommitAtVcs: Optional[AwareDatetime] = None
-    lastSyncedAt: Optional[AwareDatetime] = None
-    mappedEmail: Optional[str] = None
+class Cause1(Enum):
+    AUTOMATION = 'AUTOMATION'
+    STUCK_DRAFT = 'STUCK_DRAFT'
+    AUTHOR_GONE = 'AUTHOR_GONE'
+    APPROVED_NOT_MERGED = 'APPROVED_NOT_MERGED'
+    CHANGES_REQUESTED_QUIET = 'CHANGES_REQUESTED_QUIET'
+    WAITING_ON_REVIEW = 'WAITING_ON_REVIEW'
+    ON_PACE = 'ON_PACE'
+
+
+class VcsPrHealthPrCountsRead(BaseModel):
+    active: Optional[int] = None
+    aging: Optional[int] = None
+    closedUnmerged: Optional[int] = None
+    draft: Optional[int] = None
+    rotting: Optional[int] = None
+
+
+class VcsPrHealthPrRefRead(BaseModel):
     prNumber: Optional[int] = None
     repoName: Optional[str] = None
-    reviewDecision: Optional[str] = None
-    title: Optional[str] = None
-    updatedAtVcs: Optional[AwareDatetime] = None
-    url: Optional[str] = None
+
+
+class Triaged(StrEnum):
+    EXCLUDE = 'EXCLUDE'
+    ONLY = 'ONLY'
+
+
+class VcsPrHealthRepositoryRead(BaseModel):
+    excluded: Optional[bool] = None
+    openPrs: Optional[int] = None
+    repoName: Optional[str] = None
+
+
+class VcsPrHealthRequestedReviewerRead(BaseModel):
+    kind: Optional[str] = None
+    login: Optional[str] = None
 
 
 class VcsPrHealthTotalsRead(BaseModel):
     agingPrs: Optional[int] = None
     agingPrsAssisted: Optional[int] = None
+    aiWorkValue: Optional[float] = None
     automationPrs: Optional[int] = None
     avgCostPerMergedPr: Optional[float] = None
+    basisMergedPrs: Optional[int] = None
     closedUnmerged: Optional[int] = None
     closedUnmergedAssisted: Optional[int] = None
     draftPrs: Optional[int] = None
@@ -5550,8 +5589,100 @@ class VcsPrHealthTotalsRead(BaseModel):
     mergedPrsAssisted: Optional[int] = None
     openPrs: Optional[int] = None
     openPrsAssisted: Optional[int] = None
+    pricedClosedUnmerged: Optional[int] = None
+    pricedClosedUnmergedAssisted: Optional[int] = None
+    pricedRottingPrs: Optional[int] = None
+    pricedRottingPrsAssisted: Optional[int] = None
     rottingPrs: Optional[int] = None
     rottingPrsAssisted: Optional[int] = None
+    triagedPrs: Optional[int] = None
+
+
+class Action5(StrEnum):
+    DISMISSED = 'DISMISSED'
+    SNOOZED = 'SNOOZED'
+
+
+class Reason(Enum):
+    NOT_WASTE = 'NOT_WASTE'
+    WILL_CLOSE = 'WILL_CLOSE'
+    DUPLICATE = 'DUPLICATE'
+    OTHER = 'OTHER'
+
+
+class VcsPrHealthTriageRead(BaseModel):
+    actedAt: Optional[AwareDatetime] = None
+    actedBy: Optional[str] = None
+    action: Optional[Action5] = None
+    prNumber: Optional[int] = None
+    reason: Optional[Reason] = None
+    repoName: Optional[str] = None
+    snoozedUntil: Optional[date_aliased] = None
+    source: Optional[str] = None
+
+
+class VcsPrListItemRead(BaseModel):
+    codingToolAssisted: Optional[bool] = None
+    codingToolVendors: Optional[list[str]] = None
+    mappedEmail: Optional[str] = None
+    mergedAt: Optional[AwareDatetime] = None
+    platformLogin: Optional[str] = None
+    prNumber: Optional[int] = None
+    repository: Optional[str] = None
+    repositoryDisplay: Optional[str] = None
+    title: Optional[str] = None
+    url: Optional[str] = None
+
+
+class VcsPrMemberRead(BaseModel):
+    mappedEmail: Optional[str] = None
+    platformLogin: Optional[str] = None
+    prsMerged: Optional[int] = None
+    prsMergedByVendor: Optional[dict[str, Any]] = None
+    prsMergedWithCodingTool: Optional[int] = None
+
+
+class VcsPrRepositoryMemberRead(BaseModel):
+    mappedEmail: Optional[str] = None
+    platformLogin: Optional[str] = None
+    prsMerged: Optional[int] = None
+    prsMergedWithCodingTool: Optional[int] = None
+
+
+class VcsPrRepositoryRowRead(BaseModel):
+    members: Optional[list[VcsPrRepositoryMemberRead]] = None
+    prsMerged: Optional[int] = None
+    prsMergedWithCodingTool: Optional[int] = None
+    repository: Optional[str] = None
+    repositoryDisplay: Optional[str] = None
+
+
+class VcsSyncScopeRead(BaseModel):
+    connected: Optional[bool] = Field(
+        None,
+        description='True when at least one active credential for this source last validated as delivering (valid or warning). A credential that exists but last failed validation reports false with a non-zero credentialCount.',
+    )
+    credentialCount: Optional[int] = None
+    deliveringCredentialCount: Optional[int] = None
+    filterActive: Optional[bool] = Field(
+        None,
+        description="True when a repository filter (allowedRepos) is configured on every credential for this source. One credential without an active filter makes the combined scope unrestricted, so this reports false even if other credentials do carry a filter: that credential's token can still see every repository it has access to.",
+    )
+    lastSyncedAt: Optional[AwareDatetime] = Field(
+        None,
+        description='When this source last actually persisted a pull request row, read from the pull request rows themselves rather than from credential validation: a credential can validate successfully, or warn, without any pull request data landing. Null when nothing has ever synced.',
+    )
+    repositoryBreakdownSupported: Optional[bool] = None
+    source: Optional[str] = None
+    syncedRepositoryCount: Optional[int] = Field(
+        None,
+        description='How many repositories the filter covers, null when no filter is active. Zero means a filter is configured whose every entry was rejected as malformed, so nothing is synced.',
+    )
+    totalRepositoryCount: Optional[int] = Field(
+        None,
+        description="Always null today. The organization's true repository total is never persisted by the sync, so any value here would be fabricated. The key is present so a caller can tell 'unknown' from an older server, and a follow-up ticket would have to persist the total at sync time.",
+    )
+    unsupportedReason: Optional[str] = None
 
 
 class VerifiedDomainRequest(BaseModel):
@@ -5573,7 +5704,7 @@ class JoinPolicy(StrEnum):
     OFF = 'OFF'
 
 
-class Source10(StrEnum):
+class Source9(StrEnum):
     """
     How the domain mapping was established
     """
@@ -5596,7 +5727,7 @@ class VerifiedDomainResource(BaseModel):
         description='Signup behavior for users on this domain',
         examples=['REQUEST'],
     )
-    source: Optional[Source10] = Field(
+    source: Optional[Source9] = Field(
         None, description='How the domain mapping was established', examples=['ADMIN']
     )
 
@@ -5697,7 +5828,7 @@ class V2ApiAiEnforcementEventsAffectedGetParametersQuery(BaseModel):
     affectedSearch: Optional[str] = None
 
 
-class Bucket1(StrEnum):
+class Bucket2(StrEnum):
     HOUR = 'HOUR'
     DAY = 'DAY'
     WEEK = 'WEEK'
@@ -5714,7 +5845,7 @@ class V2ApiAiEnforcementEventsHistoryGetParametersQuery(BaseModel):
     groupValue: Optional[str] = None
     groupBy: Optional[str] = None
     transactionId: Optional[str] = None
-    bucket: Optional[Bucket1] = None
+    bucket: Optional[Bucket2] = None
     zone: Optional[str] = None
 
 
@@ -5826,8 +5957,74 @@ class V2ApiBillingUsersVcsPrHealthGetParametersQuery(BaseModel):
     source: str
     startDate: date_aliased
     endDate: date_aliased
-    orgUnitId: Optional[int] = None
+    departmentId: Optional[int] = None
     includeDescendants: Optional[bool] = False
+    teamId: Optional[str] = None
+
+
+class V2ApiBillingUsersVcsPrHealthEngineersGetParametersQuery(BaseModel):
+    source: str
+    startDate: date_aliased
+    endDate: date_aliased
+    page: Optional[int] = 0
+    size: Optional[int] = 50
+    sortBy: Optional[str] = 'authorLogin'
+    sortDir: Optional[str] = 'asc'
+    departmentId: Optional[int] = None
+    includeDescendants: Optional[bool] = False
+    assistedOnly: Optional[bool] = False
+    q: Optional[str] = None
+    teamId: Optional[str] = None
+
+
+class V2ApiBillingUsersVcsPrHealthPrsGetParametersQuery(BaseModel):
+    source: str
+    startDate: date_aliased
+    endDate: date_aliased
+    author: str
+    departmentId: Optional[int] = None
+    includeDescendants: Optional[bool] = False
+    assistedOnly: Optional[bool] = False
+    teamId: Optional[str] = None
+
+
+class V2ApiBillingUsersVcsPrHealthPullRequestsGetParametersQuery(BaseModel):
+    source: str
+    startDate: date_aliased
+    endDate: date_aliased
+    bucket: Optional[str] = None
+    author: Optional[str] = None
+    page: Optional[int] = 0
+    size: Optional[int] = 50
+    sortBy: Optional[str] = 'inactivity'
+    sortDir: Optional[str] = 'desc'
+    departmentId: Optional[int] = None
+    includeDescendants: Optional[bool] = False
+    assistedOnly: Optional[bool] = False
+    cause: Optional[str] = None
+    repo: Optional[str] = None
+    triaged: Optional[str] = 'EXCLUDE'
+    ticket: Optional[str] = None
+    teamId: Optional[str] = None
+
+
+class V2ApiBillingUsersVcsPrHealthRepositoriesGetParametersQuery(BaseModel):
+    source: str
+    teamId: Optional[str] = None
+
+
+class V2ApiBillingUsersVcsPrsGetParametersQuery(BaseModel):
+    source: str
+    startDate: date_aliased
+    endDate: date_aliased
+    granularity: Optional[str] = 'window'
+    groupBy: Optional[str] = None
+    includeMembers: Optional[bool] = False
+    email: Optional[str] = None
+    includePullRequests: Optional[bool] = False
+    prLimit: Optional[int] = 100
+    prOffset: Optional[int] = 0
+    teamId: Optional[str] = None
 
 
 class V2ApiCredentialsGetParametersQuery(BaseModel):
@@ -6093,18 +6290,6 @@ class V2ApiMeteringElementDefinitionsGetParametersQuery(BaseModel):
     page: Optional[conint(ge=0)] = 0
     size: Optional[conint(ge=1)] = 10
     sort: Optional[list[str]] = None
-
-
-class V2ApiOrgUnitsGetParametersQuery(BaseModel):
-    teamId: Optional[str] = None
-
-
-class V2ApiOrgUnitsGetResponse(RootModel[list[OrgUnitResponseRead]]):
-    root: list[OrgUnitResponseRead]
-
-
-class V2ApiOrgUnitsPostParametersQuery(BaseModel):
-    teamId: str
 
 
 class V2ApiOrganizationsGetParametersQuery(BaseModel):
@@ -8013,7 +8198,7 @@ class CompiledEnforcementRule(BaseModel):
     compiledAt: Optional[AwareDatetime] = None
     currentValue: Optional[float] = Field(
         None,
-        description="Spend or usage this rule has accumulated in the current window. For a per-person cap scoped to one department (groupBy=SUBSCRIBER plus an ORG_UNIT filter) it is the HIGHEST single person's balance in the scope, not the scope's total: that rule's threshold is per person, so a total would read as several hundred percent used on a department where nobody has crossed anything. `groupBreakdown` carries the per-person figures.",
+        description="Spend or usage this rule has accumulated in the current window. For a per-person cap scoped to one department (groupBy=SUBSCRIBER plus a DEPARTMENT filter) it is the HIGHEST single person's balance in the scope, not the scope's total: that rule's threshold is per person, so a total would read as several hundred percent used on a department where nobody has crossed anything. `groupBreakdown` carries the per-person figures.",
         examples=[0.05],
     )
     denyMessage: Optional[str] = Field(
@@ -8023,6 +8208,14 @@ class CompiledEnforcementRule(BaseModel):
             'Blocked by {ruleName}: {spent} of {limit} used this {window}. Ask the user before retrying.'
         ],
     )
+    departmentId: Optional[int] = Field(
+        None,
+        description='BACK-2605: the department (department) id this rule is scoped to, when it is a department budget. Null for an ordinary team-wide rule.',
+    )
+    departmentPath: Optional[str] = Field(
+        None,
+        description='BACK-2605: materialized ancestor-id path of departmentId (see DepartmentPathUtils), e.g. `/12/40/173/`. Carried on the wire so the metering hot path and the API can both run the ancestor-cap decision (DepartmentAncestorCapEvaluator) without a DB lookup per rule. Null unless departmentId is set.',
+    )
     filters: Optional[list[EnforcementFilterEntry]] = None
     groupBreakdown: Optional[list[EnforcementGroupEntry]] = Field(
         None,
@@ -8031,18 +8224,10 @@ class CompiledEnforcementRule(BaseModel):
     groupBy: Optional[GroupBy3] = None
     includeDescendants: Optional[bool] = Field(
         None,
-        description='BACK-2605: "include sub-teams" for the ORG_UNIT-filter scope this rule was compiled from — mirrors CostControlFilter.includeDescendants. Null unless orgUnitId is set.',
+        description='BACK-2605: "include sub-teams" for the DEPARTMENT-filter scope this rule was compiled from — mirrors CostControlFilter.includeDescendants. Null unless departmentId is set.',
     )
     metricType: Optional[MetricType5] = None
     name: Optional[str] = None
-    orgUnitId: Optional[int] = Field(
-        None,
-        description='BACK-2605: the org unit (department) id this rule is scoped to, when it is a department budget. Null for an ordinary team-wide rule.',
-    )
-    orgUnitPath: Optional[str] = Field(
-        None,
-        description='BACK-2605: materialized ancestor-id path of orgUnitId (see OrgUnitPathUtils), e.g. `/12/40/173/`. Carried on the wire so the metering hot path and the API can both run the ancestor-cap decision (OrgUnitAncestorCapEvaluator) without a DB lookup per rule. Null unless orgUnitId is set.',
-    )
     percentUsed: Optional[float] = None
     periodType: Optional[PeriodType] = None
     ruleId: Optional[int] = None
@@ -8151,6 +8336,11 @@ class CostControlResource(BaseModel):
     notificationChannelIds: Optional[list[str]] = Field(
         None,
         description='Optional notification channels that receive alerts when the rule fires. Each entry is a type-prefixed identifier — `slack:<hashedId>` resolves to a Slack configuration; `webhook:<hashedId>` resolves to a webhook export configuration. PATCH: passing an empty list clears all channels; passing a non-empty list replaces the set; omitting the field leaves the persisted set unchanged.',
+    )
+    notificationEmails: Optional[list[EmailStr]] = Field(
+        None,
+        description="Optional email addresses that receive the rule's warn and block notices, at most 10. Addresses are trimmed and lowercased, and duplicates collapse. Shadow-mode rules email a preview, as Slack does. PATCH: passing an empty list clears the addresses; passing a non-empty list replaces them; omitting the field or passing JSON `null` leaves them unchanged.",
+        max_length=10,
     )
     resourceType: Optional[str] = Field(
         None,
@@ -8264,6 +8454,11 @@ class CostControlResourceRead(BaseModel):
         None,
         description='Optional notification channels that receive alerts when the rule fires. Each entry is a type-prefixed identifier — `slack:<hashedId>` resolves to a Slack configuration; `webhook:<hashedId>` resolves to a webhook export configuration. PATCH: passing an empty list clears all channels; passing a non-empty list replaces the set; omitting the field leaves the persisted set unchanged.',
     )
+    notificationEmails: Optional[list[EmailStr]] = Field(
+        None,
+        description="Optional email addresses that receive the rule's warn and block notices, at most 10. Addresses are trimmed and lowercased, and duplicates collapse. Shadow-mode rules email a preview, as Slack does. PATCH: passing an empty list clears the addresses; passing a non-empty list replaces them; omitting the field or passing JSON `null` leaves them unchanged.",
+        max_length=10,
+    )
     resourceType: Optional[str] = Field(
         None,
         description='The type of object (automatically set by the system)',
@@ -8375,6 +8570,11 @@ class CostControlResourceWrite(BaseModel):
     notificationChannelIds: Optional[list[str]] = Field(
         None,
         description='Optional notification channels that receive alerts when the rule fires. Each entry is a type-prefixed identifier — `slack:<hashedId>` resolves to a Slack configuration; `webhook:<hashedId>` resolves to a webhook export configuration. PATCH: passing an empty list clears all channels; passing a non-empty list replaces the set; omitting the field leaves the persisted set unchanged.',
+    )
+    notificationEmails: Optional[list[EmailStr]] = Field(
+        None,
+        description="Optional email addresses that receive the rule's warn and block notices, at most 10. Addresses are trimmed and lowercased, and duplicates collapse. Shadow-mode rules email a preview, as Slack does. PATCH: passing an empty list clears the addresses; passing a non-empty list replaces them; omitting the field or passing JSON `null` leaves them unchanged.",
+        max_length=10,
     )
     resourceType: Optional[str] = Field(
         None,
@@ -8720,7 +8920,7 @@ class EnforcementRuleRosterResource(BaseModel):
     )
     dimension: Optional[str] = Field(
         None,
-        description="The rule's own grouping, SUBSCRIBER or ORG_UNIT. Never null: a rule that groups on nothing has no roster and the endpoint answers 404 instead.",
+        description="The rule's own grouping, SUBSCRIBER or DEPARTMENT. Never null: a rule that groups on nothing has no roster and the endpoint answers 404 instead.",
         examples=['SUBSCRIBER'],
     )
     page: Optional[int] = Field(
@@ -8786,10 +8986,10 @@ class EnforcementRuleRosterResource(BaseModel):
 
 class EnforcementRulesPayload(BaseModel):
     compiledAt: Optional[AwareDatetime] = None
-    orgUnitBudgetBlockBalances: Optional[dict[str, float]] = None
-    orgUnitBudgetBlockUnits: Optional[dict[str, int]] = None
-    orgUnitBudgetBlocks: Optional[dict[str, int]] = None
-    orgUnitBudgetWarnings: Optional[dict[str, int]] = None
+    departmentBudgetBlockBalances: Optional[dict[str, float]] = None
+    departmentBudgetBlockUnits: Optional[dict[str, int]] = None
+    departmentBudgetBlocks: Optional[dict[str, int]] = None
+    departmentBudgetWarnings: Optional[dict[str, int]] = None
     rules: Optional[list[CompiledEnforcementRule]] = None
 
 
@@ -9583,6 +9783,11 @@ class EntityModelCostControlResourceRead(BaseModel):
         None,
         description='Optional notification channels that receive alerts when the rule fires. Each entry is a type-prefixed identifier — `slack:<hashedId>` resolves to a Slack configuration; `webhook:<hashedId>` resolves to a webhook export configuration. PATCH: passing an empty list clears all channels; passing a non-empty list replaces the set; omitting the field leaves the persisted set unchanged.',
     )
+    notificationEmails: Optional[list[EmailStr]] = Field(
+        None,
+        description="Optional email addresses that receive the rule's warn and block notices, at most 10. Addresses are trimmed and lowercased, and duplicates collapse. Shadow-mode rules email a preview, as Slack does. PATCH: passing an empty list clears the addresses; passing a non-empty list replaces them; omitting the field or passing JSON `null` leaves them unchanged.",
+        max_length=10,
+    )
     resourceType: Optional[str] = Field(
         None,
         description='The type of object (automatically set by the system)',
@@ -9847,12 +10052,12 @@ class EntityModelEnforcementEventResourceRead(BaseModel):
     )
     groupLabel: Optional[str] = Field(
         None,
-        description="Display name of the object `groupValue` identifies. On a rule grouped by org unit this is the department's name. For every other dimension, and whenever the org unit cannot be resolved (renamed away, deleted, or owned by another team), it repeats `groupValue` byte for byte, so a client can compare the two and print the identifier once rather than twice. Null exactly when `groupValue` is null. Display only: `groupValue` is still what a filter sends back.",
+        description="Display name of the object `groupValue` identifies. On a rule grouped by department this is the department's name. For every other dimension, and whenever the department cannot be resolved (renamed away, deleted, or owned by another team), it repeats `groupValue` byte for byte, so a client can compare the two and print the identifier once rather than twice. Null exactly when `groupValue` is null. Display only: `groupValue` is still what a filter sends back.",
         examples=['Data Science'],
     )
     groupValue: Optional[str] = Field(
         None,
-        description='For a rule grouped by subscriber or org unit, the group this event belongs to: the subscriber key (usually an email address) or the Revenium-generated identifier of the org unit. Null for a pooled rule, and for events written before this field existed.',
+        description='For a rule grouped by subscriber or department, the group this event belongs to: the subscriber key (usually an email address) or the Revenium-generated identifier of the department. Null for a pooled rule, and for events written before this field existed.',
         examples=['jane@acme.com'],
     )
     id: Optional[str] = Field(
@@ -9933,6 +10138,11 @@ class EntityModelEnforcementEventResourceRead(BaseModel):
         None,
         description='The configured hard limit the rule evaluated against',
         examples=[100.0],
+    )
+    tier: Optional[Tier] = Field(
+        None,
+        description='Which line this event crossed: `HARD` for the cap, `WARN` for the warning line. Differs from `level` only when a non-blocking rule crosses its cap: nothing was blocked, so `level` is `WARN`.',
+        examples=['HARD'],
     )
     transactionId: Optional[str] = Field(
         None,
@@ -11577,21 +11787,6 @@ class MeteringElementDefinitionResourceWrite(BaseModel):
     )
 
 
-class OrgUnitBudgetGroupPreviewResult(BaseModel):
-    """
-    Result of a department group-spawn preview.
-    """
-
-    targetCount: Optional[int] = Field(
-        None,
-        description='Number of direct sub-teams under parentOrgUnitId — the number of independent per-department caps a groupBy=ORG_UNIT rule scoped here would produce.',
-        examples=[6],
-    )
-    targets: Optional[list[ResourceMetadata]] = Field(
-        None, description='The direct sub-teams of parentOrgUnitId.'
-    )
-
-
 class FieldEmbedded14(BaseModel):
     organizationResourceList: Optional[list[EntityModelOrganizationResourceRead]] = None
 
@@ -11977,7 +12172,7 @@ class RatingAggregation(BaseModel):
         description='The name of the rating aggregation for identification and display purposes',
         examples=['API Calls by Region'],
     )
-    tiers: Optional[list[Tier]] = Field(
+    tiers: Optional[list[TierModel]] = Field(
         None,
         description='Volume-based pricing tiers that define different rates based on usage levels. Each tier specifies a usage range and corresponding pricing.',
     )
@@ -12956,20 +13151,122 @@ class UserPagedModelRead(BaseModel):
     page: Optional[PageMetadataRead] = None
 
 
+class VcsPrHealthOpenPrRead(BaseModel):
+    activeMappedEmail: Optional[str] = None
+    ageDays: Optional[int] = None
+    authorLogin: Optional[str] = None
+    bucket: Optional[Bucket] = None
+    cause: Optional[Cause1] = None
+    closedAtVcs: Optional[AwareDatetime] = None
+    codingToolAssisted: Optional[bool] = None
+    createdAtVcs: Optional[AwareDatetime] = None
+    draft: Optional[bool] = None
+    firstReviewAt: Optional[AwareDatetime] = None
+    headRef: Optional[str] = None
+    inactiveDays: Optional[int] = None
+    lastCommitAtVcs: Optional[AwareDatetime] = None
+    lastSyncedAt: Optional[AwareDatetime] = None
+    mappedEmail: Optional[str] = None
+    prNumber: Optional[int] = None
+    repoName: Optional[str] = None
+    requestedReviewers: Optional[list[VcsPrHealthRequestedReviewerRead]] = None
+    reviewDecision: Optional[str] = None
+    sameTicketAs: Optional[VcsPrHealthPrRefRead] = None
+    ticketId: Optional[str] = None
+    title: Optional[str] = None
+    triage: Optional[VcsPrHealthTriageRead] = None
+    updatedAtVcs: Optional[AwareDatetime] = None
+    url: Optional[str] = None
+
+
+class VcsPrHealthPrsResponseRead(BaseModel):
+    agingDays: Optional[int] = None
+    assistedOnly: Optional[bool] = None
+    author: Optional[str] = None
+    closedUnmerged: Optional[list[VcsPrHealthOpenPrRead]] = None
+    closedUnmergedTruncated: Optional[bool] = None
+    counts: Optional[VcsPrHealthPrCountsRead] = None
+    departmentId: Optional[int] = None
+    endDate: Optional[date_aliased] = None
+    includeDescendants: Optional[bool] = None
+    mappedEmail: Optional[str] = None
+    open: Optional[list[VcsPrHealthOpenPrRead]] = None
+    openTruncated: Optional[bool] = None
+    rottingDays: Optional[int] = None
+    source: Optional[str] = None
+    startDate: Optional[date_aliased] = None
+    triaged: Optional[list[VcsPrHealthOpenPrRead]] = None
+    triagedTruncated: Optional[bool] = None
+
+
+class VcsPrHealthPullRequestsPageResponseRead(BaseModel):
+    agingDays: Optional[int] = None
+    assistedOnly: Optional[bool] = None
+    author: Optional[str] = None
+    bucket: Optional[Bucket] = None
+    cause: Optional[Cause1] = None
+    departmentId: Optional[int] = None
+    endDate: Optional[date_aliased] = None
+    includeDescendants: Optional[bool] = None
+    page: Optional[int] = None
+    pullRequests: Optional[list[VcsPrHealthOpenPrRead]] = None
+    repo: Optional[str] = None
+    rottingDays: Optional[int] = None
+    size: Optional[int] = None
+    sortBy: Optional[str] = None
+    sortDir: Optional[str] = None
+    source: Optional[str] = None
+    startDate: Optional[date_aliased] = None
+    ticket: Optional[str] = None
+    totalElements: Optional[int] = None
+    totalPages: Optional[int] = None
+    triaged: Optional[Triaged] = None
+
+
+class VcsPrHealthRepositoriesResponseRead(BaseModel):
+    repositories: Optional[list[VcsPrHealthRepositoryRead]] = None
+    source: Optional[str] = None
+
+
 class VcsPrHealthResponseRead(BaseModel):
     agingDays: Optional[int] = None
+    causes: Optional[list[VcsPrHealthCauseCountRead]] = None
     cutoffDate: Optional[date_aliased] = None
     cutoffDateIsDefault: Optional[bool] = None
+    departmentId: Optional[int] = None
     endDate: Optional[date_aliased] = None
     engineers: Optional[list[VcsPrHealthEngineerRead]] = None
     excludedRepos: Optional[list[str]] = None
     includeDescendants: Optional[bool] = None
     oldest: Optional[list[VcsPrHealthOpenPrRead]] = None
-    orgUnitId: Optional[int] = None
+    pricedSince: Optional[date_aliased] = None
     rottingDays: Optional[int] = None
     source: Optional[str] = None
     startDate: Optional[date_aliased] = None
     totals: Optional[VcsPrHealthTotalsRead] = None
+
+
+class VcsPrsSummaryResponseRead(BaseModel):
+    dailyRows: Optional[list[VcsPrDailyMemberRead]] = None
+    granularity: Optional[str] = None
+    groupBy: Optional[str] = None
+    historyStartDate: Optional[date_aliased] = Field(
+        None,
+        description='Earliest day on which PR activity was recorded for this organization and source, independent of the requested startDate and endDate. A lower bound on coverage, not a promise that earlier days were absent rather than unsynced.',
+    )
+    members: Optional[list[VcsPrMemberRead]] = None
+    pullRequests: Optional[list[VcsPrListItemRead]] = None
+    pullRequestsLimit: Optional[int] = None
+    pullRequestsOffset: Optional[int] = None
+    pullRequestsTotal: Optional[int] = None
+    pullRequestsTruncated: Optional[bool] = None
+    repositories: Optional[list[VcsPrRepositoryRowRead]] = None
+    repositoriesTruncated: Optional[bool] = None
+    source: Optional[str] = None
+    syncScope: Optional[VcsSyncScopeRead] = None
+    totalPrsMerged: Optional[int] = None
+    totalPrsMergedByVendor: Optional[dict[str, Any]] = None
+    totalPrsMergedWithCodingTool: Optional[int] = None
 
 
 class V2ApiAiAlertsAnomalyIdBudgetProgressGetResponse(
@@ -13731,7 +14028,7 @@ class Plan(BaseModel):
         None,
         description='One-time setup fees charged when a subscription is created. Each setup fee has a name, amount, and type',
     )
-    tiers: Optional[list[Tier]] = Field(
+    tiers: Optional[list[TierModel]] = Field(
         None,
         description='Volume-based pricing tiers that define different rates based on usage levels. Each tier specifies a usage range and corresponding pricing',
     )
