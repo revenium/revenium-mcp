@@ -18,6 +18,7 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
 from ..client import ReveniumAPIError
+from ..common.department_aliases import deprecated_argument_properties
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
@@ -27,25 +28,25 @@ from ..introspection.metadata import ToolType
 from .unified_tool_base import ToolBase
 
 
-# BACK-2757. The org-unit id is an opaque number the agent cannot guess, and
+# BACK-2757. The department id is an opaque number the agent cannot guess, and
 # the only MCP surface that resolves a department name to it is
-# manage_customers' list_org_units (BACK-2767) — so the schema says so rather
+# manage_customers' list_departments (BACK-2767) — so the schema says so rather
 # than leaving the caller to invent an id. The feature-flag caveat is repeated
 # here because a caller reaches this filter without ever touching the customers
 # tool, where the 403 is explained.
-ORG_UNIT_FILTER_DESCRIPTION = (
-    "Single org-unit (department) id to scope the run to; omit for a "
+DEPARTMENT_FILTER_DESCRIPTION = (
+    "Single department id to scope the run to; omit for a "
     "tenant-wide run. A single id string, NOT a list, unlike the neighbouring "
     "filter_agent / filter_product_id arrays. Resolve the id with "
-    "manage_customers(action=list_org_units). Org units are gated by the "
+    "manage_customers(action=list_departments). Departments are gated by the "
     "per-tenant org-unit-attribution-enabled feature flag: if that lookup "
     "answers 403 the dimension is unavailable for the tenant."
 )
 
 INCLUDE_DESCENDANTS_DESCRIPTION = (
-    "Whether a filter_org_unit_id run also covers the unit's sub-units. "
+    "Whether a filter_department_id run also covers the department's sub-departments. "
     "Defaults to true (the backend's own default); pass false to analyze only "
-    "the department's own rows. Ignored when filter_org_unit_id is omitted."
+    "the department's own rows. Ignored when filter_department_id is omitted."
 )
 
 
@@ -234,7 +235,7 @@ class AIInsightsManagement(ToolBase):
         slim = arguments.get("slim", True)
         client = await self.get_client(ctx=ctx)
         # The run dict is rendered verbatim, so the filters the backend echoes
-        # back — filterOrgUnitId / filterIncludeDescendants included (BACK-2757),
+        # back — filterDepartmentId / filterIncludeDescendants included (BACK-2757),
         # present in both the slim and full responses — surface without any
         # per-field rendering here.
         run = await client.get_recommendation_run(run_id, slim=slim)
@@ -413,7 +414,7 @@ class AIInsightsManagement(ToolBase):
             filter_trace_type=arguments.get("filter_trace_type"),
             filter_consuming_org_id=arguments.get("filter_consuming_org_id"),
             filter_environment=arguments.get("filter_environment", ""),
-            filter_org_unit_id=arguments.get("filter_org_unit_id", ""),
+            filter_department_id=arguments.get("filter_department_id", ""),
             filter_include_descendants=arguments.get("filter_include_descendants", True),
             filter_include_coding_assistants=arguments.get("filter_include_coding_assistants", True),
             filter_include_coding_assistants_for_cost_detectors=arguments.get(
@@ -518,14 +519,14 @@ class AIInsightsManagement(ToolBase):
             "`period_end=2026-01-31T23:59:59Z`. Returns immediately with `runId` and "
             "`status=running`. Poll `get_run` until status is one of "
             "`completed | partial | failed | cancelled`.\n\n"
-            "## Scope a run to one department (org unit)\n"
+            "## Scope a run to one department\n"
             "`action=trigger_run`, `period_start=...`, `period_end=...`, "
-            "`filter_org_unit_id=\"173\"` — a string, per the schema; resolve the id with "
-            "`manage_customers(action=list_org_units)`; the filter takes a single "
-            "id string, not a list. Sub-units are included by default; pass "
-            "`filter_include_descendants=false` for that department alone. Org "
-            "units are gated by the per-tenant org-unit-attribution-enabled "
-            "feature flag, so `list_org_units` answering 403 means the dimension "
+            "`filter_department_id=\"173\"` — a string, per the schema; resolve the id with "
+            "`manage_customers(action=list_departments)`; the filter takes a single "
+            "id string, not a list. Sub-departments are included by default; pass "
+            "`filter_include_descendants=false` for that department alone. "
+            "Departments are gated by the per-tenant org-unit-attribution-enabled "
+            "feature flag, so `list_departments` answering 403 means the dimension "
             "is unavailable for the tenant.\n\n"
             "## Read a run (compact)\n"
             "`action=get_run`, `run_id=<id>` — defaults to slim mode (compact "
@@ -584,10 +585,11 @@ class AIInsightsManagement(ToolBase):
                 "filter_trace_type":        {"type": "array", "items": {"type": "string"}},
                 "filter_consuming_org_id":  {"type": "array", "items": {"type": "string"}},
                 "filter_environment":       {"type": "string"},
-                "filter_org_unit_id": {
+                "filter_department_id": {
                     "type": "string",
-                    "description": ORG_UNIT_FILTER_DESCRIPTION,
+                    "description": DEPARTMENT_FILTER_DESCRIPTION,
                 },
+                **deprecated_argument_properties("filter_department_id", "string"),
                 "filter_include_descendants": {
                     "type": "boolean",
                     "description": INCLUDE_DESCENDANTS_DESCRIPTION,

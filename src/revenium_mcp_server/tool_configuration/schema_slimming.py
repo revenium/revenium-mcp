@@ -33,6 +33,8 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Set
 
 from loguru import logger
 
+from ..common.department_aliases import mark_deprecated_aliases
+
 #: Parameters advertised on a thin schema when the tool declares them. These
 #: are the argument names that are meaningful across most actions of a tool,
 #: so leaving them visible saves a ``get_capabilities`` round trip for the
@@ -223,7 +225,7 @@ def thin_schema(
 
 def slim_tool_schema(tool_name: str, schema: Mapping[str, Any]) -> Dict[str, Any]:
     """Return the schema to advertise for ``tool_name``."""
-    slimmed = slim_schema(schema)
+    slimmed = mark_deprecated_aliases(tool_name, slim_schema(schema))
     if tool_name in THIN_SCHEMA_TOOLS:
         return thin_schema(slimmed, THIN_TOOL_DEFAULTS[tool_name])
     return slimmed

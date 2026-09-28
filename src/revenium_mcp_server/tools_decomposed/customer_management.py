@@ -22,6 +22,7 @@ from ..common.error_handling import (
     create_structured_missing_parameter_error,
     create_structured_validation_error,
 )
+from ..common.department_aliases import deprecated_aliases_note
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.update_configs import UpdateConfigFactory
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
@@ -554,7 +555,7 @@ def _raise_pr_health_settings_error(
 ATTRIBUTION_POLICY_STRICT_DEFAULT = "VERIFIED_DOMAIN_ONLY"
 
 # Documentation only - deliberately NOT a validation gate. A client-side copy of an
-# upstream enum is what keeps ORG_UNIT unreachable on the alert surface today; the
+# upstream enum is what keeps DEPARTMENT unreachable on the alert surface today; the
 # policy value is sent verbatim and the API rejects an unknown one with a 400 that
 # names it.
 ATTRIBUTION_POLICY_KNOWN_VALUES = (
@@ -917,64 +918,69 @@ def _raise_verified_domain_error(
     raise error
 
 
-# Org-unit (department) lookup -------------------------------------------------
+# Department lookup -------------------------------------------------
 
-# BACK-2767 one-place rule: the upstream OrgUnitResponse carries `id` and `parentId`
-# as JSON numbers, but every ORG_UNIT consumer downstream (insight-run filters,
+# BACK-2767 one-place rule: the upstream DepartmentResponse carries `id` and `parentId`
+# as JSON numbers, but every DEPARTMENT consumer downstream (insight-run filters,
 # department cost controls, group previews) sends the value as a STRING. The
 # number-to-string conversion is defined here and nowhere else, so every consumer
 # inherits one rule instead of each re-deriving its own.
-ORG_UNIT_ID_STRING_NOTE = (
-    "org unit ids are returned as strings because that is the form the ORG_UNIT "
+DEPARTMENT_ID_STRING_NOTE = (
+    "department ids are returned as strings because that is the form the DEPARTMENT "
     "dimension expects wherever it is filtered on (insights, cost controls, groups); "
     "the upstream API stores them as numbers."
 )
 
 # Surfaced on the response when the endpoint answers with something other than the
 # documented flat array, so an empty result is never mistaken for "no departments".
-ORG_UNIT_UNEXPECTED_SHAPE_NOTE = (
-    "The org-units endpoint answered with an unexpected payload shape instead of the "
+DEPARTMENT_UNEXPECTED_SHAPE_NOTE = (
+    "The departments endpoint answered with an unexpected payload shape instead of the "
     "documented JSON array, so no units could be read. Retry, and report the tenant if "
     "it persists - this is an upstream contract change, not an empty organization."
 )
-ORG_UNIT_FEATURE_FLAG_NOTE = (
-    "Org units are gated by the per-tenant org-unit-attribution-enabled feature "
+DEPARTMENT_FEATURE_FLAG_NOTE = (
+    "Departments are gated by the per-tenant org-unit-attribution-enabled feature "
     "flag, which is OFF by default. A 403 from this listing means the flag is not "
-    "enabled for the tenant — the whole ORG_UNIT dimension family (department "
+    "enabled for the tenant — the whole DEPARTMENT dimension family (department "
     "cost controls, insight-run filters, group previews) is unavailable until "
     "Revenium enables it. This is a tenant-configuration state, not a "
     "permissions problem with your key."
 )
-ORG_UNIT_PERSON_DELETE_NOTE = (
-    "Deleting a directory person closes their open org-unit assignment effective "
+DEPARTMENT_PERSON_DELETE_NOTE = (
+    "Deleting a directory person closes their open department assignment effective "
     "now, removes every email mapping that points at them and deletes the person, in "
     "one transaction. Assignment history is kept, so usage recorded before the "
-    "removal stays attributed to the org unit. Re-importing the same email later "
+    "removal stays attributed to the department. Re-importing the same email later "
     "creates a new person."
 )
-ORG_UNIT_ASSIGNMENT_CLEAR_NOTE = (
-    "Clearing an assignment closes the person's open primary org-unit assignment "
+DEPARTMENT_ASSIGNMENT_CLEAR_NOTE = (
+    "Clearing an assignment closes the person's open primary department assignment "
     "effective now. The person and their email mappings stay, usage recorded before "
-    "stays attributed to the org unit, and the call succeeds whether or not an "
+    "stays attributed to the department, and the call succeeds whether or not an "
     "assignment was open."
 )
-ORG_UNIT_REMOVAL_BUDGET_NOTE = (
-    "An ORG_UNIT cost control caps whoever is attributed to the department when it "
+DEPARTMENT_REMOVAL_BUDGET_NOTE = (
+    "A DEPARTMENT cost control caps whoever is attributed to the department when it "
     "evaluates, so from now on this person's usage no longer counts toward, or is "
     "capped by, that department's budget."
 )
-ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE = (
-    "CSV import of org units and memberships stays outside the MCP: run it in the "
+DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE = (
+    "CSV import of departments and memberships stays outside the MCP: run it in the "
     "Revenium UI. That includes its removeMissing switch, which ends the assignment "
     "of everyone missing from the file, and the membershipsRemoved / removalsSkipped "
     "counters the import reports."
 )
 
 
-def org_unit_id_to_filter_value(unit_id: Any) -> Optional[str]:
-    """Convert an upstream org-unit id to the string an ORG_UNIT filter expects.
+DEPARTMENT_ACTION_ALIASES_NOTE = deprecated_aliases_note(
+    "list_departments", "delete_department_person", "clear_department_assignment"
+)
 
-    Single definition of BACK-2767's number-to-string rule (see ORG_UNIT_ID_STRING_NOTE).
+
+def department_id_to_filter_value(unit_id: Any) -> Optional[str]:
+    """Convert an upstream department id to the string a DEPARTMENT filter expects.
+
+    Single definition of BACK-2767's number-to-string rule (see DEPARTMENT_ID_STRING_NOTE).
     Returns None for a missing id, which is a legitimate value for `parentId` on a
     root unit.
     """
@@ -988,17 +994,17 @@ def org_unit_id_to_filter_value(unit_id: Any) -> Optional[str]:
     return text or None
 
 
-def _normalize_org_unit(unit: Any) -> Optional[Dict[str, Any]]:
-    """Project one upstream org unit onto the fields name-to-id resolution needs.
+def _normalize_department(unit: Any) -> Optional[Dict[str, Any]]:
+    """Project one upstream department onto the fields name-to-id resolution needs.
 
     Returns None for anything that is not a JSON object so a malformed entry is
     skipped rather than crashing the whole listing.
     """
     if not isinstance(unit, dict):
         return None
-    unit_id = org_unit_id_to_filter_value(unit.get("id"))
+    unit_id = department_id_to_filter_value(unit.get("id"))
     # The whole point of this listing is handing an agent a value it can paste
-    # into an ORG_UNIT filter. The server contract types id as a number, so an
+    # into a DEPARTMENT filter. The server contract types id as a number, so an
     # entry whose id is missing or does not read as one is malformed — rendering
     # it (as id=None or an arbitrary string) would invite copying an unusable
     # value. parentId stays permissive: None is legitimate on a root unit.
@@ -1007,54 +1013,54 @@ def _normalize_org_unit(unit: Any) -> Optional[Dict[str, Any]]:
     return {
         "name": unit.get("name"),
         "id": unit_id,
-        "parentId": org_unit_id_to_filter_value(unit.get("parentId")),
+        "parentId": department_id_to_filter_value(unit.get("parentId")),
         "path": unit.get("path"),
         "source": unit.get("source"),
         "externalRef": unit.get("externalRef"),
     }
 
 
-def _format_org_units_text(result: Dict[str, Any]) -> str:
-    """Render the org-unit listing so a name can be grepped straight to its id."""
-    units: List[Dict[str, Any]] = result.get("org_units") or []
+def _format_departments_text(result: Dict[str, Any]) -> str:
+    """Render the department listing so a name can be grepped straight to its id."""
+    units: List[Dict[str, Any]] = result.get("departments") or []
     team_id = result.get("team_id")
     scope = f" for team {team_id}" if team_id else ""
 
     if not units:
-        text = f"No org units (departments) found{scope}.\n\n"
+        text = f"No departments found{scope}.\n\n"
         if result.get("warning"):
             text += f"WARNING: {result['warning']}\n\n"
         else:
             text += (
-                "An organization with no departments defined answers this way. Org units "
+                "An organization with no departments defined answers this way. Departments "
                 "are created in the Revenium UI or imported there; this action is "
                 "read-only and cannot create them.\n\n"
             )
         return text + json.dumps(result, indent=2)
 
-    text = f"Found {len(units)} org unit(s){scope}:\n\n"
+    text = f"Found {len(units)} department(s){scope}:\n\n"
     if result.get("warning"):
         text = f"WARNING: {result['warning']}\n\n" + text
-    # One line per unit, name first, so `list_org_units` output greps by department name.
+    # One line per unit, name first, so `list_departments` output greps by department name.
     for unit in units:
         text += (
             f"- {unit.get('name')} | id={unit.get('id')} | "
             f"parentId={unit.get('parentId')} | path={unit.get('path')} | "
             f"source={unit.get('source')}\n"
         )
-    text += f"\nNote: {ORG_UNIT_ID_STRING_NOTE}\n\n"
+    text += f"\nNote: {DEPARTMENT_ID_STRING_NOTE}\n\n"
     return text + json.dumps(result, indent=2)
 
 
-def _org_unit_feature_disabled_error(team_id: Optional[str], action: str) -> ToolError:
+def _department_feature_disabled_error(team_id: Optional[str], action: str) -> ToolError:
     return ToolError(
-        message="Org units are not enabled for this tenant",
+        message="Departments are not enabled for this tenant",
         error_code=ErrorCodes.API_AUTHORIZATION,
         field="team_id",
         value=team_id or "(ambient team)",
         suggestions=[
-            ORG_UNIT_FEATURE_FLAG_NOTE,
-            "Ask Revenium to enable org-unit attribution for this "
+            DEPARTMENT_FEATURE_FLAG_NOTE,
+            "Ask Revenium to enable department attribution for this "
             f"tenant, then retry {action}.",
         ],
     )
@@ -1124,14 +1130,14 @@ def _removal_call_example(result: Dict[str, Any]) -> str:
     return f"{result['action']}({identifier}{team}, confirm=true)"
 
 
-def _raise_org_unit_removal_error(
+def _raise_department_removal_error(
     error: ReveniumAPIError, action: str, team_id: Optional[str], target: Dict[str, Any]
 ) -> NoReturn:
     """Translate the removal routes' documented 4xx answers into caller guidance."""
-    # The org-unit routes share list_org_units' default-OFF feature flag, so a 403
+    # The department routes share list_departments' default-OFF feature flag, so a 403
     # is a tenant-configuration state before it is a permissions problem.
     if error.status_code == 403:
-        raise _org_unit_feature_disabled_error(team_id, action)
+        raise _department_feature_disabled_error(team_id, action)
     field, value = (
         ("person_id", target["person_id"])
         if target.get("person_id") is not None
@@ -1139,7 +1145,7 @@ def _raise_org_unit_removal_error(
     )
     upstream = str(error.message)
     if error.status_code == 404:
-        raise _org_unit_removal_not_found_error(upstream, team_id, field, value)
+        raise _department_removal_not_found_error(upstream, team_id, field, value)
     if error.status_code == 400 and field == "email":
         raise ToolError(
             message=f"Email {value} does not resolve to exactly one directory person",
@@ -1152,13 +1158,13 @@ def _raise_org_unit_removal_error(
 
 
 _AMBIGUOUS_EMAIL_HINTS = {
-    "delete_org_unit_person": (
-        "delete_org_unit_person(person_id=...) addresses one directory person exactly"
+    "delete_department_person": (
+        "delete_department_person(person_id=...) addresses one directory person exactly"
     ),
-    "clear_org_unit_assignment": (
+    "clear_department_assignment": (
         "The email must resolve to exactly one directory person, and there is no "
         "id-addressed clear route: fix the directory's email mapping first, or delete "
-        "the person with delete_org_unit_person(person_id=...)"
+        "the person with delete_department_person(person_id=...)"
     ),
 }
 
@@ -1169,7 +1175,7 @@ _ALREADY_REMOVED_HINT = (
 _AMBIENT_TEAM_HINT = "Check team_id; omitted, the ambient team from the auth config is used"
 
 
-def _org_unit_removal_not_found_error(
+def _department_removal_not_found_error(
     upstream: str, team_id: Optional[str], person_field: str, person_value: Any
 ) -> ToolError:
     """Attribute a removal 404 to the person or the team from upstream's own message.
@@ -1203,15 +1209,15 @@ def _org_unit_removal_not_found_error(
 
 
 _REMOVAL_HEADLINES = {
-    "delete_org_unit_person": ("Delete {target}", "Deleted {target}"),
-    "clear_org_unit_assignment": (
-        "Clear the org-unit assignment of {target}",
-        "Cleared the org-unit assignment of {target}",
+    "delete_department_person": ("Delete {target}", "Deleted {target}"),
+    "clear_department_assignment": (
+        "Clear the department assignment of {target}",
+        "Cleared the department assignment of {target}",
     ),
 }
 
 
-def _format_org_unit_removal_text(result: Dict[str, Any]) -> str:
+def _format_department_removal_text(result: Dict[str, Any]) -> str:
     """Render a removal preview or its confirmation; the 204 carries no payload to show."""
     preview_headline, done_headline = _REMOVAL_HEADLINES[result["action"]]
     target = _describe_removal_target(result)
@@ -1220,7 +1226,7 @@ def _format_org_unit_removal_text(result: Dict[str, Any]) -> str:
     if result.get("confirmation_required"):
         return (
             f"**Confirmation Required - {preview_headline.format(target=target)} in {scope}**\n\n"
-            f"{result['effect']}\n\n{ORG_UNIT_REMOVAL_BUDGET_NOTE}\n\n"
+            f"{result['effect']}\n\n{DEPARTMENT_REMOVAL_BUDGET_NOTE}\n\n"
             "No request was sent. To apply, repeat the call with confirm=true:\n"
             f"`{_removal_call_example(result)}`"
         )
@@ -2707,30 +2713,30 @@ class TeamManager(BaseManager):
         }
 
 
-class OrgUnitManager(BaseManager):
-    """Internal manager for org units (departments) and their memberships.
+class DepartmentManager(BaseManager):
+    """Internal manager for departments and their memberships.
 
-    Org units themselves are created and CSV-imported in the Revenium UI; the MCP
+    Departments themselves are created and CSV-imported in the Revenium UI; the MCP
     lists them (BACK-2767) and detaches people from them (BACK-3353), with every
     detach gated behind an explicit confirm=true.
     """
 
-    async def list_org_units(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """List the active org units, optionally scoped to one team."""
+    async def list_departments(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """List the active departments, optionally scoped to one team."""
         team_id = _optional_team_id(arguments)
 
         # Typed as Any on purpose: the client's return annotation promises a list, but
         # that promise is a cast over an untyped JSON body, so the shape check below is
         # a real runtime guard rather than dead code.
         try:
-            response: Any = await self.client.get_org_units(team_id)
+            response: Any = await self.client.get_departments(team_id)
         except ReveniumAPIError as e:
-            # The whole OrgUnitController is behind the default-OFF
+            # The whole DepartmentController is behind the default-OFF
             # org-unit-attribution-enabled feature flag, so a 403 here usually
             # means "not enabled for this tenant", not "bad credentials" —
             # surface that instead of a raw permission error.
             if e.status_code == 403:
-                raise _org_unit_feature_disabled_error(team_id, "list_org_units")
+                raise _department_feature_disabled_error(team_id, "list_departments")
             raise
 
         warning: Optional[str] = None
@@ -2740,12 +2746,12 @@ class OrgUnitManager(BaseManager):
             # The endpoint is documented as a flat array; anything else is an upstream
             # contract change, and reporting it beats rendering a silent empty list.
             raw_units = []
-            warning = ORG_UNIT_UNEXPECTED_SHAPE_NOTE
+            warning = DEPARTMENT_UNEXPECTED_SHAPE_NOTE
 
         units: List[Dict[str, Any]] = []
         skipped = 0
         for raw in raw_units:
-            normalized = _normalize_org_unit(raw)
+            normalized = _normalize_department(raw)
             if normalized is None:
                 skipped += 1
                 continue
@@ -2756,23 +2762,23 @@ class OrgUnitManager(BaseManager):
         # -empty explanation must never conceal it.
         if skipped and not warning:
             warning = (
-                f"{skipped} of {len(raw_units)} entries in the org-unit response "
+                f"{skipped} of {len(raw_units)} entries in the department response "
                 "were malformed (not an object, or no usable numeric id) and were "
                 "skipped. "
             ) + (
-                "No valid org units remained — treat this as an upstream data or "
+                "No valid departments remained — treat this as an upstream data or "
                 "contract problem, not as an organization without departments."
                 if not units
                 else "The listing below covers only the well-formed entries."
             )
 
         result: Dict[str, Any] = {
-            "action": "list_org_units",
-            "resource_type": "org_units",
+            "action": "list_departments",
+            "resource_type": "departments",
             "team_id": team_id,
-            "org_units": units,
+            "departments": units,
             "total_found": len(units),
-            "id_type_note": ORG_UNIT_ID_STRING_NOTE,
+            "id_type_note": DEPARTMENT_ID_STRING_NOTE,
         }
         if warning:
             result["warning"] = warning
@@ -2780,13 +2786,13 @@ class OrgUnitManager(BaseManager):
             result["skipped_malformed_entries"] = skipped
         return result
 
-    async def delete_org_unit_person(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def delete_department_person(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Delete one directory person, addressed by person_id or by email."""
-        action = "delete_org_unit_person"
+        action = "delete_department_person"
         team_id = _removal_team_id(arguments, action)
         person = self._person_identifier(arguments, action)
         result = self._removal_result(
-            action, "org_unit_persons", team_id, ORG_UNIT_PERSON_DELETE_NOTE,
+            action, "department_persons", team_id, DEPARTMENT_PERSON_DELETE_NOTE,
             **({"person_id": person} if isinstance(person, int) else {"email": person}),
         )
         if arguments.get("confirm") is not True:
@@ -2794,29 +2800,29 @@ class OrgUnitManager(BaseManager):
 
         try:
             if isinstance(person, int):
-                await self.client.delete_org_unit_person(person, team_id)
+                await self.client.delete_department_person(person, team_id)
             else:
-                await self.client.delete_org_unit_person_by_email(person, team_id)
+                await self.client.delete_department_person_by_email(person, team_id)
         except ReveniumAPIError as e:
-            _raise_org_unit_removal_error(e, action, team_id, result)
+            _raise_department_removal_error(e, action, team_id, result)
         return {**result, "deleted": True}
 
-    async def clear_org_unit_assignment(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Close the open primary org-unit assignment of the person an email resolves to."""
-        action = "clear_org_unit_assignment"
+    async def clear_department_assignment(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Close the open primary department assignment of the person an email resolves to."""
+        action = "clear_department_assignment"
         team_id = _removal_team_id(arguments, action)
         email = _validate_lookup_email(arguments.get("email"), action)
         result = self._removal_result(
-            action, "org_unit_assignments", team_id, ORG_UNIT_ASSIGNMENT_CLEAR_NOTE,
+            action, "department_assignments", team_id, DEPARTMENT_ASSIGNMENT_CLEAR_NOTE,
             email=email,
         )
         if arguments.get("confirm") is not True:
             return {**result, "confirmation_required": True}
 
         try:
-            await self.client.clear_org_unit_assignment_by_email(email, team_id)
+            await self.client.clear_department_assignment_by_email(email, team_id)
         except ReveniumAPIError as e:
-            _raise_org_unit_removal_error(e, action, team_id, result)
+            _raise_department_removal_error(e, action, team_id, result)
         return {**result, "cleared": True}
 
     @staticmethod
@@ -3390,7 +3396,7 @@ class CustomerManagement(ToolBase):
             subscriber_manager = SubscriberManager(client)
             organization_manager = OrganizationManager(client)
             team_manager = TeamManager(client)
-            org_unit_manager = OrgUnitManager(client)
+            department_manager = DepartmentManager(client)
             analytics_processor = CustomerAnalytics(client)
 
             # Handle introspection actions
@@ -3429,7 +3435,7 @@ class CustomerManagement(ToolBase):
                                 "teams",
                             ],
                             "usage": "list(resource_type='organizations')",
-                            "org_units": "Org units (departments) have their own actions: list_org_units(), delete_org_unit_person(), clear_org_unit_assignment()",
+                            "departments": "Departments have their own actions: list_departments(), delete_department_person(), clear_department_assignment()",
                             "example_calls": [
                                 "list(resource_type='organizations')",
                                 "list(resource_type='subscribers')",
@@ -3881,17 +3887,17 @@ class CustomerManagement(ToolBase):
                     )
                 ]
 
-            elif action == "list_org_units":
-                result = await org_unit_manager.list_org_units(arguments)
-                return [TextContent(type="text", text=_format_org_units_text(result))]
+            elif action == "list_departments":
+                result = await department_manager.list_departments(arguments)
+                return [TextContent(type="text", text=_format_departments_text(result))]
 
-            elif action == "delete_org_unit_person":
-                result = await org_unit_manager.delete_org_unit_person(arguments)
-                return [TextContent(type="text", text=_format_org_unit_removal_text(result))]
+            elif action == "delete_department_person":
+                result = await department_manager.delete_department_person(arguments)
+                return [TextContent(type="text", text=_format_department_removal_text(result))]
 
-            elif action == "clear_org_unit_assignment":
-                result = await org_unit_manager.clear_org_unit_assignment(arguments)
-                return [TextContent(type="text", text=_format_org_unit_removal_text(result))]
+            elif action == "clear_department_assignment":
+                result = await department_manager.clear_department_assignment(arguments)
+                return [TextContent(type="text", text=_format_department_removal_text(result))]
 
             # Analytics and relationship operations
             elif action == "analyze":
@@ -3995,10 +4001,10 @@ class CustomerManagement(ToolBase):
                             "add_verified_domain",
                             "remove_verified_domain",
                         ],
-                        "org_unit_actions": [
-                            "list_org_units",
-                            "delete_org_unit_person",
-                            "clear_org_unit_assignment",
+                        "department_actions": [
+                            "list_departments",
+                            "delete_department_person",
+                            "clear_department_assignment",
                         ],
                         "analysis_actions": ["analyze", "get_relationships"],
                         "discovery_actions": [
@@ -4015,9 +4021,9 @@ class CustomerManagement(ToolBase):
                             "get_subscriber": "get(resource_type='subscribers', subscriber_id='sub_123')",
                             "lookup_subscriber": "lookup_subscriber(email='joao@acme.com')",
                             "lookup_user": "lookup_user(email='admin@acme.com')",
-                            "list_org_units": "list_org_units()",
-                            "delete_org_unit_person": "delete_org_unit_person(person_id=97, confirm=true)",
-                            "clear_org_unit_assignment": "clear_org_unit_assignment(email='ash@acme.com', confirm=true)",
+                            "list_departments": "list_departments()",
+                            "delete_department_person": "delete_department_person(person_id=97, confirm=true)",
+                            "clear_department_assignment": "clear_department_assignment(email='ash@acme.com', confirm=true)",
                             "get_marketplace_settings": "get_marketplace_settings(team_id='jR2kmLs')",
                             "update_marketplace_settings": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'], operation='add')",
                             "get_pr_health_settings": "get_pr_health_settings(team_id='jR2kmLs')",
@@ -4172,20 +4178,21 @@ class CustomerManagement(ToolBase):
         result_text += f"- **Permissions (add)**: {VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE}\n"
         result_text += f"- **Together**: {ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE}\n\n"
 
-        result_text += "## **Org Units (Departments)**\n"
-        result_text += "Resolve a department name to the id the `ORG_UNIT` filter dimension expects, and detach people from departments.\n\n"
-        result_text += "- `list_org_units()` - every active org unit for the caller's team/organization\n"
-        result_text += "- `list_org_units(team_id='jR2kmLs')` - restrict the listing to one team\n"
-        result_text += "- Each unit reports `name`, `id`, `parentId`, `path` (materialized ancestor-id path, e.g. `/12/40/173/`) and `source`\n"
-        result_text += f"- **Types**: {ORG_UNIT_ID_STRING_NOTE}\n"
-        result_text += "- `delete_org_unit_person(person_id=97, confirm=true)` or `delete_org_unit_person(email='ash@acme.com', confirm=true)` - delete one directory person\n"
-        result_text += "- `clear_org_unit_assignment(email='ash@acme.com', confirm=true)` - end one person's primary assignment, keeping the person\n"
+        result_text += "## **Departments**\n"
+        result_text += "Resolve a department name to the id the `DEPARTMENT` filter dimension expects, and detach people from departments.\n\n"
+        result_text += "- `list_departments()` - every active department for the caller's team/organization\n"
+        result_text += "- `list_departments(team_id='jR2kmLs')` - restrict the listing to one team\n"
+        result_text += "- Each department reports `name`, `id`, `parentId`, `path` (materialized ancestor-id path, e.g. `/12/40/173/`) and `source`\n"
+        result_text += f"- **Types**: {DEPARTMENT_ID_STRING_NOTE}\n"
+        result_text += "- `delete_department_person(person_id=97, confirm=true)` or `delete_department_person(email='ash@acme.com', confirm=true)` - delete one directory person\n"
+        result_text += "- `clear_department_assignment(email='ash@acme.com', confirm=true)` - end one person's primary assignment, keeping the person\n"
         result_text += "- **Confirm gate**: without `confirm=true` both removals only preview what would change; no request is sent\n"
-        result_text += f"- **Delete**: {ORG_UNIT_PERSON_DELETE_NOTE}\n"
-        result_text += f"- **Clear**: {ORG_UNIT_ASSIGNMENT_CLEAR_NOTE}\n"
-        result_text += f"- **Budgets**: {ORG_UNIT_REMOVAL_BUDGET_NOTE}\n"
-        result_text += "- Org units are created, renamed and deleted in the Revenium UI; this tool cannot change the units themselves\n"
-        result_text += f"- **CSV import**: {ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE}\n\n"
+        result_text += f"- **Delete**: {DEPARTMENT_PERSON_DELETE_NOTE}\n"
+        result_text += f"- **Clear**: {DEPARTMENT_ASSIGNMENT_CLEAR_NOTE}\n"
+        result_text += f"- **Budgets**: {DEPARTMENT_REMOVAL_BUDGET_NOTE}\n"
+        result_text += "- Departments are created, renamed and deleted in the Revenium UI; this tool cannot change the departments themselves\n"
+        result_text += f"- **CSV import**: {DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE}\n"
+        result_text += f"- **Renamed**: {DEPARTMENT_ACTION_ALIASES_NOTE}\n\n"
 
         result_text += "## **Business Rules**\n"
         for rule in capabilities.get("business_rules", []):
@@ -4705,10 +4712,10 @@ class CustomerManagement(ToolBase):
                 ],
             ),
             ToolCapability(
-                name="Org Unit (Department) Lookup and Membership Removal",
+                name="Department Lookup and Membership Removal",
                 description=(
-                    "List the organization's active org units (departments) to resolve a "
-                    "department name to the id the ORG_UNIT dimension expects. ORG_UNIT is "
+                    "List the organization's active departments to resolve a "
+                    "department name to the id the DEPARTMENT dimension expects. DEPARTMENT is "
                     "accepted as a filter dimension by insight runs, department cost "
                     "controls and group previews, and this is the only action that produces "
                     "the id those filters take. Detach a person from their department by "
@@ -4716,37 +4723,38 @@ class CustomerManagement(ToolBase):
                     "removals require confirm=true and otherwise return a preview."
                 ),
                 parameters={
-                    "list_org_units": {
+                    "list_departments": {
                         "team_id": "str (optional - defaults to the caller's team/organization)"
                     },
-                    "delete_org_unit_person": {
+                    "delete_department_person": {
                         "person_id": "int (numeric directory person id) - or email, not both",
                         "email": "str (resolved to one directory person upstream) - or person_id",
                         "team_id": "str (optional - defaults to the ambient team)",
                         "confirm": "bool (required true to delete; otherwise a preview)",
                     },
-                    "clear_org_unit_assignment": {
+                    "clear_department_assignment": {
                         "email": "str (required)",
                         "team_id": "str (optional - defaults to the ambient team)",
                         "confirm": "bool (required true to clear; otherwise a preview)",
                     },
                 },
                 examples=[
-                    "list_org_units()",
-                    "list_org_units(team_id='jR2kmLs')",
-                    "delete_org_unit_person(person_id=97, confirm=true)",
-                    "delete_org_unit_person(email='ash@acme.com', confirm=true)",
-                    "clear_org_unit_assignment(email='ash@acme.com', confirm=true)",
+                    "list_departments()",
+                    "list_departments(team_id='jR2kmLs')",
+                    "delete_department_person(person_id=97, confirm=true)",
+                    "delete_department_person(email='ash@acme.com', confirm=true)",
+                    "clear_department_assignment(email='ash@acme.com', confirm=true)",
                 ],
                 limitations=[
-                    "Org units themselves are created, renamed and deleted in the Revenium UI, not through this tool",
-                    ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE,
-                    ORG_UNIT_PERSON_DELETE_NOTE,
-                    ORG_UNIT_ASSIGNMENT_CLEAR_NOTE,
-                    ORG_UNIT_REMOVAL_BUDGET_NOTE,
-                    "Only active org units are returned",
-                    ORG_UNIT_ID_STRING_NOTE,
-                    "Hierarchy is expressed by parentId and the materialized path (e.g. /12/40/173/, ancestors first, unit last)",
+                    "Departments themselves are created, renamed and deleted in the Revenium UI, not through this tool",
+                    DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE,
+                    DEPARTMENT_PERSON_DELETE_NOTE,
+                    DEPARTMENT_ASSIGNMENT_CLEAR_NOTE,
+                    DEPARTMENT_REMOVAL_BUDGET_NOTE,
+                    "Only active departments are returned",
+                    DEPARTMENT_ID_STRING_NOTE,
+                    DEPARTMENT_ACTION_ALIASES_NOTE,
+                    "Hierarchy is expressed by parentId and the materialized path (e.g. /12/40/173/, ancestors first, department last)",
                 ],
             ),
             ToolCapability(
@@ -4860,9 +4868,9 @@ class CustomerManagement(ToolBase):
             "list_verified_domains",
             "add_verified_domain",
             "remove_verified_domain",
-            "list_org_units",
-            "delete_org_unit_person",
-            "clear_org_unit_assignment",
+            "list_departments",
+            "delete_department_person",
+            "clear_department_assignment",
             "analyze",
             "get_capabilities",
             "get_examples",
@@ -4899,8 +4907,8 @@ class CustomerManagement(ToolBase):
                 "team_id": {
                     "type": "string",
                     "description": (
-                        "Optional team scope for list_org_units, "
-                        "delete_org_unit_person and clear_org_unit_assignment; "
+                        "Optional team scope for list_departments, "
+                        "delete_department_person and clear_department_assignment; "
                         "omitted, the ambient team from the auth config (or, for "
                         "the listing, the caller's own organization) is used. "
                         "Required by every team-settings action, which addresses "
@@ -4911,22 +4919,22 @@ class CustomerManagement(ToolBase):
                     "type": "string",
                     "description": (
                         "Email for lookup_user / lookup_subscriber, and the person "
-                        "to remove for delete_org_unit_person (instead of "
-                        "person_id) and clear_org_unit_assignment"
+                        "to remove for delete_department_person (instead of "
+                        "person_id) and clear_department_assignment"
                     ),
                 },
                 "person_id": {
                     "type": "integer",
                     "description": (
-                        "Numeric directory person id for delete_org_unit_person; "
+                        "Numeric directory person id for delete_department_person; "
                         "pass either person_id or email, not both"
                     ),
                 },
                 "confirm": {
                     "type": "boolean",
                     "description": (
-                        "Must be true for delete_org_unit_person and "
-                        "clear_org_unit_assignment to send the request; any other "
+                        "Must be true for delete_department_person and "
+                        "clear_department_assignment to send the request; any other "
                         "value returns a preview of what would be removed"
                     ),
                 },

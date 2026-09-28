@@ -23,11 +23,11 @@ from src.revenium_mcp_server.tools_decomposed.customer_management import (
     PR_HEALTH_DIVERGENCE_NOTE,
     PR_HEALTH_REPORT_NOTE,
     PR_HEALTH_SEMANTICS_NOTE,
-    ORG_UNIT_ASSIGNMENT_CLEAR_NOTE,
-    ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE,
-    ORG_UNIT_ID_STRING_NOTE,
-    ORG_UNIT_PERSON_DELETE_NOTE,
-    ORG_UNIT_UNEXPECTED_SHAPE_NOTE,
+    DEPARTMENT_ASSIGNMENT_CLEAR_NOTE,
+    DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE,
+    DEPARTMENT_ID_STRING_NOTE,
+    DEPARTMENT_PERSON_DELETE_NOTE,
+    DEPARTMENT_UNEXPECTED_SHAPE_NOTE,
     VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE,
     VERIFIED_DOMAIN_ADD_SEMANTICS_NOTE,
     VERIFIED_DOMAIN_FIXED_FIELDS_NOTE,
@@ -37,15 +37,15 @@ from src.revenium_mcp_server.tools_decomposed.customer_management import (
     CustomerAnalytics,
     CustomerManagement,
     CustomerValidator,
-    OrgUnitManager,
+    DepartmentManager,
     OrganizationManager,
     SubscriberManager,
     TeamManager,
     UserManager,
     _format_create_warnings,
-    _format_org_unit_removal_text,
-    _format_org_units_text,
-    org_unit_id_to_filter_value,
+    _format_department_removal_text,
+    _format_departments_text,
+    department_id_to_filter_value,
 )
 from src.revenium_mcp_server.tools_decomposed.pr_health_settings_fields import (
     PR_HEALTH_DISPLAY_FIELDS,
@@ -127,11 +127,11 @@ def mock_client():
     )
     client.remove_team_verified_domain = AsyncMock(return_value={})
 
-    # Org-unit methods
-    client.get_org_units = AsyncMock(return_value=[])
-    client.delete_org_unit_person = AsyncMock(return_value={})
-    client.delete_org_unit_person_by_email = AsyncMock(return_value={})
-    client.clear_org_unit_assignment_by_email = AsyncMock(return_value={})
+    # Department methods
+    client.get_departments = AsyncMock(return_value=[])
+    client.delete_department_person = AsyncMock(return_value={})
+    client.delete_department_person_by_email = AsyncMock(return_value={})
+    client.clear_department_assignment_by_email = AsyncMock(return_value={})
 
     # Helpers
     client._extract_embedded_data = MagicMock(return_value=[])
@@ -163,8 +163,8 @@ def team_manager(mock_client):
 
 
 @pytest.fixture
-def org_unit_manager(mock_client):
-    return OrgUnitManager(mock_client)
+def department_manager(mock_client):
+    return DepartmentManager(mock_client)
 
 
 @pytest.fixture
@@ -2372,7 +2372,7 @@ class TestPrHealthSettingsActionRouting:
 # ===========================================================================
 
 
-ORG_UNITS_PAYLOAD = [
+DEPARTMENTS_PAYLOAD = [
     {
         "id": 12,
         "name": "Acme Corp",
@@ -2392,29 +2392,29 @@ ORG_UNITS_PAYLOAD = [
 ]
 
 
-class TestOrgUnitIdConversion:
-    """org_unit_id_to_filter_value - BACK-2767's single number-to-string rule."""
+class TestDepartmentIdConversion:
+    """department_id_to_filter_value - BACK-2767's single number-to-string rule."""
 
     def test_number_becomes_string(self):
-        assert org_unit_id_to_filter_value(173) == "173"
+        assert department_id_to_filter_value(173) == "173"
 
     def test_float_id_drops_the_decimal(self):
         """A JSON number decoded as a float is still the integer id, not '173.0'."""
-        assert org_unit_id_to_filter_value(173.0) == "173"
+        assert department_id_to_filter_value(173.0) == "173"
 
     def test_string_passes_through(self):
-        assert org_unit_id_to_filter_value(" 173 ") == "173"
+        assert department_id_to_filter_value(" 173 ") == "173"
 
     def test_none_stays_none(self):
         """A root unit's parentId is legitimately absent."""
-        assert org_unit_id_to_filter_value(None) is None
+        assert department_id_to_filter_value(None) is None
 
     def test_empty_string_is_not_an_id(self):
-        assert org_unit_id_to_filter_value("") is None
+        assert department_id_to_filter_value("") is None
 
     def test_bool_is_not_an_id(self):
         """bool is an int subclass; True must not become the id '1'."""
-        assert org_unit_id_to_filter_value(True) is None
+        assert department_id_to_filter_value(True) is None
 
 
 class TestTeamAttributionIdentityPolicyRead:
@@ -3058,123 +3058,123 @@ class TestCustomerManagementIdentityPolicyActions:
         assert schema["properties"]["action"]["enum"] == await customer_mgmt._get_supported_actions()
 
 
-class TestOrgUnitManagerList:
-    """OrgUnitManager.list_org_units."""
+class TestDepartmentManagerList:
+    """DepartmentManager.list_departments."""
 
     @pytest.mark.asyncio
-    async def test_returns_units_with_string_ids(self, org_unit_manager, mock_client):
-        mock_client.get_org_units.return_value = ORG_UNITS_PAYLOAD
+    async def test_returns_units_with_string_ids(self, department_manager, mock_client):
+        mock_client.get_departments.return_value = DEPARTMENTS_PAYLOAD
 
-        result = await org_unit_manager.list_org_units({})
+        result = await department_manager.list_departments({})
 
-        assert result["action"] == "list_org_units"
-        assert result["resource_type"] == "org_units"
+        assert result["action"] == "list_departments"
+        assert result["resource_type"] == "departments"
         assert result["total_found"] == 2
-        engineering = result["org_units"][1]
+        engineering = result["departments"][1]
         assert engineering["name"] == "Engineering"
         assert engineering["id"] == "173"
         assert engineering["parentId"] == "40"
         assert engineering["path"] == "/12/40/173/"
         assert engineering["source"] == "SCIM"
-        assert result["id_type_note"] == ORG_UNIT_ID_STRING_NOTE
+        assert result["id_type_note"] == DEPARTMENT_ID_STRING_NOTE
 
     @pytest.mark.asyncio
-    async def test_root_unit_keeps_null_parent(self, org_unit_manager, mock_client):
-        mock_client.get_org_units.return_value = ORG_UNITS_PAYLOAD
+    async def test_root_unit_keeps_null_parent(self, department_manager, mock_client):
+        mock_client.get_departments.return_value = DEPARTMENTS_PAYLOAD
 
-        result = await org_unit_manager.list_org_units({})
+        result = await department_manager.list_departments({})
 
-        assert result["org_units"][0]["parentId"] is None
-        assert result["org_units"][0]["id"] == "12"
-
-    @pytest.mark.asyncio
-    async def test_omitted_team_id_is_not_forwarded(self, org_unit_manager, mock_client):
-        await org_unit_manager.list_org_units({})
-        mock_client.get_org_units.assert_called_once_with(None)
+        assert result["departments"][0]["parentId"] is None
+        assert result["departments"][0]["id"] == "12"
 
     @pytest.mark.asyncio
-    async def test_team_id_is_forwarded(self, org_unit_manager, mock_client):
-        result = await org_unit_manager.list_org_units({"team_id": " jR2kmLs "})
-        mock_client.get_org_units.assert_called_once_with("jR2kmLs")
+    async def test_omitted_team_id_is_not_forwarded(self, department_manager, mock_client):
+        await department_manager.list_departments({})
+        mock_client.get_departments.assert_called_once_with(None)
+
+    @pytest.mark.asyncio
+    async def test_team_id_is_forwarded(self, department_manager, mock_client):
+        result = await department_manager.list_departments({"team_id": " jR2kmLs "})
+        mock_client.get_departments.assert_called_once_with("jR2kmLs")
         assert result["team_id"] == "jR2kmLs"
 
     @pytest.mark.asyncio
-    async def test_empty_list_reports_zero_without_warning(self, org_unit_manager, mock_client):
-        mock_client.get_org_units.return_value = []
+    async def test_empty_list_reports_zero_without_warning(self, department_manager, mock_client):
+        mock_client.get_departments.return_value = []
 
-        result = await org_unit_manager.list_org_units({})
+        result = await department_manager.list_departments({})
 
-        assert result["org_units"] == []
+        assert result["departments"] == []
         assert result["total_found"] == 0
         assert "warning" not in result
 
     @pytest.mark.asyncio
-    async def test_non_list_response_degrades_with_warning(self, org_unit_manager, mock_client):
+    async def test_non_list_response_degrades_with_warning(self, department_manager, mock_client):
         """A HAL page or error envelope must not crash, and must not read as 'no departments'."""
-        mock_client.get_org_units.return_value = {"_embedded": {"orgUnits": []}}
+        mock_client.get_departments.return_value = {"_embedded": {"departments": []}}
 
-        result = await org_unit_manager.list_org_units({})
+        result = await department_manager.list_departments({})
 
-        assert result["org_units"] == []
+        assert result["departments"] == []
         assert result["total_found"] == 0
-        assert result["warning"] == ORG_UNIT_UNEXPECTED_SHAPE_NOTE
+        assert result["warning"] == DEPARTMENT_UNEXPECTED_SHAPE_NOTE
 
     @pytest.mark.asyncio
-    async def test_malformed_entries_are_skipped_and_counted(self, org_unit_manager, mock_client):
-        mock_client.get_org_units.return_value = [ORG_UNITS_PAYLOAD[1], "not-a-unit", None]
+    async def test_malformed_entries_are_skipped_and_counted(self, department_manager, mock_client):
+        mock_client.get_departments.return_value = [DEPARTMENTS_PAYLOAD[1], "not-a-unit", None]
 
-        result = await org_unit_manager.list_org_units({})
+        result = await department_manager.list_departments({})
 
         assert result["total_found"] == 1
         assert result["skipped_malformed_entries"] == 2
 
     @pytest.mark.asyncio
-    async def test_api_error_propagates(self, org_unit_manager, mock_client):
-        mock_client.get_org_units.side_effect = ReveniumAPIError("Boom", status_code=500)
+    async def test_api_error_propagates(self, department_manager, mock_client):
+        mock_client.get_departments.side_effect = ReveniumAPIError("Boom", status_code=500)
 
         with pytest.raises(ReveniumAPIError):
-            await org_unit_manager.list_org_units({})
+            await department_manager.list_departments({})
 
 
-class TestOrgUnitFormatting:
-    """_format_org_units_text - the resolution-oriented rendering."""
+class TestDepartmentFormatting:
+    """_format_departments_text - the resolution-oriented rendering."""
 
     @pytest.mark.asyncio
-    async def test_each_unit_is_greppable_by_name(self, org_unit_manager, mock_client):
-        mock_client.get_org_units.return_value = ORG_UNITS_PAYLOAD
-        result = await org_unit_manager.list_org_units({})
+    async def test_each_unit_is_greppable_by_name(self, department_manager, mock_client):
+        mock_client.get_departments.return_value = DEPARTMENTS_PAYLOAD
+        result = await department_manager.list_departments({})
 
-        text = _format_org_units_text(result)
+        text = _format_departments_text(result)
 
-        assert "Found 2 org unit(s)" in text
+        assert "Found 2 department(s)" in text
         assert "- Engineering | id=173 | parentId=40 | path=/12/40/173/ | source=SCIM" in text
         assert "- Acme Corp | id=12 | parentId=None | path=/12/ | source=MANUAL" in text
-        assert ORG_UNIT_ID_STRING_NOTE in text
+        assert DEPARTMENT_ID_STRING_NOTE in text
 
-    def test_empty_listing_says_no_org_units(self):
-        text = _format_org_units_text(
-            {"action": "list_org_units", "org_units": [], "total_found": 0}
+    def test_empty_listing_says_no_departments(self):
+        text = _format_departments_text(
+            {"action": "list_departments", "departments": [], "total_found": 0}
         )
 
-        assert "No org units (departments) found" in text
+        assert "No departments found" in text
         assert "read-only" in text
 
     def test_unexpected_shape_warning_leads_the_text(self):
-        text = _format_org_units_text(
+        text = _format_departments_text(
             {
-                "action": "list_org_units",
-                "org_units": [],
+                "action": "list_departments",
+                "departments": [],
                 "total_found": 0,
-                "warning": ORG_UNIT_UNEXPECTED_SHAPE_NOTE,
+                "warning": DEPARTMENT_UNEXPECTED_SHAPE_NOTE,
             }
         )
 
         assert "WARNING:" in text
-        assert ORG_UNIT_UNEXPECTED_SHAPE_NOTE in text
+        assert DEPARTMENT_UNEXPECTED_SHAPE_NOTE in text
 
     def test_team_scope_is_named(self):
-        text = _format_org_units_text(
-            {"action": "list_org_units", "team_id": "jR2kmLs", "org_units": [], "total_found": 0}
+        text = _format_departments_text(
+            {"action": "list_departments", "team_id": "jR2kmLs", "departments": [], "total_found": 0}
         )
 
         assert "for team jR2kmLs" in text
@@ -3780,41 +3780,41 @@ class TestCustomerManagementHandleAction:
         assert MARKETPLACE_CONCURRENCY_NOTE in marketplace.limitations
 
 
-class TestOrgUnitMalformedEntries:
+class TestDepartmentMalformedEntries:
     """Review round on PR #325: malformed entries must warn, never masquerade."""
 
     @pytest.mark.asyncio
-    async def test_all_malformed_list_warns_instead_of_reading_as_empty_org(self, org_unit_manager):
-        org_unit_manager.client.get_org_units.return_value = ["junk", 42, {"name": "NoId"}]
-        result = await org_unit_manager.list_org_units({})
+    async def test_all_malformed_list_warns_instead_of_reading_as_empty_org(self, department_manager):
+        department_manager.client.get_departments.return_value = ["junk", 42, {"name": "NoId"}]
+        result = await department_manager.list_departments({})
         assert result["skipped_malformed_entries"] == 3
-        assert result["org_units"] == []
+        assert result["departments"] == []
         assert "upstream data or contract problem" in result["warning"]
-        text = _format_org_units_text(result)
+        text = _format_departments_text(result)
         assert "WARNING:" in text
         assert "An organization with no departments defined" not in text
 
     @pytest.mark.asyncio
-    async def test_partially_malformed_list_warns_and_lists_the_rest(self, org_unit_manager):
-        org_unit_manager.client.get_org_units.return_value = [
+    async def test_partially_malformed_list_warns_and_lists_the_rest(self, department_manager):
+        department_manager.client.get_departments.return_value = [
             {"id": 173, "name": "Payments", "parentId": None, "path": "/173/", "source": "MANUAL"},
             {"name": "NoId"},
         ]
-        result = await org_unit_manager.list_org_units({})
+        result = await department_manager.list_departments({})
         assert result["total_found"] == 1
         assert result["skipped_malformed_entries"] == 1
         assert "well-formed entries" in result["warning"]
-        text = _format_org_units_text(result)
+        text = _format_departments_text(result)
         assert "WARNING:" in text and "Payments | id=173" in text
 
     @pytest.mark.asyncio
-    async def test_entry_with_non_numeric_id_is_classified_malformed(self, org_unit_manager):
-        org_unit_manager.client.get_org_units.return_value = [
+    async def test_entry_with_non_numeric_id_is_classified_malformed(self, department_manager):
+        department_manager.client.get_departments.return_value = [
             {"id": "not-a-number", "name": "Weird"},
             {"id": None, "name": "Missing"},
         ]
-        result = await org_unit_manager.list_org_units({})
-        assert result["org_units"] == []
+        result = await department_manager.list_departments({})
+        assert result["departments"] == []
         assert result["skipped_malformed_entries"] == 2
 
 
@@ -3867,305 +3867,305 @@ class TestIntrospectionSchemaRequired:
         assert "resource_type" in schema["properties"]
 
 
-class TestOrgUnitFeatureFlagGate:
+class TestDepartmentFeatureFlagGate:
     """PR #325 cross-repo review: the endpoint is behind a default-OFF tenant flag."""
 
     @pytest.mark.asyncio
-    async def test_403_maps_to_the_feature_flag_explanation(self, org_unit_manager):
+    async def test_403_maps_to_the_feature_flag_explanation(self, department_manager):
         from src.revenium_mcp_server.client import ReveniumAPIError
         from src.revenium_mcp_server.common.error_handling import ToolError
 
-        org_unit_manager.client.get_org_units.side_effect = ReveniumAPIError(
+        department_manager.client.get_departments.side_effect = ReveniumAPIError(
             "Forbidden", status_code=403
         )
         with pytest.raises(ToolError) as excinfo:
-            await org_unit_manager.list_org_units({})
+            await department_manager.list_departments({})
         assert "not enabled for this tenant" in str(excinfo.value.message)
         assert any("org-unit-attribution-enabled" in s for s in excinfo.value.suggestions)
 
     @pytest.mark.asyncio
-    async def test_non_403_api_errors_still_propagate(self, org_unit_manager):
+    async def test_non_403_api_errors_still_propagate(self, department_manager):
         from src.revenium_mcp_server.client import ReveniumAPIError
 
-        org_unit_manager.client.get_org_units.side_effect = ReveniumAPIError(
+        department_manager.client.get_departments.side_effect = ReveniumAPIError(
             "boom", status_code=500
         )
         with pytest.raises(ReveniumAPIError):
-            await org_unit_manager.list_org_units({})
+            await department_manager.list_departments({})
 
 
-class TestCustomerManagementOrgUnitAction:
-    """The list_org_units action on manage_customers."""
+class TestCustomerManagementDepartmentAction:
+    """The list_departments action on manage_customers."""
 
     @pytest.mark.asyncio
     async def test_action_renders_units(self, customer_mgmt):
         with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_client = MagicMock()
             mock_gc.return_value = mock_client
-            mock_client.get_org_units = AsyncMock(return_value=ORG_UNITS_PAYLOAD)
+            mock_client.get_departments = AsyncMock(return_value=DEPARTMENTS_PAYLOAD)
 
-            result = await customer_mgmt.handle_action("list_org_units", {})
+            result = await customer_mgmt.handle_action("list_departments", {})
 
             assert isinstance(result[0], TextContent)
             assert "Engineering" in result[0].text
             assert "id=173" in result[0].text
-            mock_client.get_org_units.assert_awaited_once_with(None)
+            mock_client.get_departments.assert_awaited_once_with(None)
 
     @pytest.mark.asyncio
     async def test_action_forwards_team_id(self, customer_mgmt):
         with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_client = MagicMock()
             mock_gc.return_value = mock_client
-            mock_client.get_org_units = AsyncMock(return_value=[])
+            mock_client.get_departments = AsyncMock(return_value=[])
 
-            result = await customer_mgmt.handle_action("list_org_units", {"team_id": "jR2kmLs"})
+            result = await customer_mgmt.handle_action("list_departments", {"team_id": "jR2kmLs"})
 
-            mock_client.get_org_units.assert_awaited_once_with("jR2kmLs")
-            assert "No org units (departments) found for team jR2kmLs" in result[0].text
+            mock_client.get_departments.assert_awaited_once_with("jR2kmLs")
+            assert "No departments found for team jR2kmLs" in result[0].text
 
     @pytest.mark.asyncio
     async def test_action_is_advertised(self, customer_mgmt):
         actions = await customer_mgmt._get_supported_actions()
-        assert "list_org_units" in actions
+        assert "list_departments" in actions
 
     @pytest.mark.asyncio
     async def test_capability_documents_the_string_id_rule(self, customer_mgmt):
         capabilities = await customer_mgmt._get_tool_capabilities()
-        org_unit_capability = next(
-            (c for c in capabilities if "Org Unit" in c.name), None
+        department_capability = next(
+            (c for c in capabilities if "Department" in c.name), None
         )
-        assert org_unit_capability is not None
-        assert ORG_UNIT_ID_STRING_NOTE in org_unit_capability.limitations
+        assert department_capability is not None
+        assert DEPARTMENT_ID_STRING_NOTE in department_capability.limitations
 
 
-class TestOrgUnitRemovalConfirmGate:
+class TestDepartmentRemovalConfirmGate:
     """BACK-3353: no removal DELETE is sent without a literal confirm=True."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("confirm", [None, False, "true", 1])
     async def test_unconfirmed_delete_previews_without_calling_the_client(
-        self, org_unit_manager, mock_client, confirm
+        self, department_manager, mock_client, confirm
     ):
         arguments = {"person_id": 97}
         if confirm is not None:
             arguments["confirm"] = confirm
 
-        result = await org_unit_manager.delete_org_unit_person(arguments)
+        result = await department_manager.delete_department_person(arguments)
 
         assert result["confirmation_required"] is True
-        assert result["effect"] == ORG_UNIT_PERSON_DELETE_NOTE
+        assert result["effect"] == DEPARTMENT_PERSON_DELETE_NOTE
         assert "deleted" not in result
-        mock_client.delete_org_unit_person.assert_not_awaited()
-        mock_client.delete_org_unit_person_by_email.assert_not_awaited()
+        mock_client.delete_department_person.assert_not_awaited()
+        mock_client.delete_department_person_by_email.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unconfirmed_clear_previews_without_calling_the_client(
-        self, org_unit_manager, mock_client
+        self, department_manager, mock_client
     ):
-        result = await org_unit_manager.clear_org_unit_assignment({"email": "ash@acme.com"})
+        result = await department_manager.clear_department_assignment({"email": "ash@acme.com"})
 
         assert result["confirmation_required"] is True
-        assert result["effect"] == ORG_UNIT_ASSIGNMENT_CLEAR_NOTE
-        mock_client.clear_org_unit_assignment_by_email.assert_not_awaited()
+        assert result["effect"] == DEPARTMENT_ASSIGNMENT_CLEAR_NOTE
+        mock_client.clear_department_assignment_by_email.assert_not_awaited()
 
     def test_preview_text_names_the_target_and_the_confirming_call(self):
-        text = _format_org_unit_removal_text(
+        text = _format_department_removal_text(
             {
-                "action": "delete_org_unit_person",
-                "resource_type": "org_unit_persons",
+                "action": "delete_department_person",
+                "resource_type": "department_persons",
                 "team_id": "jR2kmLs",
                 "person_id": 97,
-                "effect": ORG_UNIT_PERSON_DELETE_NOTE,
+                "effect": DEPARTMENT_PERSON_DELETE_NOTE,
                 "confirmation_required": True,
             }
         )
 
         assert "Confirmation Required - Delete directory person 97 in team jR2kmLs" in text
         assert "No request was sent" in text
-        assert "`delete_org_unit_person(person_id=97, team_id='jR2kmLs', confirm=true)`" in text
+        assert "`delete_department_person(person_id=97, team_id='jR2kmLs', confirm=true)`" in text
 
 
-class TestOrgUnitRemovalConfirmed:
+class TestDepartmentRemovalConfirmed:
     """Confirmed removals reach the right client method, scoped by team."""
 
     @pytest.mark.asyncio
-    async def test_delete_by_person_id(self, org_unit_manager, mock_client):
-        result = await org_unit_manager.delete_org_unit_person(
+    async def test_delete_by_person_id(self, department_manager, mock_client):
+        result = await department_manager.delete_department_person(
             {"person_id": "97", "team_id": " jR2kmLs ", "confirm": True}
         )
 
-        mock_client.delete_org_unit_person.assert_awaited_once_with(97, "jR2kmLs")
-        mock_client.delete_org_unit_person_by_email.assert_not_awaited()
+        mock_client.delete_department_person.assert_awaited_once_with(97, "jR2kmLs")
+        mock_client.delete_department_person_by_email.assert_not_awaited()
         assert result["deleted"] is True
         assert result["person_id"] == 97
         assert result["team_id"] == "jR2kmLs"
-        assert result["resource_type"] == "org_unit_persons"
+        assert result["resource_type"] == "department_persons"
 
     @pytest.mark.asyncio
     async def test_delete_by_email_uses_the_ambient_team_when_omitted(
-        self, org_unit_manager, mock_client
+        self, department_manager, mock_client
     ):
-        result = await org_unit_manager.delete_org_unit_person(
+        result = await department_manager.delete_department_person(
             {"email": " ash@acme.com ", "confirm": True}
         )
 
-        mock_client.delete_org_unit_person_by_email.assert_awaited_once_with("ash@acme.com", None)
-        mock_client.delete_org_unit_person.assert_not_awaited()
+        mock_client.delete_department_person_by_email.assert_awaited_once_with("ash@acme.com", None)
+        mock_client.delete_department_person.assert_not_awaited()
         assert result["email"] == "ash@acme.com"
         assert result["team_id"] is None
 
     @pytest.mark.asyncio
-    async def test_clear_assignment_by_email(self, org_unit_manager, mock_client):
-        result = await org_unit_manager.clear_org_unit_assignment(
+    async def test_clear_assignment_by_email(self, department_manager, mock_client):
+        result = await department_manager.clear_department_assignment(
             {"email": "ash@acme.com", "team_id": "jR2kmLs", "confirm": True}
         )
 
-        mock_client.clear_org_unit_assignment_by_email.assert_awaited_once_with(
+        mock_client.clear_department_assignment_by_email.assert_awaited_once_with(
             "ash@acme.com", "jR2kmLs"
         )
         assert result["cleared"] is True
-        assert result["resource_type"] == "org_unit_assignments"
+        assert result["resource_type"] == "department_assignments"
 
     def test_confirmation_text_reports_the_removal_without_inventing_a_payload(self):
-        text = _format_org_unit_removal_text(
+        text = _format_department_removal_text(
             {
-                "action": "clear_org_unit_assignment",
-                "resource_type": "org_unit_assignments",
+                "action": "clear_department_assignment",
+                "resource_type": "department_assignments",
                 "team_id": None,
                 "email": "ash@acme.com",
-                "effect": ORG_UNIT_ASSIGNMENT_CLEAR_NOTE,
+                "effect": DEPARTMENT_ASSIGNMENT_CLEAR_NOTE,
                 "cleared": True,
             }
         )
 
         assert text.startswith(
-            "Cleared the org-unit assignment of the directory person for ash@acme.com "
+            "Cleared the department assignment of the directory person for ash@acme.com "
             "in the ambient team."
         )
         assert "Confirmation Required" not in text
 
 
-class TestOrgUnitRemovalIdentifierValidation:
+class TestDepartmentRemovalIdentifierValidation:
     """Bad identifiers are refused before any request, with the field named."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("person_id", ["abc", "-3", 0, True, 9.5, "", "\u00b2"])
-    async def test_invalid_person_id_names_person_id(self, org_unit_manager, mock_client, person_id):
+    async def test_invalid_person_id_names_person_id(self, department_manager, mock_client, person_id):
         with pytest.raises(ToolError) as excinfo:
-            await org_unit_manager.delete_org_unit_person(
+            await department_manager.delete_department_person(
                 {"person_id": person_id, "confirm": True}
             )
 
         assert excinfo.value.field == "person_id"
-        mock_client.delete_org_unit_person.assert_not_awaited()
+        mock_client.delete_department_person.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_missing_identifier_names_person_id(self, org_unit_manager, mock_client):
+    async def test_missing_identifier_names_person_id(self, department_manager, mock_client):
         with pytest.raises(ToolError) as excinfo:
-            await org_unit_manager.delete_org_unit_person({"confirm": True})
+            await department_manager.delete_department_person({"confirm": True})
 
         assert excinfo.value.field == "person_id"
-        mock_client.delete_org_unit_person.assert_not_awaited()
-        mock_client.delete_org_unit_person_by_email.assert_not_awaited()
+        mock_client.delete_department_person.assert_not_awaited()
+        mock_client.delete_department_person_by_email.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_both_identifiers_are_refused(self, org_unit_manager, mock_client):
+    async def test_both_identifiers_are_refused(self, department_manager, mock_client):
         with pytest.raises(ToolError) as excinfo:
-            await org_unit_manager.delete_org_unit_person(
+            await department_manager.delete_department_person(
                 {"person_id": 97, "email": "ash@acme.com", "confirm": True}
             )
 
         assert excinfo.value.field == "person_id"
         assert "not both" in excinfo.value.message
-        mock_client.delete_org_unit_person.assert_not_awaited()
+        mock_client.delete_department_person.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("email", [None, "", "not-an-email", "a@b@c"])
     async def test_clear_rejects_a_missing_or_malformed_email(
-        self, org_unit_manager, mock_client, email
+        self, department_manager, mock_client, email
     ):
         arguments = {"confirm": True}
         if email is not None:
             arguments["email"] = email
 
         with pytest.raises(ToolError) as excinfo:
-            await org_unit_manager.clear_org_unit_assignment(arguments)
+            await department_manager.clear_department_assignment(arguments)
 
         assert excinfo.value.field == "email"
-        mock_client.clear_org_unit_assignment_by_email.assert_not_awaited()
+        mock_client.clear_department_assignment_by_email.assert_not_awaited()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("action", ["delete_org_unit_person", "clear_org_unit_assignment"])
+    @pytest.mark.parametrize("action", ["delete_department_person", "clear_department_assignment"])
     @pytest.mark.parametrize("team_id", ["", "  ", 123])
     async def test_supplied_but_unusable_team_id_is_refused(
-        self, org_unit_manager, mock_client, action, team_id
+        self, department_manager, mock_client, action, team_id
     ):
         arguments = {"email": "ash@acme.com", "team_id": team_id, "confirm": True}
 
         with pytest.raises(ToolError) as excinfo:
-            await getattr(org_unit_manager, action)(arguments)
+            await getattr(department_manager, action)(arguments)
 
         assert excinfo.value.field == "team_id"
-        mock_client.delete_org_unit_person_by_email.assert_not_awaited()
-        mock_client.clear_org_unit_assignment_by_email.assert_not_awaited()
+        mock_client.delete_department_person_by_email.assert_not_awaited()
+        mock_client.clear_department_assignment_by_email.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_none_team_id_falls_back_to_the_ambient_team(self, org_unit_manager, mock_client):
-        await org_unit_manager.clear_org_unit_assignment(
+    async def test_none_team_id_falls_back_to_the_ambient_team(self, department_manager, mock_client):
+        await department_manager.clear_department_assignment(
             {"email": "ash@acme.com", "team_id": None, "confirm": True}
         )
 
-        mock_client.clear_org_unit_assignment_by_email.assert_awaited_once_with(
+        mock_client.clear_department_assignment_by_email.assert_awaited_once_with(
             "ash@acme.com", None
         )
 
     @pytest.mark.asyncio
-    async def test_list_org_units_keeps_its_lenient_team_id(self, org_unit_manager, mock_client):
-        await org_unit_manager.list_org_units({"team_id": "  "})
+    async def test_list_departments_keeps_its_lenient_team_id(self, department_manager, mock_client):
+        await department_manager.list_departments({"team_id": "  "})
 
-        mock_client.get_org_units.assert_awaited_once_with(None)
+        mock_client.get_departments.assert_awaited_once_with(None)
 
     @pytest.mark.asyncio
     async def test_invalid_identifier_is_refused_even_when_unconfirmed(
-        self, org_unit_manager
+        self, department_manager
     ):
         with pytest.raises(ToolError) as excinfo:
-            await org_unit_manager.delete_org_unit_person({"person_id": "abc"})
+            await department_manager.delete_department_person({"person_id": "abc"})
 
         assert excinfo.value.field == "person_id"
 
 
-class TestOrgUnitRemovalErrors:
+class TestDepartmentRemovalErrors:
     """Upstream 4xx answers become caller guidance; everything else propagates."""
 
     @pytest.mark.asyncio
-    async def test_403_maps_to_the_feature_flag_explanation(self, org_unit_manager, mock_client):
-        mock_client.delete_org_unit_person.side_effect = ReveniumAPIError(
+    async def test_403_maps_to_the_feature_flag_explanation(self, department_manager, mock_client):
+        mock_client.delete_department_person.side_effect = ReveniumAPIError(
             "Forbidden", status_code=403
         )
 
         with pytest.raises(ToolError) as excinfo:
-            await org_unit_manager.delete_org_unit_person({"person_id": 97, "confirm": True})
+            await department_manager.delete_department_person({"person_id": 97, "confirm": True})
 
-        assert excinfo.value.message == "Org units are not enabled for this tenant"
+        assert excinfo.value.message == "Departments are not enabled for this tenant"
         assert excinfo.value.error_code == ErrorCodes.API_AUTHORIZATION
         assert any("org-unit-attribution-enabled" in s for s in excinfo.value.suggestions)
-        assert any("retry delete_org_unit_person" in s for s in excinfo.value.suggestions)
+        assert any("retry delete_department_person" in s for s in excinfo.value.suggestions)
 
     @pytest.mark.asyncio
     async def test_403_on_clear_maps_to_the_feature_flag_explanation(
-        self, org_unit_manager, mock_client
+        self, department_manager, mock_client
     ):
-        mock_client.clear_org_unit_assignment_by_email.side_effect = ReveniumAPIError(
+        mock_client.clear_department_assignment_by_email.side_effect = ReveniumAPIError(
             "Forbidden", status_code=403
         )
 
         with pytest.raises(ToolError) as excinfo:
-            await org_unit_manager.clear_org_unit_assignment(
+            await department_manager.clear_department_assignment(
                 {"email": "ash@acme.com", "confirm": True}
             )
 
-        assert excinfo.value.message == "Org units are not enabled for this tenant"
+        assert excinfo.value.message == "Departments are not enabled for this tenant"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -4176,14 +4176,14 @@ class TestOrgUnitRemovalErrors:
         ],
     )
     async def test_unknown_person_404_names_the_identifier(
-        self, org_unit_manager, mock_client, upstream
+        self, department_manager, mock_client, upstream
     ):
-        mock_client.delete_org_unit_person.side_effect = ReveniumAPIError(
+        mock_client.delete_department_person.side_effect = ReveniumAPIError(
             upstream, status_code=404
         )
 
         with pytest.raises(ToolError) as excinfo:
-            await org_unit_manager.delete_org_unit_person({"person_id": 97, "confirm": True})
+            await department_manager.delete_department_person({"person_id": 97, "confirm": True})
 
         assert excinfo.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
         assert excinfo.value.field == "person_id"
@@ -4192,14 +4192,14 @@ class TestOrgUnitRemovalErrors:
 
     @pytest.mark.asyncio
     async def test_unclassifiable_404_names_both_fields_without_guessing(
-        self, org_unit_manager, mock_client
+        self, department_manager, mock_client
     ):
-        mock_client.delete_org_unit_person.side_effect = ReveniumAPIError(
+        mock_client.delete_department_person.side_effect = ReveniumAPIError(
             "HTTP 404: Not Found", status_code=404
         )
 
         with pytest.raises(ToolError) as excinfo:
-            await org_unit_manager.delete_org_unit_person(
+            await department_manager.delete_department_person(
                 {"person_id": 97, "team_id": "jR2kmLs", "confirm": True}
             )
 
@@ -4209,13 +4209,13 @@ class TestOrgUnitRemovalErrors:
         )
 
     @pytest.mark.asyncio
-    async def test_unknown_team_404_names_team_id(self, org_unit_manager, mock_client):
-        mock_client.clear_org_unit_assignment_by_email.side_effect = ReveniumAPIError(
+    async def test_unknown_team_404_names_team_id(self, department_manager, mock_client):
+        mock_client.clear_department_assignment_by_email.side_effect = ReveniumAPIError(
             "HTTP 404: Organization not found for ID: zzzzzz", status_code=404
         )
 
         with pytest.raises(ToolError) as excinfo:
-            await org_unit_manager.clear_org_unit_assignment(
+            await department_manager.clear_department_assignment(
                 {"email": "ash@acme.com", "team_id": "zzzzzz", "confirm": True}
             )
 
@@ -4223,13 +4223,13 @@ class TestOrgUnitRemovalErrors:
         assert excinfo.value.value == "zzzzzz"
 
     @pytest.mark.asyncio
-    async def test_ambiguous_email_400_points_at_person_id(self, org_unit_manager, mock_client):
-        mock_client.delete_org_unit_person_by_email.side_effect = ReveniumAPIError(
+    async def test_ambiguous_email_400_points_at_person_id(self, department_manager, mock_client):
+        mock_client.delete_department_person_by_email.side_effect = ReveniumAPIError(
             "HTTP 400: email matches more than one directory person", status_code=400
         )
 
         with pytest.raises(ToolError) as excinfo:
-            await org_unit_manager.delete_org_unit_person(
+            await department_manager.delete_department_person(
                 {"email": "ash@acme.com", "confirm": True}
             )
 
@@ -4239,14 +4239,14 @@ class TestOrgUnitRemovalErrors:
 
     @pytest.mark.asyncio
     async def test_ambiguous_email_400_on_clear_explains_there_is_no_id_route(
-        self, org_unit_manager, mock_client
+        self, department_manager, mock_client
     ):
-        mock_client.clear_org_unit_assignment_by_email.side_effect = ReveniumAPIError(
+        mock_client.clear_department_assignment_by_email.side_effect = ReveniumAPIError(
             "HTTP 400: email matches more than one directory person", status_code=400
         )
 
         with pytest.raises(ToolError) as excinfo:
-            await org_unit_manager.clear_org_unit_assignment(
+            await department_manager.clear_department_assignment(
                 {"email": "ash@acme.com", "confirm": True}
             )
 
@@ -4255,82 +4255,82 @@ class TestOrgUnitRemovalErrors:
         assert "Revenium UI" not in hint
 
     @pytest.mark.asyncio
-    async def test_other_statuses_propagate(self, org_unit_manager, mock_client):
-        mock_client.delete_org_unit_person.side_effect = ReveniumAPIError("boom", status_code=500)
+    async def test_other_statuses_propagate(self, department_manager, mock_client):
+        mock_client.delete_department_person.side_effect = ReveniumAPIError("boom", status_code=500)
 
         with pytest.raises(ReveniumAPIError):
-            await org_unit_manager.delete_org_unit_person({"person_id": 97, "confirm": True})
+            await department_manager.delete_department_person({"person_id": 97, "confirm": True})
 
 
-class TestCustomerManagementOrgUnitRemovalActions:
+class TestCustomerManagementDepartmentRemovalActions:
     """The removal actions on manage_customers."""
 
     @pytest.mark.asyncio
     async def test_unconfirmed_action_renders_a_preview_and_sends_nothing(self, customer_mgmt):
         with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_client = MagicMock()
-            mock_client.delete_org_unit_person = AsyncMock(return_value={})
+            mock_client.delete_department_person = AsyncMock(return_value={})
             mock_gc.return_value = mock_client
 
             result = await customer_mgmt.handle_action(
-                "delete_org_unit_person", {"person_id": 97}
+                "delete_department_person", {"person_id": 97}
             )
 
         assert "Confirmation Required" in result[0].text
-        mock_client.delete_org_unit_person.assert_not_awaited()
+        mock_client.delete_department_person.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_confirmed_action_is_dispatched(self, customer_mgmt):
         with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_client = MagicMock()
-            mock_client.clear_org_unit_assignment_by_email = AsyncMock(return_value={})
+            mock_client.clear_department_assignment_by_email = AsyncMock(return_value={})
             mock_gc.return_value = mock_client
 
             result = await customer_mgmt.handle_action(
-                "clear_org_unit_assignment",
+                "clear_department_assignment",
                 {"email": "ash@acme.com", "team_id": "jR2kmLs", "confirm": True},
             )
 
-        mock_client.clear_org_unit_assignment_by_email.assert_awaited_once_with(
+        mock_client.clear_department_assignment_by_email.assert_awaited_once_with(
             "ash@acme.com", "jR2kmLs"
         )
-        assert result[0].text.startswith("Cleared the org-unit assignment")
+        assert result[0].text.startswith("Cleared the department assignment")
 
     @pytest.mark.asyncio
     async def test_actions_are_advertised_and_in_the_schema(self, customer_mgmt):
         actions = await customer_mgmt._get_supported_actions()
         schema = await customer_mgmt._get_input_schema()
 
-        assert {"delete_org_unit_person", "clear_org_unit_assignment"} <= set(actions)
+        assert {"delete_department_person", "clear_department_assignment"} <= set(actions)
         assert {"person_id", "email", "confirm"} <= set(schema["properties"])
 
     @pytest.mark.asyncio
-    async def test_unknown_action_lists_the_removals_as_org_unit_actions(self, customer_mgmt):
+    async def test_unknown_action_lists_the_removals_as_department_actions(self, customer_mgmt):
         with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock):
             with pytest.raises(ToolError) as excinfo:
                 await customer_mgmt.handle_action("no_such_action", {})
 
-        assert excinfo.value.examples["org_unit_actions"] == [
-            "list_org_units",
-            "delete_org_unit_person",
-            "clear_org_unit_assignment",
+        assert excinfo.value.examples["department_actions"] == [
+            "list_departments",
+            "delete_department_person",
+            "clear_department_assignment",
         ]
 
     @pytest.mark.asyncio
     async def test_capability_states_that_csv_import_stays_outside_the_mcp(self, customer_mgmt):
         capabilities = await customer_mgmt._get_tool_capabilities()
-        org_unit_capability = next(c for c in capabilities if "Org Unit" in c.name)
+        department_capability = next(c for c in capabilities if "Department" in c.name)
 
-        assert ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE in org_unit_capability.limitations
-        assert "removeMissing" in ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE
-        assert "membershipsRemoved" in ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE
+        assert DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE in department_capability.limitations
+        assert "removeMissing" in DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE
+        assert "membershipsRemoved" in DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE
 
     def test_capabilities_text_documents_the_confirm_gate_and_csv_exclusion(self, customer_mgmt):
         text = customer_mgmt._format_capabilities_response({})[0].text
 
-        assert "delete_org_unit_person(person_id=97, confirm=true)" in text
-        assert "clear_org_unit_assignment(email='ash@acme.com', confirm=true)" in text
-        assert ORG_UNIT_CSV_IMPORT_EXCLUSION_NOTE in text
+        assert "delete_department_person(person_id=97, confirm=true)" in text
+        assert "clear_department_assignment(email='ash@acme.com', confirm=true)" in text
+        assert DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE in text
 
 
 class TestCustomerManagementAutoGeneration:

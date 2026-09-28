@@ -58,6 +58,7 @@ from ..common.error_handling import (
     create_structured_missing_parameter_error,
     create_structured_validation_error,
 )
+from ..common.department_aliases import deprecated_argument_properties
 from ..common.numeric_param_validator import coerce_numeric_param
 from ..common.validation import validate_pagination_params
 from ..introspection.metadata import ToolType
@@ -490,12 +491,12 @@ If you're seeing this error, please report it as it indicates a reliability issu
    - Dollar figures are client-side ESTIMATES (count x avgCostPerMergedPr), never billed amounts
    - Thresholds come from the team settings and are echoed in the report; the same settings also hold the cutoff date, excluded repositories, automation patterns and assisted-only default. Read them with manage_customers get_pr_health_settings and change them with update_pr_health_settings
    - The report lists at most 50 engineers; page through all of them with get_pr_health_engineers
-   - Optional org_unit_id narrows every figure to one department (include_descendants=true adds its subtree)
+   - Optional department_id narrows every figure to one department (include_descendants=true adds its subtree)
    - The header echoes the cutoff date and excluded repositories the team settings applied
 
 6e1. **get_pr_health_engineers / get_pr_health_prs / get_pr_health_pull_requests**
    - Same source/start_date/end_date window and 366-day rule as get_pr_health, same organization scope
-   - Same optional org_unit_id / include_descendants narrowing, plus assisted_only=true to keep only AI-assisted PRs
+   - Same optional department_id / include_descendants narrowing, plus assisted_only=true to keep only AI-assisted PRs
    - get_pr_health_engineers: every engineer row, paged (page, size) and sorted server-side (sort_by authorLogin|openPrs|agingPrs|rottingPrs|closedUnmerged|oldestInactiveDays, sort_dir asc|desc)
    - get_pr_health_prs: one engineer's open PRs (bucketed ROTTING/AGING/ACTIVE/DRAFT) and PRs closed without merge; author (the login from the engineer rows) is required
    - get_pr_health_pull_requests: the flat PR list behind the report, paged, filterable by bucket (ROTTING|AGING|ACTIVE|DRAFT|CLOSED_UNMERGED) and author, sort_by inactivity|age
@@ -503,7 +504,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 
 6e1a. **get_pr_health_repositories**
    - Every repository of your organization holding open PRs, with its open count and whether the team excludes it
-   - Takes source only: no window, no org unit, and the team's cutoff/exclusions/automation patterns are not applied
+   - Takes source only: no window, no department, and the team's cutoff/exclusions/automation patterns are not applied
 
 6e2. **get_merged_prs**
    - Merged pull-request counts for your own organization, per person (default) or per repository (group_by='repository')
@@ -1005,7 +1006,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 **Parameters** (all required):
 - `source`: `github` or `gitlab`
 - `start_date` / `end_date`: ISO `yyyy-MM-dd`; the window must span fewer than 366 days and `start_date` must not be after `end_date`
-**Optional**: `org_unit_id` narrows every figure to one department of your organization (404 for any other); `include_descendants=true` adds its descendant departments and needs `org_unit_id`.
+**Optional**: `department_id` narrows every figure to one department of your organization (404 for any other); `include_descendants=true` adds its descendant departments and needs `department_id`.
 **Scope**: the organization is resolved from your credentials — there is no team parameter. The PR-health settings are team-addressed and live on `manage_customers` (`get_pr_health_settings` / `update_pr_health_settings`): the `agingDays` and `rottingDays` thresholds (the report echoes the pair it used) plus `cutoffDate` and `excludedRepos`, which narrow which pull requests the figures count at all; `automationPatterns`, which put matching pull requests in the automation bucket; and `assistedOnly`, the team's default view for pricing and listing AI-assisted pull requests only (not a filter on what the report counts).
 **Paging**: the report lists at most 50 engineers. Use `get_pr_health_engineers` for every engineer, `get_pr_health_prs` for one engineer's pull requests and `get_pr_health_pull_requests` for the whole bucketed list.
 **Reading the numbers**:
@@ -1030,7 +1031,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 ```
 **Purpose**: every engineer row of the PR-health report, one server-sorted page at a time.
 **Parameters**: the `get_pr_health` window (required) plus optional `page`, `size`, `sort_by` (authorLogin, openPrs, agingPrs, rottingPrs, closedUnmerged, oldestInactiveDays) and `sort_dir` (asc, desc).
-**Narrowing** (all three drill-downs): optional `org_unit_id`, `include_descendants` (needs `org_unit_id`) and `assisted_only` (true keeps only AI-assisted pull requests).
+**Narrowing** (all three drill-downs): optional `department_id`, `include_descendants` (needs `department_id`) and `assisted_only` (true keeps only AI-assisted pull requests).
 
 ### get_pr_health_prs
 ```json
@@ -1068,7 +1069,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 }
 ```
 **Purpose**: every repository of your organization holding open pull requests, with its open count and whether the team's PR-health settings exclude it.
-**Parameters**: `source` (required). No window and no org unit: the list deliberately ignores the team's cutoff, exclusions and automation patterns, so an excluded repository is still listed and flagged.
+**Parameters**: `source` (required). No window and no department: the list deliberately ignores the team's cutoff, exclusions and automation patterns, so an excluded repository is still listed and flagged.
 
 ### get_merged_prs
 ```json
@@ -2721,7 +2722,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
     _PR_HEALTH_RULES: ClassVar[List[str]] = [
         _VCS_WINDOW_REQUIRED_RULE,
         _PR_HEALTH_WINDOW_RULE,
-        "org_unit_id must be a department of your own organization; the platform answers 404 for any other",
+        "department_id must be a department of your own organization; the platform answers 404 for any other",
     ]
     # The report breaks the AI-assisted subset out in its *Assisted totals instead
     # of filtering by it; only the drill-downs accept assistedOnly.
@@ -2732,14 +2733,14 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
     ]
     # Upstream cap on the repository list; excluded repositories are appended past it.
     _PR_HEALTH_MAX_REPOSITORIES: ClassVar[int] = 2000
-    # orgUnitId is an int64 upstream.
+    # departmentId is an int64 upstream.
     _INT64_MAX: ClassVar[int] = 2**63 - 1
-    _PR_HEALTH_ORG_UNIT_CAPABILITY_PARAMS: ClassVar[Dict[str, str]] = {
-        "org_unit_id": "int (optional, a department of your organization)",
-        "include_descendants": "bool (optional, needs org_unit_id)",
+    _PR_HEALTH_DEPARTMENT_CAPABILITY_PARAMS: ClassVar[Dict[str, str]] = {
+        "department_id": "int (optional, a department of your organization)",
+        "include_descendants": "bool (optional, needs department_id)",
     }
     _PR_HEALTH_NARROWING_CAPABILITY_PARAMS: ClassVar[Dict[str, str]] = {
-        **_PR_HEALTH_ORG_UNIT_CAPABILITY_PARAMS,
+        **_PR_HEALTH_DEPARTMENT_CAPABILITY_PARAMS,
         "assisted_only": "bool (optional, true keeps only AI-assisted pull requests)",
     }
 
@@ -2862,7 +2863,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
     ) -> "tuple[str, str, str, Dict[str, Any]]":
         """Reject the request shapes the platform 400s on, before the call is made.
 
-        Returns the window plus the org-unit narrowing as client keyword arguments.
+        Returns the window plus the department narrowing as client keyword arguments.
         Pre-flight only, for the same reason as ``_validate_vcs_window``.
         """
         source, start, end = self._validate_vcs_window(arguments, action)
@@ -2881,11 +2882,11 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         return source, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), scope
 
     def _validate_pr_health_scope(self, arguments: Dict[str, Any], action: str) -> Dict[str, Any]:
-        org_unit_id = self._validate_optional_int(arguments, "org_unit_id", 1, self._INT64_MAX)
-        if org_unit_id is None:
-            self._reject_params_without(arguments, ["include_descendants"], "org_unit_id", action)
+        department_id = self._validate_optional_int(arguments, "department_id", 1, self._INT64_MAX)
+        if department_id is None:
+            self._reject_params_without(arguments, ["include_descendants"], "department_id", action)
         scope: Dict[str, Any] = {
-            "org_unit_id": org_unit_id,
+            "department_id": department_id,
             "include_descendants": self._validate_optional_bool(arguments, "include_descendants"),
         }
         if action in self._PR_HEALTH_ASSISTED_ONLY_ACTIONS:
@@ -3002,15 +3003,15 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
     def _render_pr_health_applied_scope(self, report: Dict[str, Any]) -> List[str]:
         """The narrowing and team settings the platform echoes it applied, each only when present."""
         lines: List[str] = []
-        org_unit_id = report.get("orgUnitId")
-        if org_unit_id is not None:
+        department_id = report.get("departmentId")
+        if department_id is not None:
             subtree = (
                 "and its descendant departments"
                 if report.get("includeDescendants") is True
                 else "only (descendant departments not included)"
             )
             lines.append(
-                f"**Org unit**: narrowed to org unit {org_unit_id} {subtree}, by the department "
+                f"**Department**: narrowed to department {department_id} {subtree}, by the department "
                 "its members belong to today. avgCostPerMergedPr stays organization-wide."
             )
         if report.get("assistedOnly") is True:
@@ -3474,7 +3475,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         lines = [
             f"**PR Health repositories — {report.get('source') or source}**",
             "",
-            "Scope: your own organization, current synced state (no date window, no org unit). "
+            "Scope: your own organization, current synced state (no date window, no department). "
             "The team's cutoff, exclusions and automation patterns are deliberately NOT applied, "
             "so an excluded repository is still listed and flagged; every excluded repository "
             "appears, even one with no open pull request left.",
@@ -5345,13 +5346,14 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "enum": ["asc", "desc"],
                     "description": "Sort direction on get_pr_health_engineers and get_pr_health_pull_requests",
                 },
-                "org_unit_id": {
+                "department_id": {
                     "type": "integer",
                     "description": "Department of your own organization to narrow get_pr_health and its engineers/prs/pull_requests drill-downs to. Omit for the whole organization",
                 },
+                **deprecated_argument_properties("department_id", "integer"),
                 "include_descendants": {
                     "type": "boolean",
-                    "description": "Also cover the org unit's descendant departments on the PR-health reads. Needs org_unit_id",
+                    "description": "Also cover the department's descendant departments on the PR-health reads. Needs department_id",
                 },
                 "assisted_only": {
                     "type": "boolean",
@@ -5607,7 +5609,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                         "source": "str (required, github|gitlab)",
                         "start_date": "str (required, yyyy-MM-dd)",
                         "end_date": "str (required, yyyy-MM-dd)",
-                        **self._PR_HEALTH_ORG_UNIT_CAPABILITY_PARAMS,
+                        **self._PR_HEALTH_DEPARTMENT_CAPABILITY_PARAMS,
                     },
                 },
                 examples=[

@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
 
 from ..auth.claims_middleware import current_tenant_context
+from .department_aliases import resolve_department_aliases
 from ..log_context import bind_tenant_context, clear_tenant_context, sanitize_error_message
 
 
@@ -53,6 +54,7 @@ async def standardized_tool_execution(
     from ..common.error_handling import IntrospectionError, ToolExecutionError
     from ..introspection.integration import introspection_integration
 
+    action, arguments = resolve_department_aliases(tool_name, action, arguments)
     if ctx is None:
         ctx = current_tenant_context()
     tokens = bind_tenant_context(ctx)

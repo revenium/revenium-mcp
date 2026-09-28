@@ -1792,6 +1792,15 @@ class TestSessionAttributionDecisionIsRecorded:
         assert "422" in doc and "400" in doc
         assert "CodingAssistantSource" in doc
 
+    def test_no_internal_tooling_references_in_shipped_text(self):
+        """Regression guard: neutral wording must not regress anywhere in the module,
+        not only in the docstring checked above (BACK-3454)."""
+        import inspect
+
+        source = inspect.getsource(job_management_module)
+        assert "association-client.ts" not in source
+        assert "ticket-gate CLI" not in source
+
 
 # ===========================================================================
 

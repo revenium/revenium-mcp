@@ -523,28 +523,28 @@ class TestGetVcsPrHealth:
         assert exc_info.value.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_forwards_the_org_unit_scope_under_its_wire_names(self, mock_env_vars):
+    async def test_forwards_the_department_scope_under_its_wire_names(self, mock_env_vars):
         client = ReveniumClient()
 
         with patch.object(client, "get", new_callable=AsyncMock, return_value={}) as mock_get:
             await client.get_vcs_pr_health(
-                "github", "2026-01-01", "2026-01-31", org_unit_id=42, include_descendants=True
+                "github", "2026-01-01", "2026-01-31", department_id=42, include_descendants=True
             )
 
         assert mock_get.call_args[1]["params"] == {
             "source": "github",
             "startDate": "2026-01-01",
             "endDate": "2026-01-31",
-            "orgUnitId": 42,
+            "departmentId": 42,
             "includeDescendants": True,
         }
 
 
 class TestVcsPrHealthScopedSubReads:
-    """BACK-3387: the drill-downs forward the org-unit scope and assistedOnly, never a team id."""
+    """BACK-3387: the drill-downs forward the department scope and assistedOnly, never a team id."""
 
-    SCOPE = {"org_unit_id": 7, "include_descendants": False, "assisted_only": True}
-    WIRE_SCOPE = {"orgUnitId": 7, "includeDescendants": False, "assistedOnly": True}
+    SCOPE = {"department_id": 7, "include_descendants": False, "assisted_only": True}
+    WIRE_SCOPE = {"departmentId": 7, "includeDescendants": False, "assistedOnly": True}
     WINDOW = {"source": "github", "startDate": "2026-05-17", "endDate": "2026-08-17"}
 
     @staticmethod
@@ -810,8 +810,8 @@ class TestJobOutcomeEndpoint:
         assert kwargs["json"] == outcome_data
 
 
-class TestOrgUnitGroupPreview:
-    """Test the org-unit budget group preview client method (BACK-2764)."""
+class TestDepartmentGroupPreview:
+    """Test the department budget group preview client method (BACK-2764)."""
 
     @pytest.mark.asyncio
     async def test_preview_targets_the_preview_endpoint(self, mock_env_vars):
@@ -820,11 +820,11 @@ class TestOrgUnitGroupPreview:
         with patch.object(
             client, "post", new_callable=AsyncMock, return_value={"targetCount": 0, "targets": []}
         ) as mock_post:
-            await client.preview_org_unit_group(173)
+            await client.preview_department_group(173)
 
         assert (
             mock_post.call_args[0][0]
-            == "/profitstream/v2/api/ai/cost-controls/org-unit-group-preview"
+            == "/profitstream/v2/api/ai/cost-controls/department-group-preview"
         )
 
     @pytest.mark.asyncio
@@ -837,11 +837,11 @@ class TestOrgUnitGroupPreview:
         with patch.object(
             client, "post", new_callable=AsyncMock, return_value={"targetCount": 0, "targets": []}
         ) as mock_post:
-            await client.preview_org_unit_group(173)
+            await client.preview_department_group(173)
 
         body = mock_post.call_args[1]["data"]
         assert body["teamId"] == client.team_id
-        assert body["parentOrgUnitId"] == 173
+        assert body["parentDepartmentId"] == 173
         assert "params" not in mock_post.call_args[1]
 
     @pytest.mark.asyncio
@@ -850,52 +850,52 @@ class TestOrgUnitGroupPreview:
         payload = {"targetCount": 2, "targets": [{"id": "ou_1"}, {"id": "ou_2"}]}
 
         with patch.object(client, "post", new_callable=AsyncMock, return_value=payload):
-            result = await client.preview_org_unit_group(173)
+            result = await client.preview_department_group(173)
 
         assert result == payload
 
 
-class TestOrgUnits:
-    """Test the org-unit (department) lookup client method (BACK-2767)."""
+class TestDepartments:
+    """Test the department lookup client method (BACK-2767)."""
 
     @pytest.mark.asyncio
-    async def test_get_org_units_targets_org_units_endpoint(self, mock_env_vars):
-        """GET hits the platform org-units collection under the profitstream prefix."""
+    async def test_get_departments_targets_departments_endpoint(self, mock_env_vars):
+        """GET hits the platform departments collection under the profitstream prefix."""
         client = ReveniumClient()
 
         with patch.object(
             client, "get", new_callable=AsyncMock, return_value=[]
         ) as mock_get:
-            await client.get_org_units()
+            await client.get_departments()
 
-        assert mock_get.call_args[0][0] == "/profitstream/v2/api/org-units"
+        assert mock_get.call_args[0][0] == "/profitstream/v2/api/departments"
 
     @pytest.mark.asyncio
-    async def test_get_org_units_without_team_id_sends_ambient_team(self, mock_env_vars):
+    async def test_get_departments_without_team_id_sends_ambient_team(self, mock_env_vars):
         """Omitting team_id falls back to the auth config's team, like the other reads."""
         client = ReveniumClient()
 
         with patch.object(
             client, "get", new_callable=AsyncMock, return_value=[]
         ) as mock_get:
-            await client.get_org_units()
+            await client.get_departments()
 
         assert mock_get.call_args[1]["params"] == client._add_team_id_to_params()
 
     @pytest.mark.asyncio
-    async def test_get_org_units_with_team_id_sends_that_team(self, mock_env_vars):
+    async def test_get_departments_with_team_id_sends_that_team(self, mock_env_vars):
         """An explicit team_id overrides the ambient team on the teamId query param."""
         client = ReveniumClient()
 
         with patch.object(
             client, "get", new_callable=AsyncMock, return_value=[]
         ) as mock_get:
-            await client.get_org_units("other_team")
+            await client.get_departments("other_team")
 
         assert mock_get.call_args[1]["params"] == {"teamId": "other_team"}
 
     @pytest.mark.asyncio
-    async def test_get_org_units_returns_flat_array_untouched(self, mock_env_vars):
+    async def test_get_departments_returns_flat_array_untouched(self, mock_env_vars):
         """The endpoint answers with a bare array; it must not be paged or unwrapped."""
         client = ReveniumClient()
         payload = [
@@ -910,26 +910,26 @@ class TestOrgUnits:
         ]
 
         with patch.object(client, "get", new_callable=AsyncMock, return_value=payload):
-            result = await client.get_org_units()
+            result = await client.get_departments()
 
         assert result == payload
 
     @pytest.mark.asyncio
-    async def test_get_org_units_uses_default_api_key_host(self, mock_env_vars):
+    async def test_get_departments_uses_default_api_key_host(self, mock_env_vars):
         """HAL unwrapping only fires for bearer calls, so this read must stay on the default host."""
         client = ReveniumClient()
 
         with patch.object(
             client, "get", new_callable=AsyncMock, return_value=[]
         ) as mock_get:
-            await client.get_org_units()
+            await client.get_departments()
 
         kwargs = mock_get.call_args[1]
         assert "use_bearer" not in kwargs
         assert "base_url" not in kwargs
 
     @pytest.mark.asyncio
-    async def test_get_org_units_propagates_api_error(self, mock_env_vars):
+    async def test_get_departments_propagates_api_error(self, mock_env_vars):
         """Upstream failures surface as ReveniumAPIError for the tool layer to translate."""
         client = ReveniumClient()
 
@@ -938,23 +938,23 @@ class TestOrgUnits:
             side_effect=ReveniumAPIError("Forbidden", status_code=403),
         ):
             with pytest.raises(ReveniumAPIError) as exc_info:
-                await client.get_org_units()
+                await client.get_departments()
 
         assert exc_info.value.status_code == 403
 
 
-class TestOrgUnitMembershipRemovals:
-    """The three org-unit DELETE routes (BACK-3353)."""
+class TestDepartmentMembershipRemovals:
+    """The three department DELETE routes (BACK-3353)."""
 
     @pytest.mark.asyncio
     async def test_delete_person_by_id_puts_the_id_in_the_path(self, mock_env_vars):
         client = ReveniumClient()
 
         with patch.object(client, "delete", new_callable=AsyncMock, return_value={}) as mock_delete:
-            result = await client.delete_org_unit_person(97, "jR2kmLs")
+            result = await client.delete_department_person(97, "jR2kmLs")
 
         mock_delete.assert_awaited_once_with(
-            "/profitstream/v2/api/org-units/persons/97",
+            "/profitstream/v2/api/departments/persons/97",
             params={"teamId": "jR2kmLs"},
             use_retry=False,
         )
@@ -965,10 +965,10 @@ class TestOrgUnitMembershipRemovals:
         client = ReveniumClient()
 
         with patch.object(client, "delete", new_callable=AsyncMock, return_value={}) as mock_delete:
-            await client.delete_org_unit_person_by_email("ash@acme.com")
+            await client.delete_department_person_by_email("ash@acme.com")
 
         mock_delete.assert_awaited_once_with(
-            "/profitstream/v2/api/org-units/persons",
+            "/profitstream/v2/api/departments/persons",
             params={**client._add_team_id_to_params(), "email": "ash@acme.com"},
             use_retry=False,
         )
@@ -978,10 +978,10 @@ class TestOrgUnitMembershipRemovals:
         client = ReveniumClient()
 
         with patch.object(client, "delete", new_callable=AsyncMock, return_value={}) as mock_delete:
-            await client.clear_org_unit_assignment_by_email("ash@acme.com", "jR2kmLs")
+            await client.clear_department_assignment_by_email("ash@acme.com", "jR2kmLs")
 
         mock_delete.assert_awaited_once_with(
-            "/profitstream/v2/api/org-units/assignments",
+            "/profitstream/v2/api/departments/assignments",
             params={"teamId": "jR2kmLs", "email": "ash@acme.com"},
             use_retry=False,
         )

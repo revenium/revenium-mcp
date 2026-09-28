@@ -676,10 +676,10 @@ async def test_submit_recommendation_feedback_includes_realized_savings_measured
 
 
 @pytest.mark.asyncio
-async def test_trigger_recommendation_run_sends_org_unit_filter(monkeypatch):
-    """BACK-2757: the org-unit scope rides on the wire as a bare string.
+async def test_trigger_recommendation_run_sends_department_filter(monkeypatch):
+    """BACK-2757: the department scope rides on the wire as a bare string.
 
-    filterOrgUnitId is single-valued, unlike the neighbouring filterAgent /
+    filterDepartmentId is single-valued, unlike the neighbouring filterAgent /
     filterProductId arrays — wrapping it in a list would not match the
     documented type and the backend would run unscoped.
     """
@@ -707,20 +707,20 @@ async def test_trigger_recommendation_run_sends_org_unit_filter(monkeypatch):
     await client.trigger_recommendation_run(
         period_start="2026-01-01T00:00:00Z",
         period_end="2026-01-31T23:59:59Z",
-        filter_org_unit_id="173",
+        filter_department_id="173",
         filter_include_descendants=False,
     )
 
-    assert captured["body"]["filterOrgUnitId"] == "173"
+    assert captured["body"]["filterDepartmentId"] == "173"
     assert captured["body"]["filterIncludeDescendants"] is False
 
 
 @pytest.mark.asyncio
 async def test_trigger_recommendation_run_defaults_include_descendants_true(monkeypatch):
-    """Both org-unit fields are always sent, with descendants included by default.
+    """Both department fields are always sent, with descendants included by default.
 
     Defaulting filterIncludeDescendants to false would silently narrow every
-    org-unit-scoped run to the department's own rows, excluding its sub-units.
+    department-scoped run to the department's own rows, excluding its sub-units.
     """
     from src.revenium_mcp_server.client import ReveniumClient
 
@@ -748,5 +748,5 @@ async def test_trigger_recommendation_run_defaults_include_descendants_true(monk
         period_end="2026-01-02T00:00:00Z",
     )
 
-    assert captured["body"]["filterOrgUnitId"] == ""
+    assert captured["body"]["filterDepartmentId"] == ""
     assert captured["body"]["filterIncludeDescendants"] is True

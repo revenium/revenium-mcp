@@ -278,7 +278,9 @@ class ToolConfigurationRegistry:
             include_pull_requests: Optional[Union[bool, str]] = None,
             pr_limit: Optional[Union[int, str]] = None,
             pr_offset: Optional[Union[int, str]] = None,
-            # PR-health org-unit narrowing, and the drill-downs' AI-assisted filter
+            # PR-health department narrowing (org_unit_id is its deprecated alias, see
+            # common.department_aliases), and the drill-downs' AI-assisted filter
+            department_id: Optional[Union[int, str]] = None,
             org_unit_id: Optional[Union[int, str]] = None,
             include_descendants: Optional[Union[bool, str]] = None,
             assisted_only: Optional[Union[bool, str]] = None,
@@ -348,6 +350,7 @@ class ToolConfigurationRegistry:
                 "include_pull_requests": include_pull_requests,
                 "pr_limit": pr_limit,
                 "pr_offset": pr_offset,
+                "department_id": department_id,
                 "org_unit_id": org_unit_id,
                 "include_descendants": include_descendants,
                 "assisted_only": assisted_only,
@@ -591,6 +594,7 @@ class ToolConfigurationRegistry:
             filter_trace_type: Optional[List[str]] = None,
             filter_consuming_org_id: Optional[List[str]] = None,
             filter_environment: Optional[str] = None,
+            filter_department_id: Optional[str] = None,
             filter_org_unit_id: Optional[str] = None,
             filter_include_descendants: Optional[bool] = None,
             filter_include_coding_assistants: Optional[bool] = None,
@@ -625,8 +629,9 @@ class ToolConfigurationRegistry:
                 "filter_consuming_org_id": filter_consuming_org_id,
                 "filter_environment": filter_environment,
                 # BACK-2757: FastMCP builds this tool's accepted arguments from
-                # the signature above, so both org-unit filters have to be
+                # the signature above, so both department filters have to be
                 # declared there or the handler's reads are unreachable.
+                "filter_department_id": filter_department_id,
                 "filter_org_unit_id": filter_org_unit_id,
                 "filter_include_descendants": filter_include_descendants,
                 "filter_include_coding_assistants": filter_include_coding_assistants,
@@ -1493,7 +1498,7 @@ class ToolConfigurationRegistry:
             # Team attribution-identity-policy and verified-domain actions
             policy: Optional[str] = None,
             domain: Optional[str] = None,
-            # Org-unit membership removals (delete_org_unit_person, clear_org_unit_assignment)
+            # Department membership removals (delete_department_person, clear_department_assignment)
             person_id: Optional[Union[int, str]] = None,
             confirm: Optional[Union[bool, str]] = None,
             page: Union[int, str] = 0,
@@ -1610,7 +1615,7 @@ class ToolConfigurationRegistry:
             arguments = preprocess_numeric_parameters(arguments, numeric_params)
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values.
-            # "confirm" is deliberately excluded: the org-unit removals run only for a
+            # "confirm" is deliberately excluded: the department removals run only for a
             # literal boolean True, so a loosely typed confirm must stay a preview.
             boolean_params = ["auto_generate", "dry_run", "assisted_only"]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
@@ -2165,6 +2170,7 @@ class ToolConfigurationRegistry:
             action: _JSONScalar = "get_capabilities",
             control_id: Optional[_JSONScalar] = None,
             control_data: Optional[Union[dict, str]] = None,
+            parent_department_id: Optional[Union[int, str]] = None,
             parent_org_unit_id: Optional[Union[int, str]] = None,
             rule_id: Optional[_JSONScalar] = None,
             since: Optional[_JSONScalar] = None,
@@ -2190,10 +2196,11 @@ class ToolConfigurationRegistry:
                 "action": action,
                 "control_id": control_id,
                 "control_data": control_data,
-                # Raw numeric org-unit id for preview_org_unit_group. Kept out
+                # Raw numeric department id for preview_department_group. Kept out
                 # of string_fields below because both an int and a digit string
-                # are legitimate here (the org-unit listing hands out strings,
+                # are legitimate here (the department listing hands out strings,
                 # the raw API returns JSON numbers); the tool coerces in-body.
+                "parent_department_id": parent_department_id,
                 "parent_org_unit_id": parent_org_unit_id,
                 "rule_id": rule_id,
                 "since": since,
