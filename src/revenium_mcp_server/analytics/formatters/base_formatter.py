@@ -5,32 +5,42 @@ Provides abstract base class and common formatting utilities
 that all specialized formatters can inherit and use.
 """
 
+import json
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Dict
+
+from ..validation import DEFAULT_USER_COST_SOURCES
 
 # Path prefix of the ClickHouse-backed analytics plane. Which plane served a
 # request decides the coding-assistant scope of its numbers, so the note is
 # selected from the path the endpoint registry resolves, never hardcoded.
 _NEW_ANALYTICS_PATH_PREFIX = "/api/v2/analytics"
 
-# Scope on the v2 analytics plane. Its REST context never carries
-# apiRateCodingAssistantProviders (isotope: the contextAdapter in
-# apps/web/src/server/public-api/index.ts omits it), so
-# buildAiMetricsCostedPricingModePredicate collapses to "real spend OR not a
-# coding assistant": rows priced as coding_assistant are always dropped, and
-# coding-assistant providers survive only where the row carries real spend.
+# Scope on the v2 analytics plane. Since isotope #4163 (2026-10-04) the REST
+# context resolves apiRateCodingAssistantProviders per team
+# (apps/web/src/server/public-api/index.ts, publicApiContext). Verified on dev
+# team JMwaj9y on 2026-10-09: with ClaudeCode in apiRateProviders its usage is
+# real spend under revenium_metered (coding_assistant alone is empty); with
+# it unmarked, dev shows that usage under no source at all, while the prod
+# tenant of BACK-4136, which does not pay for Claude Code at API rates, had
+# it only under coding_assistant as an API-equivalent estimate. Wherever the
+# platform exposes it, the three-source default reaches it; BACK-3959's
+# two-source default only reached the API-rate case.
 _NEW_PLANE_CODING_ASSISTANT_NOTE = (
-    "**Coding-assistant scope**: usage priced as coding-assistant activity "
-    "(cost source `coding_assistant`) is NOT counted in these numbers. "
-    "Coding-assistant traffic recorded as real provider spend "
-    "(`revenium_metered`, `provider_billing`) IS counted, which is why a "
-    "coding-assistant provider such as ClaudeCode or ClaudeCowork can still "
-    "appear here. This is one rule for the whole analytics plane, not a "
-    "per-action filter: every analytics cost action and `get_transaction_count` "
-    "report the same universe. To check whether individual coding-assistant "
-    "records arrived, use `manage_metering` transaction lookups, which read a "
-    "different dataset.\n"
+    "**Coding-assistant scope**: coding-assistant usage (Claude Code, Claude "
+    "Cowork and similar) is reported in two ways. For the assistants the team "
+    "pays for at real API rates (its apiRateProviders, readable with "
+    "manage_customers get_coding_assistant_billing_settings) it is real spend "
+    "under `revenium_metered` or `provider_billing`; for every other assistant "
+    "it is an API-equivalent estimate that, where the platform exposes it to "
+    "analytics, is reported only under the `coding_assistant` cost source. "
+    "Traffic recorded as real provider spend "
+    "is counted regardless. This is one rule for the whole analytics plane, "
+    "not a per-action filter: every analytics cost action and "
+    "`get_transaction_count` report the same universe. To check whether "
+    "individual coding-assistant records arrived, use `manage_metering` "
+    "transaction lookups, which read a different dataset.\n"
 )
 
 # Scope on the legacy profitstream plane. There the tenant's coding-assistant
@@ -43,26 +53,33 @@ _LEGACY_PLANE_CODING_ASSISTANT_NOTE = (
     "Gemini CLI, Cursor IDE, Codex CLI, GitHub Copilot) are counted unless "
     "your tenant's coding-assistant filter policy excludes them. That policy "
     "is tenant-level, so the legacy cost actions agree with each other; "
-    "`get_transaction_count` always reads the v2 analytics plane, which drops "
-    "coding-assistant-priced usage, so it can legitimately disagree with this "
-    "number.\n"
+    "`get_transaction_count` always reads the v2 analytics plane, which "
+    "reports coding-assistant usage as real spend or as an estimate by "
+    "assistant, so it can legitimately disagree with this number.\n"
 )
 
 # get_user_costs only ever reaches the v2 plane (cost_metric_by_user_aggregated
-# is NEW_API_ONLY). Two facts make a small or empty result here meaningless as
-# a statement about a person: the query keeps only rows whose subscriber email
-# is populated (isotope buildCostByUserAggregatedQuery), and the action's
-# default costSources selects exactly the rows that plane's predicate drops.
+# is NEW_API_ONLY), whose query keeps only rows whose subscriber email is
+# populated (isotope buildCostByUserAggregatedQuery). Which source carries a
+# team's coding-assistant usage depends on whether it pays for that assistant
+# at API rates (see DEFAULT_USER_COST_SOURCES), so the default asks for every
+# source and the note says so instead of promising that any one source is empty.
+_USER_COSTS_DEFAULT_FILTER = (
+    f"`filters.costSources={json.dumps(list(DEFAULT_USER_COST_SOURCES))}`"
+)
 _USER_ATTRIBUTION_NOTE = (
     "**Per-user attribution**: this dataset reports only rows whose subscriber "
-    "email is populated, and this action defaults to "
-    '`filters.costSources=["coding_assistant"]` - the records the v2 analytics '
-    "plane excludes. Per-employee coding-assistant spend is therefore not "
-    "answerable from this action, and an empty or small total here is a "
-    "property of the dataset, not a measure of anyone's usage. For "
-    "per-employee coding-assistant usage use the Revenium web app's AI by "
-    "Employee view; for API-metered per-user spend pass "
-    '`filters.costSources=["revenium_metered", "provider_billing"]`.\n'
+    "email is populated. Unless you pass `filters.costSources`, this action "
+    "asks for every cost source per user "
+    f"({_USER_COSTS_DEFAULT_FILTER}); pass a subset to narrow it. Coding-assistant "
+    "usage is real spend under `revenium_metered` or `provider_billing` when the "
+    "team pays for that assistant at API rates and, where the platform exposes "
+    "the estimate, under `coding_assistant` otherwise, so an empty report under "
+    "one source says "
+    "nothing about the others. Missing subscriber emails can reduce the reported total, "
+    "and filters or the chosen period can make it small or empty; that does not "
+    "show whether anyone used AI. The Revenium web app's AI by Employee view "
+    "remains the authoritative per-employee coding-assistant report.\n"
 )
 
 

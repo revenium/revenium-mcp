@@ -1,7 +1,7 @@
 """Extended unit tests for Revenium API client — covers convenience methods, retry logic, error formatting."""
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 
 from src.revenium_mcp_server.client import (
@@ -741,9 +741,9 @@ class TestTenantIngestionAPIMethods:
     @pytest.mark.asyncio
     async def test_get_ingestion_failures_forwards_error_code(self):
         client = self._client_with_tenant()
-        await client.get_ingestion_failures(errorCode="UNKNOWN_PRODUCT")
+        await client.get_ingestion_failures(errorCode="PRODUCT_NOT_FOUND")
         params = client.get.call_args.kwargs.get("params")
-        assert params["errorCode"] == "UNKNOWN_PRODUCT"
+        assert params["errorCode"] == "PRODUCT_NOT_FOUND"
 
     @pytest.mark.asyncio
     async def test_get_ingestion_failures_requires_tenant_id(self):
@@ -950,25 +950,44 @@ class TestCostControlsAPIMethods:
 class TestBudgetProgressAPIMethods:
     """Budget-progress reads hit the literal /profitstream progress routes.
 
-    These routes are authorized per-tenant (isAuthenticated) or per-anomaly
-    (canReadAIAnomaly) — none take a teamId param, so the client must NOT add
-    one (same rationale as reset_anomaly_budget)."""
+    The per-anomaly and bulk routes declare no teamId, so the client must NOT add
+    one there. The portfolio declares an optional teamId whose absence widens the
+    read to every team the caller can read, so it always carries the resolved team."""
 
     def setup_method(self):
         self.client = _make_client()
         self.client.get = AsyncMock(return_value={})
 
     @pytest.mark.asyncio
-    async def test_get_budget_portfolio_path_pagination_no_team(self):
+    async def test_get_budget_portfolio_path_pagination_and_resolved_team(self):
         await self.client.get_budget_portfolio(page=1, size=5)
         assert (
             self.client.get.call_args[0][0]
             == "/profitstream/v2/api/ai/alerts/budgets/portfolio"
         )
         params = self.client.get.call_args.kwargs.get("params")
-        assert params["page"] == 1
-        assert params["size"] == 5
-        assert "teamId" not in params
+        assert params == {"page": 1, "size": 5, "teamId": "team_abc"}
+
+    @pytest.mark.asyncio
+    async def test_get_budget_portfolio_omits_team_when_none_resolved(self):
+        with patch.object(
+            ReveniumClient, "team_id", new_callable=PropertyMock, return_value=None
+        ):
+            await self.client.get_budget_portfolio()
+        assert "teamId" not in self.client.get.call_args.kwargs["params"]
+
+    @pytest.mark.asyncio
+    async def test_get_budget_portfolio_sends_the_resolved_team_over_a_typed_one(self):
+        await self.client.get_budget_portfolio(teamId="someone_elses_team")
+        assert self.client.get.call_args.kwargs["params"]["teamId"] == "team_abc"
+
+    @pytest.mark.asyncio
+    async def test_get_budget_portfolio_forwards_group_limit_only_when_set(self):
+        await self.client.get_budget_portfolio(groupLimit=10)
+        assert self.client.get.call_args.kwargs["params"]["groupLimit"] == 10
+
+        await self.client.get_budget_portfolio()
+        assert "groupLimit" not in self.client.get.call_args.kwargs["params"]
 
     @pytest.mark.asyncio
     async def test_get_budget_portfolio_forwards_filters(self):

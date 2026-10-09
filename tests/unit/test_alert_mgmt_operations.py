@@ -1373,7 +1373,54 @@ class TestHandleResetBudget:
 
 
 # ---------------------------------------------------------------------------
-# BACK-2374 Part D: get_budget_portfolio (tenant-wide budget-progress read)
+# BACK-3944: get_budget_portfolio group_limit -> groupLimit (1 to 100)
+# ---------------------------------------------------------------------------
+
+class TestBudgetPortfolioGroupLimit:
+    @staticmethod
+    def _empty_portfolio(mock_client):
+        mock_client.get_budget_portfolio = AsyncMock(return_value={"_embedded": {}})
+        mock_client._extract_embedded_data = MagicMock(return_value=[])
+        mock_client._extract_pagination_info = MagicMock(return_value={})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("group_limit, sent", [(1, 1), (100, 100), ("10", 10)])
+    async def test_forwards_group_limit_as_group_limit_param(
+        self, alert_mgmt, mock_client, group_limit, sent
+    ):
+        self._empty_portfolio(mock_client)
+        await alert_mgmt._handle_get_budget_portfolio(mock_client, {"group_limit": group_limit})
+        assert mock_client.get_budget_portfolio.call_args.kwargs["groupLimit"] == sent
+
+    @pytest.mark.asyncio
+    async def test_omits_group_limit_when_unset(self, alert_mgmt, mock_client):
+        self._empty_portfolio(mock_client)
+        await alert_mgmt._handle_get_budget_portfolio(mock_client, {})
+        assert "groupLimit" not in mock_client.get_budget_portfolio.call_args.kwargs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("group_limit", [0, 101, -1, True, 2.5, "ten"])
+    async def test_rejects_group_limit_outside_1_to_100_before_the_call(
+        self, alert_mgmt, mock_client, group_limit
+    ):
+        self._empty_portfolio(mock_client)
+        with pytest.raises(ToolError) as exc_info:
+            await alert_mgmt._handle_get_budget_portfolio(mock_client, {"group_limit": group_limit})
+        assert exc_info.value.field == "group_limit"
+        assert "1 to 100" in exc_info.value.message
+        mock_client.get_budget_portfolio.assert_not_called()
+
+    def test_progress_reads_never_carry_group_limit(self):
+        assert AlertManagement._budget_progress_filters({"group_limit": 5}) == {}
+
+    @pytest.mark.asyncio
+    async def test_group_limit_is_in_the_input_schema(self, alert_mgmt):
+        schema = (await alert_mgmt._get_input_schema())["properties"]["group_limit"]
+        assert (schema["minimum"], schema["maximum"]) == (1, 100)
+
+
+# ---------------------------------------------------------------------------
+# BACK-2374 Part D: get_budget_portfolio (budget-progress read scoped to the resolved team)
 # ---------------------------------------------------------------------------
 
 class TestHandleGetBudgetPortfolio:
@@ -1414,6 +1461,86 @@ class TestHandleGetBudgetPortfolio:
         assert "ON_TRACK" in text
         assert "25" in text  # percentUsed
 
+    @staticmethod
+    def _grouped_entry(**over):
+        # Live dev shape of a groupBy=MODEL budget in the portfolio
+        # (2026-10-07): the totals add every group; the grouped fields are
+        # fractions of the per-group threshold.
+        base = {
+            "alertId": "g1",
+            "name": "Multi-Model Budget",
+            "metricType": "TOTAL_COST",
+            "threshold": 500.0,
+            "currentValue": 460.0,
+            "percentUsed": 0.92,
+            "worstPercentUsed": 0.6,
+            "groupCount": 2,
+            "groupsOverLimit": 0,
+            "risk": "LOW",
+            "groups": [
+                {"groupValue": "gpt-4", "currentValue": 300.0, "percentUsed": 0.6},
+                {"groupValue": "claude-3", "currentValue": 160.0, "percentUsed": 0.32},
+            ],
+        }
+        base.update(over)
+        return base
+
+    async def _render_portfolio(self, alert_mgmt, mock_client, entries):
+        mock_client.get_budget_portfolio = AsyncMock(return_value={"_embedded": {}})
+        mock_client._extract_embedded_data = MagicMock(return_value=entries)
+        mock_client._extract_pagination_info = MagicMock(return_value={})
+        return _text(await alert_mgmt._handle_get_budget_portfolio(mock_client, {}))
+
+    @pytest.mark.asyncio
+    async def test_portfolio_grouped_entry_leads_with_the_highest_group(
+        self, alert_mgmt, mock_client
+    ):
+        """BACK-3944: a grouped budget's totals add every group, so the line
+        names them as sums and shows the highest group, risk and the groups
+        over the threshold, which is what the per-group alert acts on."""
+        text = await self._render_portfolio(alert_mgmt, mock_client, [self._grouped_entry()])
+        line = next(ln for ln in text.splitlines() if "`g1`" in ln)
+        assert "460.0/500.0 summed across groups" in line
+        assert "92% used summed across groups" in line
+        assert "highest group 60% used (the figure the per-group alert uses)" in line
+        assert "risk LOW (from the highest group)" in line
+        assert "0 of 2 groups at or over the threshold" in line
+
+    @pytest.mark.asyncio
+    async def test_portfolio_grouped_entry_over_the_limit(self, alert_mgmt, mock_client):
+        entry = self._grouped_entry(
+            worstPercentUsed=1.2, groupsOverLimit=1, groupCount=3, risk="CRITICAL"
+        )
+        text = await self._render_portfolio(alert_mgmt, mock_client, [entry])
+        assert "highest group 120% used" in text
+        assert "risk CRITICAL" in text
+        assert "1 of 3 groups at or over the threshold" in text
+
+    @pytest.mark.asyncio
+    async def test_portfolio_grouped_entry_with_zero_threshold_omits_the_highest_group(
+        self, alert_mgmt, mock_client
+    ):
+        """worstPercentUsed is null for a zero threshold; it is omitted, never
+        printed as None."""
+        entry = self._grouped_entry(
+            threshold=0.0, percentUsed=None, worstPercentUsed=None, groupsOverLimit=0
+        )
+        text = await self._render_portfolio(alert_mgmt, mock_client, [entry])
+        assert "the figure the per-group alert uses" not in text
+        assert "None" not in text
+        assert "0 of 2 groups at or over the threshold" in text
+
+    @pytest.mark.asyncio
+    async def test_portfolio_ungrouped_entry_renders_as_before(self, alert_mgmt, mock_client):
+        """A null groupCount is an ungrouped budget: no group wording at all."""
+        entry = self._entry(groupCount=None, worstPercentUsed=None, groupsOverLimit=None, risk="LOW")
+        text = await self._render_portfolio(alert_mgmt, mock_client, [entry])
+        line = next(ln for ln in text.splitlines() if "`a1`" in ln)
+        assert line == (
+            "- Monthly Budget (`a1`) · metric TOTAL_COST · 250/1000 · 25% used"
+            " · vs-linear ON_TRACK"
+        )
+
     @pytest.mark.asyncio
     async def test_portfolio_empty_state(self, alert_mgmt, mock_client):
         mock_client.get_budget_portfolio = AsyncMock(return_value={"_embedded": {}})
@@ -1422,6 +1549,8 @@ class TestHandleGetBudgetPortfolio:
         result = await alert_mgmt._handle_get_budget_portfolio(mock_client, {})
         text = _text(result)
         assert "no budget alerts" in text.lower()
+        assert "the team your credentials resolve to" in text
+        assert "tenant" not in text.lower()
 
     @pytest.mark.asyncio
     async def test_portfolio_forwards_pagination_and_filters(self, alert_mgmt, mock_client):
@@ -1618,6 +1747,22 @@ class TestHandleGetBudgetProgress:
         assert "a1" in text
         assert "a2" in text
         assert mock_client.get_budget_progress_bulk.call_args[0][0] == ["a1", "a2"]
+
+    @pytest.mark.asyncio
+    async def test_bulk_grouped_item_has_no_per_group_summary_to_render(
+        self, alert_mgmt, mock_client
+    ):
+        """BACK-3944: bulk items carry groups but not groupCount,
+        worstPercentUsed, groupsOverLimit or risk (preview contract and live
+        dev, 2026-10-07), so a grouped bulk item keeps the plain line."""
+        item = self._progress_bulk(
+            groups=[{"groupValue": "gpt-4", "currentValue": 300.0, "percentUsed": 0.3}]
+        )
+        mock_client.get_budget_progress_bulk = AsyncMock(return_value={"items": [item]})
+        result = await alert_mgmt._handle_get_budget_progress(mock_client, {"anomaly_ids": ["a1"]})
+        text = _text(result)
+        assert "400/1000 · 40% used" in text
+        assert "summed across groups" not in text
 
     @pytest.mark.asyncio
     async def test_bulk_degrades_entry_without_numeric_fields(self, alert_mgmt, mock_client):

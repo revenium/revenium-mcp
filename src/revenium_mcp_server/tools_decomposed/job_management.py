@@ -38,6 +38,17 @@ are rejected). Splits are additionally gated behind the
 server-side, so a client must surface the server's rejection rather than
 pre-normalizing or assuming availability.
 
+Decision (BACK-3938): GET /api/v2/analytics/ai-assistants/engineer-sessions is
+not adopted. It returns one engineer's coding-assistant figures found from one
+to three session ids the caller already holds, so it fails on the second
+BACK-2769 reason above: an MCP model has no reliable source for those ids, and
+no session listing or discovery endpoint exists to look them up. Asking the
+model for them invites a guess, and ids that match nobody return well-formed
+empty figures with HTTP 200, so a wrong id reads as a real person with no
+usage. Indexed under ``decision_exclusions`` in
+.claude/commands/mcp-api-exclusions.yaml. Revisit when the platform adds a
+session listing or discovery endpoint.
+
 Decision (BACK-3091): ADOPTED — this tool exposes ``amend_outcome`` over
 PATCH /v2/api/jobs/{agenticJobId}/outcome, with the platform's optimistic lock
 wired up (``expected_entity_version``) rather than as a bare overwrite.

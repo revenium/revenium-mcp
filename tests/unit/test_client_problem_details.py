@@ -350,7 +350,7 @@ async def test_list_recommendation_feedback_hits_nested_path(monkeypatch):
     await client.list_recommendation_feedback("r1", limit=50, cursor="c2")
 
     assert "/api/v2/insights/runs/r1/feedback" in captured["url"]
-    assert captured["params"] == {"limit": 50, "cursor": "c2"}
+    assert captured["params"] == {"limit": 50, "cursor": "c2", "teamId": client.team_id}
 
 
 @pytest.mark.asyncio
@@ -526,7 +526,7 @@ async def test_trigger_recommendation_run_posts_body_and_idempotency_key(monkeyp
     assert captured["body"]["filterAgent"] == ["agent_a"]
     assert captured["body"]["excludeInvestigatorIds"] == ["x"]
     assert captured["body"]["filterIncludeCodingAssistants"] is True
-    assert captured["body"]["filterIncludeCodingAssistantsForCostDetectors"] is False
+    assert "filterIncludeCodingAssistantsForCostDetectors" not in captured["body"]
     key = captured["headers"].get("Idempotency-Key")
     parsed = _uuid_test.UUID(key)
     assert parsed.version == 4

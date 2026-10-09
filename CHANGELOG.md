@@ -5,6 +5,33 @@ All notable changes to the Revenium MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-10-08
+
+### Added
+- `business_analytics_management`: get_department_costs reports cost, requests and tokens per department for the whole period, with the same period, aggregation and filters as get_user_costs. Each department shows its own figures and, labelled apart, the figures with its sub-departments; spend from people with no department is its own group; a team with no departments, no assignments or no loaded data is told so rather than shown $0. Department ids in the answer are hashids, not the numeric ids list_departments returns
+- `business_analytics_management`: four PR-health reads (get_pr_health_breakdown, get_pr_health_queue, get_pr_health_trend, get_pr_health_follow_through) show where the figures come from per repository, engineer or department, the open pull requests that need a decision grouped by cause, the at-risk and closed-without-merge trend per day, week or month, and whether the pull requests flagged as rotting got fixed; the existing PR-health lists can search by login, filter by cause, repository, ticket and triage state, and list the automation pull requests
+- `business_analytics_management`: get_ai_assistant_team_medians reads the anonymous team medians of Claude Code habits (context per call, cache rebuild ratio, share of requests above default effort); with fewer than five people the platform withholds them and the answer says so
+- `business_analytics_management`: get_seat_utilization reports whether the latest Claude Enterprise sync read the seat census (READ, UNREAD, UNKNOWN); get_coverage_ratio renders an incomplete coding-assistant check as unknown and names each provider's revision window
+- `manage_alerts`: alert authors can look up a provider API key by name or id (search_provider_api_keys) and a provider alert keeps its dataSource on create so it can carry an API_KEY filter; alert reads show whether the alert is firing right now
+- `manage_customers`: the PR-health digest can be read and changed (get_pr_health_digest_settings / update_pr_health_digest_settings): the weekly digest and rotting alert switches, day, hour, timezone, Slack channels and email addresses, sending only the fields named; previewing and test-sending the digest stay in the app
+- `manage_customers`: get_coding_assistant_billing_settings reads which coding assistants a team pays for at real API rates and which pricing modes someone has confirmed; changing them stays in the app
+- `manage_cost_controls`: get_budget_portfolio accepts group_limit and a grouped budget shows the group that will trip its alert; control_data documents notificationEmails, the addresses that receive a control's warn and block notices, including the update rule that an empty list clears them while omitting the field leaves them unchanged
+- `manage_metering`: transaction details render clientSurface and the field analysis counts it
+- `system_diagnostics`: get_ingestion_failures shows each rejection's error code and resolution and can be narrowed with error_code
+
+### Changed
+- `system_diagnostics`: set_usage_billing says what switching usage billing off does on the platform now: besides hiding the billing screens it stops rating the tenant's usage, and usage that arrives while it is off is never rated later; get_usage_billing is described the same way
+- Analytics, AI Insights, jobs ROI, PR-health, merged-PR and budget-portfolio reads send the team the session resolved, so a user who belongs to several teams no longer gets the figures of a different team
+- Upstream contract snapshots and generated models refreshed through 2026-10-08
+
+### Fixed
+- `business_analytics_management`: get_user_costs and get_department_costs ask for every cost source (coding_assistant, revenium_metered, provider_billing) when the caller passes none. The two-source default answered an empty report on tenants whose spend is coding-assistant usage reported under coding_assistant; which source carries a tenant's spend is tenant-dependent, so the notes no longer claim that any one source returns no rows. An explicit filters.costSources subset is still sent as given
+- `business_analytics_management`: hosted connectors return cost per user (get_user_costs) instead of answering that the report needs the new analytics API, and get_capabilities lists the action again
+- `business_analytics_management`: a get_department_costs page past the last one is told apart from an empty report, and MEAN, MAXIMUM and MINIMUM keep fractional request and token figures
+- `manage_ai_insights`: trigger_run no longer offers or sends filter_include_coding_assistants_for_cost_detectors, which the platform ignores (the cost checks follow the team's coding-assistant pricing policy); passed as a top-level argument it is rejected with an unknown-argument error. filter_include_coding_assistants is unchanged
+- `manage_cost_controls`: enforcement-event rows are described with their tier (the line the event crossed), and level is no longer called the tier that fired, which was wrong when a non-blocking rule crosses its cap
+- `manage_alerts`: an exhausted provider-key search page points back at the pages that hold the matches
+
 ## [0.7.1] - 2026-09-28
 
 ### Changed
@@ -373,6 +400,7 @@ No functional changes. Changelog formatting update only.
 [0.2.0]: https://github.com/revenium/revenium-mcp/compare/v0.1.27...v0.2.0
 [0.1.27]: https://github.com/revenium/revenium-mcp/releases/tag/v0.1.27
 
+[0.8.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.8.0
 [0.7.1]: https://github.com/revenium/revenium-mcp/releases/tag/v0.7.1
 [0.7.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.7.0
 [0.6.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.6.0

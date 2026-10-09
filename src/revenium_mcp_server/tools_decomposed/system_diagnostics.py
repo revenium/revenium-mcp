@@ -174,8 +174,8 @@ Unified system diagnostics combining configuration analysis, auto-discovery debu
 - `get_ingestion_failures` - List strict-ingestion rejections (error_code filter, pagination)
 - `set_strict_ingestion_mode` - Toggle strict mode (requires confirm=true; preview otherwise). Optional `allow_ticket_jobs` keeps ticket-grain Job creation on under strict mode; omit it to leave the tenant's current setting unchanged, and note that disabling strict mode clears the opt-in
 - `set_attribution_detail_text` - Turn the tenant's free-text attribution detail on or off (`enabled`, no confirm). While off (the platform default) a coding-assistant session attribution carrying a free-text reason still records, but the text is stored as null and never returned. The flag has no published read-only endpoint: the tenant toggle responses are the only places the platform reports it
-- `set_usage_billing` - Show or hide the tenant's billing screens (`enabled`, requires confirm=true; preview otherwise). Presentation only: invoices, payment methods, plan and subscription screens appear or disappear while metering, rating and invoicing keep running and no stored amount changes. Default is on. Requires a platform admin or the tenant's own tenant admin - an organization admin key passes the other tenant toggles but not this one
-- `get_usage_billing` - Read the billing-screen flag without a write (tenant stub of `GET /v2/api/users/me`), with the roles on the key's user
+- `set_usage_billing` - Switch usage-based billing on or off for the tenant (`enabled`, requires confirm=true; preview otherwise). Off hides the billing screens and stops rating the tenant's usage (no usage line items for AI product usage, platform usage or /v2/events; AI metrics are still recorded). Usage that arrives while off is never rated later. Default is on. Requires a platform admin or the tenant's own tenant admin - an organization admin key passes the other tenant toggles but not this one
+- `get_usage_billing` - Read the usage-billing flag without a write (tenant stub of `GET /v2/api/users/me`), with the roles on the key's user
 
 ### Meta Actions
 - `get_capabilities` - Show this capabilities overview
@@ -274,7 +274,7 @@ Applies immediately (no confirm): it rejects nothing and deletes nothing. While 
 ```json
 {"action": "set_usage_billing", "enabled": false, "confirm": true}
 ```
-Presentation only: it decides whether the tenant's users can reach invoices, payment methods, plan and subscription screens. Metering, rating and invoicing keep running either way and no stored amount changes. It lands on every user of the tenant at once, so without `confirm: true` the call returns a consequences preview and changes nothing. Only a platform admin or the tenant's own tenant admin may apply it; an organization admin key passes the other two toggles but is refused here.
+It decides whether the tenant's users can reach invoices, payment methods, plan and subscription screens, and whether the platform rates the tenant's usage. While it is off, AI product usage, platform usage and /v2/events produce no usage line items and are never rated later, even after it is turned back on; AI metrics are still recorded. It lands on every user of the tenant at once, so without `confirm: true` the call returns a consequences preview and changes nothing. Only a platform admin or the tenant's own tenant admin may apply it; an organization admin key passes the other two toggles but is refused here.
 
 ```json
 {"action": "get_usage_billing"}

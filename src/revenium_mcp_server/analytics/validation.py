@@ -16,6 +16,18 @@ from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
+# Every cost source the per-user and per-department reads accept. The endpoint's
+# own default is coding_assistant alone. Coding-assistant usage the team pays
+# for at real API rates (apiRateProviders) is real spend under revenium_metered
+# or provider_billing; usage of every other assistant is an API-equivalent
+# estimate that, where the platform exposes it to analytics, is reported only
+# under coding_assistant (prod does, dev did not on 2026-10-09). A prod tenant on Claude
+# Enterprise seats therefore had everything under coding_assistant and nothing
+# under the other two (BACK-4136, 2026-10-08), while a team that pays at API
+# rates has it the other way round. Asking for all three never answers an
+# empty report because the SDK guessed the wrong source.
+DEFAULT_USER_COST_SOURCES = ("coding_assistant", "revenium_metered", "provider_billing")
+
 
 class SupportedPeriod(Enum):
     """API-verified time periods that work reliably."""
@@ -432,6 +444,22 @@ class AnalyticsValidator:
         Raises:
             ValidationError: If parameters are invalid
         """
+        return self._validate_person_attributed_cost_params(params, context="user costs")
+
+    def validate_department_costs_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate parameters for get_department_costs.
+
+        The department report takes the same filters as the user report, so the
+        two share one validation.
+
+        Raises:
+            ValidationError: If parameters are invalid
+        """
+        return self._validate_person_attributed_cost_params(params, context="department costs")
+
+    def _validate_person_attributed_cost_params(
+        self, params: Dict[str, Any], context: str
+    ) -> Dict[str, Any]:
         # Extract filters before base validation (which has a different allowlist)
         raw_filters = params.get("filters") or {}
         base_params = {k: v for k, v in params.items() if k != "filters"}
@@ -442,16 +470,15 @@ class AnalyticsValidator:
             "aggregation": analytics_params.aggregation,
         }
 
-        # Validate user-costs-specific filters (agents, providers, models, users)
         if raw_filters:
             validated["filters"] = self._validate_array_filters(
                 raw_filters,
                 allowed_keys=self._USER_COSTS_FILTER_KEYS,
                 valid_cost_sources=self._VALID_COST_SOURCES,
-                context="user costs",
+                context=context,
             )
 
-        logger.debug("Validated user costs params: period=%s", validated["period"])
+        logger.debug("Validated %s params: period=%s", context, validated["period"])
         return validated
 
     def validate_cost_summary_params(self, params: Dict[str, Any]) -> Dict[str, Any]:

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Union, cast
 
 from ..auth import AuthenticationError
+from ..endpoint_registry import NewApiRequiredError
 from .formatters.base_formatter import BaseFormattingUtilities
 from .response_formatter import ResponseFormatter
 from .simple_cost_analyzer import SimpleCostAnalyzer
@@ -82,6 +83,10 @@ class AnalyticsProcessor(ABC):
         except AuthenticationError:
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # Each tool handler that catches Exception below must also re-raise this.
+            raise
+        except NewApiRequiredError:
+            # A deployment-configuration refusal, not an analysis failure: the tool
+            # handler words it so a caller does not read it as a tenant limitation.
             raise
         except Exception as e:
             return self._handle_general_error_with_logging(e, params.operation_type)
@@ -354,7 +359,6 @@ class UserCostsProcessor(AnalyticsProcessor):
                 "Check that the time period is valid (HOUR, SEVEN_DAYS, THIRTY_DAYS, etc.)",
                 "Verify that aggregation is valid (TOTAL, MEAN, MAXIMUM, MINIMUM)",
                 "Ensure there is data available for the specified period",
-                "This endpoint requires the new analytics API (cost-by-user)",
             ],
         )
 

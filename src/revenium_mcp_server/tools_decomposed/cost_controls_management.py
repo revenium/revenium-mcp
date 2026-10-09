@@ -55,6 +55,17 @@ from .unified_tool_base import ToolBase
 # supply to define a guardrail are validated at the boundary.
 _CREATE_REQUIRED_FIELDS = ("name", "metricType", "hardLimit", "windowType", "action")
 
+NOTIFICATION_EMAILS_MAX = 10
+
+# An agent told only "a list of emails" may send [] to mean "no change" and
+# wipe the recipients, so the PATCH rule is spelled the way the platform spec
+# spells it.
+NOTIFICATION_EMAILS_PATCH_NOTE = (
+    "On update: passing an empty list clears the addresses; passing a "
+    "non-empty list replaces them; omitting the field or passing JSON null leaves "
+    "them unchanged."
+)
+
 # snake_case filter name -> camelCase query parameter, bounded to what the
 # endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
 # CostControlController.list: @RequestParam query / teamId / type plus a
@@ -111,13 +122,18 @@ ENFORCEMENT_LEVEL_MODE_NOTE = (
 )
 
 ENFORCEMENT_EVENT_ROW_FIELDS_NOTE = (
-    "Event rows reach the caller unmodified and carry level (which tier fired), "
-    "isShadow (whether the rule was only evaluating), groupBy and groupValue "
-    "(the dimension and the affected person or object) with groupLabel as its "
-    "display name, transactionId (the request that tripped the rule), ruleId and "
-    "ruleDeleted (the rule fired but has since been removed), plus outcome and "
-    "subscriberEmail. Every one of those except groupLabel, ruleDeleted, outcome "
-    "and subscriberEmail is also a filter on this action."
+    "Event rows reach the caller unmodified and carry tier (the line the event "
+    "crossed: HARD for the cap, WARN for the warning line), level (HARD for a "
+    "cap breach, or a would-be breach in shadow mode; WARN when nothing was "
+    "blocked), isShadow (whether the rule was only evaluating), groupBy and "
+    "groupValue (the dimension and the affected person or object) with "
+    "groupLabel as its display name, transactionId (the request that tripped "
+    "the rule), ruleId and ruleDeleted (the rule fired but has since been "
+    "removed), plus outcome and subscriberEmail. tier and level differ only "
+    "when a non-blocking rule crosses its cap: tier is HARD, but level stays "
+    "WARN because nothing was blocked. Every one of those except tier, "
+    "groupLabel, ruleDeleted, outcome and subscriberEmail is also a filter on "
+    "this action."
 )
 
 # The three sub-reads answer with a single object and no page: summary is one
@@ -1014,6 +1030,18 @@ class CostControlsManagement(ToolBase):
                             "type": "array",
                             "description": "Optional notification channel IDs alerted when the control fires",
                         },
+                        "notificationEmails": {
+                            "type": ["array", "null"],
+                            "items": {"type": "string", "format": "email"},
+                            "maxItems": NOTIFICATION_EMAILS_MAX,
+                            "description": (
+                                "Optional email addresses that receive the control's warn and "
+                                f"block notices, at most {NOTIFICATION_EMAILS_MAX}. Addresses are "
+                                "trimmed and lowercased, and duplicates collapse. A shadow-mode "
+                                "control emails a preview. "
+                                + NOTIFICATION_EMAILS_PATCH_NOTE
+                            ),
+                        },
                     },
                 },
                 "parent_department_id": {
@@ -1218,12 +1246,15 @@ class CostControlsManagement(ToolBase):
                         "control_data": (
                             "dict (required: name, metricType, hardLimit, windowType, action; "
                             "optional: description, warnThreshold, shadowMode, enabled, groupBy, "
-                            "filters, notificationChannelIds)"
+                            "filters, notificationChannelIds, notificationEmails)"
                         )
                     },
                     "update": {
                         "control_id": "str",
-                        "control_data": "dict (partial — PATCH sends the given fields as-is)",
+                        "control_data": (
+                            "dict (partial — PATCH sends the given fields as-is). "
+                            "notificationEmails: " + NOTIFICATION_EMAILS_PATCH_NOTE
+                        ),
                     },
                     "delete": {"control_id": "str"},
                 },

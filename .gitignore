@@ -191,3 +191,5 @@ docs/*credentials*
 # (BACK-2524) via /mcp-api-drift-local — regenerated on demand, never tracked.
 .claude/commands/mcp-api-drift.md
 .claude/commands/mcp-api-drift/
+
+.scratch/

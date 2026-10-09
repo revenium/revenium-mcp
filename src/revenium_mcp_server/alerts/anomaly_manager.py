@@ -47,6 +47,30 @@ def format_filter_row(filter_item: Dict[str, Any]) -> str:
     return f"{dimension} {operator} '{filter_item.get('value', 'N/A')}'"
 
 
+FIRING_STATE_LABELS = {
+    "FIRING": "Firing",
+    "NOT_FIRING": "Not firing",
+    "UNKNOWN": "Unknown (could not be read just now)",
+}
+
+
+def format_status(anomaly: Dict[str, Any]) -> str:
+    """Render the enabled status, with the ``firingState`` the platform reports.
+
+    A disabled rule can keep its last firing state, so for one that is
+    disabled the state is labelled as the last one rather than the current.
+    """
+    enabled = anomaly.get("enabled", True)
+    status = "Enabled" if enabled else "Disabled"
+    firing_state = anomaly.get("firingState")
+    if firing_state is None:
+        return status
+    label = FIRING_STATE_LABELS.get(firing_state, str(firing_state))
+    if enabled:
+        return f"{status}; firing state: {label}"
+    return f"{status}; last firing state: {label}"
+
+
 class AnomalyManager:
     """Manages AI anomaly CRUD operations and related functionality."""
 
@@ -198,7 +222,7 @@ class AnomalyManager:
         # Format the response
         anomaly_list = []
         for anomaly in anomalies:
-            enabled_status = "Enabled" if anomaly.get("enabled", True) else "Disabled"
+            status = format_status(anomaly)
 
             # Generate notification summary
             notification_summary = self._format_notification_summary(anomaly)
@@ -227,7 +251,7 @@ class AnomalyManager:
                 f"  • ID: `{anomaly.get('id', 'N/A')}`\n"
                 f"  • Type: {anomaly.get('alertType', 'N/A')}\n"
                 f"  • Metric: {anomaly.get('metricType', 'N/A')}\n"
-                f"  • {enabled_status}\n"
+                f"  • {status}\n"
                 f"  • Threshold: {anomaly.get('threshold', 'N/A')}\n"
                 f"  • Created: {(anomaly.get('createdAt') or anomaly.get('created', 'N/A'))[:10] if (anomaly.get('createdAt') or anomaly.get('created')) else 'N/A'}"
                 f"{filter_summary}"
@@ -324,7 +348,7 @@ class AnomalyManager:
             f"**AI Anomaly Details**\n\n"
             f"**Name:** {anomaly.get('name', 'Unnamed')}\n"
             f"**ID:** `{anomaly.get('id', 'N/A')}`\n"
-            f"**Status:** {anomaly.get('enabled', True) and 'Enabled' or 'Disabled'}\n"
+            f"**Status:** {format_status(anomaly)}\n"
             f"**State:** {enabled_status}\n"
             f"**Description:** {anomaly.get('description', 'No description')}\n"
             f"**Created:** {anomaly.get('createdAt', anomaly.get('created', 'N/A'))}\n"
@@ -461,7 +485,7 @@ class AnomalyManager:
         self._process_advanced_configuration(anomaly_data, validated_data)
 
         # Copy other basic fields with validation
-        for field in ["status", "enabled", "team_id", "notification_settings", "metadata"]:
+        for field in ["status", "enabled", "team_id", "notification_settings", "metadata", "dataSource"]:
             if field in anomaly_data:
                 if field == "team_id" and not anomaly_data[field]:
                     raise ValidationError(
@@ -1222,6 +1246,9 @@ class AnomalyManager:
             # is coherent; these entries decide whether it reaches the platform at all.
             "minSampleCount": "passthrough",
             "groupBy": "passthrough",
+            # Dropping it stored every alert as SDK, where an API_KEY or WORKSPACE row
+            # is accepted and then cannot be evaluated (BACK-3942).
+            "dataSource": "passthrough",
         }
 
         for field, field_type in optional_fields.items():

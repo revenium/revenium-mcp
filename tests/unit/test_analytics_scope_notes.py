@@ -130,7 +130,7 @@ class TestScopeNoteFollowsThePlane:
         note = BaseFormattingUtilities.coding_assistant_scope_note(
             "cost_metric_by_provider_over_time"
         )
-        assert "`coding_assistant`) is NOT counted" in note
+        assert "is reported only under the `coding_assistant` cost source" in note
         assert "revenium_metered" in note
         assert "get_transaction_count" in note
 
@@ -224,7 +224,8 @@ class TestCapabilityTextIsConsistent:
         monkeypatch.setenv("REVENIUM_USE_NEW_ANALYTICS_API", "true")
         tool = _analytics_tool()
         text = (await tool._handle_get_capabilities())[0].text
-        assert "NOT a per-employee coding-assistant report" in text
+        assert "authoritative per-employee coding-assistant report" in text
+        assert "returns no rows" not in text
 
     def test_stripping_user_costs_section_survives_rewording(self):
         capabilities = (
@@ -278,4 +279,4 @@ class TestCostSummaryCarriesTheScopeNote:
 
         monkeypatch.setenv("REVENIUM_USE_NEW_ANALYTICS_API", "true")
         result = CostSummaryFormatter().format(self._summary_data(), PARAMS)
-        assert "cost source `coding_assistant`) is NOT counted" in result
+        assert "is reported only under the `coding_assistant` cost source" in result

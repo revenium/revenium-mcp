@@ -696,6 +696,7 @@ _SESSION_TRACKING_LABELS: Tuple[Tuple[str, str], ...] = (
     ("parentTransactionId", "Parent Transaction ID"),
     ("operationType", "Operation Type"),
     ("operationSubtype", "Operation Subtype"),
+    ("clientSurface", "Client Surface"),
     ("agenticJobId", "Agentic Job ID"),
     ("agenticJobName", "Agentic Job Name"),
     ("agenticJobType", "Agentic Job Type"),
@@ -787,6 +788,7 @@ _COMPLETIONS_REPORTED_FIELDS: Tuple[str, ...] = (
     "traceId",
     "traceType",
     "traceName",
+    "clientSurface",
     "responseQualityScore",
     "skillName",
     "skillSource",
@@ -5473,10 +5475,13 @@ record, not the summary.
 `return_transaction_data="full"` (or `true`) renders a **Session Tracking** section
 carrying every trace, operation and job identifier the transaction holds:
 `traceId`, `traceType`, `traceName`, `parentTransactionId`, `operationType`,
-`operationSubtype`, `agenticJobId`, `agenticJobName`, `agenticJobType`,
-`agenticJobVersion` and `ticketId`. A field the transaction does not
-carry is omitted rather than shown as 0 or N/A. `traceType` also appears in the
-summary rendering whenever the transaction carries one.
+`operationSubtype`, `clientSurface`, `agenticJobId`, `agenticJobName`,
+`agenticJobType`, `agenticJobVersion` and `ticketId`. `clientSurface` names the
+first-party app that sent a coding-assistant call (`claude-code` for the
+terminal CLI, `claude-code-desktop` for the desktop app). A field the
+transaction does not carry is omitted rather than shown as 0 or N/A.
+`traceType` also appears in the summary rendering whenever the transaction
+carries one.
 
 ### **Prompt Context (full detail only)**
 `return_transaction_data="full"` (or `true`) renders a **Prompt Context** section
@@ -5524,7 +5529,7 @@ lookup_transactions(transaction_ids=["tx_abc123"], max_retries=5)
 - `return_transaction_data` (string|boolean) - Transaction data detail level:
   - "no": Show only verification status (✅ Found/❌ Not Found) - default
   - "summary": Show core fields (Model, Provider, Input/Output Tokens, plus Trace Type when the transaction carries one)
-  - "full": Show comprehensive details including metadata, costs, attribution, cache tokens, session tracking (traceId, traceType, traceName, parentTransactionId, operationType, operationSubtype, agenticJobId, agenticJobName, agenticJobType, agenticJobVersion, ticketId) and prompt context (promptId, promptLength, querySource, speed, subagentType)
+  - "full": Show comprehensive details including metadata, costs, attribution, cache tokens, session tracking (traceId, traceType, traceName, parentTransactionId, operationType, operationSubtype, clientSurface, agenticJobId, agenticJobName, agenticJobType, agenticJobVersion, ticketId) and prompt context (promptId, promptLength, querySource, speed, subagentType)
   - Boolean support: true="full", false="no"
 - `wait_seconds` (integer) - Wait time for transaction verification (0-300):
   - Default: 30 seconds

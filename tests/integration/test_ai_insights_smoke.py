@@ -7,12 +7,12 @@ have AI_RECOMMENDATIONS flag enabled.
 """
 from __future__ import annotations
 
-import os
-
 import pytest
 
+from tests.conftest import live_network_opted_in
+
 pytestmark = pytest.mark.skipif(
-    not os.getenv("REVENIUM_INTEGRATION_TESTS"),
+    not live_network_opted_in(),
     reason="REVENIUM_INTEGRATION_TESTS not set",
 )
 

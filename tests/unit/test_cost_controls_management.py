@@ -18,6 +18,7 @@ from src.revenium_mcp_server.tools_decomposed.cost_controls_management import (
     ENFORCEMENT_ROSTER_NOTE,
     ENFORCEMENT_SUBREADS_UNPAGED_NOTE,
     DEPARTMENT_ENFORCEMENT_MAPS_NOTE,
+    NOTIFICATION_EMAILS_PATCH_NOTE,
     CostControlsManager,
     CostControlsManagement,
     _build_enforcement_event_filters,
@@ -268,6 +269,22 @@ class TestCostControlsManagerUpdate:
         sent = mock_client.update_cost_control.call_args[0][1]
         assert sent == {"hardLimit": 2000}
 
+    @pytest.mark.asyncio
+    async def test_update_sends_an_empty_notification_email_list_intact(
+        self, cc_manager, mock_client
+    ):
+        """An empty list is how a caller clears the recipients, so it must not
+        be dropped as falsy or treated as "no change" on the way out."""
+        mock_client.update_cost_control.return_value = {"id": "cc_1"}
+
+        await cc_manager.update_cost_control(
+            {"control_id": "cc_1", "control_data": {"notificationEmails": []}}
+        )
+
+        mock_client.update_cost_control.assert_awaited_once_with(
+            "cc_1", {"notificationEmails": []}
+        )
+
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", [403, 404])
@@ -294,6 +311,45 @@ class TestCostControlsManagerUpdate:
             await cc_manager.update_cost_control(
                 {"control_id": "cc_1", "control_data": {"hardLimit": -1}}
             )
+
+class TestNotificationEmailsDocumentation:
+    """notificationEmails is discoverable on control_data with its PATCH rule."""
+
+    @pytest.mark.asyncio
+    async def test_control_data_declares_notification_emails(self, cc_mgmt):
+        schema = await cc_mgmt._get_input_schema()
+        prop = schema["properties"]["control_data"]["properties"]["notificationEmails"]
+        assert "array" in prop["type"]
+        assert prop["items"]["type"] == "string"
+        assert prop["maxItems"] == 10
+
+    def test_the_patch_rule_states_clear_replace_and_unchanged(self):
+        for phrase in (
+            "empty list clears the addresses",
+            "non-empty list replaces them",
+            "omitting the field or passing JSON null leaves them unchanged",
+        ):
+            assert phrase in NOTIFICATION_EMAILS_PATCH_NOTE, phrase
+
+    @pytest.mark.asyncio
+    async def test_the_schema_and_update_text_carry_the_patch_rule(self, cc_mgmt):
+        schema = await cc_mgmt._get_input_schema()
+        prop = schema["properties"]["control_data"]["properties"]["notificationEmails"]
+        assert NOTIFICATION_EMAILS_PATCH_NOTE in prop["description"]
+
+        caps = await cc_mgmt._get_tool_capabilities()
+        crud = next(c for c in caps if "update" in c.parameters)
+        assert NOTIFICATION_EMAILS_PATCH_NOTE in crud.parameters["update"]["control_data"]
+        assert "notificationEmails" in crud.parameters["create"]["control_data"]
+
+    @pytest.mark.asyncio
+    async def test_no_top_level_notification_emails_argument(self, cc_mgmt):
+        """control_data already carries the field; a second spelling would
+        need merge rules the platform does not define."""
+        schema = await cc_mgmt._get_input_schema()
+        assert "notification_emails" not in schema["properties"]
+        assert "notificationEmails" not in schema["properties"]
+
 
 class TestCostControlsManagerDelete:
     """Test CostControlsManager.delete_cost_control behavior."""
@@ -349,6 +405,31 @@ class TestCostControlsManagerEnforcementEvents:
             page=0, size=20, since="2026-01-01", ruleId="cc_1"
         )
         assert result["total_found"] == 1
+
+    @pytest.mark.asyncio
+    async def test_events_with_a_legacy_action_pass_through_unchanged(self, cc_manager, mock_client):
+        """A legacy action value the published enum no longer lists still renders.
+
+        The platform's enforcement-event contract restricts ``action`` to the
+        accepted values but says a rule saved under a since-retired action can
+        still report it (hypercurrent BACK-2997; contradiction tracked in
+        BACK-3107). The MCP must never validate events against that enum: it
+        renders what the platform sent, so an old rule's events stay readable.
+        """
+        legacy_event = {"id": "ev_legacy", "action": "THROTTLE", "ruleName": "Old cap"}
+        current_event = {"id": "ev_now", "action": "BLOCK", "ruleName": "New cap"}
+        mock_client._extract_embedded_data.return_value = [legacy_event, current_event]
+        mock_client._extract_pagination_info.return_value = {"totalPages": 1, "totalElements": 2}
+        mock_client.get_enforcement_events.return_value = {"_embedded": {}}
+
+        result = await cc_manager.list_enforcement_events({})
+
+        assert result["enforcement_events"] == [
+            {"id": "ev_legacy", "action": "THROTTLE", "ruleName": "Old cap"},
+            {"id": "ev_now", "action": "BLOCK", "ruleName": "New cap"},
+        ]
+        assert result["enforcement_events"][0]["action"] == "THROTTLE"
+        assert result["total_found"] == 2
 
 
 class TestCostControlsManagerEnforcementRules:
@@ -1705,10 +1786,40 @@ class TestEnforcementEventDocumentationSurface:
         caps = await cc_mgmt._get_tool_capabilities()
         enforcement = next(c for c in caps if "get_enforcement_rules" in c.parameters)
         for field in (
-            "level", "isShadow", "groupBy", "groupValue", "groupLabel",
+            "tier", "level", "isShadow", "groupBy", "groupValue", "groupLabel",
             "transactionId", "ruleId", "ruleDeleted",
         ):
             assert field in enforcement.description, field
+
+    def test_tier_is_named_as_the_line_the_event_crossed(self):
+        assert "which tier fired" not in ENFORCEMENT_EVENT_ROW_FIELDS_NOTE
+        assert (
+            "tier (the line the event crossed: HARD for the cap, WARN for the "
+            "warning line)"
+        ) in ENFORCEMENT_EVENT_ROW_FIELDS_NOTE
+
+    def test_level_stays_warn_when_a_non_blocking_rule_crosses_its_cap(self):
+        """The case the old wording got wrong: level is not the tier that
+        fired, because a non-blocking cap crossing blocks nothing."""
+        assert (
+            "when a non-blocking rule crosses its cap: tier is HARD, but level "
+            "stays WARN because nothing was blocked"
+        ) in ENFORCEMENT_EVENT_ROW_FIELDS_NOTE
+
+    @pytest.mark.asyncio
+    async def test_tier_is_listed_as_a_row_field_not_a_filter(self, cc_mgmt):
+        """The list endpoint has no tier query parameter."""
+        assert "except tier," in ENFORCEMENT_EVENT_ROW_FIELDS_NOTE
+        schema = await cc_mgmt._get_input_schema()
+        assert "tier" not in schema["properties"]
+
+    @pytest.mark.asyncio
+    async def test_get_capabilities_publishes_the_tier_wording(self, cc_mgmt):
+        result = await cc_mgmt.handle_action("get_capabilities", {})
+        text = result[0].text
+        assert "tier (the line the event crossed" in text
+        assert "level stays WARN because nothing was blocked" in text
+        assert "which tier fired" not in text
 
     @pytest.mark.asyncio
     async def test_the_row_field_note_is_stated_once(self, cc_mgmt):

@@ -215,16 +215,30 @@ _ENDPOINT_REGISTRY: Dict[str, EndpointConfig] = {
     ),
     # ── User cost endpoint (new-API only — no legacy equivalent) ────────
     # New: /api/v2/analytics/cost-by-user-aggregated  (FRONT-931 — aggregated)
+    # force_new: hosted deployments do not set REVENIUM_USE_NEW_ANALYTICS_API,
+    # and there is no old-API fallback for this metric.
     "cost_metric_by_user_aggregated": EndpointConfig(
-        old_path="/api/v2/analytics/cost-by-user-aggregated",  # placeholder; guarded by mapping_status="NEW_API_ONLY"
+        old_path="/api/v2/analytics/cost-by-user-aggregated",  # placeholder; never used (force_new)
         new_path="/api/v2/analytics/cost-by-user-aggregated",
         mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
+    # New: /api/v2/analytics/cost-by-department-aggregated  (BACK-3979)
+    # Same filters as cost-by-user-aggregated, grouped by the department each
+    # call's person was in at the time. The time series sibling
+    # /api/v2/analytics/cost-by-department is deliberately not routed: see the
+    # Decision (BACK-3979) block in business_analytics_management.py.
+    "cost_metric_by_department_aggregated": EndpointConfig(
+        old_path="/api/v2/analytics/cost-by-department-aggregated",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/cost-by-department-aggregated",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
     ),
     # ── Aggregate transaction count (new-API only — no legacy equivalent) ──
     # New: /api/v2/analytics/transaction-count-by-team
-    # Single team-scoped total; teamId resolved server-side from the API-key
-    # auth context, so only startDate/endDate are sent. The response's metric
-    # links are intentionally empty (no drill-down/timeseries sibling).
+    # Single team-scoped total for the teamId resolve_analytics_request sends
+    # alongside startDate/endDate. The response's metric links are intentionally
+    # empty (no drill-down/timeseries sibling).
     # force_new: hosted deployments do not set REVENIUM_USE_NEW_ANALYTICS_API,
     # and there is no old-API fallback for this metric.
     "transaction_count_by_team": EndpointConfig(
@@ -385,6 +399,20 @@ def _should_use_new_path(config: "EndpointConfig") -> bool:
     return config.force_new or _use_new_api()
 
 
+def _is_refused_without_new_api(config: "EndpointConfig") -> bool:
+    """True when a NEW_API_ONLY endpoint cannot be routed in this deployment."""
+    return config.mapping_status == "NEW_API_ONLY" and not _should_use_new_path(config)
+
+
+def requires_new_api_flag(key: str) -> bool:
+    """True when ``resolve_analytics_request`` would refuse ``key`` with ``NewApiRequiredError``.
+
+    Lets a tool stop advertising an action its endpoint cannot serve, using the
+    same rule the resolver enforces instead of a second copy of it.
+    """
+    return _is_refused_without_new_api(_ENDPOINT_REGISTRY[key])
+
+
 def paired_app_base_url(
     platform_base_url: Optional[str],
     known_hosts: Optional[Dict[str, str]] = None,
@@ -521,6 +549,9 @@ def resolve_analytics_request(
       - path is the new endpoint path on app.revenium.ai
       - params use startDate/endDate ISO 8601 (period converted automatically)
       - extra_new_params (if provided) are merged in (e.g. tokenType)
+      - team_id, when set, is sent as teamId; without it the analytics host
+        answers for a user token's default team, which can differ from the
+        team the session resolved
       - call_kwargs contains ``base_url`` and ``use_bearer=True``
 
     When using the old API (flag disabled or endpoint not yet mapped):
@@ -531,7 +562,9 @@ def resolve_analytics_request(
 
     Args:
         key: Registry key (e.g. 'cost_metric_by_provider')
-        team_id: Team identifier — used for old API calls only
+        team_id: The team the session resolved (``client.team_id``), never a
+            caller-typed id: an API key naming any other team is refused with 403.
+            Sent as teamId on both paths; omitted from new-API calls when empty.
         period: Period string (e.g. 'SEVEN_DAYS') — converted to ISO 8601 dates
             for new API calls
         extra_old_params: Additional params merged into old-API calls only
@@ -547,13 +580,10 @@ def resolve_analytics_request(
     """
     config = get_endpoint_config(key)
 
-    if (
-        config.mapping_status == "NEW_API_ONLY"
-        and not _use_new_api()
-        and not config.force_new
-    ):
+    if _is_refused_without_new_api(config):
         raise NewApiRequiredError(
-            f"Endpoint {key!r} is new-API only; set REVENIUM_USE_NEW_ANALYTICS_API=true to use it."
+            f"Endpoint {key!r} is new-API only and this server deployment does not route"
+            " to the analytics API; set REVENIUM_USE_NEW_ANALYTICS_API=true on the server."
         )
 
     if _should_use_new_path(config):
@@ -577,6 +607,8 @@ def resolve_analytics_request(
         new_params: Dict[str, Any] = {"startDate": start_date, "endDate": end_date}
         if extra_new_params:
             new_params.update(extra_new_params)
+        if team_id:
+            new_params["teamId"] = team_id
         return (
             config.new_path,
             new_params,

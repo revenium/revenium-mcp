@@ -57,6 +57,22 @@ class PrHealthSettingsPayload(TypedDict, total=False):
     excludedRepos: List[str]
 
 
+class PrHealthDigestSettingsPayload(TypedDict, total=False):
+    """PUT body for a team's PR-health digest settings, under the API's wire names.
+
+    Every field is optional: the server leaves an absent or null field unchanged,
+    a list replaces the stored one and an empty list clears it.
+    """
+
+    enabled: bool
+    rottingAlertEnabled: bool
+    dayOfWeek: str
+    hourOfDay: int
+    timezone: str
+    slackConfigurationIds: List[str]
+    emailAddresses: List[str]
+
+
 def _new_idempotency_key() -> str:
     """Return a fresh UUID4 string for use as an Idempotency-Key header.
 
@@ -732,6 +748,43 @@ class ReveniumClient:
         params.update(self.auth_config.get_team_and_tenant_query_params())
         return params
 
+    def _resolved_team_param(self) -> Dict[str, str]:
+        """``{"teamId": <resolved team>}`` when the session resolved a team, else ``{}``.
+
+        For reads whose ``teamId`` is optional and whose default is not the
+        resolved team: the analytics host otherwise answers for a user's default
+        team, the PR-health reads for the first organization the user belongs to,
+        and the budget portfolio for every team the caller can read. Only the
+        resolved team is ever sent, never a caller-typed id: naming a team the
+        credential cannot read is refused with 403.
+        """
+        team_id = self.team_id
+        return {"teamId": team_id} if team_id else {}
+
+    @staticmethod
+    def _team_scope_refusal(
+        response: httpx.Response, params: Optional[Dict[str, Any]], use_bearer: bool
+    ) -> Optional[ReveniumAPIError]:
+        """The structured refusal for an analytics-host 403 caused by the ``teamId`` sent.
+
+        A 403 whose body names another cause (``AI_RECOMMENDATIONS_DISABLED``,
+        for one) keeps its own meaning, so only a body naming no code or the
+        team-membership code is translated.
+        """
+        team_id = (params or {}).get("teamId")
+        if not (use_bearer and team_id and response.status_code == 403):
+            return None
+        from .common.team_scope_error import TEAM_NOT_IN_MEMBERSHIP, TeamScopeForbiddenError
+
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        payload = body if isinstance(body, dict) else {}
+        if payload.get("code") not in (None, TEAM_NOT_IN_MEMBERSHIP):
+            return None
+        return TeamScopeForbiddenError(str(team_id), response_data=payload or None)
+
     async def _request(
         self,
         method: str,
@@ -823,6 +876,10 @@ class ReveniumClient:
 
                 # Check for HTTP errors
                 if response.status_code >= 400:
+                    team_scope_refusal = self._team_scope_refusal(response, params, use_bearer)
+                    if team_scope_refusal is not None:
+                        raise team_scope_refusal
+
                     # RFC 7807 problem-details path. AI Insights endpoints (and any future
                     # endpoint adopting this format) carry a structured `code` field that
                     # callers need for UX mapping. Detect Content-Type and short-circuit
@@ -2067,13 +2124,13 @@ class ReveniumClient:
         department_id: Optional[int] = None,
         include_descendants: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """Get the PR-health report for the caller's own organization.
+        """Get the PR-health report for the team the session resolved.
 
-        All three query parameters are required by the endpoint. The report is
-        principal-scoped: the platform resolves the organization from the
-        authenticated caller and accepts no team or tenant identifier, which is
-        why no team/tenant scope is attached to the request. A department narrows
-        within that organization; one outside it answers 404.
+        All three window parameters are required by the endpoint. ``teamId`` is
+        optional upstream, and without it a signed-in user gets the first
+        organization they belong to, so ``_vcs_window_params`` always sends the
+        resolved team. A department narrows within that organization; one
+        outside it answers 404.
 
         The response is a flat VcsPrHealthResponse (source, startDate, endDate,
         the echoed agingDays/rottingDays, the applied cutoff, excluded
@@ -2102,21 +2159,26 @@ class ReveniumClient:
             "/profitstream/v2/api/billing/users/vcs-pr-health", params=params
         ))
 
-    @staticmethod
     def _vcs_window_params(
-        source: str, start_date: str, end_date: str, **optional: Any
+        self, source: str, start_date: str, end_date: str, **optional: Any
     ) -> Dict[str, Any]:
-        """Build the source/startDate/endDate triple plus the optional params that were set.
+        """Build the window triple, the optional params that were set and the resolved team.
 
-        Every VCS report read is principal-scoped, so no team or tenant id is
-        ever added here (see ``get_vcs_pr_health``).
+        Every VCS report read is team-scoped by the resolved team (see
+        ``get_vcs_pr_health``); a caller-typed team id is never added here.
         """
-        params: Dict[str, Any] = {
-            "source": source,
-            "startDate": start_date,
-            "endDate": end_date,
-        }
+        return self._vcs_source_params(
+            source, startDate=start_date, endDate=end_date, **optional
+        )
+
+    def _vcs_source_params(self, source: str, **optional: Any) -> Dict[str, Any]:
+        """Build the source, the optional params that were set and the resolved team.
+
+        Used directly by the PR-health reads whose window is optional or absent.
+        """
+        params: Dict[str, Any] = {"source": source}
         params.update({name: value for name, value in optional.items() if value is not None})
+        params.update(self._resolved_team_param())
         return params
 
     @staticmethod
@@ -2137,17 +2199,19 @@ class ReveniumClient:
         department_id: Optional[int] = None,
         include_descendants: Optional[bool] = None,
         assisted_only: Optional[bool] = None,
+        q: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Get one server-sorted page of the PR-health report's engineer rows.
 
-        Principal-scoped like ``get_vcs_pr_health``. The response is a flat page
+        Team-scoped like ``get_vcs_pr_health``. The response is a flat page
         (page, size, totalElements, totalPages, sortBy, sortDir, engineers) whose
-        rows match the report's engineers[] exactly.
+        rows match the report's engineers[] exactly. ``q`` keeps the engineers
+        whose login or mapped email contains it, case-insensitively.
         """
         params = self._vcs_window_params(
             source, start_date, end_date,
             page=page, size=size, sortBy=sort_by, sortDir=sort_dir,
-            assistedOnly=assisted_only,
+            assistedOnly=assisted_only, q=q,
             **self._vcs_department_params(department_id, include_descendants),
         )
         return cast(Dict[str, Any], await self.get(
@@ -2166,7 +2230,7 @@ class ReveniumClient:
     ) -> Dict[str, Any]:
         """Get the pull requests behind one engineer's PR-health row.
 
-        Principal-scoped like ``get_vcs_pr_health``. ``author`` is required by the
+        Team-scoped like ``get_vcs_pr_health``. ``author`` is required by the
         endpoint (it answers 400 without it) and is the provider login exactly as
         the report's engineers[].authorLogin spells it. The response carries
         bucket counts plus ``open`` and ``closedUnmerged`` lists, each capped
@@ -2195,16 +2259,25 @@ class ReveniumClient:
         department_id: Optional[int] = None,
         include_descendants: Optional[bool] = None,
         assisted_only: Optional[bool] = None,
+        cause: Optional[str] = None,
+        repo: Optional[str] = None,
+        ticket: Optional[str] = None,
+        triaged: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Get one page of the flat, bucketed pull-request list behind the PR-health report.
 
-        Principal-scoped like ``get_vcs_pr_health``. The response is a flat page
+        Team-scoped like ``get_vcs_pr_health``. The response is a flat page
         (page, size, totalElements, totalPages, sortBy, sortDir, pullRequests).
+        Without ``bucket`` the list holds every bucket except AUTOMATION.
+        ``cause`` selects one action-queue cause instead and answers 400 together
+        with ``bucket``; ``triaged`` is EXCLUDE upstream when omitted, which
+        leaves out the pull requests the team dismissed or snoozed.
         """
         params = self._vcs_window_params(
             source, start_date, end_date,
             bucket=bucket, author=author, page=page, size=size,
             sortBy=sort_by, sortDir=sort_dir, assistedOnly=assisted_only,
+            cause=cause, repo=repo, ticket=ticket, triaged=triaged,
             **self._vcs_department_params(department_id, include_descendants),
         )
         return cast(Dict[str, Any], await self.get(
@@ -2214,14 +2287,151 @@ class ReveniumClient:
     async def get_vcs_pr_health_repositories(self, source: str) -> Dict[str, Any]:
         """Get the repositories holding open pull requests, with their open count and exclusion flag.
 
-        Principal-scoped like ``get_vcs_pr_health``. Unlike the other PR-health
+        Team-scoped like ``get_vcs_pr_health``. Unlike the other PR-health
         reads it takes no window and no department: the endpoint declares
-        ``source`` only, and deliberately ignores the team's cutoff, exclusions
+        ``source`` and ``teamId`` only, and deliberately ignores the team's cutoff, exclusions
         and automation patterns so an excluded repository is still listed.
         """
         return cast(Dict[str, Any], await self.get(
             "/profitstream/v2/api/billing/users/vcs-pr-health/repositories",
-            params={"source": source},
+            params={"source": source, **self._resolved_team_param()},
+        ))
+
+    async def get_vcs_pr_health_breakdown(
+        self,
+        source: str,
+        start_date: str,
+        end_date: str,
+        group_by: str,
+        page: Optional[int] = None,
+        size: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_dir: Optional[str] = None,
+        department_id: Optional[int] = None,
+        include_descendants: Optional[bool] = None,
+        assisted_only: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Get one page of the PR-health figures grouped by repository, engineer or department.
+
+        GET /v2/api/billing/users/vcs-pr-health/breakdown. Team-scoped like
+        ``get_vcs_pr_health``; the window is required and bounded the same way.
+        ``groupBy`` (repo|engineer|department) is required; ``sortBy``
+        (rottingPrs, the default, closedUnmerged, openPrs, name or share),
+        ``sortDir``, ``page`` and ``size`` (default 5, 1..200, 400 above) page
+        the rows. 200 (application/json) is a flat page: the echoed request and
+        thresholds, page/size/totalElements/totalPages, rows[] (key, label, the
+        five counts plus pricedRottingPrs/pricedClosedUnmerged, and per group
+        noMergesInWindow, mappedEmail/prsInWindow/activeMappedEmail or
+        departmentId/directMembersOnly), whole totals and departmentAvailable.
+        No dollars are returned. 400, 401, 403, 404 (department) and 500 answer
+        application/json ApiError.
+        """
+        params = self._vcs_window_params(
+            source, start_date, end_date,
+            groupBy=group_by, page=page, size=size, sortBy=sort_by, sortDir=sort_dir,
+            assistedOnly=assisted_only,
+            **self._vcs_department_params(department_id, include_descendants),
+        )
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/billing/users/vcs-pr-health/breakdown", params=params
+        ))
+
+    async def get_vcs_pr_health_queue(
+        self,
+        source: str,
+        per_cause: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_dir: Optional[str] = None,
+        author: Optional[str] = None,
+        repo: Optional[str] = None,
+        ticket: Optional[str] = None,
+        triaged: Optional[str] = None,
+        department_id: Optional[int] = None,
+        include_descendants: Optional[bool] = None,
+        assisted_only: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Get the PR-health action queue: open pull requests grouped by why they need a decision.
+
+        GET /v2/api/billing/users/vcs-pr-health/queue. Team-scoped like
+        ``get_vcs_pr_health`` but with no window: the queue holds open pull
+        requests only. One group per cause in a fixed order, empty groups
+        included, each with its first ``perCause`` rows (default 8, 1..50, 400
+        above) in the requested order and its whole totalElements. ``sortBy`` is
+        inactivity (default), age, repo, author or review; ``triaged`` is
+        EXCLUDE upstream when omitted. 200 (application/json) echoes the
+        thresholds, authorGoneDays and every filter next to groups[]. 400, 401,
+        403, 404 (department) and 500 answer application/json ApiError.
+        """
+        params = self._vcs_source_params(
+            source,
+            perCause=per_cause, sortBy=sort_by, sortDir=sort_dir, author=author,
+            repo=repo, ticket=ticket, triaged=triaged, assistedOnly=assisted_only,
+            **self._vcs_department_params(department_id, include_descendants),
+        )
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/billing/users/vcs-pr-health/queue", params=params
+        ))
+
+    async def get_vcs_pr_health_trend(
+        self,
+        source: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        granularity: Optional[str] = None,
+        department_id: Optional[int] = None,
+        include_descendants: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Get the PR-health trend: closed-unmerged and at-risk counts per day, week or month.
+
+        GET /v2/api/billing/users/vcs-pr-health/trend. Team-scoped like
+        ``get_vcs_pr_health``. Without startDate and endDate the buckets are the
+        26 calendar weeks ending with the current one; with them (both or
+        neither, at most 366 days, startDate not after endDate, else a 400)
+        ``granularity`` picks day (at most 92 days), week (the default) or month.
+        ``includeBasis`` is declared and not sent. 200 (application/json) echoes
+        the window, granularity, rottingDays, cutoffDate, pricedSince and
+        historyStart next to weeks[] (weekStart, asOf, complete, covered, each
+        count with its AI-assisted part and its priced part). No dollars are
+        returned. 400, 401, 403, 404 (department) and 500 answer
+        application/json ApiError.
+        """
+        params = self._vcs_source_params(
+            source,
+            startDate=start_date, endDate=end_date, granularity=granularity,
+            **self._vcs_department_params(department_id, include_descendants),
+        )
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/billing/users/vcs-pr-health/trend", params=params
+        ))
+
+    async def get_vcs_pr_health_follow_through(
+        self,
+        source: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        department_id: Optional[int] = None,
+        include_descendants: Optional[bool] = None,
+        assisted_only: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Get whether the pull requests PR Health flagged as rotting got fixed.
+
+        GET /v2/api/billing/users/vcs-pr-health/follow-through. Team-scoped like
+        ``get_vcs_pr_health``. Without startDate and endDate every flag ever
+        taken counts; with them (both or neither, at most 366 days, else a 400)
+        only flags taken on those UTC days. 200 (application/json): since,
+        flaggedPrs/flaggedMerged/flaggedClosed/flaggedOpen, atRiskThen and
+        atRiskNow ({prs, estimatedDollars}), basisThen and basisNow (cost per
+        merged pull request, null rather than 0 when it has no basis), and the
+        echoed scope. 400, 401, 403, 404 (department) and 500 answer
+        application/json ApiError.
+        """
+        params = self._vcs_source_params(
+            source,
+            startDate=start_date, endDate=end_date, assistedOnly=assisted_only,
+            **self._vcs_department_params(department_id, include_descendants),
+        )
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/billing/users/vcs-pr-health/follow-through", params=params
         ))
 
     async def get_vcs_prs(
@@ -2239,7 +2449,7 @@ class ReveniumClient:
     ) -> Dict[str, Any]:
         """Get the merged pull-request report, per login or per repository.
 
-        Principal-scoped like ``get_vcs_pr_health``. The response is flat and
+        Team-scoped like ``get_vcs_pr_health``. The response is flat and
         always carries ``syncScope``, which is what tells a tenant with no VCS
         credential apart from one with a quiet window. The platform silently
         ignores ``includeMembers``, ``email`` and ``includePullRequests`` unless
@@ -2422,17 +2632,18 @@ class ReveniumClient:
         ))
 
     async def set_usage_billing(self, enabled: bool) -> Dict[str, Any]:
-        """Toggle whether the tenant's billing screens are shown.
+        """Switch usage-based billing on or off for the tenant.
 
-        The flag decides whether the product presents the tenant's billing
-        surfaces at all: invoices, payment methods, plan and subscription
-        screens. It is presentation only — ingestion, rating and invoicing are
-        not gated on it, so turning it off hides those screens without
-        changing a single amount, and turning it back on reveals the invoices
-        that were being produced all along. The platform default is on.
+        Off hides the tenant's billing screens (invoices, payment methods, plan
+        and subscription screens) and stops the platform rating the tenant's
+        usage: AI product usage, its platform usage and ``/v2/events`` produce
+        no usage line items. AI metrics are still recorded. Usage that arrives
+        while the flag is off is never rated later, so turning it back on rates
+        usage from that moment only. Subscription charges and tool-event line
+        items are unaffected. The platform default is on.
 
         Args:
-            enabled: Desired state of the tenant's billing screens
+            enabled: Desired state of usage-based billing for the tenant
 
         Returns:
             The updated tenant resource (includes usageBillingEnabled and the
@@ -3190,6 +3401,97 @@ class ReveniumClient:
             data=dict(settings),
             params=params,
         ))
+
+    async def get_team_pr_health_digest_settings(self, team_id: str) -> Dict[str, Any]:
+        """Get the team's PR-health weekly digest and rotting alert settings.
+
+        GET /v2/api/teams/{id}/settings/pr-health/digest (operationId
+        get_team_pr_health_digest_settings); the only parameter is the path id.
+        200 answers application/json PrHealthDigestSettingsResource; 400, 401,
+        403, 404 and 500 answer an application/json ApiError, and 409, 422, 429
+        and 504 a */* ApiError.
+
+        Before anything is saved both switches are off, the day is MONDAY at hour
+        9 and timezone is null. nextSendAt and nextAlertAt are UTC and null while
+        off. rottingDays is the team's PR-health threshold, which the alert uses;
+        it is read-only here.
+
+        Args:
+            team_id: The team ID
+
+        Returns:
+            Digest settings carrying enabled, rottingAlertEnabled, dayOfWeek,
+            hourOfDay, timezone, slackConfigurationIds, slackChannels,
+            emailAddresses, rottingDays and the read-only schedule and last-send
+            fields
+        """
+        params = self._add_tenant_id_to_params()
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/teams/{team_id}/settings/pr-health/digest", params=params
+        ))
+
+    async def update_team_pr_health_digest_settings(
+        self, team_id: str, settings: PrHealthDigestSettingsPayload
+    ) -> Dict[str, Any]:
+        """Update the team's PR-health digest settings.
+
+        PUT /v2/api/teams/{id}/settings/pr-health/digest (operationId
+        update_team_pr_health_digest_settings); the only parameter is the path id
+        and the required body is application/json PrHealthDigestSettingsResource.
+        200 answers application/json PrHealthDigestSettingsResource; 400, 401,
+        403, 404 and 500 answer an application/json ApiError, and 409, 422, 429
+        and 504 a */* ApiError.
+
+        A partial update: absent or null leaves a field unchanged, a list
+        replaces the stored one and an empty list clears it. Callers send only
+        the fields they mean to change; read-merging the rest would turn the
+        server's per-field update into last-writer-wins. slackConfigurationIds
+        must be this team's Slack connections, at most 5; emailAddresses at most
+        20 valid addresses; dayOfWeek MONDAY to SUNDAY; hourOfDay 0 to 23;
+        timezone an IANA zone. When either switch ends on, at least one Slack
+        channel or address and a timezone are required. Anything else is a 400.
+
+        Args:
+            team_id: The team ID
+            settings: Only the fields to change
+
+        Returns:
+            The stored digest settings after the update
+        """
+        params = self._add_tenant_id_to_params()
+        return cast(Dict[str, Any], await self.put(
+            f"/profitstream/v2/api/teams/{team_id}/settings/pr-health/digest",
+            data=dict(settings),
+            params=params,
+        ))
+
+    async def get_team_coding_assistant_filter_settings(self, team_id: str) -> Dict[str, Any]:
+        """Get which coding assistants the team pays for at real API rates.
+
+        GET /v2/api/teams/{id}/settings/coding-assistant-filter (operationId
+        get_team_coding_assistant_filter_settings); the only parameter is the
+        path id. 200 answers application/json CodingAssistantFilterSettingsResource;
+        400, 401, 403, 404 and 500 answer an application/json ApiError, and 409,
+        422, 429 and 504 a */* ApiError.
+
+        confirmedProviders, classificationSource, confidence, needsReview and
+        persistence are read-only; the deprecated enabled, defaultProviders and
+        allowUserOverride fields are still returned for stored-policy
+        compatibility.
+
+        Args:
+            team_id: The team ID
+
+        Returns:
+            Settings carrying apiRateProviders, confirmedProviders, needsReview,
+            classificationSource, confidence and persistence
+        """
+        params = self._add_tenant_id_to_params()
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/teams/{team_id}/settings/coding-assistant-filter",
+            params=params,
+        ))
+
     async def get_team_attribution_identity_policy(self, team_id: str) -> Dict[str, Any]:
         """Get the team's coding-assistant attribution identity policy.
 
@@ -3526,25 +3828,27 @@ class ReveniumClient:
     async def get_budget_portfolio(
         self, page: int = 0, size: int = 20, **filters: Any
     ) -> Dict[str, Any]:
-        """Get the tenant-wide budget-progress portfolio (paginated HAL).
+        """Get the budget-progress portfolio of the resolved team (paginated HAL).
 
-        Lists budget progress for every CUMULATIVE_USAGE alert visible to the
-        tenant. The route is authorized per-tenant (isAuthenticated) and takes
-        no teamId param, so — like reset_anomaly_budget — we do NOT call
-        _add_team_id_to_params; adding one would not scope the read and the
-        controller ignores it.
+        Lists budget progress for every CUMULATIVE_USAGE alert on the team the
+        session resolved. ``teamId`` is optional upstream, and without it the
+        route answers for every team the caller can read, so the resolved team
+        is always sent (``_resolved_team_param``).
 
         Args:
             page: Page number (0-based)
             size: Number of items per page
             **filters: Optional query params — ``now`` (ISO timestamp anchoring
-                the progress window) and ``includeTrend`` (bool)
+                the progress window), ``includeTrend`` (bool) and ``groupLimit``
+                (1 to 100: for a per-group budget, only its highest groups,
+                highest first; ``groupCount`` still counts every group)
 
         Returns:
             Paginated HAL response of budget-progress entries
         """
         params: Dict[str, Any] = {"page": page, "size": size}
         params.update(filters)
+        params.update(self._resolved_team_param())
         return cast(Dict[str, Any], await self.get(
             "/profitstream/v2/api/ai/alerts/budgets/portfolio", params=params
         ))
@@ -3554,8 +3858,8 @@ class ReveniumClient:
     ) -> Dict[str, Any]:
         """Get budget progress for a specific set of anomaly ids.
 
-        Authorized per-tenant (isAuthenticated); no teamId param (see
-        get_budget_portfolio). ``ids`` is REQUIRED and passed through as the
+        Authorized per-tenant (isAuthenticated); unlike get_budget_portfolio
+        the route declares no teamId param. ``ids`` is REQUIRED and passed through as the
         list — httpx repeats the ``ids`` query param for each element.
 
         Args:
@@ -3620,6 +3924,56 @@ class ReveniumClient:
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.get(
             f"/profitstream/v2/api/sources/ai/anomaly/{anomaly_id}/metric", params=params
+        ))
+
+    async def search_provider_api_keys(
+        self,
+        query: Optional[str] = None,
+        provider: Optional[str] = None,
+        page: int = 0,
+        size: int = 50,
+    ) -> Dict[str, Any]:
+        """Search one page of the resolved team's provider API keys by name or id.
+
+        ``GET /v2/api/sources/ai/anomaly/provider-dimensions/api-keys``
+        (``searchProviderApiKeys``). Query parameters: ``teamId`` (required),
+        ``provider`` (optional, one provider), ``query`` (optional,
+        case-insensitive match on the key name or id; ``%`` and ``_`` act as
+        wildcards), ``apiKeyIds`` (optional lookup by id, not used here),
+        ``page`` (zero-based, default 0) and ``size`` (1 to 100, default 50).
+        ``teamId`` is the resolved team (``_resolved_team_param``), never a
+        caller-typed one.
+
+        200 answers ``application/json`` or ``application/hal+json`` with an
+        ``ApiKeyFilterOptionPage``: ``items`` (``id``, ``name``, ``provider``,
+        ``partialKeyHint``, ``active``) and ``total``, with no HAL envelope and
+        no page metadata. Identifiers and masked hints only, never the secret.
+        A page that starts at or after result 1,000 has no items but still
+        carries ``total``. 400, 401, 403, 404, 409, 422, 429, 500 and 504 answer
+        ``*/*`` with an ``ApiError``.
+
+        Live dev 2026-10-08: without ``teamId`` the route answers 400 "Missing
+        request parameter: teamId". ``size`` outside 1 to 100 is not refused:
+        ``ProviderDimensionsService.searchApiKeys`` clamps it into range.
+
+        Args:
+            query: Text matched against the key name or id
+            provider: Provider name to scope the search to (e.g. ``anthropic``)
+            page: Zero-based page number
+            size: Page size, 1 to 100
+
+        Returns:
+            The ``{"items": [...], "total": n}`` page
+        """
+        params: Dict[str, Any] = {"page": page, "size": size}
+        if query:
+            params["query"] = query
+        if provider:
+            params["provider"] = provider
+        params.update(self._resolved_team_param())
+        return cast(Dict[str, Any], await self.get(
+            "/profitstream/v2/api/sources/ai/anomaly/provider-dimensions/api-keys",
+            params=params,
         ))
 
     # AI Alert API methods
@@ -4008,12 +4362,12 @@ class ReveniumClient:
         host.
 
         Args:
-            **filters: Query parameters to send. The operation declares four --
-                startDate, endDate, metricType and jobType -- and the caller
-                chooses which of them it means to send; ``None`` values are
-                dropped. Anything the operation does not declare is discarded
-                upstream without an error, so it must be filtered out before it
-                gets here.
+            **filters: Query parameters to send. The operation declares
+                startDate, endDate, metricType and jobType for the caller to
+                choose from; ``None`` values are dropped. Anything the operation
+                does not declare is discarded upstream without an error, so it
+                must be filtered out before it gets here. Its fifth parameter,
+                teamId, is always the resolved team.
 
         Returns:
             Whatever the endpoint answered, uncoerced. The published shape is
@@ -4025,6 +4379,7 @@ class ReveniumClient:
             would collapse it to an empty list and throw away every row.
         """
         params: Dict[str, Any] = {k: v for k, v in filters.items() if v is not None}
+        params.update(self._resolved_team_param())
         return await self.get(
             get_endpoint_path("jobs_roi_summary"),
             params=params,
@@ -4542,8 +4897,7 @@ class ReveniumClient:
         Returns:
             Cost breakdown data by tool
         """
-        params = {}
-        params.update(filters)
+        params = {**filters, **self._resolved_team_param()}
         return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/cost-by-tool",
             params=params,
@@ -4560,8 +4914,7 @@ class ReveniumClient:
         Returns:
             Aggregated cost data per tool
         """
-        params = {}
-        params.update(filters)
+        params = {**filters, **self._resolved_team_param()}
         return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/cost-by-tool-aggregated",
             params=params,
@@ -4578,8 +4931,7 @@ class ReveniumClient:
         Returns:
             Cost data grouped by agent
         """
-        params = {}
-        params.update(filters)
+        params = {**filters, **self._resolved_team_param()}
         return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/cost-by-tool-agent",
             params=params,
@@ -4596,8 +4948,7 @@ class ReveniumClient:
         Returns:
             Cost breakdown by agent-tool pair
         """
-        params = {}
-        params.update(filters)
+        params = {**filters, **self._resolved_team_param()}
         return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/agent-tool-breakdown",
             params=params,
@@ -4614,8 +4965,7 @@ class ReveniumClient:
         Returns:
             Cost data by tool provider
         """
-        params = {}
-        params.update(filters)
+        params = {**filters, **self._resolved_team_param()}
         return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/cost-by-tool-provider",
             params=params,
@@ -4632,8 +4982,7 @@ class ReveniumClient:
         Returns:
             Aggregated cost data by provider
         """
-        params = {}
-        params.update(filters)
+        params = {**filters, **self._resolved_team_param()}
         return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/cost-by-tool-provider-aggregated",
             params=params,
@@ -4650,13 +4999,51 @@ class ReveniumClient:
         Returns:
             Top tools ranked by call count
         """
-        params = {}
-        params.update(filters)
+        params = {**filters, **self._resolved_team_param()}
         return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/top-tools-by-call-count",
             params=params,
             base_url=self._get_app_base_url(),
             use_bearer=True,
+        ))
+
+    TEAM_MEDIANS_ASSISTANTS = "claude-code"
+
+    async def get_ai_assistant_team_medians(self, window: Optional[str] = None) -> Dict[str, Any]:
+        """Anonymous team medians of coding-assistant habits for the resolved team.
+
+        GET /api/v2/analytics/ai-assistants/team-medians (operation
+        ``get_team_medians``) on the analytics host. ``assistants`` is required,
+        repeated or comma-separated, and its spec enum holds ``claude-code``
+        only; a missing, empty or unknown value answers 400, so it is always
+        sent as ``TEAM_MEDIANS_ASSISTANTS``. ``window`` defaults upstream to
+        ``14d`` and, verified against dev, also takes ``completed-weeks:<1-4>``
+        (anything else is a 400 the spec does not spell out). ``group``
+        (team|department) and ``department`` (a department hashid, read only
+        with group=department) are declared too and not sent: the answer is for
+        the whole team. ``teamId`` is the resolved team.
+
+        200 (application/json) is one of two shapes. With five or more people
+        who made a call in the window: window, windowStart, windowEnd, group, n,
+        and the nullable medians contextPerCall (nearest 10,000 tokens),
+        cacheRebuildRatio (two significant figures) and effortAboveDefaultShare
+        (nearest 0.05), plus an optional unavailable[] naming measures without a
+        figure. With fewer, or a department that does not resolve: only window,
+        group and belowFloor=true. 400, 401, 403, 404, 429 and 500 answer
+        application/problem+json (type, title, status, detail, code); the spec
+        asks callers to treat a 429 or 5xx as no figures. The body is flat, so
+        it is not unwrapped as a HAL collection (which would turn it into []).
+        """
+        params: Dict[str, Any] = {"assistants": self.TEAM_MEDIANS_ASSISTANTS}
+        if window is not None:
+            params["window"] = window
+        params.update(self._resolved_team_param())
+        return cast(Dict[str, Any], await self.get(
+            "/api/v2/analytics/ai-assistants/team-medians",
+            params=params,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+            unwrap_hal_embedded=False,
         ))
 
     async def get_tool_success_rate(self, **filters: Any) -> Dict[str, Any]:
@@ -4668,8 +5055,7 @@ class ReveniumClient:
         Returns:
             Success rate data per tool
         """
-        params = {}
-        params.update(filters)
+        params = {**filters, **self._resolved_team_param()}
         return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/tool-success-rate",
             params=params,
@@ -4686,8 +5072,7 @@ class ReveniumClient:
         Returns:
             Latency data per tool
         """
-        params = {}
-        params.update(filters)
+        params = {**filters, **self._resolved_team_param()}
         return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/tool-latency",
             params=params,
@@ -4703,6 +5088,7 @@ class ReveniumClient:
         """
         return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/filter-options/tools",
+            params=self._resolved_team_param(),
             base_url=self._get_app_base_url(),
             use_bearer=True,
         ))
@@ -4717,6 +5103,7 @@ class ReveniumClient:
         """
         result = await self.get(
             "/api/v2/insights/investigators",
+            params=self._resolved_team_param(),
             base_url=self._get_app_base_url(),
             use_bearer=True,
             unwrap_hal_embedded=False,
@@ -4737,6 +5124,7 @@ class ReveniumClient:
             Full RunOutput dict (or slim variant when slim=True).
         """
         params: Dict[str, Any] = {"slim": "true"} if slim else {}
+        params.update(self._resolved_team_param())
         result = await self.get(
             f"/api/v2/insights/runs/{run_id}", params=params,
             base_url=self._get_app_base_url(),
@@ -4779,6 +5167,7 @@ class ReveniumClient:
             params["until"] = until
         if triggered_by:
             params["triggered_by"] = triggered_by
+        params.update(self._resolved_team_param())
         result = await self.get(
             "/api/v2/insights/runs", params=params,
             base_url=self._get_app_base_url(),
@@ -4854,6 +5243,7 @@ class ReveniumClient:
         params: Dict[str, Any] = {"limit": limit}
         if cursor:
             params["cursor"] = cursor
+        params.update(self._resolved_team_param())
         result = await self.get(
             f"/api/v2/insights/runs/{run_id}/feedback",
             params=params,
@@ -4878,7 +5268,6 @@ class ReveniumClient:
         filter_department_id: str = "",
         filter_include_descendants: bool = True,
         filter_include_coding_assistants: bool = True,
-        filter_include_coding_assistants_for_cost_detectors: bool = False,
         exclude_investigator_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """POST /insights/runs — trigger an analysis run (returns 202 + runId).
@@ -4893,6 +5282,11 @@ class ReveniumClient:
             filter_include_descendants: include the department's sub-departments. Always
                 sent, defaulting to the backend's own default of True — sending
                 False would narrow the run to the department's own rows.
+            filter_include_coding_assistants: the one coding-assistant switch the
+                platform honours. Its cost-detector sibling,
+                ``filterIncludeCodingAssistantsForCostDetectors``, is never sent:
+                the platform accepts and ignores it, and the cost checks follow
+                the team's coding-assistant pricing policy instead.
             exclude_investigator_ids: skip specific detectors; None = run all.
 
         Returns:
@@ -4918,8 +5312,6 @@ class ReveniumClient:
             "filterDepartmentId": filter_department_id,
             "filterIncludeDescendants": filter_include_descendants,
             "filterIncludeCodingAssistants": filter_include_coding_assistants,
-            "filterIncludeCodingAssistantsForCostDetectors":
-                filter_include_coding_assistants_for_cost_detectors,
         }
         if exclude_investigator_ids is not None:
             body["excludeInvestigatorIds"] = exclude_investigator_ids
@@ -4927,6 +5319,7 @@ class ReveniumClient:
         result = await self.post(
             "/api/v2/insights/runs",
             data=body,
+            params=self._resolved_team_param(),
             base_url=self._get_app_base_url(),
             use_bearer=True,
             unwrap_hal_embedded=False,
@@ -4972,6 +5365,7 @@ class ReveniumClient:
         result = await self.post(
             "/api/v2/insights/feedback",
             data=body,
+            params=self._resolved_team_param(),
             base_url=self._get_app_base_url(),
             use_bearer=True,
             unwrap_hal_embedded=False,

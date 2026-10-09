@@ -18,8 +18,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from tests.conftest import live_network_opted_in
+
 pytestmark = pytest.mark.skipif(
-    not os.getenv("REVENIUM_INTEGRATION_TESTS")
+    not live_network_opted_in()
     or not os.getenv("REVENIUM_API_KEY")
     or not os.getenv("REVENIUM_BASE_URL"),
     reason=(

@@ -811,6 +811,8 @@ class InputValidator:
             api_data["description"] = user_data["description"]
         if "group_by" in user_data:
             api_data["groupBy"] = user_data["group_by"]
+        if "dataSource" in user_data:
+            api_data["dataSource"] = user_data["dataSource"]
 
         # Convert operator - API expects "operatorType" field, not "operator"
         operator = rule.get("operator", ">")

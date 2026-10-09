@@ -11,7 +11,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from ..endpoint_registry import resolve_analytics_request
-from .validation import ValidationError
+from .department_costs import DEPARTMENT_COSTS_ENDPOINT_KEY, DepartmentCostsQuery
+from .validation import DEFAULT_USER_COST_SOURCES, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -806,7 +807,8 @@ class SimpleCostAnalyzer:
         Args:
             period: Time period (API-verified values only)
             aggregation: Aggregation type (API-verified values only)
-            filters: Optional dict with array params: agents, providers, models, users
+            filters: Optional dict with array params: agents, providers, models,
+                users, costSources (DEFAULT_USER_COST_SOURCES when omitted)
 
         Returns:
             List of user cost data with cost, requests, and tokens per user
@@ -821,14 +823,11 @@ class SimpleCostAnalyzer:
 
             extra_old = {"group": aggregation} if aggregation else {}
             extra_new = dict(filters) if filters else {}
-            # Default costSources to coding_assistant: subscriber email is populated
-            # on those rows. Note this is not a per-user view of coding-assistant
-            # spend - the v2 analytics plane's own predicate drops rows priced as
-            # coding_assistant (its REST context carries no API-rate provider list),
-            # which the response's scope notes state. Changing the default is a
-            # behaviour change tracked separately.
+            # The endpoint's own default is coding_assistant alone, which is empty
+            # for tenants whose spend is API-metered; ask for every source so the
+            # answer does not depend on how the tenant classifies its traffic.
             if "costSources" not in extra_new:
-                extra_new["costSources"] = ["coding_assistant"]
+                extra_new["costSources"] = list(DEFAULT_USER_COST_SOURCES)
             if aggregation and "aggregation" not in extra_new:
                 extra_new["aggregation"] = aggregation
             path, params, call_kwargs = resolve_analytics_request(
@@ -1788,6 +1787,12 @@ class SimpleCostAnalyzer:
             "token_breakdown_by_type", period, extra_new_params=extra
         )
         return self._flatten_timeseries_items(response)
+
+    async def get_department_costs(self, query: DepartmentCostsQuery) -> Dict[str, Any]:
+        """Cost by department as the full envelope: departmentSetup sits beside _embedded."""
+        return await self._fetch_analytics_envelope(
+            DEPARTMENT_COSTS_ENDPOINT_KEY, query.period, extra_new_params=query.request_params()
+        )
 
     async def get_team_costs(self, period: str) -> List[Dict[str, Any]]:
         """Cost by team over time (envelope A timeseries buckets)."""

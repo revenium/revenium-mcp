@@ -26,6 +26,7 @@ from .log_analysis_constants import (
     DEFAULT_VALUES,
     ERROR_MESSAGES,
     EXAMPLES_TEXT,
+    INGESTION_FAILURE_ERROR_CODES,
     LOG_ENDPOINTS,
     SUGGESTIONS,
     UNSUPPORTED_ACTION_TEMPLATE,
@@ -180,6 +181,23 @@ def _unconfirmed_sibling_report(sibling_flag_lines: str) -> str:
         "\n\nThe response did carry the tenant's other settings:\n\n"
         f"{sibling_flag_lines}"
     )
+
+
+def _validate_ingestion_error_code(error_code: Any) -> None:
+    if error_code and error_code not in INGESTION_FAILURE_ERROR_CODES:
+        raise ToolError(
+            message=(
+                f"error_code '{error_code}' is not an ingestion rejection code. "
+                f"Valid codes: {', '.join(INGESTION_FAILURE_ERROR_CODES)}"
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="error_code",
+            value=error_code,
+            suggestions=[
+                f"Use one of: {', '.join(INGESTION_FAILURE_ERROR_CODES)}",
+                "Omit error_code to list every rejection",
+            ],
+        )
 
 
 class ReveniumLogAnalysis(ToolBase):
@@ -560,10 +578,43 @@ No log entries found for analysis. This may be expected for integration logs.
     # Per-entry cap for rendered originalPayload JSON, so a page of large
     # payloads cannot blow past the MCP transport's response limits.
     _MAX_RENDERED_PAYLOAD_CHARS = 2000
+    # Per-field cap for an error's value and resolution, so one oversized
+    # value cannot push its entry past the response budget and hide the code.
+    _MAX_RENDERED_ERROR_FIELD_CHARS = 500
     # Bound on the COMPLETE rendered response: entries stop being appended
     # once the budget is spent (a page of many per-entry-capped payloads can
     # still exceed the transport limit otherwise).
     _MAX_RENDERED_RESPONSE_CHARS = 24000
+
+    @classmethod
+    def _bounded_error_field(cls, text: Any) -> tuple[str, str]:
+        """Return the field text within the cap and a truncation note, if any."""
+        text = str(text)
+        excess = len(text) - cls._MAX_RENDERED_ERROR_FIELD_CHARS
+        if excess <= 0:
+            return text, ""
+        return (
+            text[: cls._MAX_RENDERED_ERROR_FIELD_CHARS],
+            f" (truncated, {excess} more characters)",
+        )
+
+    @classmethod
+    def _structured_error_lines(cls, err: Dict[str, Any]) -> List[str]:
+        """Render one StructuredError entry of an ingestion failure."""
+        code = err.get("code") or "no code reported"
+        lines = [f"- **{code}**: {err.get('message', '')}"]
+        reference = []
+        if err.get("field") is not None:
+            reference.append(f"field `{err['field']}`")
+        if err.get("value") is not None:
+            value, note = cls._bounded_error_field(err["value"])
+            reference.append(f"value `{value}`{note}")
+        if reference:
+            lines.append(f"  - Refers to {', '.join(reference)}")
+        if err.get("resolution"):
+            resolution, note = cls._bounded_error_field(err["resolution"])
+            lines.append(f"  - Resolution: {resolution}{note}")
+        return lines
 
     async def _handle_get_ingestion_failures(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -579,6 +630,7 @@ No log entries found for analysis. This may be expected for integration logs.
         error_code = arguments.get("error_code")
 
         self._validate_page_size(size)
+        _validate_ingestion_error_code(error_code)
 
         try:
             client = await self.get_client(ctx=ctx)
@@ -615,9 +667,7 @@ No log entries found for analysis. This may be expected for integration logs.
                 ts = failure.get("failureTimestamp", "unknown time")
                 entry_lines.append(f"### {ts}")
                 for err in failure.get("errors") or []:
-                    code = err.get("errorCode", "UNKNOWN")
-                    message = err.get("message", "")
-                    entry_lines.append(f"- **{code}**: {message}")
+                    entry_lines.extend(self._structured_error_lines(err))
                 payload = failure.get("originalPayload")
                 if payload:
                     # Bound per-entry rendering: callers control page size, and
@@ -949,21 +999,31 @@ No log entries found for analysis. This may be expected for integration logs.
                 ],
             )
 
+    # Decision (BACK-3943): the billing refreshes, GET /v2/api/billing/refresh and
+    # POST /v2/api/billing/refresh/historical, are not adopted beside this
+    # billing-side write. Both re-pull provider billing data, the GET included
+    # despite its verb: an operations action that can be expensive and that an
+    # agent could trigger by mistake. The historical form runs in the background
+    # and reports progress only in the internal system logs, so a caller could
+    # not tell when it ended.
+    # Indexed under `decision_exclusions` in
+    # .claude/commands/mcp-api-exclusions.yaml. Revisit when the platform exposes
+    # refresh progress to callers.
     async def _handle_set_usage_billing(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Show or hide the tenant's billing screens, guarded by confirm.
+        """Switch usage-based billing on or off for the tenant, guarded by confirm.
 
-        The flag is presentation-only: invoices, payment methods, plan and
-        subscription screens appear or disappear, while ingestion, rating and
-        invoicing keep running untouched and every stored amount stays put.
-        The platform default is on.
+        Off hides the billing screens (invoices, payment methods, plan and
+        subscription screens) and stops the platform rating the tenant's usage:
+        AI product usage, platform usage and /v2/events produce no usage line
+        items, while AI metrics are still recorded. Usage that arrives while it
+        is off is never rated later. The platform default is on.
 
-        It is confirm-gated even though nothing is destroyed, because the
-        change lands on every user of the tenant at once and, once the billing
-        screens are gone, the people who would notice have no screen left to
-        notice it on. The state reported is the one the server returned, never
-        the requested value.
+        It is confirm-gated because the change lands on every user of the
+        tenant at once and the usage it leaves unrated cannot be recovered by
+        turning it back on. The state reported is the one the server returned,
+        never the requested value.
         """
         enabled = arguments.get("enabled")
         if not isinstance(enabled, bool):
@@ -973,8 +1033,8 @@ No log entries found for analysis. This may be expected for integration logs.
                 field="enabled",
                 value=enabled,
                 suggestions=[
-                    "Pass enabled=true to show the tenant's billing screens",
-                    "Pass enabled=false to hide them (billing itself keeps running)",
+                    "Pass enabled=true to show the billing screens and rate the tenant's usage",
+                    "Pass enabled=false to hide them and stop rating the tenant's usage",
                     "Add confirm=true to apply the change",
                 ],
             )
@@ -982,26 +1042,31 @@ No log entries found for analysis. This may be expected for integration logs.
         # Only the boolean True applies the change — loosely typed MCP
         # arguments (confirm="false", confirm=1) must not bypass the guard.
         if arguments.get("confirm") is not True:
-            state = "SHOW" if enabled else "HIDE"
-            effect = (
-                "Every billing surface becomes visible again for the whole "
-                "tenant: invoices, payment methods, plan and subscription "
-                "screens. Nothing is recalculated — the invoices were being "
-                "produced while the screens were hidden."
+            state = (
+                "SHOW the tenant's billing screens and rate its usage again"
                 if enabled
-                else "Every billing surface is HIDDEN for the whole tenant: "
-                "invoices, payment methods, plan and subscription screens. "
-                "This is presentation only — ingestion, rating and invoicing "
-                "keep running and no stored amount changes, but no user of the "
-                "tenant can reach a billing screen until the flag is turned "
-                "back on."
+                else "HIDE the tenant's billing screens and stop rating its usage"
+            )
+            effect = (
+                "The billing screens become visible again for the whole tenant "
+                "(invoices, payment methods, plan and subscription screens), and "
+                "its usage is rated again from now on. Usage that arrived while "
+                "usage billing was off was never rated and is not recovered."
+                if enabled
+                else "The billing screens are HIDDEN for the whole tenant "
+                "(invoices, payment methods, plan and subscription screens), and "
+                "the tenant's usage STOPS being rated: AI product usage, platform "
+                "usage and /v2/events produce no usage line items from now on. "
+                "AI metrics keep being recorded. Usage that arrives while the "
+                "flag is off is never rated, even after it is turned back on. "
+                "Subscription charges and tool-event line items are unaffected."
             )
             return [
                 TextContent(
                     type="text",
                     text=(
-                        f"**Confirmation Required — {state} the tenant's billing screens**\n\n"
-                        f"This changes what every user of the tenant sees:\n\n{effect}\n\n"
+                        f"**Confirmation Required — {state}**\n\n"
+                        f"This applies to every user of the tenant:\n\n{effect}\n\n"
                         f"**Who can apply it**: {USAGE_BILLING_GATE_NOTE}\n\n"
                         f"Read the current value first with `get_usage_billing()`. "
                         f"To apply, repeat the call with confirm=true:\n"
@@ -1035,11 +1100,13 @@ No log entries found for analysis. This may be expected for integration logs.
                     )
                 ]
             follow_up = (
-                "Billing screens are visible to the tenant's users again."
+                "Billing screens are visible to the tenant's users again, and its "
+                "usage is rated from now on. Usage from the period it was off stays "
+                "unrated."
                 if new_state
-                else "Billing screens are hidden from the tenant's users. Metering, "
-                "rating and invoicing are unaffected: invoices keep being produced "
-                "and will be there when the flag is turned back on."
+                else "Billing screens are hidden from the tenant's users and its "
+                "usage is no longer rated. AI metrics keep being recorded; usage "
+                "from this period will not be rated when the flag is turned back on."
             )
             return [
                 TextContent(

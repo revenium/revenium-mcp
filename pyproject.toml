@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "revenium-mcp"
-version = "0.7.1"
+version = "0.8.0"
 description = "Model Context Protocol (MCP) server for Revenium API monitoring, analytics, and AI spending management"
 readme = "README.md"
 license = "MIT"
@@ -76,6 +76,7 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "pytest-mock>=3.10.0",
     "pytest-httpserver>=1.0.0",
+    "pytest-socket>=0.7.0",
     "PyJWT[crypto]>=2.8.0",
     "fakeredis>=2.20",
     "ruff>=0.4.0",
@@ -102,6 +103,7 @@ test = [
     "pytest-asyncio>=0.23.0",
     "pytest-mock>=3.10.0",
     "pytest-httpserver>=1.0.0",
+    "pytest-socket>=0.7.0",
     "PyJWT[crypto]>=2.8.0",
     "requests-mock>=1.10.0",
     "fakeredis>=2.20",
@@ -178,7 +180,10 @@ disable_error_code = ["untyped-decorator"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"
-addopts = "-ra -q --strict-markers --strict-config --tb=short"
+addopts = [
+    "-ra", "-q", "--strict-markers", "--strict-config", "--tb=short",
+    "--disable-socket", "--allow-unix-socket", "--allow-hosts=127.0.0.1,::1,localhost",
+]
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]

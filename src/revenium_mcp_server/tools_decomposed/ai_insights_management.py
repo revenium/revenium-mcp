@@ -417,9 +417,6 @@ class AIInsightsManagement(ToolBase):
             filter_department_id=arguments.get("filter_department_id", ""),
             filter_include_descendants=arguments.get("filter_include_descendants", True),
             filter_include_coding_assistants=arguments.get("filter_include_coding_assistants", True),
-            filter_include_coding_assistants_for_cost_detectors=arguments.get(
-                "filter_include_coding_assistants_for_cost_detectors", False,
-            ),
             exclude_investigator_ids=arguments.get("exclude_investigator_ids"),
         )
         run_id = result.get("runId")
@@ -595,7 +592,6 @@ class AIInsightsManagement(ToolBase):
                     "description": INCLUDE_DESCENDANTS_DESCRIPTION,
                 },
                 "filter_include_coding_assistants": {"type": "boolean"},
-                "filter_include_coding_assistants_for_cost_detectors": {"type": "boolean"},
                 "exclude_investigator_ids": {"type": "array", "items": {"type": "string"}},
                 "slim": {"type": "boolean"},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 1000},
