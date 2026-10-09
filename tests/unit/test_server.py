@@ -37,7 +37,7 @@ class TestMCPServer:
         """Test that environment variables are properly loaded."""
         # This test verifies our test environment setup
         assert os.getenv("REVENIUM_API_KEY") == "test_api_key_12345"
-        assert os.getenv("REVENIUM_BASE_URL") == "https://api.test.revenium.ai"
+        assert os.getenv("REVENIUM_BASE_URL") == "https://api.revenium.invalid"
         assert os.getenv("LOG_LEVEL") == "ERROR"
 
 

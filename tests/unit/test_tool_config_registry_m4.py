@@ -1449,6 +1449,69 @@ class TestSystemDiagnosticsClosure:
         assert captured["tool_name"] == "system_diagnostics"
 
 
+class TestSystemDiagnosticsIngestionErrorCode:
+    """BACK-3980: the error_code filter reaches get_ingestion_failures through the registered tool."""
+
+    @staticmethod
+    async def _registered_server():
+        from fastmcp import FastMCP
+
+        mcp = FastMCP("back-3980")
+        await _make_registry()._register_system_diagnostics(mcp)
+        return mcp
+
+    @pytest.mark.asyncio
+    async def test_registered_tool_declares_error_code(self):
+        mcp = await self._registered_server()
+        tools = {tool.name: tool for tool in await mcp.list_tools(run_middleware=False)}
+        assert "error_code" in tools["system_diagnostics"].parameters["properties"]
+
+    @pytest.mark.asyncio
+    async def test_error_code_is_forwarded_and_omitted_when_absent(self):
+        registered_fn = await _get_registered_closure(
+            _make_registry(), "_register_system_diagnostics"
+        )
+        calls: list = []
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            calls.append(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="get_ingestion_failures", error_code="PRODUCT_NOT_FOUND")
+            await registered_fn(action="get_ingestion_failures")
+
+        assert calls[0]["error_code"] == "PRODUCT_NOT_FOUND"
+        assert "error_code" not in calls[1]
+
+    @pytest.mark.asyncio
+    async def test_invalid_error_code_is_refused_through_the_registered_tool(self):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError as FastMCPToolError
+
+        mcp = await self._registered_server()
+        mock = AsyncMock(return_value={"page": {"totalElements": 0}})
+        with patch(
+            "src.revenium_mcp_server.client.ReveniumClient.get_ingestion_failures",
+            new=mock,
+        ):
+            async with Client(mcp) as client:
+                with pytest.raises(FastMCPToolError) as exc_info:
+                    await client.call_tool(
+                        "system_diagnostics",
+                        {"action": "get_ingestion_failures", "error_code": "UNKNOWN_PRODUCT"},
+                    )
+
+        message = str(exc_info.value)
+        assert "UNKNOWN_PRODUCT" in message
+        assert "PRODUCT_NOT_FOUND" in message
+        assert "SUBSCRIPTION_RELATIONSHIP_NOT_FOUND" in message
+        mock.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # manage_metering closure
 # ---------------------------------------------------------------------------
@@ -2954,6 +3017,97 @@ class TestPrHealthClosureParameters:
         )
         for name in ("assisted_only", "automation_patterns", "cutoff_date", "excluded_repos"):
             assert name not in captured
+
+    _DIGEST_PARAMS = (
+        "digest_enabled",
+        "rotting_alert_enabled",
+        "day_of_week",
+        "hour_of_day",
+        "timezone",
+        "slack_configuration_ids",
+        "email_addresses",
+    )
+
+    @pytest.mark.asyncio
+    async def test_customers_signature_declares_digest_params(self):
+        """BACK-3951: update_pr_health_digest_settings reads these out of the
+        arguments dict; the read-only digest echoes are never parameters."""
+        import inspect
+
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_customers")
+        params = inspect.signature(fn).parameters
+        for name in self._DIGEST_PARAMS:
+            assert name in params
+        for read_only in ("slack_channels", "next_send_at", "last_outcome", "confirmed_providers"):
+            assert read_only not in params
+
+    @pytest.mark.asyncio
+    async def test_digest_arguments_match_between_closure_and_input_schema(self):
+        """BACK-3951 review: a client building calls from get_tool_metadata must see
+        every argument update_pr_health_digest_settings accepts, typed the way the
+        closure takes it, and the schema must advertise nothing the closure drops."""
+        import inspect
+        import typing
+
+        from src.revenium_mcp_server.tools_decomposed.customer_management import (
+            CustomerManagement,
+        )
+        from src.revenium_mcp_server.tools_decomposed.pr_health_digest_fields import (
+            PR_HEALTH_DIGEST_FIELDS,
+        )
+
+        registry = _make_registry(profile="business")
+        fn = await _get_registered_closure(registry, "_register_manage_customers")
+        closure_params = inspect.signature(fn).parameters
+        properties = (await CustomerManagement(ucm_helper=None)._get_input_schema())["properties"]
+
+        action_args = {field.snake for field in PR_HEALTH_DIGEST_FIELDS}
+        advertised_for_action = {
+            name for name, prop in properties.items()
+            if "update_pr_health_digest_settings" in prop.get("description", "")
+        }
+
+        assert action_args | {"team_id"} <= set(closure_params)
+        assert action_args | {"team_id"} <= set(properties)
+        assert advertised_for_action == action_args
+
+        python_type = {"boolean": bool, "integer": int, "string": str, "array": list}
+        for name in action_args:
+            accepted = {typing.get_origin(t) or t for t in typing.get_args(closure_params[name].annotation)}
+            assert python_type[properties[name]["type"]] in accepted, name
+
+    @pytest.mark.asyncio
+    async def test_serialized_digest_fields_are_decoded(self):
+        captured = await self._run(
+            "_register_manage_customers",
+            action="update_pr_health_digest_settings",
+            team_id="jR2kmLs",
+            digest_enabled="true",
+            rotting_alert_enabled="false",
+            hour_of_day="0",
+            slack_configuration_ids='["Zq8kP2a"]',
+            email_addresses="[]",
+        )
+        assert captured["digest_enabled"] is True
+        assert captured["rotting_alert_enabled"] is False
+        assert captured["hour_of_day"] == 0
+        assert captured["slack_configuration_ids"] == ["Zq8kP2a"]
+        assert captured["email_addresses"] == []
+
+    @pytest.mark.asyncio
+    async def test_digest_fields_omitted_when_not_supplied(self):
+        """A partial update must not grow keys the caller never named."""
+        captured = await self._run(
+            "_register_manage_customers",
+            action="update_pr_health_digest_settings",
+            team_id="jR2kmLs",
+            day_of_week="FRIDAY",
+        )
+        assert captured["day_of_week"] == "FRIDAY"
+        for name in self._DIGEST_PARAMS:
+            if name != "day_of_week":
+                assert name not in captured
 
 
 # ---------------------------------------------------------------------------

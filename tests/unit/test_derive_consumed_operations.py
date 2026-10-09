@@ -70,6 +70,9 @@ KNOWN_UNDECLARED_VERBS = {
         "BACK-3217 -- alert update is not declared on the alert-by-id path",
     ("hypercurrent", "/v2/api/sources/ai/alert/{id}", "delete"):
         "BACK-3217 -- alert delete is not declared on the alert-by-id path",
+    ("hypercurrent", "/v2/api/teams/{teamId}/settings/verified-domains", "put"):
+        "BACK-3983 -- the preview document dropped the add-domain PUT that "
+        "client.py add_team_verified_domain still sends; gated DEFER on 2026-10-08",
 }
 
 

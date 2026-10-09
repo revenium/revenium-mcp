@@ -270,6 +270,10 @@ class ToolConfigurationRegistry:
             # PR-health drill-downs and get_merged_prs (group_by is declared above)
             author: Optional[str] = None,
             bucket: Optional[str] = None,
+            cause: Optional[str] = None,
+            repo: Optional[str] = None,
+            ticket: Optional[str] = None,
+            triaged: Optional[str] = None,
             sort_by: Optional[str] = None,
             sort_dir: Optional[str] = None,
             granularity: Optional[str] = None,
@@ -278,6 +282,8 @@ class ToolConfigurationRegistry:
             include_pull_requests: Optional[Union[bool, str]] = None,
             pr_limit: Optional[Union[int, str]] = None,
             pr_offset: Optional[Union[int, str]] = None,
+            # PR-health action queue: get_pr_health_queue
+            per_cause: Optional[Union[int, str]] = None,
             # PR-health department narrowing (org_unit_id is its deprecated alias, see
             # common.department_aliases), and the drill-downs' AI-assisted filter
             department_id: Optional[Union[int, str]] = None,
@@ -286,6 +292,8 @@ class ToolConfigurationRegistry:
             assisted_only: Optional[Union[bool, str]] = None,
             # Provider metering-coverage report: get_coverage_ratio
             provider: Optional[str] = None,
+            # Coding-assistant team medians: get_ai_assistant_team_medians
+            window: Optional[str] = None,
             # Claude Enterprise seat census: get_seat_utilization. Named
             # from_date/to_date rather than reusing start_date/end_date because the
             # endpoint's own parameters are fromDate/toDate and its bounds are whole
@@ -342,6 +350,10 @@ class ToolConfigurationRegistry:
                 "source": source,
                 "author": author,
                 "bucket": bucket,
+                "cause": cause,
+                "repo": repo,
+                "ticket": ticket,
+                "triaged": triaged,
                 "sort_by": sort_by,
                 "sort_dir": sort_dir,
                 "granularity": granularity,
@@ -350,12 +362,15 @@ class ToolConfigurationRegistry:
                 "include_pull_requests": include_pull_requests,
                 "pr_limit": pr_limit,
                 "pr_offset": pr_offset,
+                "per_cause": per_cause,
                 "department_id": department_id,
                 "org_unit_id": org_unit_id,
                 "include_descendants": include_descendants,
                 "assisted_only": assisted_only,
                 # Provider metering-coverage report
                 "provider": provider,
+                # Coding-assistant team medians
+                "window": window,
                 # Claude Enterprise seat census
                 "from_date": from_date,
                 "to_date": to_date,
@@ -598,7 +613,6 @@ class ToolConfigurationRegistry:
             filter_org_unit_id: Optional[str] = None,
             filter_include_descendants: Optional[bool] = None,
             filter_include_coding_assistants: Optional[bool] = None,
-            filter_include_coding_assistants_for_cost_detectors: Optional[bool] = None,
             exclude_investigator_ids: Optional[List[str]] = None,
             slim: Optional[bool] = None,
             max_results: Optional[int] = None,
@@ -635,8 +649,6 @@ class ToolConfigurationRegistry:
                 "filter_org_unit_id": filter_org_unit_id,
                 "filter_include_descendants": filter_include_descendants,
                 "filter_include_coding_assistants": filter_include_coding_assistants,
-                "filter_include_coding_assistants_for_cost_detectors":
-                    filter_include_coding_assistants_for_cost_detectors,
                 "exclude_investigator_ids": exclude_investigator_ids,
                 "slim": slim,
                 "max_results": max_results,
@@ -779,6 +791,7 @@ class ToolConfigurationRegistry:
             search_all_pages: Optional[Union[bool, str]] = None,
             search_term: Optional[str] = None,
             status_filter: Optional[str] = None,
+            error_code: Optional[str] = None,
             # Tenant-setting toggles (set_strict_ingestion_mode,
             # set_attribution_detail_text, set_usage_billing): the closure
             # signature is this tool's public schema, so their arguments must
@@ -805,6 +818,7 @@ class ToolConfigurationRegistry:
                 "search_all_pages": search_all_pages,
                 "search_term": search_term,
                 "status_filter": status_filter,
+                "error_code": error_code,
                 "enabled": enabled,
                 "allow_ticket_jobs": allow_ticket_jobs,
                 "confirm": confirm
@@ -1495,6 +1509,14 @@ class ToolConfigurationRegistry:
             automation_patterns: Optional[Union[List[str], str]] = None,
             cutoff_date: Optional[str] = None,
             excluded_repos: Optional[Union[List[str], str]] = None,
+            # Team PR-health digest actions
+            digest_enabled: Optional[Union[bool, str]] = None,
+            rotting_alert_enabled: Optional[Union[bool, str]] = None,
+            day_of_week: Optional[str] = None,
+            hour_of_day: Optional[Union[int, str]] = None,
+            timezone: Optional[str] = None,
+            slack_configuration_ids: Optional[Union[List[str], str]] = None,
+            email_addresses: Optional[Union[List[str], str]] = None,
             # Team attribution-identity-policy and verified-domain actions
             policy: Optional[str] = None,
             domain: Optional[str] = None,
@@ -1526,6 +1548,13 @@ class ToolConfigurationRegistry:
                 "automation_patterns": automation_patterns,
                 "cutoff_date": cutoff_date,
                 "excluded_repos": excluded_repos,
+                "digest_enabled": digest_enabled,
+                "rotting_alert_enabled": rotting_alert_enabled,
+                "day_of_week": day_of_week,
+                "hour_of_day": hour_of_day,
+                "timezone": timezone,
+                "slack_configuration_ids": slack_configuration_ids,
+                "email_addresses": email_addresses,
                 "policy": policy,
                 "domain": domain,
                 "person_id": person_id,
@@ -1611,19 +1640,29 @@ class ToolConfigurationRegistry:
                 'size': int,
                 'aging_days': int,
                 'rotting_days': int,
+                'hour_of_day': int,
             }
             arguments = preprocess_numeric_parameters(arguments, numeric_params)
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values.
             # "confirm" is deliberately excluded: the department removals run only for a
             # literal boolean True, so a loosely typed confirm must stay a preview.
-            boolean_params = ["auto_generate", "dry_run", "assisted_only"]
+            boolean_params = [
+                "auto_generate", "dry_run", "assisted_only", "digest_enabled", "rotting_alert_enabled"
+            ]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
 
             # ARRAY PREPROCESSING: Convert string array parameters to actual Python lists.
             # A non-array string is left as-is so the tool raises its own structured error.
             arguments = preprocess_array_parameters(
-                arguments, ["marketplace_names", "automation_patterns", "excluded_repos"]
+                arguments,
+                [
+                    "marketplace_names",
+                    "automation_patterns",
+                    "excluded_repos",
+                    "slack_configuration_ids",
+                    "email_addresses",
+                ],
             )
 
             # Remove None values

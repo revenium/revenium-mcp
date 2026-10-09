@@ -93,7 +93,7 @@ def test_get_endpoint_config_preserves_force_new(flag_off, key):
 
 @pytest.mark.parametrize("key", PACK_KEYS)
 def test_resolve_uses_bearer_and_iso_dates_with_flag_off(flag_off, key):
-    """force_new endpoints route Bearer + startDate/endDate even with the flag off."""
+    """force_new endpoints route Bearer + startDate/endDate + the resolved team even with the flag off."""
     path, params, call_kwargs = resolve_analytics_request(
         key, team_id="team-123", period="THIRTY_DAYS"
     )
@@ -101,7 +101,7 @@ def test_resolve_uses_bearer_and_iso_dates_with_flag_off(flag_off, key):
     assert call_kwargs.get("use_bearer") is True
     assert "base_url" in call_kwargs
     assert "startDate" in params and "endDate" in params
-    assert "teamId" not in params
+    assert params["teamId"] == "team-123"
     assert "period" not in params
 
 

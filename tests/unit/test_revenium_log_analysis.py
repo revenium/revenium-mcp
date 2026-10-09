@@ -4,6 +4,10 @@ Tests handle_action routing, _validate_page_size, _analyze_operation_patterns,
 _format_analysis_response, and error handling paths.
 """
 
+import json
+import re
+from pathlib import Path
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from mcp.types import TextContent
@@ -19,6 +23,13 @@ from src.revenium_mcp_server.tools_decomposed.revenium_log_analysis import (
     ReveniumLogAnalysis,
 )
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
+from src.revenium_mcp_server.tools_decomposed.log_analysis_constants import (
+    CAPABILITIES_TEXT,
+    EXAMPLES_TEXT,
+    INGESTION_FAILURE_ERROR_CODES,
+)
+
+SNAPSHOT = Path(__file__).resolve().parents[2] / "specs" / "openapi" / "hypercurrent.json"
 
 
 @pytest.fixture
@@ -282,7 +293,7 @@ def _ingestion_client(
         else {"id": "ten_1", "usageBillingEnabled": True}
     )
     client._extract_embedded_data = MagicMock(
-        side_effect=lambda resp: resp.get("_embedded", {}).get("items", [])
+        side_effect=lambda resp: resp.get("_embedded", {}).get("ingestionFailureResourceList", [])
         if isinstance(resp, dict) else []
     )
     client._extract_pagination_info = MagicMock(
@@ -298,10 +309,18 @@ class TestGetIngestionFailures:
     async def test_renders_failures(self, log_tool):
         failures = {
             "_embedded": {
-                "items": [
+                "ingestionFailureResourceList": [
                     {
                         "failureTimestamp": "2026-07-21T10:00:00Z",
-                        "errors": [{"errorCode": "UNKNOWN_PRODUCT", "message": "no such product"}],
+                        "errors": [
+                            {
+                                "code": "PRODUCT_NOT_FOUND",
+                                "field": "productId",
+                                "value": "prd_xyz",
+                                "message": "no such product",
+                                "resolution": "Create the product before metering against it",
+                            }
+                        ],
                         "originalPayload": {"model": "gpt-4"},
                     }
                 ]
@@ -313,8 +332,40 @@ class TestGetIngestionFailures:
 
         result = await log_tool.handle_action("get_ingestion_failures", {})
         text = result[0].text
-        assert "UNKNOWN_PRODUCT" in text
         assert "2026-07-21T10:00:00Z" in text
+        assert "- **PRODUCT_NOT_FOUND**: no such product" in text
+        assert "Resolution: Create the product before metering against it" in text
+        assert "field `productId`, value `prd_xyz`" in text
+        assert "UNKNOWN" not in text
+
+    @pytest.mark.asyncio
+    async def test_error_without_field_or_resolution_renders_code_and_message_only(self, log_tool):
+        failures = {
+            "_embedded": {
+                "ingestionFailureResourceList": [
+                    {
+                        "failureTimestamp": "2026-07-21T10:00:00Z",
+                        "errors": [
+                            {
+                                "code": "SUBSCRIPTION_RELATIONSHIP_NOT_FOUND",
+                                "field": None,
+                                "value": None,
+                                "message": "no active subscription",
+                            }
+                        ],
+                    }
+                ]
+            },
+            "page": {"totalElements": 1},
+        }
+        client = _ingestion_client(failures=failures)
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_ingestion_failures", {})
+        text = result[0].text
+        assert "- **SUBSCRIPTION_RELATIONSHIP_NOT_FOUND**: no active subscription" in text
+        assert "Refers to" not in text
+        assert "Resolution" not in text
 
     @pytest.mark.asyncio
     async def test_empty_failures_renders_clean_message(self, log_tool):
@@ -331,10 +382,71 @@ class TestGetIngestionFailures:
         log_tool.get_client = AsyncMock(return_value=client)
 
         await log_tool.handle_action(
-            "get_ingestion_failures", {"error_code": "UNKNOWN_PRODUCT"}
+            "get_ingestion_failures", {"error_code": "PRODUCT_NOT_FOUND"}
         )
         kwargs = client.get_ingestion_failures.call_args.kwargs
-        assert kwargs.get("errorCode") == "UNKNOWN_PRODUCT"
+        assert kwargs.get("errorCode") == "PRODUCT_NOT_FOUND"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_code", ["UNKNOWN_PRODUCT", "product_not_found", 7])
+    async def test_error_code_outside_the_enum_is_refused_before_the_call(
+        self, log_tool, error_code
+    ):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        with pytest.raises(ToolError) as exc_info:
+            await log_tool.handle_action(
+                "get_ingestion_failures", {"error_code": error_code}
+            )
+        err = exc_info.value
+        assert err.error_code == ErrorCodes.VALIDATION_ERROR
+        assert err.field == "error_code"
+        assert err.value == error_code
+        for code in INGESTION_FAILURE_ERROR_CODES:
+            assert code in err.message
+        client.get_ingestion_failures.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_code", INGESTION_FAILURE_ERROR_CODES)
+    async def test_every_enum_code_is_forwarded(self, log_tool, error_code):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        await log_tool.handle_action("get_ingestion_failures", {"error_code": error_code})
+        assert client.get_ingestion_failures.call_args.kwargs.get("errorCode") == error_code
+
+    @pytest.mark.asyncio
+    async def test_error_code_stays_optional(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        await log_tool.handle_action("get_ingestion_failures", {})
+        assert "errorCode" not in client.get_ingestion_failures.call_args.kwargs
+
+
+class TestIngestionFailureErrorCodesMirrorTheSnapshot:
+    """The accepted error_code values are the errorCode enum the platform declares."""
+
+    def test_codes_match_the_declared_error_code_enum(self):
+        if not SNAPSHOT.exists():
+            pytest.skip(
+                "specs/openapi/ is internal-only and not part of the public export "
+                "(see public-allowlist-mcp.txt)"
+            )
+        spec = json.loads(SNAPSHOT.read_text())
+        operation = spec["paths"]["/v2/api/tenants/{id}/ingestion-failures"]["get"]
+        (error_code_param,) = [p for p in operation["parameters"] if p["name"] == "errorCode"]
+        assert INGESTION_FAILURE_ERROR_CODES == tuple(error_code_param["schema"]["enum"])
+
+    def test_capabilities_publish_the_accepted_codes(self):
+        for code in INGESTION_FAILURE_ERROR_CODES:
+            assert code in CAPABILITIES_TEXT
+
+    def test_example_error_code_is_an_accepted_code(self):
+        examples = re.findall(r'"error_code": "([^"]+)"', EXAMPLES_TEXT)
+        assert examples
+        assert set(examples) <= set(INGESTION_FAILURE_ERROR_CODES)
 
 
 class TestSetStrictIngestionMode:
@@ -420,10 +532,10 @@ class TestIngestionHardening:
         """A huge originalPayload is truncated, not rendered in full."""
         failures = {
             "_embedded": {
-                "items": [
+                "ingestionFailureResourceList": [
                     {
                         "failureTimestamp": "2026-07-21T10:00:00Z",
-                        "errors": [{"errorCode": "UNKNOWN_PRODUCT", "message": "x"}],
+                        "errors": [{"code": "PRODUCT_NOT_FOUND", "message": "x"}],
                         "originalPayload": {"blob": "x" * 20000},
                     }
                 ]
@@ -449,12 +561,18 @@ class TestIngestionTotalResponseBound:
         entries = [
             {
                 "failureTimestamp": f"2026-07-22T10:00:{i:02d}Z",
-                "errors": [{"errorCode": "UNKNOWN_PRODUCT", "message": "x" * 200}],
+                "errors": [
+                    {
+                        "code": "PRODUCT_NOT_FOUND",
+                        "message": "x" * 200,
+                        "resolution": "r" * 200,
+                    }
+                ],
                 "originalPayload": {"blob": "y" * 5000},
             }
             for i in range(20)
         ]
-        failures = {"_embedded": {"items": entries}, "page": {"totalElements": 20}}
+        failures = {"_embedded": {"ingestionFailureResourceList": entries}, "page": {"totalElements": 20}}
         client = _ingestion_client(failures=failures)
         log_tool.get_client = AsyncMock(return_value=client)
 
@@ -464,6 +582,70 @@ class TestIngestionTotalResponseBound:
         assert "truncated" in text.lower() or "more entries" in text.lower()
         # Guidance for narrowing must be present when output is cut
         assert "size" in text or "error_code" in text
+
+
+class TestIngestionErrorFieldBound:
+    """An oversized error value or resolution is shortened, not allowed to drop its entry."""
+
+    @pytest.mark.asyncio
+    async def test_oversized_value_keeps_code_and_message_visible(self, log_tool):
+        cap = ReveniumLogAnalysis._MAX_RENDERED_ERROR_FIELD_CHARS
+        oversized = "v" * (ReveniumLogAnalysis._MAX_RENDERED_RESPONSE_CHARS + 1000)
+        failures = {
+            "_embedded": {
+                "ingestionFailureResourceList": [
+                    {
+                        "failureTimestamp": "2026-07-23T10:00:00Z",
+                        "errors": [
+                            {
+                                "code": "PRODUCT_NOT_FOUND",
+                                "field": "productId",
+                                "value": oversized,
+                                "message": "no such product",
+                                "resolution": "Create the product first",
+                            }
+                        ],
+                    }
+                ]
+            },
+            "page": {"totalElements": 1},
+        }
+        client = _ingestion_client(failures=failures)
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_ingestion_failures", {})
+        text = result[0].text
+        assert "- **PRODUCT_NOT_FOUND**: no such product" in text
+        assert f"value `{'v' * cap}` (truncated, {len(oversized) - cap} more characters)" in text
+        assert "Resolution: Create the product first" in text
+        assert "more entries on this page" not in text
+
+    @pytest.mark.asyncio
+    async def test_oversized_resolution_is_truncated_with_a_note(self, log_tool):
+        cap = ReveniumLogAnalysis._MAX_RENDERED_ERROR_FIELD_CHARS
+        failures = {
+            "_embedded": {
+                "ingestionFailureResourceList": [
+                    {
+                        "failureTimestamp": "2026-07-23T10:00:00Z",
+                        "errors": [
+                            {
+                                "code": "CREDENTIAL_NOT_FOUND",
+                                "message": "no such credential",
+                                "resolution": "r" * (cap + 10),
+                            }
+                        ],
+                    }
+                ]
+            },
+            "page": {"totalElements": 1},
+        }
+        client = _ingestion_client(failures=failures)
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("get_ingestion_failures", {})
+        text = result[0].text
+        assert f"Resolution: {'r' * cap} (truncated, 10 more characters)" in text
 
 
 class TestStrictModeTicketJobsOptIn:
@@ -819,12 +1001,12 @@ class TestStrictModeReportsAttributionDetailText:
 
 
 class TestSetUsageBilling:
-    """BACK-3354: the switch for the tenant's billing screens.
+    """BACK-3354: the tenant's usage-based billing switch.
 
-    The flag decides whether invoices, payment methods, plan and subscription
-    screens are shown at all. It is presentation-only, and it lands on every
-    user of the tenant at once, so the action is confirm-gated and reports the
-    state the server returned rather than the one that was asked for.
+    Off hides invoices, payment methods, plan and subscription screens and stops
+    the platform rating the tenant's usage, which is never rated later. It lands
+    on every user of the tenant at once, so the action is confirm-gated and
+    reports the state the server returned rather than the one that was asked for.
     """
 
     @pytest.mark.asyncio
@@ -852,15 +1034,28 @@ class TestSetUsageBilling:
         client.set_usage_billing.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_preview_names_what_stays_running(self, log_tool):
-        """The preview must not read as a switch that stops billing."""
+    async def test_disable_preview_says_usage_stops_being_rated(self, log_tool):
+        """Whoever switches it off must learn the off period is never rated."""
         client = _ingestion_client()
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action("set_usage_billing", {"enabled": False})
         text = result[0].text
-        assert "presentation only" in text.lower()
-        assert "invoicing" in text
+        assert "STOPS being rated" in text
+        assert "never rated, even after it is turned back on" in text
+        assert "AI metrics keep being recorded" in text
+        assert "Subscription charges and tool-event line items are unaffected" in text
+
+    @pytest.mark.asyncio
+    async def test_enable_preview_says_the_gap_is_not_recovered(self, log_tool):
+        client = _ingestion_client()
+        log_tool.get_client = AsyncMock(return_value=client)
+
+        result = await log_tool.handle_action("set_usage_billing", {"enabled": True})
+        text = result[0].text
+        assert "SHOW the tenant's billing screens" in text
+        assert "not recovered" in text
+        client.set_usage_billing.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_with_confirm_toggles_and_renders_the_server_state(self, log_tool):
@@ -874,6 +1069,8 @@ class TestSetUsageBilling:
         client.set_usage_billing.assert_awaited_once_with(True)
         assert "Usage Billing Updated" in text
         assert "**State**: enabled" in text
+        assert "usage is rated from now on" in text
+        assert "Usage from the period it was off stays unrated" in text
         assert "ten_1" in text
         assert USAGE_BILLING_READ_PATH_NOTE in text
         assert TOGGLE_ONLY_TENANT_FLAGS_READ_PATH_NOTE not in text
@@ -891,7 +1088,7 @@ class TestSetUsageBilling:
         assert "**State**: disabled" in result[0].text
 
     @pytest.mark.asyncio
-    async def test_disable_states_billing_keeps_running(self, log_tool):
+    async def test_disable_states_usage_is_no_longer_rated(self, log_tool):
         client = _ingestion_client(
             usage_billing_result={"id": "ten_1", "usageBillingEnabled": False}
         )
@@ -902,7 +1099,8 @@ class TestSetUsageBilling:
         )
         text = result[0].text
         assert "**State**: disabled" in text
-        assert "invoices keep being produced" in text
+        assert "usage is no longer rated" in text
+        assert "will not be rated when the flag is turned back on" in text
 
     @pytest.mark.asyncio
     async def test_absent_state_is_not_reported_as_confirmed(self, log_tool):

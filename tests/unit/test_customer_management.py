@@ -47,6 +47,19 @@ from src.revenium_mcp_server.tools_decomposed.customer_management import (
     _format_departments_text,
     department_id_to_filter_value,
 )
+from src.revenium_mcp_server.tools_decomposed.coding_assistant_billing_fields import (
+    CODING_ASSISTANT_BILLING_DISPLAY_FIELDS,
+    CODING_ASSISTANT_BILLING_READ_ONLY_NOTE,
+    CODING_ASSISTANT_BILLING_SEMANTICS_NOTE,
+    CODING_ASSISTANT_CONFIRMATION_NOTE,
+)
+from src.revenium_mcp_server.tools_decomposed.pr_health_digest_fields import (
+    PR_HEALTH_DIGEST_DISPLAY_FIELDS,
+    PR_HEALTH_DIGEST_FIELDS,
+    PR_HEALTH_DIGEST_FIELDS_NOTE,
+    PR_HEALTH_DIGEST_NOT_ADOPTED_NOTE,
+    PR_HEALTH_DIGEST_PARTIAL_UPDATE_NOTE,
+)
 from src.revenium_mcp_server.tools_decomposed.pr_health_settings_fields import (
     PR_HEALTH_DISPLAY_FIELDS,
     PR_HEALTH_FIELDS_NOTE,
@@ -115,6 +128,9 @@ def mock_client():
     client.update_team_pr_health_settings = AsyncMock(
         return_value={"agingDays": 14, "rottingDays": 30}
     )
+    client.get_team_pr_health_digest_settings = AsyncMock(return_value={})
+    client.update_team_pr_health_digest_settings = AsyncMock(return_value={})
+    client.get_team_coding_assistant_filter_settings = AsyncMock(return_value={})
     client.get_team_attribution_identity_policy = AsyncMock(
         return_value={"policy": "VERIFIED_DOMAIN_ONLY"}
     )
@@ -2392,6 +2408,442 @@ DEPARTMENTS_PAYLOAD = [
 ]
 
 
+# Recorded from GET /v2/api/teams/{id}/settings/pr-health/digest on dev
+# (2026-10-08): a team that has never saved its digest.
+DEV_PR_HEALTH_DIGEST_SETTINGS = {
+    "enabled": False,
+    "rottingAlertEnabled": False,
+    "slackConfigurationIds": [],
+    "emailAddresses": [],
+    "dayOfWeek": "MONDAY",
+    "hourOfDay": 9,
+    "timezone": None,
+    "slackChannels": [],
+    "rottingDays": 30,
+    "nextSendAt": None,
+    "nextAlertAt": None,
+    "lastSentAt": None,
+    "lastAlertAt": None,
+    "lastAlertAttemptAt": None,
+    "lastAlertOutcome": None,
+    "lastAlertError": None,
+    "lastAttemptAt": None,
+    "lastOutcome": None,
+    "lastError": None,
+}
+
+
+class TestTeamPrHealthDigestSettingsRead:
+    """TeamManager.get_pr_health_digest_settings (BACK-3951)."""
+
+    @pytest.mark.asyncio
+    async def test_missing_team_id_raises_before_any_call(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_pr_health_digest_settings({})
+        assert exc.value.field == "team_id"
+        mock_client.get_team_pr_health_digest_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_renders_every_field_the_platform_returns(self, team_manager, mock_client):
+        mock_client.get_team_pr_health_digest_settings.return_value = DEV_PR_HEALTH_DIGEST_SETTINGS
+
+        result = await team_manager.get_pr_health_digest_settings({"team_id": "jR2kmLs"})
+
+        mock_client.get_team_pr_health_digest_settings.assert_called_once_with("jR2kmLs")
+        assert result["team_id"] == "jR2kmLs"
+        for camel in PR_HEALTH_DIGEST_DISPLAY_FIELDS:
+            assert result[camel] == DEV_PR_HEALTH_DIGEST_SETTINGS[camel]
+        assert result["field_semantics"] == PR_HEALTH_DIGEST_FIELDS_NOTE
+        assert result["not_available"] == PR_HEALTH_DIGEST_NOT_ADOPTED_NOTE
+
+    @pytest.mark.asyncio
+    async def test_a_null_timezone_stays_null_and_absent_fields_are_omitted(
+        self, team_manager, mock_client
+    ):
+        """An unsaved zone is null, not a default this tool invents; a field the
+        platform does not return is left out rather than shown as null."""
+        mock_client.get_team_pr_health_digest_settings.return_value = {
+            "enabled": False,
+            "timezone": None,
+        }
+
+        result = await team_manager.get_pr_health_digest_settings({"team_id": "jR2kmLs"})
+
+        assert result["timezone"] is None
+        assert "nextSendAt" not in result
+        assert "slackChannels" not in result
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status, error_code",
+        [(403, ErrorCodes.API_AUTHORIZATION), (404, ErrorCodes.RESOURCE_NOT_FOUND)],
+    )
+    async def test_permission_and_missing_team_are_translated(
+        self, team_manager, mock_client, status, error_code
+    ):
+        mock_client.get_team_pr_health_digest_settings.side_effect = ReveniumAPIError(
+            "nope", status_code=status
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_pr_health_digest_settings({"team_id": "jR2kmLs"})
+        assert exc.value.error_code == error_code
+
+    @pytest.mark.asyncio
+    async def test_500_reraises(self, team_manager, mock_client):
+        mock_client.get_team_pr_health_digest_settings.side_effect = ReveniumAPIError(
+            "Boom", status_code=500
+        )
+        with pytest.raises(ReveniumAPIError):
+            await team_manager.get_pr_health_digest_settings({"team_id": "jR2kmLs"})
+
+    @pytest.mark.asyncio
+    async def test_rendered_text_carries_the_settings(self, mock_client):
+        tool = CustomerManagement(ucm_helper=None)
+        mock_client.get_team_pr_health_digest_settings.return_value = DEV_PR_HEALTH_DIGEST_SETTINGS
+        with patch.object(tool, "get_client", AsyncMock(return_value=mock_client)):
+            result = await tool.handle_action("get_pr_health_digest_settings", {"team_id": "jR2kmLs"})
+        text = result[0].text
+        assert text.startswith("PR health digest settings for team jR2kmLs")
+        assert '"dayOfWeek": "MONDAY"' in text
+        assert '"timezone": null' in text
+
+
+class TestTeamPrHealthDigestSettingsUpdate:
+    """TeamManager.update_pr_health_digest_settings sends exactly the caller's fields:
+    the PUT is a partial update, so a read-merge would make it last-writer-wins."""
+
+    @pytest.fixture(autouse=True)
+    def _echo(self, mock_client):
+        mock_client.update_team_pr_health_digest_settings.side_effect = (
+            lambda team_id, body: {**DEV_PR_HEALTH_DIGEST_SETTINGS, **body}
+        )
+
+    def _sent_body(self, mock_client):
+        mock_client.update_team_pr_health_digest_settings.assert_called_once()
+        return mock_client.update_team_pr_health_digest_settings.call_args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_one_field_sends_a_one_field_body_and_reads_nothing(
+        self, team_manager, mock_client
+    ):
+        await team_manager.update_pr_health_digest_settings(
+            {"team_id": "jR2kmLs", "hour_of_day": 16}
+        )
+
+        assert self._sent_body(mock_client) == {"hourOfDay": 16}
+        mock_client.update_team_pr_health_digest_settings.assert_called_once_with(
+            "jR2kmLs", {"hourOfDay": 16}
+        )
+        mock_client.get_team_pr_health_digest_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_every_field_is_sent_under_its_wire_name(self, team_manager, mock_client):
+        await team_manager.update_pr_health_digest_settings({
+            "team_id": "jR2kmLs",
+            "digest_enabled": True,
+            "rotting_alert_enabled": False,
+            "day_of_week": "friday",
+            "hour_of_day": 0,
+            "timezone": " America/New_York ",
+            "slack_configuration_ids": ["Zq8kP2a"],
+            "email_addresses": ["eng-leads@acme.com"],
+        })
+
+        assert self._sent_body(mock_client) == {
+            "enabled": True,
+            "rottingAlertEnabled": False,
+            "dayOfWeek": "FRIDAY",
+            "hourOfDay": 0,
+            "timezone": "America/New_York",
+            "slackConfigurationIds": ["Zq8kP2a"],
+            "emailAddresses": ["eng-leads@acme.com"],
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "snake, camel",
+        [("email_addresses", "emailAddresses"), ("slack_configuration_ids", "slackConfigurationIds")],
+    )
+    async def test_an_empty_list_is_sent_to_clear_the_stored_one(
+        self, team_manager, mock_client, snake, camel
+    ):
+        await team_manager.update_pr_health_digest_settings({"team_id": "jR2kmLs", snake: []})
+
+        assert self._sent_body(mock_client) == {camel: []}
+
+    @pytest.mark.asyncio
+    async def test_omitted_and_null_fields_are_not_sent(self, team_manager, mock_client):
+        await team_manager.update_pr_health_digest_settings({
+            "team_id": "jR2kmLs",
+            "digest_enabled": False,
+            "timezone": None,
+            "email_addresses": None,
+        })
+
+        assert self._sent_body(mock_client) == {"enabled": False}
+
+    @pytest.mark.asyncio
+    async def test_no_digest_field_is_refused_before_any_call(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_digest_settings({"team_id": "jR2kmLs"})
+
+        assert exc.value.field == "digest_enabled"
+        mock_client.update_team_pr_health_digest_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_team_id_is_refused_before_any_call(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_digest_settings({"digest_enabled": True})
+
+        assert exc.value.field == "team_id"
+        mock_client.update_team_pr_health_digest_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "snake, value",
+        [
+            ("digest_enabled", "yes"),
+            ("rotting_alert_enabled", 1),
+            ("day_of_week", "Funday"),
+            ("day_of_week", 1),
+            ("hour_of_day", 24),
+            ("hour_of_day", -1),
+            ("hour_of_day", True),
+            ("hour_of_day", "9"),
+            ("timezone", "  "),
+            ("slack_configuration_ids", "Zq8kP2a"),
+            ("slack_configuration_ids", [f"id{n}" for n in range(6)]),
+            ("email_addresses", [f"dev{n}@acme.com" for n in range(21)]),
+            ("email_addresses", ["eng-leads@acme.com", " "]),
+        ],
+    )
+    async def test_out_of_contract_values_are_refused_before_any_call(
+        self, team_manager, mock_client, snake, value
+    ):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_digest_settings({"team_id": "jR2kmLs", snake: value})
+
+        assert exc.value.field == snake
+        mock_client.update_team_pr_health_digest_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_documented_limits_are_accepted(self, team_manager, mock_client):
+        await team_manager.update_pr_health_digest_settings({
+            "team_id": "jR2kmLs",
+            "hour_of_day": 23,
+            "slack_configuration_ids": [f"id{n}" for n in range(5)],
+            "email_addresses": [f"dev{n}@acme.com" for n in range(20)],
+        })
+
+        body = self._sent_body(mock_client)
+        assert body["hourOfDay"] == 23
+        assert len(body["slackConfigurationIds"]) == 5
+        assert len(body["emailAddresses"]) == 20
+
+    @pytest.mark.asyncio
+    async def test_response_reports_what_was_sent_beside_what_was_stored(
+        self, team_manager, mock_client
+    ):
+        mock_client.update_team_pr_health_digest_settings.side_effect = None
+        mock_client.update_team_pr_health_digest_settings.return_value = {
+            **DEV_PR_HEALTH_DIGEST_SETTINGS,
+            "emailAddresses": ["eng-leads@acme.com"],
+        }
+
+        result = await team_manager.update_pr_health_digest_settings(
+            {"team_id": "jR2kmLs", "email_addresses": ["Eng-Leads@acme.com "]}
+        )
+
+        assert result["sent"] == {"emailAddresses": ["Eng-Leads@acme.com "]}
+        assert result["emailAddresses"] == ["eng-leads@acme.com"]
+        assert result["partial_update"] == PR_HEALTH_DIGEST_PARTIAL_UPDATE_NOTE
+
+    @pytest.mark.asyncio
+    async def test_a_platform_400_reaches_the_caller(self, team_manager, mock_client):
+        """The cross-field rule (a switch on needs a destination and a timezone)
+        depends on stored values this action deliberately does not read."""
+        mock_client.update_team_pr_health_digest_settings.side_effect = ReveniumAPIError(
+            "A timezone is required when the digest is on", status_code=400
+        )
+        with pytest.raises(ReveniumAPIError) as exc:
+            await team_manager.update_pr_health_digest_settings(
+                {"team_id": "jR2kmLs", "digest_enabled": True}
+            )
+        assert exc.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_403_is_translated(self, team_manager, mock_client):
+        mock_client.update_team_pr_health_digest_settings.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.update_pr_health_digest_settings(
+                {"team_id": "jR2kmLs", "digest_enabled": True}
+            )
+        assert exc.value.error_code == ErrorCodes.API_AUTHORIZATION
+        assert "PR health digest settings" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_routed_and_rendered_with_the_sent_fields_first(self, mock_client):
+        tool = CustomerManagement(ucm_helper=None)
+        actions = await tool._get_supported_actions()
+        assert "get_pr_health_digest_settings" in actions
+        assert "update_pr_health_digest_settings" in actions
+
+        with patch.object(tool, "get_client", AsyncMock(return_value=mock_client)):
+            result = await tool.handle_action(
+                "update_pr_health_digest_settings",
+                {"team_id": "jR2kmLs", "day_of_week": "FRIDAY", "email_addresses": []},
+            )
+
+        text = result[0].text
+        assert text.startswith(
+            "PR health digest settings updated for team jR2kmLs (sent: dayOfWeek, emailAddresses)"
+        )
+        assert text.endswith(PR_HEALTH_DIGEST_PARTIAL_UPDATE_NOTE)
+
+    def test_capabilities_document_every_field_and_the_exclusions(self, customer_mgmt):
+        text = customer_mgmt._format_capabilities_response({})[0].text
+
+        assert "get_pr_health_digest_settings(team_id='jR2kmLs')" in text
+        for field in PR_HEALTH_DIGEST_FIELDS:
+            assert f"`{field.snake}`" in text or f"{field.snake}=" in text, field.snake
+        assert PR_HEALTH_DIGEST_PARTIAL_UPDATE_NOTE in text
+        assert PR_HEALTH_DIGEST_NOT_ADOPTED_NOTE in text
+
+
+# The dev response to GET /v2/api/teams/{id}/settings/coding-assistant-filter
+# (2026-10-08), whose lists were both empty, with ClaudeCode added to each so the
+# rendering of a non-empty list is pinned too.
+DEV_CODING_ASSISTANT_FILTER_SETTINGS = {
+    "enabled": True,
+    "apiRateProviders": ["ClaudeCode"],
+    "defaultProviders": [],
+    "allowUserOverride": False,
+    "persistence": "appconfig",
+    "classificationSource": "tenant_default",
+    "confidence": "medium",
+    "needsReview": True,
+    "confirmedProviders": ["ClaudeCode"],
+}
+
+
+class TestTeamCodingAssistantBillingSettingsRead:
+    """TeamManager.get_coding_assistant_billing_settings (BACK-3945)."""
+
+    @pytest.mark.asyncio
+    async def test_missing_team_id_raises_before_any_call(self, team_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_coding_assistant_billing_settings({})
+        assert exc.value.field == "team_id"
+        mock_client.get_team_coding_assistant_filter_settings.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reads_the_addressed_team(self, team_manager, mock_client):
+        await team_manager.get_coding_assistant_billing_settings({"team_id": " jR2kmLs "})
+        mock_client.get_team_coding_assistant_filter_settings.assert_called_once_with("jR2kmLs")
+
+    @pytest.mark.asyncio
+    async def test_renders_the_pricing_mode_fields_including_confirmed_providers(
+        self, team_manager, mock_client
+    ):
+        mock_client.get_team_coding_assistant_filter_settings.return_value = (
+            DEV_CODING_ASSISTANT_FILTER_SETTINGS
+        )
+
+        result = await team_manager.get_coding_assistant_billing_settings({"team_id": "jR2kmLs"})
+
+        assert result["team_id"] == "jR2kmLs"
+        for camel in CODING_ASSISTANT_BILLING_DISPLAY_FIELDS:
+            assert result[camel] == DEV_CODING_ASSISTANT_FILTER_SETTINGS[camel]
+        assert result["confirmedProviders"] == ["ClaudeCode"]
+        assert result["billing_semantics"] == CODING_ASSISTANT_BILLING_SEMANTICS_NOTE
+        assert result["confirmation_semantics"] == CODING_ASSISTANT_CONFIRMATION_NOTE
+        assert result["read_only"] == CODING_ASSISTANT_BILLING_READ_ONLY_NOTE
+
+    @pytest.mark.asyncio
+    async def test_deprecated_legacy_fields_are_not_rendered(self, team_manager, mock_client):
+        """enabled/defaultProviders/allowUserOverride are retired switches, not live settings."""
+        mock_client.get_team_coding_assistant_filter_settings.return_value = (
+            DEV_CODING_ASSISTANT_FILTER_SETTINGS
+        )
+
+        result = await team_manager.get_coding_assistant_billing_settings({"team_id": "jR2kmLs"})
+
+        for legacy in ("enabled", "defaultProviders", "allowUserOverride"):
+            assert legacy not in result
+
+    @pytest.mark.asyncio
+    async def test_an_empty_provider_list_stays_empty_and_an_absent_field_is_omitted(
+        self, team_manager, mock_client
+    ):
+        """[] means no assistant is billed at API rates; an absent confirmedProviders
+        (a platform predating it) must not read as 'nobody confirmed anything'."""
+        mock_client.get_team_coding_assistant_filter_settings.return_value = {
+            "apiRateProviders": [],
+            "needsReview": True,
+        }
+
+        result = await team_manager.get_coding_assistant_billing_settings({"team_id": "jR2kmLs"})
+
+        assert result["apiRateProviders"] == []
+        assert "confirmedProviders" not in result
+
+    @pytest.mark.asyncio
+    async def test_403_maps_to_authorization_error(self, team_manager, mock_client):
+        mock_client.get_team_coding_assistant_filter_settings.side_effect = ReveniumAPIError(
+            "Forbidden", status_code=403
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_coding_assistant_billing_settings({"team_id": "jR2kmLs"})
+        assert exc.value.error_code == ErrorCodes.API_AUTHORIZATION
+        assert "coding-assistant billing settings" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_404_maps_to_not_found(self, team_manager, mock_client):
+        mock_client.get_team_coding_assistant_filter_settings.side_effect = ReveniumAPIError(
+            "Not found", status_code=404
+        )
+        with pytest.raises(ToolError) as exc:
+            await team_manager.get_coding_assistant_billing_settings({"team_id": "bad"})
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_500_reraises(self, team_manager, mock_client):
+        mock_client.get_team_coding_assistant_filter_settings.side_effect = ReveniumAPIError(
+            "Boom", status_code=500
+        )
+        with pytest.raises(ReveniumAPIError):
+            await team_manager.get_coding_assistant_billing_settings({"team_id": "jR2kmLs"})
+
+    @pytest.mark.asyncio
+    async def test_action_is_supported_routed_and_rendered(self, mock_client):
+        tool = CustomerManagement(ucm_helper=None)
+        assert "get_coding_assistant_billing_settings" in await tool._get_supported_actions()
+        mock_client.get_team_coding_assistant_filter_settings.return_value = (
+            DEV_CODING_ASSISTANT_FILTER_SETTINGS
+        )
+
+        with patch.object(tool, "get_client", AsyncMock(return_value=mock_client)):
+            result = await tool.handle_action(
+                "get_coding_assistant_billing_settings", {"team_id": "jR2kmLs"}
+            )
+
+        text = result[0].text
+        assert text.startswith("Coding-assistant billing settings for team jR2kmLs")
+        assert '"confirmedProviders": [\n    "ClaudeCode"\n  ]' in text
+        assert text.endswith(CODING_ASSISTANT_BILLING_READ_ONLY_NOTE)
+
+    def test_capabilities_text_documents_the_read_and_that_writes_stay_in_the_app(
+        self, customer_mgmt
+    ):
+        text = customer_mgmt._format_capabilities_response({})[0].text
+
+        assert "get_coding_assistant_billing_settings(team_id='jR2kmLs')" in text
+        assert "`confirmedProviders`" in text
+        assert CODING_ASSISTANT_BILLING_READ_ONLY_NOTE in text
+
+
 class TestDepartmentIdConversion:
     """department_id_to_filter_value - BACK-2767's single number-to-string rule."""
 
@@ -4324,6 +4776,10 @@ class TestCustomerManagementDepartmentRemovalActions:
         assert DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE in department_capability.limitations
         assert "removeMissing" in DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE
         assert "membershipsRemoved" in DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE
+
+    def test_csv_import_note_names_the_history_corrections_history_and_undo(self):
+        for ui_only in ("rewriteHistory", "rewriteFrom", "import history", "undo"):
+            assert ui_only in DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE, ui_only
 
     def test_capabilities_text_documents_the_confirm_gate_and_csv_exclusion(self, customer_mgmt):
         text = customer_mgmt._format_capabilities_response({})[0].text

@@ -2,11 +2,17 @@
 
 import inspect
 
+import os
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import httpx
 
-from src.revenium_mcp_server.client import PrHealthSettingsPayload, ReveniumAPIError, ReveniumClient
+from src.revenium_mcp_server.client import (
+    PrHealthDigestSettingsPayload,
+    PrHealthSettingsPayload,
+    ReveniumAPIError,
+    ReveniumClient,
+)
 from src.revenium_mcp_server.auth import AuthConfig
 
 
@@ -32,7 +38,7 @@ class TestReveniumClient:
         client = ReveniumClient()
         assert client.api_key == "test_api_key_12345"
         assert client.team_id == "test_team_id_456"
-        assert client.base_url == "https://api.test.revenium.ai"
+        assert client.base_url == "https://api.revenium.invalid"
         assert client.timeout == 30.0
 
     def test_client_initialization_missing_api_key(self, monkeypatch):
@@ -56,11 +62,11 @@ class TestReveniumClient:
 
         # Test with leading slash
         url = client._build_url("/profitstream/v2/api/products")
-        assert url == "https://api.test.revenium.ai/profitstream/v2/api/products"
+        assert url == "https://api.revenium.invalid/profitstream/v2/api/products"
 
         # Test without leading slash
         url = client._build_url("profitstream/v2/api/products")
-        assert url == "https://api.test.revenium.ai/profitstream/v2/api/products"
+        assert url == "https://api.revenium.invalid/profitstream/v2/api/products"
 
     @pytest.mark.asyncio
     async def test_request_success(self, mock_env_vars):
@@ -337,6 +343,124 @@ class TestTeamPrHealthSettings:
             assert preceding[-1] == "", f"missing blank line before {definition.strip()}"
 
 
+class TestTeamPrHealthDigestSettings:
+    """The team PR-health digest settings read and partial update (BACK-3951)."""
+
+    PATH = "/profitstream/v2/api/teams/jR2kmLs/settings/pr-health/digest"
+
+    @pytest.mark.asyncio
+    async def test_get_targets_the_digest_endpoint_with_tenant_scope(self, mock_env_vars):
+        client = ReveniumClient()
+        payload = {"enabled": False, "dayOfWeek": "MONDAY", "hourOfDay": 9, "timezone": None}
+
+        with patch.object(client, "get", new_callable=AsyncMock, return_value=payload) as mock_get:
+            result = await client.get_team_pr_health_digest_settings("jR2kmLs")
+
+        assert result == payload
+        assert mock_get.call_args[0][0] == self.PATH
+        params = mock_get.call_args[1]["params"]
+        assert "teamId" not in params
+        assert params == client._add_tenant_id_to_params()
+
+    @pytest.mark.asyncio
+    async def test_put_forwards_only_the_given_fields_verbatim(self, mock_env_vars):
+        """The PUT is a partial update: nothing is added to the body, and an empty
+        list reaches the wire as [] because that is what clears a stored list."""
+        client = ReveniumClient()
+        settings: PrHealthDigestSettingsPayload = {"emailAddresses": [], "hourOfDay": 0}
+
+        with patch.object(client, "put", new_callable=AsyncMock, return_value={}) as mock_put:
+            await client.update_team_pr_health_digest_settings("jR2kmLs", settings)
+
+        assert mock_put.call_args[0][0] == self.PATH
+        assert mock_put.call_args[1]["data"] == {"emailAddresses": [], "hourOfDay": 0}
+        assert mock_put.call_args[1]["params"] == client._add_tenant_id_to_params()
+
+    @pytest.mark.asyncio
+    async def test_put_propagates_api_error(self, mock_env_vars):
+        client = ReveniumClient()
+
+        with patch.object(
+            client, "put", new_callable=AsyncMock,
+            side_effect=ReveniumAPIError("Bad Request", status_code=400),
+        ):
+            with pytest.raises(ReveniumAPIError) as exc_info:
+                await client.update_team_pr_health_digest_settings("jR2kmLs", {"enabled": True})
+
+        assert exc_info.value.status_code == 400
+
+    def test_payload_declares_no_required_field(self):
+        assert PrHealthDigestSettingsPayload.__required_keys__ == frozenset()
+
+    def test_the_client_never_previews_or_test_sends(self):
+        """Decision (BACK-3951): the test send delivers real messages."""
+        source = inspect.getsource(ReveniumClient)
+        assert "pr-health/digest/test" not in source
+        assert "pr-health/digest/preview" not in source
+
+    def test_methods_keep_pep8_method_spacing(self):
+        source = inspect.getsource(ReveniumClient)
+        for definition in (
+            "    async def get_team_pr_health_digest_settings(",
+            "    async def update_team_pr_health_digest_settings(",
+        ):
+            preceding = source[: source.index(definition)].splitlines()
+            assert preceding[-1] == "", f"missing blank line before {definition.strip()}"
+
+
+class TestTeamCodingAssistantFilterSettings:
+    """The team coding-assistant billing settings read (BACK-3945)."""
+
+    PATH = "/profitstream/v2/api/teams/jR2kmLs/settings/coding-assistant-filter"
+
+    @pytest.mark.asyncio
+    async def test_get_targets_the_settings_endpoint_with_tenant_scope(self, mock_env_vars):
+        client = ReveniumClient()
+        payload = {"apiRateProviders": ["ClaudeCode"], "confirmedProviders": ["ClaudeCode"]}
+
+        with patch.object(client, "get", new_callable=AsyncMock, return_value=payload) as mock_get:
+            result = await client.get_team_coding_assistant_filter_settings("jR2kmLs")
+
+        assert result == payload
+        assert mock_get.call_args[0][0] == self.PATH
+        params = mock_get.call_args[1]["params"]
+        assert "teamId" not in params
+        assert params == client._add_tenant_id_to_params()
+
+    @pytest.mark.asyncio
+    async def test_get_propagates_api_error(self, mock_env_vars):
+        client = ReveniumClient()
+
+        with patch.object(
+            client, "get", new_callable=AsyncMock,
+            side_effect=ReveniumAPIError("Forbidden", status_code=403),
+        ):
+            with pytest.raises(ReveniumAPIError) as exc_info:
+                await client.get_team_coding_assistant_filter_settings("jR2kmLs")
+
+        assert exc_info.value.status_code == 403
+
+    def test_the_client_never_writes_the_billing_settings(self):
+        """Decision (BACK-3945): the billing mode is changed in the app, so neither the
+        whole-settings PUT nor the per-provider confirm has a client method."""
+        source = inspect.getsource(ReveniumClient)
+        assert "coding-assistant-filter/providers" not in source
+        writers = [
+            name for name, _ in inspect.getmembers(ReveniumClient, inspect.iscoroutinefunction)
+            if "coding_assistant_filter" in name and not name.startswith("get_")
+        ]
+        assert writers == []
+
+    def test_method_keeps_pep8_method_spacing(self):
+        source = inspect.getsource(ReveniumClient)
+        for definition in (
+            "    async def get_team_coding_assistant_filter_settings(",
+            "    async def get_team_attribution_identity_policy(",
+        ):
+            preceding = source[: source.index(definition)].splitlines()
+            assert preceding[-1] == "", f"missing blank line before {definition.strip()}"
+
+
 class TestTeamAttributionIdentityPolicy:
     """Test the team attribution-identity-policy client methods."""
 
@@ -478,7 +602,7 @@ class TestTeamVerifiedDomains:
 
 
 class TestGetVcsPrHealth:
-    """get_vcs_pr_health — the principal-scoped PR-health report read."""
+    """get_vcs_pr_health — the PR-health report read, scoped to the resolved team."""
 
     @pytest.mark.asyncio
     async def test_targets_the_billing_users_report_path(self, mock_env_vars):
@@ -493,8 +617,10 @@ class TestGetVcsPrHealth:
         assert mock_get.call_args[0][0] == "/profitstream/v2/api/billing/users/vcs-pr-health"
 
     @pytest.mark.asyncio
-    async def test_sends_exactly_the_three_required_query_params(self, mock_env_vars):
-        """The report resolves the org from the caller's principal: no team/tenant scope."""
+    async def test_sends_the_three_required_query_params_and_the_resolved_team(
+        self, mock_env_vars
+    ):
+        """Without teamId a signed-in user gets their first organization, not the resolved team."""
         client = ReveniumClient()
 
         with patch.object(
@@ -507,7 +633,19 @@ class TestGetVcsPrHealth:
             "source": "gitlab",
             "startDate": "2026-01-01",
             "endDate": "2026-01-31",
+            "teamId": "test_team_id_456",
         }
+
+    @pytest.mark.asyncio
+    async def test_omits_the_team_when_none_is_resolved(self, mock_env_vars):
+        client = ReveniumClient()
+
+        with patch.object(
+            ReveniumClient, "team_id", new_callable=PropertyMock, return_value=None
+        ), patch.object(client, "get", new_callable=AsyncMock, return_value={}) as mock_get:
+            await client.get_vcs_pr_health("gitlab", "2026-01-01", "2026-01-31")
+
+        assert "teamId" not in mock_get.call_args[1]["params"]
 
     @pytest.mark.asyncio
     async def test_propagates_api_error(self, mock_env_vars):
@@ -537,15 +675,21 @@ class TestGetVcsPrHealth:
             "endDate": "2026-01-31",
             "departmentId": 42,
             "includeDescendants": True,
+            "teamId": "test_team_id_456",
         }
 
 
 class TestVcsPrHealthScopedSubReads:
-    """BACK-3387: the drill-downs forward the department scope and assistedOnly, never a team id."""
+    """BACK-3387: the drill-downs forward the department scope and assistedOnly; the team is the resolved one."""
 
     SCOPE = {"department_id": 7, "include_descendants": False, "assisted_only": True}
     WIRE_SCOPE = {"departmentId": 7, "includeDescendants": False, "assistedOnly": True}
-    WINDOW = {"source": "github", "startDate": "2026-05-17", "endDate": "2026-08-17"}
+    WINDOW = {
+        "source": "github",
+        "startDate": "2026-05-17",
+        "endDate": "2026-08-17",
+        "teamId": "test_team_id_456",
+    }
 
     @staticmethod
     async def _params_sent(read, *args, **kwargs):
@@ -587,9 +731,51 @@ class TestVcsPrHealthScopedSubReads:
         assert params == {**self.WINDOW, "author": "alice"}
 
 
+class TestVcsPrHealthListFilters:
+    """BACK-3952: the pull-request list filters and the engineer search reach the wire only when set."""
+
+    WINDOW = {"source": "github", "startDate": "2026-05-17", "endDate": "2026-08-17"}
+
+    @staticmethod
+    async def _params_sent(read, **kwargs):
+        client = ReveniumClient()
+        with patch.object(client, "get", new_callable=AsyncMock, return_value={}) as mock_get:
+            await getattr(client, read)("github", "2026-05-17", "2026-08-17", **kwargs)
+        return mock_get.call_args[1]["params"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "kwarg, wire, value",
+        [
+            ("cause", "cause", "WAITING_ON_REVIEW"),
+            ("repo", "repo", "acme/widget"),
+            ("ticket", "ticket", "BACK-3348"),
+            ("triaged", "triaged", "ONLY"),
+        ],
+    )
+    async def test_pull_request_filter_is_sent_when_set(self, mock_env_vars, kwarg, wire, value):
+        params = await self._params_sent("get_vcs_pr_health_pull_requests", **{kwarg: value})
+        assert params == {**self.WINDOW, "teamId": os.environ["REVENIUM_TEAM_ID"], wire: value}
+
+    @pytest.mark.asyncio
+    async def test_pull_request_filters_are_omitted_when_unset(self, mock_env_vars):
+        params = await self._params_sent("get_vcs_pr_health_pull_requests", bucket="AUTOMATION")
+        assert params == {**self.WINDOW, "teamId": os.environ["REVENIUM_TEAM_ID"], "bucket": "AUTOMATION"}
+
+    @pytest.mark.asyncio
+    async def test_engineer_search_is_sent_as_q(self, mock_env_vars):
+        params = await self._params_sent("get_vcs_pr_health_engineers", q="ali")
+        assert params == {**self.WINDOW, "teamId": os.environ["REVENIUM_TEAM_ID"], "q": "ali"}
+
+    @pytest.mark.asyncio
+    async def test_engineer_search_is_omitted_when_unset(self, mock_env_vars):
+        params = await self._params_sent("get_vcs_pr_health_engineers", page=0)
+        assert params == {**self.WINDOW, "teamId": os.environ["REVENIUM_TEAM_ID"], "page": 0}
+
+
 class TestGetVcsPrHealthRepositories:
     @pytest.mark.asyncio
-    async def test_sends_source_only_with_no_team_or_window(self, mock_env_vars):
+    async def test_sends_source_and_the_resolved_team_with_no_window(self, mock_env_vars):
         client = ReveniumClient()
         payload = {"source": "github", "repositories": [{"repoName": "acme/api", "openPrs": 3}]}
 
@@ -600,6 +786,85 @@ class TestGetVcsPrHealthRepositories:
         assert mock_get.call_args[0][0] == (
             "/profitstream/v2/api/billing/users/vcs-pr-health/repositories"
         )
+        assert mock_get.call_args[1]["params"] == {"source": "github", "teamId": "test_team_id_456"}
+
+
+class TestVcsPrHealthBreakdownQueueTrendFollowThrough:
+    """BACK-3953: the four new PR-health reads send what was set plus the resolved team, nothing else."""
+
+    TEAM = {"teamId": "test_team_id_456"}
+    SCOPE = {"department_id": 7, "include_descendants": True}
+    WIRE_SCOPE = {"departmentId": 7, "includeDescendants": True}
+
+    @staticmethod
+    async def _sent(read, *args, **kwargs):
+        client = ReveniumClient()
+        with patch.object(client, "get", new_callable=AsyncMock, return_value={}) as mock_get:
+            await getattr(client, read)(*args, **kwargs)
+        return mock_get.call_args[0][0], mock_get.call_args[1]["params"]
+
+    @pytest.mark.asyncio
+    async def test_breakdown_sends_the_window_grouping_paging_and_scope(self, mock_env_vars):
+        path, params = await self._sent(
+            "get_vcs_pr_health_breakdown", "github", "2026-05-17", "2026-08-17", "repo",
+            page=1, size=20, sort_by="share", sort_dir="asc", assisted_only=True, **self.SCOPE,
+        )
+        assert path == "/profitstream/v2/api/billing/users/vcs-pr-health/breakdown"
+        assert params == {
+            "source": "github", "startDate": "2026-05-17", "endDate": "2026-08-17", "groupBy": "repo",
+            "page": 1, "size": 20, "sortBy": "share", "sortDir": "asc", "assistedOnly": True,
+            **self.WIRE_SCOPE, **self.TEAM,
+        }
+
+    @pytest.mark.asyncio
+    async def test_queue_sends_no_window(self, mock_env_vars):
+        path, params = await self._sent(
+            "get_vcs_pr_health_queue", "github", per_cause=8, sort_by="review", triaged="ONLY",
+            author="octocat", repo="acme/api", ticket="BACK-1",
+        )
+        assert path == "/profitstream/v2/api/billing/users/vcs-pr-health/queue"
+        assert params == {
+            "source": "github", "perCause": 8, "sortBy": "review", "triaged": "ONLY",
+            "author": "octocat", "repo": "acme/api", "ticket": "BACK-1", **self.TEAM,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("read", ["get_vcs_pr_health_trend", "get_vcs_pr_health_follow_through"])
+    async def test_an_unset_window_is_not_sent(self, mock_env_vars, read):
+        _, params = await self._sent(read, "github")
+        assert params == {"source": "github", **self.TEAM}
+
+    @pytest.mark.asyncio
+    async def test_trend_sends_the_window_and_granularity(self, mock_env_vars):
+        path, params = await self._sent(
+            "get_vcs_pr_health_trend", "github", start_date="2026-07-01", end_date="2026-09-30",
+            granularity="day", **self.SCOPE,
+        )
+        assert path == "/profitstream/v2/api/billing/users/vcs-pr-health/trend"
+        assert params == {
+            "source": "github", "startDate": "2026-07-01", "endDate": "2026-09-30",
+            "granularity": "day", **self.WIRE_SCOPE, **self.TEAM,
+        }
+
+    @pytest.mark.asyncio
+    async def test_follow_through_sends_the_window_and_assisted_only(self, mock_env_vars):
+        path, params = await self._sent(
+            "get_vcs_pr_health_follow_through", "github", start_date="2026-07-01",
+            end_date="2026-09-30", assisted_only=False,
+        )
+        assert path == "/profitstream/v2/api/billing/users/vcs-pr-health/follow-through"
+        assert params == {
+            "source": "github", "startDate": "2026-07-01", "endDate": "2026-09-30",
+            "assistedOnly": False, **self.TEAM,
+        }
+
+    @pytest.mark.asyncio
+    async def test_no_team_is_sent_when_none_is_resolved(self, mock_env_vars):
+        client = ReveniumClient()
+        with patch.object(
+            ReveniumClient, "team_id", new_callable=PropertyMock, return_value=None
+        ), patch.object(client, "get", new_callable=AsyncMock, return_value={}) as mock_get:
+            await client.get_vcs_pr_health_queue("github")
         assert mock_get.call_args[1]["params"] == {"source": "github"}
 
 
@@ -803,7 +1068,7 @@ class TestJobOutcomeEndpoint:
         assert kwargs["method"] == "POST"
         assert (
             kwargs["url"]
-            == "https://api.test.revenium.ai/profitstream/v2/api/jobs/job_123/outcome"
+            == "https://api.revenium.invalid/profitstream/v2/api/jobs/job_123/outcome"
         )
         assert not kwargs["url"].endswith("/outcomes")
         # body is forwarded verbatim, so outcomeReason reaches the API untouched
@@ -1086,6 +1351,241 @@ class TestGetSeatUtilization:
                 await client.get_seat_utilization("2026-08-01", "2026-08-22")
 
         assert exc_info.value.status_code == 404
+
+
+class TestGetVcsPrs:
+    @pytest.mark.asyncio
+    async def test_sends_the_resolved_team(self, mock_env_vars):
+        client = ReveniumClient()
+
+        with patch.object(client, "get", new_callable=AsyncMock, return_value={}) as mock_get:
+            await client.get_vcs_prs("github", "2026-05-17", "2026-08-17", group_by="repository")
+
+        assert mock_get.call_args[0][0] == "/profitstream/v2/api/billing/users/vcs-prs"
+        assert mock_get.call_args[1]["params"] == {
+            "source": "github",
+            "startDate": "2026-05-17",
+            "endDate": "2026-08-17",
+            "groupBy": "repository",
+            "teamId": "test_team_id_456",
+        }
+
+
+class TestResolvedTeamOnAnalyticsHostReads:
+    """BACK-3940: without teamId a user token is answered for the user's default team."""
+
+    @staticmethod
+    async def _call(read, *args, team_id="test_team_id_456", verb="get", **kwargs):
+        client = ReveniumClient()
+        with patch.object(
+            ReveniumClient, "team_id", new_callable=PropertyMock, return_value=team_id
+        ), patch.object(client, verb, new_callable=AsyncMock, return_value={"data": []}) as mock_verb:
+            await getattr(client, read)(*args, **kwargs)
+        return mock_verb.call_args
+
+    @pytest.mark.asyncio
+    async def test_cost_by_tool_sends_the_resolved_team(self, mock_env_vars):
+        call = await self._call("get_cost_by_tool", startDate="2026-08-01")
+        assert call[0][0] == "/api/v2/analytics/cost-by-tool"
+        assert call[1]["params"] == {"startDate": "2026-08-01", "teamId": "test_team_id_456"}
+        assert call[1]["use_bearer"] is True
+
+    @pytest.mark.asyncio
+    async def test_cost_by_tool_omits_the_team_when_none_is_resolved(self, mock_env_vars):
+        call = await self._call("get_cost_by_tool", team_id=None, startDate="2026-08-01")
+        assert call[1]["params"] == {"startDate": "2026-08-01"}
+
+    @pytest.mark.asyncio
+    async def test_a_typed_team_never_replaces_the_resolved_one(self, mock_env_vars):
+        call = await self._call("get_top_tools_by_call_count", teamId="someone_elses_team")
+        assert call[1]["params"]["teamId"] == "test_team_id_456"
+
+    @pytest.mark.asyncio
+    async def test_tool_filter_options_sends_the_resolved_team(self, mock_env_vars):
+        call = await self._call("get_tool_filter_options")
+        assert call[1]["params"] == {"teamId": "test_team_id_456"}
+
+    @pytest.mark.asyncio
+    async def test_list_recommendation_runs_sends_the_resolved_team(self, mock_env_vars):
+        call = await self._call("list_recommendation_runs", limit=5)
+        assert call[0][0] == "/api/v2/insights/runs"
+        assert call[1]["params"] == {"limit": 5, "teamId": "test_team_id_456"}
+
+    @pytest.mark.asyncio
+    async def test_list_recommendation_runs_omits_the_team_when_none_is_resolved(
+        self, mock_env_vars
+    ):
+        call = await self._call("list_recommendation_runs", team_id=None, limit=5)
+        assert call[1]["params"] == {"limit": 5}
+
+    @pytest.mark.asyncio
+    async def test_trigger_recommendation_run_sends_the_team_as_a_query_param(
+        self, mock_env_vars
+    ):
+        call = await self._call(
+            "trigger_recommendation_run",
+            "2026-08-01T00:00:00Z",
+            "2026-08-08T00:00:00Z",
+            verb="post",
+        )
+        assert call[1]["params"] == {"teamId": "test_team_id_456"}
+        assert "teamId" not in call[1]["data"]
+
+
+class TestGetAiAssistantTeamMedians:
+    """BACK-3939: the medians read always names claude-code and the resolved team."""
+
+    @staticmethod
+    async def _call(team_id="test_team_id_456", **kwargs):
+        client = ReveniumClient()
+        with patch.object(
+            ReveniumClient, "team_id", new_callable=PropertyMock, return_value=team_id
+        ), patch.object(client, "get", new_callable=AsyncMock, return_value={"belowFloor": True}) as mock_get:
+            await client.get_ai_assistant_team_medians(**kwargs)
+        return mock_get.call_args
+
+    @pytest.mark.asyncio
+    async def test_sends_claude_code_and_the_resolved_team_to_the_analytics_host(self, mock_env_vars):
+        call = await self._call()
+        assert call[0][0] == "/api/v2/analytics/ai-assistants/team-medians"
+        assert call[1]["params"] == {"assistants": "claude-code", "teamId": "test_team_id_456"}
+        assert call[1]["use_bearer"] is True
+        assert call[1]["base_url"]
+
+    @pytest.mark.asyncio
+    async def test_the_flat_body_reaches_the_caller_whole(self, mock_env_vars, monkeypatch):
+        """Unwrapped as a HAL collection, a flat body without _embedded comes back as []."""
+        import json as json_lib
+
+        body = {"window": "14d", "group": "team", "belowFloor": True}
+        client = ReveniumClient()
+
+        async def fake_request(method, url, params=None, json=None, headers=None):
+            response = MagicMock(spec=httpx.Response)
+            response.status_code = 200
+            response.content = json_lib.dumps(body).encode()
+            response.headers = {"content-type": "application/json"}
+            response.json = MagicMock(return_value=body)
+            return response
+
+        monkeypatch.setattr(client.client, "request", fake_request)
+        assert await client.get_ai_assistant_team_medians() == body
+
+    @pytest.mark.asyncio
+    async def test_forwards_the_window_when_set(self, mock_env_vars):
+        call = await self._call(window="completed-weeks:2")
+        assert call[1]["params"] == {
+            "assistants": "claude-code",
+            "window": "completed-weeks:2",
+            "teamId": "test_team_id_456",
+        }
+
+    @pytest.mark.asyncio
+    async def test_omits_the_team_when_none_is_resolved(self, mock_env_vars):
+        call = await self._call(team_id=None)
+        assert call[1]["params"] == {"assistants": "claude-code"}
+
+
+class TestTeamScopeRefusal:
+    """BACK-3940: a 403 caused by the teamId sent is explained as a team the credential cannot read."""
+
+    @staticmethod
+    def _client_answering(monkeypatch, status_code, body, content_type="application/json"):
+        import json as json_lib
+
+        monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
+        client = ReveniumClient()
+
+        async def fake_request(method, url, params=None, json=None, headers=None):
+            response = MagicMock(spec=httpx.Response)
+            response.status_code = status_code
+            response.content = json_lib.dumps(body).encode()
+            response.text = json_lib.dumps(body)
+            response.reason_phrase = "Forbidden"
+            response.headers = {"content-type": content_type}
+            response.json = MagicMock(return_value=body)
+            return response
+
+        monkeypatch.setattr(client.client, "request", fake_request)
+        return client
+
+    TEAM_REFUSAL = {
+        "code": "TEAM_NOT_IN_MEMBERSHIP",
+        "message": "The requested team is not one this credential can read",
+    }
+
+    @pytest.mark.asyncio
+    async def test_team_membership_403_is_a_structured_team_scope_error(
+        self, mock_env_vars, monkeypatch
+    ):
+        from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
+
+        client = self._client_answering(monkeypatch, 403, self.TEAM_REFUSAL)
+
+        with pytest.raises(ReveniumAPIError) as exc_info:
+            await client.get_cost_by_tool(startDate="2026-08-01")
+
+        error = exc_info.value
+        assert isinstance(error, ToolError)
+        assert error.status_code == 403
+        assert error.code == "TEAM_NOT_IN_MEMBERSHIP"
+        assert error.error_code == ErrorCodes.API_AUTHORIZATION
+        assert error.field == "teamId"
+        assert error.value == "test_team_id_456"
+        assert "cannot read team test_team_id_456" in error.message
+        assert "An API key answers only for the team it was issued to" in error.message
+        assert "REVENIUM_APP_BASE_URL" not in error.message
+
+    @pytest.mark.asyncio
+    async def test_the_tool_layer_renders_the_team_scope_message(
+        self, mock_env_vars, monkeypatch
+    ):
+        from src.revenium_mcp_server.common.error_handling import format_error_response
+
+        client = self._client_answering(monkeypatch, 403, self.TEAM_REFUSAL)
+        with pytest.raises(ReveniumAPIError) as exc_info:
+            await client.list_recommendation_runs()
+
+        rendered = format_error_response(exc_info.value)[0].text
+        assert "This credential cannot read team test_team_id_456" in rendered
+        assert "use a credential issued for that team" in rendered
+
+    @pytest.mark.asyncio
+    async def test_a_403_naming_another_cause_keeps_its_own_code(
+        self, mock_env_vars, monkeypatch
+    ):
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        problem = {
+            "title": "Disabled",
+            "status": 403,
+            "detail": "AI recommendations is disabled.",
+            "code": "AI_RECOMMENDATIONS_DISABLED",
+        }
+        client = self._client_answering(
+            monkeypatch, 403, problem, content_type="application/problem+json"
+        )
+
+        with pytest.raises(ReveniumAPIError) as exc_info:
+            await client.list_recommendation_runs()
+
+        assert exc_info.value.code == "AI_RECOMMENDATIONS_DISABLED"
+        assert not isinstance(exc_info.value, ToolError)
+
+    @pytest.mark.asyncio
+    async def test_a_403_on_a_read_that_sent_no_team_is_not_translated(
+        self, mock_env_vars, monkeypatch
+    ):
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        client = self._client_answering(monkeypatch, 403, self.TEAM_REFUSAL)
+
+        with patch.object(
+            ReveniumClient, "team_id", new_callable=PropertyMock, return_value=None
+        ), pytest.raises(ReveniumAPIError) as exc_info:
+            await client.get_cost_by_tool(startDate="2026-08-01")
+
+        assert not isinstance(exc_info.value, ToolError)
 
 
 class TestReveniumAPIError:

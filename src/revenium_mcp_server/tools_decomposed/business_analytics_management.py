@@ -31,13 +31,16 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
+from ..analytics.department_costs import DepartmentCostsQuery, parse_department_costs
 from ..analytics.enhanced_spike_analyzer import EnhancedSpikeAnalyzer
+from ..analytics.formatters.department_costs_formatter import DepartmentCostsFormatter
+from ..analytics.formatters.user_costs_formatter import UserCostsFormatter
 from ..analytics.simple_analytics_engine import SimpleAnalyticsEngine
 from ..analytics.simple_cost_analyzer import SimpleCostAnalyzer
-from ..analytics.validation import ValidationError
+from ..analytics.validation import AnalyticsValidator, ValidationError
 from ..auth import AuthenticationError
 from ..client import SEAT_UTILIZATION_MAX_RANGE_DAYS, ReveniumAPIError
-from ..endpoint_registry import NewApiRequiredError, _use_new_api
+from ..endpoint_registry import NewApiRequiredError, requires_new_api_flag
 from ..introspection.metadata import ToolCapability
 from .unified_tool_base import ToolBase
 
@@ -63,8 +66,6 @@ from ..common.numeric_param_validator import coerce_numeric_param
 from ..common.validation import validate_pagination_params
 from ..introspection.metadata import ToolType
 
-# Section bounds of the get_user_costs capability entry, which is dropped when
-# the new analytics API is off (the endpoint is NEW_API_ONLY).
 # BACK-3170: get_capabilities now returns two renderings of the same value
 # lists — the hand-written "Supported Parameter Values" section and the
 # generated parameter reference — so both are built from these.
@@ -119,7 +120,7 @@ class BusinessAnalyticsManagement(ToolBase):
 
     tool_name: ClassVar[str] = "business_analytics_management"
     tool_description: ClassVar[str] = (
-        "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_user_costs, get_tool_costs, get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider, get_transaction_count, get_filter_options, get_unpaid_invoice_totals, get_seat_utilization, list_invoices, list_refunds, list_period_charges, list_skills, get_skill, get_pr_health, get_pr_health_engineers, get_pr_health_prs, get_pr_health_pull_requests, get_pr_health_repositories, get_merged_prs, get_coverage_ratio, get_task_costs, get_task_completion, get_task_performance, get_profit_margins, get_top_movers, get_token_breakdown, get_team_costs, get_vendor_costs, get_token_vs_tool_cost, get_trace_cost_distribution, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_filter_options(dimension=...) to discover valid filter values. Use get_examples() for parameter guidance and get_capabilities() for status."
+        "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_user_costs, get_department_costs, get_tool_costs, get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider, get_ai_assistant_team_medians, get_transaction_count, get_filter_options, get_unpaid_invoice_totals, get_seat_utilization, list_invoices, list_refunds, list_period_charges, list_skills, get_skill, get_pr_health, get_pr_health_engineers, get_pr_health_prs, get_pr_health_pull_requests, get_pr_health_repositories, get_pr_health_breakdown, get_pr_health_queue, get_pr_health_trend, get_pr_health_follow_through, get_merged_prs, get_coverage_ratio, get_task_costs, get_task_completion, get_task_performance, get_profit_margins, get_top_movers, get_token_breakdown, get_team_costs, get_vendor_costs, get_token_vs_tool_cost, get_trace_cost_distribution, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_filter_options(dimension=...) to discover valid filter values. Use get_examples() for parameter guidance and get_capabilities() for status."
     )
     business_category: ClassVar[str] = "Metering and Analytics Tools"
     tool_type: ClassVar[ToolType] = ToolType.ANALYTICS
@@ -256,6 +257,8 @@ class BusinessAnalyticsManagement(ToolBase):
                 return await self._handle_get_agent_costs(arguments, ctx=ctx)
             elif action == "get_user_costs":
                 return await self._handle_get_user_costs(arguments, ctx=ctx)
+            elif action == "get_department_costs":
+                return await self._handle_get_department_costs(arguments, ctx=ctx)
             elif action == "get_tool_costs":
                 return await self._handle_get_tool_costs(arguments, ctx=ctx)
             elif action == "get_top_tools":
@@ -264,6 +267,8 @@ class BusinessAnalyticsManagement(ToolBase):
                 return await self._handle_get_tool_costs_by_agent(arguments, ctx=ctx)
             elif action == "get_tool_costs_by_provider":
                 return await self._handle_get_tool_costs_by_provider(arguments, ctx=ctx)
+            elif action == "get_ai_assistant_team_medians":
+                return await self._handle_get_ai_assistant_team_medians(arguments, ctx=ctx)
 
             elif action == "get_transaction_count":
                 return await self._handle_get_transaction_count(arguments, ctx=ctx)
@@ -313,6 +318,14 @@ class BusinessAnalyticsManagement(ToolBase):
                 return await self._handle_get_pr_health_pull_requests(arguments, ctx=ctx)
             elif action == "get_pr_health_repositories":
                 return await self._handle_get_pr_health_repositories(arguments, ctx=ctx)
+            elif action == "get_pr_health_breakdown":
+                return await self._handle_get_pr_health_breakdown(arguments, ctx=ctx)
+            elif action == "get_pr_health_queue":
+                return await self._handle_get_pr_health_queue(arguments, ctx=ctx)
+            elif action == "get_pr_health_trend":
+                return await self._handle_get_pr_health_trend(arguments, ctx=ctx)
+            elif action == "get_pr_health_follow_through":
+                return await self._handle_get_pr_health_follow_through(arguments, ctx=ctx)
             elif action == "get_merged_prs":
                 return await self._handle_get_merged_prs(arguments, ctx=ctx)
             elif action == "get_coverage_ratio":
@@ -440,12 +453,13 @@ If you're seeing this error, please report it as it indicates a reliability issu
 6. **get_user_costs**
    - Analyze costs by user email (subscriber)
    - Returns cost, request count, and token usage per user
-   - Reports only rows whose subscriber email is populated; defaults to
-     filters.costSources=["coding_assistant"]
-   - NOT a per-employee coding-assistant report: the v2 analytics plane excludes usage priced as
-     coding-assistant activity, so an empty or small total here says nothing about a person's usage.
-     Use the web app's AI by Employee view for that, or pass
-     filters.costSources=["revenium_metered", "provider_billing"] for API-metered per-user spend
+   - Reports only rows whose subscriber email is populated
+   - Without filters.costSources it asks for every cost source per user
+     (filters.costSources=["coding_assistant", "revenium_metered", "provider_billing"]); pass a
+     subset to narrow it. Coding-assistant usage is real spend under revenium_metered or
+     provider_billing when the team pays for that assistant at API rates and an estimate under
+     coding_assistant otherwise, so never conclude from one source being empty
+   - The web app's AI by Employee view remains the authoritative per-employee coding-assistant report
    - Per-person billed spend (the platform's billing per-person view) is not exposed by this tool
      at all: only anthropic_enterprise and github_copilot attribute spend to a named person at the
      source, so that view answers an empty page for most tenants with nothing to explain why. For
@@ -454,9 +468,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
 
 6a. **get_transaction_count**
    - Total transaction volume for your team over a period (real count, not derived from cost)
-   - Single aggregate number; same universe as the v2 analytics cost actions - transactions priced as
-     coding-assistant usage are excluded, coding-assistant traffic billed as real provider spend is
-     counted, and no cost action applies a different rule
+   - Single aggregate number; same universe as the v2 analytics cost actions - coding-assistant
+     usage is real spend for the assistants the team pays for at API rates (apiRateProviders) and an
+     estimate under the coding_assistant cost source otherwise, traffic billed as real provider spend
+     is counted regardless, and no cost action applies a different rule
    - Deliberately narrower than manage_metering's transaction lookups, which include coding-assistant
      records by default; use those to verify whether Claude Code / Gemini CLI data arrived
 
@@ -471,6 +486,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
    - Adoption rate is seatsUsed (the trailing 30-day active count) / seatsPaid — never dailyActive / seatsPaid
    - Withheld counts render as 'unavailable (withheld by vendor)', never 0; a day missing either adoption input shows no rate
    - An empty census means no Claude Enterprise connection for the team, which is reported as such rather than as zero seats
+   - A census freshness line reports censusState, whether the latest Claude Enterprise sync read the census: READ, UNREAD (the most recent sync in the last 3 days could not read it, so the counts may be stale) or UNKNOWN (no sync completed in the last 3 days); a response without censusState renders as unknown, never READ
 
 6c. **list_invoices / list_refunds / list_period_charges**
    - Read-only billing listings; numeric-honest amounts (missing → 'n/a', never a fabricated 0)
@@ -484,7 +500,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 
 6e. **get_pr_health**
    - Aging/rotting open pull requests and closed-without-merge waste, per engineer
-   - Covers YOUR OWN organization (resolved from your credentials); it takes no team parameter
+   - Covers the team your credentials resolve to, sent with the read; you do not pass one
    - Aging/rotting classify by INACTIVITY (days since the PR's last provider-side activity), not by age
    - Drafts are counted separately and excluded; at-risk (rotting, still open) and wasted (closed unmerged) stay separate
    - Requires source (github|gitlab), start_date and end_date; the window must span fewer than 366 days
@@ -497,14 +513,26 @@ If you're seeing this error, please report it as it indicates a reliability issu
 6e1. **get_pr_health_engineers / get_pr_health_prs / get_pr_health_pull_requests**
    - Same source/start_date/end_date window and 366-day rule as get_pr_health, same organization scope
    - Same optional department_id / include_descendants narrowing, plus assisted_only=true to keep only AI-assisted PRs
-   - get_pr_health_engineers: every engineer row, paged (page, size) and sorted server-side (sort_by authorLogin|openPrs|agingPrs|rottingPrs|closedUnmerged|oldestInactiveDays, sort_dir asc|desc)
+   - get_pr_health_engineers: every engineer row, paged (page, size) and sorted server-side (sort_by authorLogin|openPrs|agingPrs|rottingPrs|closedUnmerged|oldestInactiveDays, sort_dir asc|desc); query keeps the engineers whose login or mapped email contains it
    - get_pr_health_prs: one engineer's open PRs (bucketed ROTTING/AGING/ACTIVE/DRAFT) and PRs closed without merge; author (the login from the engineer rows) is required
-   - get_pr_health_pull_requests: the flat PR list behind the report, paged, filterable by bucket (ROTTING|AGING|ACTIVE|DRAFT|CLOSED_UNMERGED) and author, sort_by inactivity|age
+   - get_pr_health_pull_requests: the flat PR list behind the report, paged, filterable by bucket (AUTOMATION|ROTTING|AGING|ACTIVE|DRAFT|CLOSED_UNMERGED), author, repo, ticket and triaged (EXCLUDE|ONLY), sort_by inactivity|age
+   - get_pr_health_pull_requests also takes cause (AUTOMATION|STUCK_DRAFT|AUTHOR_GONE|APPROVED_NOT_MERGED|CHANGES_REQUESTED_QUIET|WAITING_ON_REVIEW|ON_PACE) for the open PRs of one action-queue cause; cause and bucket cannot be combined
+   - Without bucket the pull-request list holds every bucket except AUTOMATION, and triaged defaults to EXCLUDE: pull requests someone dismissed or snoozed in the app are left out unless triaged=ONLY is passed
    - Each PR row shows its bucket, draft flag and AI-assisted flag; inactivity and age stay separate figures
 
 6e1a. **get_pr_health_repositories**
    - Every repository of your organization holding open PRs, with its open count and whether the team excludes it
    - Takes source only: no window, no department, and the team's cutoff/exclusions/automation patterns are not applied
+
+6e1b. **get_pr_health_breakdown / get_pr_health_queue / get_pr_health_trend / get_pr_health_follow_through**
+   - Same organization scope, department_id / include_descendants narrowing and source as get_pr_health
+   - get_pr_health_breakdown: the report's figures grouped by group_by (repo|engineer|department, required) for a get_pr_health window, paged (page, size 1-100, default 5) and sorted by sort_by (rottingPrs|closedUnmerged|openPrs|name|share)
+   - get_pr_health_queue: open pull requests grouped by why they need a decision (AUTOMATION, STUCK_DRAFT, AUTHOR_GONE, APPROVED_NOT_MERGED, CHANGES_REQUESTED_QUIET, WAITING_ON_REVIEW, ON_PACE); no window; per_cause rows per group (1-50, default 8), filterable by author, repo, ticket and triaged, sort_by inactivity|age|repo|author|review
+   - get_pr_health_trend: closed-unmerged and at-risk counts per bucket with their AI-assisted part; the 26 weeks ending now by default, or start_date/end_date (both or neither, fewer than 366 days) with granularity day (fewer than 92 days), week or month
+   - get_pr_health_follow_through: whether the pull requests flagged as rotting were merged, closed or are still open, with the at-risk estimate then and now; every flag by default, or the flags taken between start_date and end_date
+   - assisted_only applies to the breakdown, the queue and the follow-through
+   - Triage (dismiss, snooze, undo) is not available here: the queue and the pull-request list leave dismissed and snoozed pull requests out unless triaged=ONLY is passed
+   - No dollars come back from the breakdown or the trend: their priced counts are the pull requests opened on or after the report's pricedSince
 
 6e2. **get_merged_prs**
    - Merged pull-request counts for your own organization, per person (default) or per repository (group_by='repository')
@@ -522,12 +550,21 @@ If you're seeing this error, please report it as it indicates a reliability issu
    - Metered spend outside the comparison is NOT hidden spend: hidden spend is billed and not metered, the other is metered with nothing to compare
    - A per-provider 'billing credential connected: no' row is metered-only and is excluded from the aggregate ratio and hidden spend
    - meteredBasis, when present, names the metered window, the store it was read from, and any transform applied to the figures
-   - Coding-assistant usage is a yes/no PRESENCE FLAG, never an amount; 'no' does not prove absence
+   - Coding-assistant usage is a yes/no PRESENCE FLAG, never an amount; 'no' does not prove absence, and a check the platform reports as incomplete (codingAssistantUsageUnknown) renders as unknown
+   - A provider row with a revisionWindowStart says its figures from that day onward may still be restated
    - Requires the coding-assistant-separation-active feature: without it the platform answers 403, not a reduced report
 
 6g. **get_filter_options**
    - Enumerate the valid filter values for a dimension (providers, models, agents, tasks, and the rest)
    - Use it before passing a filter value to any cost action, so the value is one the platform knows
+
+6h. **get_department_costs**
+   - Cost, requests and tokens per department for the team your credentials resolve to, over the whole period
+   - Takes period, group/aggregation and filters (arrays under agents, providers, models, users, costSources); paged with page and size (1 to 100, default 20)
+   - Each department shows its own figures and, labelled apart, the figures with every sub-department added; never add the with-sub-departments figures across groups
+   - Spend from people with no department when the call was made is the No department assigned group (departmentId unassigned)
+   - departmentId and parentDepartmentId are hashids, not the numeric ids manage_customers list_departments returns; never pass one for the other
+   - A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED means there is no grouping, never $0 of spend
 
 7. **get_cost_summary**
    - Generate a summary report of recent AI spending (includes all dimensions)
@@ -546,6 +583,13 @@ If you're seeing this error, please report it as it indicates a reliability issu
 
 7e. **get_agent_summary**
    - Agent-friendly overview of this tool's surface
+
+7f. **get_ai_assistant_team_medians**
+   - Anonymous team medians of Claude Code habits: context tokens per call, cache rebuild ratio and the share of requests sent above the model's default effort
+   - Covers the team your credentials resolve to; nothing about any person is returned, and every figure is coarsened by the platform
+   - Optional window: 14d (default, the last 14 days) or completed-weeks:N for the last N completed weeks, N from 1 to 4
+   - Fewer than five people who made a call in the window means 'not enough people to compare': the medians are withheld, never zero
+   - A rate limit or server error means no figures right now, not a zero
 
 8. **analyze_cost_anomalies** (Phase 1)
    - Enhanced statistical anomaly detection using z-score analysis
@@ -616,7 +660,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - **Time Periods**: """ + _values(COST_PERIOD_VALUES) + """
 - **Aggregations**: """ + _values(AGGREGATION_VALUES) + """
 """
-        if not _use_new_api():
+        if requires_new_api_flag(UserCostsFormatter.ENDPOINT_KEY):
             capabilities = _strip_user_costs_section(capabilities)
             for old, new in [("7.", "6."), ("8.", "7."), ("9.", "8."), ("10.", "9.")]:
                 capabilities = capabilities.replace(old, new, 1)
@@ -767,6 +811,25 @@ If you're seeing this error, please report it as it indicates a reliability issu
 }
 ```
 
+### get_department_costs
+```json
+{
+  "action": "get_department_costs",
+  "period": "THIRTY_DAYS",
+  "filters": {"providers": ["anthropic"]},
+  "size": 50
+}
+```
+**Purpose**: Cost, requests and tokens per department for your team over the period
+**Parameters**:
+- `period` (required): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- `group` (optional): TOTAL, MEAN, MAXIMUM, MINIMUM (defaults to TOTAL)
+- `filters` (optional): arrays under `agents`, `providers`, `models`, `users` (subscriber emails), `costSources`
+  (defaults to `["coding_assistant", "revenium_metered", "provider_billing"]`, as on get_user_costs)
+- `page` (optional, zero-based) and `size` (optional, 1 to 100, default 20)
+**Reading the answer**: department ids are hashids, not the numeric ids manage_customers list_departments
+returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED means no grouping, not $0.
+
 ### get_transaction_count
 ```json
 {
@@ -813,7 +876,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - `from_date` (required): first UTC day, inclusive, ISO yyyy-MM-dd
 - `to_date` (required): last UTC day, inclusive, ISO yyyy-MM-dd; the range may not exceed 366 days
 - `team_id` (optional): team hashid; defaults to the team on your credentials
-**Reading the output**: adoption rate is seatsUsed / seatsPaid, where seatsUsed is the trailing 30-day active count (the basis Anthropic's own console uses). A count the vendor withheld renders as 'unavailable (withheld by vendor)', never 0, and its day shows no adoption rate. An empty census reports no Claude Enterprise connection — a different problem from a withheld count.
+**Reading the output**: adoption rate is seatsUsed / seatsPaid, where seatsUsed is the trailing 30-day active count (the basis Anthropic's own console uses). A count the vendor withheld renders as 'unavailable (withheld by vendor)', never 0, and its day shows no adoption rate. An empty census reports no Claude Enterprise connection — a different problem from a withheld count. The census freshness line, shown even for an empty census, reports `censusState` with `censusCheckedAt`: `READ` means the latest Claude Enterprise sync read the census, `UNREAD` means the most recent sync in the last 3 days could not read it so the counts may be stale, and `UNKNOWN` means no sync completed in the last 3 days. A response without `censusState` renders as unknown, never as `READ`.
 
 ### get_task_costs
 ```json
@@ -1002,12 +1065,12 @@ If you're seeing this error, please report it as it indicates a reliability issu
   "end_date": "2026-08-17"
 }
 ```
-**Purpose**: PR health for your own organization — aging/rotting open pull requests and closed-without-merge waste, with a per-engineer breakdown and the most inactive open PRs.
+**Purpose**: PR health for the team your credentials resolve to — aging/rotting open pull requests and closed-without-merge waste, with a per-engineer breakdown and the most inactive open PRs.
 **Parameters** (all required):
 - `source`: `github` or `gitlab`
 - `start_date` / `end_date`: ISO `yyyy-MM-dd`; the window must span fewer than 366 days and `start_date` must not be after `end_date`
 **Optional**: `department_id` narrows every figure to one department of your organization (404 for any other); `include_descendants=true` adds its descendant departments and needs `department_id`.
-**Scope**: the organization is resolved from your credentials — there is no team parameter. The PR-health settings are team-addressed and live on `manage_customers` (`get_pr_health_settings` / `update_pr_health_settings`): the `agingDays` and `rottingDays` thresholds (the report echoes the pair it used) plus `cutoffDate` and `excludedRepos`, which narrow which pull requests the figures count at all; `automationPatterns`, which put matching pull requests in the automation bucket; and `assistedOnly`, the team's default view for pricing and listing AI-assisted pull requests only (not a filter on what the report counts).
+**Scope**: the team your credentials resolve to, which the server sends with the read — you do not pass one. The PR-health settings are team-addressed and live on `manage_customers` (`get_pr_health_settings` / `update_pr_health_settings`): the `agingDays` and `rottingDays` thresholds (the report echoes the pair it used) plus `cutoffDate` and `excludedRepos`, which narrow which pull requests the figures count at all; `automationPatterns`, which put matching pull requests in the automation bucket; and `assistedOnly`, the team's default view for pricing and listing AI-assisted pull requests only (not a filter on what the report counts).
 **Paging**: the report lists at most 50 engineers. Use `get_pr_health_engineers` for every engineer, `get_pr_health_prs` for one engineer's pull requests and `get_pr_health_pull_requests` for the whole bucketed list.
 **Reading the numbers**:
 - aging and rotting classify by INACTIVITY (days since the PR's last provider-side activity), not by age; `ageDays` and `inactiveDays` are reported separately
@@ -1030,7 +1093,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 }
 ```
 **Purpose**: every engineer row of the PR-health report, one server-sorted page at a time.
-**Parameters**: the `get_pr_health` window (required) plus optional `page`, `size`, `sort_by` (authorLogin, openPrs, agingPrs, rottingPrs, closedUnmerged, oldestInactiveDays) and `sort_dir` (asc, desc).
+**Parameters**: the `get_pr_health` window (required) plus optional `page`, `size`, `sort_by` (authorLogin, openPrs, agingPrs, rottingPrs, closedUnmerged, oldestInactiveDays), `sort_dir` (asc, desc) and `query` (keeps the engineers whose login or mapped email contains it, case-insensitively; at most 100 characters).
 **Narrowing** (all three drill-downs): optional `department_id`, `include_descendants` (needs `department_id`) and `assisted_only` (true keeps only AI-assisted pull requests).
 
 ### get_pr_health_prs
@@ -1059,7 +1122,9 @@ If you're seeing this error, please report it as it indicates a reliability issu
 }
 ```
 **Purpose**: the flat, paged list of every pull request behind the report.
-**Parameters**: the `get_pr_health` window plus optional `bucket` (ROTTING, AGING, ACTIVE, DRAFT, CLOSED_UNMERGED), `author`, `page`, `size`, `sort_by` (inactivity, age) and `sort_dir` (asc, desc).
+**Parameters**: the `get_pr_health` window plus optional `bucket` (AUTOMATION, ROTTING, AGING, ACTIVE, DRAFT, CLOSED_UNMERGED), `author`, `repo` (owner/repo, case-insensitive), `ticket` (the ticket id read from the PR's title or branch, at most 80 characters), `triaged` (EXCLUDE, ONLY), `page`, `size`, `sort_by` (inactivity, age) and `sort_dir` (asc, desc).
+**Cause**: optional `cause` (AUTOMATION, STUCK_DRAFT, AUTHOR_GONE, APPROVED_NOT_MERGED, CHANGES_REQUESTED_QUIET, WAITING_ON_REVIEW, ON_PACE) lists only the open pull requests of that action-queue cause; the window then filters nothing, and it cannot be combined with `bucket`.
+**Defaults**: without `bucket` the list holds every bucket except AUTOMATION; `bucket=AUTOMATION` lists the open automation pull requests. `triaged` defaults to EXCLUDE, so pull requests someone dismissed or snoozed in the app are left out unless `triaged=ONLY` is passed, which lists just those.
 
 ### get_pr_health_repositories
 ```json
@@ -1070,6 +1135,60 @@ If you're seeing this error, please report it as it indicates a reliability issu
 ```
 **Purpose**: every repository of your organization holding open pull requests, with its open count and whether the team's PR-health settings exclude it.
 **Parameters**: `source` (required). No window and no department: the list deliberately ignores the team's cutoff, exclusions and automation patterns, so an excluded repository is still listed and flagged.
+
+### get_pr_health_breakdown
+```json
+{
+  "action": "get_pr_health_breakdown",
+  "source": "github",
+  "start_date": "2026-05-17",
+  "end_date": "2026-08-17",
+  "group_by": "repo",
+  "sort_by": "share",
+  "size": 20
+}
+```
+**Purpose**: where the report's figures come from, one row per repository, engineer or department, with open, aging, at-risk, wasted and merged counts and their priced parts.
+**Parameters**: the `get_pr_health` window plus `group_by` (required: repo, engineer or department) and optional `page`, `size` (1-100, default 5), `sort_by` (rottingPrs, closedUnmerged, openPrs, name, share), `sort_dir`, `department_id`, `include_descendants` and `assisted_only`.
+**Reading the answer**: a group appears only when it holds an open pull request or one closed without merging; the totals are whole across every group. A repository row flags when it had no human merge in the last 90 days. Department rows carry the `department_id` to pass back for exactly that row's figures. No dollars are returned.
+
+### get_pr_health_queue
+```json
+{
+  "action": "get_pr_health_queue",
+  "source": "github",
+  "per_cause": 8,
+  "sort_by": "inactivity"
+}
+```
+**Purpose**: the open pull requests that need a decision, grouped by why: AUTOMATION, STUCK_DRAFT, AUTHOR_GONE, APPROVED_NOT_MERGED, CHANGES_REQUESTED_QUIET, WAITING_ON_REVIEW, ON_PACE. Each pull request takes the first cause that matches.
+**Parameters**: `source` (required); optional `per_cause` (rows shown per group, 1-50, default 8), `sort_by` (inactivity, age, repo, author, review), `sort_dir`, `author`, `repo`, `ticket`, `triaged` (EXCLUDE, ONLY), `department_id`, `include_descendants` and `assisted_only`. No window: the queue holds open pull requests only.
+**Reading the answer**: every group states its whole count; page through one with `get_pr_health_pull_requests(cause=...)`. `triaged` defaults to EXCLUDE, so pull requests someone dismissed or snoozed in the app are left out of every group except AUTOMATION.
+
+### get_pr_health_trend
+```json
+{
+  "action": "get_pr_health_trend",
+  "source": "github",
+  "start_date": "2026-07-01",
+  "end_date": "2026-09-30",
+  "granularity": "day"
+}
+```
+**Purpose**: closed-without-merge and at-risk pull requests per day, week or month, each with its AI-assisted part.
+**Parameters**: `source` (required). Without `start_date` and `end_date` the trend is the 26 calendar weeks ending with the current one; with both (fewer than 366 days apart) `granularity` picks day (fewer than 92 days apart), week (default) or month. Optional `department_id` and `include_descendants`.
+**Reading the answer**: the current bucket is the period so far; past at-risk counts are reconstructed and may read high; buckets before the synced history are marked not covered. No dollars are returned.
+
+### get_pr_health_follow_through
+```json
+{
+  "action": "get_pr_health_follow_through",
+  "source": "github"
+}
+```
+**Purpose**: whether the pull requests PR Health flagged as rotting got fixed: how many were merged, closed without merging or are still open, and the estimated at-risk spend then and now.
+**Parameters**: `source` (required); optional `start_date` and `end_date` together (fewer than 366 days apart) to count only the flags taken on those days, `department_id`, `include_descendants` and `assisted_only`.
+**Reading the answer**: dollar figures are platform estimates priced at a cost per merged pull request; a basis with no merges or no recorded coding-assistant spend reads n/a, never 0.
 
 ### get_merged_prs
 ```json
@@ -1113,8 +1232,24 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - `trend` is a signed PERCENTAGE-POINT delta against the previous window (current ratio minus previous), so `0.0 pp` means coverage held steady and is a real answer; only a null means there was no prior period
 - each `byProvider` row's ratio is that provider's SHARE of total billed spend, not its coverage — compare the row's `metered` against its `billing` to see one provider's gap; a row `state` of `no-data` means it reported nothing to compare
 - no amount carries a currency code: the report does not send one, so figures print bare rather than under an invented denomination
-- coding-assistant usage is a yes/no PRESENCE FLAG, never a dollar figure; `no` does not prove there was none, because a probe that cannot complete also reports `no`
+- coding-assistant usage is a yes/no PRESENCE FLAG, never a dollar figure; `no` does not prove there was none. When the platform sets `codingAssistantUsageUnknown` (the check could not complete), the report or row renders `unknown` instead; an older platform build without that field reports an incomplete check as `no`
+- a `byProvider` row with a `revisionWindowStart` says that provider's figures from that day onward may still be restated; a row without one has final figures
 - the endpoint requires the coding-assistant-separation-active feature: teams without it get a 403 (a feature-availability answer, not a permissions problem)
+
+### get_ai_assistant_team_medians
+```json
+{
+  "action": "get_ai_assistant_team_medians",
+  "window": "completed-weeks:2"
+}
+```
+**Purpose**: anonymous team medians of Claude Code habits for the team your credentials resolve to: context tokens per call, cache rebuild ratio and the share of requests sent above the model's default effort.
+**Parameters** (optional): `window` is `14d` (the default, the last 14 days) or `completed-weeks:N` for the last N completed weeks, N from 1 to 4.
+**Reading the answer**:
+- the figures are medians across people, coarsened by the platform (context to the nearest 10,000 tokens, shares to the nearest 5%, ratios to two significant figures); nothing about any person is returned
+- with fewer than five people who made a call in the window the platform withholds every median, and the answer says "not enough people to compare" instead of showing zeros
+- a measure the platform could not compute reads "unavailable", never 0
+- a rate limit or server error is reported as no figures right now, not as a zero
 
 ### get_cost_summary
 ```json
@@ -1471,6 +1606,44 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
         "rate derived from a substituted zero."
     )
 
+    # censusState is absent from older platform builds. Absence renders as not
+    # reported, never as READ, which would assert a freshness nobody checked.
+    _SEAT_CENSUS_STATE_NOTES: ClassVar[Dict[str, str]] = {
+        "READ": "the latest Claude Enterprise sync read the seat census",
+        "UNREAD": (
+            "the most recent Claude Enterprise sync in the last 3 days could not read the "
+            "seat census, so these seat counts may be stale"
+        ),
+        "UNKNOWN": (
+            "no Claude Enterprise sync completed in the last 3 days, so how fresh these "
+            "seat counts are is unknown"
+        ),
+    }
+    _SEAT_CENSUS_NOT_REPORTED_NOTE: ClassVar[str] = (
+        "the platform did not report whether the latest sync read the seat census, so "
+        "how fresh these seat counts are is unknown"
+    )
+    _SEAT_CENSUS_UNRECOGNISED_NOTE: ClassVar[str] = (
+        "a census state this client does not recognise, so how fresh these seat counts "
+        "are is unknown"
+    )
+
+    @classmethod
+    def _render_census_freshness(cls, census: Dict[str, Any]) -> str:
+        """One line saying whether the latest Claude Enterprise sync read the census."""
+        state = census.get("censusState")
+        if not isinstance(state, str) or not state.strip():
+            return f"**Census freshness**: unknown — {cls._SEAT_CENSUS_NOT_REPORTED_NOTE}"
+        state = state.strip()
+        note = cls._SEAT_CENSUS_STATE_NOTES.get(state, cls._SEAT_CENSUS_UNRECOGNISED_NOTE)
+        checked_at = census.get("censusCheckedAt")
+        checked = (
+            f" (sync ran {checked_at.strip()})"
+            if isinstance(checked_at, str) and checked_at.strip()
+            else ""
+        )
+        return f"**Census freshness**: {state}{checked} — {note}"
+
     @staticmethod
     def _is_iso_calendar_date(value: Any) -> bool:
         """True only for a real ISO calendar date, not merely a digit-dash shape.
@@ -1698,11 +1871,17 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
             days.sort(key=lambda day: str(day.get("date") or ""))
 
             header = f"**Claude Enterprise Seat Utilization — {from_date} to {to_date}**"
+            census_freshness = self._render_census_freshness(census)
             if not days:
                 # Distinct from a withheld count: there is no census at all.
+                # The freshness line still shows: an unread census is the
+                # likeliest explanation for an empty one.
                 return [TextContent(
                     type="text",
-                    text=f"{header}\n\n{self._SEAT_NO_CONNECTION_MESSAGE}",
+                    text=(
+                        f"{header}\n\n{self._SEAT_NO_CONNECTION_MESSAGE}"
+                        f"\n\n{census_freshness}"
+                    ),
                 )]
 
             lines = [header, "", self._SEAT_ADOPTION_NOTE, "", "**Daily census**"]
@@ -1744,6 +1923,8 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
                     f"the first {self._SEAT_MAX_DAY_ROWS}{shown_note}; re-run with "
                     f"a narrower from_date/to_date to retrieve the remainder._"
                 )
+
+            lines.extend(["", census_freshness])
 
             logger.info("Seat utilization retrieved successfully")
             return [TextContent(type="text", text="\n".join(lines))]
@@ -2650,13 +2831,13 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
     _PR_HEALTH_MAX_ENGINEER_ROWS: ClassVar[int] = 50
     # The engineers and pull-requests sub-resources answer 400 above this size.
     _PR_HEALTH_MAX_PAGE_SIZE: ClassVar[int] = 200
-    # The report resolves the organization from the caller's own principal and
-    # accepts no team parameter — unlike the team-addressed PR-health settings on
-    # manage_customers. A caller who can pass team_id to one would otherwise
-    # assume this report was filtered by it.
+    # The tool takes no team argument (the client sends the resolved team) —
+    # unlike the team-addressed PR-health settings on manage_customers. A caller
+    # who can pass team_id to one would otherwise assume this report was
+    # filtered by it.
     _PR_HEALTH_SCOPE_NOTE: ClassVar[str] = (
-        "Scope: your own organization. The report resolves the organization from your "
-        "credentials and takes no team parameter (the thresholds below, the cutoff date, "
+        "Scope: the team your credentials resolve to, sent with the read; you do not pass "
+        "one (the thresholds below, the cutoff date, "
         "excluded repositories, automation patterns and assisted-only default are "
         "team-addressed and are read/changed with manage_customers get_pr_health_settings)."
     )
@@ -2685,12 +2866,46 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
     _PR_HEALTH_PULL_REQUEST_SORT_FIELDS: ClassVar[List[str]] = ["inactivity", "age"]
     _VCS_SORT_DIRECTIONS: ClassVar[List[str]] = ["asc", "desc"]
     _PR_HEALTH_BUCKETS: ClassVar[List[str]] = [
+        "AUTOMATION",
         "ROTTING",
         "AGING",
         "ACTIVE",
         "DRAFT",
         "CLOSED_UNMERGED",
     ]
+    _PR_HEALTH_CAUSES: ClassVar[List[str]] = [
+        "AUTOMATION",
+        "STUCK_DRAFT",
+        "AUTHOR_GONE",
+        "APPROVED_NOT_MERGED",
+        "CHANGES_REQUESTED_QUIET",
+        "WAITING_ON_REVIEW",
+        "ON_PACE",
+    ]
+    _PR_HEALTH_TRIAGE_FILTERS: ClassVar[List[str]] = ["EXCLUDE", "ONLY"]
+    _PR_HEALTH_BREAKDOWN_GROUPS: ClassVar[List[str]] = ["repo", "engineer", "department"]
+    _PR_HEALTH_BREAKDOWN_SORT_FIELDS: ClassVar[List[str]] = [
+        "rottingPrs",
+        "closedUnmerged",
+        "openPrs",
+        "name",
+        "share",
+    ]
+    _PR_HEALTH_QUEUE_SORT_FIELDS: ClassVar[List[str]] = ["inactivity", "age", "repo", "author", "review"]
+    # Verified against dev: the queue answers 400 for perCause above this, the trend
+    # for any other granularity (case-sensitively), and for granularity=day once
+    # end_date - start_date reaches the day span.
+    _PR_HEALTH_QUEUE_MAX_PER_CAUSE: ClassVar[int] = 50
+    _PR_HEALTH_TREND_GRANULARITIES: ClassVar[List[str]] = ["day", "week", "month"]
+    _PR_HEALTH_TREND_MAX_DAY_SPAN_DAYS: ClassVar[int] = 92
+    _PR_HEALTH_TREND_BUCKET_NOUNS: ClassVar[Dict[str, str]] = {"day": "Days", "week": "Weeks", "month": "Months"}
+    _PR_HEALTH_MAX_TICKET_LENGTH: ClassVar[int] = 80
+    _PR_HEALTH_MAX_SEARCH_LENGTH: ClassVar[int] = 100
+    _PR_HEALTH_LIST_DEFAULTS_NOTE: ClassVar[str] = (
+        "Without bucket the list holds every bucket except AUTOMATION (bucket='AUTOMATION' lists "
+        "the open automation pull requests). triaged defaults to EXCLUDE, so pull requests someone "
+        "dismissed or snoozed in the app are left out unless triaged='ONLY' is passed."
+    )
     _VCS_ACTION_USAGE: ClassVar[Dict[str, str]] = {
         "get_pr_health": "get_pr_health(source='github', start_date='2026-05-17', end_date='2026-08-17')",
         "get_pr_health_engineers": (
@@ -2706,6 +2921,13 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             "end_date='2026-08-17', bucket='ROTTING')"
         ),
         "get_pr_health_repositories": "get_pr_health_repositories(source='github')",
+        "get_pr_health_breakdown": (
+            "get_pr_health_breakdown(source='github', start_date='2026-05-17', "
+            "end_date='2026-08-17', group_by='repo')"
+        ),
+        "get_pr_health_queue": "get_pr_health_queue(source='github', per_cause=8)",
+        "get_pr_health_trend": "get_pr_health_trend(source='github')",
+        "get_pr_health_follow_through": "get_pr_health_follow_through(source='github')",
         "get_merged_prs": (
             "get_merged_prs(source='github', start_date='2026-08-01', "
             "end_date='2026-08-31', group_by='repository')"
@@ -2730,6 +2952,9 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         "get_pr_health_engineers",
         "get_pr_health_prs",
         "get_pr_health_pull_requests",
+        "get_pr_health_breakdown",
+        "get_pr_health_queue",
+        "get_pr_health_follow_through",
     ]
     # Upstream cap on the repository list; excluded repositories are appended past it.
     _PR_HEALTH_MAX_REPOSITORIES: ClassVar[int] = 2000
@@ -2984,21 +3209,33 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
     def _render_pr_health_heading(
         self, title: str, report: Dict[str, Any], source: str, start_date: str, end_date: str
     ) -> List[str]:
-        """Title, scope note, echoed narrowing and thresholds shared by every PR-health read."""
+        """Title, scope note, echoed narrowing and thresholds shared by every windowed PR-health read."""
+        period = f"{report.get('startDate') or start_date} to {report.get('endDate') or end_date}"
         return [
-            f"**{title} — {report.get('source') or source}, "
-            f"{report.get('startDate') or start_date} to {report.get('endDate') or end_date}**",
+            *self._render_pr_health_scope_heading(title, report, source, period),
+            "",
+            self._render_pr_health_thresholds(report),
+        ]
+
+    def _render_pr_health_scope_heading(
+        self, title: str, report: Dict[str, Any], source: str, period: str
+    ) -> List[str]:
+        return [
+            f"**{title} — {report.get('source') or source}, {period}**",
             "",
             self._PR_HEALTH_SCOPE_NOTE,
             *self._render_pr_health_applied_scope(report),
-            "",
-            # Echoed, not assumed: the thresholds are team-configurable and the
-            # report tells you which pair produced these counts.
+        ]
+
+    def _render_pr_health_thresholds(self, report: Dict[str, Any]) -> str:
+        # Echoed, not assumed: the thresholds are team-configurable and the
+        # report tells you which pair produced these counts.
+        return (
             f"**Thresholds used**: aging at {self._render_count(report.get('agingDays'))}+ days inactive, "
             f"rotting at {self._render_count(report.get('rottingDays'))}+ days inactive. "
             "Aging and rotting classify by INACTIVITY — days since the pull request's last "
-            "provider-side activity — not by how old it is.",
-        ]
+            "provider-side activity — not by how old it is."
+        )
 
     def _render_pr_health_applied_scope(self, report: Dict[str, Any]) -> List[str]:
         """The narrowing and team settings the platform echoes it applied, each only when present."""
@@ -3096,10 +3333,18 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             return [f"- {empty_text}"] + ([self._PR_HEALTH_GITLAB_NOTE] if source == "gitlab" else [])
         return [line for pull in rows for line in self._render_pr_health_pull_request(pull)]
 
+    @staticmethod
+    def _render_call_args(args: "List[tuple[str, Optional[str]]]") -> str:
+        """Keyword arguments for a suggested call, each set value quoted as a literal."""
+        return "".join(f", {name}={value!r}" for name, value in args if value)
+
     def _render_page_position(
-        self, page: Dict[str, Any], noun: str, next_call: str
+        self, page: Dict[str, Any], noun: str, next_call_prefix: str
     ) -> List[str]:
-        """Say where this page sits in the whole list, and how to fetch the next one."""
+        """Say where this page sits in the whole list, and how to fetch the next one.
+
+        ``next_call_prefix`` is the suggested call up to, not including, its page argument.
+        """
         number = page.get("page")
         total_pages = page.get("totalPages")
         lines = [
@@ -3115,7 +3360,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             and isinstance(total_pages, int)
             and number + 1 < total_pages
         ):
-            lines.append(f"Next page: {next_call.format(page=number + 1)}")
+            lines.append(f"Next page: {next_call_prefix}, page={number + 1})")
         return lines
 
     def _pr_health_window_call(
@@ -3143,6 +3388,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         totals: Dict[str, Any] = raw_totals if isinstance(raw_totals, dict) else {}
         lines = self._render_pr_health_heading("PR Health", report, source, start_date, end_date)
         lines.extend(["", *self._render_pr_health_totals(totals)])
+        lines.extend(self._render_pr_health_causes(report.get("causes")))
         lines.extend([
             "",
             *self._render_pr_health_engineers_section(report, source, start_date, end_date, scope),
@@ -3151,6 +3397,23 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         if isinstance(raw_oldest, list) and raw_oldest:
             lines.extend(["", "**Most inactive open PRs**"])
             lines.extend(self._render_pr_health_pull_requests(raw_oldest, "", source))
+        return lines
+
+    def _render_pr_health_causes(self, causes: Any) -> List[str]:
+        """One line per action-queue cause, or nothing when the platform sent no causes array."""
+        rows = [cause for cause in causes if isinstance(cause, dict)] if isinstance(causes, list) else []
+        if not rows:
+            return []
+        lines = [
+            "",
+            "**Open PRs by cause** (the causes other than AUTOMATION add up to open plus draft PRs; "
+            "list one with get_pr_health_pull_requests(cause=...))",
+        ]
+        lines.extend(
+            f"- {row.get('cause') or 'unknown'}: {self._render_count(row.get('prs'))} "
+            f"({self._render_count(row.get('prsAssisted'))} AI-assisted)"
+            for row in rows
+        )
         return lines
 
     def _render_assisted_share(self, totals: Dict[str, Any], key: str) -> str:
@@ -3256,7 +3519,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
 
 **Troubleshooting:**
 {rule_lines}
-- The report covers your own organization and takes no team parameter
+- The report covers the team your credentials resolve to; you do not pass one
 - Verify your API key can view the organization's VCS data
 
 **For Help:**
@@ -3288,14 +3551,18 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         )
         sort_dir = self._validate_vcs_choice(arguments, "sort_dir", self._VCS_SORT_DIRECTIONS, action)
         page, size = self._validate_pr_health_paging(arguments)
+        query = self._validate_optional_text(arguments, "query", action, self._PR_HEALTH_MAX_SEARCH_LENGTH)
+        search = {"q": query} if query is not None else {}
 
         def render(report: Dict[str, Any]) -> List[str]:
             lines = self._render_pr_health_heading(
                 "PR Health engineers", report, source, start_date, end_date
             )
+            if query is not None:
+                lines.extend(["", f"**Search**: engineers whose login or mapped email contains {query!r}"])
             window_call = self._pr_health_window_call(action, source, start_date, end_date, scope)
-            sort_args = "".join(
-                f", {name}='{value}'" for name, value in (("sort_by", sort_by), ("sort_dir", sort_dir)) if value
+            sort_args = self._render_call_args(
+                [("sort_by", sort_by), ("sort_dir", sort_dir), ("query", query)]
             )
             size_arg = f", size={size}" if size is not None else ""
             lines.extend(["", "**Engineers**"])
@@ -3307,7 +3574,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             lines.append("")
             lines.extend(
                 self._render_page_position(
-                    report, "engineers", f"{window_call}{sort_args}{size_arg}, page={{page}})"
+                    report, "engineers", f"{window_call}{sort_args}{size_arg}"
                 )
             )
             return lines
@@ -3318,7 +3585,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             self._PR_HEALTH_RULES,
             lambda client: client.get_vcs_pr_health_engineers(
                 source, start_date, end_date,
-                page=page, size=size, sort_by=sort_by, sort_dir=sort_dir, **scope,
+                page=page, size=size, sort_by=sort_by, sort_dir=sort_dir, **search, **scope,
             ),
             render,
             ctx,
@@ -3355,6 +3622,65 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
                 examples={"usage": self._VCS_ACTION_USAGE[action]},
             )
         return author.strip()
+
+    def _validate_optional_text(
+        self, arguments: Dict[str, Any], field: str, action: str, max_length: Optional[int] = None
+    ) -> Optional[str]:
+        """Return a stripped optional text filter, None when blank, or reject a non-string or overlong one."""
+        value = arguments.get(field)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise create_structured_validation_error(
+                message=f"{field} must be a string, got {value!r}",
+                field=field,
+                value=value,
+                suggestions=[f"Pass {field} as text, or omit it"],
+                examples={"usage": self._VCS_ACTION_USAGE[action]},
+            )
+        text = value.strip()
+        if max_length is not None and len(text) > max_length:
+            raise create_structured_validation_error(
+                message=f"{field} may be at most {max_length} characters, got {len(text)}",
+                field=field,
+                value=value,
+                suggestions=[f"Shorten {field} to {max_length} characters or fewer"],
+                examples={"usage": self._VCS_ACTION_USAGE[action]},
+            )
+        return text or None
+
+    def _validate_pr_health_list_filters(
+        self, arguments: Dict[str, Any], action: str
+    ) -> "tuple[Optional[str], Dict[str, Optional[str]]]":
+        """Validate bucket plus the cause, repo, ticket and triaged filters; cause excludes bucket upstream."""
+        bucket = self._validate_vcs_choice(arguments, "bucket", self._PR_HEALTH_BUCKETS, action)
+        cause = self._validate_vcs_choice(arguments, "cause", self._PR_HEALTH_CAUSES, action)
+        if bucket is not None and cause is not None:
+            raise create_structured_validation_error(
+                message=f"{action} takes cause or bucket, not both",
+                field="cause",
+                value=arguments.get("cause"),
+                suggestions=[
+                    "Drop bucket to list one action-queue cause",
+                    "Drop cause to list one bucket",
+                ],
+                examples={
+                    "usage": (
+                        f"{action}(source='github', start_date='2026-05-17', "
+                        "end_date='2026-08-17', cause='WAITING_ON_REVIEW')"
+                    ),
+                },
+            )
+        return bucket, {
+            "cause": cause,
+            "repo": self._validate_optional_text(arguments, "repo", action),
+            "ticket": self._validate_optional_text(
+                arguments, "ticket", action, self._PR_HEALTH_MAX_TICKET_LENGTH
+            ),
+            "triaged": self._validate_vcs_choice(
+                arguments, "triaged", self._PR_HEALTH_TRIAGE_FILTERS, action
+            ),
+        }
 
     async def _handle_get_pr_health_prs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -3409,20 +3735,52 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             ctx,
         )
 
+    @staticmethod
+    def _render_pr_health_list_filter(
+        report: Dict[str, Any],
+        bucket: Optional[str],
+        author: Optional[str],
+        list_filters: Dict[str, Optional[str]],
+    ) -> str:
+        """The filters this page was read with, preferring what the platform echoes over what was sent."""
+        cause = report.get("cause") or list_filters.get("cause")
+        selection = (
+            f"cause={cause}" if cause
+            else f"bucket={report.get('bucket') or bucket or 'all except AUTOMATION'}"
+        )
+        parts = [selection, f"author={report.get('author') or author or 'all'}"]
+        for name in ("repo", "ticket"):
+            value = report.get(name) or list_filters.get(name)
+            if value:
+                parts.append(f"{name}={value}")
+        triaged = report.get("triaged") or list_filters.get("triaged") or "EXCLUDE"
+        listing_automation = "AUTOMATION" in (cause, report.get("bucket") or bucket)
+        triage_text = (
+            "ignored for automation pull requests, which are listed whether or not anyone dismissed them"
+            if listing_automation
+            else "only dismissed or snoozed pull requests" if str(triaged).upper() == "ONLY"
+            else "dismissed and snoozed pull requests left out"
+        )
+        parts.append(f"triaged={triaged} ({triage_text})")
+        return ", ".join(parts)
+
     async def _handle_get_pr_health_pull_requests(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get_pr_health_pull_requests — one page of the flat, bucketed PR list."""
         action = "get_pr_health_pull_requests"
         source, start_date, end_date, scope = self._validate_pr_health_request(arguments, action)
-        bucket = self._validate_vcs_choice(arguments, "bucket", self._PR_HEALTH_BUCKETS, action)
+        bucket, list_filters = self._validate_pr_health_list_filters(arguments, action)
         author = self._validate_pr_health_author(arguments, action, required=False)
         sort_by = self._validate_vcs_choice(
             arguments, "sort_by", self._PR_HEALTH_PULL_REQUEST_SORT_FIELDS, action
         )
         sort_dir = self._validate_vcs_choice(arguments, "sort_dir", self._VCS_SORT_DIRECTIONS, action)
         page, size = self._validate_pr_health_paging(arguments)
-        filter_args = {"bucket": bucket, "author": author, "sort_by": sort_by, "sort_dir": sort_dir}
+        sent_filters = {name: value for name, value in list_filters.items() if value is not None}
+        filter_args = {
+            "bucket": bucket, **sent_filters, "author": author, "sort_by": sort_by, "sort_dir": sort_dir,
+        }
 
         def render(report: Dict[str, Any]) -> List[str]:
             lines = self._render_pr_health_heading(
@@ -3430,8 +3788,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             )
             lines.extend([
                 "",
-                f"**Filter**: bucket={report.get('bucket') or bucket or 'all'}, "
-                f"author={report.get('author') or author or 'all'}",
+                f"**Filter**: {self._render_pr_health_list_filter(report, bucket, author, list_filters)}",
                 "",
                 "**Pull requests**",
                 *self._render_pr_health_pull_requests(
@@ -3440,11 +3797,11 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
                 "",
             ])
             window_call = self._pr_health_window_call(action, source, start_date, end_date, scope)
-            extra = "".join(f", {name}='{value}'" for name, value in filter_args.items() if value)
+            extra = self._render_call_args(list(filter_args.items()))
             size_arg = f", size={size}" if size is not None else ""
             lines.extend(
                 self._render_page_position(
-                    report, "pull requests", f"{window_call}{extra}{size_arg}, page={{page}})"
+                    report, "pull requests", f"{window_call}{extra}{size_arg}"
                 )
             )
             return lines
@@ -3455,7 +3812,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             self._PR_HEALTH_RULES,
             lambda client: client.get_vcs_pr_health_pull_requests(
                 source, start_date, end_date, bucket=bucket, author=author,
-                page=page, size=size, sort_by=sort_by, sort_dir=sort_dir, **scope,
+                page=page, size=size, sort_by=sort_by, sort_dir=sort_dir, **sent_filters, **scope,
             ),
             render,
             ctx,
@@ -3506,6 +3863,399 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             [f"`source` is required and is one of {', '.join(self._PR_HEALTH_SOURCES)}; this read takes no window"],
             lambda client: client.get_vcs_pr_health_repositories(source),
             lambda report: self._render_pr_health_repositories(report, source),
+            ctx,
+        )
+
+    # Decision (BACK-3953): the PR-health triage writes are not adopted. They are
+    # POST /v2/api/billing/users/vcs-pr-health/triage/dismiss (dismiss with a reason),
+    # POST .../triage/snooze (snooze until a date) and DELETE .../triage (undo either).
+    # This tool keeps no mutations, and adopting them would give every profile that
+    # exposes it its first writes; the spec also lets only organization admins write,
+    # so most callers would only get 403s. The reads above and below still show the
+    # result of triage done in the app: triaged=EXCLUDE (the platform default) leaves
+    # dismissed and snoozed pull requests out, and triaged=ONLY lists just those.
+    # Indexed under `decision_exclusions` in .claude/commands/mcp-api-exclusions.yaml.
+    # Revisit if triage is wanted from an agent, as a confirm-gated action on a tool
+    # that already writes.
+    def _validate_pr_health_optional_window(
+        self, arguments: Dict[str, Any], action: str
+    ) -> "tuple[str, Optional[str], Optional[str], Dict[str, Any]]":
+        """Like ``_validate_pr_health_request``, for the reads whose window is both-or-neither."""
+        if arguments.get("start_date") is None and arguments.get("end_date") is None:
+            source = self._validate_vcs_source(arguments, action)
+            return source, None, None, self._validate_pr_health_scope(arguments, action)
+        return self._validate_pr_health_request(arguments, action)
+
+    def _validate_pr_health_trend_granularity(
+        self, arguments: Dict[str, Any], start_date: Optional[str], end_date: Optional[str]
+    ) -> Optional[str]:
+        """Return the bucket size, refusing one the platform would ignore or 400 on."""
+        action = "get_pr_health_trend"
+        granularity = self._validate_vcs_choice(
+            arguments, "granularity", self._PR_HEALTH_TREND_GRANULARITIES, action
+        )
+        if start_date is None or end_date is None:
+            self._reject_params_without(arguments, ["granularity"], "start_date and end_date", action)
+        elif granularity == "day":
+            self._reject_span_at_or_over(
+                datetime.strptime(start_date, "%Y-%m-%d"),
+                datetime.strptime(end_date, "%Y-%m-%d"),
+                self._PR_HEALTH_TREND_MAX_DAY_SPAN_DAYS,
+                "granularity=day",
+                arguments.get("end_date"),
+                ["Use granularity='week' or 'month' for longer ranges"],
+            )
+        return granularity
+
+    @staticmethod
+    def _pr_health_window_text(start_date: Optional[str], end_date: Optional[str], unbounded: str) -> str:
+        return f"{start_date} to {end_date}" if start_date and end_date else unbounded
+
+    def _render_pr_health_breakdown_counts(self, counts: Dict[str, Any]) -> str:
+        return (
+            f"open={self._render_count(counts.get('openPrs'))} "
+            f"aging={self._render_count(counts.get('agingPrs'))} "
+            f"at-risk={self._render_count(counts.get('rottingPrs'))} "
+            f"wasted={self._render_count(counts.get('closedUnmerged'))} "
+            f"merged={self._render_count(counts.get('mergedPrs'))} | "
+            f"priced at-risk={self._render_count(counts.get('pricedRottingPrs'))} "
+            f"priced wasted={self._render_count(counts.get('pricedClosedUnmerged'))}"
+        )
+
+    def _render_pr_health_breakdown_row(self, row: Dict[str, Any]) -> str:
+        details = [str(email) for email in [row.get("activeMappedEmail") or row.get("mappedEmail")] if email]
+        if row.get("departmentId") is not None:
+            members = ", direct members only" if row.get("directMembersOnly") is True else ""
+            details.append(f"department_id={row.get('departmentId')}{members}")
+        label = row.get("label") or row.get("key") or "unknown"
+        identity = f"{label} ({'; '.join(details)})" if details else str(label)
+        in_window = row.get("prsInWindow")
+        extras = [f"{self._render_count(in_window)} PRs in the window"] if in_window is not None else []
+        if row.get("noMergesInWindow") is True:
+            extras.append("no human merge in the last 90 days")
+        suffix = "".join(f" | {extra}" for extra in extras)
+        return f"- {identity} | {self._render_pr_health_breakdown_counts(row)}{suffix}"
+
+    def _render_pr_health_breakdown(
+        self,
+        report: Dict[str, Any],
+        source: str,
+        start_date: str,
+        end_date: str,
+        request: Dict[str, Any],
+    ) -> List[str]:
+        group_by = report.get("groupBy") or request["group_by"]
+        lines = self._render_pr_health_heading(
+            f"PR Health breakdown by {group_by}", report, source, start_date, end_date
+        )
+        raw_totals = report.get("totals")
+        totals: Dict[str, Any] = raw_totals if isinstance(raw_totals, dict) else {}
+        lines.extend([
+            "",
+            "**Totals** (whole, across every group; for repo and department the rows add up "
+            "to them except merged, which also counts groups with nothing else)",
+            f"- {self._render_pr_health_breakdown_counts(totals)}",
+            "",
+            "**Groups** (a group appears only when it holds an open pull request or one closed without merging)",
+        ])
+        raw_rows = report.get("rows")
+        rows: List[Dict[str, Any]] = raw_rows if isinstance(raw_rows, list) else []
+        if not rows:
+            lines.append("- No group on this page.")
+        lines.extend(self._render_pr_health_breakdown_row(row) for row in rows)
+        if group_by == "department":
+            lines.append(
+                "The organization has no org chart, so there are no department rows."
+                if report.get("departmentAvailable") is False
+                else "Pass a row's department_id (with include_descendants=true, or false for a "
+                "direct-members row) to any PR-health read for exactly that row's figures."
+            )
+        lines.extend([
+            "Priced counts are the pull requests opened on or after the report's pricedSince. No "
+            "dollars are returned: multiply them by get_pr_health's avgCostPerMergedPr for an estimate.",
+            "",
+        ])
+        window_call = self._pr_health_window_call(
+            "get_pr_health_breakdown", source, start_date, end_date, request["scope"]
+        )
+        sort_args = self._render_call_args(
+            [("group_by", group_by), ("sort_by", request["sort_by"]), ("sort_dir", request["sort_dir"])]
+        )
+        size_arg = f", size={request['size']}" if request["size"] is not None else ""
+        lines.extend(self._render_page_position(report, "groups", f"{window_call}{sort_args}{size_arg}"))
+        return lines
+
+    async def _handle_get_pr_health_breakdown(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_pr_health_breakdown — one page of the figures grouped by repo, engineer or department."""
+        action = "get_pr_health_breakdown"
+        source, start_date, end_date, scope = self._validate_pr_health_request(arguments, action)
+        group_by = self._validate_vcs_choice(arguments, "group_by", self._PR_HEALTH_BREAKDOWN_GROUPS, action)
+        if group_by is None:
+            raise create_structured_missing_parameter_error(
+                parameter_name="group_by",
+                action=action,
+                examples={
+                    "usage": self._VCS_ACTION_USAGE[action],
+                    "valid_group_by": self._PR_HEALTH_BREAKDOWN_GROUPS,
+                },
+            )
+        page, size = self._validate_pr_health_paging(arguments)
+        request: Dict[str, Any] = {
+            "group_by": group_by,
+            "sort_by": self._validate_vcs_choice(
+                arguments, "sort_by", self._PR_HEALTH_BREAKDOWN_SORT_FIELDS, action
+            ),
+            "sort_dir": self._validate_vcs_choice(arguments, "sort_dir", self._VCS_SORT_DIRECTIONS, action),
+            "size": size,
+            "scope": scope,
+        }
+        return await self._run_vcs_read(
+            action,
+            "PR Health Breakdown",
+            self._PR_HEALTH_RULES,
+            lambda client: client.get_vcs_pr_health_breakdown(
+                source, start_date, end_date, group_by,
+                page=page, size=size, sort_by=request["sort_by"], sort_dir=request["sort_dir"], **scope,
+            ),
+            lambda report: self._render_pr_health_breakdown(report, source, start_date, end_date, request),
+            ctx,
+        )
+
+    _PR_HEALTH_QUEUE_LIST_FILTERS: ClassVar[List[str]] = ["triaged", "author", "repo", "ticket"]
+
+    def _pr_health_queue_continuation_args(
+        self, filters: Dict[str, Any], scope: Dict[str, Any]
+    ) -> str:
+        """The queue's own filters, so the suggested list continues the same group, not a wider one."""
+        return self._render_call_args(
+            [(name, filters.get(name)) for name in self._PR_HEALTH_QUEUE_LIST_FILTERS]
+            + list(scope.items())
+        )
+
+    def _render_pr_health_queue_group(
+        self, group: Dict[str, Any], source: str, continuation_args: str
+    ) -> List[str]:
+        cause = group.get("cause") or "unknown"
+        raw = group.get("pullRequests")
+        pulls: List[Dict[str, Any]] = raw if isinstance(raw, list) else []
+        total = group.get("totalElements")
+        lines = ["", f"**{cause}** — {self._render_count(total)} open pull request(s)"]
+        lines.extend(line for pull in pulls for line in self._render_pr_health_pull_request(pull))
+        if not pulls:
+            lines.append("- None.")
+        if isinstance(total, int) and not isinstance(total, bool) and total > len(pulls):
+            lines.append(
+                f"Showing {len(pulls)} of {total}; list every one with get_pr_health_pull_requests("
+                f"source='{source}', cause='{cause}'{continuation_args}), adding any start_date and "
+                "end_date: the window filters nothing with cause."
+            )
+        return lines
+
+    def _render_pr_health_queue(
+        self, report: Dict[str, Any], source: str, filters: Dict[str, Any], scope: Dict[str, Any]
+    ) -> List[str]:
+        lines = self._render_pr_health_scope_heading(
+            "PR Health action queue", report, source, "open pull requests now (no window)"
+        )
+        triaged = report.get("triaged") or filters.get("triaged") or "EXCLUDE"
+        triage_text = (
+            "only dismissed or snoozed pull requests" if str(triaged).upper() == "ONLY"
+            else "dismissed and snoozed pull requests left out"
+        )
+        narrowing = [
+            f"{name}={report.get(name) or filters.get(name)}"
+            for name in ("repo", "author", "ticket")
+            if report.get(name) or filters.get(name)
+        ]
+        lines.extend([
+            "",
+            self._render_pr_health_thresholds(report),
+            f"An author counts as gone after {self._render_count(report.get('authorGoneDays'))} days "
+            "with no pull request opened, merged or committed to.",
+            "",
+            f"**Filter**: triaged={triaged} ({triage_text}, except in AUTOMATION)"
+            + "".join(f", {item}" for item in narrowing)
+            + f"; each group lists its first {self._render_count(report.get('perCause'))} rows, sorted by "
+            f"{report.get('sortBy') or 'inactivity'} {report.get('sortDir') or 'desc'}",
+            "Every open pull request takes the first cause that matches, in this order.",
+        ])
+        continuation_args = self._pr_health_queue_continuation_args(filters, scope)
+        raw_groups = report.get("groups")
+        groups = [group for group in raw_groups if isinstance(group, dict)] if isinstance(raw_groups, list) else []
+        for group in groups:
+            lines.extend(self._render_pr_health_queue_group(group, source, continuation_args))
+        if not groups:
+            lines.extend(["", "- The platform returned no cause groups."])
+        if source == "gitlab":
+            lines.append(self._PR_HEALTH_GITLAB_NOTE)
+        return lines
+
+    async def _handle_get_pr_health_queue(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_pr_health_queue — open pull requests grouped by why they need a decision."""
+        action = "get_pr_health_queue"
+        source = self._validate_vcs_source(arguments, action)
+        scope = self._validate_pr_health_scope(arguments, action)
+        filters: Dict[str, Any] = {
+            "per_cause": self._validate_optional_int(
+                arguments, "per_cause", 1, self._PR_HEALTH_QUEUE_MAX_PER_CAUSE
+            ),
+            "sort_by": self._validate_vcs_choice(arguments, "sort_by", self._PR_HEALTH_QUEUE_SORT_FIELDS, action),
+            "sort_dir": self._validate_vcs_choice(arguments, "sort_dir", self._VCS_SORT_DIRECTIONS, action),
+            "author": self._validate_pr_health_author(arguments, action, required=False),
+            "repo": self._validate_optional_text(arguments, "repo", action),
+            "ticket": self._validate_optional_text(
+                arguments, "ticket", action, self._PR_HEALTH_MAX_TICKET_LENGTH
+            ),
+            "triaged": self._validate_vcs_choice(arguments, "triaged", self._PR_HEALTH_TRIAGE_FILTERS, action),
+        }
+        sent = {name: value for name, value in filters.items() if value is not None}
+        return await self._run_vcs_read(
+            action,
+            "PR Health Action Queue",
+            [
+                f"`source` is required and is one of {', '.join(self._PR_HEALTH_SOURCES)}; this read takes no window",
+                f"per_cause is between 1 and {self._PR_HEALTH_QUEUE_MAX_PER_CAUSE}",
+            ],
+            lambda client: client.get_vcs_pr_health_queue(source, **sent, **scope),
+            lambda report: self._render_pr_health_queue(report, source, filters, scope),
+            ctx,
+        )
+
+    def _render_pr_health_trend_bucket(self, bucket: Dict[str, Any]) -> str:
+        marks = []
+        if bucket.get("complete") is False:
+            marks.append("so far")
+        if bucket.get("covered") is False:
+            marks.append("before the synced history, not covered")
+        mark_text = f" [{'; '.join(marks)}]" if marks else ""
+        return (
+            f"- {bucket.get('weekStart') or '?'} (as of {bucket.get('asOf') or '?'}){mark_text} | "
+            f"closed unmerged={self._render_count(bucket.get('closedUnmerged'))} "
+            f"({self._render_count(bucket.get('closedUnmergedAssisted'))} AI-assisted) | "
+            f"at risk={self._render_count(bucket.get('atRiskPrs'))} "
+            f"({self._render_count(bucket.get('atRiskPrsAssisted'))} AI-assisted) | "
+            f"priced: closed unmerged={self._render_count(bucket.get('pricedClosedUnmerged'))} "
+            f"at risk={self._render_count(bucket.get('pricedAtRiskPrs'))}"
+        )
+
+    def _render_pr_health_trend(
+        self, report: Dict[str, Any], source: str, start_date: Optional[str], end_date: Optional[str]
+    ) -> List[str]:
+        granularity = report.get("granularity") or "week"
+        period = self._pr_health_window_text(
+            report.get("startDate") or start_date,
+            report.get("endDate") or end_date,
+            "the 26 weeks ending with the current one",
+        )
+        lines = self._render_pr_health_scope_heading(
+            "PR Health trend", report, source, f"{period}, by {granularity}"
+        )
+        history_start = report.get("historyStart")
+        lines.extend([
+            "",
+            f"**Rotting threshold**: {self._render_count(report.get('rottingDays'))}+ days inactive. At risk "
+            "counts the open, non-draft, non-automation pull requests idle that long at each bucket's end.",
+            f"**Priced since**: {report.get('pricedSince') or 'none (no coding-assistant spend to price yet)'}",
+            f"**Synced history starts**: {history_start}" if history_start
+            else "**Synced history starts**: unknown, so every bucket is marked not covered",
+            "",
+            f"**{self._PR_HEALTH_TREND_BUCKET_NOUNS.get(granularity, 'Buckets')}** (oldest first)",
+        ])
+        raw = report.get("weeks")
+        buckets = [bucket for bucket in raw if isinstance(bucket, dict)] if isinstance(raw, list) else []
+        if not buckets:
+            lines.append("- No bucket: the window starts after the current week.")
+        lines.extend(self._render_pr_health_trend_bucket(bucket) for bucket in buckets)
+        lines.extend([
+            "",
+            "Past buckets' at-risk counts are reconstructed from each pull request's last known "
+            "activity and may read high; the current bucket's matches get_pr_health's rotting count. "
+            "No dollars are returned: multiply the priced counts by a cost basis for an estimate.",
+        ])
+        return lines
+
+    async def _handle_get_pr_health_trend(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_pr_health_trend — closed-unmerged and at-risk counts per day, week or month."""
+        action = "get_pr_health_trend"
+        source, start_date, end_date, scope = self._validate_pr_health_optional_window(arguments, action)
+        granularity = self._validate_pr_health_trend_granularity(arguments, start_date, end_date)
+        return await self._run_vcs_read(
+            action,
+            "PR Health Trend",
+            [
+                "Without start_date and end_date the trend is the 26 weeks ending now; with them "
+                + self._PR_HEALTH_WINDOW_RULE.lower(),
+                f"granularity=day spans fewer than {self._PR_HEALTH_TREND_MAX_DAY_SPAN_DAYS} days",
+            ],
+            lambda client: client.get_vcs_pr_health_trend(
+                source, start_date=start_date, end_date=end_date, granularity=granularity, **scope
+            ),
+            lambda report: self._render_pr_health_trend(report, source, start_date, end_date),
+            ctx,
+        )
+
+    def _render_pr_health_at_risk(self, label: str, at_risk: Any) -> str:
+        figures: Dict[str, Any] = at_risk if isinstance(at_risk, dict) else {}
+        return (
+            f"- {label}: {self._render_count(figures.get('prs'))} pull requests, "
+            f"{self._render_money(figures.get('estimatedDollars'), None)} estimated"
+        )
+
+    def _render_pr_health_follow_through(
+        self, report: Dict[str, Any], source: str, start_date: Optional[str], end_date: Optional[str]
+    ) -> List[str]:
+        period = self._pr_health_window_text(
+            report.get("startDate") or start_date,
+            report.get("endDate") or end_date,
+            "every flag ever taken",
+        )
+        lines = self._render_pr_health_scope_heading("PR Health follow-through", report, source, period)
+        since = report.get("since")
+        lines.extend([
+            "",
+            f"**Flagged as rotting** (first flag: {since})" if since
+            else "**Flagged as rotting**: no pull request has been flagged in this scope yet",
+            f"- Flagged: {self._render_count(report.get('flaggedPrs'))}",
+            f"  - merged after the flag: {self._render_count(report.get('flaggedMerged'))}",
+            f"  - closed without merging after the flag: {self._render_count(report.get('flaggedClosed'))}",
+            f"  - still open, not dismissed or snoozed: {self._render_count(report.get('flaggedOpen'))}",
+            "",
+            "**At risk then and now** (platform estimates, not billed amounts)",
+            self._render_pr_health_at_risk(
+                "Then (every pull request flagged in the first 7 days from the first flag)",
+                report.get("atRiskThen"),
+            ),
+            self._render_pr_health_at_risk("Now (today's rotting set)", report.get("atRiskNow")),
+            f"- Cost per merged pull request, last 90 days: {self._render_money(report.get('basisNow'), None)}; "
+            f"the 90 days ending on the first flag: {self._render_money(report.get('basisThen'), None)}",
+            "n/a means the basis window had no merged pull request outside automation or no recorded "
+            "coding-assistant spend (or nothing was flagged yet), not a zero.",
+        ])
+        return lines
+
+    async def _handle_get_pr_health_follow_through(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_pr_health_follow_through — whether flagged rotting pull requests got fixed."""
+        action = "get_pr_health_follow_through"
+        source, start_date, end_date, scope = self._validate_pr_health_optional_window(arguments, action)
+        return await self._run_vcs_read(
+            action,
+            "PR Health Follow-Through",
+            [
+                "Without start_date and end_date every flag ever taken counts; with them "
+                + self._PR_HEALTH_WINDOW_RULE.lower(),
+            ],
+            lambda client: client.get_vcs_pr_health_follow_through(
+                source, start_date=start_date, end_date=end_date, **scope
+            ),
+            lambda report: self._render_pr_health_follow_through(report, source, start_date, end_date),
             ctx,
         )
 
@@ -3747,7 +4497,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             f"**Merged PRs — {source}, {request['start_date']} to {request['end_date']}** "
             f"({grouping}, granularity={report.get('granularity') or request['granularity'] or 'window'})",
             "",
-            "Scope: your own organization, resolved from your credentials; there is no team parameter.",
+            "Scope: the team your credentials resolve to, sent with the read; you do not pass one.",
         ]
         sync_scope = report.get("syncScope")
         lines.extend(self._render_vcs_sync_scope(sync_scope, source))
@@ -3810,6 +4560,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         "not prove there was no coding-assistant usage — a probe that cannot complete "
         "also reports no."
     )
+    _COVERAGE_CHECK_INCOMPLETE_LABEL: ClassVar[str] = "unknown (the check could not complete)"
 
     # Each row's ratio is that provider's slice of the billed total — the rows sum
     # toward 1.0 across providers. It answers "who did we spend it with", not
@@ -3869,6 +4620,34 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         if not isinstance(value, bool):
             return "unknown"
         return "yes" if value else "no"
+
+    @staticmethod
+    def _reports_coding_assistant_check(source: Dict[str, Any]) -> bool:
+        """Whether a report or row carries a coding-assistant answer worth a line."""
+        return (
+            "codingAssistantUsagePresent" in source
+            or source.get("codingAssistantUsageUnknown") is True
+        )
+
+    @classmethod
+    def _render_coding_assistant_presence(cls, source: Dict[str, Any]) -> str:
+        """Render the coding-assistant flag, or say the check did not complete.
+
+        When the check could not complete the platform still sends
+        codingAssistantUsagePresent=false, so the flag alone would print a
+        confident no for what is really no answer.
+        """
+        if source.get("codingAssistantUsageUnknown") is True:
+            return cls._COVERAGE_CHECK_INCOMPLETE_LABEL
+        return cls._render_presence_flag(source.get("codingAssistantUsagePresent"))
+
+    @staticmethod
+    def _render_revision_window(row: Dict[str, Any]) -> Optional[str]:
+        """The restatement caveat for one provider row, or None when its figures are final."""
+        start = row.get("revisionWindowStart")
+        if not isinstance(start, str) or not start.strip():
+            return None
+        return f"  - figures from {start.strip()} onward may still be restated by the provider"
 
     @staticmethod
     def _render_ratio(value: Any) -> str:
@@ -4158,11 +4937,11 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             # Upstream serializes this boolean on every 200 (flag-off tenants
             # get a 403 instead, since the endpoint is feature-gated). The
             # membership check stays as defense against older payloads only.
-            if "codingAssistantUsagePresent" in report:
+            if self._reports_coding_assistant_check(report):
                 lines.extend([
                     "",
                     "**Coding-assistant usage**",
-                    f"- Present: {self._render_presence_flag(report.get('codingAssistantUsagePresent'))}",
+                    f"- Present: {self._render_coding_assistant_presence(report)}",
                     self._COVERAGE_PRESENCE_NOTE,
                 ])
 
@@ -4195,10 +4974,9 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
                     f"metered={self._render_coverage_amount(row.get('metered'))}",
                     f"billed={self._render_coverage_amount(row.get('billing'))}",
                 ]
-                if "codingAssistantUsagePresent" in row:
+                if self._reports_coding_assistant_check(row):
                     parts.append(
-                        "coding-assistant usage: "
-                        f"{self._render_presence_flag(row.get('codingAssistantUsagePresent'))}"
+                        f"coding-assistant usage: {self._render_coding_assistant_presence(row)}"
                     )
                 if "billingCredentialConnected" in row:
                     connected = row.get("billingCredentialConnected")
@@ -4212,6 +4990,9 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
                     if connected is False:
                         uncredentialed_row_seen = True
                 lines.append(" ".join(parts))
+                revision_window = self._render_revision_window(row)
+                if revision_window is not None:
+                    lines.append(revision_window)
             if len(rows) > self._COVERAGE_MAX_PROVIDER_ROWS:
                 lines.append(
                     f"… {len(rows) - self._COVERAGE_MAX_PROVIDER_ROWS} more providers not shown."
@@ -4578,8 +5359,11 @@ If you're seeing this error, please report it as it indicates a reliability issu
             raise
         except NewApiRequiredError:
             return [TextContent(type="text", text=(
-                "**get_user_costs** requires the new analytics API.\n\n"
-                "Set the environment variable `REVENIUM_USE_NEW_ANALYTICS_API=true` to enable it."
+                "**get_user_costs** is not enabled on this MCP server deployment.\n\n"
+                "This is a server configuration gap, not something your tenant lacks: "
+                "the per-user cost report reads the analytics API, which this server is "
+                "not configured to call. The server operator can enable it by setting "
+                "`REVENIUM_USE_NEW_ANALYTICS_API=true`."
             ))]
         except Exception as e:
             logger.error(f"Error in get_user_costs: {e}")
@@ -4590,21 +5374,86 @@ If you're seeing this error, please report it as it indicates a reliability issu
 
 **Troubleshooting:**
 - Verify your parameters: period (required), aggregation (optional, defaults to TOTAL)
-- User cost data exists only for rows whose subscriber email is populated; per-employee
-  coding-assistant spend is not answerable from this action
+- User cost data exists only for rows whose subscriber email is populated; coding-assistant usage
+  is real spend or an estimate under coding_assistant depending on whether the team pays for it at API rates
 
 **Supported Parameters:**
 - **period**: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - **aggregation**: TOTAL, MEAN, MAXIMUM, MINIMUM (optional, defaults to TOTAL)
 - **filters**: Optional dict with array keys `agents`, `providers`, `models`, `users`, `costSources`
-- **costSources**: Defaults to `["coding_assistant"]` (the rows that populate subscriber email);
-  pass `["revenium_metered", "provider_billing"]` for API-metered per-user spend
+- **costSources**: Defaults to `["coding_assistant", "revenium_metered", "provider_billing"]`
+  (every source); pass a subset to narrow the report to one classification
 
 **For Help:**
 - Use `get_capabilities()` to check current status
 - Use `get_examples()` to see working examples
 """
             return [TextContent(type="text", text=error_response)]
+
+    # Decision (BACK-3979): GET /api/v2/analytics/cost-by-department is not wrapped.
+    #
+    # get_department_costs below reads the aggregated route, one row per department
+    # for the whole window. The time series sibling returns the same groups per
+    # time bucket, and its own contract sends long ranges to the aggregated route.
+    # No caller has asked for per-bucket department figures, and a paged series of
+    # groups times buckets would cost a second renderer for an answer the
+    # aggregated read already gives over any window.
+    #
+    # What reopens it: a caller needs department spend per day or week rather than
+    # for the window. Then add a registry key beside
+    # cost_metric_by_department_aggregated and render the buckets with the same
+    # hashid, departmentSetup and own versus with-sub-departments rules.
+    async def _handle_get_department_costs(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Cost by department for the resolved team, from the aggregated analytics route."""
+        try:
+            validated = AnalyticsValidator().validate_department_costs_params(arguments)
+            query = DepartmentCostsQuery(
+                period=validated["period"],
+                aggregation=validated["aggregation"],
+                filters=validated.get("filters", {}),
+                page=arguments.get("page"),
+                size=arguments.get("size"),
+            )
+            client = await self.get_client(ctx=ctx)
+            envelope = await SimpleCostAnalyzer(client).get_department_costs(query)
+            text = DepartmentCostsFormatter().format(parse_department_costs(envelope), query)
+            return [TextContent(type="text", text=text)]
+        except ValidationError as e:
+            return [TextContent(type="text", text=self._department_costs_validation_error(e))]
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in get_department_costs: {e}")
+            return [TextContent(type="text", text=self._department_costs_failure(e))]
+
+    @staticmethod
+    def _department_costs_validation_error(error: ValidationError) -> str:
+        suggestions = "".join(f"- {suggestion}\n" for suggestion in error.suggestions)
+        return f"""**Department Costs Validation Error**
+
+**Error**: {error.message}
+
+**Suggestions:**
+{suggestions}
+**Parameters:**
+- **period** (required): {_values(COST_PERIOD_VALUES)}
+- **group** or **aggregation** (optional): {_values(AGGREGATION_VALUES)}, default TOTAL
+- **filters** (optional): arrays under agents, providers, models, users, costSources
+- **page** (optional, zero-based) and **size** (optional, 1 to 100, default 20)
+"""
+
+    def _department_costs_failure(self, error: Exception) -> str:
+        return f"""**Department Costs Analysis Failed**
+
+{self._format_api_error_details(error)}
+
+**Troubleshooting:**
+- Verify your parameters: period (required), group or aggregation (optional, default TOTAL)
+- size must be from 1 to 100
+- Filter values must be names the platform knows: use get_filter_options(dimension=...)
+"""
 
     async def _handle_get_tool_costs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -4704,6 +5553,144 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_examples()` to see working examples
 """
             return [TextContent(type="text", text=error_response)]
+
+    # ── Coding-assistant team medians (analytics plane) ────────────────────
+    # Verified against dev: any other window answers 400
+    # "window must be 14d or completed-weeks:<1-4>", which the spec does not state.
+    _TEAM_MEDIANS_ROLLING_WINDOW: ClassVar[str] = "14d"
+    _TEAM_MEDIANS_MAX_COMPLETED_WEEKS: ClassVar[int] = 4
+    _TEAM_MEDIANS_COMPLETED_WEEKS_PREFIX: ClassVar[str] = "completed-weeks:"
+    _TEAM_MEDIANS_MIN_PEOPLE: ClassVar[int] = 5
+    _TEAM_MEDIANS_USAGE: ClassVar[str] = "get_ai_assistant_team_medians(window='completed-weeks:2')"
+    _TEAM_MEDIANS_SCOPE_NOTE: ClassVar[str] = (
+        "Scope: the team your credentials resolve to, sent with the read; Claude Code is "
+        "the only coding assistant the medians cover today. The figures are anonymous "
+        "medians across the people the Context efficiency view compares: nothing about "
+        "any person is returned."
+    )
+    _TEAM_MEDIANS_NO_FIGURES_NOTE: ClassVar[str] = (
+        "The platform asks callers to treat this as no figures: it is not a zero and "
+        "not a small team. Try again later."
+    )
+
+    def _team_medians_windows(self) -> List[str]:
+        return [self._TEAM_MEDIANS_ROLLING_WINDOW] + [
+            f"{self._TEAM_MEDIANS_COMPLETED_WEEKS_PREFIX}{weeks}"
+            for weeks in range(1, self._TEAM_MEDIANS_MAX_COMPLETED_WEEKS + 1)
+        ]
+
+    def _validate_team_medians_window(self, arguments: Dict[str, Any]) -> Optional[str]:
+        """Return the window to send, None for the platform default, or reject one it 400s on."""
+        value = arguments.get("window")
+        if value is None:
+            return None
+        windows = self._team_medians_windows()
+        if isinstance(value, str) and value.strip().lower() in windows:
+            return value.strip().lower()
+        raise create_structured_validation_error(
+            message=f"Unsupported window for get_ai_assistant_team_medians: {value!r}",
+            field="window",
+            value=value,
+            suggestions=[
+                f"Use {self._TEAM_MEDIANS_ROLLING_WINDOW} (the last 14 days, the default) or "
+                f"{self._TEAM_MEDIANS_COMPLETED_WEEKS_PREFIX}N for the last N completed weeks, "
+                f"N from 1 to {self._TEAM_MEDIANS_MAX_COMPLETED_WEEKS}",
+            ],
+            examples={"usage": self._TEAM_MEDIANS_USAGE, "valid_windows": windows},
+        )
+
+    @staticmethod
+    def _team_median_figure(report: Dict[str, Any], key: str) -> Optional[float]:
+        """The median for one measure, or None when the platform withheld or could not compute it."""
+        unavailable = report.get("unavailable")
+        if isinstance(unavailable, list) and key in unavailable:
+            return None
+        value = report.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    def _render_team_median(
+        self, report: Dict[str, Any], key: str, label: str, render: Callable[[float], str]
+    ) -> str:
+        figure = self._team_median_figure(report, key)
+        text = render(figure) if figure is not None else "unavailable for this window (not a zero)"
+        return f"- {label}: {text}"
+
+    def _render_team_medians(self, report: Dict[str, Any]) -> List[str]:
+        window = report.get("window") or self._TEAM_MEDIANS_ROLLING_WINDOW
+        lines = [
+            f"**Coding-assistant team medians (Claude Code) — window {window}, group "
+            f"{report.get('group') or 'team'}**",
+            "",
+            self._TEAM_MEDIANS_SCOPE_NOTE,
+            "",
+        ]
+        if report.get("belowFloor") is True:
+            return lines + [
+                "**Not enough people to compare.** Fewer than "
+                f"{self._TEAM_MEDIANS_MIN_PEOPLE} people made a Claude Code call in this "
+                "window, so the platform withholds every median. This is not a zero: there is "
+                "no figure to report until more people use it.",
+            ]
+        start, end = report.get("windowStart"), report.get("windowEnd")
+        if start and end:
+            lines.append(f"**Window**: {start} to {end}")
+        lines.extend([
+            f"**Compared across**: {self._render_count(report.get('n'))} people",
+            "",
+            "**Medians** (coarsened by the platform)",
+            self._render_team_median(
+                report, "contextPerCall", "Context tokens per call",
+                lambda value: f"{value:,.0f} (rounded to the nearest 10,000)",
+            ),
+            self._render_team_median(
+                report, "cacheRebuildRatio", "Cache rebuild ratio",
+                lambda value: f"{value:g} (two significant figures)",
+            ),
+            self._render_team_median(
+                report, "effortAboveDefaultShare", "Requests sent above the model's default effort",
+                lambda value: f"{value * 100:.0f}% (rounded to the nearest 5%)",
+            ),
+        ])
+        return lines
+
+    def _render_team_medians_failure(self, error: ReveniumAPIError) -> str:
+        status = error.status_code
+        lines = ["**Coding-Assistant Team Medians Failed**", "", self._format_api_error_details(error)]
+        if status == 429 or (isinstance(status, int) and status >= 500):
+            lines.extend(["", f"No figures right now. {self._TEAM_MEDIANS_NO_FIGURES_NOTE}"])
+        elif status == 400:
+            response = error.response_data if isinstance(error.response_data, dict) else {}
+            reasons = [
+                str(item.get("message"))
+                for item in response.get("errors") or []
+                if isinstance(item, dict) and item.get("message")
+            ]
+            lines.extend([
+                "",
+                *(f"- {reason}" for reason in reasons),
+                "This action always sends assistants=claude-code, the only coding assistant "
+                "the platform accepts for the medians today; a 400 naming assistants means the "
+                "platform changed that list. window must be one of "
+                f"{', '.join(self._team_medians_windows())}.",
+            ])
+        return "\n".join(lines)
+
+    async def _handle_get_ai_assistant_team_medians(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_ai_assistant_team_medians — anonymous Claude Code habit medians for the team."""
+        window = self._validate_team_medians_window(arguments)
+        try:
+            client = await self.get_client(ctx=ctx)
+            report = await client.get_ai_assistant_team_medians(window=window)
+        except (AuthenticationError, ToolError):
+            raise
+        except ReveniumAPIError as e:
+            logger.warning(f"get_ai_assistant_team_medians failed: {e}")
+            return [TextContent(type="text", text=self._render_team_medians_failure(e))]
+        return [TextContent(type="text", text="\n".join(self._render_team_medians(report)))]
 
     async def _handle_get_tool_costs_by_agent(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -5128,13 +6115,15 @@ If you're seeing this error, please report it as it indicates a reliability issu
             "get_api_key_costs",
             "get_agent_costs",
         ]
-        if _use_new_api():
+        if not requires_new_api_flag(UserCostsFormatter.ENDPOINT_KEY):
             actions.append("get_user_costs")
         actions.extend([
+            "get_department_costs",
             "get_tool_costs",
             "get_top_tools",
             "get_tool_costs_by_agent",
             "get_tool_costs_by_provider",
+            "get_ai_assistant_team_medians",
             "get_transaction_count",
             "get_filter_options",
             "get_unpaid_invoice_totals",
@@ -5160,6 +6149,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
             "get_pr_health_prs",
             "get_pr_health_pull_requests",
             "get_pr_health_repositories",
+            "get_pr_health_breakdown",
+            "get_pr_health_queue",
+            "get_pr_health_trend",
+            "get_pr_health_follow_through",
             "get_merged_prs",
             "get_coverage_ratio",
             "get_cost_summary",
@@ -5211,7 +6204,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 },
                 "group_by": {
                     "type": "string",
-                    "description": "Dimension the spend movers are grouped by on get_top_movers (for example model or agent); on get_merged_prs, repository for one row per repository",
+                    "description": "Dimension the spend movers are grouped by on get_top_movers (for example model or agent); on get_merged_prs, repository for one row per repository; on get_pr_health_breakdown (required), repo, engineer or department",
                 },
                 "dimension": {
                     "type": "string",
@@ -5265,7 +6258,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 # Billing listings: list_invoices / list_refunds / list_period_charges
                 "start_date": {
                     "type": "string",
-                    "description": "Start of the window. yyyy-MM-dd for get_pr_health, an ISO-8601 instant for get_coverage_ratio (required when period is custom), pass-through for the billing listings",
+                    "description": "Start of the window. yyyy-MM-dd for get_pr_health and the PR-health reads (optional, with end_date, on get_pr_health_trend and get_pr_health_follow_through), an ISO-8601 instant for get_coverage_ratio (required when period is custom), pass-through for the billing listings",
                 },
                 "end_date": {
                     "type": "string",
@@ -5307,7 +6300,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 },
                 "query": {
                     "type": "string",
-                    "description": "Free-text refund search on list_refunds",
+                    "description": "Free-text refund search on list_refunds. On get_pr_health_engineers, keeps the engineers whose login or mapped email contains it (at most 100 characters)",
                 },
                 "cursor": {
                     "type": "string",
@@ -5330,25 +6323,51 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 },
                 "author": {
                     "type": "string",
-                    "description": "Provider login from the PR-health engineer rows. Required by get_pr_health_prs, optional filter on get_pr_health_pull_requests",
+                    "description": "Provider login from the PR-health engineer rows. Required by get_pr_health_prs, optional filter on get_pr_health_pull_requests and get_pr_health_queue",
                 },
                 "bucket": {
                     "type": "string",
-                    "enum": ["ROTTING", "AGING", "ACTIVE", "DRAFT", "CLOSED_UNMERGED"],
-                    "description": "PR-health bucket filter on get_pr_health_pull_requests",
+                    "enum": ["AUTOMATION", "ROTTING", "AGING", "ACTIVE", "DRAFT", "CLOSED_UNMERGED"],
+                    "description": "PR-health bucket filter on get_pr_health_pull_requests. Without it the list holds every bucket except AUTOMATION. Not combinable with cause",
+                },
+                "cause": {
+                    "type": "string",
+                    "enum": [
+                        "AUTOMATION",
+                        "STUCK_DRAFT",
+                        "AUTHOR_GONE",
+                        "APPROVED_NOT_MERGED",
+                        "CHANGES_REQUESTED_QUIET",
+                        "WAITING_ON_REVIEW",
+                        "ON_PACE",
+                    ],
+                    "description": "One action-queue cause on get_pr_health_pull_requests: only the open pull requests of that cause, and the window filters nothing. Not combinable with bucket",
+                },
+                "repo": {
+                    "type": "string",
+                    "description": "One repository by name (owner/repo), case-insensitive, on get_pr_health_pull_requests and get_pr_health_queue",
+                },
+                "ticket": {
+                    "type": "string",
+                    "description": "One ticket id read from the pull request's title or branch, case-insensitive, at most 80 characters, on get_pr_health_pull_requests and get_pr_health_queue",
+                },
+                "triaged": {
+                    "type": "string",
+                    "enum": ["EXCLUDE", "ONLY"],
+                    "description": "Triage filter on get_pr_health_pull_requests and get_pr_health_queue. EXCLUDE (the default) leaves out pull requests someone dismissed or snoozed in the app; ONLY lists just those",
                 },
                 "sort_by": {
                     "type": "string",
-                    "description": "get_pr_health_engineers: authorLogin, openPrs, agingPrs, rottingPrs, closedUnmerged or oldestInactiveDays. get_pr_health_pull_requests: inactivity or age",
+                    "description": "get_pr_health_engineers: authorLogin, openPrs, agingPrs, rottingPrs, closedUnmerged or oldestInactiveDays. get_pr_health_pull_requests: inactivity or age. get_pr_health_breakdown: rottingPrs, closedUnmerged, openPrs, name or share. get_pr_health_queue: inactivity, age, repo, author or review",
                 },
                 "sort_dir": {
                     "type": "string",
                     "enum": ["asc", "desc"],
-                    "description": "Sort direction on get_pr_health_engineers and get_pr_health_pull_requests",
+                    "description": "Sort direction on get_pr_health_engineers, get_pr_health_pull_requests, get_pr_health_breakdown and get_pr_health_queue",
                 },
                 "department_id": {
                     "type": "integer",
-                    "description": "Department of your own organization to narrow get_pr_health and its engineers/prs/pull_requests drill-downs to. Omit for the whole organization",
+                    "description": "Department of your own organization to narrow get_pr_health and every get_pr_health_* read except get_pr_health_repositories to. Omit for the whole organization",
                 },
                 **deprecated_argument_properties("department_id", "integer"),
                 "include_descendants": {
@@ -5357,12 +6376,12 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 },
                 "assisted_only": {
                     "type": "boolean",
-                    "description": "Keep only AI-assisted pull requests on get_pr_health_engineers, get_pr_health_prs and get_pr_health_pull_requests",
+                    "description": "Keep only AI-assisted pull requests on get_pr_health_engineers, get_pr_health_prs, get_pr_health_pull_requests, get_pr_health_breakdown, get_pr_health_queue and get_pr_health_follow_through",
                 },
                 "granularity": {
                     "type": "string",
                     "enum": ["window", "day", "week", "month"],
-                    "description": "Row shape on get_merged_prs (default window). day spans fewer than 35 days, week and month fewer than 400",
+                    "description": "Row shape on get_merged_prs (default window). day spans fewer than 35 days, week and month fewer than 400. On get_pr_health_trend, day (fewer than 92 days), week (default) or month; needs start_date and end_date",
                 },
                 "email": {
                     "type": "string",
@@ -5380,9 +6399,18 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "type": "integer",
                     "description": "Page size of the get_merged_prs pull-request list, 1-200 (default 100). Needs include_pull_requests=true",
                 },
+                "per_cause": {
+                    "type": "integer",
+                    "description": "Rows shown per cause group on get_pr_health_queue, 1-50 (default 8). Every group still states its whole count",
+                },
                 "pr_offset": {
                     "type": "integer",
                     "description": "Offset into the get_merged_prs pull-request list (default 0). Needs include_pull_requests=true",
+                },
+                # Coding-assistant team medians
+                "window": {
+                    "type": "string",
+                    "description": "Window of get_ai_assistant_team_medians: 14d (default, the last 14 days) or completed-weeks:N for the last N completed weeks, N from 1 to 4",
                 },
                 # Claude Enterprise seat census
                 "from_date": {
@@ -5400,7 +6428,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 # Advertised at the top level, repeated here for completeness
                 "filters": {
                     "type": "object",
-                    "description": "Per-action filter object, most commonly {\"costSources\": [...]}",
+                    "description": "Per-action filter object, most commonly {\"costSources\": [...]}. The per-user and per-department cost reports take arrays under agents, providers, models, users and costSources",
                 },
                 "page": {"type": "integer", "description": "Zero-based page index (default 0)"},
                 "size": {"type": "integer", "description": "Page size (default 20)"},
@@ -5452,6 +6480,55 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "get_top_tools(period='TWENTY_FOUR_HOURS')",
                     "get_tool_costs_by_agent(period='SEVEN_DAYS')",
                     "get_tool_costs_by_provider(period='THIRTY_DAYS')",
+                ],
+            ),
+            ToolCapability(
+                name="Department Cost Analysis",
+                description=(
+                    "Cost, requests and tokens per department for the caller's team, each "
+                    "department with its own figures and, labelled apart, the figures with "
+                    "every sub-department added."
+                ),
+                parameters={
+                    "get_department_costs": {
+                        "period": "str",
+                        "group": "str (optional, TOTAL by default)",
+                        "filters": "dict (optional: agents, providers, models, users, costSources)",
+                        "page": "int (optional)",
+                        "size": "int (optional, 1 to 100)",
+                    },
+                },
+                examples=[
+                    "get_department_costs(period='THIRTY_DAYS')",
+                    "get_department_costs(period='SEVEN_DAYS', filters={'providers': ['anthropic']}, size=50)",
+                ],
+                limitations=[
+                    "Department ids are hashids, not the numeric ids manage_customers list_departments returns",
+                    "No departments, no assignments or data not loaded yet means no grouping, never $0",
+                    "One row per department for the whole period; per-day department figures are not available",
+                ],
+            ),
+            ToolCapability(
+                name="Coding-Assistant Team Medians",
+                description=(
+                    "Anonymous team medians of Claude Code habits for the caller's team: context "
+                    "tokens per call, cache rebuild ratio and the share of requests sent above the "
+                    "model's default effort. Fewer than five people who made a call in the window "
+                    "renders as not enough people to compare, never as zeros."
+                ),
+                parameters={
+                    "get_ai_assistant_team_medians": {
+                        "window": "str (optional, 14d (default) or completed-weeks:1 to completed-weeks:4)",
+                    },
+                },
+                examples=[
+                    "get_ai_assistant_team_medians()",
+                    "get_ai_assistant_team_medians(window='completed-weeks:2')",
+                ],
+                limitations=[
+                    "Covers the team the caller's credentials resolve to and Claude Code only",
+                    "Every figure is coarsened by the platform and nothing about any person is returned",
+                    "A rate limit or server error means no figures right now, not a zero",
                 ],
             ),
             ToolCapability(
@@ -5617,7 +6694,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "get_pr_health(source='gitlab', start_date='2026-08-01', end_date='2026-08-26')",
                 ],
                 limitations=[
-                    "Covers the caller's own organization only — the report takes no team parameter",
+                    "Covers the team the caller's credentials resolve to, sent with the read; the caller does not pass one",
                     "All three parameters are required; the window must span fewer than 366 days and start_date must not be after end_date",
                     "The aging/rotting thresholds, cutoff date, excluded repositories, automation patterns and assisted-only default are team-addressed and changed with manage_customers update_pr_health_settings",
                     "The report itself is flat and lists at most 50 engineers; get_pr_health_engineers pages every engineer and get_pr_health_pull_requests every PR",
@@ -5639,6 +6716,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                         "size": "int (optional)",
                         "sort_by": "str (optional, authorLogin|openPrs|agingPrs|rottingPrs|closedUnmerged|oldestInactiveDays)",
                         "sort_dir": "str (optional, asc|desc)",
+                        "query": "str (optional, login or mapped email contains it, at most 100 characters)",
                         **self._PR_HEALTH_NARROWING_CAPABILITY_PARAMS,
                     },
                     "get_pr_health_prs": {
@@ -5652,8 +6730,15 @@ If you're seeing this error, please report it as it indicates a reliability issu
                         "source": "str (required, github|gitlab)",
                         "start_date": "str (required, yyyy-MM-dd)",
                         "end_date": "str (required, yyyy-MM-dd)",
-                        "bucket": "str (optional, ROTTING|AGING|ACTIVE|DRAFT|CLOSED_UNMERGED)",
+                        "bucket": "str (optional, AUTOMATION|ROTTING|AGING|ACTIVE|DRAFT|CLOSED_UNMERGED; without it every bucket except AUTOMATION)",
+                        "cause": (
+                            "str (optional, AUTOMATION|STUCK_DRAFT|AUTHOR_GONE|APPROVED_NOT_MERGED|"
+                            "CHANGES_REQUESTED_QUIET|WAITING_ON_REVIEW|ON_PACE; not combinable with bucket)"
+                        ),
                         "author": "str (optional, provider login)",
+                        "repo": "str (optional, owner/repo)",
+                        "ticket": "str (optional, ticket id from the PR title or branch, at most 80 characters)",
+                        "triaged": "str (optional, EXCLUDE (default, dismissed and snoozed left out)|ONLY)",
                         "page": "int (optional, zero-based)",
                         "size": "int (optional)",
                         "sort_by": "str (optional, inactivity|age)",
@@ -5676,6 +6761,68 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "get_pr_health_prs caps each list upstream and says so; its counts are computed before the cap",
                     "source=gitlab returns empty PR lists: GitLab writes no per-PR rows today",
                     "get_pr_health_repositories takes source only and ignores the team's cutoff and exclusions by design",
+                    "get_pr_health_pull_requests takes cause or bucket, not both",
+                    self._PR_HEALTH_LIST_DEFAULTS_NOTE,
+                ],
+            ),
+            ToolCapability(
+                name="Developer PR Health Breakdown, Queue and Trends",
+                description=(
+                    "The PR-health figures grouped by repository, engineer or department, the "
+                    "action queue of open pull requests grouped by cause, the closed-unmerged and "
+                    "at-risk trend, and the follow-through on pull requests flagged as rotting, for "
+                    "the caller's own organization. Read-only: triage is not available."
+                ),
+                parameters={
+                    "get_pr_health_breakdown": {
+                        "source": "str (required, github|gitlab)",
+                        "start_date": "str (required, yyyy-MM-dd)",
+                        "end_date": "str (required, yyyy-MM-dd)",
+                        "group_by": "str (required, repo|engineer|department)",
+                        "page": "int (optional, zero-based)",
+                        "size": "int (optional, 1-100, default 5)",
+                        "sort_by": "str (optional, rottingPrs|closedUnmerged|openPrs|name|share)",
+                        "sort_dir": "str (optional, asc|desc)",
+                        **self._PR_HEALTH_NARROWING_CAPABILITY_PARAMS,
+                    },
+                    "get_pr_health_queue": {
+                        "source": "str (required, github|gitlab)",
+                        "per_cause": "int (optional, 1-50, default 8)",
+                        "sort_by": "str (optional, inactivity|age|repo|author|review)",
+                        "sort_dir": "str (optional, asc|desc)",
+                        "author": "str (optional, provider login)",
+                        "repo": "str (optional, owner/repo)",
+                        "ticket": "str (optional, at most 80 characters)",
+                        "triaged": "str (optional, EXCLUDE (default)|ONLY)",
+                        **self._PR_HEALTH_NARROWING_CAPABILITY_PARAMS,
+                    },
+                    "get_pr_health_trend": {
+                        "source": "str (required, github|gitlab)",
+                        "start_date": "str (optional, yyyy-MM-dd, with end_date)",
+                        "end_date": "str (optional, yyyy-MM-dd, with start_date)",
+                        "granularity": "str (optional, day|week|month; needs the window)",
+                        **self._PR_HEALTH_DEPARTMENT_CAPABILITY_PARAMS,
+                    },
+                    "get_pr_health_follow_through": {
+                        "source": "str (required, github|gitlab)",
+                        "start_date": "str (optional, yyyy-MM-dd, with end_date)",
+                        "end_date": "str (optional, yyyy-MM-dd, with start_date)",
+                        **self._PR_HEALTH_NARROWING_CAPABILITY_PARAMS,
+                    },
+                },
+                examples=[
+                    "get_pr_health_breakdown(source='github', start_date='2026-05-17', end_date='2026-08-17', group_by='repo')",
+                    "get_pr_health_queue(source='github', per_cause=8)",
+                    "get_pr_health_trend(source='github')",
+                    "get_pr_health_trend(source='github', start_date='2026-07-01', end_date='2026-09-30', granularity='day')",
+                    "get_pr_health_follow_through(source='github')",
+                ],
+                limitations=[
+                    "get_pr_health_breakdown takes the get_pr_health window: fewer than 366 days, start_date not after end_date",
+                    "get_pr_health_trend defaults to the 26 weeks ending now; a window spans fewer than 366 days, and fewer than 92 at granularity=day",
+                    "get_pr_health_queue has no window and shows at most 50 rows per cause; every group still states its whole count",
+                    "Dismissing, snoozing and un-triaging pull requests is not available through this tool; triaged=EXCLUDE (the default) leaves them out of the queue",
+                    "The breakdown and the trend return priced counts, not dollars",
                 ],
             ),
             ToolCapability(
@@ -5736,7 +6883,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 ],
                 limitations=[
                     "period picks the comparison window (24h/7d/30d/90d/custom, default 30d); custom needs start_date/end_date",
-                    "The team is resolved from your credentials; there is no team parameter",
+                    "The team is the one your credentials resolve to; you do not pass one",
                     "A null aggregateRatio is not zero coverage — read state before concluding anything",
                     "trend is a percentage-point delta, not a percentage: 0.0 pp means unchanged, null means no prior period",
                     "A per-provider ratio is a share of total billed spend, not that provider's coverage",

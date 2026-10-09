@@ -1417,3 +1417,78 @@ class TestValidatePromptContextFields:
             manager._validate_transaction_inputs({**VALID_TRANSACTION, "prompt_length": -1})
             is False
         )
+
+
+# ===========================================================================
+# BACK-3946: clientSurface on the completions read
+# ===========================================================================
+
+
+def _completion_row(**fields):
+    return {
+        "transactionId": "tx-3946",
+        "model": "claude-sonnet-4",
+        "provider": "anthropic",
+        "inputTokenCount": 10,
+        "outputTokenCount": 5,
+        **fields,
+    }
+
+
+class TestClientSurfaceRendering:
+    """The full detail rendering names the first-party app that sent the call."""
+
+    @pytest.mark.parametrize("surface", ["claude-code-desktop", "claude-code"])
+    def test_surface_renders_under_session_tracking(self, surface):
+        details = MeteringManagement()._format_full_transaction_details(
+            _completion_row(clientSurface=surface)
+        )
+        assert "Session Tracking" in details
+        assert f"**Client Surface**: {surface}" in details
+
+    @pytest.mark.parametrize("row", [_completion_row(clientSurface=None), _completion_row()])
+    def test_null_or_absent_surface_renders_no_line(self, row):
+        details = MeteringManagement()._format_full_transaction_details(row)
+        assert "Client Surface" not in details
+        assert "Session Tracking" not in details
+
+    def test_streamed_mirror_does_not_replace_is_streamed(self):
+        """The platform emits `streamed` beside `isStreamed`; the rendering
+        keeps reading `isStreamed`."""
+        details = MeteringManagement()._format_full_transaction_details(
+            _completion_row(isStreamed=True, streamed=True)
+        )
+        assert details.count("**Streamed Response**") == 1
+
+
+class TestClientSurfacePresenceDiagnostic:
+    """analyze_recent_transactions counts clientSurface like any reported field."""
+
+    @staticmethod
+    async def _analyze(rows):
+        client = make_client()
+        client.tenant_id = None
+        client.get = AsyncMock(
+            return_value={
+                "_embedded": {"aICompletionMetricResourceList": rows},
+                "page": {"totalPages": 1, "totalElements": len(rows), "number": 0, "last": True},
+            }
+        )
+        mgmt = MeteringManagement()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock) as get_client:
+            get_client.return_value = client
+            result = await mgmt.handle_action("analyze_recent_transactions", {})
+        return result[0].text
+
+    @pytest.mark.asyncio
+    async def test_presence_is_counted(self):
+        text = await self._analyze(
+            [_completion_row(clientSurface="claude-code-desktop"), _completion_row(clientSurface=None)]
+        )
+        assert "`clientSurface` | 1 | 1 | 50.0% |" in text
+
+    @pytest.mark.asyncio
+    async def test_surface_is_not_reported_as_untracked(self):
+        text = await self._analyze([_completion_row(clientSurface="claude-code")])
+        assert "- `clientSurface`" not in text
+        assert "**clientSurface:**\n  1. `claude-code`" in text

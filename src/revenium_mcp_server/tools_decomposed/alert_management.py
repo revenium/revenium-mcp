@@ -16,7 +16,7 @@ Follows MCP best practices:
 """
 
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -95,6 +95,33 @@ _ANOMALY_FILTER_MAP: Dict[str, str] = {
 }
 
 
+# The portfolio's documented groupLimit bounds; the platform answers 400 outside them.
+BUDGET_PORTFOLIO_GROUP_LIMIT_RANGE = (1, 100)
+
+# The key search's documented page-size bounds. The platform clamps a size outside
+# them rather than refusing it, which would answer for a page size nobody asked for.
+PROVIDER_API_KEY_PAGE_SIZE_RANGE = (1, 100)
+
+# A key-search page starting at or past this result comes back empty with only the total.
+PROVIDER_API_KEY_SEARCH_DEPTH = 1000
+
+# An SDK alert stores an API_KEY row without complaint and then cannot evaluate it
+# (AIAlertCriteriaQueryBuilder refuses the dimension), so the data source is half of the rule.
+API_KEY_FILTER_GUIDANCE = (
+    "An API_KEY filter row takes a key's `id` as its `value` (or several ids in `values` "
+    "with IN) and only works on a provider alert, so set `dataSource` to `PROVIDER` in "
+    "anomaly_data. Provider alerts take THRESHOLD or CUMULATIVE_USAGE, a DAILY, WEEKLY or "
+    "MONTHLY period (QUARTERLY for budgets), TOTAL_COST or a token metric, and only "
+    "WORKSPACE, API_KEY, MODEL and PROVIDER filters; the platform refuses anything else."
+)
+
+API_KEY_FILTER_EXAMPLE = (
+    'create(anomaly_data={"name": "Production key budget", "dataSource": "PROVIDER", '
+    '"alertType": "CUMULATIVE_USAGE", "metricType": "TOTAL_COST", '
+    '"operatorType": "GREATER_THAN", "threshold": 500, "periodDuration": "MONTHLY", '
+    '"filters": [{"dimension": "API_KEY", "operator": "IS", "value": "<id>"}]})'
+)
+
 # Module-level — must stay in sync with AlertType enum members.
 _ALERT_TYPE_DESCRIPTIONS = {
     AlertType.THRESHOLD.value: "real-time spike detection on a metric crossing a threshold",
@@ -115,6 +142,40 @@ def _stored_operator_note(anomaly: Dict[str, Any]) -> str:
     if operator and is_rejected_operator(operator):
         return f"\n\n{historical_operator_notice(operator)}"
     return ""
+
+
+def _format_budget_share(share: float) -> str:
+    """Render a budget-progress share (0.75 means 75%) as a percentage."""
+    return f"{share * 100:.1f}".rstrip("0").rstrip(".") + "%"
+
+
+def _grouped_budget_parts(entry: Dict[str, Any], group_count: int) -> List[str]:
+    """Render a grouped budget's figures, leading with the totals' scope.
+
+    The threshold of a grouped budget applies to each group on its own and
+    the alert fires per group, so currentValue/percentUsed (every group added
+    together) can read as safe while one group is over. worstPercentUsed and
+    risk come from the highest group.
+    """
+    parts = [f"{entry.get('currentValue')}/{entry.get('threshold')} summed across groups"]
+    percent = entry.get("percentUsed")
+    if isinstance(percent, (int, float)):
+        parts.append(f"{_format_budget_share(percent)} used summed across groups")
+    worst = entry.get("worstPercentUsed")
+    if isinstance(worst, (int, float)):
+        parts.append(
+            f"highest group {_format_budget_share(worst)} used "
+            "(the figure the per-group alert uses)"
+        )
+    risk = entry.get("risk")
+    if risk:
+        parts.append(f"risk {risk} (from the highest group)")
+    over = entry.get("groupsOverLimit")
+    if isinstance(over, int):
+        parts.append(f"{over} of {group_count} groups at or over the threshold")
+    else:
+        parts.append(f"{group_count} groups")
+    return parts
 
 
 class AlertManagement(ToolBase, SlackPromptingMixin):
@@ -249,6 +310,8 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                 return await self._handle_get_budget_portfolio(client, arguments)
             elif action == "get_budget_progress":
                 return await self._handle_get_budget_progress(client, arguments)
+            elif action == "search_provider_api_keys":
+                return await self._handle_search_provider_api_keys(client, arguments)
             else:
                 # Use structured error for unknown action
                 raise ToolError(
@@ -292,6 +355,7 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                             "get_budget_portfolio",
                             "get_budget_progress",
                         ],
+                        "filter_lookups": ["search_provider_api_keys"],
                     },
                 )
 
@@ -460,6 +524,7 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
             "reset_budget",
             "get_budget_portfolio",
             "get_budget_progress",
+            "search_provider_api_keys",
         ]
 
     async def _get_tool_dependencies(self) -> List[ToolDependency]:
@@ -1517,8 +1582,9 @@ list(resource_type="anomalies")                 # Alert rules/definitions
 create_cumulative_usage_alert(...)              # Budget tracking rule
 create_threshold_alert(...)                     # Real-time monitoring rule
 reset_budget(anomaly_id="anom_123")             # Restart a budget alert's current-period accumulation (id from list(resource_type="anomalies"))
-get_budget_portfolio()                          # Tenant-wide budget-progress snapshot for every CUMULATIVE_USAGE alert
+get_budget_portfolio()                          # Budget-progress snapshot for every CUMULATIVE_USAGE alert on your team
 get_budget_progress(anomaly_id="anom_123")      # Current period spend vs. threshold for one budget alert (or anomaly_ids=[...] for several)
+search_provider_api_keys(query="prod")          # Find a provider API key's id for an API_KEY filter (ids and masked hints only)
 ```
 
 ## **Alert Type Decision Tree**
@@ -1628,6 +1694,10 @@ get_budget_progress(anomaly_id="anom_123")      # Current period spend vs. thres
             '{"dimension": "MODEL", "operator": "IN", '
             '"values": ["gpt-4", "claude-sonnet-4-5"]}\n'
             "```\n"
+            "\n**API_KEY filters**: find the key's id with "
+            "`search_provider_api_keys(query=...)`. "
+            f"{API_KEY_FILTER_GUIDANCE}\n\n"
+            f"```bash\n{API_KEY_FILTER_EXAMPLE}\n```\n"
         )
 
         # Alert Types — same fallback chain. Each enum value carries a short
@@ -1951,7 +2021,7 @@ reset_budget(anomaly_id="anom_123")
 
 ## **Budget Progress (read-only)**
 ```bash
-# Tenant-wide snapshot — every CUMULATIVE_USAGE alert's current-period spend
+# Team snapshot — every CUMULATIVE_USAGE alert's current-period spend
 # vs. its threshold, with pace-vs-linear status. Paginated.
 get_budget_portfolio(page=0, size=20)
 
@@ -4299,6 +4369,45 @@ create(resource_type="anomalies", anomaly_data={
             )
         ]
 
+    @classmethod
+    def _budget_portfolio_filters(cls, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """The budget-progress filters plus ``groupLimit``, which only the portfolio declares."""
+        filters = cls._budget_progress_filters(arguments)
+        group_limit = arguments.get("group_limit")
+        if group_limit is not None:
+            filters["groupLimit"] = cls._validated_group_limit(group_limit)
+        return filters
+
+    @classmethod
+    def _validated_group_limit(cls, value: Any) -> int:
+        return cls._whole_number_in_range(
+            value,
+            "group_limit",
+            BUDGET_PORTFOLIO_GROUP_LIMIT_RANGE,
+            [
+                "Pass group_limit=10 for the 10 highest groups of each per-group budget",
+                "Omit group_limit to return every group",
+            ],
+        )
+
+    @staticmethod
+    def _whole_number_in_range(
+        value: Any, field: str, bounds: Tuple[int, int], suggestions: List[str]
+    ) -> int:
+        low, high = bounds
+        try:
+            number = None if isinstance(value, bool) else int(str(value))
+        except ValueError:
+            number = None
+        if number is None or not low <= number <= high:
+            raise create_structured_validation_error(
+                message=f"{field} must be a whole number from {low} to {high}",
+                field=field,
+                value=value,
+                suggestions=suggestions,
+            )
+        return number
+
     @staticmethod
     def _budget_progress_filters(arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Map the tool-level ``include_trend``/``now`` args to API query params.
@@ -4310,7 +4419,8 @@ create(resource_type="anomalies", anomaly_data={
         AIAnomalyProgressController.getBudgetPortfolio / .getBudgetProgress /
         .getBudgetProgressBulk — all three declare exactly @RequestParam now and
         includeTrend (plus ids on the bulk endpoint and a Pageable on the
-        portfolio one).
+        portfolio one); the portfolio has since added groupLimit, forwarded by
+        ``_budget_portfolio_filters``.
         """
         filters: Dict[str, Any] = {}
         if "include_trend" in arguments and arguments["include_trend"] is not None:
@@ -4353,11 +4463,15 @@ create(resource_type="anomalies", anomaly_data={
         parts = [f"- {label}"]
         if metric:
             parts.append(f"metric {metric}")
-        parts.append(f"{current}/{threshold}")
 
-        percent = entry.get("percentUsed")
-        if isinstance(percent, (int, float)):
-            parts.append(f"{percent}% used")
+        group_count = entry.get("groupCount")
+        if isinstance(group_count, int):
+            parts.extend(_grouped_budget_parts(entry, group_count))
+        else:
+            parts.append(f"{current}/{threshold}")
+            percent = entry.get("percentUsed")
+            if isinstance(percent, (int, float)):
+                parts.append(f"{percent}% used")
 
         if status:
             parts.append(f"vs-linear {status}")
@@ -4367,16 +4481,17 @@ create(resource_type="anomalies", anomaly_data={
     async def _handle_get_budget_portfolio(
         self, client: ReveniumClient, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """List tenant-wide budget progress for every CUMULATIVE_USAGE alert.
+        """List budget progress for every CUMULATIVE_USAGE alert on the resolved team.
 
         Read-only companion to reset_budget: the same budget-progress resource,
-        rendered as a compact per-alert list with pagination. Authorized
-        per-tenant — no id path param, so API errors propagate through the
-        tool's standard tail (no not-found translation here).
+        rendered as a compact per-alert list with pagination. Scoped to the team
+        the session resolved (``ReveniumClient.get_budget_portfolio`` sends it) —
+        no id path param, so API errors propagate through the tool's standard
+        tail (no not-found translation here).
         """
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = self._budget_progress_filters(arguments)
+        filters = self._budget_portfolio_filters(arguments)
 
         result = await client.get_budget_portfolio(page=page, size=size, **filters)
 
@@ -4389,7 +4504,8 @@ create(resource_type="anomalies", anomaly_data={
                     type="text",
                     text=(
                         "**Budget Progress Portfolio**\n\n"
-                        "No budget alerts for this tenant. Create one with "
+                        "No budget alerts on the team your credentials resolve to "
+                        "(other teams you can read may have some). Create one with "
                         "`create_cumulative_usage_alert(...)` to start tracking "
                         "period spend."
                     ),
@@ -4519,6 +4635,96 @@ create(resource_type="anomalies", anomaly_data={
         text = "**Budget Progress**\n\n" + "\n".join(lines)
         return [TextContent(type="text", text=text)]
 
+    async def _handle_search_provider_api_keys(
+        self, client: ReveniumClient, arguments: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Find provider API keys by name or id so an API_KEY filter can name one.
+
+        One page of the resolved team's keys (``ReveniumClient.search_provider_api_keys``
+        sends the team). Only the fields the option declares are rendered, so a
+        field the platform might add later never reaches the caller unreviewed.
+        """
+        query = arguments.get("query")
+        provider = arguments.get("provider")
+        page = arguments.get("page", 0)
+        size = self._whole_number_in_range(
+            arguments.get("size", 20),
+            "size",
+            PROVIDER_API_KEY_PAGE_SIZE_RANGE,
+            ["Pass size=50 for 50 keys per page", "Narrow the search with query or provider"],
+        )
+
+        result = await client.search_provider_api_keys(
+            query=query, provider=provider, page=page, size=size
+        )
+        items = result.get("items") or []
+        total = result.get("total")
+
+        heading = "**Provider API Keys**" + self._key_search_scope(query, provider)
+        if not items:
+            return [
+                TextContent(
+                    type="text",
+                    text=heading + "\n\n" + self._empty_key_search_note(page, size, total),
+                )
+            ]
+
+        lines = [self._render_provider_api_key(item) for item in items]
+        footer = f"Page {page} · {len(items)} shown"
+        if isinstance(total, int):
+            footer += f" of {total} matching"
+        text = (
+            heading
+            + "\n\n"
+            + "\n".join(lines)
+            + f"\n\n{footer}\n\n"
+            + API_KEY_FILTER_GUIDANCE
+            + f"\n\n```bash\n{API_KEY_FILTER_EXAMPLE}\n```"
+        )
+        return [TextContent(type="text", text=text)]
+
+    @staticmethod
+    def _key_search_scope(query: Optional[str], provider: Optional[str]) -> str:
+        scope = []
+        if query:
+            scope.append(f"matching `{query}`")
+        if provider:
+            scope.append(f"for provider `{provider}`")
+        return (" " + " ".join(scope)) if scope else ""
+
+    @staticmethod
+    def _empty_key_search_note(page: int, size: int, total: Any) -> str:
+        if not (isinstance(total, int) and total > 0):
+            return (
+                "No provider API keys match on the team your credentials resolve to. "
+                "Keys appear here once a provider's billing data has synced for the team."
+            )
+        last_page = (min(total, PROVIDER_API_KEY_SEARCH_DEPTH) - 1) // size
+        if page * size >= PROVIDER_API_KEY_SEARCH_DEPTH:
+            return (
+                f"{total} keys match, but pages starting at result "
+                f"{PROVIDER_API_KEY_SEARCH_DEPTH} or later come back empty; the last page "
+                f"with results at size {size} is page {last_page}. Narrow the search with "
+                "query or provider instead of paging further."
+            )
+        return (
+            f"{total} keys match, but page {page} starts past the last result at size "
+            f"{size}. The matches are on pages 0 to {last_page}."
+        )
+
+    @staticmethod
+    def _render_provider_api_key(item: Dict[str, Any]) -> str:
+        name = item.get("name")
+        parts = [f"- {name}" if name else "- (unnamed)", f"id `{item.get('id')}`"]
+        if item.get("provider"):
+            parts.append(str(item["provider"]))
+        hint = item.get("partialKeyHint")
+        parts.append(f"hint `{hint}`" if hint else "no hint")
+        active = item.get("active")
+        if isinstance(active, bool):
+            parts.append("live" if active else "inactive")
+        return " · ".join(parts)
+
     async def _get_input_schema(self) -> Dict[str, Any]:
         """Context7 single source of truth for manage_alerts schema."""
         return {
@@ -4630,10 +4836,20 @@ create(resource_type="anomalies", anomaly_data={
                     "type": "string",
                     "description": "ISO timestamp anchoring the budget-progress window (defaults to server time)",
                 },
+                "group_limit": {
+                    "type": "integer",
+                    "minimum": BUDGET_PORTFOLIO_GROUP_LIMIT_RANGE[0],
+                    "maximum": BUDGET_PORTFOLIO_GROUP_LIMIT_RANGE[1],
+                    "description": "get_budget_portfolio only: for a per-group budget, return only this many of its highest groups (omit for every group)",
+                },
                 # Query and filtering fields
                 "query": {
                     "type": "string",
-                    "description": "Natural language query for searching alerts/anomalies",
+                    "description": "Natural language query for searching alerts/anomalies; for search_provider_api_keys, text matched against the key name or id (% and _ are wildcards)",
+                },
+                "provider": {
+                    "type": "string",
+                    "description": "search_provider_api_keys only: scope the key search to one provider (e.g. anthropic, openai)",
                 },
                 "text": {
                     "type": "string",

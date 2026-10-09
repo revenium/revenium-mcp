@@ -15,7 +15,12 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
-from ..client import PrHealthSettingsPayload, ReveniumAPIError, ReveniumClient
+from ..client import (
+    PrHealthDigestSettingsPayload,
+    PrHealthSettingsPayload,
+    ReveniumAPIError,
+    ReveniumClient,
+)
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
@@ -34,6 +39,22 @@ from ..introspection.metadata import (
     ToolDependency,
     ToolType,
     UsagePattern,
+)
+from .coding_assistant_billing_fields import (
+    CODING_ASSISTANT_BILLING_READ_ONLY_NOTE,
+    CODING_ASSISTANT_BILLING_SEMANTICS_NOTE,
+    CODING_ASSISTANT_CONFIRMATION_NOTE,
+    present_billing_fields,
+)
+from .pr_health_digest_fields import (
+    PR_HEALTH_DIGEST_ALERT_NOTE,
+    PR_HEALTH_DIGEST_FIELDS,
+    PR_HEALTH_DIGEST_FIELDS_NOTE,
+    PR_HEALTH_DIGEST_NOT_ADOPTED_NOTE,
+    PR_HEALTH_DIGEST_PARTIAL_UPDATE_NOTE,
+    collect_digest_updates,
+    digest_input_schema_properties,
+    present_digest_fields,
 )
 from .pr_health_settings_fields import (
     PR_HEALTH_FIELDS_NOTE,
@@ -547,6 +568,16 @@ def _raise_pr_health_settings_error(
         error, team_id, action, settings_label="PR health settings"
     )
     raise error
+
+
+def _raise_pr_health_digest_error(
+    error: ReveniumAPIError, team_id: str, action: str
+) -> NoReturn:
+    """Translate the PR-health digest failures an agent can act on; re-raise the rest."""
+    _raise_team_settings_permission_error(
+        error, team_id, action, settings_label="PR health digest settings"
+    )
+    raise error
 # Attribution identity policy and verified domains ------------------------------
 
 # The strict policy the platform substitutes when a team has never stored a choice.
@@ -964,11 +995,24 @@ DEPARTMENT_REMOVAL_BUDGET_NOTE = (
     "evaluates, so from now on this person's usage no longer counts toward, or is "
     "capped by, that department's budget."
 )
+# Decision (BACK-3948): the department CSV import stays UI-only, and so do its
+# history corrections (rewriteHistory, rewriteFrom, absent, previewVersion), the
+# import history (GET /v2/api/departments/imports) and the undo
+# (POST /v2/api/departments/imports/{importId}/undo). Corrections, history and undo
+# need department-past-correction-enabled, which is off in prod, and BACK-3927 hides
+# the history and the undo from the public API reference, so a customer's key has
+# nothing to call. The undo would stay out even then: it rewrites people's
+# department history, and the import it reverses is itself UI-only. Indexed under
+# `exclusions` in .claude/commands/mcp-api-exclusions.yaml. Revisit when
+# department-past-correction-enabled is on in prod.
 DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE = (
     "CSV import of departments and memberships stays outside the MCP: run it in the "
     "Revenium UI. That includes its removeMissing switch, which ends the assignment "
     "of everyone missing from the file, and the membershipsRemoved / removalsSkipped "
-    "counters the import reports."
+    "counters the import reports. The history-correcting switches (rewriteHistory, "
+    "rewriteFrom, absent, previewVersion), the department import history and the "
+    "undo of an import are UI-only too: this tool cannot rewrite anyone's past "
+    "departments, list past imports or undo one."
 )
 
 
@@ -2175,6 +2219,14 @@ class TeamManager(BaseManager):
         self._populate_call_count_element_definition(result)
         return result
 
+    # Decision (BACK-3956): the demo switch (PUT /v2/api/teams/{teamId}/settings/demo)
+    # is not adopted, and isDemo is not added to the team update body, where the spec
+    # marks it read-only and names the switch as the only way to set it. BACK-3927
+    # narrows the switch's gate to Revenium platform admins and hides it from the
+    # public API reference; this tool's callers are organisation users, so the call
+    # could only answer 403. get_team keeps returning isDemo as the API reports it.
+    # Indexed under `decision_exclusions` in .claude/commands/mcp-api-exclusions.yaml.
+    # Revisit if the gate opens to organisation admins again.
     async def update_team(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Update existing team using PartialUpdateHandler."""
         team_id = arguments.get("team_id")
@@ -2339,6 +2391,17 @@ class TeamManager(BaseManager):
 
         return result
 
+    # Decision (BACK-3949): the developer-experience policy is not adopted, neither
+    # the reads (GET /v2/api/ai/experience-policy/{teamId}, .../catalog, .../machines)
+    # nor the save (PUT /v2/api/ai/experience-policy/{teamId}), although they sit
+    # beside these team-scoped settings. The panel behind them,
+    # developer-experience-panel-enabled, is off in prod, and BACK-3927 hides the
+    # whole controller from the public API reference, so a customer's key has
+    # nothing to call. The reads are the status-line script's machine protocol, and
+    # the save drops every section it is not sent, so a careless write would reset
+    # developers' status lines. Indexed under `decision_exclusions` in
+    # .claude/commands/mcp-api-exclusions.yaml. Revisit when
+    # developer-experience-panel-enabled is on in prod.
     async def _read_pr_health_settings(self, team_id: str, action: str) -> Dict[str, Any]:
         """Read the team's current PR-health settings payload."""
         try:
@@ -2511,6 +2574,110 @@ class TeamManager(BaseManager):
             result["divergence_detail"] = divergence_detail
 
         return result
+
+    # Decision (BACK-3951): the digest settings are read and updated here, but neither
+    # the preview (GET /v2/api/teams/{id}/settings/pr-health/digest/preview) nor the
+    # test send (POST /v2/api/teams/{id}/settings/pr-health/digest/test) is wrapped.
+    # The test send delivers real Slack and email messages, to destinations a caller
+    # can name in the body, and the preview exists to check a message before sending
+    # it. Indexed under `decision_exclusions` in
+    # .claude/commands/mcp-api-exclusions.yaml.
+    async def get_pr_health_digest_settings(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Get the team's PR-health weekly digest and rotting alert settings."""
+        action = "get_pr_health_digest_settings"
+        team_id = self._require_team_id(arguments, action)
+
+        try:
+            settings = await self.client.get_team_pr_health_digest_settings(team_id)
+        except ReveniumAPIError as e:
+            _raise_pr_health_digest_error(e, team_id, action)
+
+        return {
+            "action": action,
+            "resource_type": "teams",
+            "team_id": team_id,
+            **present_digest_fields(settings),
+            "field_semantics": PR_HEALTH_DIGEST_FIELDS_NOTE,
+            "not_available": PR_HEALTH_DIGEST_NOT_ADOPTED_NOTE,
+        }
+
+    async def update_pr_health_digest_settings(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Change the team's PR-health digest settings, sending only the fields named.
+
+        The upstream PUT is a partial update (PR_HEALTH_DIGEST_PARTIAL_UPDATE_NOTE), so
+        the body carries exactly the caller's fields and nothing is read first: merging
+        a read into the body would overwrite whatever another writer stored in between.
+        """
+        action = "update_pr_health_digest_settings"
+        team_id = self._require_team_id(arguments, action)
+        body = collect_digest_updates(arguments)
+
+        if not body:
+            raise create_structured_missing_parameter_error(
+                parameter_name="digest_enabled",
+                action=action,
+                examples={
+                    "usage": (
+                        f"{action}(team_id='jR2kmLs', digest_enabled=true, "
+                        "timezone='America/New_York', email_addresses=['eng-leads@acme.com'])"
+                    ),
+                    "valid_formats": [
+                        f"{field.snake}: {field.description}" for field in PR_HEALTH_DIGEST_FIELDS
+                    ],
+                    "partial_update": PR_HEALTH_DIGEST_PARTIAL_UPDATE_NOTE,
+                },
+            )
+
+        try:
+            updated = await self.client.update_team_pr_health_digest_settings(
+                team_id, cast(PrHealthDigestSettingsPayload, body)
+            )
+        except ReveniumAPIError as e:
+            _raise_pr_health_digest_error(e, team_id, action)
+
+        return {
+            "action": action,
+            "resource_type": "teams",
+            "team_id": team_id,
+            "sent": body,
+            **present_digest_fields(updated),
+            "partial_update": PR_HEALTH_DIGEST_PARTIAL_UPDATE_NOTE,
+            "alert_semantics": PR_HEALTH_DIGEST_ALERT_NOTE,
+            "field_semantics": PR_HEALTH_DIGEST_FIELDS_NOTE,
+        }
+
+    # Decision (BACK-3945): only the read of the coding-assistant billing settings is
+    # adopted. Neither the per-provider confirm
+    # (PUT /v2/api/teams/{id}/settings/coding-assistant-filter/providers/{provider})
+    # nor the whole-settings save (PUT /v2/api/teams/{id}/settings/coding-assistant-filter)
+    # is wrapped: both decide whether an assistant's usage counts as real spend or as an
+    # estimate in every report, and a team's billing mode is changed in the app, not by
+    # an agent. Indexed under `decision_exclusions` in
+    # .claude/commands/mcp-api-exclusions.yaml.
+    async def get_coding_assistant_billing_settings(
+        self, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Read which coding assistants the team pays for at real API rates."""
+        action = "get_coding_assistant_billing_settings"
+        team_id = self._require_team_id(arguments, action)
+
+        try:
+            settings = await self.client.get_team_coding_assistant_filter_settings(team_id)
+        except ReveniumAPIError as e:
+            _raise_team_settings_permission_error(
+                e, team_id, action, settings_label="coding-assistant billing settings"
+            )
+            raise
+
+        return {
+            "action": action,
+            "resource_type": "teams",
+            "team_id": team_id,
+            **present_billing_fields(settings),
+            "billing_semantics": CODING_ASSISTANT_BILLING_SEMANTICS_NOTE,
+            "confirmation_semantics": CODING_ASSISTANT_CONFIRMATION_NOTE,
+            "read_only": CODING_ASSISTANT_BILLING_READ_ONLY_NOTE,
+        }
 
 
     async def get_attribution_identity_policy(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -3805,6 +3972,39 @@ class CustomerManagement(ToolBase):
                         + f"\n\n{PR_HEALTH_REPORT_NOTE}",
                     )
                 ]
+
+            elif action == "get_pr_health_digest_settings":
+                result = await team_manager.get_pr_health_digest_settings(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"PR health digest settings for team {result['team_id']}:\n\n"
+                        + json.dumps(result, indent=2),
+                    )
+                ]
+
+            elif action == "update_pr_health_digest_settings":
+                result = await team_manager.update_pr_health_digest_settings(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"PR health digest settings updated for team {result['team_id']}"
+                        + f" (sent: {', '.join(result['sent'])}):\n\n"
+                        + json.dumps(result, indent=2)
+                        + f"\n\n{PR_HEALTH_DIGEST_PARTIAL_UPDATE_NOTE}",
+                    )
+                ]
+
+            elif action == "get_coding_assistant_billing_settings":
+                result = await team_manager.get_coding_assistant_billing_settings(arguments)
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Coding-assistant billing settings for team {result['team_id']}:\n\n"
+                        + json.dumps(result, indent=2)
+                        + f"\n\n{CODING_ASSISTANT_BILLING_READ_ONLY_NOTE}",
+                    )
+                ]
             # Team attribution identity policy (a sub-resource of teams)
             elif action == "get_attribution_identity_policy":
                 result = await team_manager.get_attribution_identity_policy(arguments)
@@ -3995,6 +4195,9 @@ class CustomerManagement(ToolBase):
                             "update_marketplace_settings",
                             "get_pr_health_settings",
                             "update_pr_health_settings",
+                            "get_pr_health_digest_settings",
+                            "update_pr_health_digest_settings",
+                            "get_coding_assistant_billing_settings",
                             "get_attribution_identity_policy",
                             "update_attribution_identity_policy",
                             "list_verified_domains",
@@ -4028,6 +4231,9 @@ class CustomerManagement(ToolBase):
                             "update_marketplace_settings": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'], operation='add')",
                             "get_pr_health_settings": "get_pr_health_settings(team_id='jR2kmLs')",
                             "update_pr_health_settings": "update_pr_health_settings(team_id='jR2kmLs', aging_days=14, rotting_days=30)",
+                            "get_pr_health_digest_settings": "get_pr_health_digest_settings(team_id='jR2kmLs')",
+                            "update_pr_health_digest_settings": "update_pr_health_digest_settings(team_id='jR2kmLs', digest_enabled=true, timezone='America/New_York', email_addresses=['eng-leads@acme.com'])",
+                            "get_coding_assistant_billing_settings": "get_coding_assistant_billing_settings(team_id='jR2kmLs')",
                             "get_attribution_identity_policy": "get_attribution_identity_policy(team_id='jR2kmLs')",
                             "update_attribution_identity_policy": "update_attribution_identity_policy(team_id='jR2kmLs', policy='ALLOW_SELF_ASSERTED_UNVERIFIED')",
                             "list_verified_domains": "list_verified_domains(team_id='jR2kmLs')",
@@ -4159,6 +4365,20 @@ class CustomerManagement(ToolBase):
         result_text += "- Updates require team-management permissions on the target team\n"
         result_text += f"- **Limitation**: {PR_HEALTH_CONCURRENCY_NOTE}\n"
         result_text += f"- **Downstream**: {PR_HEALTH_REPORT_NOTE}\n\n"
+        result_text += "## **Team PR-Health Digest**\n"
+        result_text += "The team's weekly PR-health digest and weekday rotting alert: whether each is on, when it goes out and the Slack channels and email addresses it goes to.\n\n"
+        result_text += "- `get_pr_health_digest_settings(team_id='jR2kmLs')` - read the switches, schedule, destinations, `nextSendAt` / `nextAlertAt` and the last send's outcome\n"
+        result_text += "- `update_pr_health_digest_settings(team_id='jR2kmLs', digest_enabled=true, timezone='America/New_York', email_addresses=['eng-leads@acme.com'])` - also accepts `rotting_alert_enabled`, `day_of_week`, `hour_of_day` and `slack_configuration_ids`\n"
+        result_text += f"- **Partial update**: {PR_HEALTH_DIGEST_PARTIAL_UPDATE_NOTE}\n"
+        result_text += f"- **Fields**: {PR_HEALTH_DIGEST_FIELDS_NOTE}\n"
+        result_text += f"- **Rotting alert**: {PR_HEALTH_DIGEST_ALERT_NOTE}\n"
+        result_text += f"- **Not available**: {PR_HEALTH_DIGEST_NOT_ADOPTED_NOTE}\n\n"
+        result_text += "## **Team Coding-Assistant Billing Settings**\n"
+        result_text += "Which coding assistants the team pays for at real API rates, and which pricing modes someone has confirmed.\n\n"
+        result_text += "- `get_coding_assistant_billing_settings(team_id='jR2kmLs')` - read `apiRateProviders`, `confirmedProviders`, `needsReview`, `classificationSource`, `confidence` and `persistence`\n"
+        result_text += f"- **Semantics**: {CODING_ASSISTANT_BILLING_SEMANTICS_NOTE}\n"
+        result_text += f"- **Confirmation**: {CODING_ASSISTANT_CONFIRMATION_NOTE}\n"
+        result_text += f"- **Read-only**: {CODING_ASSISTANT_BILLING_READ_ONLY_NOTE}\n\n"
         result_text += "## **Team Attribution Identity Policy**\n"
         result_text += "Whether coding-assistant identity assertions from unverified email domains are honoured.\n\n"
         result_text += "- `get_attribution_identity_policy(team_id='jR2kmLs')` - read the **effective** policy in force\n"
@@ -4468,6 +4688,16 @@ class CustomerManagement(ToolBase):
                 "example": "update_pr_health_settings(team_id='jR2kmLs', excluded_repos=['acme/legacy-app'])",
             },
             {
+                "title": "Send the PR-Health Digest to the Team Leads",
+                "description": "Switch on the weekly PR-health digest and say where and when it goes; only the fields named change",
+                "example": "update_pr_health_digest_settings(team_id='jR2kmLs', digest_enabled=true, timezone='America/New_York', email_addresses=['eng-leads@acme.com'])",
+            },
+            {
+                "title": "See How the Team Pays for Each Coding Assistant",
+                "description": "Read which coding assistants count as real spend at API rates and which pricing modes are still unconfirmed",
+                "example": "get_coding_assistant_billing_settings(team_id='jR2kmLs')",
+            },
+            {
                 "title": "Loosen the Attribution Identity Policy",
                 "description": "Accept coding-assistant identity assertions from unverified domains, instead of only from the team's verified-domain list",
                 "example": "update_attribution_identity_policy(team_id='jR2kmLs', policy='ALLOW_SELF_ASSERTED_UNVERIFIED')",
@@ -4641,6 +4871,51 @@ class CustomerManagement(ToolBase):
                     PR_HEALTH_CONCURRENCY_NOTE,
                     "When a stored threshold or optional setting comes back different from the value sent, the response carries divergence_warning naming the fields the interleaved write changed, with the sent and stored values in divergence_detail (excludedRepos is compared ignoring order and case, as the platform sorts and matches it case-insensitively)",
                     PR_HEALTH_SEMANTICS_NOTE,
+                ],
+            ),
+            ToolCapability(
+                name="Team PR-Health Digest",
+                description=(
+                    "Read and change the team's weekly PR-health digest and weekday rotting "
+                    "alert: the two switches, the day, hour and timezone they go out at, and "
+                    "the Slack channel connections and email addresses they go to. Reads also "
+                    "echo slackChannels, rottingDays, nextSendAt, nextAlertAt and the last "
+                    "send's outcome."
+                ),
+                parameters={
+                    "get_pr_health_digest_settings": {"team_id": "str (required)"},
+                    "update_pr_health_digest_settings": {
+                        "team_id": "str (required)",
+                        **{field.snake: field.description for field in PR_HEALTH_DIGEST_FIELDS},
+                    },
+                },
+                examples=[
+                    "get_pr_health_digest_settings(team_id='jR2kmLs')",
+                    "update_pr_health_digest_settings(team_id='jR2kmLs', digest_enabled=true, timezone='America/New_York', email_addresses=['eng-leads@acme.com'])",
+                    "update_pr_health_digest_settings(team_id='jR2kmLs', day_of_week='FRIDAY', hour_of_day=16)",
+                    "update_pr_health_digest_settings(team_id='jR2kmLs', email_addresses=[])",
+                ],
+                limitations=[
+                    "At least one digest field is required for an update",
+                    PR_HEALTH_DIGEST_PARTIAL_UPDATE_NOTE,
+                    PR_HEALTH_DIGEST_ALERT_NOTE,
+                    PR_HEALTH_DIGEST_NOT_ADOPTED_NOTE,
+                ],
+            ),
+            ToolCapability(
+                name="Team Coding-Assistant Billing Settings",
+                description=(
+                    "Read which coding assistants the team pays for at real API rates "
+                    "(apiRateProviders), which pricing modes someone has confirmed "
+                    "(confirmedProviders) and whether any still need review."
+                ),
+                parameters={
+                    "get_coding_assistant_billing_settings": {"team_id": "str (required)"},
+                },
+                examples=["get_coding_assistant_billing_settings(team_id='jR2kmLs')"],
+                limitations=[
+                    CODING_ASSISTANT_BILLING_READ_ONLY_NOTE,
+                    "The deprecated enabled, defaultProviders and allowUserOverride fields are not rendered",
                 ],
             ),
             ToolCapability(
@@ -4863,6 +5138,9 @@ class CustomerManagement(ToolBase):
             "update_marketplace_settings",
             "get_pr_health_settings",
             "update_pr_health_settings",
+            "get_pr_health_digest_settings",
+            "update_pr_health_digest_settings",
+            "get_coding_assistant_billing_settings",
             "get_attribution_identity_policy",
             "update_attribution_identity_policy",
             "list_verified_domains",
@@ -4956,6 +5234,7 @@ class CustomerManagement(ToolBase):
                         "carries a single domain; the add is not a list replacement"
                     ),
                 },
+                **digest_input_schema_properties(),
                 # Note: email, firstName, lastName auto-generated from name
                 # Note: ownerId, teamId system-managed for customer resources
                 # Note: resource_type determined from context

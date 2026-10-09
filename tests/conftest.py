@@ -1,25 +1,114 @@
-"""Pytest configuration and shared fixtures for Revenium MCP Server tests."""
+"""Pytest configuration and shared fixtures for Revenium MCP Server tests.
+
+Test runs are network-free by default: every ``REVENIUM_*`` variable the shell
+exported is replaced by the fake values in ``TEST_ENVIRONMENT`` and sockets may
+only connect to loopback. Setting ``LIVE_NETWORK_OPT_IN`` hands the caller's
+environment and the network through for integration and smoke runs.
+"""
 
 import os
+import sys
+
 import pytest
+from pytest_socket import socket_allow_hosts
 from unittest.mock import AsyncMock, MagicMock
 
-# Default test environment variables — only set when not already provided by the
-# caller. Using `setdefault` lets integration/smoke runs override with real
-# credentials (e.g. live AI Insights smoke against dev) without the unit-test
-# defaults silently shadowing them.
-os.environ.setdefault("REVENIUM_API_KEY", "test_api_key_12345")
-os.environ.setdefault("REVENIUM_TEAM_ID", "test_team_id_456")
-os.environ.setdefault("REVENIUM_BASE_URL", "https://api.test.revenium.ai")
-os.environ.setdefault("LOG_LEVEL", "ERROR")  # Reduce log noise during tests
+LIVE_NETWORK_OPT_IN = "REVENIUM_INTEGRATION_TESTS"
+LIVE_NETWORK_OPT_IN_VALUES = frozenset({"1", "true", "yes", "on"})
+
+TEST_API_KEY = "test_api_key_12345"
+TEST_TEAM_ID = "test_team_id_456"
+TEST_BASE_URL = "https://api.revenium.invalid"
+TEST_APP_BASE_URL = "https://app.revenium.invalid"
+
+CONFIG_CACHE_MODULES = (
+    "src.revenium_mcp_server.config_cache",
+    "revenium_mcp_server.config_cache",
+)
+
+TEST_ENVIRONMENT = {
+    "REVENIUM_API_KEY": TEST_API_KEY,
+    "REVENIUM_TEAM_ID": TEST_TEAM_ID,
+    "REVENIUM_BASE_URL": TEST_BASE_URL,
+    "REVENIUM_APP_BASE_URL": TEST_APP_BASE_URL,
+}
+
+# Live runs derive the analytics host from REVENIUM_BASE_URL, so a fake app URL
+# must not shadow that pairing.
+LIVE_RUN_DEFAULTS = {
+    name: value for name, value in TEST_ENVIRONMENT.items() if name != "REVENIUM_APP_BASE_URL"
+}
+
+
+def live_network_opted_in() -> bool:
+    return os.getenv(LIVE_NETWORK_OPT_IN, "").strip().lower() in LIVE_NETWORK_OPT_IN_VALUES
+
+
+def isolate_revenium_environment() -> None:
+    for name in [name for name in os.environ if name.startswith("REVENIUM_")]:
+        del os.environ[name]
+    os.environ.update(TEST_ENVIRONMENT)
+
+
+if live_network_opted_in():
+    for name, value in LIVE_RUN_DEFAULTS.items():
+        os.environ.setdefault(name, value)
+else:
+    isolate_revenium_environment()
+
+os.environ.setdefault("LOG_LEVEL", "ERROR")
+
+
+def pytest_configure(config):
+    """Guard collection with pytest-socket's own allow-list from ``addopts``.
+
+    pytest-socket guards only the setup/call/teardown of each test, while
+    importing ``smart_defaults`` during collection already runs config discovery.
+    """
+    if live_network_opted_in():
+        return
+    allowed_hosts = config.getoption("--allow-hosts", default=None)
+    if not allowed_hosts:
+        raise pytest.UsageError(
+            "Network-free test runs need pytest-socket's --allow-hosts (set in "
+            f"pyproject.toml addopts). Set {LIVE_NETWORK_OPT_IN}=1 for a live run."
+        )
+    socket_allow_hosts(
+        allowed_hosts, allow_unix_socket=config.getoption("--allow-unix-socket")
+    )
+
+
+def pytest_collection_modifyitems(items):
+    if live_network_opted_in():
+        for item in items:
+            item.add_marker(pytest.mark.enable_socket)
+
+
+def forget_saved_configuration(monkeypatch, empty_cache_file) -> None:
+    """Point the saved-configuration cache at a file that does not exist.
+
+    ``get_value_with_override`` prefers ``.revenium_cache`` in the working
+    directory over the environment, so a developer's saved values would
+    otherwise reach the tests.
+    """
+    for module_name in CONFIG_CACHE_MODULES:
+        module = sys.modules.get(module_name)
+        if module is not None:
+            monkeypatch.setattr(module._default_cache, "cache_file", empty_cache_file)
+
+
+@pytest.fixture(autouse=True)
+def _no_saved_configuration(monkeypatch, tmp_path_factory):
+    if not live_network_opted_in():
+        empty_cache_file = tmp_path_factory.getbasetemp() / "no-saved-configuration"
+        forget_saved_configuration(monkeypatch, empty_cache_file)
 
 
 @pytest.fixture
 def mock_env_vars(monkeypatch):
     """Mock environment variables for testing."""
-    monkeypatch.setenv("REVENIUM_API_KEY", "test_api_key_12345")
-    monkeypatch.setenv("REVENIUM_TEAM_ID", "test_team_id_456")
-    monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.test.revenium.ai")
+    for name, value in TEST_ENVIRONMENT.items():
+        monkeypatch.setenv(name, value)
     monkeypatch.setenv("LOG_LEVEL", "ERROR")
 
 
@@ -29,8 +118,8 @@ async def mock_revenium_client():
     from src.revenium_mcp_server.client import ReveniumClient
 
     client = MagicMock(spec=ReveniumClient)
-    client.api_key = "test_api_key_12345"
-    client.base_url = "https://api.test.revenium.ai"
+    client.api_key = TEST_API_KEY
+    client.base_url = TEST_BASE_URL
     client.timeout = 30.0
 
     # Mock async methods

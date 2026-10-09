@@ -27,10 +27,12 @@ import os
 import httpx
 import pytest
 
+from tests.conftest import live_network_opted_in
+
 from src.revenium_mcp_server.endpoint_registry import paired_app_base_url
 
 pytestmark = pytest.mark.skipif(
-    not os.getenv("REVENIUM_INTEGRATION_TESTS")
+    not live_network_opted_in()
     or not os.getenv("REVENIUM_API_KEY")
     or not os.getenv("REVENIUM_BASE_URL"),
     reason=(

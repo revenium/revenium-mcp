@@ -460,6 +460,87 @@ class TestGetAnomaly:
         assert "openai" in text
 
 
+FIRING_STATE_CASES = [
+    ({"enabled": True, "firingState": "FIRING"}, "Enabled; firing state: Firing"),
+    ({"enabled": True, "firingState": "NOT_FIRING"}, "Enabled; firing state: Not firing"),
+    (
+        {"enabled": True, "firingState": "UNKNOWN"},
+        "Enabled; firing state: Unknown (could not be read just now)",
+    ),
+    ({"enabled": False, "firingState": "FIRING"}, "Disabled; last firing state: Firing"),
+    ({"enabled": True, "firingState": "THROTTLED"}, "Enabled; firing state: THROTTLED"),
+]
+
+ABSENT_FIRING_STATE_CASES = [
+    ({"enabled": True}, "Enabled"),
+    ({"enabled": True, "firingState": None}, "Enabled"),
+    ({"enabled": False}, "Disabled"),
+]
+
+
+def _list_client(anomaly):
+    client = MagicMock()
+    client.get_anomalies = AsyncMock(return_value={})
+    client._extract_embedded_data = MagicMock(return_value=[anomaly])
+    client._extract_pagination_info = MagicMock(
+        return_value={"totalPages": 1, "totalElements": 1}
+    )
+    return client
+
+
+def _get_client(anomaly):
+    client = MagicMock()
+    client.get_anomaly_by_id = AsyncMock(return_value=anomaly)
+    client.get_slack_configuration_by_id = AsyncMock()
+    return client
+
+
+class TestFiringState:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fields,expected", FIRING_STATE_CASES)
+    async def test_list_row_shows_firing_state_beside_status(self, manager, fields, expected):
+        anomaly = {"id": "anom-1", "name": "Cost Spike", "filters": [], **fields}
+
+        result = await manager.list_anomalies(_list_client(anomaly))
+
+        assert f"  • {expected}\n" in result[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fields,expected", FIRING_STATE_CASES)
+    async def test_details_show_firing_state_beside_status(self, manager, fields, expected):
+        anomaly = {"id": "anom-1", "name": "Cost Spike", **fields}
+
+        result = await manager.get_anomaly(_get_client(anomaly), "anom-1")
+
+        assert f"**Status:** {expected}\n" in result[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fields,expected", ABSENT_FIRING_STATE_CASES)
+    async def test_list_row_without_firing_state_shows_status_only(
+        self, manager, fields, expected
+    ):
+        anomaly = {"id": "anom-1", "name": "Cost Spike", "filters": [], **fields}
+
+        result = await manager.list_anomalies(_list_client(anomaly))
+
+        text = result[0].text
+        assert f"  • {expected}\n" in text
+        assert "firing state" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fields,expected", ABSENT_FIRING_STATE_CASES)
+    async def test_details_without_firing_state_show_status_only(
+        self, manager, fields, expected
+    ):
+        anomaly = {"id": "anom-1", "name": "Cost Spike", **fields}
+
+        result = await manager.get_anomaly(_get_client(anomaly), "anom-1")
+
+        text = result[0].text
+        assert f"**Status:** {expected}\n" in text
+        assert "firing state" not in text
+
+
 class TestGetAnomalyNotFound:
     """BACK-2938: the default manage_alerts get lands here, and the platform
     answers 403 for an id that simply does not exist."""

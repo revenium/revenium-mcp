@@ -73,11 +73,11 @@ class TestRegistryEntry:
     def test_resolves_to_new_path_with_flag_off(self, monkeypatch):
         monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
         path, params, call_kwargs = resolve_analytics_request(
-            "transaction_count_by_team", "team-ignored", "SEVEN_DAYS"
+            "transaction_count_by_team", "team-123", "SEVEN_DAYS"
         )
         assert path == "/api/v2/analytics/transaction-count-by-team"
         assert "startDate" in params and "endDate" in params
-        assert "teamId" not in params
+        assert params["teamId"] == "team-123"
         assert call_kwargs.get("use_bearer") is True
 
 

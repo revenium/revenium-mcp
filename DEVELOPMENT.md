@@ -108,6 +108,41 @@ pytest -v
 pytest tests/unit/test_auth.py::TestAuthConfig
 ```
 
+#### Tests are network-free by default
+
+A test run cannot reach the network or use your real credentials, even when
+your shell exports them:
+
+- `tests/conftest.py` removes every `REVENIUM_*` variable from the environment
+  and sets the fake values in `TEST_ENVIRONMENT` instead. The base URLs point
+  at `.invalid` hosts, so config auto-discovery has nothing real to call.
+  It also points the saved-configuration cache (`.revenium_cache`) at an
+  empty path, so values you saved locally do not reach the tests.
+- `pytest-socket` (in the `dev` and `test` extras) only lets sockets connect to
+  loopback (`127.0.0.1`, `::1`, `localhost`) and Unix sockets. Any other
+  connection raises `SocketConnectBlockedError`. Local stub servers, such as
+  `pytest-httpserver` or the uvicorn servers the e2e tests start, keep working.
+
+If pytest fails with `unrecognized arguments: --disable-socket`, your venv
+predates this setup: run `pip install -e ".[dev]"` again.
+
+#### Live integration runs (opt-in)
+
+The live smoke and contract tests in `tests/integration/` call a real
+environment. Set `REVENIUM_INTEGRATION_TESTS=1` (`true`, `yes` and `on` also
+work; `0`, `false` or any other value keeps the isolation) to run them. The flag is read
+before the override above: your `REVENIUM_*` variables pass through unchanged
+(an unset `REVENIUM_API_KEY`, `REVENIUM_TEAM_ID` or `REVENIUM_BASE_URL` falls
+back to the fake test value) and sockets are unrestricted for the whole run,
+unit tests included. Point live runs at dev only:
+
+```bash
+REVENIUM_INTEGRATION_TESTS=1 \
+REVENIUM_BASE_URL=https://api.dev.hcapp.io \
+REVENIUM_API_KEY=<dev key> REVENIUM_TEAM_ID=<dev team> \
+pytest tests/integration/test_live_analytics_smoke.py
+```
+
 ### Testing AI Routing (Optional Feature)
 
 ```bash

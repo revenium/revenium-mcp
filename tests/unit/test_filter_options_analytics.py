@@ -68,7 +68,7 @@ class TestFilterOptionsRegistryEntry:
         assert path == "/api/v2/analytics/filter-options"
         assert call_kwargs.get("use_bearer") is True
         assert "startDate" in params and "endDate" in params
-        assert "teamId" not in params
+        assert params["teamId"] == "team-123"
         assert "period" not in params
 
 

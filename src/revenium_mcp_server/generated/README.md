@@ -20,13 +20,16 @@ uv run --extra dev python scripts/generate_openapi_models.py
 
 `scripts/generate_openapi_models.py` prunes each snapshot to the operations
 listed in `specs/openapi/consumed-operations.json` (plus everything they
-reference transitively), runs `datamodel-codegen` over the pruned document, and
-prepends the DO-NOT-EDIT header. Output is deterministic: regenerating without a
+reference transitively), rewrites `nullable: true` into the OpenAPI 3.1
+`"null"` type form so required nullable fields come out `Optional`, runs
+`datamodel-codegen` over the pruned document, and prepends the DO-NOT-EDIT header. Output is deterministic: regenerating without a
 snapshot change produces a byte-identical file.
 
-To pick up an upstream change, refresh the snapshot first:
+To pick up an upstream change, refresh the snapshot first. The hypercurrent
+docs endpoint needs a dev-environment Revenium API key in `REVENIUM_DEV_API_KEY`:
 
 ```
+export REVENIUM_DEV_API_KEY=...
 uv run python scripts/fetch_openapi_specs.py
 uv run --extra dev python scripts/generate_openapi_models.py
 uv run --extra dev pytest tests/unit/test_openapi_contract.py

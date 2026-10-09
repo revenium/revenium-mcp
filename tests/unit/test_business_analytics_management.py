@@ -540,6 +540,88 @@ class TestSeatUtilizationRendering:
         assert "get_seat_utilization" in examples
         assert "get_seat_utilization" in analytics_tool.tool_description
 
+    # BACK-3955 — whether the latest Claude Enterprise sync read the census.
+
+    @pytest.mark.asyncio
+    async def test_read_census_is_reported_with_its_check_time(self, analytics_tool):
+        payload = dict(SEAT_CENSUS_PAYLOAD)
+        payload.update({"censusState": "READ", "censusCheckedAt": "2026-08-22T03:15:00Z"})
+        _, text = await _run_seat_action(
+            analytics_tool, {"from_date": "2026-08-01", "to_date": "2026-08-22"}, payload
+        )
+        assert text.splitlines()[-1] == (
+            "**Census freshness**: READ (sync ran 2026-08-22T03:15:00Z) — the latest "
+            "Claude Enterprise sync read the seat census"
+        )
+        assert text.index("**Census freshness**") > text.index("**2026-08-02**")
+
+    @pytest.mark.asyncio
+    async def test_unread_census_warns_the_counts_may_be_stale(self, analytics_tool):
+        payload = dict(SEAT_CENSUS_PAYLOAD)
+        payload.update({"censusState": "UNREAD", "censusCheckedAt": "2026-08-22T03:15:00Z"})
+        _, text = await _run_seat_action(
+            analytics_tool, {"from_date": "2026-08-01", "to_date": "2026-08-22"}, payload
+        )
+        line = next(line for line in text.splitlines() if "Census freshness" in line)
+        assert "UNREAD (sync ran 2026-08-22T03:15:00Z)" in line
+        assert "could not read the seat census" in line
+        assert "may be stale" in line
+
+    @pytest.mark.asyncio
+    async def test_unknown_census_says_no_sync_completed(self, analytics_tool):
+        payload = dict(SEAT_CENSUS_PAYLOAD)
+        payload.update({"censusState": "UNKNOWN", "censusCheckedAt": None})
+        _, text = await _run_seat_action(
+            analytics_tool, {"from_date": "2026-08-01", "to_date": "2026-08-22"}, payload
+        )
+        line = next(line for line in text.splitlines() if "Census freshness" in line)
+        assert line.startswith("**Census freshness**: UNKNOWN — ")
+        assert "no Claude Enterprise sync completed in the last 3 days" in line
+        assert "sync ran" not in line
+
+    @pytest.mark.asyncio
+    async def test_absent_census_state_renders_unknown_never_read(self, analytics_tool):
+        """Prod omits censusState; READ would assert a freshness nobody checked."""
+        _, text = await _run_seat_action(
+            analytics_tool, {"from_date": "2026-08-01", "to_date": "2026-08-22"}
+        )
+        line = next(line for line in text.splitlines() if "Census freshness" in line)
+        assert line.startswith("**Census freshness**: unknown — ")
+        assert "did not report" in line
+        assert "READ" not in line
+
+    @pytest.mark.asyncio
+    async def test_unrecognised_census_state_is_named_not_trusted(self, analytics_tool):
+        payload = dict(SEAT_CENSUS_PAYLOAD)
+        payload["censusState"] = "PARTIAL"
+        _, text = await _run_seat_action(
+            analytics_tool, {"from_date": "2026-08-01", "to_date": "2026-08-22"}, payload
+        )
+        line = next(line for line in text.splitlines() if "Census freshness" in line)
+        assert "PARTIAL" in line
+        assert "does not recognise" in line
+
+    @pytest.mark.asyncio
+    async def test_census_line_shows_when_days_is_empty(self, analytics_tool):
+        """An unread census is the likeliest explanation for an empty one."""
+        _, text = await _run_seat_action(
+            analytics_tool,
+            {"from_date": "2026-08-01", "to_date": "2026-08-22"},
+            {"days": [], "censusState": "UNREAD", "censusCheckedAt": "2026-08-22T03:15:00Z"},
+        )
+        assert "No Claude Enterprise connection found" in text
+        assert text.splitlines()[-1].startswith(
+            "**Census freshness**: UNREAD (sync ran 2026-08-22T03:15:00Z)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_discovery_surfaces_describe_the_census_state(self, analytics_tool):
+        capabilities = (await analytics_tool.handle_action("get_capabilities", {}))[0].text
+        examples = (await analytics_tool.handle_action("get_examples", {}))[0].text
+        for text in (capabilities, examples):
+            seat_section = text.split("get_seat_utilization", 1)[1][:2500]
+            assert "censusState" in seat_section
+            assert "UNREAD" in seat_section
 
 PR_HEALTH_PAYLOAD = {
     "source": "github",
@@ -763,11 +845,12 @@ class TestPrHealthRendering:
         analytics_tool._handle_get_pr_health.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_states_the_report_covers_the_callers_own_organization(
+    async def test_states_the_report_covers_the_team_the_credentials_resolve_to(
         self, analytics_tool
     ):
         text = await self._render(analytics_tool)
-        assert "own organization" in text
+        assert "Scope: the team your credentials resolve to" in text
+        assert "takes no team parameter" not in text
 
     @pytest.mark.asyncio
     async def test_echoes_the_thresholds_the_report_used(self, analytics_tool):
@@ -1514,6 +1597,92 @@ class TestCoverageRatio:
         # The outside-comparison total is a separate figure and stays a number.
         assert "compare against): 1088.34" in text
 
+    # BACK-3954 — a coding-assistant check that could not complete still sends
+    # codingAssistantUsagePresent=false, so the unknown flag decides the label.
+
+    @pytest.mark.asyncio
+    async def test_incomplete_report_check_renders_unknown_not_absent(
+        self, analytics_tool
+    ):
+        text = await self._render(
+            analytics_tool,
+            {
+                "state": "VALID",
+                "aggregateRatio": 0.5,
+                "codingAssistantUsagePresent": False,
+                "codingAssistantUsageUnknown": True,
+            },
+        )
+        assert "- Present: unknown (the check could not complete)" in text
+        assert "- Present: no" not in text
+
+    @pytest.mark.asyncio
+    async def test_incomplete_row_check_renders_unknown_not_absent(
+        self, analytics_tool
+    ):
+        payload = {
+            "state": "VALID",
+            "aggregateRatio": 0.5,
+            "byProvider": [
+                {"provider": "ANTHROPIC", "state": "active", "ratio": 1.0,
+                 "metered": 5.0, "billing": 10.0,
+                 "codingAssistantUsagePresent": False,
+                 "codingAssistantUsageUnknown": True},
+            ],
+        }
+        text = await self._render(analytics_tool, payload)
+        anthropic = next(line for line in text.split("\n") if line.startswith("- ANTHROPIC"))
+        assert "coding-assistant usage: unknown (the check could not complete)" in anthropic
+        assert "coding-assistant usage: no" not in anthropic
+
+    @pytest.mark.asyncio
+    async def test_completed_check_still_renders_a_plain_no(self, analytics_tool):
+        """codingAssistantUsageUnknown=false is the spec default: a real absence."""
+        payload = {
+            "state": "VALID",
+            "codingAssistantUsagePresent": False,
+            "codingAssistantUsageUnknown": False,
+            "byProvider": [
+                {"provider": "OPENAI", "state": "active", "ratio": 1.0,
+                 "metered": 1.0, "billing": 1.0,
+                 "codingAssistantUsagePresent": False,
+                 "codingAssistantUsageUnknown": False},
+            ],
+        }
+        text = await self._render(analytics_tool, payload)
+        assert "- Present: no" in text
+        assert "coding-assistant usage: no" in text
+        assert "could not complete)" not in text
+
+    @pytest.mark.asyncio
+    async def test_absent_unknown_flag_is_treated_as_false(self, analytics_tool):
+        """Prod omits the field; its absence must keep today's yes/no rendering."""
+        text = await self._render(analytics_tool)
+        assert "- Present: yes" in text
+        assert "coding-assistant usage: no" in text
+        assert "could not complete)" not in text
+
+    @pytest.mark.asyncio
+    async def test_revision_window_is_stated_per_provider(self, analytics_tool):
+        payload = {
+            "state": "VALID",
+            "byProvider": [
+                {"provider": "ANTHROPIC", "state": "active", "ratio": 0.6,
+                 "metered": 6.0, "billing": 6.0,
+                 "revisionWindowStart": "2026-08-24"},
+                {"provider": "OPENAI", "state": "active", "ratio": 0.4,
+                 "metered": 4.0, "billing": 4.0,
+                 "revisionWindowStart": None},
+            ],
+        }
+        text = await self._render(analytics_tool, payload)
+        lines = text.split("\n")
+        anthropic = next(i for i, line in enumerate(lines) if line.startswith("- ANTHROPIC"))
+        assert lines[anthropic + 1] == (
+            "  - figures from 2026-08-24 onward may still be restated by the provider"
+        )
+        assert text.count("may still be restated") == 1
+
     def test_removed_cost_field_is_referenced_nowhere_in_src(self):
         """BACK-2776 acceptance: the release replaced the cost field with a flag."""
         import pathlib
@@ -1743,10 +1912,10 @@ class TestCapabilitiesCoverDispatch:
 
     @pytest.mark.asyncio
     async def test_legacy_api_variant_stays_consistent(self, analytics_tool):
-        """The non-new-api rendering strips get_user_costs from both surfaces together."""
+        """A deployment that refuses get_user_costs strips it from both surfaces together."""
         with patch(
-            "src.revenium_mcp_server.tools_decomposed.business_analytics_management._use_new_api",
-            return_value=False,
+            "src.revenium_mcp_server.tools_decomposed.business_analytics_management.requires_new_api_flag",
+            return_value=True,
         ):
             supported = set(await analytics_tool._get_supported_actions())
             result = await analytics_tool.handle_action("get_capabilities", {})
@@ -1779,12 +1948,12 @@ class TestPerPersonSpendDecision:
     async def test_capabilities_say_per_person_spend_is_not_exposed(self, analytics_tool):
         """A caller reading get_user_costs is told per-person billed spend is elsewhere.
 
-        The note sits inside the get_user_costs entry, which is stripped when the new
-        analytics API is off, so the surface is exercised with that action available.
+        The note sits inside the get_user_costs entry, which is stripped only when the
+        deployment would refuse that action, so the surface is exercised with it available.
         """
         with patch(
-            "src.revenium_mcp_server.tools_decomposed.business_analytics_management._use_new_api",
-            return_value=True,
+            "src.revenium_mcp_server.tools_decomposed.business_analytics_management.requires_new_api_flag",
+            return_value=False,
         ):
             result = await analytics_tool.handle_action("get_capabilities", {})
         text = result[0].text
@@ -2075,6 +2244,254 @@ class TestPrHealthPullRequests:
         )
         text = await _call(analytics_tool, "get_pr_health_pull_requests", WINDOW, client)
         assert "Failed" in text and "366" in text
+
+
+# ── BACK-3952: pull-request list filters, engineer search, causes ───────────
+
+LIST_FILTER_KWARGS = ("cause", "repo", "ticket", "triaged")
+
+
+class TestPrHealthListFilters:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "given, sent",
+        [
+            ({"cause": "waiting_on_review"}, {"cause": "WAITING_ON_REVIEW"}),
+            ({"repo": " acme/widget "}, {"repo": "acme/widget"}),
+            ({"ticket": "BACK-3348"}, {"ticket": "BACK-3348"}),
+            ({"triaged": "only"}, {"triaged": "ONLY"}),
+            ({"triaged": "EXCLUDE"}, {"triaged": "EXCLUDE"}),
+        ],
+    )
+    async def test_each_filter_is_forwarded_when_set(self, analytics_tool, given, sent):
+        client = _vcs_client(get_vcs_pr_health_pull_requests=PULL_REQUESTS_PAGE)
+        await _call(analytics_tool, "get_pr_health_pull_requests", {**WINDOW, **given}, client)
+        kwargs = client.get_vcs_pr_health_pull_requests.await_args.kwargs
+        assert {name: kwargs[name] for name in LIST_FILTER_KWARGS if name in kwargs} == sent
+
+    @pytest.mark.asyncio
+    async def test_filters_are_omitted_when_unset(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_pull_requests=PULL_REQUESTS_PAGE)
+        await _call(analytics_tool, "get_pr_health_pull_requests", {**WINDOW, "repo": "  "}, client)
+        kwargs = client.get_vcs_pr_health_pull_requests.await_args.kwargs
+        assert not set(LIST_FILTER_KWARGS) & set(kwargs)
+
+    @pytest.mark.asyncio
+    async def test_automation_bucket_is_accepted(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_pull_requests={**PULL_REQUESTS_PAGE, "bucket": "AUTOMATION"})
+        text = await _call(
+            analytics_tool, "get_pr_health_pull_requests", {**WINDOW, "bucket": "automation"}, client
+        )
+        assert client.get_vcs_pr_health_pull_requests.await_args.kwargs["bucket"] == "AUTOMATION"
+        assert "bucket=AUTOMATION" in text
+
+    @pytest.mark.asyncio
+    async def test_cause_with_bucket_is_refused_before_the_call(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_pull_requests=PULL_REQUESTS_PAGE)
+        with patch.object(analytics_tool, "get_client", AsyncMock(return_value=client)):
+            with pytest.raises(ToolError) as exc:
+                await analytics_tool.handle_action(
+                    "get_pr_health_pull_requests",
+                    {**WINDOW, "bucket": "ROTTING", "cause": "STUCK_DRAFT"},
+                )
+        assert exc.value.field == "cause"
+        client.get_vcs_pr_health_pull_requests.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "field, bad",
+        [
+            ("cause", "STALE"),
+            ("triaged", "INCLUDE"),
+            ("ticket", "X" * 81),
+            ("repo", 42),
+        ],
+    )
+    async def test_invalid_filters_are_refused(self, analytics_tool, field, bad):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("get_pr_health_pull_requests", {**WINDOW, field: bad})
+        assert exc.value.field == field
+
+    @pytest.mark.asyncio
+    async def test_every_spec_cause_is_accepted(self, analytics_tool):
+        for cause in [
+            "AUTOMATION", "STUCK_DRAFT", "AUTHOR_GONE", "APPROVED_NOT_MERGED",
+            "CHANGES_REQUESTED_QUIET", "WAITING_ON_REVIEW", "ON_PACE",
+        ]:
+            client = _vcs_client(get_vcs_pr_health_pull_requests=PULL_REQUESTS_PAGE)
+            await _call(analytics_tool, "get_pr_health_pull_requests", {**WINDOW, "cause": cause}, client)
+            assert client.get_vcs_pr_health_pull_requests.await_args.kwargs["cause"] == cause
+
+    @pytest.mark.asyncio
+    async def test_default_filter_line_names_the_automation_and_triage_exclusions(self, analytics_tool):
+        page = {key: value for key, value in PULL_REQUESTS_PAGE.items() if key != "bucket"}
+        text = await _call(
+            analytics_tool, "get_pr_health_pull_requests", WINDOW,
+            _vcs_client(get_vcs_pr_health_pull_requests=page),
+        )
+        assert "bucket=all except AUTOMATION" in text
+        assert "triaged=EXCLUDE (dismissed and snoozed pull requests left out)" in text
+
+    @pytest.mark.asyncio
+    async def test_filter_line_and_next_page_keep_the_filters(self, analytics_tool):
+        page = {**PULL_REQUESTS_PAGE, "bucket": None, "totalPages": 3}
+        text = await _call(
+            analytics_tool,
+            "get_pr_health_pull_requests",
+            {**WINDOW, "cause": "WAITING_ON_REVIEW", "repo": "acme/api", "ticket": "BACK-1", "triaged": "ONLY"},
+            _vcs_client(get_vcs_pr_health_pull_requests=page),
+        )
+        assert (
+            "cause=WAITING_ON_REVIEW, author=all, repo=acme/api, ticket=BACK-1, "
+            "triaged=ONLY (only dismissed or snoozed pull requests)"
+        ) in text
+        next_page = next(line for line in text.splitlines() if line.startswith("Next page:"))
+        for arg in ("cause='WAITING_ON_REVIEW'", "repo='acme/api'", "ticket='BACK-1'", "triaged='ONLY'"):
+            assert arg in next_page
+
+    @pytest.mark.asyncio
+    async def test_engineer_query_is_forwarded_as_q(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_engineers=ENGINEERS_PAGE)
+        text = await _call(analytics_tool, "get_pr_health_engineers", {**WINDOW, "query": " ali "}, client)
+        assert client.get_vcs_pr_health_engineers.await_args.kwargs["q"] == "ali"
+        assert "contains 'ali'" in text
+        next_page = next(line for line in text.splitlines() if line.startswith("Next page:"))
+        assert "query='ali'" in next_page
+
+    @pytest.mark.asyncio
+    async def test_engineer_query_is_omitted_when_unset(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_engineers=ENGINEERS_PAGE)
+        await _call(analytics_tool, "get_pr_health_engineers", WINDOW, client)
+        assert "q" not in client.get_vcs_pr_health_engineers.await_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_engineer_query_over_100_characters_is_refused(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("get_pr_health_engineers", {**WINDOW, "query": "a" * 101})
+        assert exc.value.field == "query"
+
+    @pytest.mark.asyncio
+    async def test_input_schema_advertises_the_new_filters(self, analytics_tool):
+        properties = (await analytics_tool._get_input_schema())["properties"]
+        assert "AUTOMATION" in properties["bucket"]["enum"]
+        assert properties["cause"]["enum"] == analytics_tool._PR_HEALTH_CAUSES
+        assert properties["triaged"]["enum"] == ["EXCLUDE", "ONLY"]
+        assert {"repo", "ticket"} <= set(properties)
+
+    @pytest.mark.asyncio
+    async def test_descriptions_explain_the_automation_and_triage_defaults(self, analytics_tool):
+        capabilities = (await analytics_tool.handle_action("get_capabilities", {}))[0].text
+        examples = (await analytics_tool.handle_action("get_examples", {}))[0].text
+        for text in (capabilities, examples):
+            assert "every bucket except AUTOMATION" in text
+            assert "triaged=ONLY" in text or "`triaged=ONLY`" in text
+        drill_down = next(
+            c for c in await analytics_tool._get_tool_capabilities()
+            if "get_pr_health_pull_requests" in c.parameters
+        )
+        assert analytics_tool._PR_HEALTH_LIST_DEFAULTS_NOTE in drill_down.limitations
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", ["{team}@acme.com", "o'neil", "a{0}b'c"])
+    @pytest.mark.parametrize(
+        "action, field, method, payload",
+        [
+            ("get_pr_health_engineers", "query", "get_vcs_pr_health_engineers", ENGINEERS_PAGE),
+            (
+                "get_pr_health_pull_requests", "repo", "get_vcs_pr_health_pull_requests",
+                {**PULL_REQUESTS_PAGE, "totalPages": 3},
+            ),
+            (
+                "get_pr_health_pull_requests", "ticket", "get_vcs_pr_health_pull_requests",
+                {**PULL_REQUESTS_PAGE, "totalPages": 3},
+            ),
+        ],
+    )
+    async def test_next_page_hint_quotes_text_filters_verbatim(
+        self, analytics_tool, action, field, method, payload, value
+    ):
+        """Braces and apostrophes in a caller's text must not break the page or the suggested call."""
+        text = await _call(analytics_tool, action, {**WINDOW, field: value}, _vcs_client(**{method: payload}))
+        assert "Failed" not in text
+        next_page = next(line for line in text.splitlines() if line.startswith("Next page:"))
+        assert f"{field}={value!r}" in next_page
+        assert next_page.endswith(", page=1)")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "given",
+        [
+            {"bucket": "AUTOMATION", "triaged": "ONLY"},
+            {"cause": "AUTOMATION", "triaged": "ONLY"},
+            {"bucket": "AUTOMATION"},
+            {"cause": "automation"},
+        ],
+    )
+    async def test_triage_is_described_as_ignored_for_automation(self, analytics_tool, given):
+        page = {key: value for key, value in PULL_REQUESTS_PAGE.items() if key != "bucket"}
+        text = await _call(
+            analytics_tool, "get_pr_health_pull_requests", {**WINDOW, **given},
+            _vcs_client(get_vcs_pr_health_pull_requests=page),
+        )
+        filter_line = next(line for line in text.splitlines() if line.startswith("**Filter**"))
+        assert "ignored for automation pull requests" in filter_line
+        assert "only dismissed or snoozed" not in filter_line
+        assert "left out" not in filter_line
+
+    def test_registry_closure_declares_the_list_filters(self):
+        import inspect
+
+        from src.revenium_mcp_server.tool_configuration import registry as registry_module
+
+        source = inspect.getsource(
+            registry_module.ToolConfigurationRegistry._register_business_analytics_management
+        )
+        for name in [*LIST_FILTER_KWARGS, "query"]:
+            assert f'"{name}": {name}' in source
+
+
+CAUSES = [
+    {"cause": "AUTOMATION", "prs": 4, "prsAssisted": 4, "pricedPrs": 4, "pricedPrsAssisted": 4},
+    {"cause": "STUCK_DRAFT", "prs": 3, "prsAssisted": 1, "pricedPrs": 2, "pricedPrsAssisted": 1},
+    {"cause": "AUTHOR_GONE", "prs": 0, "prsAssisted": 0, "pricedPrs": 0, "pricedPrsAssisted": 0},
+    {"cause": "APPROVED_NOT_MERGED", "prs": 2, "prsAssisted": 2, "pricedPrs": 2, "pricedPrsAssisted": 2},
+    {"cause": "CHANGES_REQUESTED_QUIET", "prs": 1, "prsAssisted": 0, "pricedPrs": 1, "pricedPrsAssisted": 0},
+    {"cause": "WAITING_ON_REVIEW", "prs": 5, "prsAssisted": 3, "pricedPrs": 5, "pricedPrsAssisted": 3},
+    {"cause": "ON_PACE", "prs": 4, "prsAssisted": 2, "pricedPrs": 4, "pricedPrsAssisted": 2},
+]
+
+
+class TestPrHealthCausesRendering:
+    @pytest.mark.asyncio
+    async def test_one_line_per_cause_with_prs_and_assisted(self, analytics_tool):
+        payload = {**PR_HEALTH_PAYLOAD, "causes": CAUSES}
+        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=payload))
+        assert "**Open PRs by cause**" in text
+        lines = text.splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("**Open PRs by cause**"))
+        assert lines[start + 1:start + 1 + len(CAUSES)] == [
+            "- AUTOMATION: 4 (4 AI-assisted)",
+            "- STUCK_DRAFT: 3 (1 AI-assisted)",
+            "- AUTHOR_GONE: 0 (0 AI-assisted)",
+            "- APPROVED_NOT_MERGED: 2 (2 AI-assisted)",
+            "- CHANGES_REQUESTED_QUIET: 1 (0 AI-assisted)",
+            "- WAITING_ON_REVIEW: 5 (3 AI-assisted)",
+            "- ON_PACE: 4 (2 AI-assisted)",
+        ]
+        assert "get_pr_health_pull_requests(cause=...)" in text
+
+    @pytest.mark.asyncio
+    async def test_missing_assisted_count_reads_n_a(self, analytics_tool):
+        payload = {**PR_HEALTH_PAYLOAD, "causes": [{"cause": "ON_PACE", "prs": 2}]}
+        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=payload))
+        assert "- ON_PACE: 2 (n/a AI-assisted)" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("causes", [None, [], "bogus"])
+    async def test_no_section_without_causes(self, analytics_tool, causes):
+        payload = {**PR_HEALTH_PAYLOAD, "causes": causes}
+        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=payload))
+        assert "Open PRs by cause" not in text
 
 
 # ── BACK-3357: merged pull-request report ───────────────────────────────────
@@ -2725,3 +3142,505 @@ class TestPrHealthRepositories:
         text = await _call(analytics_tool, "get_pr_health_repositories", {"source": "github"}, client)
         assert "PR Health Repositories Failed" in text
         assert "this read takes no window" in text
+
+
+TEAM_MEDIANS_FIGURES = {
+    "window": "14d",
+    "windowStart": "2026-09-24T00:00:00.000Z",
+    "windowEnd": "2026-10-07T23:59:59.000Z",
+    "group": "team",
+    "n": 23,
+    "contextPerCall": 140000,
+    "cacheRebuildRatio": 0.062,
+    "effortAboveDefaultShare": 0.3,
+}
+TEAM_MEDIANS_BELOW_FLOOR = {"window": "14d", "group": "team", "belowFloor": True}
+
+
+class TestAiAssistantTeamMedians:
+    """BACK-3939: anonymous coding-assistant team medians, with belowFloor never read as zeros."""
+
+    @pytest.mark.asyncio
+    async def test_below_floor_says_not_enough_people_and_shows_no_figures(self, analytics_tool):
+        client = _vcs_client(get_ai_assistant_team_medians=TEAM_MEDIANS_BELOW_FLOOR)
+        text = await _call(analytics_tool, "get_ai_assistant_team_medians", {}, client)
+        assert "Not enough people to compare" in text
+        assert "Fewer than 5 people made a Claude Code call" in text
+        assert "This is not a zero" in text
+        assert "Context tokens per call" not in text
+        assert re.search(r":\s*0(\.0+)?\b", text) is None
+
+    @pytest.mark.asyncio
+    async def test_figures_render_coarsened_with_the_population(self, analytics_tool):
+        client = _vcs_client(get_ai_assistant_team_medians=TEAM_MEDIANS_FIGURES)
+        text = await _call(analytics_tool, "get_ai_assistant_team_medians", {}, client)
+        assert "window 14d, group team" in text
+        assert "**Compared across**: 23 people" in text
+        assert "- Context tokens per call: 140,000 (rounded to the nearest 10,000)" in text
+        assert "- Cache rebuild ratio: 0.062 (two significant figures)" in text
+        assert "- Requests sent above the model's default effort: 30% (rounded to the nearest 5%)" in text
+        assert "2026-09-24T00:00:00.000Z to 2026-10-07T23:59:59.000Z" in text
+        assert "Not enough people" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_null_or_unavailable_measure_is_not_a_zero(self, analytics_tool):
+        payload = {
+            **TEAM_MEDIANS_FIGURES,
+            "cacheRebuildRatio": None,
+            "effortAboveDefaultShare": 0.0,
+            "unavailable": ["cacheRebuildRatio", "effortAboveDefaultShare"],
+        }
+        client = _vcs_client(get_ai_assistant_team_medians=payload)
+        text = await _call(analytics_tool, "get_ai_assistant_team_medians", {}, client)
+        assert "- Cache rebuild ratio: unavailable for this window (not a zero)" in text
+        assert "- Requests sent above the model's default effort: unavailable for this window" in text
+        assert "0%" not in text
+
+    @pytest.mark.asyncio
+    async def test_window_is_omitted_by_default(self, analytics_tool):
+        client = _vcs_client(get_ai_assistant_team_medians=TEAM_MEDIANS_BELOW_FLOOR)
+        await _call(analytics_tool, "get_ai_assistant_team_medians", {}, client)
+        client.get_ai_assistant_team_medians.assert_awaited_once_with(window=None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("window, sent", [("14d", "14d"), (" Completed-Weeks:4 ", "completed-weeks:4")])
+    async def test_window_is_forwarded_in_the_platform_spelling(self, analytics_tool, window, sent):
+        client = _vcs_client(get_ai_assistant_team_medians=TEAM_MEDIANS_BELOW_FLOOR)
+        await _call(analytics_tool, "get_ai_assistant_team_medians", {"window": window}, client)
+        client.get_ai_assistant_team_medians.assert_awaited_once_with(window=sent)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("window", ["30d", "completed-weeks:5", "completed-weeks:0", 14])
+    async def test_a_window_the_platform_refuses_is_rejected_before_the_call(self, analytics_tool, window):
+        client = _vcs_client(get_ai_assistant_team_medians=TEAM_MEDIANS_BELOW_FLOOR)
+        with pytest.raises(ToolError) as exc:
+            await _call(analytics_tool, "get_ai_assistant_team_medians", {"window": window}, client)
+        assert exc.value.field == "window"
+        client.get_ai_assistant_team_medians.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_400_on_assistants_is_explained(self, analytics_tool):
+        client = MagicMock()
+        client.get_ai_assistant_team_medians = AsyncMock(
+            side_effect=ReveniumAPIError(
+                "Invalid input",
+                status_code=400,
+                response_data={
+                    "code": "VALIDATION_ERROR",
+                    "errors": [{"path": ["assistants", 0], "message": "Invalid enum value. Expected 'claude-code'"}],
+                },
+            )
+        )
+        text = await _call(analytics_tool, "get_ai_assistant_team_medians", {}, client)
+        assert "- Invalid enum value. Expected 'claude-code'" in text
+        assert "always sends assistants=claude-code" in text
+        assert "a 400 naming assistants means the platform changed that list" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [429, 500, 503])
+    async def test_rate_limit_and_server_errors_are_no_figures(self, analytics_tool, status):
+        client = MagicMock()
+        client.get_ai_assistant_team_medians = AsyncMock(
+            side_effect=ReveniumAPIError("Too many requests", status_code=status)
+        )
+        text = await _call(analytics_tool, "get_ai_assistant_team_medians", {}, client)
+        assert "No figures right now" in text
+        assert "not a zero and not a small team" in text
+
+    @pytest.mark.asyncio
+    async def test_supported_described_and_documented(self, analytics_tool):
+        action = "get_ai_assistant_team_medians"
+        capabilities = (await analytics_tool.handle_action("get_capabilities", {}))[0].text
+        examples = (await analytics_tool.handle_action("get_examples", {}))[0].text
+        assert action in await analytics_tool._get_supported_actions()
+        assert action in analytics_tool.tool_description
+        assert action in capabilities
+        assert action in examples
+
+    def test_registry_closure_declares_the_window(self):
+        import inspect
+
+        from src.revenium_mcp_server.tool_configuration import registry as registry_module
+
+        source = inspect.getsource(
+            registry_module.ToolConfigurationRegistry._register_business_analytics_management
+        )
+        assert '"window": window' in source
+
+
+BREAKDOWN_TOTALS = {
+    "openPrs": 9, "agingPrs": 3, "rottingPrs": 4, "closedUnmerged": 2,
+    "mergedPrs": 11, "pricedRottingPrs": 3, "pricedClosedUnmerged": 1,
+}
+BREAKDOWN_PAYLOAD = {
+    "source": "github", "startDate": "2026-05-17", "endDate": "2026-08-17",
+    "agingDays": 14, "rottingDays": 30, "groupBy": "repo",
+    "page": 0, "size": 1, "totalElements": 2, "totalPages": 2,
+    "sortBy": "rottingPrs", "sortDir": "desc",
+    "rows": [{
+        "key": "acme/api", "label": "Acme/API", "openPrs": 7, "agingPrs": 2, "rottingPrs": 4,
+        "closedUnmerged": 0, "mergedPrs": 0, "pricedRottingPrs": 3, "pricedClosedUnmerged": 0,
+        "noMergesInWindow": True, "mappedEmail": None, "prsInWindow": None,
+        "activeMappedEmail": None, "departmentId": None, "directMembersOnly": None,
+    }],
+    "totals": BREAKDOWN_TOTALS,
+    "departmentAvailable": True, "departmentId": None, "includeDescendants": None, "assistedOnly": False,
+}
+QUEUE_PAYLOAD = {
+    "source": "github", "agingDays": 14, "rottingDays": 30, "authorGoneDays": 60,
+    "sortBy": "inactivity", "sortDir": "desc", "perCause": 1, "triaged": "EXCLUDE",
+    "groups": [
+        {"cause": "AUTOMATION", "totalElements": 0, "pullRequests": []},
+        {"cause": "WAITING_ON_REVIEW", "totalElements": 3, "pullRequests": [PR_ROW]},
+    ],
+    "departmentId": None, "includeDescendants": None, "assistedOnly": False,
+    "repo": None, "author": None, "ticket": None,
+}
+TREND_WEEK = {
+    "weekStart": "2026-09-28", "asOf": "2026-10-05T00:00:00Z", "complete": True, "covered": True,
+    "closedUnmerged": 2, "closedUnmergedAssisted": 1, "atRiskPrs": 5, "atRiskPrsAssisted": 3,
+    "pricedClosedUnmerged": 1, "pricedClosedUnmergedAssisted": 0,
+    "pricedAtRiskPrs": 4, "pricedAtRiskPrsAssisted": 2,
+}
+TREND_PAYLOAD = {
+    "source": "github", "rottingDays": 30, "cutoffDate": None, "pricedSince": "2026-03-01",
+    "historyStart": "2026-01-01", "includeBasis": False, "startDate": None, "endDate": None,
+    "departmentId": None, "includeDescendants": None, "granularity": "week",
+    "weeks": [
+        TREND_WEEK,
+        {**TREND_WEEK, "weekStart": "2026-10-05", "asOf": "2026-10-08T12:00:00Z", "complete": False},
+    ],
+}
+FOLLOW_THROUGH_PAYLOAD = {
+    "source": "github", "since": "2026-06-02", "startDate": None, "endDate": None,
+    "flaggedPrs": 10, "flaggedMerged": 4, "flaggedClosed": 3, "flaggedOpen": 2,
+    "atRiskThen": {"prs": 6, "estimatedDollars": 120.5},
+    "atRiskNow": {"prs": 2, "estimatedDollars": None},
+    "basisThen": 20.08, "basisNow": None,
+    "departmentId": None, "includeDescendants": None, "assistedOnly": False,
+}
+
+
+class TestPrHealthBreakdown:
+    """BACK-3953: the report's figures grouped by repo, engineer or department, paged."""
+
+    @pytest.mark.asyncio
+    async def test_forwards_window_grouping_paging_and_scope(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_breakdown=BREAKDOWN_PAYLOAD)
+        args = {
+            **WINDOW, "group_by": "Repo", "sort_by": "SHARE", "sort_dir": "DESC", "page": 1, "size": 100,
+            "department_id": 7, "include_descendants": True, "assisted_only": True,
+        }
+        await _call(analytics_tool, "get_pr_health_breakdown", args, client)
+        client.get_vcs_pr_health_breakdown.assert_awaited_once_with(
+            "github", "2026-05-17", "2026-08-17", "repo",
+            page=1, size=100, sort_by="share", sort_dir="desc",
+            department_id=7, include_descendants=True, assisted_only=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_renders_rows_totals_priced_counts_and_the_next_page(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_breakdown=BREAKDOWN_PAYLOAD)
+        text = await _call(analytics_tool, "get_pr_health_breakdown", {**WINDOW, "group_by": "repo", "size": 1}, client)
+        assert "**PR Health breakdown by repo — github, 2026-05-17 to 2026-08-17**" in text
+        assert "- open=9 aging=3 at-risk=4 wasted=2 merged=11 | priced at-risk=3 priced wasted=1" in text
+        assert (
+            "- Acme/API | open=7 aging=2 at-risk=4 wasted=0 merged=0 | priced at-risk=3 priced wasted=0 "
+            "| no human merge in the last 90 days"
+        ) in text
+        assert "No dollars are returned" in text
+        assert (
+            "Next page: get_pr_health_breakdown(source='github', start_date='2026-05-17', "
+            "end_date='2026-08-17', group_by='repo', size=1, page=1)"
+        ) in text
+
+    @pytest.mark.asyncio
+    async def test_department_rows_carry_the_id_to_pass_back(self, analytics_tool):
+        payload = {
+            **BREAKDOWN_PAYLOAD, "groupBy": "department",
+            "rows": [{**BREAKDOWN_PAYLOAD["rows"][0], "key": "12", "label": "Platform",
+                      "noMergesInWindow": None, "departmentId": 12, "directMembersOnly": True}],
+        }
+        client = _vcs_client(get_vcs_pr_health_breakdown=payload)
+        text = await _call(analytics_tool, "get_pr_health_breakdown", {**WINDOW, "group_by": "department"}, client)
+        assert "- Platform (department_id=12, direct members only) | open=7" in text
+        assert "Pass a row's department_id" in text
+
+    @pytest.mark.asyncio
+    async def test_no_org_chart_is_said_rather_than_an_empty_table(self, analytics_tool):
+        payload = {**BREAKDOWN_PAYLOAD, "groupBy": "department", "rows": [], "departmentAvailable": False}
+        client = _vcs_client(get_vcs_pr_health_breakdown=payload)
+        text = await _call(analytics_tool, "get_pr_health_breakdown", {**WINDOW, "group_by": "department"}, client)
+        assert "The organization has no org chart, so there are no department rows." in text
+
+    @pytest.mark.asyncio
+    async def test_engineer_rows_show_the_verified_email(self, analytics_tool):
+        payload = {
+            **BREAKDOWN_PAYLOAD, "groupBy": "engineer",
+            "rows": [{**BREAKDOWN_PAYLOAD["rows"][0], "key": "octocat", "label": "octocat",
+                      "noMergesInWindow": None, "mappedEmail": "old@acme.io",
+                      "activeMappedEmail": "octo@acme.io", "prsInWindow": 5}],
+        }
+        client = _vcs_client(get_vcs_pr_health_breakdown=payload)
+        text = await _call(analytics_tool, "get_pr_health_breakdown", {**WINDOW, "group_by": "engineer"}, client)
+        assert "- octocat (octo@acme.io) | open=7" in text
+        assert "| 5 PRs in the window" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra, field",
+        [
+            ({}, "group_by"),
+            ({"group_by": "team"}, "group_by"),
+            ({"group_by": "repo", "sort_by": "age"}, "sort_by"),
+            ({"group_by": "repo", "size": 101}, "size"),
+            ({"group_by": "repo", "end_date": "2027-05-18"}, "end_date"),
+        ],
+    )
+    async def test_rejects_what_the_platform_400s_on(self, analytics_tool, extra, field):
+        client = _vcs_client(get_vcs_pr_health_breakdown=BREAKDOWN_PAYLOAD)
+        with pytest.raises(ToolError) as exc:
+            await _call(analytics_tool, "get_pr_health_breakdown", {**WINDOW, **extra}, client)
+        assert exc.value.field == field
+        client.get_vcs_pr_health_breakdown.assert_not_awaited()
+
+
+class TestPrHealthQueue:
+    """BACK-3953: open pull requests grouped by cause, capped per group, no window."""
+
+    @pytest.mark.asyncio
+    async def test_forwards_the_cap_filters_and_scope_but_no_window(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_queue=QUEUE_PAYLOAD)
+        args = {
+            **WINDOW, "per_cause": "50", "sort_by": "Review", "sort_dir": "asc", "author": "octocat",
+            "repo": "acme/api", "ticket": "BACK-1", "triaged": "only", "department_id": 7, "assisted_only": True,
+        }
+        await _call(analytics_tool, "get_pr_health_queue", args, client)
+        client.get_vcs_pr_health_queue.assert_awaited_once_with(
+            "github", per_cause=50, sort_by="review", sort_dir="asc", author="octocat",
+            repo="acme/api", ticket="BACK-1", triaged="ONLY", department_id=7, assisted_only=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_unset_filters_are_not_sent(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_queue=QUEUE_PAYLOAD)
+        await _call(analytics_tool, "get_pr_health_queue", {"source": "github"}, client)
+        client.get_vcs_pr_health_queue.assert_awaited_once_with("github")
+
+    @pytest.mark.asyncio
+    async def test_every_group_states_its_whole_count_and_how_to_page_it(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_queue=QUEUE_PAYLOAD)
+        text = await _call(analytics_tool, "get_pr_health_queue", {"source": "github"}, client)
+        assert "**AUTOMATION** — 0 open pull request(s)\n- None." in text
+        assert "**WAITING_ON_REVIEW** — 3 open pull request(s)" in text
+        assert "- acme/api#412 by" in text
+        assert (
+            "Showing 1 of 3; list every one with get_pr_health_pull_requests(source='github', "
+            "cause='WAITING_ON_REVIEW'), adding any start_date and end_date"
+        ) in text
+        assert "triaged=EXCLUDE (dismissed and snoozed pull requests left out" in text
+        assert "An author counts as gone after 60 days" in text
+
+    @pytest.mark.asyncio
+    async def test_the_continuation_hint_carries_every_filter_the_queue_was_read_with(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_queue={**QUEUE_PAYLOAD, "triaged": "ONLY"})
+        args = {
+            "source": "github", "triaged": "only", "repo": "acme/api", "author": "octocat",
+            "department_id": 7, "include_descendants": True, "assisted_only": True, "sort_by": "review",
+        }
+        text = await _call(analytics_tool, "get_pr_health_queue", args, client)
+        assert (
+            "list every one with get_pr_health_pull_requests(source='github', cause='WAITING_ON_REVIEW', "
+            "triaged='ONLY', author='octocat', repo='acme/api', department_id=7, include_descendants=True, "
+            "assisted_only=True), adding any start_date and end_date"
+        ) in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra, field",
+        [({"per_cause": 0}, "per_cause"), ({"per_cause": 51}, "per_cause"), ({"sort_by": "share"}, "sort_by"),
+         ({"triaged": "ALL"}, "triaged"), ({"ticket": "X" * 81}, "ticket")],
+    )
+    async def test_rejects_what_the_platform_400s_on(self, analytics_tool, extra, field):
+        client = _vcs_client(get_vcs_pr_health_queue=QUEUE_PAYLOAD)
+        with pytest.raises(ToolError) as exc:
+            await _call(analytics_tool, "get_pr_health_queue", {"source": "github", **extra}, client)
+        assert exc.value.field == field
+        client.get_vcs_pr_health_queue.assert_not_awaited()
+
+
+class TestPrHealthTrend:
+    """BACK-3953: the trend defaults to 26 weeks and is bounded at 366 days (92 by day)."""
+
+    @pytest.mark.asyncio
+    async def test_without_a_window_nothing_but_the_source_is_sent(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_trend=TREND_PAYLOAD)
+        text = await _call(analytics_tool, "get_pr_health_trend", {"source": "github"}, client)
+        client.get_vcs_pr_health_trend.assert_awaited_once_with(
+            "github", start_date=None, end_date=None, granularity=None
+        )
+        assert "the 26 weeks ending with the current one, by week" in text
+
+    @pytest.mark.asyncio
+    async def test_window_granularity_and_department_are_forwarded(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_trend=TREND_PAYLOAD)
+        args = {"source": "github", "start_date": "2026-07-01", "end_date": "2026-09-30",
+                "granularity": "DAY", "department_id": 3}
+        await _call(analytics_tool, "get_pr_health_trend", args, client)
+        client.get_vcs_pr_health_trend.assert_awaited_once_with(
+            "github", start_date="2026-07-01", end_date="2026-09-30", granularity="day", department_id=3
+        )
+
+    @pytest.mark.asyncio
+    async def test_buckets_render_counts_assisted_and_priced_parts(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_trend=TREND_PAYLOAD)
+        text = await _call(analytics_tool, "get_pr_health_trend", {"source": "github"}, client)
+        assert (
+            "- 2026-09-28 (as of 2026-10-05T00:00:00Z) | closed unmerged=2 (1 AI-assisted) | "
+            "at risk=5 (3 AI-assisted) | priced: closed unmerged=1 at risk=4"
+        ) in text
+        assert "- 2026-10-05 (as of 2026-10-08T12:00:00Z) [so far] |" in text
+        assert "**Priced since**: 2026-03-01" in text
+        assert "may read high" in text
+        assert "No dollars are returned" in text
+
+    @pytest.mark.asyncio
+    async def test_buckets_before_the_synced_history_are_marked(self, analytics_tool):
+        payload = {**TREND_PAYLOAD, "historyStart": None, "weeks": [{**TREND_WEEK, "covered": False}]}
+        client = _vcs_client(get_vcs_pr_health_trend=payload)
+        text = await _call(analytics_tool, "get_pr_health_trend", {"source": "github"}, client)
+        assert "[before the synced history, not covered]" in text
+        assert "unknown, so every bucket is marked not covered" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "args, field",
+        [
+            ({"start_date": "2026-07-01"}, "end_date"),
+            ({"end_date": "2026-07-01"}, "start_date"),
+            ({"start_date": "2025-01-01", "end_date": "2026-01-02"}, "end_date"),
+            ({"granularity": "day"}, "granularity"),
+            ({"start_date": "2026-07-01", "end_date": "2026-10-01", "granularity": "day"}, "end_date"),
+            ({"start_date": "2026-07-01", "end_date": "2026-08-01", "granularity": "quarter"}, "granularity"),
+            ({"assisted_only": True}, "assisted_only"),
+        ],
+    )
+    async def test_rejects_what_the_platform_400s_on_or_ignores(self, analytics_tool, args, field):
+        client = _vcs_client(get_vcs_pr_health_trend=TREND_PAYLOAD)
+        with pytest.raises(ToolError) as exc:
+            await _call(analytics_tool, "get_pr_health_trend", {"source": "github", **args}, client)
+        assert exc.value.field == field
+        client.get_vcs_pr_health_trend.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_widest_windows_are_accepted(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_trend=TREND_PAYLOAD)
+        await _call(
+            analytics_tool, "get_pr_health_trend",
+            {"source": "github", "start_date": "2025-01-01", "end_date": "2026-01-01"}, client,
+        )
+        await _call(
+            analytics_tool, "get_pr_health_trend",
+            {"source": "github", "start_date": "2026-07-01", "end_date": "2026-09-30", "granularity": "day"},
+            client,
+        )
+        assert client.get_vcs_pr_health_trend.await_count == 2
+
+
+class TestPrHealthFollowThrough:
+    """BACK-3953: whether the pull requests flagged as rotting got fixed."""
+
+    @pytest.mark.asyncio
+    async def test_forwards_the_optional_window_and_scope(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_follow_through=FOLLOW_THROUGH_PAYLOAD)
+        await _call(analytics_tool, "get_pr_health_follow_through", {**WINDOW, "assisted_only": True}, client)
+        client.get_vcs_pr_health_follow_through.assert_awaited_once_with(
+            "github", start_date="2026-05-17", end_date="2026-08-17", assisted_only=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_renders_the_outcomes_and_never_a_zero_for_a_missing_estimate(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_follow_through=FOLLOW_THROUGH_PAYLOAD)
+        text = await _call(analytics_tool, "get_pr_health_follow_through", {"source": "github"}, client)
+        assert "every flag ever taken" in text
+        assert "**Flagged as rotting** (first flag: 2026-06-02)" in text
+        assert "  - merged after the flag: 4" in text
+        assert "  - closed without merging after the flag: 3" in text
+        assert "  - still open, not dismissed or snoozed: 2" in text
+        assert "flagged in the first 7 days from the first flag): 6 pull requests, 120.5 estimated" in text
+        assert "- Now (today's rotting set): 2 pull requests, n/a estimated" in text
+        assert "last 90 days: n/a; the 90 days ending on the first flag: 20.08" in text
+
+    @pytest.mark.asyncio
+    async def test_nothing_flagged_is_said(self, analytics_tool):
+        payload = {**FOLLOW_THROUGH_PAYLOAD, "since": None}
+        client = _vcs_client(get_vcs_pr_health_follow_through=payload)
+        text = await _call(analytics_tool, "get_pr_health_follow_through", {"source": "github"}, client)
+        assert "no pull request has been flagged in this scope yet" in text
+
+    @pytest.mark.asyncio
+    async def test_a_window_of_366_days_or_more_is_rejected(self, analytics_tool):
+        client = _vcs_client(get_vcs_pr_health_follow_through=FOLLOW_THROUGH_PAYLOAD)
+        with pytest.raises(ToolError) as exc:
+            await _call(
+                analytics_tool, "get_pr_health_follow_through",
+                {"source": "github", "start_date": "2024-01-01", "end_date": "2025-01-01"}, client,
+            )
+        assert exc.value.field == "end_date"
+
+
+class TestPrHealthTriageDecision:
+    """BACK-3953: the triage writes stay out, recorded as decisions rather than left as drift."""
+
+    TRIAGE_PATHS = [
+        ("/v2/api/billing/users/vcs-pr-health/triage/dismiss", "POST"),
+        ("/v2/api/billing/users/vcs-pr-health/triage/snooze", "POST"),
+        ("/v2/api/billing/users/vcs-pr-health/triage", "DELETE"),
+    ]
+
+    def test_each_write_is_a_decision_exclusion_pointing_at_the_block(self):
+        import yaml
+
+        declared = yaml.safe_load(
+            (REPO_ROOT / ".claude" / "commands" / "mcp-api-exclusions.yaml").read_text(encoding="utf-8")
+        )["decision_exclusions"]
+        pinned = {(entry["path"], entry.get("method")): entry for entry in declared}
+        for path, method in self.TRIAGE_PATHS:
+            entry = pinned[(path, method)]
+            assert entry["ticket"] == "BACK-3953"
+            assert 'Decision (BACK-3953)' in entry["anchor"]
+
+    def test_the_client_never_calls_the_triage_paths(self):
+        source = (REPO_ROOT / "src" / "revenium_mcp_server" / "client.py").read_text(encoding="utf-8")
+        assert "vcs-pr-health/triage" not in source
+        assert "Decision (BACK-3953)" in Path(business_analytics_module.__file__).read_text(encoding="utf-8")
+
+
+class TestPrHealthTrendsAreDiscoverable:
+    ACTIONS = [
+        "get_pr_health_breakdown",
+        "get_pr_health_queue",
+        "get_pr_health_trend",
+        "get_pr_health_follow_through",
+    ]
+
+    @pytest.mark.asyncio
+    async def test_supported_described_and_documented(self, analytics_tool):
+        supported = await analytics_tool._get_supported_actions()
+        capabilities = (await analytics_tool.handle_action("get_capabilities", {}))[0].text
+        examples = (await analytics_tool.handle_action("get_examples", {}))[0].text
+        for action in self.ACTIONS:
+            assert action in supported
+            assert action in analytics_tool.tool_description
+            assert action in capabilities
+            assert action in examples
+
+    def test_registry_closure_declares_per_cause(self):
+        import inspect
+
+        from src.revenium_mcp_server.tool_configuration import registry as registry_module
+
+        source = inspect.getsource(
+            registry_module.ToolConfigurationRegistry._register_business_analytics_management
+        )
+        assert '"per_cause": per_cause' in source

@@ -73,8 +73,25 @@ def test_resolve_analytics_request_uses_bearer_for_forced_endpoint(flag_off):
     assert path == "/api/v2/analytics/revenue-per-customer"
     assert call_kwargs.get("use_bearer") is True
     assert "startDate" in params and "endDate" in params
-    assert "teamId" not in params
+    assert params["teamId"] == "team-123"
     assert "period" not in params
+
+
+def test_resolve_analytics_request_omits_team_id_on_the_new_path_when_none_resolved(flag_off):
+    _path, params, _call_kwargs = resolve_analytics_request(
+        "revenue_metric_by_organization", team_id="", period="THIRTY_DAYS"
+    )
+    assert "teamId" not in params
+
+
+def test_resolve_analytics_request_new_path_team_cannot_be_replaced_by_extra_params(flag_off):
+    _path, params, _call_kwargs = resolve_analytics_request(
+        "revenue_metric_by_organization",
+        team_id="team-123",
+        period="THIRTY_DAYS",
+        extra_new_params={"teamId": "someone-elses-team"},
+    )
+    assert params["teamId"] == "team-123"
 
 
 def test_resolve_analytics_request_uses_legacy_for_non_forced_when_flag_off(flag_off):

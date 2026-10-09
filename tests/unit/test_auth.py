@@ -160,7 +160,7 @@ class TestConfigManager:
 
         assert config.api_key == "test_api_key_12345"
         assert config.team_id == "test_team_id_456"
-        assert config.base_url == "https://api.test.revenium.ai"
+        assert config.base_url == "https://api.revenium.invalid"
         assert config.timeout == 30.0
 
         # Verify the loaded config produces valid auth headers for API use
@@ -259,7 +259,7 @@ class TestUtilityFunctions:
         assert config.api_key == "test_api_key_12345"
         assert config.team_id == "test_team_id_456"
         # Confirm the base_url was read from the environment (not just default)
-        assert config.base_url == "https://api.test.revenium.ai"
+        assert config.base_url == "https://api.revenium.invalid"
         # Confirm the config is operationally usable: headers include the correct api key
         headers = config.get_auth_headers()
         assert headers["x-api-key"] == config.api_key

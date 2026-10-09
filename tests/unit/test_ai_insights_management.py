@@ -971,3 +971,173 @@ async def test_get_examples_documents_the_department_scoped_run():
     text = result[0].text if hasattr(result[0], "text") else str(result[0])
     assert "filter_department_id" in text
     assert "list_departments" in text
+
+
+IGNORED_COST_DETECTOR_ARGUMENT = "filter_include_coding_assistants_for_cost_detectors"
+IGNORED_COST_DETECTOR_FIELD = "filterIncludeCodingAssistantsForCostDetectors"
+
+
+def _recording_client(monkeypatch, captured: dict):
+    from unittest.mock import MagicMock
+
+    from src.revenium_mcp_server.auth import AuthConfig
+    from src.revenium_mcp_server.client import ReveniumClient
+
+    # Config auto-discovery (an unset app URL, or the first import of the
+    # onboarding defaults) calls the platform with whatever key the
+    # developer's shell exports; without a key it makes no call.
+    monkeypatch.setenv("REVENIUM_APP_BASE_URL", "https://example.invalid")
+    monkeypatch.delenv("REVENIUM_API_KEY", raising=False)
+    client = ReveniumClient(auth_config=AuthConfig(
+        api_key="hak_test_abcd1234",
+        team_id="team_1",
+        base_url="https://example.invalid",
+    ))
+
+    async def fake_request(method, url, params=None, json=None, headers=None):
+        captured["body"] = json
+        resp = MagicMock()
+        resp.status_code = 202
+        resp.content = b'{"runId":"r1","status":"running"}'
+        resp.json = MagicMock(return_value={"runId": "r1", "status": "running"})
+        resp.is_success = True
+        resp.headers = {"content-type": "application/json"}
+        return resp
+
+    monkeypatch.setattr(client.client, "request", fake_request)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_trigger_run_never_sends_the_ignored_cost_detector_filter(monkeypatch):
+    """BACK-3957: the platform ignores the cost-detector switch, so the run body omits it."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    captured: dict = {}
+    tool = AIInsightsManagement()
+    client = _recording_client(monkeypatch, captured)
+    with patch.object(tool, "get_client", new=AsyncMock(return_value=client)):
+        await tool.handle_action("trigger_run", {
+            "period_start": "2026-01-01T00:00:00Z",
+            "period_end":   "2026-01-31T23:59:59Z",
+        })
+
+    assert IGNORED_COST_DETECTOR_FIELD not in captured["body"]
+    assert captured["body"]["filterIncludeCodingAssistants"] is True
+
+
+@pytest.mark.asyncio
+async def test_trigger_run_still_forwards_the_honoured_coding_assistant_filter():
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    mock = AsyncMock(return_value={"runId": "r1", "status": "running"})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.trigger_recommendation_run",
+        new=mock,
+    ):
+        await tool.handle_action("trigger_run", {
+            "period_start": "2026-01-01T00:00:00Z",
+            "period_end":   "2026-01-31T23:59:59Z",
+            "filter_include_coding_assistants": False,
+        })
+
+    call_kwargs = mock.await_args.kwargs
+    assert call_kwargs["filter_include_coding_assistants"] is False
+    assert IGNORED_COST_DETECTOR_ARGUMENT not in call_kwargs
+
+
+@pytest.mark.asyncio
+async def test_input_schema_does_not_offer_the_ignored_cost_detector_filter():
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    props = (await AIInsightsManagement()._get_input_schema())["properties"]
+    assert IGNORED_COST_DETECTOR_ARGUMENT not in props
+    assert props["filter_include_coding_assistants"]["type"] == "boolean"
+
+
+async def _registered_insights_server():
+    from fastmcp import FastMCP
+
+    from src.revenium_mcp_server.tool_configuration.config import ToolConfig
+    from src.revenium_mcp_server.tool_configuration.registry import (
+        ToolConfigurationRegistry,
+    )
+
+    mcp = FastMCP("back-3957")
+    registry = ToolConfigurationRegistry(
+        tool_config=ToolConfig.create_for_testing(profile="business")
+    )
+    await registry._register_manage_ai_insights(mcp)
+    return mcp
+
+
+_RUN_PERIOD = {
+    "period_start": "2026-01-01T00:00:00Z",
+    "period_end":   "2026-01-31T23:59:59Z",
+}
+
+
+@pytest.mark.asyncio
+async def test_registered_tool_does_not_accept_the_ignored_cost_detector_filter():
+    """FastMCP validates calls against the closure signature, not the input schema."""
+    mcp = await _registered_insights_server()
+    tools = {tool.name: tool for tool in await mcp.list_tools(run_middleware=False)}
+    properties = tools["manage_ai_insights"].parameters["properties"]
+
+    assert IGNORED_COST_DETECTOR_ARGUMENT not in properties
+    assert "filter_include_coding_assistants" in properties
+
+
+@pytest.mark.asyncio
+async def test_top_level_cost_detector_filter_is_rejected_before_any_run():
+    from fastmcp import Client
+    from fastmcp.exceptions import ToolError as FastMCPToolError
+
+    mcp = await _registered_insights_server()
+    mock = AsyncMock(return_value={"runId": "r1", "status": "running"})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.trigger_recommendation_run",
+        new=mock,
+    ):
+        async with Client(mcp) as client:
+            with pytest.raises(FastMCPToolError, match=IGNORED_COST_DETECTOR_ARGUMENT):
+                await client.call_tool("manage_ai_insights", {
+                    "action": "trigger_run",
+                    **_RUN_PERIOD,
+                    IGNORED_COST_DETECTOR_ARGUMENT: True,
+                })
+
+    mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cost_detector_filter_inside_params_is_dropped_and_the_run_starts(monkeypatch):
+    """The params bag accepts any name, so the key is ignored rather than rejected."""
+    from fastmcp import Client
+
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    captured: dict = {}
+    recording_client = _recording_client(monkeypatch, captured)
+    mcp = await _registered_insights_server()
+    with patch.object(
+        AIInsightsManagement, "get_client", new=AsyncMock(return_value=recording_client)
+    ):
+        async with Client(mcp) as client:
+            result = await client.call_tool("manage_ai_insights", {
+                "action": "trigger_run",
+                "params": {**_RUN_PERIOD, IGNORED_COST_DETECTOR_ARGUMENT: True},
+            })
+
+    assert not result.is_error
+    assert captured["body"]["periodStart"] == _RUN_PERIOD["period_start"]
+    assert IGNORED_COST_DETECTOR_FIELD not in captured["body"]

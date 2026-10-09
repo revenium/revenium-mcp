@@ -4,6 +4,22 @@ This module contains all large text blocks extracted from the main tool
 to comply with function length requirements.
 """
 
+# The errorCode enum on GET /v2/api/tenants/{id}/ingestion-failures, pinned
+# to the committed snapshot by test_revenium_log_analysis.py. Dev answered a
+# value outside it with 200 and an empty page (2026-10-08), so a misspelt code
+# would read as a tenant with no rejections of that kind.
+INGESTION_FAILURE_ERROR_CODES: tuple[str, ...] = (
+    "PRODUCT_NOT_FOUND",
+    "PRODUCT_NAME_ID_MISMATCH",
+    "SUBSCRIBER_NOT_FOUND",
+    "SUBSCRIBER_NAME_ID_MISMATCH",
+    "CREDENTIAL_NOT_FOUND",
+    "CONSUMING_ORG_NOT_FOUND",
+    "CONSUMING_ORG_NAME_ID_MISMATCH",
+    "SUBSCRIPTION_RELATIONSHIP_NOT_FOUND",
+    "REQUIRED_REFERENCE_MISSING",
+)
+
 # Capabilities text template
 CAPABILITIES_TEXT = """
 # Revenium Log Analysis Capabilities
@@ -33,8 +49,10 @@ CAPABILITIES_TEXT = """
 
 5a. **get_ingestion_failures** - ✅ **AVAILABLE**
    - List AI transactions rejected by strict ingestion mode (newest-first)
-   - Structured error details plus the prompt-redacted original payload
-   - Optional error_code filter, page/size pagination
+   - Each error carries its code, message, resolution and, when the platform names
+     them, the offending field and value, plus the prompt-redacted original payload
+   - Optional error_code filter, one of: """ + ", ".join(INGESTION_FAILURE_ERROR_CODES) + """
+   - page/size pagination
 
 5b. **set_strict_ingestion_mode** - ✅ **AVAILABLE**
    - Toggle the tenant's strict ingestion mode (requires confirm=true)
@@ -50,10 +68,12 @@ CAPABILITIES_TEXT = """
      are the only places it is reported
 
 5d. **set_usage_billing** - ✅ **AVAILABLE**
-   - Show or hide the tenant's billing screens (requires confirm=true)
-   - PRESENTATION ONLY: invoices, payment methods, plan and subscription screens appear
-     or disappear, while metering, rating and invoicing keep running and no stored
-     amount changes
+   - Switch usage-based billing on or off for the tenant (requires confirm=true)
+   - OFF hides the billing screens (invoices, payment methods, plan and subscription
+     screens) AND stops rating the tenant's usage: AI product usage, platform usage and
+     /v2/events produce no usage line items. AI metrics are still recorded
+   - Usage that arrives while it is off is NEVER rated later; turning it back on does
+     not recover it
    - Requires a platform admin or the tenant's own tenant admin: an organization admin
      key passes the other tenant toggles but is refused (403) on this one
    - The platform default is on; read the current value with get_usage_billing
@@ -152,7 +172,7 @@ EXAMPLES_TEXT = """
   "action": "get_ingestion_failures",
   "page": 0,
   "size": 20,
-  "error_code": "UNKNOWN_PRODUCT"
+  "error_code": "PRODUCT_NOT_FOUND"
 }
 ```
 **Purpose**: List strict-ingestion rejections with error details and the redacted payload (error_code optional).
@@ -185,7 +205,7 @@ EXAMPLES_TEXT = """
   "confirm": true
 }
 ```
-**Purpose**: Show or hide the tenant's billing screens - invoices, payment methods, plan and subscription views. The flag is PRESENTATION ONLY: metering, rating and invoicing keep running either way and no stored amount changes, so hiding the screens withholds them rather than stopping any billing. It applies to every user of the tenant at once, so without confirm=true the call returns a consequences preview and changes nothing. Only a platform admin or the tenant's own tenant admin may apply it - an organization admin key passes the other tenant toggles but is refused on this one. The platform default is on, and the response reports the state the server returned.
+**Purpose**: Switch usage-based billing on or off for the tenant. Off hides the billing screens (invoices, payment methods, plan and subscription views) and stops rating the tenant's usage: AI product usage, platform usage and /v2/events produce no usage line items, while AI metrics are still recorded. Usage that arrives while it is off is never rated, including after it is turned back on, so the off period leaves a permanent gap in the tenant's usage billing. Subscription charges and tool-event line items are unaffected. It applies to every user of the tenant at once, so without confirm=true the call returns a consequences preview and changes nothing. Only a platform admin or the tenant's own tenant admin may apply it - an organization admin key passes the other tenant toggles but is refused on this one. The platform default is on, and the response reports the state the server returned.
 
 ### get_usage_billing
 ```json
@@ -193,7 +213,7 @@ EXAMPLES_TEXT = """
   "action": "get_usage_billing"
 }
 ```
-**Purpose**: Read whether the tenant's billing screens are shown, without changing anything. The value comes from the tenant stub of GET /v2/api/users/me, which describes the key's own tenant; the response says so when that differs from the configured tenant the toggles write to.
+**Purpose**: Read whether usage-based billing is on for the tenant, without changing anything. The value comes from the tenant stub of GET /v2/api/users/me, which describes the key's own tenant; the response says so when that differs from the configured tenant the toggles write to.
 
 ### get_recent_logs
 ```json
@@ -316,8 +336,8 @@ UNSUPPORTED_ACTION_TEMPLATE = """
 - get_ingestion_failures (strict-ingestion rejections)
 - set_strict_ingestion_mode (guarded strict-mode toggle, optional allow_ticket_jobs opt-in)
 - set_attribution_detail_text (free-text attribution detail toggle)
-- set_usage_billing (guarded billing-screen visibility toggle, presentation only)
-- get_usage_billing (read the billing-screen visibility flag without a write)
+- set_usage_billing (guarded usage-billing toggle: billing screens and usage rating)
+- get_usage_billing (read the usage-billing flag without a write)
 
 Use `get_capabilities()` for current status.
 """
