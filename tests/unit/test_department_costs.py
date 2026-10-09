@@ -246,7 +246,7 @@ class TestPagePastTheLast:
         )
         assert "The report has 23 department groups on 2 pages" in text
         assert "the page requested (page=5) is past the last" in text
-        assert "Pass page=1 for the last page" in text
+        assert "Pass page=1 size=20 for the last page, or page=0 size=20 for the first." in text
         assert "No department groups returned" not in text
 
     @pytest.mark.asyncio
@@ -328,7 +328,7 @@ class TestGroups:
         )
         assert "**2. Platform**" in text
         assert "Page 2 of 3, 3 groups in all." in text
-        assert "Pass page=2 for the next page." in text
+        assert "Pass page=2 size=1 for the next page." in text
 
 
 class TestDiscovery:
@@ -355,6 +355,10 @@ class TestDiscovery:
 
 
 class TestSeriesDecision:
+    @pytest.mark.skipif(
+        not (REPO_ROOT / ".claude" / "commands" / "mcp-api-exclusions.yaml").exists(),
+        reason="mcp-api-exclusions.yaml is internal-only and absent from the public mirror",
+    )
     def test_the_series_route_is_pinned_to_the_decision_block(self):
         declared = yaml.safe_load(
             (REPO_ROOT / ".claude" / "commands" / "mcp-api-exclusions.yaml").read_text(encoding="utf-8")

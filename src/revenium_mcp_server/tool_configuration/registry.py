@@ -459,6 +459,8 @@ class ToolConfigurationRegistry:
             anomaly_data: Optional[Union[dict, str]] = None,
             include_trend: Optional[Union[bool, str]] = None,
             now: Optional[str] = None,
+            group_limit: Optional[Union[int, str]] = None,
+            provider: Optional[str] = None,
             # P2 Enhancement: Direct update parameters for flexible UX
             description: Optional[str] = None,
             tags: Optional[List[str]] = None,
@@ -498,6 +500,8 @@ class ToolConfigurationRegistry:
                 "anomaly_data": anomaly_data,
                 "include_trend": include_trend,
                 "now": now,
+                "group_limit": group_limit,
+                "provider": provider,
                 # P2 Enhancement: Direct update parameters
                 "description": description,
                 "tags": tags,

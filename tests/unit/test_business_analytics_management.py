@@ -3598,6 +3598,10 @@ class TestPrHealthTriageDecision:
         ("/v2/api/billing/users/vcs-pr-health/triage", "DELETE"),
     ]
 
+    @pytest.mark.skipif(
+        not (REPO_ROOT / ".claude" / "commands" / "mcp-api-exclusions.yaml").exists(),
+        reason="mcp-api-exclusions.yaml is internal-only and absent from the public mirror",
+    )
     def test_each_write_is_a_decision_exclusion_pointing_at_the_block(self):
         import yaml
 

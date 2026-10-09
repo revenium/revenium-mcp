@@ -3271,3 +3271,41 @@ class TestManageMeteringPromptContextForwarding:
         assert captured_args["speed"] == "fast"
         for key in ("prompt_id", "prompt_length", "query_source", "subagent_type"):
             assert key not in captured_args
+
+
+class TestManageAlertsProviderAndGroupLimit:
+    """provider (search_provider_api_keys) and group_limit (get_budget_portfolio) reach
+    the handler at the top level, as the advertised schema promises, not only inside params."""
+
+    @pytest.mark.asyncio
+    async def test_registered_tool_declares_both(self):
+        from fastmcp import FastMCP
+
+        mcp = FastMCP("alerts-top-level")
+        await _make_registry()._register_manage_alerts(mcp)
+        tools = {tool.name: tool for tool in await mcp.list_tools(run_middleware=False)}
+        properties = tools["manage_alerts"].parameters["properties"]
+        assert "provider" in properties
+        assert "group_limit" in properties
+
+    @pytest.mark.asyncio
+    async def test_both_are_forwarded_and_omitted_when_absent(self):
+        registered_fn = await _get_registered_closure(_make_registry(), "_register_manage_alerts")
+        calls: list = []
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            calls.append(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="search_provider_api_keys", provider="anthropic")
+            await registered_fn(action="get_budget_portfolio", group_limit=10)
+            await registered_fn(action="list")
+
+        assert calls[0]["provider"] == "anthropic"
+        assert calls[1]["group_limit"] == 10
+        assert "provider" not in calls[2] and "group_limit" not in calls[2]
+

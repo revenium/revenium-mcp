@@ -107,14 +107,15 @@ class DepartmentCostsFormatter:
     ) -> str:
         total_pages = max(page.total_pages or 1, 1)
         requested = "" if page.page_number is None else f" (page={page.page_number})"
+        size = self._size_hint(page)
         lines = self._header(page, query)
         lines += [
             "## Page past the last one",
             "",
             f"The report has {total_elements} department groups on {total_pages} "
             f"page{'s' if total_pages != 1 else ''}, and the page requested{requested} "
-            f"is past the last. Pass page={total_pages - 1} for the last page, or "
-            "page=0 for the first.",
+            f"is past the last. Pass page={total_pages - 1}{size} for the last page, or "
+            f"page=0{size} for the first.",
         ]
         return "\n".join(lines)
 
@@ -227,8 +228,13 @@ class DepartmentCostsFormatter:
             "groups in all."
         ]
         if page.page_number + 1 < page.total_pages:
-            lines.append(f"Pass page={page.page_number + 1} for the next page.")
+            size = DepartmentCostsFormatter._size_hint(page)
+            lines.append(f"Pass page={page.page_number + 1}{size} for the next page.")
         return lines
+
+    @staticmethod
+    def _size_hint(page: DepartmentCostsPage) -> str:
+        return f" size={page.page_size}" if page.page_size else ""
 
     @staticmethod
     def _platform_setup_lines(page: DepartmentCostsPage) -> List[str]:

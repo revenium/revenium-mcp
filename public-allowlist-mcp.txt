@@ -40,4 +40,7 @@ public-allowlist-mcp.txt
 !scripts/derive_consumed_operations.py
 !scripts/generate_openapi_models.py
 !tests/unit/test_openapi_contract.py
+# These two import the excluded scripts above, so they cannot run in the mirror.
+!tests/unit/test_fetch_openapi_specs.py
+!tests/unit/test_derive_consumed_operations.py
 uv.lock
