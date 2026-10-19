@@ -19,6 +19,7 @@ schema — not to forbid an honest new parameter.
 
 import importlib
 import json
+import re
 
 import pytest
 from fastmcp import FastMCP
@@ -59,6 +60,12 @@ PER_TOOL_CHARACTER_BUDGETS = {
 }
 
 _NULL_BRANCH = {"type": "null"}
+
+
+#: Names a thin tool lists that another open pull request removes or declares.
+#: manage_tools: BACK-4624 (PR 444) declares ``provider`` and drops ``agent``
+#: from the help. The exemption lapses once ``provider`` is on the closure.
+_AWAITING_OTHER_PRS = {"manage_tools": {"agent", "provider"}}
 
 
 _REGISTERED_TOOLS = {}
@@ -223,3 +230,145 @@ class TestThinToolsDocumentWhatTheyHide:
             f"{tool_name} documents these parameters without a type: {untyped}. "
             "Give them a type in that tool class's _get_input_schema()."
         )
+
+    @staticmethod
+    async def _listed_parameters(tool_name):
+        """The names under get_capabilities' "Pass any of these as a top-level argument"."""
+        text = await TestThinToolsDocumentWhatTheyHide._capabilities_text(tool_name)
+        reference = text.split("## Parameters", 1)[-1]
+        return re.findall(r"^- `([^`]+)`", reference, re.MULTILINE)
+
+    @pytest.mark.parametrize("tool_name", sorted(THIN_SCHEMA_TOOLS))
+    async def test_every_listed_parameter_is_accepted_at_the_top_level(
+        self, registered_tools, tool_name
+    ):
+        """The reference promises top-level use, and FastMCP refuses any name the
+        closure signature does not declare, so every listed name must be declared."""
+        declared = set(
+            ParsedFunction.from_function(registered_tools[tool_name].fn).input_schema[
+                "properties"
+            ]
+        )
+        listed = await self._listed_parameters(tool_name)
+        awaiting = _AWAITING_OTHER_PRS.get(tool_name, set())
+        if "provider" in declared:
+            awaiting = set()
+
+        refused = sorted(set(listed) - declared - awaiting)
+
+        assert refused == [], (
+            f"{tool_name}'s get_capabilities lists these as top-level arguments, but "
+            f"its registered closure refuses them: {refused}. Declare them in "
+            "tool_configuration/registry.py or drop them from _get_input_schema()."
+        )
+        if tool_name == "manage_metering":
+            from src.revenium_mcp_server.tools_decomposed.metering_management import (
+                _COMPLETIONS_FILTER_PARAM_MAP,
+            )
+
+            filters = set(_COMPLETIONS_FILTER_PARAM_MAP)
+            assert sorted(filters - set(listed)) == []
+            assert sorted(filters - declared) == []
+
+
+
+#: The registration closure, a call action and a value for each option that
+#: is declared so existing callers are not refused but that nothing reads.
+_IGNORED_ARGUMENT_CALLS = [
+    ("_register_system_diagnostics", "system_diagnostics", "environment_variables", "include_sensitive", True),
+    ("_register_system_diagnostics", "system_diagnostics", "environment_variables", "format_output", "json"),
+    ("_register_system_diagnostics", "system_diagnostics", "system_health", "include_recommendations", True),
+    ("_register_system_diagnostics", "system_diagnostics", "debug", "show_detailed_analysis", True),
+    ("_register_system_setup", "system_setup", "show_welcome", "show_environment", True),
+    ("_register_system_setup", "system_setup", "show_welcome", "include_recommendations", True),
+    ("_register_system_setup", "system_setup", "show_welcome", "include_setup_guidance", True),
+    ("_register_system_setup", "system_setup", "setup_checklist", "suggest_smart_defaults", True),
+    ("_register_system_setup", "system_setup", "update_email", "validate_format", True),
+    ("_register_slack_management", "slack_management", "guided_setup", "skip_prompts", True),
+]
+
+_IGNORED_ARGUMENT_TOOL_CLASSES = {
+    "system_diagnostics": ("system_diagnostics", "SystemDiagnostics"),
+    "system_setup": ("system_setup", "SystemSetup"),
+    "slack_management": ("slack_management", "SlackManagement"),
+}
+
+
+def _ignored_arguments():
+    from src.revenium_mcp_server.tool_configuration import schema_slimming
+
+    return getattr(schema_slimming, "ACCEPTED_BUT_IGNORED_ARGUMENTS", {})
+
+
+class TestIgnoredArgumentsAreNotAdvertised:
+    """An option nothing reads stays accepted, so no caller is refused, but is
+    not offered, so an assistant is not told that setting it changes the answer."""
+
+    def test_every_ignored_argument_is_listed(self):
+        listed = {(tool, name) for _, tool, _, name, _ in _IGNORED_ARGUMENT_CALLS}
+        constant = {
+            (tool, name) for tool, names in _ignored_arguments().items() for name in names
+        }
+
+        assert constant == listed
+
+    async def test_an_ignored_argument_is_not_in_the_advertised_schema(
+        self, advertised_tools
+    ):
+        advertised = sorted(
+            f"{tool}.{name}"
+            for _, tool, _, name, _ in _IGNORED_ARGUMENT_CALLS
+            if name in _properties(advertised_tools[tool])
+        )
+
+        assert advertised == []
+        for tool in _IGNORED_ARGUMENT_TOOL_CLASSES:
+            assert advertised_tools[tool]["inputSchema"]["additionalProperties"] is True
+
+    @pytest.mark.parametrize(
+        ("register_method", "tool", "action", "name", "value"), _IGNORED_ARGUMENT_CALLS
+    )
+    async def test_an_ignored_argument_is_still_accepted(
+        self, register_method, tool, action, name, value
+    ):
+        from tests.unit.test_tool_config_registry_m4 import _call_through_the_boundary
+
+        is_error, text, captured = await _call_through_the_boundary(
+            register_method, tool, {"action": action, name: value}
+        )
+
+        assert is_error is False, text
+        assert name in captured
+
+    @pytest.mark.parametrize("tool", sorted(_IGNORED_ARGUMENT_TOOL_CLASSES))
+    async def test_no_help_answer_names_an_ignored_argument(self, tool):
+        module_name, class_name = _IGNORED_ARGUMENT_TOOL_CLASSES[tool]
+        module = importlib.import_module(
+            f"src.revenium_mcp_server.tools_decomposed.{module_name}"
+        )
+        instance = getattr(module, class_name)(ucm_helper=None)
+        ignored = {name for _, _, _, name, _ in _IGNORED_ARGUMENT_CALLS}
+
+        answers = {}
+        for action in ("help", "get_capabilities", "get_examples", "get_agent_summary"):
+            try:
+                result = await instance.handle_action(action, {})
+            except Exception:  # an action this tool does not have
+                continue
+            answers[action] = "\n".join(getattr(part, "text", "") for part in result)
+        capabilities = await instance._get_tool_capabilities()
+        answers["_get_tool_capabilities"] = json.dumps(
+            [
+                [c.parameters, c.examples, c.limitations, c.description]
+                for c in capabilities
+            ]
+        )
+
+        assert "get_capabilities" in answers
+        named = sorted(
+            f"{action}: {name}"
+            for action, text in answers.items()
+            for name in ignored
+            if name in text
+        )
+        assert named == []

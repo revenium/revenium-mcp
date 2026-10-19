@@ -16,7 +16,8 @@ Follows MCP best practices:
 """
 
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -26,19 +27,45 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
 from ..alerts import AlertManager, AlertSemanticProcessor, AnalyticsEngine, AnomalyManager
+from ..alerts.alert_manager import ALERT_FILTER_MAP, ALERT_HISTORY_DATE_FORMS
+from ..alerts.anomaly_inventory import read_every_anomaly
+from ..alerts.anomaly_manager import alert_label
+from ..alerts.notification_recipients import (
+    RECIPIENT_FIELDS,
+    union_named_recipients,
+    union_recipients,
+    union_slack_configurations,
+)
+from ..alerts.quick_actions import (
+    FLAT_UPDATE_FIELDS,
+    quick_action_is_percentage,
+    quick_action_metric,
+    refuse_unhonoured_arguments,
+)
+from ..alerts.semantic_processor import refuse_an_undecided_threshold, threshold_in_text
+from ..alerts.update_fidelity import (
+    PROVIDER_ALERT_TYPES,
+    PROVIDER_FILTER_DIMENSIONS,
+    PROVIDER_METRICS,
+    platform_periods_for,
+    refuse_stored_alert_rule_breach,
+    stored_alert_refusal,
+)
 from ..client import ReveniumAPIError, ReveniumClient
+from ..common.default_slack_configuration import get_default_slack_config_id
 from ..common.error_handling import (
     ErrorCodes,
     ResourceError,
     ToolError,
     create_structured_missing_parameter_error,
     create_structured_validation_error,
-    format_structured_error,
+    raise_refusal,
     raise_structured_error,
 )
 from ..common.pagination_performance import validate_pagination_with_performance
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..common.ucm_config import log_ucm_status
+from ..config_store import default_notification_email
 from ..exceptions import ValidationError
 from ..introspection.metadata import (
     DependencyType,
@@ -60,29 +87,22 @@ from ..alert_operators import (
     OPERATORS_BY_ALERT_TYPE,
     REJECTED_OPERATOR_GUIDANCE,
     REJECTED_OPERATORS,
-    historical_operator_notice,
     is_rejected_operator,
 )
 from ..models import AlertType, MetricType
 from ..schema.alert_schema import get_alert_metrics_capabilities
+from ..validators import refuse_sub_fifteen_minute_period
 from .unified_tool_base import ToolBase
 
 
-# snake_case filter name -> camelCase query parameter, bounded to what the
-# endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
-# AIAlertController.find: @RequestParam teamId / type / start / end /
-# anomalyId / ownerId / resolved plus a Pageable (page, size, sort). teamId and
-# page/size are set by the client. There is no `severity` and no `status` on
-# this endpoint — both were being sent by the natural-language path and
-# discarded upstream.
-_ALERT_FILTER_MAP: Dict[str, str] = {
-    "type": "type",
-    "start": "start",
-    "end": "end",
-    "anomaly_id": "anomalyId",
-    "owner_id": "ownerId",
-    "resolved": "resolved",
-    "sort": "sort",
+_UNAVAILABLE_ACTIONS: Dict[str, str] = {
+    "get_metrics": (
+        "get_metrics is not available: the platform has no per-alert metrics read. "
+        "Use get(anomaly_id=...) for the rule and its firing state, "
+        "get_budget_progress(anomaly_id=...) for a budget's spend against its "
+        "threshold, or list(resource_type=\"alerts\", filters={\"anomaly_id\": ...}) "
+        "for when it fired."
+    ),
 }
 
 # Verified 2026-08-28 against hypercurrent origin/develop
@@ -110,9 +130,10 @@ PROVIDER_API_KEY_SEARCH_DEPTH = 1000
 API_KEY_FILTER_GUIDANCE = (
     "An API_KEY filter row takes a key's `id` as its `value` (or several ids in `values` "
     "with IN) and only works on a provider alert, so set `dataSource` to `PROVIDER` in "
-    "anomaly_data. Provider alerts take THRESHOLD or CUMULATIVE_USAGE, a DAILY, WEEKLY or "
-    "MONTHLY period (QUARTERLY for budgets), TOTAL_COST or a token metric, and only "
-    "WORKSPACE, API_KEY, MODEL and PROVIDER filters; the platform refuses anything else."
+    f"anomaly_data. Provider alerts take {' or '.join(PROVIDER_ALERT_TYPES)}, a DAILY, "
+    "WEEKLY or MONTHLY period (QUARTERLY for budgets), the metrics "
+    f"{', '.join(PROVIDER_METRICS)}, and only {', '.join(PROVIDER_FILTER_DIMENSIONS)} "
+    "filters; the platform refuses anything else."
 )
 
 API_KEY_FILTER_EXAMPLE = (
@@ -130,18 +151,27 @@ _ALERT_TYPE_DESCRIPTIONS = {
 }
 
 
-def _stored_operator_note(anomaly: Dict[str, Any]) -> str:
-    """A trailing note when a stored definition carries a refused operator.
+def _bulk_answer(
+    result_text: str, successful: int, failed: int
+) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+    """A bulk switch answer, flagged as an error when every attempt failed."""
+    if successful == 0 and failed > 0:
+        raise_refusal(result_text, error_code=ErrorCodes.API_ERROR)
+    return [TextContent(type="text", text=result_text)]
 
-    Enable and disable read the alert and PUT it back whole, so an alert stored
-    with EQUAL_TO or NOT_EQUAL_TO resubmits one. They must not refuse the call —
-    the value is the platform's own and blocking it would make the alert
-    impossible to turn off through the MCP — so they say what the body carried.
-    """
-    operator = anomaly.get("operatorType") if isinstance(anomaly, dict) else None
-    if operator and is_rejected_operator(operator):
-        return f"\n\n{historical_operator_notice(operator)}"
-    return ""
+
+async def _put_enabled(
+    client: ReveniumClient,
+    anomaly_id: str,
+    stored: Dict[str, Any],
+    enabled: bool,
+    action: str,
+) -> Dict[str, Any]:
+    """PUT the stored alert back with only `enabled` changed, once the platform's rules pass on it."""
+    body = {**stored, "enabled": enabled}
+    refuse_stored_alert_rule_breach(body, stored, action)
+    updated: Dict[str, Any] = await client.update_anomaly(anomaly_id, body)
+    return updated
 
 
 def _format_budget_share(share: float) -> str:
@@ -176,6 +206,19 @@ def _grouped_budget_parts(entry: Dict[str, Any], group_count: int) -> List[str]:
     else:
         parts.append(f"{group_count} groups")
     return parts
+
+
+def _quick_threshold_label(threshold: Any, is_percentage: bool) -> str:
+    return f"{threshold}%" if is_percentage else str(threshold)
+
+
+@contextmanager
+def _refusing_without_an_email() -> Iterator[None]:
+    """Turn the missing-email ValidationError into a refusal the MCP envelope flags."""
+    try:
+        yield
+    except ValidationError as e:
+        raise_refusal(e.format_user_message(), field="email")
 
 
 class AlertManagement(ToolBase, SlackPromptingMixin):
@@ -266,8 +309,6 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                 return await self._handle_delete(client, arguments)
             elif action == "clear_all":
                 return await self._handle_clear_all(client, arguments)
-            elif action == "get_metrics":
-                return await self._handle_get_metrics(client, arguments)
             elif action == "query":
                 return await self._handle_query(client, arguments)
             elif action == "validate":
@@ -312,6 +353,13 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                 return await self._handle_get_budget_progress(client, arguments)
             elif action == "search_provider_api_keys":
                 return await self._handle_search_provider_api_keys(client, arguments)
+            elif action in _UNAVAILABLE_ACTIONS:
+                raise ToolError(
+                    message=_UNAVAILABLE_ACTIONS[action],
+                    error_code=ErrorCodes.ACTION_NOT_SUPPORTED,
+                    field="action",
+                    value=action,
+                )
             else:
                 # Use structured error for unknown action
                 raise ToolError(
@@ -337,7 +385,7 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                             "create_from_text",
                         ],
                         "management_actions": ["list", "get", "update", "delete", "clear_all"],
-                        "analysis_actions": ["get_metrics", "query", "validate"],
+                        "analysis_actions": ["query", "validate"],
                         "bulk_operations": [
                             "enable_all",
                             "disable_all",
@@ -432,7 +480,7 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                     "filters": (
                         "dict - accepted keys: type, start, end, anomaly_id, "
                         "owner_id, resolved, sort (the endpoint declares no "
-                        "severity or status filter)"
+                        f"severity or status filter). {ALERT_HISTORY_DATE_FORMS}"
                     ),
                 },
                 examples=[
@@ -461,13 +509,17 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                     "create_threshold_alert (Spike Detection)": {
                         "name": "str (required)",
                         "threshold": "float (required)",
-                        "period_minutes": "float (required)",
+                        "period_minutes": "float (optional, default 15)",
                         "email": "str (required)",
                         "metric": "str (optional) - TOTAL_COST, TOKEN_COUNT, ERROR_RATE, etc.",
                         "triggerAfterPersistsDuration": trigger_duration_doc,
                     },
                     "create_from_text": {
-                        "text": "str (required) - Natural language description including metric type"
+                        "text": "str (required) - Natural language description including metric type",
+                        "name": "str (optional) - the alert's name; generated from the text when absent",
+                        "email": "str (optional)",
+                        "notificationAddresses": "list (optional) - further recipients",
+                        "slack_config_id": "str (optional) - the default Slack configuration when absent",
                     },
                     "Advanced Alert Configuration": {
                         "triggerAfterPersistsDuration": trigger_duration_doc
@@ -478,9 +530,9 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                     "create_cumulative_usage_alert(name='Budget Alert', threshold=5000, period='monthly', email='admin@co.com')",
                     "create_cumulative_usage_alert(name='Token Budget', metric='TOKEN_COUNT', threshold=1000, period='monthly', email='admin@co.com')",
                     "# Spike Detection alerts - immediate threshold monitoring",
-                    "create_threshold_alert(name='Error Spike', metric='ERROR_RATE', threshold=1, period_minutes=5, email='ops@co.com')",
+                    "create_threshold_alert(name='Error Spike', metric='ERROR_RATE', threshold=1, period_minutes=15, email='ops@co.com')",
                     "# Persistence-based alerting - only trigger if condition persists",
-                    "create_threshold_alert(name='Sustained Cost Spike', threshold=100, period_minutes=5, email='ops@co.com', triggerAfterPersistsDuration='FIFTEEN_MINUTES')",
+                    "create_threshold_alert(name='Sustained Cost Spike', threshold=100, period_minutes=15, email='ops@co.com', triggerAfterPersistsDuration='FIFTEEN_MINUTES')",
                     "create_from_text(text='Alert when monthly token count exceeds 1000')",
                 ],
                 limitations=[
@@ -503,7 +555,6 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
             "update",
             "delete",
             "clear_all",
-            "get_metrics",
             "query",
             "validate",
             "get_capabilities",
@@ -596,7 +647,7 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                 pattern_name="Alert Investigation",
                 description="Investigate triggered alerts and analyze patterns",
                 frequency=0.8,  # Daily usage, high frequency
-                typical_sequence=["query()", "get_metrics()", "list(resource_type='alerts')"],
+                typical_sequence=["query()", "get(anomaly_id=...)", "list(resource_type='alerts')"],
                 common_parameters={"query": "str", "resource_type": "alerts", "filters": "dict"},
                 success_indicators=[
                     "Relevant alerts found",
@@ -625,7 +676,6 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
             "**See Examples**: get_examples(alert_type='budget_threshold'), get_examples(alert_type='threshold'), or get_examples(alert_type='relative_change')",
             "**Quick Creation**: create_cumulative_usage_alert() for budget tracking, create_threshold_alert() for spike detection, or create with alertType RELATIVE_CHANGE for trend detection",
             "**Investigation**: query(text='show alerts from last week') for natural language search",
-            "**Analytics**: get_metrics() to analyze alert patterns and frequency",
         ]
 
     async def _get_common_use_cases(self) -> List[str]:
@@ -751,7 +801,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                 page = arguments.get("page", 0)
                 size = arguments.get("size", 20)
                 filters = apply_filter_allowlist(
-                    arguments.get("filters"), _ALERT_FILTER_MAP, action="list alerts"
+                    arguments.get("filters"), ALERT_FILTER_MAP, action="list alerts"
                 )
                 query = arguments.get("query")
 
@@ -764,7 +814,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                     f"Calling alert_manager.list_alerts with page={page}, size={size} (tier: {validation_result['performance_tier']})"
                 )
                 return await self.alert_manager.list_alerts(client, page, size, filters, query)
-            except ToolError:
+            except (ToolError, ReveniumAPIError):
                 # Re-raise ToolError exceptions without modification
                 # This preserves helpful error messages with specific suggestions
                 raise
@@ -843,51 +893,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
         if resource_type == "anomalies":
             # Handle dry_run mode for create operations
             if dry_run:
-                # Same assembly the live path uses (flat-field merge, aliases,
-                # operator default, banned-period guard) — the preview must see
-                # exactly what a live create would send.
-                anomaly_data = self._assemble_anomaly_data(arguments)
-                if not anomaly_data:
-                    return [
-                        TextContent(
-                            type="text",
-                            text="**Dry Run Validation Failed**: Missing anomaly_data parameter",
-                        )
-                    ]
-
-                # Run the SAME validation the live create runs — a dry-run
-                # that echoes success for a payload live would 400 is worse
-                # than no dry-run at all.
-                try:
-                    self.anomaly_manager.validate_anomaly_payload(anomaly_data)
-                except (ValidationError, ToolError) as exc:
-                    return [
-                        TextContent(
-                            type="text",
-                            text=(
-                                "**Dry Run Validation Failed** — the live create "
-                                f"would reject this payload:\n\n{exc}"
-                            ),
-                        )
-                    ]
-                validation_result = {
-                    "dry_run": True,
-                    "operation": "create_anomaly",
-                    "valid": True,
-                    "message": "**Dry Run Successful**: Anomaly data is valid and ready for creation",
-                    "would_create": {
-                        "name": anomaly_data.get("name", "Unnamed Alert"),
-                        "type": anomaly_data.get("alertType", "THRESHOLD"),
-                        "metric": anomaly_data.get("metricType", "TOTAL_COST"),
-                        "threshold": anomaly_data.get("threshold", 0),
-                    },
-                }
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"**DRY RUN MODE**\n\n{json.dumps(validation_result, indent=2)}",
-                    )
-                ]
+                return self._preview_create(client, "create", arguments)
 
             return await self._handle_anomaly_operations(client, "create", arguments)
         else:
@@ -904,7 +910,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                 ],
                 examples={
                     "create_monitoring": 'create(resource_type="anomalies", anomaly_data={...})',
-                    "threshold": 'create_threshold_alert(name="Error Spike", threshold=5, period_minutes=10)  # Spike Detection',
+                    "threshold": 'create_threshold_alert(name="Error Spike", threshold=5, period_minutes=15)  # Spike Detection',
                     "budget_threshold": 'create_cumulative_usage_alert(name="Budget Alert", threshold=1000, period="monthly")  # Budget Threshold',
                 },
             )
@@ -919,30 +925,12 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
         if resource_type == "anomalies":
             # Handle dry_run mode for update operations
             if dry_run:
-                anomaly_id = arguments.get("anomaly_id")
-                anomaly_data = arguments.get("anomaly_data")
-                if not anomaly_id or not anomaly_data:
-                    return [
-                        TextContent(
-                            type="text",
-                            text="**Dry Run Validation Failed**: Missing anomaly_id or anomaly_data parameter",
-                        )
-                    ]
-
-                # Validate update data without updating
-                validation_result = {
-                    "dry_run": True,
-                    "operation": "update_anomaly",
-                    "valid": True,
-                    "message": "**Dry Run Successful**: Update data is valid and ready for application",
-                    "would_update": {"anomaly_id": anomaly_id, "changes": anomaly_data},
-                }
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"**DRY RUN MODE**\n\n{json.dumps(validation_result, indent=2)}",
-                    )
-                ]
+                # The same arguments and the same checks as the live update, minus the write.
+                anomaly_id, update_data = self._update_request(arguments)
+                preview: List[Union[TextContent, ImageContent, EmbeddedResource]] = (
+                    await self.anomaly_manager.preview_update(client, anomaly_id, update_data)
+                )
+                return preview
 
             return await self._handle_anomaly_operations(client, "update", arguments)
         else:
@@ -1015,12 +1003,6 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                 },
             )
 
-    async def _handle_get_metrics(
-        self, client: ReveniumClient, arguments: Dict[str, Any]
-    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Handle get metrics operations."""
-        return await self._handle_anomaly_operations(client, "get_metrics", arguments)
-
     async def _handle_query(
         self, client: ReveniumClient, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
@@ -1051,8 +1033,60 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
     async def _handle_validate(
         self, client: ReveniumClient, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Handle validate operations."""
-        return await self._handle_anomaly_operations(client, "validate", arguments)
+        """Check an alert the way create would, without creating it."""
+        return self._preview_create(client, "validate", arguments)
+
+    def _preview_create(
+        self, client: ReveniumClient, action: str, arguments: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Answer what a live create would do with these arguments, without creating anything.
+
+        Shared by validate and create's dry run. It uses the same assembly the live
+        create uses (flat-field merge, aliases, operator default) and the same checks,
+        conversion and banned-period guard (AnomalyManager.prepare_create), so it cannot
+        approve a payload the live create refuses. A refusal is raised with the live
+        create's text, so it carries the failure flag exactly as the live create's does.
+        """
+        anomaly_data = self._assemble_anomaly_data(arguments)
+        if not anomaly_data:
+            error = create_structured_missing_parameter_error(
+                parameter_name="anomaly_data",
+                action=action,
+                examples={
+                    "usage": f'{action}(anomaly_data={{"name": "Validation Test", "metricType": "TOTAL_COST", "threshold": 100, "alertType": "THRESHOLD"}})',
+                    "required_fields": ["name", "metricType", "threshold", "alertType"],
+                },
+            )
+            raise_structured_error(error)
+
+        try:
+            api_data = self.anomaly_manager.prepare_create(anomaly_data, client.team_id)
+        except ValidationError as exc:
+            raise_refusal(exc.format_user_message(), error_code=exc.error_code)
+        message = (
+            "**Validation passed**: create would accept this alert"
+            if action == "validate"
+            else "**Dry Run Successful**: Anomaly data is valid and ready for creation"
+        )
+        validation_result = {
+            "dry_run": True,
+            "operation": "create_anomaly",
+            "valid": True,
+            "message": message,
+            "would_create": {
+                "name": api_data.get("name", "Unnamed Alert"),
+                "type": api_data.get("alertType", "THRESHOLD"),
+                "metric": api_data.get("metricType", "TOTAL_COST"),
+                "threshold": api_data.get("threshold", 0),
+                "periodDuration": api_data.get("periodDuration"),
+            },
+        }
+        return [
+            TextContent(
+                type="text",
+                text=f"**DRY RUN MODE**\n\n{json.dumps(validation_result, indent=2)}",
+            )
+        ]
 
     # ============================================================================
     # ANOMALY OPERATIONS (from alert_tools.py)
@@ -1062,8 +1096,8 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
         """Assemble the effective anomaly payload from nested + flat arguments.
 
         Single assembly source for the live create path AND dry-run, so the
-        preview always sees exactly what a live create would send. Raises the
-        banned-period validation error for both paths.
+        preview always sees exactly what a live create would send. The period floor
+        and the other create checks run after it, in AnomalyManager.prepare_create.
         """
         anomaly_data = arguments.get("anomaly_data")
         # The MCP signature and the get_examples payloads document these
@@ -1073,7 +1107,8 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
         # only periodDuration/triggerAfterPersistsDuration were folded and
         # the rest were silently dropped, so a documented flat payload
         # failed with "Anomaly name is required").
-        # Nested values win over flat kwargs (explicit > implicit).
+        # Nested values win over flat kwargs (explicit > implicit), except the
+        # recipients and Slack channels, which are the union of both.
         #
         # Use `is not None` (not truthiness) so falsy-but-meaningful
         # values like "" are forwarded to the backend rather than
@@ -1124,40 +1159,119 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
             and anomaly_data.get("alertType") in ("THRESHOLD", "CUMULATIVE_USAGE")
         ):
             anomaly_data["operatorType"] = "GREATER_THAN"
-        # The platform rejects tracking periods shorter than
-        # FIFTEEN_MINUTES for non-cumulative alerts, but its 400 carries a
-        # generic message — reject locally with the actionable rule.
-        if (
-            isinstance(anomaly_data, dict)
-            and anomaly_data.get("alertType") != "CUMULATIVE_USAGE"
-            and anomaly_data.get("periodDuration")
-            in ("ONE_MINUTE", "FIVE_MINUTES", "TEN_MINUTES")
-        ):
-            raise create_structured_validation_error(
-                message=(
-                    f"periodDuration {anomaly_data['periodDuration']} is not "
-                    "supported by the platform; use FIFTEEN_MINUTES or longer"
+        if isinstance(anomaly_data, dict):
+            refuse_sub_fifteen_minute_period(
+                anomaly_data.get("alertType"), anomaly_data.get("periodDuration")
+            )
+        if isinstance(anomaly_data, dict) and anomaly_data:
+            self._settle_notification_targets(anomaly_data, arguments)
+        return anomaly_data
+
+    def _settle_notification_targets(
+        self, anomaly_data: Dict[str, Any], arguments: Dict[str, Any]
+    ) -> None:
+        """Write who a generic create notifies into ``anomaly_data``.
+
+        Every recipient and Slack channel named, flat or nested, is kept once. A
+        Slack-only alert is sent as given; with neither, the default email is used,
+        or the create is refused when none is known. The default Slack channel is
+        never added: a generic create sets every field itself.
+        """
+        recipients = union_named_recipients(
+            [
+                ("email", arguments.get("email")),
+                ("notificationAddresses", arguments.get("notificationAddresses")),
+                *((field, anomaly_data.pop(field, None)) for field in RECIPIENT_FIELDS),
+            ]
+        )
+        slack_configurations = union_slack_configurations(
+            [
+                ("slack_config_id", arguments.get("slack_config_id")),
+                ("slackConfigurations", arguments.get("slackConfigurations")),
+                *(
+                    (field, anomaly_data.pop(field, None))
+                    for field in ("slackConfigurations", "slackConfigId", "slack_configurations")
                 ),
-                field="periodDuration",
-                value=anomaly_data["periodDuration"],
-                suggestions=[
-                    "Use FIFTEEN_MINUTES, THIRTY_MINUTES, ONE_HOUR, TWELVE_HOURS, DAILY, WEEKLY, MONTHLY, QUARTERLY, or THIRTY_DAYS",
-                ],
+            ]
+        )
+        if not recipients and not slack_configurations:
+            with _refusing_without_an_email():
+                recipients = [self._resolve_notification_email()]
+        anomaly_data["notificationAddresses"] = recipients
+        anomaly_data["slackConfigurations"] = slack_configurations
+
+    def _update_request(self, arguments: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """The alert id and update data an update call carries, refused the way the update refuses.
+
+        Shared by the live update and its dry run, so both read the same arguments.
+        """
+        anomaly_id = arguments.get("anomaly_id")
+        anomaly_data = arguments.get("anomaly_data")
+
+        if not anomaly_id:
+            error = create_structured_missing_parameter_error(
+                parameter_name="anomaly_id",
+                action="update",
                 examples={
-                    "valid_period_durations": [
-                        "FIFTEEN_MINUTES",
-                        "THIRTY_MINUTES",
-                        "ONE_HOUR",
-                        "TWELVE_HOURS",
-                        "DAILY",
-                        "WEEKLY",
-                        "MONTHLY",
-                        "QUARTERLY",
-                        "THIRTY_DAYS",
-                    ],
+                    "usage": 'update(anomaly_id="alert_123", anomaly_data={...})',
+                    "valid_format": "Anomaly ID should be a string identifier",
+                    "example_ids": ["alert_123", "threshold_alert", "usage_monitor"],
                 },
             )
-        return anomaly_data
+            raise_structured_error(error)
+
+        refuse_unhonoured_arguments("update", arguments)
+
+        # Support both direct parameters AND anomaly_data for improved UX
+        # Direct parameters take precedence over anomaly_data if both provided
+        updatable_fields = list(FLAT_UPDATE_FIELDS)
+
+        # Build update data from direct parameters
+        direct_params = {}
+        for field in updatable_fields:
+            if field in arguments:
+                direct_params[field] = arguments[field]
+
+        # Merge anomaly_data with direct parameters (direct params win)
+        if anomaly_data:
+            if not isinstance(anomaly_data, dict):
+                error = create_structured_missing_parameter_error(
+                    parameter_name="anomaly_data",
+                    action="update",
+                    examples={
+                        "usage": 'update(anomaly_id="alert_123", anomaly_data={"threshold": 200})',
+                        "error": "anomaly_data must be a dictionary/object",
+                        "received_type": str(type(anomaly_data).__name__),
+                    },
+                )
+                raise_structured_error(error)
+            # Start with anomaly_data, then override with direct params
+            final_update_data = {**anomaly_data, **direct_params}
+        elif direct_params:
+            # Only direct parameters provided
+            final_update_data = direct_params
+        else:
+            # Neither anomaly_data nor direct parameters provided
+            error = create_structured_missing_parameter_error(
+                parameter_name="update_data",
+                action="update",
+                examples={
+                    "direct_params": 'update(anomaly_id="alert_123", name="New Name", threshold=200)',
+                    "anomaly_data": 'update(anomaly_id="alert_123", anomaly_data={"threshold": 200})',
+                    "hybrid": 'update(anomaly_id="alert_123", anomaly_data={"name": "Base"}, threshold=300)',
+                    "updatable_fields": updatable_fields,
+                    "slack_config_example": {"slackConfigurations": ["5jpABv"]},
+                    "email_example": 'update(anomaly_id="alert_123", email="user@example.com")',
+                    "combined_example": {
+                        "threshold": 200,
+                        "enabled": True,
+                        "slackConfigurations": ["5jpABv"],
+                    },
+                    "note": "Supports direct params, anomaly_data object, or both (direct params take precedence)",
+                },
+            )
+            raise_structured_error(error)
+        return anomaly_id, final_update_data
 
     async def _handle_anomaly_operations(
         self, client: ReveniumClient, action: str, arguments: Dict[str, Any]
@@ -1190,7 +1304,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                         "example_ids": ["alert_123", "threshold_alert", "usage_monitor"],
                     },
                 )
-                return [TextContent(type="text", text=format_structured_error(error))]
+                raise_structured_error(error)
             return await self.anomaly_manager.get_anomaly(client, anomaly_id)
 
         elif action == "create":
@@ -1201,7 +1315,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                     action="create",
                     examples={
                         "convenience_methods": {
-                            "real_time_monitoring": 'create_threshold_alert(name="Cost Spike", threshold=100, period_minutes=5)',
+                            "real_time_monitoring": 'create_threshold_alert(name="Cost Spike", threshold=100, period_minutes=15)',
                             "budget_tracking": 'create_cumulative_usage_alert(name="Monthly Budget", threshold=1000, period="monthly")',
                             "note": "Convenience methods are easier and handle all required fields automatically!",
                         },
@@ -1227,84 +1341,8 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
             return await self.anomaly_manager.create_anomaly(client, anomaly_data)
 
         elif action == "update":
-            anomaly_id = arguments.get("anomaly_id")
-            anomaly_data = arguments.get("anomaly_data")
-
-            if not anomaly_id:
-                error = create_structured_missing_parameter_error(
-                    parameter_name="anomaly_id",
-                    action="update",
-                    examples={
-                        "usage": 'update(anomaly_id="alert_123", anomaly_data={...})',
-                        "valid_format": "Anomaly ID should be a string identifier",
-                        "example_ids": ["alert_123", "threshold_alert", "usage_monitor"],
-                    },
-                )
-                return [TextContent(type="text", text=format_structured_error(error))]
-
-            # Support both direct parameters AND anomaly_data for improved UX
-            # Direct parameters take precedence over anomaly_data if both provided
-            updatable_fields = [
-                "name",
-                "threshold",
-                "alertType",
-                "enabled",
-                "slackConfigurations",
-                "notificationAddresses",
-                "description",
-                "tags",
-                "metricType",
-                "period",
-                "periodDuration",
-                "triggerAfterPersistsDuration",
-            ]
-
-            # Build update data from direct parameters
-            direct_params = {}
-            for field in updatable_fields:
-                if field in arguments:
-                    direct_params[field] = arguments[field]
-
-            # Merge anomaly_data with direct parameters (direct params win)
-            if anomaly_data:
-                if not isinstance(anomaly_data, dict):
-                    error = create_structured_missing_parameter_error(
-                        parameter_name="anomaly_data",
-                        action="update",
-                        examples={
-                            "usage": 'update(anomaly_id="alert_123", anomaly_data={"threshold": 200})',
-                            "error": "anomaly_data must be a dictionary/object",
-                            "received_type": str(type(anomaly_data).__name__),
-                        },
-                    )
-                    return [TextContent(type="text", text=format_structured_error(error))]
-                # Start with anomaly_data, then override with direct params
-                final_update_data = {**anomaly_data, **direct_params}
-            elif direct_params:
-                # Only direct parameters provided
-                final_update_data = direct_params
-            else:
-                # Neither anomaly_data nor direct parameters provided
-                error = create_structured_missing_parameter_error(
-                    parameter_name="update_data",
-                    action="update",
-                    examples={
-                        "direct_params": 'update(anomaly_id="alert_123", name="New Name", threshold=200)',
-                        "anomaly_data": 'update(anomaly_id="alert_123", anomaly_data={"threshold": 200})',
-                        "hybrid": 'update(anomaly_id="alert_123", anomaly_data={"name": "Base"}, threshold=300)',
-                        "updatable_fields": updatable_fields,
-                        "slack_config_example": {"slackConfigurations": ["5jpABv"]},
-                        "email_example": {"notificationAddresses": ["user@example.com"]},
-                        "combined_example": {
-                            "threshold": 200,
-                            "enabled": True,
-                            "slackConfigurations": ["5jpABv"],
-                        },
-                        "note": "Supports direct params, anomaly_data object, or both (direct params take precedence)",
-                    },
-                )
-                return [TextContent(type="text", text=format_structured_error(error))]
-            return await self.anomaly_manager.update_anomaly(client, anomaly_id, final_update_data)
+            anomaly_id, update_data = self._update_request(arguments)
+            return await self.anomaly_manager.update_anomaly(client, anomaly_id, update_data)
 
         elif action == "delete":
             anomaly_id = arguments.get("anomaly_id")
@@ -1319,12 +1357,12 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                         "warning": "This action permanently removes the alert",
                     },
                 )
-                return [TextContent(type="text", text=format_structured_error(error))]
+                raise_structured_error(error)
             return await self.anomaly_manager.delete_anomaly(client, anomaly_id)
 
         elif action == "clear_all":
             confirm = arguments.get("confirm")
-            if not confirm:
+            if confirm is not True:
                 return [
                     TextContent(
                         type="text",
@@ -1339,88 +1377,15 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                 ]
             return await self.anomaly_manager.clear_all_anomalies(client)
 
-        elif action == "get_metrics":
-            anomaly_id = arguments.get("anomaly_id")
-            if not anomaly_id:
-                error = create_structured_missing_parameter_error(
-                    parameter_name="anomaly_id",
-                    action="get_metrics",
-                    examples={
-                        "usage": 'get_metrics(anomaly_id="alert_123")',
-                        "valid_format": "Anomaly ID should be a string identifier",
-                        "example_ids": ["alert_123", "threshold_alert", "usage_monitor"],
-                        "purpose": "Retrieve performance metrics for the specified alert",
-                    },
-                )
-                return [TextContent(type="text", text=format_structured_error(error))]
-            return await self.anomaly_manager.get_anomaly_metrics(client, anomaly_id)
-
         elif action == "query":
+            arguments = validate_pagination_params(arguments, action="query_anomalies")
             filters = apply_filter_allowlist(
                 arguments.get("filters"), _ANOMALY_FILTER_MAP, action="query anomalies"
             )
             # Use list with filters for query functionality
-            return await self.anomaly_manager.list_anomalies(client, 0, 20, filters)
-
-        elif action == "validate":
-            anomaly_data = arguments.get("anomaly_data")
-            if not anomaly_data:
-                error = create_structured_missing_parameter_error(
-                    parameter_name="anomaly_data",
-                    action="validate",
-                    examples={
-                        "usage": 'validate(anomaly_data={"name": "Test Alert", "metricType": "TOTAL_COST", "threshold": 100})',
-                        "required_fields": ["name", "metricType", "threshold", "alertType"],
-                        "example_data": {
-                            "name": "Validation Test",
-                            "metricType": "TOTAL_COST",
-                            "threshold": 100,
-                            "alertType": "THRESHOLD",
-                        },
-                        "purpose": "Validate alert configuration before creation",
-                    },
-                )
-                return [TextContent(type="text", text=format_structured_error(error))]
-            try:
-                # Force proper UCM integration for validation
-                error = ToolError(
-                    message="Alert validation unavailable - use UCM capabilities for validation",
-                    error_code=ErrorCodes.UCM_ERROR,
-                    field="validation",
-                    value="hardcoded_validation_removed",
-                    suggestions=[
-                        "Use get_capabilities() to see valid alert types and required fields",
-                        "Let the API handle validation during alert creation",
-                        "Check UCM integration status with test_ucm_integration action",
-                        "Verify alert configuration against UCM-provided capabilities",
-                    ],
-                    examples={
-                        "capabilities_check": "get_capabilities() to see API-verified alert types and metrics",
-                        "ucm_integration": "test_ucm_integration() to verify UCM connectivity",
-                        "api_validation": "create() action will validate against real-time API requirements",
-                        "monitoring_context": "MONITORING: UCM provides real-time validation for alert configuration",
-                    },
-                )
-                return [TextContent(type="text", text=format_structured_error(error))]
-            except Exception as e:
-                error = ToolError(
-                    message=f"Alert validation failed: {str(e)}",
-                    error_code=ErrorCodes.VALIDATION_ERROR,
-                    field="validation",
-                    value=str(e),
-                    suggestions=[
-                        "Check alert configuration parameters",
-                        "Use get_capabilities() to see valid alert types",
-                        "Verify UCM integration is working properly",
-                        "Try creating the alert directly to get API validation",
-                    ],
-                    examples={
-                        "capabilities": "get_capabilities() for valid alert types",
-                        "direct_creation": "create() action provides real-time API validation",
-                        "monitoring_context": "MONITORING: Validation ensures alert configuration meets API requirements",
-                    },
-                )
-                return [TextContent(type="text", text=format_structured_error(error))]
+            return await self.anomaly_manager.list_anomalies(
+                client, arguments.get("page", 0), arguments.get("size", 20), filters
+            )
 
         else:
             error = ToolError(
@@ -1436,16 +1401,15 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                 ],
                 examples={
                     "basic_actions": ["list", "get", "create", "update", "delete"],
-                    "monitoring_actions": ["get_metrics", "query", "validate"],
+                    "monitoring_actions": ["query", "validate"],
                     "management_actions": ["clear_all"],
                     "example_usage": {
                         "create_alert": 'create(anomaly_data={"name": "Cost Alert", "metricType": "TOTAL_COST", "threshold": 100})',
                         "list_alerts": "list(page=0, size=10)",
-                        "get_metrics": 'get_metrics(anomaly_id="alert_123")',
                     },
                 },
             )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            raise_structured_error(error)
 
     # ============================================================================
     # ALERT OPERATIONS (from alert_tools.py)
@@ -1468,16 +1432,19 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                         "note": "Alerts are read-only - use anomalies for creating new alerts",
                     },
                 )
-                return [TextContent(type="text", text=format_structured_error(error))]
+                raise_structured_error(error)
             return await self.alert_manager.get_alert(client, alert_id)
 
         elif action == "query":
+            arguments = validate_pagination_params(arguments, action="query_alerts")
             query = arguments.get("query")
             filters = apply_filter_allowlist(
-                arguments.get("filters"), _ALERT_FILTER_MAP, action="query alerts"
+                arguments.get("filters"), ALERT_FILTER_MAP, action="query alerts"
             )
             # Use list with query parameter for natural language search
-            return await self.alert_manager.list_alerts(client, 0, 20, filters, query)
+            return await self.alert_manager.list_alerts(
+                client, arguments.get("page", 0), arguments.get("size", 20), filters, query
+            )
 
         else:
             error = ToolError(
@@ -1502,7 +1469,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                     "note": "Alerts are read-only. To create monitoring, use anomalies.",
                 },
             )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            raise_structured_error(error)
 
     # ============================================================================
     # ENHANCED CREATION METHODS (from enhanced_alert_tools.py)
@@ -1542,7 +1509,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
         self, ucm_capabilities: Optional[Dict[str, Any]]
     ) -> str:
         """Build enhanced capabilities text combining semantic guidance with UCM data."""
-        text = """# **Alert Management Capabilities**
+        text = f"""# **Alert Management Capabilities**
 
 **Important Distinction**
 ### **ANOMALIES** (Alert Definitions/Rules)
@@ -1572,9 +1539,11 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
 ### **View Historical Fired Alerts**
 ```bash
 list(resource_type="alerts")                    # Recent alert events
+list(resource_type="alerts", filters={{"start": "2026-10-01", "end": "2026-10-15"}})
 query(resource_type="alerts", query="last week") # Natural language search
 get(resource_type="alerts", alert_id="evt_123")  # Specific alert event
 ```
+{ALERT_HISTORY_DATE_FORMS}
 
 ### **Manage Alert Definitions/Rules**
 ```bash
@@ -1676,10 +1645,11 @@ search_provider_api_keys(query="prod")          # Find a provider API key's id f
             for operator in operators:
                 text += f"- **{operator}**\n"
         text += (
-            f"\n**Not accepted on create or update**: "
+            f"\n**Not accepted on create, update, enable, disable or toggle_status**: "
             f"{', '.join(REJECTED_OPERATORS)}. {REJECTED_OPERATOR_GUIDANCE} "
             "Alerts already stored with either operator keep listing and rendering "
-            "normally.\n"
+            "normally; change the operator with update before you switch one on or "
+            "off.\n"
         )
 
         # Filter operators are a separate vocabulary from the operatorType values
@@ -1721,7 +1691,7 @@ search_provider_api_keys(query="prod")          # Find a provider API key's id f
 The `triggerAfterPersistsDuration` parameter enables sophisticated alert behavior by requiring the alert condition to persist for a specified duration before triggering. This prevents false alarms from temporary spikes.
 
 ### **How It Works**
-- **periodDuration**: How frequently the alert condition is evaluated (e.g., every 5 minutes)
+- **periodDuration**: How frequently the alert condition is evaluated (e.g., every 15 minutes)
 - **triggerAfterPersistsDuration**: How long the condition must persist before triggering (e.g., 15 minutes)
 - **Example**: With `periodDuration="FIFTEEN_MINUTES"` and `triggerAfterPersistsDuration="THIRTY_MINUTES"`, the alert checks every 15 minutes and only triggers if the threshold is exceeded for 2 consecutive checks
 
@@ -1981,7 +1951,7 @@ Perfect for budget tracking and quota management.
 
 ## **Quick Creation**
 ```bash
-# Basic budget alert (email optional if REVENIUM_DEFAULT_EMAIL is set)
+# Basic budget alert (email optional: defaults to your own email when hosted, REVENIUM_DEFAULT_EMAIL locally)
 create_cumulative_usage_alert(
   name="Monthly Budget",
   threshold=5000,
@@ -2188,18 +2158,18 @@ Perfect for real-time monitoring and spike detection.
 
 ## **Quick Creation**
 ```bash
-# Basic alert (email optional if REVENIUM_DEFAULT_EMAIL is set)
+# Basic alert (email optional: defaults to your own email when hosted, REVENIUM_DEFAULT_EMAIL locally)
 create_threshold_alert(
   name="Cost Spike",
   threshold=100,
-  period_minutes=5
+  period_minutes=15
 )
 
 # With explicit email
 create_threshold_alert(
   name="Cost Spike",
   threshold=100,
-  period_minutes=5,
+  period_minutes=15,
   email="alerts@company.com"
 )
 
@@ -2207,7 +2177,7 @@ create_threshold_alert(
 create_threshold_alert(
   name="Sustained Cost Spike",
   threshold=200,
-  period_minutes=5,
+  period_minutes=15,
   triggerAfterPersistsDuration="FIFTEEN_MINUTES",
   email="alerts@company.com"
 )
@@ -2358,7 +2328,7 @@ Use INCREASES_BY or DECREASES_BY operators with daily, weekly, or monthly period
 **Key Points**:
 - Valid operators: INCREASES_BY, DECREASES_BY
 - Valid periods: DAILY, WEEKLY, MONTHLY, QUARTERLY
-- Sub-daily periods (e.g., 5 minutes) are automatically clamped to DAILY
+- Periods outside the valid list above are refused, never clamped; create_from_text turns a sub-daily phrase into DAILY
 - Use `isPercentage: true` for percentage-based thresholds""",
                     )
                 ]
@@ -2495,7 +2465,7 @@ update(
 
 ### **Add Slack Notifications**
 ```python
-# First get available Slack configs with: list_slack_configurations()
+# First get available Slack configs with: slack_management(action="list_configurations")
 update(
     anomaly_id="5jXPdv",
     anomaly_data={"slackConfigurations": ["5jpABv"]}
@@ -2676,7 +2646,7 @@ update(
 All alert types support the `triggerAfterPersistsDuration` parameter for sophisticated alert behavior:
 
 ### **How It Works**
-- **periodDuration**: Evaluation frequency (e.g., every 5 minutes)
+- **periodDuration**: Evaluation frequency (e.g., every 15 minutes)
 - **triggerAfterPersistsDuration**: Required persistence duration (e.g., 15 minutes)
 - **Behavior**: Alert only triggers if condition persists for the specified duration
 
@@ -2747,18 +2717,18 @@ Complex configurations → create() with anomaly_data
 
 ## **Quick Creation Methods** (Basic Alerts)
 ```bash
-# Basic budget tracking (email optional if REVENIUM_DEFAULT_EMAIL is set)
+# Basic budget tracking (email optional: defaults to your own email when hosted, REVENIUM_DEFAULT_EMAIL locally)
 create_cumulative_usage_alert(name="Budget", threshold=5000, period="monthly")
 
-# Basic real-time monitoring (email optional if REVENIUM_DEFAULT_EMAIL is set)
-create_threshold_alert(name="Cost Spike", threshold=100, period_minutes=5)
+# Basic real-time monitoring (email optional: defaults to your own email when hosted, REVENIUM_DEFAULT_EMAIL locally)
+create_threshold_alert(name="Cost Spike", threshold=100, period_minutes=15)
 
 # With explicit email
 create_cumulative_usage_alert(name="Budget", threshold=5000, period="monthly", email="admin@co.com")
-create_threshold_alert(name="Cost Spike", threshold=100, period_minutes=5, email="ops@co.com")
+create_threshold_alert(name="Cost Spike", threshold=100, period_minutes=15, email="ops@co.com")
 
 # Threshold alerts with persistence
-create_threshold_alert(name="Sustained Cost Spike", threshold=200, period_minutes=5, triggerAfterPersistsDuration="FIFTEEN_MINUTES", email="ops@co.com")
+create_threshold_alert(name="Sustained Cost Spike", threshold=200, period_minutes=15, triggerAfterPersistsDuration="FIFTEEN_MINUTES", email="ops@co.com")
 
 ```
 
@@ -2801,7 +2771,7 @@ create(resource_type="anomalies", anomaly_data={
   "email": "finance@company.com"
 })
 
-# Natural language (uses REVENIUM_DEFAULT_EMAIL automatically)
+# Natural language (email optional: defaults to your own email when hosted, REVENIUM_DEFAULT_EMAIL locally)
 create_from_text(text="Alert when monthly OpenAI spending exceeds $2000")
 ```
 
@@ -2811,7 +2781,7 @@ create_from_text(text="Alert when monthly OpenAI spending exceeds $2000")
 For most alert scenarios, convenience methods provide the simplest and most reliable approach:
 ```bash
 # Real-time monitoring
-create_threshold_alert(name="Cost Spike Alert", threshold=100, period_minutes=5)
+create_threshold_alert(name="Cost Spike Alert", threshold=100, period_minutes=15)
 
 # Budget tracking
 create_cumulative_usage_alert(name="Monthly Budget", threshold=1000, period="monthly")
@@ -2892,13 +2862,13 @@ create(resource_type="anomalies", anomaly_data={
 **Best Practices**:
 1. **Always start with** `get_capabilities()` to understand available options
 2. **Use specific methods** like `create_cumulative_usage_alert()` for clarity
-3. **Email notifications**: Set REVENIUM_DEFAULT_EMAIL environment variable or provide email parameter
+3. **Email notifications**: Provide the email parameter, or leave it out to notify the signed-in user's own email on the hosted server, or REVENIUM_DEFAULT_EMAIL on a local server
 4. **Test configurations** with `validate()` before creating alerts
 5. **Monitor alert patterns** with analytics to optimize thresholds
 
 **Common Workflows**:
-• **Setup**: capabilities → examples → create → validate
-• **Investigation**: query → get_metrics → analyze patterns
+• **Setup**: capabilities → examples → validate → create
+• **Investigation**: query → get → list(resource_type="alerts")
 • **Maintenance**: list → update thresholds → bulk enable/disable
 
 **Integration**: Works seamlessly with products, sources, and team management for comprehensive monitoring.""",
@@ -2917,29 +2887,27 @@ create(resource_type="anomalies", anomaly_data={
         Raises:
             ValidationError: If no email can be resolved
         """
-        import os
-
-        # 1. Use provided email if available
         if provided_email and provided_email.strip():
             return provided_email.strip()
 
-        # 2. Fall back to environment variable or discovered configuration
-        from ..config_store import get_discovered_config_sync
+        default_email = default_notification_email()
+        if default_email:
+            return default_email
 
-        # Check environment variable first
-        env_email = os.getenv("REVENIUM_DEFAULT_EMAIL")
-        if env_email and env_email.strip() and env_email != "dummy@email.com":
-            logger.debug(f"Using REVENIUM_DEFAULT_EMAIL: {env_email}")
-            return env_email.strip()
-
-        # Check discovered configuration
-        discovered = get_discovered_config_sync()
-        if discovered.default_email and discovered.default_email.strip():
-            logger.debug(f"Using discovered email: {discovered.default_email}")
-            return discovered.default_email.strip()
-
-        # 3. No email available - raise structured error with clear guidance
+        from ..auth.claims_middleware import current_tenant_context
         from ..exceptions import ValidationError
+
+        if current_tenant_context() is not None:
+            raise ValidationError(
+                message="Email address is required for alert notifications",
+                field="email",
+                expected="Valid email address: your account profile has no email address on file",
+                suggestion="Provide the email parameter; a signed-in request never reads REVENIUM_DEFAULT_EMAIL",
+                example={
+                    "with_email": "create_threshold_alert(name='Alert', threshold=100, email='admin@company.com')",
+                    "best_practice": "MONITORING: Set a dedicated monitoring email for all alerts",
+                },
+            )
 
         raise ValidationError(
             message="Email address is required for alert notifications",
@@ -2955,13 +2923,17 @@ create(resource_type="anomalies", anomaly_data={
         )
 
     def _resolve_notification_config(
-        self, provided_email: Optional[str] = None, slack_config_id: Optional[str] = None
+        self,
+        provided_email: Optional[str] = None,
+        slack_config_id: Optional[str] = None,
+        notification_addresses: Any = None,
     ) -> Dict[str, Any]:
         """Resolve notification configuration with email and Slack support.
 
         Args:
             provided_email: Email provided by user (optional)
             slack_config_id: Slack configuration ID provided by user (optional)
+            notification_addresses: Further recipients provided by user (optional)
 
         Returns:
             Dictionary containing notification configuration
@@ -2969,20 +2941,16 @@ create(resource_type="anomalies", anomaly_data={
         Raises:
             ValidationError: If no email can be resolved
         """
-        config = {}
+        config: Dict[str, Any] = {}
 
-        # Email resolution (existing pattern)
-        email = self._resolve_notification_email(provided_email)
-        config["notificationAddresses"] = [email]
+        recipients = union_recipients(provided_email, notification_addresses)
+        config["notificationAddresses"] = recipients or [self._resolve_notification_email()]
 
         # Slack resolution (new pattern)
         if slack_config_id:
             config["slackConfigurations"] = [slack_config_id]
         else:
-            # Try default Slack configuration
-            from ..config_store import get_config_value
-
-            default_slack = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
+            default_slack = get_default_slack_config_id()
             if default_slack:
                 config["slackConfigurations"] = [default_slack]
                 logger.debug(f"Using default Slack configuration: {default_slack}")
@@ -2990,6 +2958,17 @@ create(resource_type="anomalies", anomaly_data={
                 config["slackConfigurations"] = []
 
         return config
+
+    def _notification_config_or_refuse(
+        self, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """The alert's recipients, or a refusal the MCP envelope flags as an error."""
+        with _refusing_without_an_email():
+            return self._resolve_notification_config(
+                arguments.get("email"),
+                arguments.get("slack_config_id"),
+                arguments.get("notificationAddresses"),
+            )
 
     async def _post_alert_creation_prompting(
         self,
@@ -3035,22 +3014,15 @@ create(resource_type="anomalies", anomaly_data={
         self, client: ReveniumClient, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Create a Budget Threshold alert for budget/quota tracking."""
+        refuse_unhonoured_arguments("create_cumulative_usage_alert", arguments)
         try:
             name = arguments.get("name")
             threshold = arguments.get("threshold")
             period = arguments.get("period", "monthly").lower()
-            provided_email = arguments.get("email")
-            slack_config_id = arguments.get("slack_config_id")
-            # CRITICAL FIX: Add metric type support
-            metric_type = arguments.get("metric", arguments.get("metric_type", "TOTAL_COST"))
+            metric_type = quick_action_metric(arguments)
+            is_percentage = quick_action_is_percentage(arguments)
 
-            # Resolve notification configuration (email + Slack)
-            try:
-                notification_config = self._resolve_notification_config(
-                    provided_email, slack_config_id
-                )
-            except ValidationError as e:
-                return [TextContent(type="text", text=e.format_user_message())]
+            notification_config = self._notification_config_or_refuse(arguments)
 
             # Validation
             if not name:
@@ -3067,31 +3039,33 @@ create(resource_type="anomalies", anomaly_data={
                         ],
                     },
                 )
-                return [TextContent(type="text", text=format_structured_error(error))]
-            if not threshold:
+                raise_structured_error(error)
+            if threshold is None or threshold == "":
                 error = create_structured_missing_parameter_error(
                     parameter_name="threshold",
                     action="create_cumulative_usage_alert",
                     examples={
                         "usage": "create_cumulative_usage_alert(name='Usage Alert', threshold=1000, period='monthly', email='admin@company.com')",
-                        "valid_format": "Threshold should be a positive number",
-                        "example_values": [100, 1000, 5000],
+                        "valid_format": "Threshold should be a number, zero or more",
+                        "example_values": [0, 100, 1000, 5000],
                     },
                 )
-                return [TextContent(type="text", text=format_structured_error(error))]
+                raise_structured_error(error)
 
-            # Validate threshold is a positive number
+            # Validate threshold is a number, zero or more
             try:
+                if isinstance(threshold, bool):
+                    raise TypeError("Threshold must be a number, not true or false")
                 threshold_value = float(threshold)
-                if threshold_value <= 0:
-                    raise ValueError("Threshold must be positive")
+                if threshold_value < 0:
+                    raise ValueError("Threshold must be zero or more")
             except (ValueError, TypeError):
                 error = create_structured_validation_error(
                     message=f"Invalid threshold value: {threshold}",
                     field="threshold",
                     value=threshold,
                     suggestions=[
-                        "Provide a positive numeric threshold value",
+                        "Provide a numeric threshold value, zero or more",
                         "Use a reasonable threshold based on your usage patterns",
                         "Consider your metric scale (e.g., $1000 for monthly costs, 10000 for token counts)",
                     ],
@@ -3102,7 +3076,7 @@ create(resource_type="anomalies", anomaly_data={
                         "quarterly_cost_budget": 5000.0,
                     },
                 )
-                return [TextContent(type="text", text=format_structured_error(error))]
+                raise_structured_error(error)
 
             # Let the API handle metric validation based on UCM capabilities
             if metric_type:
@@ -3139,7 +3113,7 @@ create(resource_type="anomalies", anomaly_data={
                         },
                     },
                 )
-                return [TextContent(type="text", text=format_structured_error(error))]
+                raise_structured_error(error)
 
             # Create anomaly data using correct direct Revenium API format
             anomaly_data = {
@@ -3149,9 +3123,9 @@ create(resource_type="anomalies", anomaly_data={
                 "metricType": metric_type,  # CRITICAL FIX: Use the specified metric type instead of hardcoded TOTAL_COST
                 "operatorType": "GREATER_THAN",
                 "threshold": float(threshold),
-                "isPercentage": False,
+                "isPercentage": is_percentage,
                 "periodDuration": tracking_period,  # For cumulative usage: DAILY, WEEKLY, MONTHLY, QUARTERLY
-                "description": f"Cumulative usage alert for {metric_type} {period} tracking (threshold: {threshold})",
+                "description": f"Cumulative usage alert for {metric_type} {period} tracking (threshold: {_quick_threshold_label(threshold, is_percentage)})",
                 "enabled": True,
                 "notificationAddresses": notification_config["notificationAddresses"],
                 "slackConfigurations": notification_config["slackConfigurations"],
@@ -3185,6 +3159,8 @@ create(resource_type="anomalies", anomaly_data={
 
             return result
 
+        except ToolError:
+            raise
         except Exception as e:
             logger.error(f"Error creating cumulative usage alert: {e}")
             error = ResourceError(
@@ -3199,34 +3175,26 @@ create(resource_type="anomalies", anomaly_data={
                 ],
                 examples={
                     "retry": "Try the same request again",
-                    "validate_first": "validate(alert_data={...}) before creating",
-                    "simple_alert": "Use create_simple_alert() for basic alerts",
+                    "validate_first": "validate(anomaly_data={...}) before creating",
+                    "simple_alert": "Use create_simple() for basic alerts",
                 },
             )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            raise_structured_error(error)
 
     async def _handle_create_threshold_alert(
         self, client: ReveniumClient, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Create a Spike Detection alert for real-time monitoring with optional persistence support."""
+        refuse_unhonoured_arguments("create_threshold_alert", arguments)
         try:
             name = arguments.get("name")
             threshold = arguments.get("threshold")
             period_minutes = arguments.get("period_minutes", 15)
-            provided_email = arguments.get("email")
-            slack_config_id = arguments.get("slack_config_id")
-            # CRITICAL FIX: Add metric type support
-            metric_type = arguments.get("metric", arguments.get("metric_type", "TOTAL_COST"))
-            # NEW: Add triggerAfterPersistsDuration support
+            metric_type = quick_action_metric(arguments)
+            is_percentage = quick_action_is_percentage(arguments)
             trigger_after_persists_duration = arguments.get("triggerAfterPersistsDuration", "")
 
-            # Resolve notification configuration (email + Slack)
-            try:
-                notification_config = self._resolve_notification_config(
-                    provided_email, slack_config_id
-                )
-            except ValidationError as e:
-                return [TextContent(type="text", text=e.format_user_message())]
+            notification_config = self._notification_config_or_refuse(arguments)
 
             # Validation with structured error handling
             if not name:
@@ -3243,29 +3211,31 @@ create(resource_type="anomalies", anomaly_data={
                         ],
                     },
                 )
-            if not threshold:
+            if threshold is None or threshold == "":
                 raise create_structured_missing_parameter_error(
                     parameter_name="threshold",
                     action="create threshold alert",
                     examples={
                         "usage": "create_threshold_alert(name='High Usage', threshold=1000, email='admin@company.com')",
-                        "valid_format": "Threshold should be a positive numeric value",
-                        "example_values": [100, 1000, 5000, 10000],
+                        "valid_format": "Threshold should be a number, zero or more",
+                        "example_values": [0, 100, 1000, 5000, 10000],
                     },
                 )
 
-            # Validate threshold is a positive number
+            # Validate threshold is a number, zero or more
             try:
+                if isinstance(threshold, bool):
+                    raise TypeError("Threshold must be a number, not true or false")
                 threshold_value = float(threshold)
-                if threshold_value <= 0:
-                    raise ValueError("Threshold must be positive")
+                if threshold_value < 0:
+                    raise ValueError("Threshold must be zero or more")
             except (ValueError, TypeError):
                 raise create_structured_validation_error(
-                    message=f"Invalid threshold value: {threshold}",
+                    message=f"Invalid threshold value: {threshold}; use a number, zero or more",
                     field="threshold",
                     value=threshold,
                     suggestions=[
-                        "Provide a positive numeric threshold value",
+                        "Provide a numeric threshold value, zero or more",
                         "Use a reasonable threshold based on your monitoring needs",
                         "Consider your metric scale (e.g., $100 for costs, 1000 for token counts)",
                     ],
@@ -3357,7 +3327,7 @@ create(resource_type="anomalies", anomaly_data={
                     )
 
             # Create anomaly data using correct direct Revenium API format
-            description = f"Threshold alert for {metric_type} monitoring every {period_minutes} minutes (threshold: {threshold})"
+            description = f"Threshold alert for {metric_type} monitoring every {period_minutes} minutes (threshold: {_quick_threshold_label(threshold, is_percentage)})"
             if trigger_after_persists_duration:
                 description += f" with {trigger_after_persists_duration} persistence"
 
@@ -3368,7 +3338,7 @@ create(resource_type="anomalies", anomaly_data={
                 "metricType": metric_type,  # CRITICAL FIX: Use the specified metric type instead of hardcoded TOTAL_COST
                 "operatorType": "GREATER_THAN",
                 "threshold": float(threshold),
-                "isPercentage": False,
+                "isPercentage": is_percentage,
                 "periodDuration": period_duration,
                 "description": description,
                 "enabled": True,
@@ -3415,6 +3385,7 @@ create(resource_type="anomalies", anomaly_data={
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Create alert from natural language text."""
         try:
+            refuse_unhonoured_arguments("create_from_text", arguments)
             text = arguments.get("text")
             if not text:
                 raise create_structured_missing_parameter_error(
@@ -3430,13 +3401,26 @@ create(resource_type="anomalies", anomaly_data={
                         ],
                     },
                 )
+            refuse_an_undecided_threshold(text)
 
-            # Use semantic processor to parse the text
+            notification_config = self._notification_config_or_refuse(arguments)
+
             parsed_data = self.semantic_processor.parse_alert_request(text)
 
-            if not parsed_data or not parsed_data.get("detection_rules"):
-                # Fallback to simple parsing
-                parsed_data = self._simple_parse_alert_text(text)
+            if parsed_data and parsed_data.get("detection_rules"):
+                parsed_data.pop("notification_addresses", None)
+                parsed_data["notificationAddresses"] = notification_config[
+                    "notificationAddresses"
+                ]
+                parsed_data["slackConfigurations"] = notification_config[
+                    "slackConfigurations"
+                ]
+            else:
+                parsed_data = self._simple_parse_alert_text(text, notification_config)
+            if arguments.get("name") is not None:
+                parsed_data["name"] = arguments["name"]
+                if "label" in parsed_data:
+                    parsed_data["label"] = arguments["name"]
 
             # Use AnomalyManager with direct API format validation
             return await self.anomaly_manager.create_anomaly(client, parsed_data)
@@ -3472,7 +3456,9 @@ create(resource_type="anomalies", anomaly_data={
                 },
             )
 
-    def _simple_parse_alert_text(self, text: str) -> Dict[str, Any]:
+    def _simple_parse_alert_text(
+        self, text: str, notification_config: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """Simple fallback parsing for natural language text."""
         text_lower = text.lower()
 
@@ -3551,16 +3537,13 @@ create(resource_type="anomalies", anomaly_data={
                 metric_type = metric
                 break
 
-        # Extract threshold
-        import re
-
-        threshold_match = re.search(r"[\$]?(\d+(?:,\d{3})*(?:\.\d+)?)", text)
-        if threshold_match:
-            # Remove commas and convert to float
-            threshold_str = threshold_match.group(1).replace(",", "")
-            threshold = float(threshold_str)
+        found = threshold_in_text(text)
+        if found:
+            threshold = found.value
+            is_percentage = found.is_percentage
         else:
             threshold = 100.0
+            is_percentage = False
 
         # Generate name from text
         name = (
@@ -3569,30 +3552,8 @@ create(resource_type="anomalies", anomaly_data={
             else f"Auto-generated Alert: {text}"
         )
 
-        # Resolve notification configuration (email + Slack)
-        try:
+        if notification_config is None:
             notification_config = self._resolve_notification_config()
-        except ValidationError:
-            # Fallback to basic email resolution for text parsing
-            import os
-
-            from ..config_store import get_discovered_config_sync
-
-            env_email = os.getenv("REVENIUM_DEFAULT_EMAIL")
-            if env_email and env_email != "dummy@email.com":
-                notification_email = env_email
-            else:
-                # Try discovered configuration
-                discovered = get_discovered_config_sync()
-                if discovered.default_email and discovered.default_email.strip():
-                    notification_email = discovered.default_email
-                else:
-                    notification_email = "admin@example.com"
-
-            notification_config = {
-                "notificationAddresses": [notification_email],
-                "slackConfigurations": [],
-            }
 
         # Build alert data using correct direct Revenium API format
         alert_data = {
@@ -3602,7 +3563,7 @@ create(resource_type="anomalies", anomaly_data={
             "metricType": metric_type,  # CRITICAL FIX: Use parsed metric type instead of hardcoded TOTAL_COST
             "operatorType": "GREATER_THAN",
             "threshold": threshold,
-            "isPercentage": False,
+            "isPercentage": is_percentage,
             "description": f"Alert created from: {text} (metric: {metric_type})",
             "enabled": True,
             "notificationAddresses": notification_config["notificationAddresses"],
@@ -3623,21 +3584,15 @@ create(resource_type="anomalies", anomaly_data={
         self, client: ReveniumClient, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Create a simple alert with smart defaults."""
+        refuse_unhonoured_arguments("create_simple", arguments)
         try:
             name = arguments.get("name", "Simple Alert")
-            provided_email = arguments.get("email")
-            slack_config_id = arguments.get("slack_config_id")
-            metric = arguments.get("metric", "TOTAL_COST")
+            metric = quick_action_metric(arguments)
             threshold = arguments.get("threshold", 100)
             dry_run = arguments.get("dry_run", False)
+            is_percentage = quick_action_is_percentage(arguments)
 
-            # Resolve notification configuration (email + Slack)
-            try:
-                notification_config = self._resolve_notification_config(
-                    provided_email, slack_config_id
-                )
-            except ValidationError as e:
-                return [TextContent(type="text", text=e.format_user_message())]
+            notification_config = self._notification_config_or_refuse(arguments)
 
             # Create simple threshold alert using correct direct Revenium API format
             anomaly_data = {
@@ -3647,7 +3602,7 @@ create(resource_type="anomalies", anomaly_data={
                 "metricType": metric,
                 "operatorType": "GREATER_THAN",
                 "threshold": float(threshold),
-                "isPercentage": False,
+                "isPercentage": is_percentage,
                 "periodDuration": "FIFTEEN_MINUTES",
                 "description": f"Simple alert for {metric} monitoring",
                 "enabled": True,
@@ -3658,12 +3613,16 @@ create(resource_type="anomalies", anomaly_data={
             }
 
             if dry_run:
+                try:
+                    api_data = self.anomaly_manager.prepare_create(anomaly_data, client.team_id)
+                except ValidationError as exc:
+                    raise_refusal(exc.format_user_message(), error_code=exc.error_code)
                 preview = {
                     "dry_run": True,
                     "operation": "create_simple",
                     "valid": True,
                     "message": "**Dry Run Successful**: Simple alert is valid and ready for creation",
-                    "would_create": anomaly_data,
+                    "would_create": api_data,
                 }
                 return [
                     TextContent(
@@ -3725,22 +3684,19 @@ create(resource_type="anomalies", anomaly_data={
                 },
             )
 
-        operator_note = ""
         try:
-            # Get current anomaly data and update enabled field
             current_anomaly = await client.get_anomaly_by_id(str(anomaly_id))
-            operator_note = _stored_operator_note(current_anomaly)
-            update_data = current_anomaly.copy()
-            update_data["enabled"] = True
-            updated_anomaly = await client.update_anomaly(str(anomaly_id), update_data)
+            updated_anomaly = await _put_enabled(
+                client, str(anomaly_id), current_anomaly, True, "enable"
+            )
 
             return [
                 TextContent(
                     type="text",
                     text=f"**Alert Enabled Successfully**\n\n"
-                    f"**Name**: {updated_anomaly.get('name', 'Unnamed')}\n"
+                    f"**Name**: {updated_anomaly.get('name') or 'Unnamed'}\n"
                     f"**ID**: `{anomaly_id}`\n"
-                    f"**Status**: Now enabled and monitoring{operator_note}",
+                    f"**Status**: Now enabled and monitoring",
                 )
             ]
 
@@ -3760,13 +3716,12 @@ create(resource_type="anomalies", anomaly_data={
                     "Check API connectivity and authentication",
                     "Ensure the alert is not already enabled",
                     "Use list() to verify the alert exists before enabling",
-                    "Try get_anomaly_status() to check current state",
-                ]
-                + ([operator_note.strip()] if operator_note else []),
+                    "Try get_status() to check current state",
+                ],
                 examples={
                     "verification_steps": [
                         "list()",
-                        "get_anomaly_status()",
+                        "get_status()",
                         "enable(anomaly_id='valid_id')",
                     ],
                     "troubleshooting": [
@@ -3796,22 +3751,19 @@ create(resource_type="anomalies", anomaly_data={
                 },
             )
 
-        operator_note = ""
         try:
-            # Get current anomaly data and update enabled field
             current_anomaly = await client.get_anomaly_by_id(str(anomaly_id))
-            operator_note = _stored_operator_note(current_anomaly)
-            update_data = current_anomaly.copy()
-            update_data["enabled"] = False
-            updated_anomaly = await client.update_anomaly(str(anomaly_id), update_data)
+            updated_anomaly = await _put_enabled(
+                client, str(anomaly_id), current_anomaly, False, "disable"
+            )
 
             return [
                 TextContent(
                     type="text",
                     text=f"**Alert Disabled Successfully**\n\n"
-                    f"**Name**: {updated_anomaly.get('name', 'Unnamed')}\n"
+                    f"**Name**: {updated_anomaly.get('name') or 'Unnamed'}\n"
                     f"**ID**: `{anomaly_id}`\n"
-                    f"**Status**: Now disabled and not monitoring{operator_note}",
+                    f"**Status**: Now disabled and not monitoring",
                 )
             ]
 
@@ -3831,13 +3783,12 @@ create(resource_type="anomalies", anomaly_data={
                     "Check API connectivity and authentication",
                     "Ensure the alert is not already disabled",
                     "Use list() to verify the alert exists before disabling",
-                    "Try get_anomaly_status() to check current state",
-                ]
-                + ([operator_note.strip()] if operator_note else []),
+                    "Try get_status() to check current state",
+                ],
                 examples={
                     "verification_steps": [
                         "list()",
-                        "get_anomaly_status()",
+                        "get_status()",
                         "disable(anomaly_id='valid_id')",
                     ],
                     "troubleshooting": [
@@ -3870,35 +3821,7 @@ create(resource_type="anomalies", anomaly_data={
                 },
             )
 
-        results = []
-        successful = 0
-        failed = 0
-
-        for anomaly_id in anomaly_ids:
-            try:
-                current_anomaly = await client.get_anomaly_by_id(anomaly_id)
-                update_data = current_anomaly.copy()
-                update_data["enabled"] = True
-                updated_anomaly = await client.update_anomaly(anomaly_id, update_data)
-                results.append(f"Success: {updated_anomaly.get('name', anomaly_id)}")
-                successful += 1
-            except ToolError:
-                # Re-raise ToolError exceptions without modification
-                # This preserves helpful error messages with specific suggestions
-                raise
-            except Exception as e:
-                results.append(f"Failed: {anomaly_id}: {str(e)}")
-                failed += 1
-
-        result_text = (
-            f"**Bulk Enable Results**\n\n"
-            f"**Total Processed:** {len(anomaly_ids)}\n"
-            f"**Successful:** {successful}\n"
-            f"**Failed:** {failed}\n\n"
-            f"**Details:**\n" + "\n".join(results)
-        )
-
-        return [TextContent(type="text", text=result_text)]
+        return await self._set_listed_anomalies_enabled(client, anomaly_ids, enabled=True)
 
     async def _handle_disable_multiple(
         self, client: ReveniumClient, arguments: Dict[str, Any]
@@ -3921,6 +3844,13 @@ create(resource_type="anomalies", anomaly_data={
                 },
             )
 
+        return await self._set_listed_anomalies_enabled(client, anomaly_ids, enabled=False)
+
+    async def _set_listed_anomalies_enabled(
+        self, client: ReveniumClient, anomaly_ids: List[str], *, enabled: bool
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Set ``enabled`` on each listed alert, skipping any whose stored values a rule refuses."""
+        verb = "Enable" if enabled else "Disable"
         results = []
         successful = 0
         failed = 0
@@ -3928,10 +3858,14 @@ create(resource_type="anomalies", anomaly_data={
         for anomaly_id in anomaly_ids:
             try:
                 current_anomaly = await client.get_anomaly_by_id(anomaly_id)
-                update_data = current_anomaly.copy()
-                update_data["enabled"] = False
-                updated_anomaly = await client.update_anomaly(anomaly_id, update_data)
-                results.append(f"Success: {updated_anomaly.get('name', anomaly_id)}")
+                body = {**current_anomaly, "enabled": enabled}
+                breach = stored_alert_refusal(body, current_anomaly, verb.lower())
+                if breach is not None:
+                    results.append(f"Failed: {anomaly_id}: {breach.message}")
+                    failed += 1
+                    continue
+                updated_anomaly = await client.update_anomaly(anomaly_id, body)
+                results.append(f"Success: {alert_label(updated_anomaly.get('name'), anomaly_id)}")
                 successful += 1
             except ToolError:
                 # Re-raise ToolError exceptions without modification
@@ -3942,14 +3876,14 @@ create(resource_type="anomalies", anomaly_data={
                 failed += 1
 
         result_text = (
-            f"**Bulk Disable Results**\n\n"
+            f"**Bulk {verb} Results**\n\n"
             f"**Total Processed:** {len(anomaly_ids)}\n"
             f"**Successful:** {successful}\n"
             f"**Failed:** {failed}\n\n"
             f"**Details:**\n" + "\n".join(results)
         )
 
-        return [TextContent(type="text", text=result_text)]
+        return _bulk_answer(result_text, successful, failed)
 
     async def _handle_enable_all_anomalies(
         self, client: ReveniumClient, arguments: Dict[str, Any]
@@ -3957,7 +3891,7 @@ create(resource_type="anomalies", anomaly_data={
         """Enable all anomalies/alerts."""
         confirm = arguments.get("confirm")
 
-        if not confirm:
+        if confirm is not True:
             return [
                 TextContent(
                     type="text",
@@ -3972,57 +3906,7 @@ create(resource_type="anomalies", anomaly_data={
             ]
 
         try:
-            # Get all anomalies
-            response = await client.get_anomalies(page=0, size=1000)
-            anomalies = client._extract_embedded_data(response)
-
-            if not anomalies:
-                return [
-                    TextContent(
-                        type="text",
-                        text="**No alerts found**\n\nThere are no alerts in the system to enable.",
-                    )
-                ]
-
-            results = []
-            successful = 0
-            failed = 0
-            already_enabled = 0
-
-            for anomaly in anomalies:
-                anomaly_id = anomaly.get("id")
-                anomaly_name = anomaly.get("name", f"Alert {anomaly_id}")
-
-                if anomaly.get("enabled", True):
-                    already_enabled += 1
-                    continue
-
-                try:
-                    current_anomaly = await client.get_anomaly_by_id(str(anomaly_id))
-                    update_data = current_anomaly.copy()
-                    update_data["enabled"] = True
-                    await client.update_anomaly(str(anomaly_id), update_data)
-                    results.append(f"Enabled: {anomaly_name}")
-                    successful += 1
-                except Exception as e:
-                    results.append(f"Failed: {anomaly_name}: {str(e)}")
-                    failed += 1
-
-            result_text = (
-                f"**Enable All Alerts - Complete**\n\n"
-                f"**Total Alerts:** {len(anomalies)}\n"
-                f"**Enabled:** {successful}\n"
-                f"**Already Enabled:** {already_enabled}\n"
-                f"**Failed:** {failed}\n\n"
-                f"**Summary:** {successful + already_enabled} alerts are now active"
-            )
-
-            if results:
-                result_text += "\n\n**Details:**\n" + "\n".join(results[:10])  # Limit to first 10
-                if len(results) > 10:
-                    result_text += f"\n... and {len(results) - 10} more"
-
-            return [TextContent(type="text", text=result_text)]
+            return await self._set_every_anomaly_enabled(client, enabled=True)
 
         except ToolError:
             # Re-raise ToolError exceptions without modification
@@ -4055,7 +3939,7 @@ create(resource_type="anomalies", anomaly_data={
         """Disable all anomalies/alerts."""
         confirm = arguments.get("confirm")
 
-        if not confirm:
+        if confirm is not True:
             return [
                 TextContent(
                     type="text",
@@ -4071,57 +3955,7 @@ create(resource_type="anomalies", anomaly_data={
             ]
 
         try:
-            # Get all anomalies
-            response = await client.get_anomalies(page=0, size=1000)
-            anomalies = client._extract_embedded_data(response)
-
-            if not anomalies:
-                return [
-                    TextContent(
-                        type="text",
-                        text="**No alerts found**\n\nThere are no alerts in the system to disable.",
-                    )
-                ]
-
-            results = []
-            successful = 0
-            failed = 0
-            already_disabled = 0
-
-            for anomaly in anomalies:
-                anomaly_id = anomaly.get("id")
-                anomaly_name = anomaly.get("name", f"Alert {anomaly_id}")
-
-                if not anomaly.get("enabled", True):
-                    already_disabled += 1
-                    continue
-
-                try:
-                    current_anomaly = await client.get_anomaly_by_id(str(anomaly_id))
-                    update_data = current_anomaly.copy()
-                    update_data["enabled"] = False
-                    await client.update_anomaly(str(anomaly_id), update_data)
-                    results.append(f"Disabled: {anomaly_name}")
-                    successful += 1
-                except Exception as e:
-                    results.append(f"Failed: {anomaly_name}: {str(e)}")
-                    failed += 1
-
-            result_text = (
-                f"**Disable All Alerts - Complete**\n\n"
-                f"**Total Alerts:** {len(anomalies)}\n"
-                f"**Disabled:** {successful}\n"
-                f"**Already Disabled:** {already_disabled}\n"
-                f"**Failed:** {failed}\n\n"
-                f"**Summary:** {successful + already_disabled} alerts are now inactive"
-            )
-
-            if results:
-                result_text += "\n\n**Details:**\n" + "\n".join(results[:10])  # Limit to first 10
-                if len(results) > 10:
-                    result_text += f"\n... and {len(results) - 10} more"
-
-            return [TextContent(type="text", text=result_text)]
+            return await self._set_every_anomaly_enabled(client, enabled=False)
 
         except ToolError:
             # Re-raise ToolError exceptions without modification
@@ -4151,6 +3985,68 @@ create(resource_type="anomalies", anomaly_data={
                 },
             )
 
+    async def _set_every_anomaly_enabled(
+        self, client: ReveniumClient, *, enabled: bool
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Set ``enabled`` on every alert of the team and report how far it got."""
+        verb, state = ("Enable", "active") if enabled else ("Disable", "inactive")
+        done_label = "Enabled" if enabled else "Disabled"
+        inventory = await read_every_anomaly(client)
+
+        if not inventory.anomalies and inventory.complete:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"**No alerts found**\n\nThere are no alerts in the system to {verb.lower()}.",
+                )
+            ]
+
+        results = []
+        successful = 0
+        failed = 0
+        already_set = 0
+
+        for anomaly in inventory.anomalies:
+            anomaly_id = anomaly.get("id")
+            anomaly_name = alert_label(anomaly.get("name"), anomaly_id)
+
+            if bool(anomaly.get("enabled", True)) == enabled:
+                already_set += 1
+                continue
+
+            try:
+                current_anomaly = await client.get_anomaly_by_id(str(anomaly_id))
+                body = {**current_anomaly, "enabled": enabled}
+                breach = stored_alert_refusal(body, current_anomaly, verb.lower())
+                if breach is not None:
+                    results.append(f"Failed: {anomaly_name}: {breach.message}")
+                    failed += 1
+                    continue
+                await client.update_anomaly(str(anomaly_id), body)
+                results.append(f"{done_label}: {anomaly_name}")
+                successful += 1
+            except Exception as e:
+                results.append(f"Failed: {anomaly_name}: {str(e)}")
+                failed += 1
+
+        heading = "Complete" if inventory.complete else "Partial"
+        result_text = (
+            f"**{verb} All Alerts - {heading}**\n\n"
+            f"**Total Alerts:** {inventory.total}\n"
+            f"**{done_label}:** {successful}\n"
+            f"**Already {done_label}:** {already_set}\n"
+            f"**Failed:** {failed}\n\n"
+            f"**Summary:** {successful + already_set} of {inventory.total} alerts are now {state}"
+        )
+        result_text += inventory.coverage_note(f"alerts were {done_label.lower()}")
+
+        if results:
+            result_text += "\n\n**Details:**\n" + "\n".join(results[:10])
+            if len(results) > 10:
+                result_text += f"\n... and {len(results) - 10} more"
+
+        return _bulk_answer(result_text, successful, failed)
+
     async def _handle_toggle_anomaly_status(
         self, client: ReveniumClient, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
@@ -4174,9 +4070,9 @@ create(resource_type="anomalies", anomaly_data={
             current_status = current_anomaly.get("enabled", True)
             new_status = not current_status
 
-            update_data = current_anomaly.copy()
-            update_data["enabled"] = new_status
-            updated_anomaly = await client.update_anomaly(str(anomaly_id), update_data)
+            updated_anomaly = await _put_enabled(
+                client, str(anomaly_id), current_anomaly, new_status, "toggle"
+            )
 
             status_text = "enabled" if new_status else "disabled"
 
@@ -4184,7 +4080,7 @@ create(resource_type="anomalies", anomaly_data={
                 TextContent(
                     type="text",
                     text=f"**Alert Status Toggled**\n\n"
-                    f"**Name**: {updated_anomaly.get('name', 'Unnamed')}\n"
+                    f"**Name**: {updated_anomaly.get('name') or 'Unnamed'}\n"
                     f"**ID**: `{anomaly_id}`\n"
                     f"**Previous Status**: {'Enabled' if current_status else 'Disabled'}\n"
                     f"**New Status**: {'Enabled' if new_status else 'Disabled'}\n\n"
@@ -4206,7 +4102,7 @@ create(resource_type="anomalies", anomaly_data={
                 suggestions=[
                     "Verify the anomaly_id exists and is valid",
                     "Check API connectivity and authentication",
-                    "Use get_anomaly_status() to check current state before toggling",
+                    "Use get_status() to check current state before toggling",
                     "Try enable() or disable() directly instead of toggle",
                     "Use list() to verify the alert exists",
                 ],
@@ -4216,7 +4112,7 @@ create(resource_type="anomalies", anomaly_data={
                         "disable(anomaly_id='alert-123')",
                     ],
                     "verification_steps": [
-                        "get_anomaly_status()",
+                        "get_status()",
                         "list()",
                         "toggle_status(anomaly_id='valid_id')",
                     ],
@@ -4229,11 +4125,10 @@ create(resource_type="anomalies", anomaly_data={
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Get the current enabled/disabled status of anomalies."""
         try:
-            # Get all anomalies
-            response = await client.get_anomalies(page=0, size=1000)
-            anomalies = client._extract_embedded_data(response)
+            inventory = await read_every_anomaly(client)
+            anomalies = inventory.anomalies
 
-            if not anomalies:
+            if not anomalies and inventory.complete:
                 return [
                     TextContent(
                         type="text",
@@ -4247,7 +4142,7 @@ create(resource_type="anomalies", anomaly_data={
 
             for anomaly in anomalies:
                 anomaly_id = anomaly.get("id")
-                anomaly_name = anomaly.get("name", f"Alert {anomaly_id}")
+                anomaly_name = anomaly.get("name") or f"Alert {anomaly_id}"
                 enabled = anomaly.get("enabled", True)
 
                 if enabled:
@@ -4261,10 +4156,12 @@ create(resource_type="anomalies", anomaly_data={
 
             result_text = (
                 f"**Alert Status Summary**\n\n"
-                f"**Total Alerts:** {len(anomalies)}\n"
+                f"**Total Alerts:** {inventory.total}\n"
                 f"**Enabled:** {enabled_count}\n"
-                f"**Disabled:** {disabled_count}\n\n"
-                f"**Individual Status:**\n" + "\n".join(status_list[:20])  # Limit to first 20
+                f"**Disabled:** {disabled_count}"
+                + inventory.coverage_note("the enabled and disabled counts are")
+                + "\n\n**Individual Status:**\n"
+                + "\n".join(status_list[:20])
             )
 
             if len(status_list) > 20:
@@ -4291,7 +4188,7 @@ create(resource_type="anomalies", anomaly_data={
                     "Check if the alert management service is running",
                 ],
                 examples={
-                    "verification_steps": ["list()", "get_capabilities()", "get_anomaly_status()"],
+                    "verification_steps": ["list()", "get_capabilities()", "get_status()"],
                     "troubleshooting": [
                         "Test API connectivity",
                         "Verify authentication",
@@ -4751,15 +4648,15 @@ create(resource_type="anomalies", anomaly_data={
                 # Optional alert configuration
                 "period": {
                     "type": "string",
-                    "description": "Period for cumulative usage alerts (daily, weekly, monthly, quarterly)",
+                    "description": "Period for budget alerts (daily, weekly, monthly, quarterly); on update, any other alert takes the periodDuration values it accepts, in lower case (for example weekly or thirty_days)",
                 },
                 "period_minutes": {
                     "anyOf": [{"type": "number"}, {"type": "string"}],
-                    "description": "Check frequency in minutes for threshold alerts (default: 5)",
+                    "description": "Check frequency in minutes for threshold alerts (default: 15)",
                 },
                 "email": {
                     "type": "string",
-                    "description": "Email for notifications (optional if REVENIUM_DEFAULT_EMAIL is set)",
+                    "description": "Email for notifications (optional: defaults to the signed-in user's own email on the hosted server, or REVENIUM_DEFAULT_EMAIL on a local server)",
                 },
                 "slack_config_id": {
                     "type": "string",
@@ -4780,7 +4677,15 @@ create(resource_type="anomalies", anomaly_data={
                 },
                 "periodDuration": {
                     "type": "string",
-                    "description": "Evaluation window for THRESHOLD/RELATIVE_CHANGE or accumulation period for CUMULATIVE_USAGE (FIFTEEN_MINUTES, THIRTY_MINUTES, ONE_HOUR, TWELVE_HOURS, DAILY, WEEKLY, MONTHLY, QUARTERLY). Sub-fifteen-minute windows are CUMULATIVE_USAGE only",
+                    "description": (
+                        "Evaluation window for THRESHOLD/RELATIVE_CHANGE or accumulation period "
+                        f"for CUMULATIVE_USAGE ({', '.join(platform_periods_for('THRESHOLD', None))}). "
+                        "Nothing under FIFTEEN_MINUTES is accepted. CUMULATIVE_USAGE takes "
+                        f"{', '.join(platform_periods_for('CUMULATIVE_USAGE', None))} only, a THRESHOLD alert "
+                        "with dataSource PROVIDER takes "
+                        f"{', '.join(platform_periods_for('THRESHOLD', 'PROVIDER'))} only, and a "
+                        "RELATIVE_CHANGE alert cannot use dataSource PROVIDER"
+                    ),
                 },
                 "description": {
                     "type": "string",

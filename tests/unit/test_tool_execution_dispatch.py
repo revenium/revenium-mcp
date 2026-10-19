@@ -18,7 +18,12 @@ from src.revenium_mcp_server.capability_manager.integration_service import (
     ucm_integration_service,
 )
 from src.revenium_mcp_server.common import tool_execution
-from src.revenium_mcp_server.common.error_handling import IntrospectionError
+from src.revenium_mcp_server.common.error_handling import (
+    ErrorCodes,
+    IntrospectionError,
+    ToolError,
+    ToolNotFoundError,
+)
 from src.revenium_mcp_server.introspection.integration import (
     introspection_integration,
 )
@@ -53,7 +58,7 @@ async def test_permission_error_skips_direct_fallback(monkeypatch):
             direct_calls["count"] += 1
             return [TextContent(type="text", text="must not run")]
 
-    async def _raise_permission(tool_name, action, arguments):
+    async def _raise_permission(tool_name, action, arguments, ctx=None):
         raise PermissionError(_AUTH_ERROR)
 
     monkeypatch.setattr(
@@ -61,6 +66,37 @@ async def test_permission_error_skips_direct_fallback(monkeypatch):
     )
 
     with pytest.raises(PermissionError, match="Tenant context unavailable"):
+        await tool_execution.standardized_tool_execution(
+            tool_name="fake_tool",
+            action="list",
+            arguments={},
+            tool_class=FakeTool,
+        )
+    assert direct_calls["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_tool_error_skips_direct_fallback(monkeypatch):
+    """A handler refusal on the introspection path must reach the caller and
+    must NOT trigger a second platform call via the direct fallback."""
+    direct_calls = {"count": 0}
+
+    class FakeTool:
+        def __init__(self, ucm_helper=None):
+            pass
+
+        async def handle_action(self, action, arguments, ctx=None):
+            direct_calls["count"] += 1
+            return [TextContent(type="text", text="must not run")]
+
+    async def _raise_refusal(tool_name, action, arguments, ctx=None):
+        raise ToolError("platform said no", suggestions=["try again later"])
+
+    monkeypatch.setattr(
+        introspection_integration, "handle_tool_execution", _raise_refusal
+    )
+
+    with pytest.raises(ToolError, match="platform said no"):
         await tool_execution.standardized_tool_execution(
             tool_name="fake_tool",
             action="list",
@@ -82,7 +118,7 @@ async def test_permission_error_from_direct_fallback_propagates(monkeypatch):
         async def handle_action(self, action, arguments, ctx=None):
             raise PermissionError(_AUTH_ERROR)
 
-    async def _raise_introspection(tool_name, action, arguments):
+    async def _raise_introspection(tool_name, action, arguments, ctx=None):
         raise IntrospectionError(
             "introspection unavailable", tool_name=tool_name, action=action
         )
@@ -114,7 +150,7 @@ async def test_contextvar_ctx_reaches_direct_fallback(monkeypatch):
             seen["ctx"] = ctx
             return [TextContent(type="text", text="ok")]
 
-    async def _raise_introspection(tool_name, action, arguments):
+    async def _raise_introspection(tool_name, action, arguments, ctx=None):
         raise IntrospectionError(
             "introspection unavailable", tool_name=tool_name, action=action
         )
@@ -159,3 +195,104 @@ async def test_handle_tool_execution_reraises_permission_error(monkeypatch):
         await introspection_integration.handle_tool_execution(
             "fake_tool", "list", {}
         )
+
+
+@pytest.mark.asyncio
+async def test_registered_provider_receives_the_resolved_context(monkeypatch):
+    """BACK-4633: the introspection path every registered tool takes first must
+    hand the provider the tenant context standardized_tool_execution resolved."""
+    seen = {}
+
+    class RecordingProvider:
+        async def handle_action(self, action, arguments, ctx=None):
+            seen["ctx"] = ctx
+            return [TextContent(type="text", text="ok")]
+
+    async def _get_provider(tool_name):
+        return RecordingProvider()
+
+    monkeypatch.setattr(
+        introspection_integration.engine.registry, "get_provider", _get_provider
+    )
+
+    ctx = TenantContext(team_id="team_a", api_key="hak_tenant_a")
+    token = _current_tenant.set(ctx)
+    try:
+        result = await tool_execution.standardized_tool_execution(
+            tool_name="fake_tool",
+            action="list",
+            arguments={},
+            tool_class=object,
+        )
+    finally:
+        _current_tenant.reset(token)
+
+    assert result[0].text == "ok"
+    assert seen["ctx"] is ctx
+
+
+@pytest.mark.asyncio
+async def test_tool_error_from_introspection_is_raised_once(monkeypatch):
+    """A ToolError the action raised on the introspection path is the answer.
+    It must reach the caller as-is, without re-running the whole action on a
+    fresh tool instance through the direct fallback (a second round of
+    platform calls and waits for the same error)."""
+    runs = {"introspection": 0, "direct": 0}
+
+    class FakeTool:
+        def __init__(self, ucm_helper=None):
+            pass
+
+        async def handle_action(self, action, arguments, ctx=None):
+            runs["direct"] += 1
+            return [TextContent(type="text", text="must not run")]
+
+    async def _raise_tool_error(tool_name, action, arguments, ctx=None):
+        runs["introspection"] += 1
+        raise ToolError(
+            message="Transaction lookup failed", error_code=ErrorCodes.API_ERROR
+        )
+
+    monkeypatch.setattr(
+        introspection_integration, "handle_tool_execution", _raise_tool_error
+    )
+
+    with pytest.raises(ToolError, match="Transaction lookup failed") as raised:
+        await tool_execution.standardized_tool_execution(
+            tool_name="fake_tool",
+            action="lookup_transactions",
+            arguments={},
+            tool_class=FakeTool,
+        )
+    assert raised.value.error_code == ErrorCodes.API_ERROR
+    assert runs == {"introspection": 1, "direct": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        IntrospectionError("introspection unavailable", tool_name="t", action="a"),
+        ToolNotFoundError("not registered", tool_name="t", action="a"),
+    ],
+)
+async def test_introspection_failures_still_fall_back(monkeypatch, error):
+    """Introspection-layer failures are not ToolErrors and still fall back to
+    direct execution."""
+
+    class FakeTool:
+        def __init__(self, ucm_helper=None):
+            pass
+
+        async def handle_action(self, action, arguments, ctx=None):
+            return [TextContent(type="text", text="direct ok")]
+
+    async def _raise(tool_name, action, arguments, ctx=None):
+        raise error
+
+    monkeypatch.setattr(introspection_integration, "handle_tool_execution", _raise)
+
+    result = await tool_execution.standardized_tool_execution(
+        tool_name="fake_tool", action="list", arguments={}, tool_class=FakeTool
+    )
+    assert result[0].text == "direct ok"

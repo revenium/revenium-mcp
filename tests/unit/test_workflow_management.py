@@ -12,6 +12,7 @@ from src.revenium_mcp_server.tools_decomposed.workflow_management import (
     WorkflowManager,
     WorkflowValidator,
 )
+from src.revenium_mcp_server.auth.tenant_scope import LOCAL_TENANT_SCOPE
 from src.revenium_mcp_server.common.error_handling import ToolError
 
 
@@ -70,11 +71,34 @@ class TestHandleActionRouting:
         assert "nonexistent" in str(exc_info.value)
 
     @pytest.mark.asyncio
-    async def test_validate_action_returns_deprecation_notice(self, wf_tool):
-        """validate action returns a deprecation message."""
-        result = await wf_tool.handle_action("validate", {})
-        text = result[0].text
-        assert "Deprecated" in text
+    async def test_every_key_action_in_the_description_is_supported(self, wf_tool):
+        """The description is what every assistant reads in the tool list."""
+        description = WorkflowManagement.tool_description
+        listed = description.split("Key actions:", 1)[-1].split(".", 1)[0]
+        key_actions = [name.strip() for name in listed.split(",") if name.strip()]
+        supported = await wf_tool._get_supported_actions()
+
+        assert "start" in key_actions
+        assert [name for name in key_actions if name not in supported] == []
+
+    @pytest.mark.asyncio
+    async def test_no_hint_names_an_unsupported_action(self, wf_tool):
+        """An error hint that names a missing action sends an assistant from
+        one refusal straight to another."""
+        import ast
+        import re
+        from pathlib import Path
+
+        import src.revenium_mcp_server.tools_decomposed.workflow_management as module
+
+        supported = set(await wf_tool._get_supported_actions()) | {"manage_workflows"}
+        named = set()
+        for node in ast.walk(ast.parse(Path(module.__file__).read_text())):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                named |= set(re.findall(r"(?<![\w.])([a-z_][a-z0-9_]*)\(", node.value))
+
+        assert "start" in named
+        assert sorted(named - supported) == []
 
     @pytest.mark.asyncio
     async def test_list_returns_json(self, wf_tool):
@@ -186,7 +210,7 @@ class TestWorkflowManagerLifecycle:
         )
         assert result["type"] == "generic"
         assert result["status"] == "started"
-        assert result["id"] in wf_manager.active_workflows
+        assert wf_manager.active_workflows.contains(LOCAL_TENANT_SCOPE, result["id"])
 
     @pytest.mark.asyncio
     async def test_start_templated_workflow(self, wf_manager):
@@ -401,11 +425,12 @@ class TestWorkflowIdEntropy:
 class TestWorkflowEviction:
     @pytest.mark.asyncio
     async def test_active_workflows_capped_with_fifo_eviction(self):
-        """Once active_workflows hits MAX_ACTIVE_WORKFLOWS, the oldest entry
+        """Once active_workflows hits its max_entries, the oldest entry
         must be evicted (FIFO) so memory does not grow unbounded."""
         manager = WorkflowManager()
-        original_max = WorkflowManager.MAX_ACTIVE_WORKFLOWS
-        WorkflowManager.MAX_ACTIVE_WORKFLOWS = 3
+        store = WorkflowManager.active_workflows
+        original_max = store.max_entries
+        store.max_entries = 3
         try:
             first = await manager.start_workflow(
                 {"workflow_type": "generic", "context": {}}
@@ -419,13 +444,10 @@ class TestWorkflowEviction:
             fourth = await manager.start_workflow(
                 {"workflow_type": "generic", "context": {}}
             )
-            assert first["id"] not in manager.active_workflows
-            assert second["id"] in manager.active_workflows
-            assert third["id"] in manager.active_workflows
-            assert fourth["id"] in manager.active_workflows
-            assert len(manager.active_workflows) == 3
+            assert store.ids(LOCAL_TENANT_SCOPE) == [second["id"], third["id"], fourth["id"]]
+            assert first["id"] not in store.ids(LOCAL_TENANT_SCOPE)
         finally:
-            WorkflowManager.MAX_ACTIVE_WORKFLOWS = original_max
+            store.max_entries = original_max
 
 
 class TestWorkflowValidator:
@@ -518,6 +540,6 @@ class TestStartContractHardening:
         result = await wf_manager.complete_step(
             {"workflow_id": wf["id"], "step_result": {"ok": True}}
         )
-        completed = wf_manager.active_workflows[wf["id"]]["completed_steps"][0]
+        completed = wf_manager.active_workflows.get(LOCAL_TENANT_SCOPE, wf["id"])["completed_steps"][0]
         assert "timestamp" not in completed["completed_at"]
         datetime.fromisoformat(completed["completed_at"])

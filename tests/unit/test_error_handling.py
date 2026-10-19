@@ -10,6 +10,7 @@ from src.revenium_mcp_server.error_handlers import (
     translate_http_error, validate_required_params, validate_anomaly_id,
     validate_alert_id, validate_pagination_params
 )
+from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
 from mcp.types import TextContent
 
@@ -205,10 +206,10 @@ class TestErrorHandlingDecorator:
 
         # Test with invalid action - empty anomaly_id handled by validation
         arguments = {"anomaly_id": ""}
-        result = await alert_tools.handle_action("get", arguments)
+        with pytest.raises(ToolError) as exc_info:
+            await alert_tools.handle_action("get", arguments)
 
-        assert len(result) >= 1
-        assert isinstance(result[0], TextContent)
+        assert "anomaly_id" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_decorator_handles_validation_errors(self):

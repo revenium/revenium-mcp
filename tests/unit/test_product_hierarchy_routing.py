@@ -6,13 +6,11 @@ Covers:
 - ProductHierarchyManager.create_with_subscription (coordinated creation)
 - ProductHierarchyManager.get_subscriptions / get_related_credentials
 - ProductManagement._handle_discovery_validation_actions
-- ProductManagement._handle_enhanced_features
 - ProductManagement._handle_hierarchy_actions
-- ProductManagement._handle_create_from_description_dry_run
 - ProductManagement._handle_get_capabilities / _build_enhanced_capabilities_text
-- ProductManagement._generate_educational_feedback
 """
 
+import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import dataclass
@@ -20,11 +18,15 @@ from typing import Any, Dict, List, Optional
 
 from mcp.types import TextContent
 
+from src.revenium_mcp_server.api_field_mapper import APIFieldMapper
+from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.tools_decomposed.product_management import (
+    CreatePayload,
     ProductHierarchyManager,
     ProductManagement,
+    ProductManager,
 )
-from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +43,7 @@ class FakeNavigationResult:
     navigation_path: List[str] = None
     metadata: Dict[str, Any] = None
     error_message: Optional[str] = None
+    incomplete: bool = False
 
     def __post_init__(self):
         if self.related_entities is None:
@@ -86,6 +89,27 @@ class FakeValidationResult:
             self.metadata = {}
 
 
+_PAGE_FAILURE_TEXT = (
+    "Could not read subscriptions page 1 (502 Bad Gateway). The subscription list "
+    "is incomplete, so no answer was built from the pages read before it. "
+    "Retry the request."
+)
+
+
+def _incomplete_walk():
+    return FakeNavigationResult(
+        success=False, incomplete=True, error_message=_PAGE_FAILURE_TEXT
+    )
+
+
+def _assert_retryable_walk_failure(error):
+    assert error.error_code == ErrorCodes.API_ERROR
+    assert "subscriptions page 1" in error.message
+    assert "incomplete" in error.message
+    assert any("Retry" in s for s in error.suggestions)
+    assert not any("Verify the product ID exists" in s for s in error.suggestions)
+
+
 def _make_client():
     """Build a fully-mocked ReveniumClient."""
     client = MagicMock()
@@ -101,6 +125,7 @@ def _make_client():
     client.get_sources = AsyncMock(return_value={})
     client.get_metering_element_definitions = AsyncMock(return_value={})
     client.get_organizations = AsyncMock(return_value={})
+    client.get_organization_by_id = AsyncMock(return_value={"id": "org_1"})
     client._extract_embedded_data = MagicMock(return_value=[])
     client._extract_pagination_info = MagicMock(
         return_value={"totalPages": 1, "totalElements": 0}
@@ -156,6 +181,7 @@ def _valid_subscription_data():
     return {
         "name": "Customer Subscription",
         "clientEmailAddress": "customer@company.com",
+        "organizationId": "org_1",
     }
 
 
@@ -182,6 +208,22 @@ class TestValidateCreateWithSubscriptionParameters:
                 {"product_data": {"name": "prod"}}
             )
         assert "subscription_data" in str(exc_info.value)
+
+    @pytest.mark.parametrize("missing", ["name", "clientEmailAddress"])
+    def test_every_subscription_example_names_the_organization(self, missing):
+        mgr = _make_hierarchy_manager()
+        subscription = {
+            "name": "Customer Subscription",
+            "clientEmailAddress": "customer@company.com",
+            "organizationId": "org_1",
+        }
+        del subscription[missing]
+        with pytest.raises(ToolError) as exc_info:
+            mgr._validate_required_fields(
+                {"name": "P", "version": "1.0.0", "plan": {"type": "SUBSCRIPTION", "name": "Plan"}},
+                subscription,
+            )
+        assert "organizationId" in repr(exc_info.value.examples["complete_example"])
 
     def test_empty_product_data_raises(self):
         mgr = _make_hierarchy_manager()
@@ -353,6 +395,16 @@ class TestGetSubscriptions:
         result = await mgr.get_subscriptions({"product_id": "p1"})
         assert result["metadata"]["total_subscriptions"] == 0
 
+    @pytest.mark.asyncio
+    async def test_incomplete_subscription_walk_raises_api_error_with_retry(self):
+        mgr = _make_hierarchy_manager()
+        mgr.navigation_service.get_subscriptions_for_product = AsyncMock(
+            return_value=_incomplete_walk()
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await mgr.get_subscriptions({"product_id": "p1"})
+        _assert_retryable_walk_failure(exc_info.value)
+
 
 # ===========================================================================
 # ProductHierarchyManager.get_related_credentials
@@ -404,6 +456,16 @@ class TestGetRelatedCredentials:
         result = await mgr.get_related_credentials({"product_id": "p1"})
         assert result["data"] == []
         assert result["metadata"]["total_credentials"] == 0
+
+    @pytest.mark.asyncio
+    async def test_incomplete_walk_in_related_credentials_raises_api_error(self):
+        mgr = _make_hierarchy_manager()
+        mgr.navigation_service.get_full_hierarchy = AsyncMock(
+            return_value=_incomplete_walk()
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await mgr.get_related_credentials({"product_id": "p1"})
+        _assert_retryable_walk_failure(exc_info.value)
 
 
 # ===========================================================================
@@ -459,6 +521,84 @@ class TestCreateWithSubscription:
         assert result["result"]["hierarchy_link"]["product_id"] == "p_new"
         client.create_product.assert_called_once()
         client.create_subscription.assert_called_once()
+
+    async def _create_with_subscription(self, mgr):
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
+            return_value="owner_123",
+        ):
+            return await mgr.create_with_subscription(
+                {
+                    "product_data": _valid_product_data(),
+                    "subscription_data": _valid_subscription_data(),
+                }
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [400, 404])
+    async def test_unknown_organization_is_refused_before_the_product_is_written(
+        self, status_code
+    ):
+        """BACK-4798: a wrong organization id must not leave a stray product."""
+        client = _make_client()
+        client.create_source = AsyncMock()
+        client.create_metering_element_definition = AsyncMock()
+        mgr = _make_hierarchy_manager(client)
+        self._setup_happy_path(mgr, client)
+        client.get_organization_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("Invalid Organization ID", status_code=status_code)
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await self._create_with_subscription(mgr)
+
+        error = exc_info.value
+        assert error.field == "subscription_data.organizationId"
+        assert "org_1" in error.message
+        assert "Nothing was created" in error.message
+        client.get_organization_by_id.assert_awaited_once_with("org_1")
+        client.create_product.assert_not_awaited()
+        client.create_subscription.assert_not_awaited()
+        client.create_source.assert_not_awaited()
+        client.create_metering_element_definition.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [403, 500, None])
+    async def test_organization_read_that_is_not_a_not_found_still_creates(
+        self, status_code
+    ):
+        """A key that cannot read organizations, or a platform hiccup, is not a wrong id."""
+        client = _make_client()
+        mgr = _make_hierarchy_manager(client)
+        self._setup_happy_path(mgr, client)
+        client.get_organization_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("read failed", status_code=status_code)
+        )
+
+        result = await self._create_with_subscription(mgr)
+
+        assert result["result"]["product"]["id"] == "p_new"
+        client.get_organization_by_id.assert_awaited_once_with("org_1")
+        client.create_product.assert_awaited_once()
+        client.create_subscription.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_existing_organization_is_read_once_before_the_product(self):
+        client = _make_client()
+        mgr = _make_hierarchy_manager(client)
+        self._setup_happy_path(mgr, client)
+        calls = []
+        client.get_organization_by_id = AsyncMock(
+            side_effect=lambda organization_id: calls.append("read") or {"id": organization_id}
+        )
+        client.create_product = AsyncMock(
+            side_effect=lambda body: calls.append("create") or {"id": "p_new", "name": "P"}
+        )
+
+        await self._create_with_subscription(mgr)
+
+        client.get_organization_by_id.assert_awaited_once_with("org_1")
+        assert calls == ["read", "create"]
 
     @pytest.mark.asyncio
     async def test_missing_product_data_raises(self):
@@ -531,77 +671,73 @@ class TestCreateWithSubscription:
             )
         assert "source" in str(exc_info.value).lower()
 
+    async def _create_expecting_refusal(self, mgr):
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
+            return_value=None,
+        ):
+            with pytest.raises(ToolError) as exc_info:
+                await mgr.create_with_subscription(
+                    {
+                        "product_data": _valid_product_data(),
+                        "subscription_data": _valid_subscription_data(),
+                    }
+                )
+        return exc_info.value
+
     @pytest.mark.asyncio
-    async def test_metering_element_fallback(self):
-        """When metering element lookup returns empty, uses fallback ID."""
+    async def test_no_metering_element_fails_before_any_write(self):
+        """No element of the organization's own means a refusal, never an id
+        borrowed from another organization."""
         client = _make_client()
         mgr = _make_hierarchy_manager(client)
-        mgr.validator.validate_hierarchy_operation = AsyncMock(
-            return_value=FakeValidationResult(valid=True)
-        )
+        self._setup_happy_path(mgr, client)
         client._extract_embedded_data.side_effect = [
             [{"id": "src_1"}],  # sources
             [],  # metering elements - empty
-            [{"id": "org_1"}],  # organizations
         ]
-        client.create_product.return_value = {"id": "p_new", "name": "Prod"}
-        client.create_subscription.return_value = {
-            "id": "sub_new", "name": "Sub", "organizationId": "org_1"
-        }
 
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
-            return_value=None,
-        ):
-            result = await mgr.create_with_subscription(
-                {
-                    "product_data": _valid_product_data(),
-                    "subscription_data": _valid_subscription_data(),
-                }
-            )
+        error = await self._create_expecting_refusal(mgr)
 
-        assert result["action"] == "create_with_subscription"
-        # Verify the product data was modified with fallback element ID
-        call_args = client.create_product.call_args[0][0]
-        aggs = call_args["plan"]["ratingAggregations"]
-        assert aggs[0]["elementDefinitionId"] == "jM73gVB"
+        assert error.field == "metering_elements"
+        assert error.value == "none_available"
+        client.create_product.assert_not_awaited()
+        client.create_subscription.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_metering_element_exception_uses_fallback(self):
-        """When metering element lookup raises, uses fallback ID."""
+    async def test_truncated_metering_scan_fails_before_any_write(self):
         client = _make_client()
         mgr = _make_hierarchy_manager(client)
-        mgr.validator.validate_hierarchy_operation = AsyncMock(
-            return_value=FakeValidationResult(valid=True)
-        )
-        # First call for sources succeeds, then metering raises
-        call_count = 0
-        def side_effect(response):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return [{"id": "src_1"}]
-            elif call_count == 2:
-                raise RuntimeError("metering fail")
-            else:
-                return [{"id": "org_1"}]
-        client._extract_embedded_data.side_effect = side_effect
-        client.create_product.return_value = {"id": "p_new", "name": "Prod"}
-        client.create_subscription.return_value = {
-            "id": "sub_new", "name": "Sub", "organizationId": "org_1"
-        }
+        self._setup_happy_path(mgr, client)
+        client._extract_embedded_data.side_effect = [[{"id": "src_1"}]] + [
+            [{"name": "no-id"}] * 20
+        ] * 5
 
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
-            return_value=None,
-        ):
-            result = await mgr.create_with_subscription(
-                {
-                    "product_data": _valid_product_data(),
-                    "subscription_data": _valid_subscription_data(),
-                }
-            )
-        assert result["action"] == "create_with_subscription"
+        error = await self._create_expecting_refusal(mgr)
+
+        assert error.value == "scan_truncated"
+        client.create_product.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_metering_lookup_failure_fails_before_any_write(self):
+        client = _make_client()
+        mgr = _make_hierarchy_manager(client)
+        self._setup_happy_path(mgr, client)
+        client._extract_embedded_data.side_effect = [[{"id": "src_1"}]]
+        client.get_metering_element_definitions.side_effect = RuntimeError("metering fail")
+
+        error = await self._create_expecting_refusal(mgr)
+
+        assert error.value == "lookup_failed"
+        client.create_product.assert_not_awaited()
+        client.create_subscription.assert_not_awaited()
+
+    def test_no_literal_element_id_in_the_handler(self):
+        from pathlib import Path
+
+        import src.revenium_mcp_server.tools_decomposed.product_management as module
+
+        assert "jM73gVB" not in Path(module.__file__).read_text()
 
     @pytest.mark.asyncio
     async def test_no_product_id_in_creation_result_raises(self):
@@ -623,19 +759,19 @@ class TestCreateWithSubscription:
                 )
         assert "no ID returned" in str(exc_info.value) or "no_id" in str(exc_info.value)
 
+    @staticmethod
+    def _subscription_without_organization():
+        data = _valid_subscription_data()
+        del data["organizationId"]
+        return data
+
     @pytest.mark.asyncio
-    async def test_no_organizations_raises(self):
+    async def test_missing_organization_id_is_refused_before_any_write(self):
+        """The subscription is never attached to whichever organization happens
+        to be listed first."""
         client = _make_client()
         mgr = _make_hierarchy_manager(client)
-        mgr.validator.validate_hierarchy_operation = AsyncMock(
-            return_value=FakeValidationResult(valid=True)
-        )
-        client._extract_embedded_data.side_effect = [
-            [{"id": "src_1"}],  # sources
-            [{"id": "elem_1"}],  # metering elements
-            [],  # organizations — empty
-        ]
-        client.create_product.return_value = {"id": "p_new", "name": "Prod"}
+        self._setup_happy_path(mgr, client)
 
         with patch(
             "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
@@ -645,29 +781,54 @@ class TestCreateWithSubscription:
                 await mgr.create_with_subscription(
                     {
                         "product_data": _valid_product_data(),
-                        "subscription_data": _valid_subscription_data(),
+                        "subscription_data": self._subscription_without_organization(),
                     }
                 )
-        assert "organization" in str(exc_info.value).lower()
+
+        assert exc_info.value.field == "subscription_data.organizationId"
+        assert any(
+            'manage_customers(action="list", resource_type="organizations")' in suggestion
+            for suggestion in exc_info.value.suggestions
+        )
+        client.get_organizations.assert_not_awaited()
+        client.create_product.assert_not_awaited()
+        client.create_subscription.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_organization_lookup_exception_raises(self):
+    async def test_organization_lookup_failure_writes_nothing(self):
         client = _make_client()
         mgr = _make_hierarchy_manager(client)
-        mgr.validator.validate_hierarchy_operation = AsyncMock(
-            return_value=FakeValidationResult(valid=True)
-        )
-        client._extract_embedded_data.side_effect = [
-            [{"id": "src_1"}],
-            [{"id": "elem_1"}],
-        ]
-        client.create_product.return_value = {"id": "p_new", "name": "Prod"}
+        self._setup_happy_path(mgr, client)
         client.get_organizations.side_effect = RuntimeError("org lookup fail")
 
         with patch(
             "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
             return_value=None,
         ):
+            with pytest.raises(ToolError):
+                await mgr.create_with_subscription(
+                    {
+                        "product_data": _valid_product_data(),
+                        "subscription_data": self._subscription_without_organization(),
+                    }
+                )
+
+        client.create_product.assert_not_awaited()
+        client.create_subscription.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_subscription_names_the_product_it_left(self):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        client = _make_client()
+        mgr = _make_hierarchy_manager(client)
+        self._setup_happy_path(mgr, client)
+        client.create_subscription.side_effect = ReveniumAPIError(400, "Bad Request", {})
+
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
+            return_value=None,
+        ):
             with pytest.raises(ToolError) as exc_info:
                 await mgr.create_with_subscription(
                     {
@@ -675,7 +836,11 @@ class TestCreateWithSubscription:
                         "subscription_data": _valid_subscription_data(),
                     }
                 )
-        assert "organization" in str(exc_info.value).lower()
+
+        error = exc_info.value
+        assert error.value == {"product_id": "p_new"}
+        assert "p_new" in error.message
+        assert any("p_new" in suggestion for suggestion in error.suggestions)
 
     @pytest.mark.asyncio
     async def test_owner_id_from_config(self):
@@ -797,6 +962,48 @@ class TestCreateWithSubscription:
 
         call_args = client.create_product.call_args[0][0]
         assert call_args["sourceIds"] == ["my_custom_source"]
+
+    async def _create_with(self, pd):
+        client = _make_client()
+        mgr = _make_hierarchy_manager(client)
+        self._setup_happy_path(mgr, client)
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
+            return_value=None,
+        ):
+            await mgr.create_with_subscription(
+                {"product_data": pd, "subscription_data": _valid_subscription_data()}
+            )
+        return client.create_product.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_product_is_published_for_the_subscription(self):
+        """BACK-4662: the caller asked for a subscription, which needs a published
+        product with a source, so this action publishes it explicitly."""
+        sent = await self._create_with(_valid_product_data())
+        assert sent.get("published") is True
+        assert sent["sourceIds"] == ["src_1"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_unpublished_is_kept(self):
+        pd = _valid_product_data()
+        pd["published"] = False
+        sent = await self._create_with(pd)
+        assert sent["published"] is False
+
+    @pytest.mark.asyncio
+    async def test_explicit_null_published_is_sent_as_true(self):
+        pd = _valid_product_data()
+        pd["published"] = None
+        sent = await self._create_with(pd)
+        assert sent["published"] is True
+
+    @pytest.mark.asyncio
+    async def test_snake_case_source_ids_are_kept(self):
+        pd = _valid_product_data()
+        pd["source_ids"] = ["own"]
+        sent = await self._create_with(pd)
+        assert APIFieldMapper.map_product_fields(sent)["sourceIds"] == ["own"]
 
     @pytest.mark.asyncio
     async def test_existing_rating_aggregations_preserved(self):
@@ -926,58 +1133,6 @@ class TestHandleDiscoveryValidationActions:
 
 
 # ===========================================================================
-# ProductManagement._handle_enhanced_features
-# ===========================================================================
-
-
-class TestHandleEnhancedFeatures:
-    """Test enhanced feature action routing."""
-
-    @pytest.mark.asyncio
-    async def test_create_simple_routed(self):
-        mgmt = ProductManagement()
-        mgmt.formatter = MagicMock()
-        mgmt.formatter.format_success_response.return_value = [
-            TextContent(type="text", text="simple created")
-        ]
-        ep = MagicMock()
-        ep.create_simple = AsyncMock(return_value={"id": "p1", "name": "Simple"})
-        result = await mgmt._handle_enhanced_features("create_simple", {}, ep)
-        assert result[0].text == "simple created"
-
-    @pytest.mark.asyncio
-    async def test_get_templates_routed(self):
-        mgmt = ProductManagement()
-        ep = MagicMock()
-        ep.get_templates = AsyncMock(return_value={"templates": []})
-        result = await mgmt._handle_enhanced_features("get_templates", {}, ep)
-        assert "templates" in result[0].text
-
-    @pytest.mark.asyncio
-    async def test_suggest_template_routed(self):
-        mgmt = ProductManagement()
-        ep = MagicMock()
-        ep.suggest_template = AsyncMock(return_value={"suggestion": "use basic"})
-        result = await mgmt._handle_enhanced_features("suggest_template", {}, ep)
-        assert "suggestion" in result[0].text
-
-    @pytest.mark.asyncio
-    async def test_clarify_pricing_routed(self):
-        mgmt = ProductManagement()
-        ep = MagicMock()
-        ep.clarify_pricing = AsyncMock(return_value={"clarification": "usage-based"})
-        result = await mgmt._handle_enhanced_features("clarify_pricing", {}, ep)
-        assert "clarification" in result[0].text
-
-    @pytest.mark.asyncio
-    async def test_unhandled_enhanced_action_returns_error(self):
-        mgmt = ProductManagement()
-        ep = MagicMock()
-        result = await mgmt._handle_enhanced_features("nonexistent", {}, ep)
-        assert "error" in result[0].text
-
-
-# ===========================================================================
 # ProductManagement._handle_hierarchy_actions
 # ===========================================================================
 
@@ -1030,147 +1185,46 @@ class TestHandleHierarchyActions:
         assert result[0].text == "created"
 
     @pytest.mark.asyncio
+    async def test_dry_run_is_refused_before_any_write(self):
+        mgmt, client = _make_mgmt_with_client()
+        client._extract_embedded_data.side_effect = [
+            [{"id": "src_1"}],
+            [{"id": "elem_1"}],
+            [{"id": "org_1"}],
+        ]
+        passing_validator = MagicMock()
+        passing_validator.validate_hierarchy_operation = AsyncMock(
+            return_value=FakeValidationResult(valid=True)
+        )
+        module = "src.revenium_mcp_server.tools_decomposed.product_management"
+
+        with patch(f"{module}.get_cross_tier_validator", return_value=passing_validator), patch(
+            f"{module}.get_config_value", return_value="owner_123"
+        ), pytest.raises(ToolError) as exc_info:
+            await mgmt.handle_action(
+                "create_with_subscription",
+                {
+                    "product_data": {**_valid_product_data(), "description": "Analytics"},
+                    "subscription_data": _valid_subscription_data(),
+                    "dry_run": "true",
+                },
+            )
+
+        client.create_product.assert_not_awaited()
+        client.create_subscription.assert_not_awaited()
+        error = exc_info.value
+        assert error.error_code == ErrorCodes.INVALID_PARAMETER
+        assert error.field == "dry_run"
+        assert "create_with_subscription has no preview" in error.message
+        assert "nothing was sent" in error.message
+        assert 'action="create"' in error.message
+
+    @pytest.mark.asyncio
     async def test_unhandled_hierarchy_action_returns_error(self):
         mgmt = ProductManagement()
         hm = MagicMock()
         result = await mgmt._handle_hierarchy_actions("unknown", {}, hm)
         assert "error" in result[0].text
-
-
-# ===========================================================================
-# ProductManagement._handle_create_from_description_dry_run
-# ===========================================================================
-
-
-class TestHandleCreateFromDescriptionDryRun:
-    """Test dry run for create_from_description."""
-
-    @pytest.mark.asyncio
-    async def test_no_description_returns_error(self):
-        mgmt = ProductManagement()
-        ep = MagicMock()
-        result = await mgmt._handle_create_from_description_dry_run({}, ep)
-        assert "Error: Description is required" in result[0].text
-
-    @pytest.mark.asyncio
-    async def test_empty_description_returns_error(self):
-        mgmt = ProductManagement()
-        ep = MagicMock()
-        result = await mgmt._handle_create_from_description_dry_run(
-            {"description": ""}, ep
-        )
-        assert "Error: Description is required" in result[0].text
-
-    @pytest.mark.asyncio
-    async def test_with_nlp_processor_success(self):
-        mgmt = ProductManagement()
-        ep = MagicMock()
-        ep.nlp_processor = MagicMock()
-        ep.nlp_processor.parse_product_request.return_value = {
-            "name": "Premium API",
-            "version": "1.0",
-            "plan": {"type": "SUBSCRIPTION", "currency": "USD"},
-            "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
-            "setupFees": [],
-        }
-        with patch.object(mgmt, "_generate_educational_feedback", return_value=""):
-            result = await mgmt._handle_create_from_description_dry_run(
-                {"description": "Premium API access plan"}, ep
-            )
-        assert "DRY RUN MODE" in result[0].text
-        assert "Premium API" in result[0].text
-        assert "Parsed Successfully" in result[0].text
-
-    @pytest.mark.asyncio
-    async def test_with_nlp_processor_exception(self):
-        mgmt = ProductManagement()
-        ep = MagicMock()
-        ep.nlp_processor = MagicMock()
-        ep.nlp_processor.parse_product_request.side_effect = ValueError("parse error")
-
-        result = await mgmt._handle_create_from_description_dry_run(
-            {"description": "bad input"}, ep
-        )
-        assert "Parsing Error" in result[0].text
-        assert "parse error" in result[0].text
-
-    @pytest.mark.asyncio
-    async def test_without_nlp_processor(self):
-        mgmt = ProductManagement()
-        ep = MagicMock()
-        ep.nlp_processor = None
-        result = await mgmt._handle_create_from_description_dry_run(
-            {"description": "A basic product"}, ep
-        )
-        assert "NLP Processor Unavailable" in result[0].text
-
-    @pytest.mark.asyncio
-    async def test_text_param_fallback(self):
-        """Uses 'text' param when 'description' is absent."""
-        mgmt = ProductManagement()
-        ep = MagicMock()
-        ep.nlp_processor = None
-        result = await mgmt._handle_create_from_description_dry_run(
-            {"text": "Some product"}, ep
-        )
-        assert "NLP Processor Unavailable" in result[0].text
-        assert "Some product" in result[0].text
-
-
-# ===========================================================================
-# ProductManagement._generate_educational_feedback
-# ===========================================================================
-
-
-class TestGenerateEducationalFeedback:
-    """Test educational feedback generation."""
-
-    def test_no_setup_fees_no_payment_source(self):
-        mgmt = ProductManagement()
-        result = mgmt._generate_educational_feedback({"name": "Prod"})
-        assert result == ""
-
-    def test_subscription_setup_fee(self):
-        mgmt = ProductManagement()
-        result = mgmt._generate_educational_feedback(
-            {"setupFees": [{"type": "SUBSCRIPTION", "flatAmount": "10.00"}]}
-        )
-        assert "SUBSCRIPTION type" in result
-        assert "flatAmount" in result
-
-    def test_organization_setup_fee(self):
-        mgmt = ProductManagement()
-        result = mgmt._generate_educational_feedback(
-            {"setupFees": [{"type": "ORGANIZATION"}]}
-        )
-        assert "ORGANIZATION type" in result
-        assert "Migration" in result  # amount migration note
-
-    def test_invoice_only_payment(self):
-        mgmt = ProductManagement()
-        result = mgmt._generate_educational_feedback(
-            {"paymentSource": "INVOICE_ONLY_NO_PAYMENT"}
-        )
-        assert "Manual invoice" in result
-
-    def test_external_payment_notification(self):
-        mgmt = ProductManagement()
-        result = mgmt._generate_educational_feedback(
-            {"paymentSource": "EXTERNAL_PAYMENT_NOTIFICATION"}
-        )
-        assert "Tracked invoice" in result
-
-    def test_combined_feedback(self):
-        mgmt = ProductManagement()
-        result = mgmt._generate_educational_feedback(
-            {
-                "setupFees": [{"type": "SUBSCRIPTION", "flatAmount": "5.00"}],
-                "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
-            }
-        )
-        assert "SUBSCRIPTION type" in result
-        assert "Manual invoice" in result
-        assert "Educational Feedback" in result
 
 
 # ===========================================================================
@@ -1324,6 +1378,72 @@ class TestFormatCreateWithSubscriptionResponse:
         assert "o1" in text
         assert "Auto-Configured" in text
 
+    @staticmethod
+    def _dev_shaped_result():
+        """create_with_subscription as dev answered it: the subscription embeds its
+        organization as an object and carries the client email, with no organizationId."""
+        return {
+            "result": {
+                "product": {
+                    "id": "jM7kXYN",
+                    "name": "product-create-paths-cws",
+                    "sources": [{"id": "qx1EMx4"}],
+                    "plan": {"ratingAggregations": [{"elementDefinitionId": "NzeYnMQ"}]},
+                },
+                "subscription": {
+                    "id": "3ByP6kL",
+                    "product": {"id": "jM7kXYN", "resourceType": "product"},
+                    "organization": {
+                        "id": "OQNb1o0",
+                        "resourceType": "organization",
+                        "label": "Proof Org",
+                    },
+                    "clientEmailAddress": "product-create-paths-proof@example.com",
+                },
+                "hierarchy_link": {},
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_names_the_organization_billed_and_the_subscriber_email(self):
+        text = (
+            await ProductManagement()._format_create_with_subscription_response(
+                self._dev_shaped_result()
+            )
+        )[0].text
+
+        assert "**Organization:** Proof Org (OQNb1o0)" in text, text
+        assert "**Subscriber:** product-create-paths-proof@example.com" in text, text
+        assert "N/A" not in text, text
+
+    @pytest.mark.asyncio
+    async def test_says_the_platform_made_a_user_for_the_client_email(self):
+        text = (
+            await ProductManagement()._format_create_with_subscription_response(
+                self._dev_shaped_result()
+            )
+        )[0].text
+
+        user_lines = [
+            line
+            for line in text.splitlines()
+            if "user" in line.lower() and "product-create-paths-proof@example.com" in line
+        ]
+        assert len(user_lines) == 1, text
+        assert "created" in user_lines[0].lower(), user_lines
+
+    @pytest.mark.asyncio
+    async def test_each_next_step_is_printed_once(self):
+        text = (
+            await ProductManagement()._format_create_with_subscription_response(
+                self._dev_shaped_result()
+            )
+        )[0].text
+
+        steps = [line for line in text.splitlines() if line.startswith("• Use")]
+        assert len(steps) == len(set(steps)), steps
+        assert sum("manage_subscriber_credentials" in step for step in steps) == 1, steps
+
 
 # ===========================================================================
 # ProductManagement._handle_unknown_action
@@ -1370,9 +1490,121 @@ class TestHandleFallbackActions:
         assert "error" in result[0].text
 
 
+class TestHandleActionCreateWithSubscriptionAnswer:
+    @pytest.mark.asyncio
+    async def test_answer_says_the_product_was_published(self):
+        mgmt = ProductManagement()
+        hierarchy_manager = MagicMock()
+        hierarchy_manager.create_with_subscription = AsyncMock(
+            return_value={
+                "result": {
+                    "product": {
+                        "id": "p1",
+                        "name": "P",
+                        "published": True,
+                        "sources": [{"id": "src_1"}],
+                        "plan": {"period": "MONTH", "currency": "USD"},
+                    },
+                    "subscription": {
+                        "id": "s1",
+                        "name": "S",
+                        "client": {"label": "C"},
+                        "organizationId": "o1",
+                    },
+                }
+            }
+        )
+        mgmt._setup_managers = AsyncMock(
+            return_value=(MagicMock(), MagicMock(), hierarchy_manager)
+        )
+        result = await mgmt.handle_action(
+            "create_with_subscription", {"product_data": {}, "subscription_data": {}}
+        )
+        text = result[0].text
+        assert "Publication: published" in text
+        assert "src_1" in text
+
+    @pytest.mark.asyncio
+    async def test_answer_says_an_explicitly_unpublished_product_is_not_published(self):
+        mgmt = ProductManagement()
+        hierarchy_manager = MagicMock()
+        hierarchy_manager.create_with_subscription = AsyncMock(
+            return_value={
+                "result": {
+                    "product": {
+                        "id": "p1",
+                        "name": "P",
+                        "published": False,
+                        "sources": [{"id": "src_1"}],
+                        "plan": {"period": "MONTH", "currency": "USD"},
+                    },
+                    "subscription": {
+                        "id": "s1",
+                        "name": "S",
+                        "client": {"label": "C"},
+                        "organizationId": "o1",
+                    },
+                }
+            }
+        )
+        mgmt._setup_managers = AsyncMock(
+            return_value=(MagicMock(), MagicMock(), hierarchy_manager)
+        )
+        result = await mgmt.handle_action(
+            "create_with_subscription", {"product_data": {}, "subscription_data": {}}
+        )
+        assert "Publication: not published" in result[0].text
+
+
 # ===========================================================================
 # ProductManagement dry run handlers
 # ===========================================================================
+
+
+def _previewed_body(preview_text: str) -> dict:
+    heading = "**Body the update would send:**"
+    assert heading in preview_text
+    return json.loads(preview_text.split(heading, 1)[1].split("**Dry Run:**", 1)[0])
+
+
+def _preview_manager(product_id: str) -> ProductManager:
+    client = MagicMock()
+    client.team_id = "team_abc"
+    client.get_product_by_id = AsyncMock(
+        return_value={
+            "id": product_id,
+            "name": "Stored",
+            "version": "1.0.0",
+            "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
+            "plan": {"type": "SUBSCRIPTION", "tiers": [{"name": "t1"}]},
+        }
+    )
+    client.prepare_product_update_body = lambda body: body
+    client.update_product = AsyncMock()
+    return ProductManager(client)
+
+
+def _complete_product(name: str) -> dict:
+    return {
+        "name": name,
+        "version": "1.0.0",
+        "description": "d",
+        "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
+        "plan": {
+            "name": f"{name} Plan",
+            "type": "SUBSCRIPTION",
+            "currency": "USD",
+            "period": "MONTH",
+            "tiers": [{"name": "Base Tier", "up_to": None, "unit_amount": "0.00"}],
+        },
+    }
+
+
+def _create_preview_manager() -> ProductManager:
+    client = MagicMock()
+    client.team_id = "team_abc"
+    client.create_product = AsyncMock()
+    return ProductManager(client)
 
 
 class TestDryRunHandlers:
@@ -1381,34 +1613,97 @@ class TestDryRunHandlers:
     @pytest.mark.asyncio
     async def test_create_dry_run_valid(self):
         mgmt = ProductManagement()
-        mgmt.validator = MagicMock()
-        mgmt.validator.validate_configuration.return_value = {"valid": True}
-        result = await mgmt._handle_create_dry_run(
-            {"product_data": {"name": "P", "version": "1.0", "plan": {"type": "SUBSCRIPTION"}}}
+        product_manager = MagicMock()
+        product_manager.client.team_id = "team_1"
+        product_manager.prepare_create_payload = AsyncMock(
+            return_value=CreatePayload(
+                body={"name": "P", "version": "1.0", "plan": {"type": "SUBSCRIPTION"}}
+            )
         )
+        arguments = {"product_data": {"name": "P"}}
+        result = await mgmt._handle_create_dry_run(arguments, product_manager, None)
+        product_manager.prepare_create_payload.assert_awaited_once_with(arguments, None)
         assert "DRY RUN MODE" in result[0].text
         assert "Validation Successful" in result[0].text
+        assert "**Plan Type:** SUBSCRIPTION" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_create_dry_run_names_publication_and_sources(self):
+        """BACK-4662: the preview says what the real create would send."""
+        mgmt = ProductManagement()
+        product_manager = _create_preview_manager()
+        default = await mgmt._handle_create_dry_run({"name": "P"}, product_manager, None)
+        assert "**Published:** False" in default[0].text
+        assert "**Data sources:** none" in default[0].text
+
+        named = await mgmt._handle_create_dry_run(
+            {"product_data": {**_complete_product("P"), "published": True, "source_ids": ["own"]}},
+            product_manager,
+            None,
+        )
+        assert "**Published:** True" in named[0].text
+        assert "**Data sources:** own" in named[0].text
+        product_manager.client.create_product.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_dry_run_validates_the_source_the_create_would_send(self):
+        """BACK-4662: a usage-based preview with source_ids passes, as the real create does."""
+        mgmt = ProductManagement()
+        product_data = {
+            **_complete_product("P"),
+            "source_ids": ["own"],
+            "plan": {
+                "name": "PP",
+                "type": "SUBSCRIPTION",
+                "currency": "USD",
+                "period": "MONTH",
+                "tiers": [],
+                "ratingAggregations": [
+                    {
+                        "name": "a",
+                        "elementDefinitionId": "e1",
+                        "aggregationType": "SUM",
+                        "tiers": [{"name": "u", "up_to": None, "unit_amount": "0.01"}],
+                    }
+                ],
+            },
+        }
+        result = await mgmt._handle_create_dry_run(
+            {"product_data": product_data}, _create_preview_manager(), None
+        )
+        assert "Validation Successful" in result[0].text
+        assert "**Data sources:** own" in result[0].text
+        assert product_data["source_ids"] == ["own"]
 
     @pytest.mark.asyncio
     async def test_create_dry_run_invalid(self):
         mgmt = ProductManagement()
-        mgmt.validator = MagicMock()
-        mgmt.validator.validate_configuration.return_value = {
-            "valid": False,
-            "errors": [{"error": "name is required"}],
-        }
-        result = await mgmt._handle_create_dry_run({"product_data": {}})
-        assert "Validation Failed" in result[0].text
-        assert "name is required" in result[0].text
+        product_manager = MagicMock()
+        product_manager.prepare_create_payload = AsyncMock(
+            side_effect=ToolError(
+                message="name is required",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+            )
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await mgmt._handle_create_dry_run({"product_data": {}}, product_manager, None)
+        assert "name is required" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_update_dry_run(self):
         mgmt = ProductManagement()
+        manager = _preview_manager("p1")
         result = await mgmt._handle_update_dry_run(
-            {"product_id": "p1", "product_data": {"name": "Updated"}}
+            {"product_id": "p1", "product_data": {"name": "Updated"}}, manager
         )
         assert "DRY RUN MODE" in result[0].text
         assert "p1" in result[0].text
+        body = _previewed_body(result[0].text)
+        assert body["name"] == "Updated"
+        assert body["version"] == "1.0.0"
+        assert body["paymentSource"] == "INVOICE_ONLY_NO_PAYMENT"
+        manager.client.get_product_by_id.assert_awaited()
+        manager.client.update_product.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_delete_dry_run(self):

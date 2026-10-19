@@ -7,6 +7,7 @@ actions including get_capabilities, verify_capability, and health status.
 import pytest
 from unittest.mock import AsyncMock, patch
 
+from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.tools_decomposed.manage_capabilities import (
     ManageCapabilities,
     CapabilityRequest,
@@ -164,9 +165,10 @@ class TestManageCapabilitiesActions:
 
     @pytest.mark.asyncio
     async def test_unsupported_action_returns_error(self, capabilities_tool):
-        """Unsupported action returns structured error with valid actions."""
-        result = await capabilities_tool.handle_action("totally_bogus", {})
-        text = result[0].text
+        """Unsupported action raises a structured error with valid actions."""
+        with pytest.raises(ToolError) as exc_info:
+            await capabilities_tool.handle_action("totally_bogus", {})
+        text = exc_info.value.message
         assert "totally_bogus" in text
 
     @pytest.mark.asyncio
@@ -237,14 +239,13 @@ class TestManageCapabilitiesActions:
 
     @pytest.mark.asyncio
     async def test_exception_during_handling_returns_error(self, capabilities_tool):
-        """Unexpected exception during handling returns formatted error."""
+        """Unexpected exception during handling raises a formatted error."""
         with patch.object(
             capabilities_tool, "_create_request", side_effect=RuntimeError("boom")
         ):
-            result = await capabilities_tool.handle_action("get_capabilities", {})
-            assert len(result) == 1
-            assert isinstance(result[0], TextContent)
-            text = result[0].text
+            with pytest.raises(ToolError) as exc_info:
+                await capabilities_tool.handle_action("get_capabilities", {})
+            text = exc_info.value.message
             assert "boom" in text
             assert len(text) > 0
 

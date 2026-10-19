@@ -5,16 +5,22 @@ debug_auto_discovery infrastructure to ensure maximum code reuse and consistency
 """
 
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
+    from ..onboarding.detection_service import OnboardingState
+    from ..onboarding.env_validation import EnvironmentVariableStatus, ValidationResult
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
 from ..auth.auth_mode import read_auth_mode
+from ..common.default_slack_configuration import (
+    DEFAULT_SLACK_CONFIG_ENV,
+    get_default_slack_config_id,
+)
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
@@ -29,6 +35,7 @@ from ..onboarding.env_validation import (
     API_READ_FORBIDDEN_MESSAGE,
     validate_environment_variables,
 )
+from ..onboarding.platform_read import PLATFORM_UNREACHABLE_MESSAGE, read_platform_facts
 from .unified_tool_base import ToolBase
 
 
@@ -72,7 +79,6 @@ class ConfigurationStatus(ToolBase):
         Returns:
             Tool response
         """
-        # ctx accepted for interface compliance; no upstream API calls in this tool.
         try:
             if action == "environment_variables":
                 return await self._handle_environment_variables(arguments)
@@ -110,6 +116,8 @@ class ConfigurationStatus(ToolBase):
                 )
                 return [TextContent(type="text", text=format_structured_error(error))]
 
+        except (PermissionError, ToolError):
+            raise
         except Exception as e:
             logger.error(f"Error in configuration_status action {action}: {e}")
             error = ToolError(
@@ -129,8 +137,7 @@ class ConfigurationStatus(ToolBase):
         """Handle environment_variables action - detailed environment variable analysis."""
         logger.debug("Analyzing environment variables")
 
-        # REUSE: Get validation result using existing infrastructure
-        validation_result = await validate_environment_variables()
+        validation_result = await validate_environment_variables(await self.get_client())
 
         # Build environment variables analysis
         env_vars_text = self._build_environment_variables_analysis(validation_result)
@@ -141,8 +148,7 @@ class ConfigurationStatus(ToolBase):
         """Handle auto_discovery action - auto-discovery system status."""
         logger.debug("Analyzing auto-discovery system")
 
-        # REUSE: Get validation result using existing infrastructure
-        validation_result = await validate_environment_variables()
+        validation_result = await validate_environment_variables(await self.get_client())
 
         # Build auto-discovery analysis
         discovery_text = self._build_auto_discovery_analysis(validation_result)
@@ -153,11 +159,9 @@ class ConfigurationStatus(ToolBase):
         """Handle onboarding_status action - onboarding and setup status."""
         logger.debug("Analyzing onboarding status")
 
-        # REUSE: Get onboarding state using existing infrastructure
-        onboarding_state = await get_onboarding_state()
-
-        # REUSE: Get validation result using existing infrastructure
-        validation_result = await validate_environment_variables()
+        facts = await read_platform_facts(await self.get_client())
+        validation_result = await validate_environment_variables(api_connectivity=facts.read)
+        onboarding_state = await get_onboarding_state(facts, validation_result)
 
         # Build onboarding status analysis
         onboarding_text = self._build_onboarding_status_analysis(
@@ -170,22 +174,27 @@ class ConfigurationStatus(ToolBase):
         """Handle system_health action - overall system health summary."""
         logger.debug("Analyzing overall system health")
 
-        # REUSE: Get validation result using existing infrastructure
-        validation_result = await validate_environment_variables()
-
-        # REUSE: Get onboarding state using existing infrastructure
-        onboarding_state = await get_onboarding_state()
+        facts = await read_platform_facts(await self.get_client())
+        validation_result = await validate_environment_variables(api_connectivity=facts.read)
+        onboarding_state = await get_onboarding_state(facts, validation_result)
 
         # Build system health summary
         health_text = self._build_system_health_summary(validation_result, onboarding_state)
 
         return [TextContent(type="text", text=health_text)]
 
+    @staticmethod
+    def _effective_value(var_name: str) -> Optional[str]:
+        if var_name == DEFAULT_SLACK_CONFIG_ENV:
+            return get_default_slack_config_id()
+        return get_config_value(var_name)
+
     def _build_environment_variables_analysis(self, validation_result) -> str:
         """Build detailed environment variables analysis."""
         analysis = "# **Environment Variables Analysis**\n\n"
         analysis += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
         analysis += f"**Total Variables**: {len(validation_result.variables)}\n\n"
+        hosted_caller = validation_result.summary.get("credential_source") == "request"
 
         # Group variables by category
         variables_by_category = {}
@@ -213,15 +222,7 @@ class ConfigurationStatus(ToolBase):
             analysis += f"## **{category}**\n\n"
 
             for var_name, var_data in vars_list:
-                # Use get_config_value to show effective configuration values
-                value = get_config_value(var_name)
-                is_set = bool(value)
-                if "API_KEY" in var_name and value:
-                    display_value = "SET (hidden)"
-                elif value:
-                    display_value = value
-                else:
-                    display_value = "NOT SET"
+                is_set, display_value = self._shown_setting(var_name, var_data, hosted_caller)
                 status_icon = "[OK]" if is_set else "[FAIL]"
 
                 analysis += f"**{var_name}**\n"
@@ -255,8 +256,15 @@ class ConfigurationStatus(ToolBase):
             "REVENIUM_DEFAULT_EMAIL",
             "REVENIUM_BASE_URL",
         ]
-        total_vars = len(config_vars)
-        set_vars = len([var for var in config_vars if get_config_value(var)])
+        if hosted_caller:
+            configured = [
+                self._shown_setting(var_name, var_data, hosted_caller)[0]
+                for var_name, var_data in validation_result.variables.items()
+            ]
+        else:
+            configured = [bool(get_config_value(var)) for var in config_vars]
+        total_vars = len(configured)
+        set_vars = sum(configured)
 
         analysis += "## **Statistics**\n\n"
         analysis += f"- **Total Variables**: {total_vars}\n"
@@ -274,10 +282,29 @@ class ConfigurationStatus(ToolBase):
 
         return analysis
 
+    @classmethod
+    def _shown_setting(
+        cls, var_name: str, var_data: "EnvironmentVariableStatus", hosted_caller: bool
+    ) -> Tuple[bool, str]:
+        """A hosted caller's row as its request supplied it; a local server's effective value.
+
+        The default Slack configuration is kept per organization, so it is read for
+        hosted and local callers alike.
+        """
+        if hosted_caller and var_name != DEFAULT_SLACK_CONFIG_ENV:
+            return var_data.is_set, var_data.display_value
+        value = cls._effective_value(var_name)
+        if "API_KEY" in var_name and value:
+            return True, "SET (hidden)"
+        return bool(value), value or "NOT SET"
+
     def _build_auto_discovery_analysis(self, validation_result) -> str:
         """Build detailed auto-discovery analysis."""
         analysis = "# **Auto-Discovery System Analysis**\n\n"
         analysis += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+
+        if validation_result.summary.get("credential_source") == "request":
+            return analysis + self._hosted_auto_discovery_analysis(validation_result)
 
         discovered_result = validation_result.discovered_config
         discovered_status = discovered_result.get("status", "unknown")
@@ -354,26 +381,51 @@ class ConfigurationStatus(ToolBase):
 
         return analysis
 
+    @staticmethod
+    def _hosted_auto_discovery_analysis(validation_result: "ValidationResult") -> str:
+        """What a hosted caller gets instead of this server's own auto-discovery."""
+        team = validation_result.variables.get("REVENIUM_TEAM_ID")
+        team_text = team.display_value if team is not None else "NOT SET"
+        return (
+            "## **Auto-Discovery: Not Used for Your Requests**\n\n"
+            "Your key or sign-in and your team come with each request, so this "
+            "server's own auto-discovered settings do not apply to you.\n\n"
+            f"- **Team on this request**: {team_text}\n\n"
+            "Use `system_diagnostics(action='system_health')` to check that your "
+            "credentials can read your organization's data.\n"
+        )
+
     def _build_onboarding_status_analysis(self, onboarding_state, validation_result) -> str:
         """Build detailed onboarding status analysis."""
         analysis = "# **Onboarding Status Analysis**\n\n"
         analysis += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
         # User type and onboarding context
-        if onboarding_state.is_first_time:
+        if onboarding_state.is_first_time is None:
+            analysis += "## **User Type: Could Not Determine**\n\n"
+            analysis += (
+                "First-time status is unknown because the platform could not be read "
+                "for this organization.\n\n"
+            )
+        elif onboarding_state.is_first_time:
             analysis += "## **User Type: First-Time User**\n\n"
             analysis += "This appears to be your first time using the Revenium MCP server.\n\n"
         else:
             analysis += "## **User Type: Returning User**\n\n"
             analysis += "Welcome back! You have used the system before.\n\n"
 
+        hosted_caller = validation_result.summary.get("credential_source") == "request"
+
         # Cache and data status
         analysis += "## **System State**\n\n"
+        if not hosted_caller:
+            analysis += (
+                f"- **Cache Exists**: {'[OK] Yes' if onboarding_state.cache_exists else '[FAIL] No'}\n"
+            )
+            analysis += f"- **Cache Valid**: {'[OK] Yes' if onboarding_state.cache_valid else '[FAIL] No'}\n"
         analysis += (
-            f"- **Cache Exists**: {'[OK] Yes' if onboarding_state.cache_exists else '[FAIL] No'}\n"
+            f"- **Has Existing Data**: {self._fact_text(onboarding_state.has_existing_data)}\n\n"
         )
-        analysis += f"- **Cache Valid**: {'[OK] Yes' if onboarding_state.cache_valid else '[FAIL] No'}\n"
-        analysis += f"- **Has Existing Data**: {'[OK] Yes' if onboarding_state.has_existing_data else '[FAIL] No'}\n\n"
 
         # Setup completion analysis
         setup_completion = onboarding_state.setup_completion
@@ -383,13 +435,19 @@ class ConfigurationStatus(ToolBase):
             ("API Key Configuration", setup_completion.get("api_key_configured", False)),
             ("Team ID Configuration", setup_completion.get("team_id_configured", False)),
             ("Email Configuration", setup_completion.get("email_configured", False)),
-            ("Slack Configuration", setup_completion.get("slack_configured", False)),
-            ("Cache Validity", setup_completion.get("cache_valid", False)),
-            ("Auto-Discovery Working", setup_completion.get("auto_discovery_working", False)),
+            ("Slack Configuration", setup_completion.get("slack_configured")),
         ]
+        if not hosted_caller:
+            completion_items.append(("Cache Validity", setup_completion.get("cache_valid", False)))
+            completion_items.append(
+                ("Auto-Discovery Working", setup_completion.get("auto_discovery_working", False))
+            )
 
         completed_count = 0
         for item_name, is_complete in completion_items:
+            if is_complete is None:
+                analysis += f"- [WARN] **{item_name}**: Unknown - the platform could not be read\n"
+                continue
             status_icon = "[OK]" if is_complete else "[FAIL]"
             analysis += (
                 f"- {status_icon} **{item_name}**: {'Complete' if is_complete else 'Incomplete'}\n"
@@ -402,8 +460,16 @@ class ConfigurationStatus(ToolBase):
 
         analysis += f"\n**Overall Completion**: {completed_count}/{total_items} ({completion_percentage:.1f}%)\n\n"
 
+        # Configuration rows prove nothing until the platform accepts them.
+        read_succeeded = validation_result.api_connectivity.get("status") == "success"
+
         # Progress assessment
-        if completion_percentage >= 80:
+        if not read_succeeded:
+            analysis += (
+                "[UNVERIFIED] Setup progress cannot be judged because the platform "
+                "could not be read.\n"
+            )
+        elif completion_percentage >= 80:
             analysis += "[EXCELLENT] Setup is nearly complete!\n"
         elif completion_percentage >= 60:
             analysis += "[GOOD] Good progress on setup.\n"
@@ -421,7 +487,14 @@ class ConfigurationStatus(ToolBase):
         # Next steps based on completion status
         analysis += "\n## **Suggested Next Steps**\n\n"
 
-        if completion_percentage < 50:
+        if not read_succeeded:
+            analysis += "**Priority Actions**:\n"
+            analysis += (
+                "1. Restore platform access: run "
+                "`system_diagnostics(action='system_health')` to see what is not working\n"
+            )
+            analysis += "2. Run `system_diagnostics(action='onboarding_status')` again afterwards\n"
+        elif completion_percentage < 50:
             analysis += "**Priority Actions**:\n"
             analysis += "1. Use `system_setup(action='show_welcome')` for guidance\n"
             analysis += "2. Configure essential items with `setup_checklist()`\n"
@@ -429,8 +502,11 @@ class ConfigurationStatus(ToolBase):
         elif completion_percentage < 80:
             analysis += "**Recommended Actions**:\n"
             analysis += "1. Complete remaining setup items with `setup_checklist()`\n"
-            analysis += "2. Configure optional features like Slack notifications\n"
-            analysis += "3. Use `system_setup(action='setup_checklist')` for guidance\n"
+            if setup_completion.get("slack_configured") is not True:
+                analysis += "2. Configure optional features like Slack notifications\n"
+                analysis += "3. Use `system_setup(action='setup_checklist')` for guidance\n"
+            else:
+                analysis += "2. Use `system_setup(action='setup_checklist')` for guidance\n"
         else:
             analysis += "**Final Steps**:\n"
             analysis += "1. Review setup with `setup_checklist()`\n"
@@ -442,9 +518,16 @@ class ConfigurationStatus(ToolBase):
         analysis += "\n## **Integration Status**\n\n"
         analysis += f"- **System Ready**: {'[OK] Yes' if overall_status else '[FAIL] No'}\n"
         analysis += f"- **API Working**: {'[OK] Yes' if validation_result.summary.get('direct_api_works') else '[FAIL] No'}\n"
-        analysis += f"- **Auto-Discovery**: {'[OK] Yes' if validation_result.summary.get('auto_discovery_works') else '[FAIL] No'}\n"
+        if not hosted_caller:
+            analysis += f"- **Auto-Discovery**: {'[OK] Yes' if validation_result.summary.get('auto_discovery_works') else '[FAIL] No'}\n"
 
         return analysis
+
+    @staticmethod
+    def _fact_text(fact: Optional[bool]) -> str:
+        if fact is None:
+            return "[WARN] Unknown - the platform could not be read"
+        return "[OK] Yes" if fact else "[FAIL] No"
 
     def _build_system_health_summary(self, validation_result, onboarding_state) -> str:
         """Build overall system health summary."""
@@ -465,10 +548,11 @@ class ConfigurationStatus(ToolBase):
         # For first-time users, missing cache is normal and shouldn't count against health
         cache_system_healthy = onboarding_state.cache_valid or onboarding_state.is_first_time
 
-        # Critical checks depend on the auth mode. In clerk/OAuth mode there is no
-        # static API key by design (auth is per-request via the Clerk JWT), so the
-        # API-key checks don't apply — the OAuth configuration is what's critical.
         is_clerk = validation_result.summary.get("auth_mode") == "clerk"
+        # A hosted caller's credential comes with the request, so checks of the
+        # server's own settings and files say nothing about this caller.
+        hosted_caller = validation_result.summary.get("credential_source") == "request"
+        api_unreachable = validation_result.summary.get("api_unreachable", False)
         # A key that authenticates but cannot read data is its own failure mode:
         # it must fail the critical check, and the report must say why.
         api_read_forbidden = validation_result.summary.get("api_read_forbidden", False)
@@ -484,25 +568,22 @@ class ConfigurationStatus(ToolBase):
             validation_result.summary.get("api_auth_rejected_detail")
             or API_AUTH_REJECTED_MESSAGE
         )
-        if is_clerk:
-            critical_checks = [
-                (
-                    "Clerk OAuth Configuration",
-                    validation_result.summary.get("clerk_configured", False),
-                ),
-            ]
-        else:
-            critical_checks = [
-                ("API Key Configuration", validation_result.summary.get("api_key_available", False)),
-                ("API Connectivity", validation_result.summary.get("direct_api_works", False)),
-            ]
+        credential_check = "Sign-in" if is_clerk else "API Key Configuration"
+        critical_checks = [
+            (credential_check, validation_result.summary.get("api_key_available", False)),
+            ("API Connectivity", validation_result.summary.get("direct_api_works", False)),
+        ]
 
         # Optional checks enhance functionality but aren't required for basic operation
-        optional_checks = [
-            ("Team Configuration", validation_result.summary.get("auth_config_works", False)),
-            ("Auto-Discovery", validation_result.summary.get("auto_discovery_works", False)),
-            ("Cache System", cache_system_healthy),
-        ]
+        optional_checks = (
+            []
+            if hosted_caller
+            else [
+                ("Team Configuration", validation_result.summary.get("auth_config_works", False)),
+                ("Auto-Discovery", validation_result.summary.get("auto_discovery_works", False)),
+                ("Cache System", cache_system_healthy),
+            ]
+        )
 
         # Display critical checks
         summary += "### **Critical Components** (Required for basic functionality)\n"
@@ -515,6 +596,8 @@ class ConfigurationStatus(ToolBase):
                 status_text = "Forbidden - the key cannot read data (wrong scope or unrecognized key)"
             elif check_name == "API Connectivity" and api_auth_rejected:
                 status_text = "Rejected - the platform did not accept the key (HTTP 401)"
+            elif check_name == "API Connectivity" and api_unreachable:
+                status_text = "Unreachable - the platform could not be reached"
             else:
                 status_text = "Failed"
             summary += f"- {status_icon} **{check_name}**: {status_text}\n"
@@ -522,7 +605,8 @@ class ConfigurationStatus(ToolBase):
                 critical_healthy += 1
 
         # Display optional checks
-        summary += "\n### **Optional Components** (Enhanced functionality)\n"
+        if optional_checks:
+            summary += "\n### **Optional Components** (Enhanced functionality)\n"
         optional_healthy = 0
         for check_name, is_healthy in optional_checks:
             status_icon = "[OK]" if is_healthy else "[WARN]"
@@ -536,7 +620,7 @@ class ConfigurationStatus(ToolBase):
         optional_weight = 0.2  # 20% of score from optional components
 
         critical_score = (critical_healthy / len(critical_checks)) if critical_checks else 0
-        optional_score = (optional_healthy / len(optional_checks)) if optional_checks else 0
+        optional_score = (optional_healthy / len(optional_checks)) if optional_checks else 1
 
         weighted_health_percentage = (
             critical_score * critical_weight + optional_score * optional_weight
@@ -547,7 +631,9 @@ class ConfigurationStatus(ToolBase):
 
         summary += f"\n**Health Score**: {total_healthy}/{total_checks} ({weighted_health_percentage:.1f}%)\n"
         summary += f"- Critical: {critical_healthy}/{len(critical_checks)} ({'[OK]' if critical_healthy == len(critical_checks) else '[FAIL]'})\n"
-        summary += f"- Optional: {optional_healthy}/{len(optional_checks)} ({'[OK]' if optional_healthy == len(optional_checks) else '[WARN]'})\n\n"
+        if optional_checks:
+            summary += f"- Optional: {optional_healthy}/{len(optional_checks)} ({'[OK]' if optional_healthy == len(optional_checks) else '[WARN]'})\n"
+        summary += "\n"
 
         # Health assessment based on weighted score
         if weighted_health_percentage >= 90:
@@ -568,37 +654,26 @@ class ConfigurationStatus(ToolBase):
         # Quick diagnostics
         summary += "\n## **Quick Diagnostics**\n\n"
 
-        if is_clerk:
-            if not validation_result.summary.get("clerk_configured"):
-                summary += (
-                    "[CRITICAL] Clerk OAuth not configured - check CLERK_DOMAIN, "
-                    "CLERK_OAUTH_CLIENT_ID, CLERK_OAUTH_CLIENT_SECRET, and MCP_SERVER_BASE_URL\n"
-                )
-        else:
-            if not validation_result.summary.get("api_key_available"):
-                summary += "[CRITICAL] API key not configured - system cannot function\n"
-            if not validation_result.summary.get("direct_api_works"):
-                if api_read_forbidden:
-                    summary += f"[CRITICAL] {read_forbidden_detail}\n"
-                elif api_auth_rejected:
-                    summary += f"[CRITICAL] {auth_rejected_detail}\n"
-                else:
-                    summary += (
-                        "[CRITICAL] API connectivity failed - check network and authentication\n"
-                    )
-        if not validation_result.summary.get("auth_config_works"):
-            summary += "[WARN] Authentication configuration issues detected\n"
-        if not validation_result.summary.get("auto_discovery_works"):
+        if is_clerk and not hosted_caller and not validation_result.summary.get("clerk_configured"):
             summary += (
-                "[WARN] Auto-discovery not working - manual configuration required\n"
+                "[CRITICAL] Clerk OAuth not configured - check CLERK_DOMAIN, "
+                "CLERK_OAUTH_CLIENT_ID, CLERK_OAUTH_CLIENT_SECRET, and MCP_SERVER_BASE_URL\n"
             )
-        if not onboarding_state.cache_valid:
-            if onboarding_state.is_first_time:
-                summary += (
-                    "[INFO] Cache system not initialized - normal for first-time users\n"
-                )
+        if not validation_result.summary.get("api_key_available"):
+            summary += "[CRITICAL] API key not configured - system cannot function\n"
+        if not validation_result.summary.get("direct_api_works"):
+            if api_read_forbidden:
+                summary += f"[CRITICAL] {read_forbidden_detail}\n"
+            elif api_auth_rejected:
+                summary += f"[CRITICAL] {auth_rejected_detail}\n"
+            elif api_unreachable:
+                summary += f"[CRITICAL] {PLATFORM_UNREACHABLE_MESSAGE}\n"
             else:
-                summary += "[WARN] Cache system expired or invalid - may need refresh\n"
+                summary += (
+                    "[CRITICAL] API connectivity failed - check network and authentication\n"
+                )
+        if not hosted_caller:
+            summary += self._server_settings_diagnostics(validation_result, onboarding_state)
 
         if overall_status:
             summary += "[OK] All systems operational - No critical issues detected\n"
@@ -608,26 +683,30 @@ class ConfigurationStatus(ToolBase):
 
         if not overall_status:
             summary += "**Immediate Actions**:\n"
+            key_name = "your key" if hosted_caller else "REVENIUM_API_KEY"
             if api_read_forbidden:
-                summary += "1. Verify REVENIUM_API_KEY and replace it with a key that has read access\n"
+                if is_clerk and hosted_caller:
+                    summary += "1. Check that your sign-in can read this organization's data\n"
+                else:
+                    summary += f"1. Verify {key_name} and replace it with a key that has read access\n"
                 summary += f"   - {read_forbidden_detail}\n"
                 summary += (
-                    "2. Use `configuration_status(action='system_health')` for detailed analysis\n"
+                    "2. Use `system_diagnostics(action='system_health')` for detailed analysis\n"
                 )
                 summary += "3. Follow `system_setup()` for guided resolution\n"
             elif api_auth_rejected:
                 summary += (
-                    "1. Wait a moment and retry before replacing REVENIUM_API_KEY - "
+                    f"1. Wait a moment and retry before replacing {key_name} - "
                     "a key created in the last few minutes may not be active yet\n"
                 )
                 summary += f"   - {auth_rejected_detail}\n"
                 summary += (
-                    "2. Use `configuration_status(action='system_health')` for detailed analysis\n"
+                    "2. Use `system_diagnostics(action='system_health')` for detailed analysis\n"
                 )
                 summary += "3. Follow `system_setup()` for guided resolution\n"
             else:
                 summary += (
-                    "1. Use `configuration_status(action='system_health')` for detailed analysis\n"
+                    "1. Use `system_diagnostics(action='system_health')` for detailed analysis\n"
                 )
                 summary += "2. Follow `system_setup()` for guided resolution\n"
                 summary += "3. Check `setup_checklist()` for specific configuration steps\n"
@@ -655,11 +734,30 @@ class ConfigurationStatus(ToolBase):
             elif api_auth_rejected:
                 summary += f"- {auth_rejected_detail}\n"
                 summary += "- The current key was not accepted, so no read was possible\n"
+            elif api_unreachable:
+                summary += f"- {PLATFORM_UNREACHABLE_MESSAGE}\n"
             summary += "- Complete setup using the onboarding tools\n"
             summary += "- Address critical configuration issues\n"
             summary += "- Test connectivity and authentication\n"
 
         return summary
+
+    @staticmethod
+    def _server_settings_diagnostics(
+        validation_result: "ValidationResult", onboarding_state: "OnboardingState"
+    ) -> str:
+        """Warnings about this server's own settings and cache (local servers only)."""
+        lines = ""
+        if not validation_result.summary.get("auth_config_works"):
+            lines += "[WARN] Authentication configuration issues detected\n"
+        if not validation_result.summary.get("auto_discovery_works"):
+            lines += "[WARN] Auto-discovery not working - manual configuration required\n"
+        if not onboarding_state.cache_valid:
+            if onboarding_state.is_first_time:
+                lines += "[INFO] Cache system not initialized - normal for first-time users\n"
+            else:
+                lines += "[WARN] Cache system expired or invalid - may need refresh\n"
+        return lines
 
     # Metadata Provider Implementation
     async def _get_tool_capabilities(self) -> List[ToolCapability]:

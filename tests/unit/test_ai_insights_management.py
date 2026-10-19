@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from src.revenium_mcp_server.common.error_handling import ToolError
+
 
 @pytest.mark.asyncio
 async def test_list_investigators_action_returns_payload():
@@ -512,9 +514,10 @@ async def test_list_feedback_empty_for_unknown_run_renders_not_found():
         "src.revenium_mcp_server.client.ReveniumClient.get_recommendation_run",
         new=AsyncMock(side_effect=err),
     ):
-        result = await tool.handle_action("list_feedback", {"run_id": "no-such-run"})
+        with pytest.raises(ToolError) as exc_info:
+            await tool.handle_action("list_feedback", {"run_id": "no-such-run"})
 
-    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    text = exc_info.value.message
     assert "not found" in text.lower()
     assert "no-such-run" in text
     assert "0 feedback items" not in text
@@ -694,12 +697,13 @@ async def test_api_error_IDEMPOTENCY_BACKEND_UNAVAILABLE_yields_transient():
         "src.revenium_mcp_server.client.ReveniumClient.trigger_recommendation_run",
         side_effect=err,
     ):
-        result = await tool.handle_action("trigger_run", {
-            "period_start": "2026-01-01T00:00:00Z",
-            "period_end":   "2026-01-02T00:00:00Z",
-        })
+        with pytest.raises(ToolError) as exc_info:
+            await tool.handle_action("trigger_run", {
+                "period_start": "2026-01-01T00:00:00Z",
+                "period_end":   "2026-01-02T00:00:00Z",
+            })
 
-    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    text = exc_info.value.message
     assert "retry" in text.lower() or "temporarily" in text.lower()
 
 
@@ -716,9 +720,10 @@ async def test_api_error_NOT_FOUND_yields_not_found():
         "src.revenium_mcp_server.client.ReveniumClient.get_recommendation_run",
         side_effect=err,
     ):
-        result = await tool.handle_action("get_run", {"run_id": "missing"})
+        with pytest.raises(ToolError) as exc_info:
+            await tool.handle_action("get_run", {"run_id": "missing"})
 
-    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    text = exc_info.value.message
     assert "not found" in text.lower()
 
 
@@ -996,6 +1001,7 @@ def _recording_client(monkeypatch, captured: dict):
 
     async def fake_request(method, url, params=None, json=None, headers=None):
         captured["body"] = json
+        captured["params"] = params
         resp = MagicMock()
         resp.status_code = 202
         resp.content = b'{"runId":"r1","status":"running"}'
@@ -1141,3 +1147,281 @@ async def test_cost_detector_filter_inside_params_is_dropped_and_the_run_starts(
     assert not result.is_error
     assert captured["body"]["periodStart"] == _RUN_PERIOD["period_start"]
     assert IGNORED_COST_DETECTOR_FIELD not in captured["body"]
+
+
+@pytest.mark.asyncio
+async def test_slim_false_text_inside_params_reads_the_full_run(monkeypatch):
+    """BACK-4667: the thin schema steers slim into params, where it arrives as text."""
+    from fastmcp import Client
+
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    captured: dict = {}
+    recording_client = _recording_client(monkeypatch, captured)
+    mcp = await _registered_insights_server()
+    with patch.object(
+        AIInsightsManagement, "get_client", new=AsyncMock(return_value=recording_client)
+    ):
+        async with Client(mcp) as client:
+            result = await client.call_tool("manage_ai_insights", {
+                "action": "get_run",
+                "params": {"run_id": "r1", "slim": "false"},
+            })
+
+    assert not result.is_error
+    assert "slim" not in captured["params"]
+    assert "slim=False" in result.content[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("text", "expected"), [("false", False), ("TRUE", True)])
+async def test_yes_no_text_inside_params_reaches_the_run_body_as_booleans(
+    monkeypatch, text, expected
+):
+    from fastmcp import Client
+
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    captured: dict = {}
+    recording_client = _recording_client(monkeypatch, captured)
+    mcp = await _registered_insights_server()
+    with patch.object(
+        AIInsightsManagement, "get_client", new=AsyncMock(return_value=recording_client)
+    ):
+        async with Client(mcp) as client:
+            await client.call_tool("manage_ai_insights", {
+                "action": "trigger_run",
+                "params": {
+                    **_RUN_PERIOD,
+                    "filter_include_descendants": text,
+                    "filter_include_coding_assistants": text,
+                },
+            })
+
+    assert captured["body"]["filterIncludeDescendants"] is expected
+    assert captured["body"]["filterIncludeCodingAssistants"] is expected
+
+
+@pytest.mark.asyncio
+async def test_unreadable_slim_text_is_refused_before_any_read(monkeypatch):
+    from fastmcp import Client
+    from fastmcp.exceptions import ToolError as FastMCPToolError
+
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    captured: dict = {}
+    recording_client = _recording_client(monkeypatch, captured)
+    mcp = await _registered_insights_server()
+    with patch.object(
+        AIInsightsManagement, "get_client", new=AsyncMock(return_value=recording_client)
+    ):
+        async with Client(mcp) as client:
+            with pytest.raises(FastMCPToolError, match="slim"):
+                await client.call_tool("manage_ai_insights", {
+                    "action": "get_run",
+                    "params": {"run_id": "r1", "slim": "maybe"},
+                })
+
+    assert "params" not in captured
+
+
+@pytest.mark.asyncio
+async def test_get_run_reads_slim_text_in_the_handler():
+    """Direct callers skip the registry closure, so the handler does the reading."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    mock = AsyncMock(return_value={"id": "r1", "findingsJson": "[]"})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.get_recommendation_run",
+        new=mock,
+    ):
+        await AIInsightsManagement().handle_action(
+            "get_run", {"run_id": "r1", "slim": "false"}
+        )
+
+    mock.assert_awaited_once_with("r1", slim=False)
+
+
+@pytest.mark.asyncio
+async def test_blank_slim_counts_as_omitted():
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    mock = AsyncMock(return_value={"id": "r1", "recommendationsSummary": []})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.get_recommendation_run",
+        new=mock,
+    ):
+        await AIInsightsManagement().handle_action("get_run", {"run_id": "r1", "slim": ""})
+
+    mock.assert_awaited_once_with("r1", slim=True)
+
+
+@pytest.mark.asyncio
+async def test_blank_run_bounds_count_as_omitted(monkeypatch):
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    captured: dict = {}
+    tool = AIInsightsManagement()
+    client = _recording_client(monkeypatch, captured)
+    with patch.object(tool, "get_client", new=AsyncMock(return_value=client)):
+        await tool.handle_action("list_runs", {"since": "", "until": "  "})
+
+    assert "since" not in captured["params"]
+    assert "until" not in captured["params"]
+
+
+async def _list_runs_through_the_registered_tool(monkeypatch, params: dict) -> dict:
+    from fastmcp import Client
+
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    captured: dict = {}
+    recording_client = _recording_client(monkeypatch, captured)
+    mcp = await _registered_insights_server()
+    with patch.object(
+        AIInsightsManagement, "get_client", new=AsyncMock(return_value=recording_client)
+    ):
+        async with Client(mcp) as client:
+            await client.call_tool(
+                "manage_ai_insights", {"action": "list_runs", "params": params}
+            )
+    return captured["params"]
+
+
+@pytest.mark.asyncio
+async def test_list_runs_until_a_calendar_day_covers_that_whole_day(monkeypatch):
+    """BACK-4667: the platform reads a bare day as its first instant, dropping that day's runs."""
+    sent = await _list_runs_through_the_registered_tool(
+        monkeypatch, {"since": "2026-10-01", "until": "2026-10-14"}
+    )
+
+    assert sent["since"] == "2026-10-01T00:00:00.000Z"
+    assert sent["until"] == "2026-10-14T23:59:59.999Z"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("until", "expected"), [
+    ("2026-10-14T23:59:59.999Z", "2026-10-14T23:59:59.999Z"),
+    ("2026-10-14T12:00:00+02:00", "2026-10-14T10:00:00.000Z"),
+    ("2026-10-14T18:00:00", "2026-10-14T18:00:00.000Z"),
+])
+async def test_list_runs_sends_a_time_as_the_same_utc_instant(monkeypatch, until, expected):
+    sent = await _list_runs_through_the_registered_tool(monkeypatch, {"until": until})
+
+    assert sent["until"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("arguments", "expected_field"), [
+    ({"until": "garbage"}, "until"),
+    ({"since": "nope"}, "since"),
+    ({"since": "2026-10-15", "until": "2026-10-14"}, "since"),
+])
+async def test_list_runs_refuses_an_unreadable_bound_before_any_read(
+    monkeypatch, arguments, expected_field
+):
+    from src.revenium_mcp_server.common.error_handling import ToolError
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    tool = AIInsightsManagement()
+    get_client = AsyncMock(return_value=_recording_client(monkeypatch, {}))
+    with patch.object(tool, "get_client", new=get_client):
+        with pytest.raises(ToolError) as exc:
+            await tool.handle_action("list_runs", arguments)
+
+    assert exc.value.field == expected_field
+    assert str(exc.value.message).startswith(expected_field)
+    get_client.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_input_schema_states_the_run_bound_formats():
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+    from src.revenium_mcp_server.tools_decomposed.unified_tool_base import (
+        _PARAMETER_DESCRIPTION_MAX,
+    )
+
+    props = (await AIInsightsManagement()._get_input_schema())["properties"]
+    since = props["since"].get("description", "")
+    until = props["until"].get("description", "")
+
+    for description in (since, until):
+        assert 0 < len(description) <= _PARAMETER_DESCRIPTION_MAX
+        assert "yyyy-MM-dd" in description
+        assert "UTC" in description
+    assert "whole day" in until
+
+
+@pytest.mark.asyncio
+async def test_list_runs_refusal_reaches_the_caller_with_the_field_detail(monkeypatch):
+    """The analytics service names the refused field, the value and the accepted
+    values; that detail must reach the caller in the raised error, after the
+    same sanitising the tool execution layer applies."""
+    import json as json_lib
+    from unittest.mock import MagicMock
+
+    from src.revenium_mcp_server.client import ReveniumAPIError
+    from src.revenium_mcp_server.log_context import sanitize_error_message
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    statuses = ["running", "completed", "partial", "failed", "cancelled"]
+    problem_body = {
+        "type": "about:blank",
+        "title": "Validation Error",
+        "status": 400,
+        "detail": "Invalid input",
+        "code": "VALIDATION_ERROR",
+        "errors": [{
+            "received": "BOGUS",
+            "code": "invalid_enum_value",
+            "options": statuses,
+            "path": ["status"],
+            "message": "Invalid enum value.",
+        }],
+    }
+    client = _recording_client(monkeypatch, {})
+    sent: dict = {}
+
+    async def refusing_request(method, url, params=None, json=None, headers=None):
+        sent["params"] = params
+        resp = MagicMock()
+        resp.status_code = 400
+        resp.content = json_lib.dumps(problem_body).encode()
+        resp.text = json_lib.dumps(problem_body)
+        resp.reason_phrase = "Bad Request"
+        resp.headers = {"content-type": "application/problem+json"}
+        resp.is_success = False
+        resp.json = MagicMock(return_value=problem_body)
+        return resp
+
+    monkeypatch.setattr(client.client, "request", refusing_request)
+    tool = AIInsightsManagement()
+    with patch.object(tool, "get_client", new=AsyncMock(return_value=client)):
+        with pytest.raises(ReveniumAPIError) as exc:
+            await tool.handle_action("list_runs", {"status": "BOGUS"})
+
+    assert sent["params"]["status"] == "BOGUS"
+    caller_text = sanitize_error_message(str(exc.value))
+    assert "status" in caller_text
+    assert "BOGUS" in caller_text
+    assert "running, completed, partial, failed, cancelled" in caller_text

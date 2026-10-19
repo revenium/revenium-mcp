@@ -11,242 +11,287 @@ from typing import Dict, Optional, Tuple
 from loguru import logger
 
 
-class DateRangeParser:
-    """Parses natural language date expressions into API date ranges."""
+#: The window an alert history question that names no dates reads.
+DEFAULT_WINDOW_DAYS = 30
 
-    def __init__(self):
-        """Initialize the date range parser."""
-        self.now = datetime.now(timezone.utc)
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+_MONTH_DAY_PARTS = re.compile(
+    rf"({'|'.join(_MONTHS)})[a-z]*\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?"
+)
+_ISO_INSTANT = r"\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:z|[+-]\d{2}:\d{2})?"
+
+#: (pattern, strptime format) for each numeric calendar-day form.
+_NUMERIC_DAYS = (
+    (r"\d{4}-\d{2}-\d{2}", "%Y-%m-%d"),
+    (r"\d{1,2}/\d{1,2}/\d{4}", "%m/%d/%Y"),
+    (r"\d{4}/\d{1,2}/\d{1,2}", "%Y/%m/%d"),
+    (r"\d{1,2}-\d{1,2}-\d{4}", "%m-%d-%Y"),
+)
+_NUMERIC_DAY_FORMATS = tuple((re.compile(pattern), fmt) for pattern, fmt in _NUMERIC_DAYS)
+
+#: Every date form a range phrase may name, matched against lower-cased text.
+#: Every alternative must also be parsed by ``DateRangeParser._parse_date``, or
+#: a phrase that names it falls through to a later matcher without an error.
+_DATE_PATTERN = "(?:" + "|".join(
+    [_ISO_INSTANT]
+    + [pattern for pattern, _ in _NUMERIC_DAYS]
+    + [re.sub(r"\((?!\?)", "(?:", _MONTH_DAY_PARTS.pattern), "yesterday", "today"]
+) + ")"
+
+_FROM_TO = re.compile(
+    rf"\bfrom\s+({_DATE_PATTERN})\s+(?:to|until|through)\s+({_DATE_PATTERN})"
+)
+_SINCE_AFTER_BEFORE = re.compile(rf"\b(since|after|before)\s+({_DATE_PATTERN})")
+_SPAN_UNITS = r"minutes?|mins?|hours?|hrs?|days?|weeks?"
+#: A span names a window only beside a window word ("last 15 minutes",
+#: "3 days ago"); a bare "15 minute" is a rule's period, not the question's window.
+_LAST_N_UNITS = re.compile(
+    rf"\b(?:last|past|previous)\s+(?P<count>\d+)\s*(?P<unit>{_SPAN_UNITS})\b"
+    rf"|\b(?P<ago_count>\d+)\s*(?P<ago_unit>{_SPAN_UNITS})\s+ago\b"
+)
+_MAX_UNITS = 3660
+
+_UNIT_TO_TIMEDELTA_ARGUMENT = {
+    "minute": "minutes",
+    "min": "minutes",
+    "hour": "hours",
+    "hr": "hours",
+    "day": "days",
+    "week": "weeks",
+}
+
+
+class DateRangeParser:
+    """Parses natural language date expressions into API date ranges.
+
+    Stateless: every call reads the clock once, so a parser built when the
+    server starts still answers "the last hour" for the hour before the
+    question. Every window is UTC, a week starts on Monday, and every bound
+    is formatted the way the platform takes it (``_format_iso8601``).
+    """
 
     def parse_natural_language_date_range(self, text: str) -> Dict[str, Optional[str]]:
-        """Parse natural language text into start/end date parameters.
-
-        Args:
-            text: Natural language text containing date expressions
+        """The window ``text`` names, or the default window ending now.
 
         Returns:
-            Dictionary with 'start' and 'end' ISO date strings
+            Dictionary with exactly the keys 'start' and 'end'
         """
-        text_lower = text.lower()
-        logger.info(f"Parsing date range from: {text}")
-
-        # Initialize result
-        result = {"start": None, "end": None}
-
-        # Handle specific time ranges
-        if "last 30 days" in text_lower or "past 30 days" in text_lower:
-            result = self._get_days_ago_range(30)
-        elif "last 7 days" in text_lower or "past week" in text_lower or "last week" in text_lower:
-            result = self._get_days_ago_range(7)
-        elif "last 24 hours" in text_lower or "past day" in text_lower or "yesterday" in text_lower:
-            result = self._get_hours_ago_range(24)
-        elif "last 12 hours" in text_lower:
-            result = self._get_hours_ago_range(12)
-        elif "last 6 hours" in text_lower:
-            result = self._get_hours_ago_range(6)
-        elif "last hour" in text_lower:
-            result = self._get_hours_ago_range(1)
-        elif "today" in text_lower:
-            result = self._get_today_range()
-        elif "this week" in text_lower:
-            result = self._get_this_week_range()
-        elif "this month" in text_lower:
-            result = self._get_this_month_range()
-
-        # Handle "since" expressions
-        elif "since" in text_lower:
-            result = self._parse_since_expression(text_lower)
-
-        # Handle "from X to Y" expressions
-        elif " from " in text_lower and " to " in text_lower:
-            result = self._parse_from_to_expression(text_lower)
-
-        # Handle "after" expressions
-        elif "after" in text_lower:
-            result = self._parse_after_expression(text_lower)
-
-        # Handle "before" expressions
-        elif "before" in text_lower:
-            result = self._parse_before_expression(text_lower)
-
-        # Handle numeric day ranges
-        else:
-            days_match = re.search(r"(\d+)\s*days?\s*ago", text_lower)
-            if days_match:
-                days = int(days_match.group(1))
-                result = self._get_days_ago_range(days)
-            else:
-                hours_match = re.search(r"(\d+)\s*hours?\s*ago", text_lower)
-                if hours_match:
-                    hours = int(hours_match.group(1))
-                    result = self._get_hours_ago_range(hours)
-
-        # If no specific range found, default to last 30 days
-        if not result["start"] and not result["end"]:
-            logger.info("No specific date range found, defaulting to last 30 days")
-            result = self._get_days_ago_range(30)
-
-        logger.info(f"Parsed date range: {result}")
+        now = datetime.now(timezone.utc)
+        result = self._match(text, now)
+        if result is None:
+            logger.info(
+                f"No date range recognized in {text!r}, "
+                f"defaulting to the last {DEFAULT_WINDOW_DAYS} days"
+            )
+            result = self._default_window(now)
         return result
 
-    def _get_days_ago_range(self, days: int) -> Dict[str, str]:
-        """Get date range for X days ago until now."""
-        start = self.now - timedelta(days=days)
-        return {
-            "start": start.isoformat().replace("+00:00", "Z"),
-            "end": self.now.isoformat().replace("+00:00", "Z"),
+    def match_date_range(self, text: str) -> Optional[Dict[str, Optional[str]]]:
+        """The window ``text`` names, or None when it names none.
+
+        Never returns a dict whose two values are both None.
+        """
+        return self._match(text, datetime.now(timezone.utc))
+
+    def default_window(self) -> Dict[str, Optional[str]]:
+        """The last ``DEFAULT_WINDOW_DAYS`` days, ending now."""
+        return self._default_window(datetime.now(timezone.utc))
+
+    def _default_window(self, now: datetime) -> Dict[str, Optional[str]]:
+        return self._span_ending_now(timedelta(days=DEFAULT_WINDOW_DAYS), now)
+
+    def _match(self, text: str, now: datetime) -> Optional[Dict[str, Optional[str]]]:
+        text_lower = text.lower()
+        result = (
+            self._match_from_to(text_lower, now)
+            or self._match_since_after_before(text_lower, now)
+            or self._match_last_n_units(text_lower, now)
+            or self._match_named_range(text_lower, now)
+        )
+        logger.info(f"Parsed date range from {text!r}: {result}")
+        return result
+
+    def _match_from_to(self, text: str, now: datetime) -> Optional[Dict[str, Optional[str]]]:
+        match = _FROM_TO.search(text)
+        if not match:
+            return None
+        start = self._parse_date(match.group(1), now)
+        if start is None:
+            return None
+        start_instant, _ = start
+        end = self._parse_flexible_date(
+            match.group(2), now, end_of_day=True, not_before=start_instant
+        )
+        result: Dict[str, Optional[str]] = {
+            "start": _format_iso8601(start_instant),
+            "end": end or _format_iso8601(now),
         }
+        return result
 
-    def _get_hours_ago_range(self, hours: int) -> Dict[str, str]:
-        """Get date range for X hours ago until now."""
-        start = self.now - timedelta(hours=hours)
-        return {
-            "start": start.isoformat().replace("+00:00", "Z"),
-            "end": self.now.isoformat().replace("+00:00", "Z"),
-        }
+    def _match_since_after_before(
+        self, text: str, now: datetime
+    ) -> Optional[Dict[str, Optional[str]]]:
+        match = _SINCE_AFTER_BEFORE.search(text)
+        if not match:
+            return None
+        bound = self._parse_flexible_date(match.group(2), now)
+        if bound is None:
+            return None
+        result: Dict[str, Optional[str]]
+        if match.group(1) == "before":
+            result = {"start": None, "end": bound}
+        else:
+            result = {"start": bound, "end": _format_iso8601(now)}
+        return result
 
-    def _get_today_range(self) -> Dict[str, str]:
-        """Get date range for today (start of day until now)."""
-        start_of_day = self.now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return {
-            "start": start_of_day.isoformat().replace("+00:00", "Z"),
-            "end": self.now.isoformat().replace("+00:00", "Z"),
-        }
+    def _match_last_n_units(
+        self, text: str, now: datetime
+    ) -> Optional[Dict[str, Optional[str]]]:
+        match = _LAST_N_UNITS.search(text)
+        if not match:
+            return None
+        count = int(match.group("count") or match.group("ago_count"))
+        if not 1 <= count <= _MAX_UNITS:
+            return None
+        unit = (match.group("unit") or match.group("ago_unit")).rstrip("s")
+        span = timedelta(**{_UNIT_TO_TIMEDELTA_ARGUMENT[unit]: count})
+        return self._span_ending_now(span, now)
 
-    def _get_this_week_range(self) -> Dict[str, str]:
-        """Get date range for this week (Monday until now)."""
-        days_since_monday = self.now.weekday()
-        start_of_week = self.now - timedelta(days=days_since_monday)
-        start_of_week = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
-        return {
-            "start": start_of_week.isoformat().replace("+00:00", "Z"),
-            "end": self.now.isoformat().replace("+00:00", "Z"),
-        }
-
-    def _get_this_month_range(self) -> Dict[str, str]:
-        """Get date range for this month (1st until now)."""
-        start_of_month = self.now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        return {
-            "start": start_of_month.isoformat().replace("+00:00", "Z"),
-            "end": self.now.isoformat().replace("+00:00", "Z"),
-        }
-
-    def _parse_since_expression(self, text: str) -> Dict[str, Optional[str]]:
-        """Parse 'since X' expressions."""
-        # Look for date patterns after "since"
-        since_match = re.search(r"since\s+(.+?)(?:\s|$)", text)
-        if since_match:
-            date_text = since_match.group(1).strip()
-            start_date = self._parse_flexible_date(date_text)
-            if start_date:
-                return {"start": start_date, "end": None}  # No end date means "until now"
-        return {"start": None, "end": None}
-
-    def _parse_after_expression(self, text: str) -> Dict[str, Optional[str]]:
-        """Parse 'after X' expressions."""
-        after_match = re.search(r"after\s+(.+?)(?:\s|$)", text)
-        if after_match:
-            date_text = after_match.group(1).strip()
-            start_date = self._parse_flexible_date(date_text)
-            if start_date:
-                return {"start": start_date, "end": None}
-        return {"start": None, "end": None}
-
-    def _parse_before_expression(self, text: str) -> Dict[str, Optional[str]]:
-        """Parse 'before X' expressions."""
-        before_match = re.search(r"before\s+(.+?)(?:\s|$)", text)
-        if before_match:
-            date_text = before_match.group(1).strip()
-            end_date = self._parse_flexible_date(date_text)
-            if end_date:
-                return {"start": None, "end": end_date}
-        return {"start": None, "end": None}
-
-    def _parse_from_to_expression(self, text: str) -> Dict[str, Optional[str]]:
-        """Parse 'from X to Y' expressions."""
-        from_to_match = re.search(r"from\s+(.+?)\s+to\s+(.+?)(?:\s|$)", text)
-        if from_to_match:
-            start_text = from_to_match.group(1).strip()
-            end_text = from_to_match.group(2).strip()
-
-            start_date = self._parse_flexible_date(start_text)
-            end_date = self._parse_flexible_date(end_text)
-
-            return {"start": start_date, "end": end_date}
-        return {"start": None, "end": None}
-
-    def _parse_flexible_date(self, date_text: str) -> Optional[str]:
-        """Parse various date formats into ISO string."""
-        date_text = date_text.strip()
-
-        # Handle relative dates
-        if "yesterday" in date_text:
-            date = self.now - timedelta(days=1)
-            return (
-                date.replace(hour=0, minute=0, second=0, microsecond=0)
-                .isoformat()
-                .replace("+00:00", "Z")
+    def _match_named_range(self, text: str, now: datetime) -> Optional[Dict[str, Optional[str]]]:
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        result: Dict[str, Optional[str]]
+        if re.search(r"\b(?:last|past)\s+hour\b", text):
+            return self._span_ending_now(timedelta(hours=1), now)
+        if re.search(r"\b(?:last|past)\s+day\b", text):
+            return self._span_ending_now(timedelta(hours=24), now)
+        if re.search(r"\b(?:last|past)\s+week\b", text):
+            return self._span_ending_now(timedelta(days=7), now)
+        if re.search(r"\byesterday\b", text):
+            yesterday = (now - timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
             )
-        elif "today" in date_text:
-            return (
-                self.now.replace(hour=0, minute=0, second=0, microsecond=0)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
+            result = {
+                "start": _format_iso8601(yesterday),
+                "end": _format_iso8601(self._last_millisecond_of(yesterday)),
+            }
+            return result
+        if re.search(r"\btoday\b", text):
+            return self._range_to_now(midnight, now)
+        if re.search(r"\bthis\s+week\b", text):
+            return self._range_to_now(midnight - timedelta(days=now.weekday()), now)
+        if re.search(r"\bthis\s+month\b", text):
+            return self._range_to_now(midnight.replace(day=1), now)
+        return None
 
-        # Handle ISO date formats
-        iso_patterns = [
-            r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z?)",  # ISO with time
-            r"(\d{4}-\d{2}-\d{2})",  # ISO date only
-        ]
+    def _span_ending_now(self, span: timedelta, now: datetime) -> Dict[str, Optional[str]]:
+        return self._range_to_now(now - span, now)
 
-        for pattern in iso_patterns:
-            match = re.search(pattern, date_text)
-            if match:
-                date_str = match.group(1)
+    def _range_to_now(self, start: datetime, now: datetime) -> Dict[str, Optional[str]]:
+        result: Dict[str, Optional[str]] = {
+            "start": _format_iso8601(start),
+            "end": _format_iso8601(now),
+        }
+        return result
+
+    def _last_millisecond_of(self, day: datetime) -> datetime:
+        return day.replace(hour=23, minute=59, second=59, microsecond=999000)
+
+    def _parse_flexible_date(
+        self,
+        date_text: str,
+        now: Optional[datetime] = None,
+        end_of_day: bool = False,
+        not_before: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """Parse one date phrase into the platform's instant form.
+
+        A bare day is its first millisecond, or its last when ``end_of_day``;
+        an instant with a time is kept as given (converted to UTC).
+        """
+        if now is None:
+            now = datetime.now(timezone.utc)
+        parsed = self._parse_date(date_text, now, not_before)
+        if parsed is None:
+            return None
+        instant, is_whole_day = parsed
+        if end_of_day and is_whole_day:
+            instant = self._last_millisecond_of(instant)
+        return _format_iso8601(instant)
+
+    def _parse_date(
+        self, date_text: str, now: datetime, not_before: Optional[datetime] = None
+    ) -> Optional[Tuple[datetime, bool]]:
+        """The UTC instant a date phrase names, and whether it named a whole day.
+
+        ``not_before`` is the start of the range this date ends, which decides
+        the year of a month and day named without one.
+        """
+        text = date_text.strip().lower()
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        if "yesterday" in text:
+            return midnight - timedelta(days=1), True
+        if "today" in text:
+            return midnight, True
+
+        instant_match = re.search(_ISO_INSTANT, text)
+        if instant_match:
+            try:
+                instant = datetime.fromisoformat(
+                    instant_match.group(0).upper().replace("Z", "+00:00")
+                )
+            except ValueError:
+                return None
+            if instant.tzinfo is None:
+                instant = instant.replace(tzinfo=timezone.utc)
+            return instant.astimezone(timezone.utc), False
+
+        for pattern, format_str in _NUMERIC_DAY_FORMATS:
+            day_match = pattern.search(text)
+            if day_match:
                 try:
-                    if "T" not in date_str:
-                        # Add time component for date-only strings
-                        date_str += "T00:00:00Z"
-                    elif not date_str.endswith("Z"):
-                        date_str += "Z"
-
-                    # Validate by parsing
-                    datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                    return date_str
+                    day = datetime.strptime(day_match.group(0), format_str)
                 except ValueError:
-                    continue
+                    return None
+                return day.replace(tzinfo=timezone.utc), True
 
-        # Handle common date formats
-        common_patterns = [
-            (r"(\d{1,2})/(\d{1,2})/(\d{4})", "%m/%d/%Y"),  # MM/DD/YYYY
-            (r"(\d{4})/(\d{1,2})/(\d{1,2})", "%Y/%m/%d"),  # YYYY/MM/DD
-            (r"(\d{1,2})-(\d{1,2})-(\d{4})", "%m-%d-%Y"),  # MM-DD-YYYY
-        ]
-
-        for pattern, format_str in common_patterns:
-            match = re.search(pattern, date_text)
-            if match:
-                try:
-                    if format_str == "%m/%d/%Y":
-                        date = datetime.strptime(
-                            f"{match.group(1)}/{match.group(2)}/{match.group(3)}", format_str
-                        )
-                    elif format_str == "%Y/%m/%d":
-                        date = datetime.strptime(
-                            f"{match.group(1)}/{match.group(2)}/{match.group(3)}", format_str
-                        )
-                    elif format_str == "%m-%d-%Y":
-                        date = datetime.strptime(
-                            f"{match.group(1)}-{match.group(2)}-{match.group(3)}", format_str
-                        )
-
-                    date = date.replace(tzinfo=timezone.utc)
-                    return date.isoformat().replace("+00:00", "Z")
-                except ValueError:
-                    continue
+        month_day = _MONTH_DAY_PARTS.search(text)
+        if month_day:
+            month = _MONTHS.index(month_day.group(1)) + 1
+            day_of_month = int(month_day.group(2))
+            try:
+                if month_day.group(3):
+                    day = midnight.replace(
+                        year=int(month_day.group(3)), month=month, day=day_of_month
+                    )
+                else:
+                    day = self._yearless_day(month, day_of_month, midnight, not_before)
+            except ValueError:
+                return None
+            return day, True
 
         return None
+
+    def _yearless_day(
+        self,
+        month: int,
+        day_of_month: int,
+        midnight: datetime,
+        not_before: Optional[datetime],
+    ) -> datetime:
+        """The year a month and day named without one falls in.
+
+        Alone, it is the most recent such day. As the end of a range, it is the
+        first such day on or after the range's start, so "from Dec 28 to Jan 3"
+        crosses New Year and "from Oct 12 to Oct 18" stays in one year.
+        """
+        if not_before is None:
+            day = midnight.replace(month=month, day=day_of_month)
+            return day.replace(year=day.year - 1) if day > midnight else day
+        day = midnight.replace(year=not_before.year, month=month, day=day_of_month)
+        if day.date() < not_before.date():
+            return day.replace(year=day.year + 1)
+        return day
 
 
 def _format_iso8601(dt: datetime) -> str:

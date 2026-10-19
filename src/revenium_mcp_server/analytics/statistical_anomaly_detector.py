@@ -7,7 +7,8 @@ for detecting temporal anomalies in cost data. Used by Enhanced Spike Analysis v
 import math
 import statistics
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from loguru import logger
 
@@ -20,11 +21,28 @@ SENSITIVITY_THRESHOLDS = {
     "aggressive": 1.5,  # 1.5 standard deviations (86.6% confidence)
 }
 
-# Baseline period mapping for new entity detection
-BASELINE_PERIOD_MAPPING = {
-    "SEVEN_DAYS": {"baseline_days": 2, "recent_days": 5},
-    "THIRTY_DAYS": {"baseline_days": 7, "recent_days": 23},
-    "TWELVE_MONTHS": {"baseline_days": 30, "recent_days": 335},
+# Share of the returned buckets that forms the baseline for new entity detection.
+# The platform picks the bucket size per period and route (half-day, six-hour,
+# daily, monthly), so the split is a share of the buckets, never a day count.
+BASELINE_SHARE = {
+    "SEVEN_DAYS": 2 / 7,
+    "THIRTY_DAYS": 7 / 30,
+    "TWELVE_MONTHS": 1 / 12,
+}
+MIN_DETECTION_BUCKETS = 2
+
+# How a cost source entered the recent part: no baseline cost at all, or none
+# in at least half of the baseline buckets
+NEW_ENTITY = "new_entity"
+ACTIVATION = "activation"
+
+# A dense cost series per (dimension, entity name), one value per bucket
+DetectionSeries = Dict[Tuple[str, str], List[float]]
+
+DIMENSION_ENTITY_TYPES = {
+    "providers": "provider",
+    "agents": "agent",
+    "api_keys": "api_key",
 }
 
 # Default entity type thresholds (all zero for maximum sensitivity)
@@ -219,315 +237,127 @@ class StatisticalAnomalyDetector:
             percentage_above_normal=percentage_above_normal,
         )
 
-    def detect_new_cost_sources(
-        self,
-        entity_time_matrix: Dict[str, List[float]],
-        period: str,
-        entity_dimension_map: Dict[str, str],
-        min_new_entity_threshold: float = 0.0,
-    ) -> List[NewEntityIntroduction]:
-        """Detect new cost source introductions using dynamic baseline approach.
-
-        Args:
-            entity_time_matrix: Dict mapping entity names to time series cost data
-            period: Analysis period (SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS)
-            entity_dimension_map: Dict mapping entity names to their dimensions/types
-            min_new_entity_threshold: Minimum cost threshold to flag new entities
-
-        Returns:
-            List of NewEntityIntroduction objects for detected new entities
+    def baseline_bucket_count(self, period: str, bucket_count: int) -> int:
+        """How many of the first buckets form the baseline; the rest are the recent part.
 
         Raises:
-            ValueError: If period is not supported for new entity detection
+            ValueError: When the period has no baseline share or too few buckets came back
         """
-        # Validate period support
-        if period not in BASELINE_PERIOD_MAPPING:
-            supported_periods = list(BASELINE_PERIOD_MAPPING.keys())
+        if period not in BASELINE_SHARE:
             raise ValueError(
-                f"Period '{period}' not supported for new entity detection. "
-                f"Supported periods: {supported_periods}"
+                f"{period} has no baseline for new-entity detection "
+                f"(supported: {', '.join(BASELINE_SHARE)})"
             )
+        if bucket_count < MIN_DETECTION_BUCKETS:
+            noun = "bucket" if bucket_count == 1 else "buckets"
+            raise ValueError(
+                f"the report returned {bucket_count} {noun}, and at least "
+                f"{MIN_DETECTION_BUCKETS} are needed to compare a baseline with a recent part"
+            )
+        share = round(bucket_count * BASELINE_SHARE[period])
+        return max(1, min(bucket_count - 1, share))
 
-        self.logger.info(f"Detecting new entities for period: {period}")
-
-        # Get baseline configuration for this period
-        baseline_config = BASELINE_PERIOD_MAPPING[period]
-        baseline_days = baseline_config["baseline_days"]
-        recent_days = baseline_config["recent_days"]
-
-        self.logger.debug(f"Using baseline: {baseline_days} days, recent: {recent_days} days")
-
-        # Split entity time matrix into baseline and recent periods
-        baseline_entities, recent_entities = self._split_entity_periods(
-            entity_time_matrix, baseline_days, recent_days
-        )
-
-        # Detect new entity introductions
-        new_entities = self._identify_new_entities(
-            baseline_entities, recent_entities, min_new_entity_threshold, period, entity_dimension_map
-        )
-
-        # Detect zero-to-cost activations
-        activated_entities = self._identify_activated_entities(
-            baseline_entities, recent_entities, min_new_entity_threshold, period, entity_dimension_map
-        )
-
-        # Combine results
-        all_new_entities = new_entities + activated_entities
-
-        self.logger.info(f"Detected {len(all_new_entities)} new/activated entities")
-        return all_new_entities
-
-    def _split_entity_periods(
+    def detect_new_cost_sources(
         self,
-        entity_time_matrix: Dict[str, List[float]],
-        baseline_days: int,
-        recent_days: int
-    ) -> Tuple[Dict[str, List[float]], Dict[str, List[float]]]:
-        """Split entity time matrix into baseline and recent periods.
+        series: DetectionSeries,
+        bucket_starts: Sequence[datetime],
+        period: str,
+        min_new_entity_threshold: float = 0.0,
+    ) -> List[NewEntityIntroduction]:
+        """Entities with cost in the recent part and none (new) or little (activated) in the baseline.
 
         Args:
-            entity_time_matrix: Full entity time series data
-            baseline_days: Number of days for baseline period
-            recent_days: Number of days for recent period
+            series: Dense cost series per (dimension, name), aligned to bucket_starts
+            bucket_starts: Every bucket's start, oldest first
+            period: Analysis period whose baseline share applies
+            min_new_entity_threshold: Minimum recent cost to report an entity
 
-        Returns:
-            Tuple of (baseline_entities, recent_entities) dictionaries
+        Raises:
+            ValueError: When the period has no baseline share or too few buckets came back
         """
-        baseline_entities = {}
-        recent_entities = {}
+        baseline_count = self.baseline_bucket_count(period, len(bucket_starts))
+        recent_starts = list(bucket_starts[baseline_count:])
+        period_type = "monthly" if period == "TWELVE_MONTHS" else "bucket"
+        introduction_period = describe_span(
+            bucket_span(recent_starts), not starts_at_midnight(bucket_starts)
+        )
 
-        for entity_name, time_series in entity_time_matrix.items():
-            if len(time_series) < baseline_days + recent_days:
-                self.logger.warning(
-                    f"Insufficient data for {entity_name}: {len(time_series)} points, "
-                    f"need {baseline_days + recent_days}"
+        found = []
+        for (dimension, entity_name), costs in series.items():
+            baseline = costs[:baseline_count]
+            recent = costs[baseline_count:]
+            introduction_type = self._introduction_type(
+                baseline, recent, min_new_entity_threshold
+            )
+            if introduction_type is None:
+                continue
+            first_index = next(index for index, cost in enumerate(recent) if cost > 0)
+            active = [cost for cost in recent if cost > 0]
+            recent_total = sum(recent)
+            found.append(
+                NewEntityIntroduction(
+                    entity_name=entity_name,
+                    entity_type=DIMENSION_ENTITY_TYPES.get(dimension, "provider"),
+                    introduction_period=introduction_period,
+                    first_appearance_index=first_index,
+                    first_active_date=recent_starts[first_index].strftime("%Y-%m-%d"),
+                    periods_active=len(active),
+                    period_type=period_type,
+                    total_cost_impact=recent_total,
+                    average_daily_cost=recent_total / len(active),
+                    introduction_type=introduction_type,
+                    cost_periods=recent,
+                    baseline_buckets_without_cost=sum(1 for cost in baseline if cost == 0),
+                    context=(
+                        f"Newly active cost source detected with ${recent_total:.2f} "
+                        "total cost impact"
+                    ),
                 )
-                continue
-
-            # Split time series: baseline period comes first, then recent period
-            baseline_period = time_series[:baseline_days]
-            recent_period = time_series[baseline_days:baseline_days + recent_days]
-
-            baseline_entities[entity_name] = baseline_period
-            recent_entities[entity_name] = recent_period
-
-        return baseline_entities, recent_entities
-
-    def _identify_new_entities(
-        self,
-        baseline_entities: Dict[str, List[float]],
-        recent_entities: Dict[str, List[float]],
-        min_threshold: float,
-        period: str,
-        entity_dimension_map: Dict[str, str],
-    ) -> List[NewEntityIntroduction]:
-        """Identify entities present in recent period but absent from baseline.
-
-        Args:
-            baseline_entities: Entities from baseline period
-            recent_entities: Entities from recent period
-            min_threshold: Minimum cost threshold
-            period: Analysis period for context
-            entity_dimension_map: Mapping of entity names to their dimensions
-
-        Returns:
-            List of new entity introductions
-        """
-        new_entities = []
-        baseline_entity_names = set(baseline_entities.keys())
-
-        for entity_name, recent_costs in recent_entities.items():
-            # Skip if entity existed in baseline period
-            if entity_name in baseline_entity_names:
-                continue
-
-            # Calculate cost impact
-            total_cost = sum(recent_costs)
-            if total_cost < min_threshold:
-                continue
-
-            # Find first non-zero appearance
-            first_appearance_index = 0
-            for i, cost in enumerate(recent_costs):
-                if cost > 0:
-                    first_appearance_index = i
-                    break
-
-            # Calculate periods active and average cost
-            non_zero_costs = [c for c in recent_costs if c > 0]
-            periods_active = len(non_zero_costs)
-            avg_daily_cost = sum(non_zero_costs) / periods_active if periods_active > 0 else 0.0
-
-            # Calculate first active date and period type
-            first_active_date, period_type = self._calculate_first_active_date(period, first_appearance_index)
-
-            # Create new entity introduction
-            new_entity = NewEntityIntroduction(
-                entity_name=entity_name,
-                entity_type=self._get_entity_type_from_dimension(entity_name, entity_dimension_map),
-                introduction_period=self._format_period_description(period),
-                first_appearance_index=first_appearance_index,
-                first_active_date=first_active_date,
-                periods_active=periods_active,
-                period_type=period_type,
-                total_cost_impact=total_cost,
-                average_daily_cost=avg_daily_cost,
-                introduction_type="new_entity",
-                cost_periods=recent_costs,
-                context=f"Newly active cost source detected with ${total_cost:.2f} total cost impact"
             )
 
-            new_entities.append(new_entity)
-            self.logger.debug(f"Detected new entity: {entity_name} (${total_cost:.2f})")
+        self.logger.info(f"Detected {len(found)} new/activated entities")
+        return found
 
-        return new_entities
+    @staticmethod
+    def _introduction_type(
+        baseline: List[float], recent: List[float], min_threshold: float
+    ) -> Optional[str]:
+        """'new_entity' when the baseline has no cost, 'activation' when it is mostly without cost."""
+        recent_total = sum(recent)
+        if recent_total <= 0 or recent_total < min_threshold:
+            return None
+        zero_buckets = sum(1 for cost in baseline if cost == 0)
+        if zero_buckets == len(baseline):
+            return NEW_ENTITY
+        if zero_buckets >= len(baseline) * 0.5:
+            return ACTIVATION
+        return None
 
-    def _identify_activated_entities(
-        self,
-        baseline_entities: Dict[str, List[float]],
-        recent_entities: Dict[str, List[float]],
-        min_threshold: float,
-        period: str,
-        entity_dimension_map: Dict[str, str],
-    ) -> List[NewEntityIntroduction]:
-        """Identify entities that transition from dormant (mostly $0) to active.
 
-        Args:
-            baseline_entities: Entities from baseline period
-            recent_entities: Entities from recent period
-            min_threshold: Minimum cost threshold
-            period: Analysis period for context
-            entity_dimension_map: Mapping of entity names to their dimensions
+def bucket_span(bucket_starts: Sequence[datetime]) -> Dict[str, Any]:
+    """The first and last bucket start of a part of the window, and its bucket count."""
+    return {
+        "start": bucket_starts[0].isoformat(),
+        "end": bucket_starts[-1].isoformat(),
+        "buckets": len(bucket_starts),
+    }
 
-        Returns:
-            List of activated entity introductions
-        """
-        activated_entities = []
 
-        for entity_name in baseline_entities.keys():
-            if entity_name not in recent_entities:
-                continue
+def starts_at_midnight(bucket_starts: Sequence[datetime]) -> bool:
+    """Whether every bucket starts at midnight UTC, so a date alone names each one."""
+    return all(start.time() == datetime.min.time() for start in bucket_starts)
 
-            baseline_costs = baseline_entities[entity_name]
-            recent_costs = recent_entities[entity_name]
 
-            # Check if entity was dormant in baseline (≥50% zero-cost periods)
-            zero_count = sum(1 for cost in baseline_costs if cost == 0.0)
-            dormant_threshold = len(baseline_costs) * 0.5
+def format_bucket_start(iso_start: str, with_time: bool) -> str:
+    """A bucket start as the answer shows it: the UTC date, with the time if asked."""
+    instant = datetime.fromisoformat(iso_start)
+    return instant.strftime("%Y-%m-%d %H:%M UTC" if with_time else "%Y-%m-%d")
 
-            if zero_count < dormant_threshold:
-                continue  # Not dormant in baseline
 
-            # Check if entity became active in recent period
-            recent_total_cost = sum(recent_costs)
-            if recent_total_cost < min_threshold:
-                continue  # Still not active enough
-
-            # Find first significant activation
-            first_activation_index = 0
-            for i, cost in enumerate(recent_costs):
-                if cost > 0:
-                    first_activation_index = i
-                    break
-
-            # Calculate periods active and average cost
-            non_zero_costs = [c for c in recent_costs if c > 0]
-            periods_active = len(non_zero_costs)
-            avg_daily_cost = sum(non_zero_costs) / periods_active if periods_active > 0 else 0.0
-
-            # Calculate first active date and period type
-            first_active_date, period_type = self._calculate_first_active_date(period, first_activation_index)
-
-            # Create activated entity introduction
-            activated_entity = NewEntityIntroduction(
-                entity_name=entity_name,
-                entity_type=self._get_entity_type_from_dimension(entity_name, entity_dimension_map),
-                introduction_period=self._format_period_description(period),
-                first_appearance_index=first_activation_index,
-                first_active_date=first_active_date,
-                periods_active=periods_active,
-                period_type=period_type,
-                total_cost_impact=recent_total_cost,
-                average_daily_cost=avg_daily_cost,
-                introduction_type="activation",
-                cost_periods=recent_costs,
-                context=f"Newly active cost source detected with ${recent_total_cost:.2f} total cost impact"
-            )
-
-            activated_entities.append(activated_entity)
-            self.logger.debug(f"Detected activated entity: {entity_name} (${recent_total_cost:.2f})")
-
-        return activated_entities
-
-    def _get_entity_type_from_dimension(self, entity_name: str, entity_dimension_map: Dict[str, str]) -> str:
-        """Determine entity type from dimension mapping (definitive, not pattern-based).
-
-        Args:
-            entity_name: Name of the entity
-            entity_dimension_map: Mapping of entity names to their dimensions
-
-        Returns:
-            Entity type based on dimension: 'agent', 'api_key', or 'provider'
-        """
-        # Get dimension from the mapping
-        dimension = entity_dimension_map.get(entity_name, "providers")  # Default to providers
-
-        # Map dimension to entity type (only supported dimensions for new entity detection)
-        dimension_to_type = {
-            "providers": "provider",
-            "agents": "agent",
-            "api_keys": "api_key",
-            # Note: models and customers excluded - they don't have time-series endpoints
-        }
-
-        entity_type = dimension_to_type.get(dimension, "provider")
-        self.logger.debug(f"Entity '{entity_name}' mapped from dimension '{dimension}' to type '{entity_type}'")
-        return entity_type
-
-    def _format_period_description(self, period: str) -> str:
-        """Format period into human-readable description.
-
-        Args:
-            period: Period string (e.g., 'THIRTY_DAYS')
-
-        Returns:
-            Human-readable period description
-        """
-        period_descriptions = {
-            "SEVEN_DAYS": "last 7 days",
-            "THIRTY_DAYS": "last 30 days",
-            "TWELVE_MONTHS": "last 12 months",
-        }
-
-        return period_descriptions.get(period, period.lower().replace('_', ' '))
-
-    def _calculate_first_active_date(self, period: str, first_appearance_index: int) -> Tuple[str, str]:
-        """Calculate the first active date and period type based on analysis period.
-
-        Args:
-            period: Analysis period (SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS)
-            first_appearance_index: Index of first appearance in recent period
-
-        Returns:
-            Tuple of (first_active_date, period_type)
-        """
-        from datetime import datetime, timedelta
-
-        # Determine period type and calculate date offset
-        if period == "TWELVE_MONTHS":
-            period_type = "monthly"
-            # For 12-month analysis, each index represents a month
-            # Index 0 = most recent month, so we go back by index months
-            base_date = datetime.now().replace(day=1)  # First day of current month
-            offset_date = base_date - timedelta(days=30 * first_appearance_index)
-            first_active_date = offset_date.strftime("%Y-%m-%d")
-        else:
-            period_type = "daily"
-            # For daily analysis (7-day, 30-day), each index represents a day
-            # Index 0 = most recent day, so we go back by index days
-            base_date = datetime.now()
-            offset_date = base_date - timedelta(days=first_appearance_index)
-            first_active_date = offset_date.strftime("%Y-%m-%d")
-
-        return first_active_date, period_type
+def describe_span(span: Dict[str, Any], with_time: bool) -> str:
+    """'the N buckets starting A to B', from a span made by bucket_span."""
+    start = format_bucket_start(span["start"], with_time)
+    if span["buckets"] == 1:
+        return f"the 1 bucket starting {start}"
+    end = format_bucket_start(span["end"], with_time)
+    return f"the {span['buckets']} buckets starting {start} to {end}"

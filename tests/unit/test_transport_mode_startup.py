@@ -165,3 +165,62 @@ async def test_main_fails_fast_on_clerk_plus_stdio(clerk_mode_env, monkeypatch):
 
     mocks["FastMCP"].assert_not_called()
     mocks["OIDCProxy"].assert_not_called()
+
+
+@pytest.fixture
+def auth_mode_unset_env(monkeypatch):
+    """A key and a base URL in the environment, AUTH_MODE absent.
+
+    load_dotenv is replaced so a stray .env in the working directory cannot
+    supply a mode.
+    """
+    monkeypatch.delenv("AUTH_MODE", raising=False)
+    monkeypatch.setenv("REVENIUM_API_KEY", "hak_test_abcd1234")
+    monkeypatch.setenv("REVENIUM_BASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setattr(
+        "src.revenium_mcp_server.enhanced_server.load_dotenv",
+        lambda *args, **kwargs: False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_main_refuses_http_when_auth_mode_unset(auth_mode_unset_env, monkeypatch):
+    """HTTP with no AUTH_MODE refuses to start and never serves (BACK-4687)."""
+    from src.revenium_mcp_server import enhanced_server
+
+    monkeypatch.setenv("TRANSPORT_MODE", "http")
+    monkeypatch.setenv("MCP_HOST", "127.0.0.1")
+    mocks = _build_main_mocks()
+
+    with ExitStack() as stack:
+        for p in mocks["patches"]:
+            stack.enter_context(p)
+        with pytest.raises(
+            ValueError, match="requires AUTH_MODE to be set"
+        ) as excinfo:
+            await enhanced_server.main()
+
+    message = str(excinfo.value)
+    assert "api_key" in message
+    assert "clerk" in message
+    assert "AUTH_MODE=env" in message
+    mocks["FastMCP"].assert_not_called()
+    mocks["fake_mcp"].run_async.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_main_runs_stdio_when_auth_mode_unset(auth_mode_unset_env, monkeypatch):
+    """Local stdio use with a key and no AUTH_MODE is unchanged."""
+    from src.revenium_mcp_server import enhanced_server
+
+    monkeypatch.delenv("TRANSPORT_MODE", raising=False)
+    mocks = _build_main_mocks()
+
+    with ExitStack() as stack:
+        for p in mocks["patches"]:
+            stack.enter_context(p)
+        await enhanced_server.main()
+
+    fake_mcp = mocks["fake_mcp"]
+    assert fake_mcp.run_async.call_count == 1
+    assert "transport" not in fake_mcp.run_async.call_args.kwargs

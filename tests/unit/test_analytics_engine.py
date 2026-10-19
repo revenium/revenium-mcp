@@ -10,6 +10,7 @@ fakes so tests run without a real API client.
 """
 
 import pytest
+from contextlib import suppress
 from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.analytics.simple_analytics_engine import (
@@ -19,7 +20,9 @@ from src.revenium_mcp_server.analytics.simple_analytics_engine import (
     ProviderCostsProcessor,
     SimpleAnalyticsEngine,
 )
+from src.revenium_mcp_server.analytics.simple_cost_analyzer import RankedCosts
 from src.revenium_mcp_server.analytics.validation import ValidationError
+from src.revenium_mcp_server.common.error_handling import ToolError
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -44,12 +47,12 @@ def make_deps(
     validator.validate_cost_summary_params.return_value = validated_params or {"period": "SEVEN_DAYS", "aggregation": "TOTAL"}
 
     analyzer = MagicMock()
-    analyzer.get_provider_costs = AsyncMock(return_value=fetch_return or [])
-    analyzer.get_model_costs = AsyncMock(return_value=fetch_return or [])
-    analyzer.get_customer_costs = AsyncMock(return_value=fetch_return or [])
+    analyzer.get_provider_costs = AsyncMock(return_value=fetch_return or RankedCosts([]))
+    analyzer.get_model_costs = AsyncMock(return_value=fetch_return or RankedCosts([]))
+    analyzer.get_customer_costs = AsyncMock(return_value=fetch_return or RankedCosts([]))
     analyzer.investigate_cost_spike = AsyncMock(return_value=fetch_return or {})
-    analyzer.get_api_key_costs = AsyncMock(return_value=fetch_return or [])
-    analyzer.get_agent_costs = AsyncMock(return_value=fetch_return or [])
+    analyzer.get_api_key_costs = AsyncMock(return_value=fetch_return or RankedCosts([]))
+    analyzer.get_agent_costs = AsyncMock(return_value=fetch_return or RankedCosts([]))
     analyzer.get_cost_summary = AsyncMock(return_value=fetch_return or {})
 
     formatter = MagicMock()
@@ -97,8 +100,8 @@ class TestProviderCostsProcessor:
         assert result == "provider-formatted"
 
     @pytest.mark.asyncio
-    async def test_validation_error_returns_error_response(self, processor, deps):
-        """ValidationError during validate_params returns error-response."""
+    async def test_validation_error_raises_error_response(self, processor, deps):
+        """ValidationError during validate_params raises the formatted error-response."""
         deps.validator.validate_provider_costs_params.side_effect = ValidationError(
             "bad period", field="period", suggestions=["SEVEN_DAYS"]
         )
@@ -106,19 +109,21 @@ class TestProviderCostsProcessor:
             operation_type="provider costs",
             kwargs={"period": "BAD", "aggregation": "TOTAL"},
         )
-        result = await processor.process_analytics_request(params)
-        assert result == "error-response"
+        with pytest.raises(ToolError) as exc:
+            await processor.process_analytics_request(params)
+        assert exc.value.message == "error-response"
 
     @pytest.mark.asyncio
-    async def test_fetch_error_returns_error_response(self, processor, deps):
-        """Exception during fetch_data returns formatted error response."""
+    async def test_fetch_error_raises_error_response(self, processor, deps):
+        """Exception during fetch_data raises the formatted error response."""
         deps.analyzer.get_provider_costs.side_effect = RuntimeError("API down")
         params = AnalyticsParams(
             operation_type="provider costs",
             kwargs={"period": "SEVEN_DAYS", "aggregation": "TOTAL"},
         )
-        result = await processor.process_analytics_request(params)
-        assert result == "error-response"
+        with pytest.raises(ToolError) as exc:
+            await processor.process_analytics_request(params)
+        assert exc.value.message == "error-response"
 
 
 class TestCostSpikeProcessor:
@@ -139,8 +144,8 @@ class TestCostSpikeProcessor:
         assert result == "spike-formatted"
 
     @pytest.mark.asyncio
-    async def test_validation_error_returns_error_response(self):
-        """ValidationError (e.g., missing threshold) produces error response."""
+    async def test_validation_error_raises_error_response(self):
+        """ValidationError (e.g., missing threshold) raises the error response."""
         deps = make_deps()
         deps.validator.validate_cost_spike_params.side_effect = ValidationError(
             "Threshold required", field="threshold"
@@ -150,8 +155,9 @@ class TestCostSpikeProcessor:
             operation_type="cost spike investigation",
             kwargs={"period": "SEVEN_DAYS"},
         )
-        result = await processor.process_analytics_request(params)
-        assert result == "error-response"
+        with pytest.raises(ToolError) as exc:
+            await processor.process_analytics_request(params)
+        assert exc.value.message == "error-response"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -236,3 +242,178 @@ class TestAgentCostsProcessorFilters:
             aggregation="TOTAL",
             filters={"costSources": ["provider_billing"]},
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cost reports whose endpoints take no filter refuse one (BACK-4694)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FILTERLESS_ACTIONS = [
+    "get_provider_costs",
+    "get_model_costs",
+    "get_customer_costs",
+    "get_api_key_costs",
+    "get_cost_summary",
+    "get_tool_costs",
+    "get_top_tools",
+    "get_tool_costs_by_agent",
+    "get_tool_costs_by_provider",
+]
+
+
+def _engine_with_analyzer_mock(action):
+    client = MagicMock()
+    engine = SimpleAnalyticsEngine(client)
+    read = AsyncMock(return_value=RankedCosts([]))
+    setattr(engine.analyzer, action, read)
+    return engine, client, read
+
+
+async def _refusal(call):
+    """The text of the refusal a call raises: a refusal carries the error flag (BACK-4699)."""
+    with pytest.raises(ToolError) as refusal:
+        await call
+    return refusal.value.message
+
+
+class TestCostReportsRefuseFilters:
+    """A filter these reports cannot apply is refused, never read as the whole report."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", _FILTERLESS_ACTIONS)
+    @pytest.mark.parametrize(
+        "filters",
+        [
+            {"provider": "openai"},
+            {"provider": ""},
+            {"providers": ["openai"]},
+            {"team_id": "x"},
+            {"customer": None},
+        ],
+    )
+    async def test_filtered_report_is_refused_and_never_read(self, action, filters):
+        engine, client, read = _engine_with_analyzer_mock(action)
+
+        text = await _refusal(getattr(engine, action)(period="SEVEN_DAYS", filters=filters))
+
+        read.assert_not_awaited()
+        assert client.mock_calls == []
+        assert f"{action} does not apply filters" in text
+        assert "Nothing was read" in text
+
+    @pytest.mark.asyncio
+    async def test_refusal_points_at_the_unfiltered_report_first(self):
+        engine, _, _ = _engine_with_analyzer_mock("get_provider_costs")
+
+        text = await _refusal(
+            engine.get_provider_costs(
+                period="SEVEN_DAYS", filters={"provider": "openai"}
+            )
+        )
+
+        assert "without filters" in text
+        if "get_user_costs" in text:
+            assert text.index("without filters") < text.index("get_user_costs")
+            assert "subscriber email" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", _FILTERLESS_ACTIONS)
+    async def test_refusal_does_not_promise_a_complete_listing(self, action):
+        """The unfiltered read stops at a page cap, so the refusal says how to read the rest."""
+        engine, _, _ = _engine_with_analyzer_mock(action)
+
+        text = await _refusal(
+            getattr(engine, action)(
+                period="SEVEN_DAYS", filters={"provider": "openai"}
+            )
+        )
+
+        assert "every page" not in text
+        assert "shorter start_date/end_date range" in text
+
+    @pytest.mark.asyncio
+    async def test_tool_cost_refusal_names_the_manage_tools_filters_that_apply(self):
+        from src.revenium_mcp_server.tools_decomposed.tool_management import (
+            _TOOL_REPORT_ACTIONS,
+        )
+
+        engine, _, _ = _engine_with_analyzer_mock("get_tool_costs_by_provider")
+
+        text = await _refusal(
+            engine.get_tool_costs_by_provider(
+                period="SEVEN_DAYS", filters={"provider": "openai"}
+            )
+        )
+
+        assert "without filters" in text
+        assert "manage_tools" in text
+        named = {"get_cost_by_provider": "provider", "get_cost_breakdown": "tool_id"}
+        for tool_action, argument in named.items():
+            assert f"{tool_action} with {argument}" in text
+            assert argument in _TOOL_REPORT_ACTIONS[tool_action].report.filters
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", _FILTERLESS_ACTIONS)
+    @pytest.mark.parametrize("filters", ["omitted", {}])
+    async def test_report_without_filters_still_reads(self, action, filters):
+        engine, _, read = _engine_with_analyzer_mock(action)
+        arguments = {"period": "SEVEN_DAYS"}
+        if filters != "omitted":
+            arguments["filters"] = filters
+
+        with suppress(ToolError):
+            await getattr(engine, action)(**arguments)
+
+        read.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action, filters",
+        [
+            ("get_user_costs", {"providers": ["openai"]}),
+            ("get_agent_costs", {"costSources": ["provider_billing"]}),
+        ],
+    )
+    async def test_applied_filters_still_reach_the_analyzer(self, action, filters):
+        engine, _, read = _engine_with_analyzer_mock(action)
+
+        with suppress(ToolError):
+            await getattr(engine, action)(period="SEVEN_DAYS", filters=filters)
+
+        read.assert_awaited_once()
+        assert read.await_args.kwargs["filters"] == filters
+
+    @pytest.mark.asyncio
+    async def test_applied_filters_still_reach_the_department_report(self, monkeypatch):
+        from src.revenium_mcp_server.analytics.simple_cost_analyzer import (
+            SimpleCostAnalyzer,
+        )
+        from src.revenium_mcp_server.tools_decomposed.business_analytics_management import (
+            BusinessAnalyticsManagement,
+        )
+
+        read = AsyncMock(return_value={})
+        monkeypatch.setattr(SimpleCostAnalyzer, "get_department_costs", read)
+        tool = BusinessAnalyticsManagement()
+        tool.get_client = AsyncMock(return_value=MagicMock())
+        filters = {"providers": ["openai"], "users": ["dev@example.com"]}
+
+        await tool.handle_action(
+            "get_department_costs", {"period": "SEVEN_DAYS", "filters": filters}
+        )
+
+        read.assert_awaited_once()
+        assert read.await_args.args[0].filters == filters
+
+
+@pytest.mark.asyncio
+async def test_user_costs_blank_filter_never_reaches_platform():
+    """A blank user filter is refused before the read, never sent as users= (BACK-4694)."""
+    engine, client, read = _engine_with_analyzer_mock("get_user_costs")
+
+    text = await _refusal(engine.get_user_costs(period="SEVEN_DAYS", filters={"users": [""]}))
+
+    read.assert_not_awaited()
+    assert client.mock_calls == []
+    assert "filters.users" in text
+    assert "blank" in text

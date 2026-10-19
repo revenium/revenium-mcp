@@ -7,6 +7,7 @@ auto-discovery debugging, and log analysis into a single tool via delegation.
 import pytest
 from unittest.mock import AsyncMock
 
+from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.tools_decomposed.system_diagnostics import SystemDiagnostics
 from mcp.types import TextContent
 
@@ -86,10 +87,12 @@ class TestSystemDiagnosticsRouting:
 
     @pytest.mark.asyncio
     async def test_unknown_action_returns_error(self, diagnostics_tool):
-        """Unknown action returns structured error with valid actions."""
-        result = await diagnostics_tool.handle_action("bogus_action", {})
-        text = result[0].text
+        """Unknown action raises a structured error with valid actions."""
+        with pytest.raises(ToolError) as exc_info:
+            await diagnostics_tool.handle_action("bogus_action", {})
+        text = exc_info.value.message
         assert "bogus_action" in text or "Unknown" in text
+        assert "valid_actions" in text
 
     @pytest.mark.asyncio
     async def test_all_config_actions_route_correctly(self, diagnostics_tool):

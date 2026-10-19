@@ -10,6 +10,8 @@ import os
 
 from loguru import logger
 
+from .auth.auth_mode import auth_mode_is_explicit
+
 
 def read_transport_mode() -> str:
     """Return the active TRANSPORT_MODE, validated.
@@ -122,18 +124,25 @@ def validate_mode_combination(auth_mode: str, transport_mode: str) -> None:
 
     Allowed combinations:
         - env + stdio   -> default, silent
-        - env + http    -> allowed with WARNING (HTTP without auth)
+        - env + http (AUTH_MODE unset) -> ValueError (HTTP without auth must be
+          chosen, never defaulted into)
+        - env + http (AUTH_MODE=env set) -> allowed with WARNING (HTTP without auth)
         - clerk + http  -> production path, silent
         - clerk + stdio -> ValueError (OAuth needs HTTP callbacks)
         - api_key + http -> production path, silent
         - api_key + stdio -> ValueError (per-request bearer auth needs HTTP endpoint)
+
+    The env + http branch also reads whether AUTH_MODE is present in the
+    process environment, through ``auth_mode_is_explicit``, so its result
+    depends on the environment as well as on ``auth_mode``.
 
     Args:
         auth_mode: Validated AUTH_MODE value ("env", "clerk", or "api_key").
         transport_mode: Validated TRANSPORT_MODE value ("stdio" or "http").
 
     Raises:
-        ValueError: when the combination is invalid (clerk + stdio, api_key + stdio).
+        ValueError: when the combination is invalid (clerk + stdio,
+            api_key + stdio, or env + http with AUTH_MODE unset).
     """
     if auth_mode in ("clerk", "api_key") and transport_mode == "stdio":
         raise ValueError(
@@ -142,8 +151,20 @@ def validate_mode_combination(auth_mode: str, transport_mode: str) -> None:
             "Set TRANSPORT_MODE=http or switch AUTH_MODE=env."
         )
     if auth_mode == "env" and transport_mode == "http":
+        if not auth_mode_is_explicit():
+            raise ValueError(
+                "TRANSPORT_MODE=http requires AUTH_MODE to be set, and it is not "
+                "set. Without it the server would answer every caller with no "
+                "sign-in, using the server's own REVENIUM_API_KEY. Set AUTH_MODE "
+                "to one of: api_key (each caller sends their own Revenium key as "
+                "an Authorization: Bearer token), clerk (OAuth sign-in through "
+                "Clerk), or env (no caller authentication; set AUTH_MODE=env only "
+                "on a trusted network, as a deliberate opt-in)."
+            )
         logger.warning(
-            "TRANSPORT_MODE=http with AUTH_MODE=env exposes the MCP server "
-            "without authentication. Use only on trusted networks or for "
-            "local development. Do NOT use in production."
+            "AUTH_MODE=env was set explicitly with TRANSPORT_MODE=http: the MCP "
+            "server accepts every caller without authentication and acts with "
+            "the server's REVENIUM_API_KEY; check that this was deliberate. Use "
+            "only on a trusted network. Switch to AUTH_MODE=api_key, so each "
+            "caller must send their own key."
         )

@@ -20,8 +20,8 @@ Platform anchors, in the ``hypercurrent`` repo under
 
 ``EQUAL_TO`` and ``NOT_EQUAL_TO`` stay in the platform's ``OperatorType`` enum in
 ``AIAnomaly.kt`` and ``describeOperator`` still renders them, so alerts already
-stored with either value keep listing and rendering normally. Only create and
-update refuse them — see :data:`REJECTED_OPERATORS` and
+stored with either value keep listing and rendering normally. Every write refuses
+them: create, update, and the enable, disable and toggle that resend a stored alert — see :data:`REJECTED_OPERATORS` and
 :func:`rejected_operator_message`, which mirrors the alternative the platform's own
 error names.
 
@@ -86,6 +86,37 @@ REJECTED_OPERATOR_GUIDANCE: str = (
     "LESS_THAN_OR_EQUAL_TO, or express a band as two alerts, one on each side."
 )
 
+OPERATOR_LABELS: Dict[str, str] = {
+    "GREATER_THAN": ">",
+    "GREATER_THAN_OR_EQUAL_TO": "≥",
+    "LESS_THAN": "<",
+    "LESS_THAN_OR_EQUAL_TO": "≤",
+    "EQUALS": "=",
+    "NOT_EQUALS": "≠",
+    # Refused on create/update, still stored on existing alerts.
+    "EQUAL_TO": "=",
+    "NOT_EQUAL_TO": "≠",
+    "INCREASES_BY": "increases by",
+    "DECREASES_BY": "decreases by",
+    "PERCENT_INCREASE": "increases by",
+    "PERCENT_DECREASE": "decreases by",
+}
+
+# AIAlertMonitor.PERCENT_CHANGE_OPERATORS evaluates these as a percent change
+# whatever isPercentage says, and AIAnomaly.condition() words the two rate
+# metrics as percentages.
+PERCENT_CHANGE_OPERATORS: Tuple[str, ...] = ("PERCENT_INCREASE", "PERCENT_DECREASE")
+PERCENTAGE_METRICS: Tuple[str, ...] = ("ERROR_RATE", "QUALITY_RATE")
+
+
+def threshold_is_percentage(rule: Dict[str, Any]) -> bool:
+    """Whether the platform evaluates and words ``rule``'s threshold as a percentage."""
+    return (
+        bool(rule.get("isPercentage"))
+        or str(rule.get("operatorType") or "").upper() in PERCENT_CHANGE_OPERATORS
+        or str(rule.get("metricType") or "").upper() in PERCENTAGE_METRICS
+    )
+
 
 def accepted_operators_for(alert_type: str) -> Tuple[str, ...]:
     """Return the operators the platform accepts for ``alert_type``.
@@ -106,23 +137,6 @@ def rejected_operator_message(operator: str) -> str:
     """The refusal an agent should see for a declared-but-unaccepted operator."""
     return (
         f"Operator {operator} is not supported for AI alerts. "
-        f"{REJECTED_OPERATOR_GUIDANCE}"
-    )
-
-
-def historical_operator_notice(operator: str) -> str:
-    """The note to attach when a call resubmits a stored, no-longer-accepted operator.
-
-    Enable, disable and a partial update all read the stored definition and PUT it
-    back whole. When that definition carries an operator the platform stored before
-    it stopped accepting the value, blocking the call would make the alert
-    uneditable and undeletable through the MCP for a value the platform itself
-    wrote. So the call goes out and the caller is told what it carried.
-    """
-    return (
-        f"Note: this alert stores operatorType {operator}, which the platform still "
-        f"returns on read but no longer accepts on create or update. If the platform "
-        f"refuses this call, change the operator first. "
         f"{REJECTED_OPERATOR_GUIDANCE}"
     )
 
@@ -304,9 +318,9 @@ def validate_filter_rows(filters: List[Any]) -> List[Dict[str, Any]]:
                     suggestion=FILTER_IN_OPERATOR_NOTE,
                 )
             value = filter_item.get("value")
-            if value is None or not str(value).strip():
+            if value is None:
                 raise ValidationError(
-                    message=f"Filter operator {operator} requires a non-empty 'value'",
+                    message=f"Filter operator {operator} requires a 'value'",
                     field="filters",
                     value=filter_item,
                     expected="Dictionary with dimension, operator and value",

@@ -11,6 +11,12 @@ from loguru import logger
 
 from ..common.error_handling import ErrorCodes, ToolError
 
+OPERATION_FILTER_KEY = "operation_filter"
+STATUS_FILTER_KEY = "status_filter"
+SEARCH_TERM_KEY = "search_term"
+# The applied-filter keys that narrow the entries; log_type_filter only names the source.
+CONTENT_FILTER_KEYS = (OPERATION_FILTER_KEY, STATUS_FILTER_KEY, SEARCH_TERM_KEY)
+
 
 class LogFilter:
     """Handles client-side filtering of log entries."""
@@ -46,17 +52,17 @@ class LogFilter:
             # Apply operation filter
             if operation_filter:
                 filtered_entries = self._filter_by_operation(filtered_entries, operation_filter)
-                applied_filters["operation_filter"] = operation_filter
+                applied_filters[OPERATION_FILTER_KEY] = operation_filter
 
             # Apply status filter
             if status_filter:
                 filtered_entries = self._filter_by_status(filtered_entries, status_filter)
-                applied_filters["status_filter"] = status_filter
+                applied_filters[STATUS_FILTER_KEY] = status_filter
 
             # Apply search term filter
             if search_term:
                 filtered_entries = self._filter_by_search_term(filtered_entries, search_term)
-                applied_filters["search_term"] = search_term
+                applied_filters[SEARCH_TERM_KEY] = search_term
 
             # Apply log type filter (for multi-source)
             if log_type_filter:

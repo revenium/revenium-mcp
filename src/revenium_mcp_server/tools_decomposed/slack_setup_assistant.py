@@ -7,23 +7,26 @@ guiding users through the complete Slack integration process with smart detectio
 and recommendations.
 """
 
-import os
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
 
-from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
+from ..common.default_slack_configuration import (
+    HOSTED_DEFAULT_LIFETIME_NOTE,
+    get_default_slack_config_id,
+    is_local_server,
+    set_default_slack_config_id,
+)
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
     create_structured_validation_error,
     format_structured_error,
 )
-from ..config_store import get_config_value
 from ..endpoint_registry import _resolved_app_base_url
 
 # from ..error_handlers import format_structured_error  # Not available
@@ -32,6 +35,8 @@ from ..introspection.metadata import ToolCapability, ToolType
 
 # REUSE: Import onboarding detection for enhanced integration
 from ..onboarding.detection_service import get_onboarding_state
+from ..onboarding.platform_read import read_platform_facts
+from .slack_configuration_management import get_slack_configuration_or_not_found
 from .unified_tool_base import ToolBase
 
 
@@ -116,6 +121,8 @@ class SlackSetupAssistant(ToolBase):
                 )
                 return [TextContent(type="text", text=format_structured_error(error))]
 
+        except (PermissionError, ToolError):
+            raise
         except Exception as e:
             error = ToolError(
                 message="Slack setup assistant failed",
@@ -148,7 +155,7 @@ class SlackSetupAssistant(ToolBase):
                 result_text += f"## Found {total_elements} Existing Slack Configuration(s)\n\n"
 
                 # Check if default is already set
-                current_default = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
+                current_default = get_default_slack_config_id(ctx)
 
                 if current_default:
                     # Find the default configuration details
@@ -222,7 +229,7 @@ class SlackSetupAssistant(ToolBase):
             if total_elements == 0:
                 return await self._handle_guided_setup(arguments, ctx=ctx)
 
-            current_default = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
+            current_default = get_default_slack_config_id(ctx)
 
             result_text = "# Slack Configuration Detection & Recommendations\n\n"
             result_text += f"**Found {total_elements} Slack configuration(s)**\n\n"
@@ -239,7 +246,7 @@ class SlackSetupAssistant(ToolBase):
                     result_text += "## Current Default Configuration\n"
                     result_text += f"**{name}**\n"
                     result_text += f"- Workspace: {workspace}\n"
-                    result_text += f"- Channel: #{channel}\n"
+                    result_text += f"- Channel: {channel}\n"
                     result_text += f"- ID: `{current_default}`\n\n"
                 else:
                     result_text += "## Default Configuration Issue\n"
@@ -255,14 +262,14 @@ class SlackSetupAssistant(ToolBase):
                 name = config.get("name", "Unnamed Configuration")
                 workspace = config.get("teamName") or config.get("team", {}).get("label", "Unknown Workspace")
                 channel = config.get("channelName", "N/A")
-                created_date = config.get("createdDate", "Unknown")
+                created_date = config.get("created", "Unknown")
 
                 is_default = config_id == current_default
                 status_prefix = "DEFAULT" if is_default else ""
 
                 result_text += f"### {i}. {name} {status_prefix}\n"
                 result_text += f"- **Workspace:** {workspace}\n"
-                result_text += f"- **Channel:** #{channel}\n"
+                result_text += f"- **Channel:** {channel}\n"
                 result_text += f"- **Created:** {created_date}\n"
                 result_text += f"- **ID:** `{config_id}`\n"
                 if is_default:
@@ -300,7 +307,6 @@ class SlackSetupAssistant(ToolBase):
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Set default configuration with confirmation."""
-        multi_tenant = ctx is not None
         config_id = arguments.get("config_id")
         if not config_id:
             error = ValidationError(
@@ -313,35 +319,20 @@ class SlackSetupAssistant(ToolBase):
         try:
             # Verify the configuration exists
             client = await self.get_client(ctx=ctx)
-            config = await client.get_slack_configuration_by_id(config_id)
+            config = await get_slack_configuration_or_not_found(client, config_id)
 
-            # Set the environment variable
-            if not multi_tenant:
-                os.environ["REVENIUM_DEFAULT_SLACK_CONFIG_ID"] = config_id
-            else:
-                # Multi-tenant: env vars are process-global and would leak across tenants.
-                # Per-tenant default storage is a Phase-2 follow-up; for now, do not persist.
-                logger.info(
-                    "Skipping env write in multi-tenant mode "
-                    "(Phase 2 will add per-tenant storage)"
-                )
+            set_default_slack_config_id(config_id, ctx)
+            local_server = is_local_server(ctx)
 
             name = config.get("name", "Unnamed Configuration")
             workspace = config.get("teamName") or config.get("team", {}).get("label", "Unknown Workspace")
             channel = config.get("channelName", "N/A")
 
-            if not multi_tenant:
-                result_text = "# Default Slack Configuration Set Successfully\n\n"
-            else:
-                result_text = (
-                    "# Default Slack Configuration Set for This Session Only\n\n"
-                    "_Per-tenant persistent default storage is deferred to Phase 2; "
-                    "this selection applies to the current request only._\n\n"
-                )
+            result_text = "# Default Slack Configuration Set Successfully\n\n"
             result_text += "## New Default Configuration\n"
             result_text += f"**{name}**\n"
             result_text += f"- **Workspace:** {workspace}\n"
-            result_text += f"- **Channel:** #{channel}\n"
+            result_text += f"- **Channel:** {channel}\n"
             result_text += f"- **ID:** `{config_id}`\n\n"
 
             result_text += "## Setup Complete!\n\n"
@@ -352,18 +343,25 @@ class SlackSetupAssistant(ToolBase):
             result_text += "## Next Steps\n\n"
             result_text += "**Create your first alert with Slack notifications:**\n"
             result_text += "```\nmanage_alerts(\n"
-            result_text += "    action='create_cumulative_usage',\n"
+            result_text += "    action='create_cumulative_usage_alert',\n"
             result_text += "    name='Monthly Cost Alert',\n"
             result_text += "    threshold=1000,\n"
-            result_text += "    period='monthly'\n"
+            result_text += "    period='monthly',\n"
+            result_text += "    email='you@company.com',\n"
             result_text += "    # Slack notifications will be added automatically!\n"
             result_text += ")\n```\n\n"
 
-            result_text += "**Make this setting persistent:**\n"
-            result_text += "Add this to your .env file:\n"
-            result_text += (
-                f'```bash\nREVENIUM_DEFAULT_SLACK_CONFIG_ID="{config_id}"\n```\n\n'
-            )
+            if local_server:
+                result_text += "**Make this setting persistent:**\n"
+                result_text += "Add this to your .env file:\n"
+                result_text += (
+                    f'```bash\nREVENIUM_DEFAULT_SLACK_CONFIG_ID="{config_id}"\n```\n\n'
+                )
+            else:
+                result_text += (
+                    "This default applies to your organization on this server. "
+                    f"{HOSTED_DEFAULT_LIFETIME_NOTE}\n\n"
+                )
 
             result_text += "**Other useful commands:**\n"
             result_text += "- Check setup status: `slack_management(action='setup_status')`\n"
@@ -391,7 +389,7 @@ class SlackSetupAssistant(ToolBase):
             total_elements = response.get("totalElements", 0)
 
             # Get default configuration
-            current_default = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
+            current_default = get_default_slack_config_id(ctx)
 
             # Get app base URL
             app_base_url = _resolved_app_base_url()
@@ -442,7 +440,7 @@ class SlackSetupAssistant(ToolBase):
             else:
                 result_text += "**You're all set!** Try creating an alert:\n"
                 result_text += (
-                    "```\nmanage_alerts(action='create_simple_alert', threshold=100)\n```\n\n"
+                    "```\nmanage_alerts(action='create_simple', threshold=100, email='you@company.com')\n```\n\n"
                 )
 
             result_text += "**Other Actions:**\n"
@@ -514,8 +512,8 @@ class SlackSetupAssistant(ToolBase):
         REUSE: Leverages existing quick_setup logic with onboarding context.
         """
         try:
-            # REUSE: Get onboarding state using existing infrastructure
-            onboarding_state = await get_onboarding_state()
+            client = await self.get_client(ctx=ctx)
+            onboarding_state = await get_onboarding_state(await read_platform_facts(client))
             is_first_time = onboarding_state.is_first_time
 
             result_text = "# 📱 **Slack Setup for Onboarding**\n\n"
@@ -531,11 +529,10 @@ class SlackSetupAssistant(ToolBase):
                 result_text += "🔧 **Slack Setup** - Let's enhance your notification setup.\n\n"
 
             # Check current Slack status using existing logic
-            client = await self.get_client(ctx=ctx)
             response = await client.get_slack_configurations(page=0, size=20)
             total_elements = response.get("totalElements", 0)
 
-            current_default = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
+            current_default = get_default_slack_config_id(ctx)
 
             if total_elements == 0:
                 result_text += "## 🚀 **Quick Onboarding Setup**\n\n"
@@ -558,7 +555,7 @@ class SlackSetupAssistant(ToolBase):
                 if is_first_time:
                     result_text += "## 🎯 **Onboarding Integration**\n\n"
                     result_text += "Once Slack is configured, you can:\n"
-                    result_text += "- Continue with `setup_checklist()` to see overall progress\n"
+                    result_text += "- Continue with `system_setup(action='setup_checklist')` to see overall progress\n"
                     result_text += "- Use `system_setup(action='setup_checklist')` for guidance\n"
                     result_text += (
                         "- Create your first alert with automatic Slack notifications\n\n"
@@ -575,7 +572,7 @@ class SlackSetupAssistant(ToolBase):
                 if is_first_time:
                     result_text += "## 🎯 **Onboarding Next Steps**\n\n"
                     result_text += "After setting your default:\n"
-                    result_text += "- Check `setup_checklist()` to see your progress\n"
+                    result_text += "- Check `system_setup(action='setup_checklist')` to see your progress\n"
                     result_text += (
                         "- Use `system_setup(action='setup_checklist')` when ready\n\n"
                     )
@@ -592,9 +589,9 @@ class SlackSetupAssistant(ToolBase):
                     result_text += "- ✅ Slack notifications ready\n"
                     result_text += "- 🔄 Continue with other setup items\n\n"
                     result_text += "**Next Steps:**\n"
-                    result_text += "- Use `setup_checklist()` to see remaining items\n"
+                    result_text += "- Use `system_setup(action='setup_checklist')` to see remaining items\n"
                     result_text += (
-                        "- Try `manage_alerts(action='create_simple_alert')` to test Slack\n"
+                        "- Try `manage_alerts(action='create_simple', email='you@company.com')` to test Slack\n"
                     )
                     result_text += (
                         "- Use `system_setup(action='setup_checklist')` when ready\n\n"
@@ -602,7 +599,7 @@ class SlackSetupAssistant(ToolBase):
                 else:
                     result_text += "**Test Your Setup:**\n"
                     result_text += (
-                        "```\nmanage_alerts(action='create_simple_alert', threshold=100)\n```\n\n"
+                        "```\nmanage_alerts(action='create_simple', threshold=100, email='you@company.com')\n```\n\n"
                     )
 
             return [TextContent(type="text", text=result_text)]
@@ -629,9 +626,6 @@ class SlackSetupAssistant(ToolBase):
         REUSE: Builds on existing setup_status logic with enhanced first-time context.
         """
         try:
-            # REUSE: Get onboarding state using existing infrastructure
-            await get_onboarding_state()
-
             result_text = "# 🌟 **First-Time User Slack Guidance**\n\n"
             result_text += "Welcome to Revenium! Let's set up Slack notifications to enhance your monitoring experience.\n\n"
 
@@ -640,7 +634,7 @@ class SlackSetupAssistant(ToolBase):
             response = await client.get_slack_configurations(page=0, size=20)
             total_elements = response.get("totalElements", 0)
 
-            current_default = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
+            current_default = get_default_slack_config_id(ctx)
 
             result_text += "## 🤔 **Why Slack for API Monitoring?**\n\n"
             result_text += "**Real-time Alerts**: Get notified instantly when:\n"
@@ -689,14 +683,14 @@ class SlackSetupAssistant(ToolBase):
                     "**Test Your Setup**: Create a simple alert to see Slack in action:\n"
                 )
                 result_text += (
-                    "```\nmanage_alerts(action='create_simple_alert', threshold=100)\n```\n\n"
+                    "```\nmanage_alerts(action='create_simple', threshold=100, email='you@company.com')\n```\n\n"
                 )
 
             # Integration with onboarding flow
             result_text += "## 🔗 **Integration with Onboarding**\n\n"
             result_text += "Once Slack is configured, continue your onboarding journey:\n\n"
             result_text += "**Check Overall Progress**:\n"
-            result_text += "```\nsetup_checklist()\n```\n\n"
+            result_text += "```\nsystem_setup(action='setup_checklist')\n```\n\n"
 
             result_text += "**Get Personalized Next Steps**:\n"
             result_text += "```\nsystem_setup(action='setup_checklist')\n```\n\n"
@@ -723,7 +717,7 @@ class SlackSetupAssistant(ToolBase):
                 "- Use `slack_management(action='setup_status')` for current status\n"
             )
             result_text += "- Try `slack_management(action='get_oauth_instructions')` for detailed OAuth help\n"
-            result_text += "- Check `setup_checklist()` for overall configuration status\n"
+            result_text += "- Check `system_setup(action='setup_checklist')` for overall configuration status\n"
 
             return [TextContent(type="text", text=result_text)]
 

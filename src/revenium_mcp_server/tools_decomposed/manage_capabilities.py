@@ -14,6 +14,8 @@ if TYPE_CHECKING:
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
+from ..common.error_handling import ErrorCodes, ToolError, raise_refusal
+from ..exceptions import ValidationError
 from ..introspection.metadata import ToolCapability
 from ..capability_manager.integration_service import ucm_integration_service
 from .manage_capabilities_errors import (
@@ -22,6 +24,18 @@ from .manage_capabilities_errors import (
     create_unsupported_action_error,
 )
 from .unified_tool_base import ToolBase
+
+
+def _validation_refusal(error: ValidationError) -> ToolError:
+    """Report a rejected input as itself, not as a UCM service failure."""
+    expected = error.details.get("expected")
+    return ToolError(
+        message=error.message,
+        error_code=ErrorCodes.INVALID_VALUE,
+        field=error.details.get("field", "resource_type"),
+        value=error.details.get("provided_value"),
+        suggestions=[f"Use a supported value. {expected}"] if expected else [],
+    )
 
 
 @dataclass
@@ -89,13 +103,21 @@ class ManageCapabilities(ToolBase):
             elif request.action == "get_capability":
                 result = await self._handle_get_capability(request)
             else:
-                result = create_unsupported_action_error(request.action)
+                raise_refusal(
+                    create_unsupported_action_error(request.action),
+                    error_code=ErrorCodes.ACTION_NOT_SUPPORTED,
+                    field="action",
+                    value=request.action,
+                )
 
             return [TextContent(type="text", text=result)]
 
+        except (ToolError, PermissionError):
+            raise
+        except ValidationError as e:
+            raise _validation_refusal(e) from e
         except Exception as e:
-            error_result = create_execution_error(e)
-            return [TextContent(type="text", text=error_result)]
+            raise_refusal(create_execution_error(e), error_code=ErrorCodes.UCM_ERROR)
 
     def _create_request(self, action: str, arguments: Dict[str, Any]) -> CapabilityRequest:
         """Create capability request from action and arguments.

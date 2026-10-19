@@ -119,7 +119,7 @@ class TestProcessProviderData:
                 ]
             }
         ]
-        result = self.analyzer._process_provider_data(data)
+        result = self.analyzer._process_provider_data(data, "TOTAL")
         assert len(result) == 2
         # Should be sorted by cost descending
         assert result[0]["provider"] == "Anthropic"
@@ -135,7 +135,7 @@ class TestProcessProviderData:
                 ]
             }
         ]
-        result = self.analyzer._process_provider_data(data)
+        result = self.analyzer._process_provider_data(data, "TOTAL")
         assert result[0]["percentage"] == pytest.approx(70.0)
         assert result[1]["percentage"] == pytest.approx(30.0)
 
@@ -148,7 +148,7 @@ class TestProcessProviderData:
                 ]
             }
         ]
-        result = self.analyzer._process_provider_data(data)
+        result = self.analyzer._process_provider_data(data, "TOTAL")
         # Both should be normalized to "OpenAI" and aggregated
         assert len(result) == 1
         assert result[0]["provider"] == "OpenAI"
@@ -159,11 +159,12 @@ class TestProcessProviderData:
         data = [
             {"groupName": "Google", "metrics": [{"metricResult": 150}]},
         ]
-        result = self.analyzer._process_provider_data(data)
+        result = self.analyzer._process_provider_data(data, "TOTAL")
         assert len(result) == 1
         assert result[0]["provider"] == "Google"
 
-    def test_zero_cost_excluded(self):
+    def test_zero_cost_kept_without_a_share(self):
+        """A provider the platform reports at $0 is listed, after the paid ones (BACK-4690)."""
         data = [
             {
                 "groups": [
@@ -172,12 +173,13 @@ class TestProcessProviderData:
                 ]
             }
         ]
-        result = self.analyzer._process_provider_data(data)
-        assert len(result) == 1
-        assert result[0]["provider"] == "Active"
+        result = self.analyzer._process_provider_data(data, "TOTAL")
+        assert [row["provider"] for row in result] == ["Active", "Empty"]
+        assert result[1]["cost"] == 0
+        assert "percentage" not in result[1]
 
     def test_empty_data_returns_empty(self):
-        result = self.analyzer._process_provider_data([])
+        result = self.analyzer._process_provider_data([], "TOTAL")
         assert result == []
 
 
@@ -201,7 +203,7 @@ class TestProcessApiKeyData:
                 ]
             }
         ]
-        result = self.analyzer._process_api_key_data(data)
+        result = self.analyzer._process_api_key_data(data, "TOTAL")
         assert len(result) == 2
         assert result[0]["api_key"] == "key-abc"
         assert result[0]["cost"] == 500.0
@@ -215,12 +217,12 @@ class TestProcessApiKeyData:
                 ]
             }
         ]
-        result = self.analyzer._process_api_key_data(data)
+        result = self.analyzer._process_api_key_data(data, "TOTAL")
         assert result[0]["percentage"] == pytest.approx(80.0)
 
     def test_direct_format(self):
         data = [{"groupName": "direct-key", "metrics": [{"metricResult": 100}]}]
-        result = self.analyzer._process_api_key_data(data)
+        result = self.analyzer._process_api_key_data(data, "TOTAL")
         assert len(result) == 1
         assert result[0]["api_key"] == "direct-key"
 
@@ -244,7 +246,7 @@ class TestProcessAgentData:
                 ]
             }
         ]
-        result = self.analyzer._process_agent_data(data)
+        result = self.analyzer._process_agent_data(data, "TOTAL")
         assert len(result) == 1
         assert result[0]["agent"] == "agent-1"
         assert result[0]["cost"] == 150.0
@@ -260,7 +262,7 @@ class TestProcessAgentData:
                 ]
             }
         ]
-        result = self.analyzer._process_agent_data(data)
+        result = self.analyzer._process_agent_data(data, "TOTAL")
         assert result[0]["cost"] == 125.0
 
     def test_duplicate_group_names_collapsed_into_single_row(self):
@@ -281,7 +283,7 @@ class TestProcessAgentData:
                 ]
             }
         ]
-        result = self.analyzer._process_agent_data(data)
+        result = self.analyzer._process_agent_data(data, "TOTAL")
         names = [r["agent"] for r in result]
         assert names.count("claude-code") == 1
         assert names.count("tessie") == 1
@@ -306,7 +308,7 @@ class TestProcessAgentData:
             {"groupName": "agent-x", "metrics": [{"metricResult": 15}]},
             {"groupName": "agent-y", "metrics": [{"metricResult": 5}]},
         ]
-        result = self.analyzer._process_agent_data(data)
+        result = self.analyzer._process_agent_data(data, "TOTAL")
         names = [r["agent"] for r in result]
         assert names.count("agent-x") == 1
         assert names.count("agent-y") == 1

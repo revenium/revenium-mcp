@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.introspection.engine import ToolIntrospectionEngine
 from src.revenium_mcp_server.introspection.metadata import ToolMetadata, MetadataProvider
+from src.revenium_mcp_server.introspection.registry import IntrospectionRegistry
 
 
 def _make_metadata(name: str = "test_tool") -> ToolMetadata:
@@ -213,3 +214,38 @@ class TestGetCacheStats:
         assert stats["cache_misses"] >= 1
         assert stats["cache_hits"] >= 1
         assert stats["hit_rate_percent"] > 0
+
+
+class TestRegistryProviderLookupFollowsChanges:
+    """Each test looks the provider up once before the change, so a lookup that
+    remembered the earlier provider would answer with it afterwards."""
+
+    async def test_a_re_registered_tool_returns_the_new_provider(self):
+        registry = IntrospectionRegistry()
+        first, second = _make_provider(), _make_provider()
+        await registry.register_provider("my_tool", first)
+        assert await registry.get_provider("my_tool") is first
+
+        await registry.register_provider("my_tool", second)
+
+        assert await registry.get_provider("my_tool") is second
+
+    async def test_an_unregistered_tool_has_no_provider(self):
+        registry = IntrospectionRegistry()
+        provider = _make_provider()
+        await registry.register_provider("my_tool", provider)
+        assert await registry.get_provider("my_tool") is provider
+
+        await registry.unregister_provider("my_tool")
+
+        assert await registry.get_provider("my_tool") is None
+
+    async def test_a_cleared_registry_has_no_provider(self):
+        registry = IntrospectionRegistry()
+        provider = _make_provider()
+        await registry.register_provider("my_tool", provider)
+        assert await registry.get_provider("my_tool") is provider
+
+        await registry.clear()
+
+        assert await registry.get_provider("my_tool") is None

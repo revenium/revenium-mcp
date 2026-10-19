@@ -21,6 +21,7 @@ import pytest
 from datetime import datetime, timezone
 
 from src.revenium_mcp_server.tools_decomposed.metering_management import (
+    _LOOKUP_DEFAULT_PAGE_SIZE,
     MeteringTransactionManager,
     MeteringManagement,
 )
@@ -49,7 +50,7 @@ class TestMeteringTransactionManagerInit:
 
     def test_transaction_store_is_empty_dict(self):
         mgr = make_mgr()
-        assert mgr.transaction_store == {}
+        assert len(mgr.transaction_store) == 0
 
     def test_validation_cache_is_empty(self):
         mgr = make_mgr()
@@ -566,10 +567,11 @@ class TestExtractLookupParameters:
         assert params["wait_seconds"] == 30
         assert params["max_retries"] == 3
         assert params["retry_interval"] == 15
-        assert params["search_page_range"] == 50
-        assert params["page_size"] == 1000
+        assert params["search_page_range"] == 10
+        assert params["page_size"] == _LOOKUP_DEFAULT_PAGE_SIZE
         assert params["early_termination"] is True
         assert params["check_session_first"] is True
+        assert params["adjustments"] == []
 
     def test_custom_values_override_defaults(self):
         args = {
@@ -578,13 +580,13 @@ class TestExtractLookupParameters:
             "max_retries": 5,
             "retry_interval": 5,
             "search_page_range": 20,
-            "page_size": 500,
+            "page_size": 50,
             "early_termination": False,
         }
         params = self.mgr._extract_lookup_parameters(args)
         assert params["wait_seconds"] == 10
         assert params["max_retries"] == 5
-        assert params["page_size"] == 500
+        assert params["page_size"] == 50
         assert params["early_termination"] is False
 
     def test_transaction_ids_passed_through(self):
@@ -614,23 +616,25 @@ class TestBuildConfigurationObject:
             "wait_seconds": 30,
             "max_retries": 3,
             "retry_interval": 15,
-            "search_page_range": 50,
+            "search_page_range": 10,
             "page_size": 1000,
             "early_termination": True,
+            "adjustments": [],
         }
         config = self.mgr._build_configuration_object(params)
-        assert config == params
+        assert config == {**params, "polling": False}
 
     def test_extra_params_excluded(self):
         params = {
             "wait_seconds": 30,
             "max_retries": 3,
             "retry_interval": 15,
-            "search_page_range": 50,
+            "search_page_range": 10,
             "page_size": 1000,
             "early_termination": True,
+            "adjustments": [],
             "transaction_ids": ["tx_1"],  # Extra field
         }
         config = self.mgr._build_configuration_object(params)
         assert "transaction_ids" not in config
-        assert len(config) == 6
+        assert len(config) == 8

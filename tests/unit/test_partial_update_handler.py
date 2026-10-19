@@ -97,19 +97,30 @@ class TestPartialUpdateHandlerHelpers:
         assert result["name"] == "new"
         assert result["version"] == "1.0"
 
-    def test_merge_data_preserves_fields(self):
+    def test_merge_data_keeps_every_field_the_caller_did_not_send(self):
         config = UpdateConfig(
             resource_type="test",
             get_method=AsyncMock(),
             update_method=AsyncMock(),
-            preserve_fields=["createdAt"],
         )
-        current = {"name": "old", "createdAt": "2025-01-01"}
-        partial = {"name": "new", "createdAt": "2025-06-01"}
+        current = {"name": "old", "productId": "p_old", "tags": ["a"]}
+        partial = {"productId": "p_new"}
         result = self.handler._merge_data(current, partial, config)
-        # Preserved field keeps current value even though partial tried to override
-        assert result["createdAt"] == "2025-01-01"
-        assert result["name"] == "new"
+        assert result == {"name": "old", "productId": "p_new", "tags": ["a"]}
+
+    def test_apply_field_transformations_never_overwrites_a_caller_field(self):
+        config = UpdateConfig(
+            resource_type="test",
+            get_method=AsyncMock(),
+            update_method=AsyncMock(),
+            field_transformations={"parent": {"parentId": FieldTransformers.object_to_id}},
+        )
+        data = {"parent": {"id": "stored"}, "parentId": "sent"}
+        result = self.handler._apply_field_transformations(
+            data, config, caller_fields={"parentId"}
+        )
+        assert result["parentId"] == "sent"
+        assert "parent" not in result
 
     def test_apply_field_transformations_converts(self):
         config = UpdateConfig(
@@ -184,7 +195,7 @@ class TestPartialUpdateHandlerHelpers:
         result = self.handler._apply_defaults(data, config)
         assert result["teamId"] == "my-team"
 
-    def test_apply_defaults_subscriber_null_names(self):
+    def test_apply_defaults_leaves_subscriber_null_names_null(self):
         config = UpdateConfig(
             resource_type="subscriber",
             get_method=AsyncMock(),
@@ -192,8 +203,8 @@ class TestPartialUpdateHandlerHelpers:
         )
         data = {"firstName": None, "lastName": None}
         result = self.handler._apply_defaults(data, config)
-        assert result["firstName"] == "Unknown"
-        assert result["lastName"] == "User"
+        assert result["firstName"] is None
+        assert result["lastName"] is None
 
     def test_prepare_final_payload_removes_id_and_metadata(self):
         config = UpdateConfig(
@@ -355,11 +366,6 @@ class TestUpdateWithMerge:
             id_field="id",
             required_fields=["name"],
             default_fields={"teamId": "team_1"},
-            preserve_fields=[
-                "id", "createdAt", "updatedAt",
-                "productId", "ownerId", "teamId",
-                "subscriberId", "organizationId",
-            ],
             field_transformations={
                 "owner": {"ownerId": FieldTransformers.extract_owner_id},
                 "client": {

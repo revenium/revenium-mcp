@@ -4,6 +4,9 @@ Tests the ProductManager and ProductManagement classes from the decomposed tools
 Focuses on CRUD operations, validation logic, and error handling paths.
 """
 
+import asyncio
+import json
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,8 +15,50 @@ from src.revenium_mcp_server.tools_decomposed.product_management import (
     ProductManagement,
     ProductValidator,
 )
-from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.api_field_mapper import APIFieldMapper
+from src.revenium_mcp_server.auth import AuthConfig
+from src.revenium_mcp_server.client import ReveniumAPIError, ReveniumClient
+from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from mcp.types import TextContent
+
+
+STORED_PRODUCT = {
+    "id": "prod_1",
+    "name": "Gold",
+    "version": "1.0.0",
+    "description": "old",
+    "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
+    "plan": {
+        "type": "SUBSCRIPTION",
+        "name": "Gold plan",
+        "currency": "USD",
+        "tiers": [{"name": "Tier 1", "up_to": None, "unit_amount": "0.01"}],
+    },
+}
+
+PREVIEW_BODY_HEADING = "**Body the update would send:**"
+
+
+def _recording_product_client() -> ReveniumClient:
+    """A real client whose product GET serves STORED_PRODUCT and whose PUT is recorded."""
+    client = ReveniumClient(
+        auth_config=AuthConfig(
+            api_key="test-key-xyz",
+            team_id="team_abc",
+            base_url="https://api.test.revenium.ai",
+            timeout=5.0,
+            max_retries=0,
+        )
+    )
+    client.get_product_by_id = AsyncMock(return_value=json.loads(json.dumps(STORED_PRODUCT)))
+    client.put = AsyncMock(return_value={"id": "prod_1"})
+    return client
+
+
+def _previewed_body(preview_text: str) -> dict:
+    assert PREVIEW_BODY_HEADING in preview_text
+    body_text = preview_text.split(PREVIEW_BODY_HEADING, 1)[1].split("**Dry Run:**", 1)[0]
+    return json.loads(body_text)
 
 
 # ---------------------------------------------------------------------------
@@ -297,13 +342,10 @@ class TestProductManagerCreate:
 
                 assert "validation" in str(exc_info.value).lower() or "deprecated" in str(exc_info.value).lower()
 
-    @pytest.mark.asyncio
-    async def test_create_assigns_default_source_when_available(self, product_manager, mock_client):
-        """Create product assigns first available source to make it subscription-ready."""
+    async def _create_and_map(self, product_manager, mock_client, product_data):
         mock_client.get_sources.return_value = {}
         mock_client._extract_embedded_data.return_value = [{"id": "default_src"}]
-        mock_client.create_product.return_value = {"id": "p_src", "name": "Test"}
-
+        mock_client.create_product.return_value = {"id": "p_new", "name": "P"}
         with patch(
             "src.revenium_mcp_server.product_validation_engine.ProductValidationEngine"
         ) as MockEngine:
@@ -312,10 +354,212 @@ class TestProductManagerCreate:
                 "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
                 return_value=None,
             ):
-                await product_manager.create_product({"name": "Test", "auto_generate": True})
+                await product_manager.create_product({"product_data": product_data})
+        return APIFieldMapper.map_product_fields(mock_client.create_product.call_args[0][0])
 
-        create_call_data = mock_client.create_product.call_args[0][0]
-        assert create_call_data["sourceIds"] == ["default_src"]
+    @pytest.mark.asyncio
+    async def test_minimal_create_body_has_no_invented_source_and_is_not_published(
+        self, product_manager, mock_client
+    ):
+        """BACK-4662: a product created without naming a source stays a draft."""
+        body = await self._create_and_map(
+            product_manager,
+            mock_client,
+            {"name": "P", "version": "1.0.0", "plan": {"name": "PP", "tiers": [{"name": "t"}]}},
+        )
+        assert body["published"] is False
+        assert "sourceIds" not in body
+        assert mock_client.get_sources.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_snake_case_source_ids_are_not_replaced_by_a_default(
+        self, product_manager, mock_client
+    ):
+        body = await self._create_and_map(
+            product_manager,
+            mock_client,
+            {"name": "P", "version": "1.0.0", "plan": {"name": "PP"}, "source_ids": ["own_src"]},
+        )
+        assert body["sourceIds"] == ["own_src"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_published_and_source_ids_are_sent_as_given(
+        self, product_manager, mock_client
+    ):
+        body = await self._create_and_map(
+            product_manager,
+            mock_client,
+            {
+                "name": "P",
+                "version": "1.0.0",
+                "plan": {"name": "PP"},
+                "published": True,
+                "sourceIds": ["own_src"],
+            },
+        )
+        assert body["published"] is True
+        assert body["sourceIds"] == ["own_src"]
+        assert mock_client.get_sources.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_both_source_spellings_camel_wins(self, product_manager, mock_client):
+        body = await self._create_and_map(
+            product_manager,
+            mock_client,
+            {
+                "name": "P",
+                "version": "1.0.0",
+                "plan": {"name": "PP"},
+                "sourceIds": ["camel"],
+                "source_ids": ["snake"],
+            },
+        )
+        assert body["sourceIds"] == ["camel"]
+
+    @pytest.mark.asyncio
+    async def test_empty_camel_source_list_still_wins_over_snake(
+        self, product_manager, mock_client
+    ):
+        body = await self._create_and_map(
+            product_manager,
+            mock_client,
+            {
+                "name": "P",
+                "version": "1.0.0",
+                "plan": {"name": "PP"},
+                "sourceIds": [],
+                "source_ids": ["snake"],
+            },
+        )
+        assert body.get("sourceIds") in (None, [])
+
+    @pytest.mark.asyncio
+    async def test_explicit_null_published_is_sent_as_false(self, product_manager, mock_client):
+        body = await self._create_and_map(
+            product_manager,
+            mock_client,
+            {"name": "P", "version": "1.0.0", "plan": {"name": "PP"}, "published": None},
+        )
+        assert body["published"] is False
+
+    @staticmethod
+    def _usage_based_product_data(**extra):
+        return {
+            "name": "P",
+            "version": "1.0.0",
+            "description": "d",
+            "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
+            "plan": {
+                "name": "PP",
+                "type": "SUBSCRIPTION",
+                "currency": "USD",
+                "period": "MONTH",
+                "tiers": [],
+                "ratingAggregations": [
+                    {
+                        "name": "a",
+                        "elementDefinitionId": "e1",
+                        "aggregationType": "SUM",
+                        "tiers": [{"name": "u", "up_to": None, "unit_amount": "0.01"}],
+                    }
+                ],
+            },
+            **extra,
+        }
+
+    @pytest.mark.asyncio
+    async def test_usage_based_create_keeps_snake_case_source_ids(
+        self, product_manager, mock_client
+    ):
+        mock_client.get_sources.return_value = {}
+        mock_client._extract_embedded_data.return_value = [{"id": "default_src"}]
+        mock_client.create_product.return_value = {"id": "p_new", "name": "P"}
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
+            return_value=None,
+        ):
+            await product_manager.create_product(
+                {"product_data": self._usage_based_product_data(source_ids=["own_src"])}
+            )
+        body = APIFieldMapper.map_product_fields(mock_client.create_product.call_args[0][0])
+        assert body["sourceIds"] == ["own_src"]
+
+    @pytest.mark.asyncio
+    async def test_usage_based_create_without_source_is_refused_with_a_usable_hint(
+        self, product_manager, mock_client
+    ):
+        mock_client.get_sources.return_value = {}
+        mock_client._extract_embedded_data.return_value = [{"id": "default_src"}]
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
+            return_value=None,
+        ):
+            with pytest.raises(ToolError) as exc_info:
+                await product_manager.create_product(
+                    {"product_data": self._usage_based_product_data()}
+                )
+        text = str(exc_info.value.message)
+        assert "manage_sources(action='list')" in text
+        assert "QOjOkbW" not in text
+        mock_client.create_product.assert_not_awaited()
+
+
+class TestCreateAnswerStatesWhatWasDone:
+    """BACK-4662: the create answer says whether the product is published and
+    which data sources it has, and only advises subscribing when it can take one."""
+
+    @staticmethod
+    def _answer(product):
+        return ProductManagement()._format_create_success_response({"data": product})[0].text
+
+    def test_unpublished_create_says_so_on_the_first_line(self):
+        first = self._answer(
+            {"id": "p1", "name": "P", "published": False, "sources": []}
+        ).splitlines()[0]
+        assert "not published" in first
+        assert "No data source" in first
+
+    def test_published_create_names_its_sources(self):
+        first = self._answer(
+            {"id": "p1", "name": "P", "published": True, "sources": [{"id": "s1", "label": "Main"}]}
+        ).splitlines()[0]
+        assert "is published" in first
+        assert "s1" in first
+
+    def test_unpublished_create_does_not_advise_subscribing(self):
+        text = self._answer({"id": "p1", "name": "P", "published": False, "sources": []})
+        assert 'manage_subscriptions(action="create"' not in text
+        assert "'published': True" in text
+
+    def test_published_create_with_a_source_advises_subscribing(self):
+        text = self._answer(
+            {"id": "p1", "name": "P", "published": True, "sources": [{"id": "s1"}]}
+        )
+        assert 'manage_subscriptions(action="create"' in text
+
+    def test_published_create_without_a_source_does_not_advise_subscribing(self):
+        text = self._answer({"id": "p1", "name": "P", "published": True, "sources": []})
+        assert 'manage_subscriptions(action="create"' not in text
+        assert "'sourceIds'" in text
+        assert "manage_sources(action='list')" in text
+
+    def test_published_create_without_a_source_asks_only_for_a_source(self):
+        text = self._answer({"id": "p1", "name": "P", "published": True, "sources": []})
+        assert "attach a data source" in text
+        assert "publish it" not in text
+        assert "'published': True" not in text
+
+    def test_unpublished_create_with_a_source_asks_only_to_publish(self):
+        text = self._answer(
+            {"id": "p1", "name": "P", "published": False, "sources": [{"id": "s1"}]}
+        )
+        assert "publish it" in text
+        assert "attach a data source" not in text
+        assert "'sourceIds'" not in text
+
+    def test_answer_without_published_or_sources_adds_no_claim(self):
+        first = self._answer({"id": "p1", "name": "P"}).splitlines()[0]
+        assert first == "✅ Product 'P' created successfully"
 
 
 class TestProductManagerUpdate:
@@ -401,11 +645,17 @@ class TestProductManagementHandleAction:
     @pytest.mark.asyncio
     async def test_create_dry_run_returns_preview(self, product_mgmt):
         """Create with dry_run=True returns validation preview without creating."""
-        product_mgmt.validator = MagicMock()
-        product_mgmt.validator.validate_configuration.return_value = {"valid": True, "errors": []}
-
-        with patch.object(product_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+        with patch.object(product_mgmt, "get_client", new_callable=AsyncMock) as mock_gc, patch(
+            "src.revenium_mcp_server.product_validation_engine.ProductValidationEngine"
+        ) as MockEngine, patch(
+            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
+            return_value=None,
+        ):
+            MockEngine.validate_for_mcp.return_value = {"isError": False, "content": []}
             mock_client = MagicMock()
+            mock_client.team_id = "team_test"
+            mock_client.get_sources = AsyncMock(return_value={})
+            mock_client._extract_embedded_data = MagicMock(return_value=[])
             mock_gc.return_value = mock_client
 
             result = await product_mgmt.handle_action(
@@ -422,18 +672,105 @@ class TestProductManagementHandleAction:
     @pytest.mark.asyncio
     async def test_update_dry_run_returns_preview(self, product_mgmt):
         """Update with dry_run=True returns preview without updating."""
+        client = _recording_product_client()
         with patch.object(product_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
-            mock_client = MagicMock()
-            mock_gc.return_value = mock_client
+            mock_gc.return_value = client
 
             result = await product_mgmt.handle_action(
                 "update",
-                {"product_id": "p1", "product_data": {"name": "New"}, "dry_run": True},
+                {"product_id": "prod_1", "product_data": {"name": "New"}, "dry_run": True},
             )
 
         assert len(result) >= 1
         assert "DRY RUN" in result[0].text
-        assert "p1" in result[0].text
+        assert "prod_1" in result[0].text
+        assert _previewed_body(result[0].text)["name"] == "New"
+        assert client.put.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_update_dry_run_for_a_missing_product_raises_not_found(self, product_mgmt):
+        """A preview of an edit to a product that does not exist fails like the get does."""
+        client = MagicMock()
+        client.team_id = "test_team_id_456"
+        client.get_product_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("Invalid Product ID", status_code=404)
+        )
+        client.update_product = AsyncMock()
+        with patch.object(product_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = client
+            with pytest.raises(ReveniumAPIError) as not_found:
+                await product_mgmt.handle_action(
+                    "update",
+                    {
+                        "product_id": "doesNotExist9",
+                        "product_data": {"description": "x"},
+                        "dry_run": True,
+                    },
+                )
+
+        assert "Invalid Product ID" in not_found.value.message
+        client.update_product.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_dry_run_read_timeout_raises_the_update_timeout_error(self, product_mgmt):
+        """A preview whose product read times out fails with the update's timeout error."""
+        client = _recording_product_client()
+        client.get_product_by_id = AsyncMock(side_effect=asyncio.TimeoutError())
+        arguments = {"product_id": "prod_1", "product_data": {"description": "x"}}
+        with patch.object(product_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = client
+            with pytest.raises(ToolError) as update_timeout:
+                await product_mgmt.handle_action("update", arguments)
+            with pytest.raises(ToolError) as preview_timeout:
+                await product_mgmt.handle_action("update", {**arguments, "dry_run": True})
+
+        assert preview_timeout.value.error_code == ErrorCodes.API_TIMEOUT
+        assert preview_timeout.value.message == update_timeout.value.message
+
+    @pytest.mark.asyncio
+    async def test_update_dry_run_body_equals_the_put_body_the_update_sends(self, product_mgmt):
+        """The preview shows exactly the body the real update would PUT."""
+        client = _recording_product_client()
+        arguments = {"product_id": "prod_1", "product_data": {"description": "x"}}
+        with patch.object(product_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = client
+            preview = await product_mgmt.handle_action("update", {**arguments, "dry_run": True})
+            assert client.put.await_count == 0
+            await product_mgmt.handle_action("update", arguments)
+
+        put_body = client.put.await_args.kwargs["data"]
+        assert put_body["description"] == "x"
+        assert _previewed_body(preview[0].text) == json.loads(json.dumps(put_body, default=str))
+
+    @pytest.mark.asyncio
+    async def test_update_dry_run_body_carries_the_products_own_team(self, product_mgmt):
+        """BACK-4818: the preview and the update send the product's stored team."""
+        client = _recording_product_client()
+        stored = {**STORED_PRODUCT, "team": {"id": "team_prod", "label": "x"}}
+        client.get_product_by_id = AsyncMock(return_value=json.loads(json.dumps(stored)))
+        arguments = {"product_id": "prod_1", "product_data": {"description": "x"}}
+        with patch.object(product_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = client
+            preview = await product_mgmt.handle_action("update", {**arguments, "dry_run": True})
+            await product_mgmt.handle_action("update", arguments)
+
+        assert _previewed_body(preview[0].text)["teamId"] == "team_prod"
+        assert client.put.await_args.kwargs["data"]["teamId"] == "team_prod"
+
+    @pytest.mark.asyncio
+    async def test_update_dry_run_refuses_a_plan_change_that_drops_every_tier(self, product_mgmt):
+        """The preview refuses the same tier-removing plan change the update refuses."""
+        client = _recording_product_client()
+        arguments = {"product_id": "prod_1", "product_data": {"plan": {"tiers": []}}}
+        with patch.object(product_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = client
+            with pytest.raises(ToolError) as update_refusal:
+                await product_mgmt.handle_action("update", arguments)
+            with pytest.raises(ToolError) as preview_refusal:
+                await product_mgmt.handle_action("update", {**arguments, "dry_run": True})
+
+        assert preview_refusal.value.message == update_refusal.value.message
+        assert client.put.await_count == 0
 
     @pytest.mark.asyncio
     async def test_delete_dry_run_returns_preview(self, product_mgmt):
@@ -1273,3 +1610,53 @@ class TestProductInputSchemaSearchSurface:
 
         assert "query" not in schema["required"]
         assert "filters" not in schema["required"]
+
+
+class TestProductListPagingText:
+    """The list answer must keep the page size in its hints and name the pages that exist."""
+
+    @staticmethod
+    def _text(response):
+        assert len(response) == 1
+        return response[0].text
+
+    @pytest.mark.asyncio
+    async def test_list_past_last_page_names_the_pages_that_exist(
+        self, product_manager, mock_client, product_mgmt
+    ):
+        mock_client._extract_embedded_data.return_value = []
+        mock_client._extract_pagination_info.return_value = {
+            "totalPages": 2,
+            "totalElements": 31,
+        }
+
+        response = await product_mgmt._handle_standard_crud_actions(
+            "list", {"page": 500, "size": 20}, product_manager
+        )
+
+        text = self._text(response)
+        assert "Found 0 of 31 items (page 501 of 2)" in text, text
+        assert (
+            "The page requested (page=500) is past the last. The list has 31 items "
+            "on 2 pages. Pass page=1, size=20 for the last page, or page=0, size=20 "
+            "for the first."
+        ) in text, text
+        assert "permissions" not in text, text
+
+    @pytest.mark.asyncio
+    async def test_list_next_page_hint_carries_requested_size(
+        self, product_manager, mock_client, product_mgmt
+    ):
+        mock_client._extract_embedded_data.return_value = [
+            {"id": f"p{i}", "name": f"P{i}"} for i in range(5)
+        ]
+        mock_client._extract_pagination_info.return_value = {
+            "totalPages": 7,
+            "totalElements": 31,
+        }
+
+        response = await product_mgmt._handle_standard_crud_actions(
+            "list", {"page": 0, "size": 5}, product_manager
+        )
+
+        assert "• Next page: page=1, size=5" in self._text(response)

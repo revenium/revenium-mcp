@@ -10,6 +10,7 @@ from ..department_costs import (
     DepartmentFigures,
     DepartmentGroup,
 )
+from ..paging import counted, pagination_lines, past_last_page_sentence
 from ..validation import DEFAULT_USER_COST_SOURCES
 from .base_formatter import BaseFormattingUtilities
 
@@ -63,7 +64,9 @@ ATTRIBUTION_NOTE = (
 COST_SOURCES_NOTE = (
     "**Cost sources**: unless you pass filters.costSources this report counts "
     f"{json.dumps(list(DEFAULT_USER_COST_SOURCES))}, the same default as "
-    "get_user_costs."
+    "get_user_costs. A call's cost source is where its row came from, so "
+    "coding-assistant telemetry is under `coding_assistant` whatever the team's "
+    "API-rate setting; the scope note below gives the whole rule."
 )
 UNASSIGNED_LABEL = "No department assigned"
 # Only a sum of requests or tokens is a whole number; an average, maximum or
@@ -82,8 +85,8 @@ class DepartmentCostsFormatter:
         status = page.setup.status
         if status in NO_GROUPING_EXPLANATIONS:
             return self._format_no_grouping(page, query, status)
-        if not page.groups and page.total_elements:
-            return self._format_past_last_page(page, query, page.total_elements)
+        if not page.groups and page.paging.total_elements:
+            return self._format_past_last_page(page, query, page.paging.total_elements)
         if not page.groups:
             return self._format_no_groups(page, query)
         return self._format_groups(page, query)
@@ -105,17 +108,13 @@ class DepartmentCostsFormatter:
     def _format_past_last_page(
         self, page: DepartmentCostsPage, query: DepartmentCostsQuery, total_elements: int
     ) -> str:
-        total_pages = max(page.total_pages or 1, 1)
-        requested = "" if page.page_number is None else f" (page={page.page_number})"
-        size = self._size_hint(page)
         lines = self._header(page, query)
         lines += [
             "## Page past the last one",
             "",
-            f"The report has {total_elements} department groups on {total_pages} "
-            f"page{'s' if total_pages != 1 else ''}, and the page requested{requested} "
-            f"is past the last. Pass page={total_pages - 1}{size} for the last page, or "
-            f"page=0{size} for the first.",
+            past_last_page_sentence(
+                page.paging, counted(total_elements, "department group", "department groups")
+            ),
         ]
         return "\n".join(lines)
 
@@ -137,11 +136,11 @@ class DepartmentCostsFormatter:
         if page.setup.status == USAGE_UNASSIGNED:
             lines += [USAGE_UNASSIGNED_NOTE, ""]
         lines += ["## Departments", ""]
-        first_index = self._first_index(page)
+        first_index = page.paging.first_index
         whole_counts = query.aggregation == WHOLE_COUNT_AGGREGATION
         for offset, group in enumerate(page.groups):
             lines += self._group_lines(group, first_index + offset, whole_counts)
-        lines += self._pagination_lines(page)
+        lines += pagination_lines(page.paging, "group", "groups")
         lines += ["", self._scope_notes(query)]
         return "\n".join(lines)
 
@@ -211,30 +210,6 @@ class DepartmentCostsFormatter:
         if value >= 1_000:
             return f"{value / 1_000:.1f}K"
         return cls._count(value, whole_counts)
-
-    @staticmethod
-    def _first_index(page: DepartmentCostsPage) -> int:
-        if page.page_number and page.page_size:
-            return page.page_number * page.page_size + 1
-        return 1
-
-    @staticmethod
-    def _pagination_lines(page: DepartmentCostsPage) -> List[str]:
-        if page.total_pages is None or page.page_number is None:
-            return []
-        lines = [
-            f"Page {page.page_number + 1} of {max(page.total_pages, 1)}, "
-            f"{page.total_elements if page.total_elements is not None else 'unknown'} "
-            "groups in all."
-        ]
-        if page.page_number + 1 < page.total_pages:
-            size = DepartmentCostsFormatter._size_hint(page)
-            lines.append(f"Pass page={page.page_number + 1}{size} for the next page.")
-        return lines
-
-    @staticmethod
-    def _size_hint(page: DepartmentCostsPage) -> str:
-        return f" size={page.page_size}" if page.page_size else ""
 
     @staticmethod
     def _platform_setup_lines(page: DepartmentCostsPage) -> List[str]:

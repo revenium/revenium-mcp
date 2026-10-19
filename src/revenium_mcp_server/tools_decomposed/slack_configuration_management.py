@@ -6,23 +6,25 @@ This tool provides comprehensive management of Slack configurations for alert no
 following the same patterns as email notification management.
 """
 
-import os
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
 
-from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
-from ..client import ReveniumClient
+from ..client import ReveniumAPIError, ReveniumClient
+from ..common.default_slack_configuration import (
+    get_default_slack_config_id,
+    is_local_server,
+    set_default_slack_config_id,
+)
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
     create_structured_missing_parameter_error,
 )
-from ..config_store import get_config_value
 from ..endpoint_registry import _resolved_app_base_url
 from ..introspection.metadata import ToolCapability, ToolType
 from .slack_config_formatters import (
@@ -36,6 +38,44 @@ from .slack_config_formatters import (
     get_examples_text,
 )
 from .unified_tool_base import ToolBase
+
+
+async def get_slack_configuration_or_not_found(
+    client: ReveniumClient,
+    config_id: str,
+    extra_suggestions: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Read one Slack configuration, naming a missing id as not found.
+
+    BACK-4679: the platform answers 403 for an id that does not exist as well
+    as for one in another organization, and a bare "HTTP 403: Access Denied"
+    reads as a permissions problem. Both fold into one named not-found, the
+    same mapping as subscription_management's get_subscription. Any other
+    error is re-raised unchanged.
+    """
+    try:
+        return await client.get_slack_configuration_by_id(config_id)
+    except ReveniumAPIError as e:
+        if e.status_code in (403, 404):
+            raise ToolError(
+                message=(
+                    f"Slack configuration {config_id} was not found "
+                    "or is not in your organization"
+                ),
+                error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+                field="config_id",
+                value=config_id,
+                suggestions=[
+                    "The platform answers the same way for an id that does not "
+                    "exist and for one that belongs to another organization",
+                    "Use slack_management(action='list_configurations') to see "
+                    "your organization's configuration ids",
+                    "If list_configurations shows this id, your role may not be "
+                    "allowed to read it",
+                    *(extra_suggestions or []),
+                ],
+            ) from e
+        raise
 
 
 class SlackConfigurationManagement(ToolBase):
@@ -94,11 +134,11 @@ class SlackConfigurationManagement(ToolBase):
         if action == "list_configurations":
             return await self._handle_list_configurations(client, arguments)
         elif action == "get_configuration":
-            return await self._handle_get_configuration(client, arguments)
+            return await self._handle_get_configuration(client, arguments, ctx=ctx)
         elif action == "set_default_configuration":
             return await self._handle_set_default_configuration(client, arguments, ctx=ctx)
         elif action == "get_default_configuration":
-            return await self._handle_get_default_configuration(client, arguments)
+            return await self._handle_get_default_configuration(client, arguments, ctx=ctx)
         elif action == "get_app_oauth_url":
             return await self._handle_get_app_oauth_url(arguments)
         elif action == "get_examples":
@@ -146,10 +186,14 @@ class SlackConfigurationManagement(ToolBase):
             )
 
         response = await client.get_slack_configurations(page=page, size=size)
-        return format_configurations_list(response, page)
+        return format_configurations_list(response, page, size)
 
     async def _handle_get_configuration(
-        self, client: ReveniumClient, arguments: Dict[str, Any]
+        self,
+        client: ReveniumClient,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Get details of a specific Slack configuration."""
         config_id = self._validate_config_id(arguments, "get_configuration")
@@ -159,8 +203,10 @@ class SlackConfigurationManagement(ToolBase):
                 f"Would get configuration details for: {config_id}"
             )
 
-        config = await client.get_slack_configuration_by_id(config_id)
-        return format_configuration_details(config, config_id)
+        config = await get_slack_configuration_or_not_found(client, config_id)
+        return format_configuration_details(
+            config, config_id, is_default=get_default_slack_config_id(ctx) == config_id
+        )
 
     def _validate_config_id(self, arguments: Dict[str, Any], action: str) -> str:
         """Validate and return config_id parameter."""
@@ -208,31 +254,32 @@ class SlackConfigurationManagement(ToolBase):
             )
 
         # Verify configuration exists
-        config = await client.get_slack_configuration_by_id(config_id)
+        config = await get_slack_configuration_or_not_found(client, config_id)
 
-        # Set environment variable
-        if ctx is None:
-            os.environ["REVENIUM_DEFAULT_SLACK_CONFIG_ID"] = config_id
-        else:
-            # Multi-tenant: env vars are process-global and would leak across tenants.
-            # Per-tenant default storage is a Phase-2 follow-up; for now, do not persist.
-            logger.info(
-                "Skipping env write in multi-tenant mode "
-                "(Phase 2 will add per-tenant storage)"
-            )
-
-        return format_default_set_success(config, config_id, ctx_is_set=ctx is not None)
+        set_default_slack_config_id(config_id, ctx)
+        return format_default_set_success(config, config_id, hosted=not is_local_server(ctx))
 
     async def _handle_get_default_configuration(
-        self, client: ReveniumClient, arguments: Dict[str, Any]
+        self,
+        client: ReveniumClient,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Get the current default Slack configuration."""
-        default_config_id = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
+        default_config_id = get_default_slack_config_id(ctx)
 
         if not default_config_id:
             return format_no_default_message()
 
-        config = await client.get_slack_configuration_by_id(default_config_id)
+        config = await get_slack_configuration_or_not_found(
+            client,
+            default_config_id,
+            [
+                "Your saved default id no longer resolves; choose a new one with "
+                "slack_management(action='select_default_configuration', config_id=...)"
+            ],
+        )
         return format_default_configuration(config, default_config_id)
 
     async def _handle_get_app_oauth_url(

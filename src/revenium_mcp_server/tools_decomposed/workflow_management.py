@@ -16,6 +16,7 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
+from ..auth.tenant_scope import TenantScope, tenant_scope
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
@@ -29,14 +30,14 @@ from ..introspection.metadata import (
     ToolDependency,
     ToolType,
 )
+from ..common.tenant_scoped_store import TenantScopedStore
 from .unified_tool_base import ToolBase
 
 
 class WorkflowManager:
     """Internal manager for workflow orchestration operations."""
 
-    active_workflows: Dict[str, Dict[str, Any]] = {}
-    MAX_ACTIVE_WORKFLOWS: int = 10000
+    active_workflows: TenantScopedStore[Dict[str, Any]] = TenantScopedStore(max_entries=10000)
 
     # Workflow state lives in server memory only — callers must not treat a
     # workflow id as durable, and a not-found must say why it can vanish.
@@ -65,8 +66,8 @@ class WorkflowManager:
                 ],
                 examples={
                     "available_types": available_types,
-                    "usage": "create(workflow_type='customer_onboarding', context={...})",
-                    "generic_workflow": "create(workflow_type='generic', context={...})",
+                    "usage": "start(workflow_type='customer_onboarding', context={...})",
+                    "generic_workflow": "start(workflow_type='generic', context={...})",
                 },
             )
 
@@ -91,7 +92,7 @@ class WorkflowManager:
                     examples={
                         "missing_fields": missing_context,
                         "required_context": template.get("required_context", []),
-                        "usage": f"create(workflow_type='{workflow_type}', context={{...}})",
+                        "usage": f"start(workflow_type='{workflow_type}', context={{...}})",
                     },
                 )
 
@@ -144,8 +145,28 @@ class WorkflowManager:
             },
         }
 
-    async def list_workflows(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        all_ids = list(self.active_workflows.keys())
+    def _owned_workflow(
+        self, workflow_id: str, scope: Optional[TenantScope]
+    ) -> Dict[str, Any]:
+        workflow = self.active_workflows.get(scope or tenant_scope(), workflow_id)
+        if not workflow:
+            raise create_resource_not_found_error(
+                resource_type="workflow",
+                resource_id=workflow_id,
+                suggestions=[
+                    "Use list() to see all active workflows",
+                    "Check the workflow ID for typos",
+                    "Ensure the workflow was created successfully",
+                    "Use start(workflow_type=..., context={...}) to start a new workflow",
+                    WorkflowManager.SESSION_SCOPE_NOTE,
+                ],
+            )
+        return workflow
+
+    async def list_workflows(
+        self, arguments: Dict[str, Any], scope: Optional[TenantScope] = None
+    ) -> Dict[str, Any]:
+        all_ids = self.active_workflows.ids(scope or tenant_scope())
         raw_page = arguments.get("page")
         raw_size = arguments.get("size")
         paginated = raw_page is not None or raw_size is not None
@@ -163,7 +184,9 @@ class WorkflowManager:
             "available_templates": list(self.workflow_templates.keys()),
         }
 
-    async def get_workflow(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def get_workflow(
+        self, arguments: Dict[str, Any], scope: Optional[TenantScope] = None
+    ) -> Dict[str, Any]:
         """Get workflow details."""
         workflow_id = arguments.get("workflow_id")
         if not workflow_id:
@@ -177,23 +200,13 @@ class WorkflowManager:
                 },
             )
 
-        workflow = self.active_workflows.get(workflow_id)
-        if not workflow:
-            raise create_resource_not_found_error(
-                resource_type="workflow",
-                resource_id=workflow_id,
-                suggestions=[
-                    "Use list() to see all active workflows",
-                    "Check the workflow ID for typos",
-                    "Ensure the workflow was created successfully",
-                    "Use create() to start a new workflow",
-                    WorkflowManager.SESSION_SCOPE_NOTE,
-                ],
-            )
+        workflow = self._owned_workflow(workflow_id, scope)
 
         return workflow
 
-    async def start_workflow(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def start_workflow(
+        self, arguments: Dict[str, Any], scope: Optional[TenantScope] = None
+    ) -> Dict[str, Any]:
         """Start a new workflow."""
         workflow_type = arguments.get("workflow_type")
         if not workflow_type:
@@ -245,14 +258,13 @@ class WorkflowManager:
                 "scope_note": self.SESSION_SCOPE_NOTE,
             }
 
-        if len(self.active_workflows) >= self.MAX_ACTIVE_WORKFLOWS:
-            oldest_id = next(iter(self.active_workflows))
-            self.active_workflows.pop(oldest_id, None)
-        self.active_workflows[workflow_id] = workflow
+        self.active_workflows.put(scope or tenant_scope(), workflow_id, workflow)
 
         return workflow
 
-    async def next_step(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def next_step(
+        self, arguments: Dict[str, Any], scope: Optional[TenantScope] = None
+    ) -> Dict[str, Any]:
         """Get next workflow step guidance."""
         workflow_id = arguments.get("workflow_id")
         if not workflow_id:
@@ -266,19 +278,7 @@ class WorkflowManager:
                 },
             )
 
-        workflow = self.active_workflows.get(workflow_id)
-        if not workflow:
-            raise create_resource_not_found_error(
-                resource_type="workflow",
-                resource_id=workflow_id,
-                suggestions=[
-                    "Use list() to see all active workflows",
-                    "Check the workflow ID for typos",
-                    "Ensure the workflow was created successfully",
-                    "Use create() to start a new workflow",
-                    WorkflowManager.SESSION_SCOPE_NOTE,
-                ],
-            )
+        workflow = self._owned_workflow(workflow_id, scope)
 
         current_step = workflow.get("current_step", 0)
         steps = workflow.get("steps", [])
@@ -302,7 +302,9 @@ class WorkflowManager:
             "context": workflow.get("context", {}),
         }
 
-    async def complete_step(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def complete_step(
+        self, arguments: Dict[str, Any], scope: Optional[TenantScope] = None
+    ) -> Dict[str, Any]:
         """Complete a workflow step."""
         workflow_id = arguments.get("workflow_id")
         step_result = arguments.get("step_result", {})
@@ -318,19 +320,7 @@ class WorkflowManager:
                 },
             )
 
-        workflow = self.active_workflows.get(workflow_id)
-        if not workflow:
-            raise create_resource_not_found_error(
-                resource_type="workflow",
-                resource_id=workflow_id,
-                suggestions=[
-                    "Use list() to see all active workflows",
-                    "Check the workflow ID for typos",
-                    "Ensure the workflow was created successfully",
-                    "Use create() to start a new workflow",
-                    WorkflowManager.SESSION_SCOPE_NOTE,
-                ],
-            )
+        workflow = self._owned_workflow(workflow_id, scope)
 
         # Record step completion
         current_step = workflow.get("current_step", 0)
@@ -388,7 +378,7 @@ class WorkflowValidator:
             ],
             examples={
                 "get_templates": "get_workflow_templates() to see validation rules",
-                "api_validation": "create(workflow_type='...', context={...}) - API validates automatically",
+                "api_validation": "start(workflow_type='...', context={...}) - API validates automatically",
                 "validation_commands": "Get validation rules: manage_workflows(action='get_capabilities')",
             },
         )
@@ -398,7 +388,7 @@ class WorkflowManagement(ToolBase):
     """Consolidated workflow management tool with comprehensive capabilities."""
 
     tool_name = "manage_workflows"
-    tool_description = "Cross-tool workflow management for complex operations. Key actions: list, create, execute, get_suggestions, validate. Use get_capabilities() for complete action list."
+    tool_description = "Cross-tool workflow management for complex operations. Key actions: get_workflow_templates, start, next_step, complete_step, list, get. Use get_capabilities() for complete action list."
     business_category = "Advanced Features"
     tool_type = ToolType.UTILITY
     tool_version = "2.0.0"
@@ -422,13 +412,13 @@ class WorkflowManagement(ToolBase):
         ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle workflow management actions."""
-        # ctx accepted for interface compliance; no upstream API calls in this tool.
+        scope = tenant_scope(ctx)
         try:
             # Route to appropriate handler
             if action == "list":
-                result = await self.workflow_manager.list_workflows(arguments)
+                result = await self.workflow_manager.list_workflows(arguments, scope)
             elif action == "get":
-                result = await self.workflow_manager.get_workflow(arguments)
+                result = await self.workflow_manager.get_workflow(arguments, scope)
             elif action == "start":
                 dry_run = arguments.get("dry_run", False)
                 if dry_run:
@@ -460,9 +450,9 @@ class WorkflowManagement(ToolBase):
                         )
                     ]
 
-                result = await self.workflow_manager.start_workflow(arguments)
+                result = await self.workflow_manager.start_workflow(arguments, scope)
             elif action == "next_step":
-                result = await self.workflow_manager.next_step(arguments)
+                result = await self.workflow_manager.next_step(arguments, scope)
             elif action == "complete_step":
                 # Handle dry_run mode for step completion
                 dry_run = arguments.get("dry_run", False)
@@ -479,26 +469,9 @@ class WorkflowManagement(ToolBase):
                         )
                     ]
 
-                result = await self.workflow_manager.complete_step(arguments)
+                result = await self.workflow_manager.complete_step(arguments, scope)
             elif action == "get_workflow_templates":
                 result = await self.workflow_manager.get_workflow_templates(arguments)
-            elif action == "validate":
-                # Validate action is deprecated - use workflow templates for validation
-                return [
-                    TextContent(
-                        type="text",
-                        text="⚠️ **Validate Action Deprecated**\n\n"
-                        "The `validate` action has been deprecated. Use workflow templates for validation instead:\n\n"
-                        "**Recommended Approach:**\n"
-                        "1. Use `get_workflow_templates()` to see validation rules\n"
-                        "2. Use `start(workflow_type='...', context={...}, dry_run=true)` for validation\n"
-                        "3. API provides automatic validation during workflow creation\n\n"
-                        "**Why this change?**\n"
-                        "- Workflow templates provide comprehensive validation rules\n"
-                        "- API validation is more accurate and up-to-date\n"
-                        "- UCM integration provides real-time validation capabilities",
-                    )
-                ]
             elif action == "get_capabilities":
                 return await self._handle_get_capabilities()
             elif action == "get_examples":
@@ -526,7 +499,6 @@ class WorkflowManagement(ToolBase):
                             "get_agent_summary",
                         ],
                         "template_actions": ["get_workflow_templates"],
-                        "deprecated_actions": ["validate (deprecated - use templates)"],
                         "example_usage": {
                             "list_workflows": "list() to see all active workflows",
                             "start_workflow": "start(workflow_type='customer_onboarding', context={...})",

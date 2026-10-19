@@ -18,11 +18,15 @@ CODING_ASSISTANT_BILLING_DISPLAY_FIELDS = (
 )
 
 CODING_ASSISTANT_BILLING_SEMANTICS_NOTE = (
-    "apiRateProviders are the coding assistants the team pays for at real API rates: "
-    "their usage counts as real spend everywhere. Every other assistant is treated as "
-    "subscription or seat-based usage and is shown only as an API-equivalent estimate "
-    "on the AI Assistant dashboards, so an empty list means no assistant's usage counts "
-    "as real spend."
+    "apiRateProviders are the coding assistants the team pays for at real API rates. "
+    "On the analytics API their usage counts as spend, valued at API rates, in every "
+    "cost read; the setting decides whether an assistant's usage counts, not which cost "
+    "source it is reported under, so usage that arrives as coding-assistant telemetry "
+    "stays under the coding_assistant cost source. Every other assistant is treated as "
+    "subscription or seat-based usage: the analytics API leaves it out of its cost reads "
+    "and the AI Assistant dashboards show it only as an API-equivalent estimate. The "
+    "legacy analytics endpoints follow the tenant's coding-assistant filter policy "
+    "instead, and count coding-assistant records unless that policy excludes them."
 )
 
 CODING_ASSISTANT_CONFIRMATION_NOTE = (

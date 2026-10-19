@@ -1588,3 +1588,202 @@ class TestGetUsageBilling:
         with pytest.raises(ToolError) as exc:
             await log_tool.handle_action("get_usage_billing", {})
         assert "Failed to read usage billing" in exc.value.message
+
+
+def _log_page(entries, total_pages, total_elements, size=100, number=0):
+    """A system log page as the platform serves it; no totals when total_pages is None."""
+    page = {"size": size, "number": number}
+    if total_pages is not None:
+        page["totalPages"] = total_pages
+        page["totalElements"] = total_elements
+    return {"_embedded": {"systemLogResourceList": entries}, "page": page}
+
+
+def _log_entries(count, details="routine metering"):
+    return [
+        {
+            "operation": "AI_METRIC_PROCESSING",
+            "status": "SUCCESS",
+            "details": details,
+            "created": "2026-10-15T08:00:00Z",
+        }
+        for _ in range(count)
+    ]
+
+
+def _every_page(total_pages, total_elements, per_page=100):
+    """Serve page N of a dataset of total_pages full pages, whatever page is asked for."""
+
+    def serve(endpoint, page, size, ctx=None):
+        return _log_page(_log_entries(per_page), total_pages, total_elements, number=page)
+
+    return serve
+
+
+class TestSearchAllPagesCoverage:
+    """search_logs with search_all_pages says how much it searched and why it stopped."""
+
+    @staticmethod
+    async def _search(log_tool):
+        result = await log_tool._handle_search_logs(
+            {"search_all_pages": True, "search_term": "needle"}
+        )
+        return result[0].text
+
+    @pytest.mark.asyncio
+    async def test_a_failed_page_is_reported_as_incomplete(self, log_tool):
+        log_tool._make_api_call = AsyncMock(
+            side_effect=[
+                _log_page(_log_entries(5), 10, 1000),
+                Exception("HTTP 503: Service Unavailable"),
+            ]
+        )
+        text = await self._search(log_tool)
+        assert (
+            "Incomplete: page 2 (page=1) failed (HTTP 503: Service Unavailable)" in text
+        )
+        assert "- **Pages Searched**: 1 of 10" in text
+        assert "Matches may still exist in the pages that were not searched." in text
+        assert "Complete historical dataset" not in text
+
+    @pytest.mark.asyncio
+    async def test_the_page_limit_is_reported_as_incomplete(self, log_tool):
+        log_tool._make_api_call = AsyncMock(side_effect=_every_page(789, 78828))
+        text = await self._search(log_tool)
+        assert log_tool._make_api_call.await_count == 50
+        assert "stopped at the search's page limit with 739 pages not searched" in text
+        assert "- **Pages Searched**: 50 of 789" in text
+        assert "Complete historical dataset" not in text
+
+    @pytest.mark.asyncio
+    async def test_complete_only_when_every_page_was_searched(self, log_tool):
+        log_tool._make_api_call = AsyncMock(side_effect=_every_page(3, 300))
+        text = await self._search(log_tool)
+        assert "- **Pages Searched**: 3 of 3" in text
+        assert "- **Search Scope**: Complete: every page the platform reported was searched" in text
+        assert "Matches may still exist" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_missing_page_count_is_never_called_complete(self, log_tool):
+        log_tool._make_api_call = AsyncMock(
+            side_effect=[_log_page(_log_entries(5), None, None)]
+        )
+        text = await self._search(log_tool)
+        assert log_tool._make_api_call.await_count == 1
+        assert "Unknown: the platform did not report how many pages exist" in text
+        assert "- **Pages Searched**: 1 of an unknown number" in text
+        assert "Complete" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_failure_on_the_first_page_is_reported(self, log_tool):
+        log_tool._make_api_call = AsyncMock(
+            side_effect=Exception("HTTP 503: Service Unavailable")
+        )
+        text = await self._search(log_tool)
+        assert "page 1 (page=0) failed (HTTP 503: Service Unavailable)" in text
+        assert "- **Pages Searched**: 0 of an unknown number" in text
+        assert "Complete" not in text
+
+    @pytest.mark.asyncio
+    async def test_exactly_fifty_pages_is_complete(self, log_tool):
+        log_tool._make_api_call = AsyncMock(side_effect=_every_page(50, 5000))
+        text = await self._search(log_tool)
+        assert log_tool._make_api_call.await_count == 50
+        assert "- **Pages Searched**: 50 of 50" in text
+        assert "- **Search Scope**: Complete: every page the platform reported was searched" in text
+        assert "page limit" not in text
+
+    @pytest.mark.asyncio
+    async def test_an_empty_first_page_is_complete(self, log_tool):
+        log_tool._make_api_call = AsyncMock(side_effect=[_log_page([], 0, 0)])
+        text = await self._search(log_tool)
+        assert "- **Pages Searched**: 0 of 0" in text
+        assert "- **Search Scope**: Complete: every page the platform reported was searched" in text
+
+    @pytest.mark.asyncio
+    async def test_an_empty_page_before_the_last_is_not_the_page_limit(self, log_tool):
+        log_tool._make_api_call = AsyncMock(
+            side_effect=[
+                _log_page(_log_entries(5), 10, 1000, number=0),
+                _log_page(_log_entries(5), 10, 1000, number=1),
+                _log_page([], 10, 1000, number=2),
+            ]
+        )
+        text = await self._search(log_tool)
+        assert (
+            "Incomplete: the platform returned an empty page before its last page; "
+            "8 pages not searched" in text
+        )
+        assert "- **Pages Searched**: 2 of 10" in text
+        assert "page limit" not in text
+
+    @pytest.mark.asyncio
+    async def test_an_empty_error_message_still_names_the_failure(self, log_tool):
+        log_tool._make_api_call = AsyncMock(
+            side_effect=[_log_page(_log_entries(5), 10, 1000), Exception("")]
+        )
+        text = await self._search(log_tool)
+        assert "page 2 (page=1) failed (Exception)" in text
+
+    @pytest.mark.asyncio
+    async def test_entries_searched_count_the_rows_the_platform_served(self, log_tool):
+        """The walk asks for 1000 a page; the platform serves 100, and the answer says so."""
+        log_tool._make_api_call = AsyncMock(side_effect=_every_page(789, 78828))
+        text = await self._search(log_tool)
+        assert {c.args[2] for c in log_tool._make_api_call.await_args_list} == {1000}
+        assert "- **Entries Searched**: 5,000 of 78,828" in text
+        assert "- **Pages Searched**: 50 of 789" in text
+
+
+class TestMultiPageCoverage:
+    """analyze_operations and get_recent_logs report the pages they read, not the pages asked for."""
+
+    STOPPED_ON_PAGE_2 = (
+        "- **Stopped Early**: page 2 (page=1) failed (HTTP 503: Service Unavailable); "
+        "results cover 1 page"
+    )
+
+    @pytest.mark.asyncio
+    async def test_analyze_operations_reports_the_pages_it_read(self, log_tool):
+        log_tool._make_api_call = AsyncMock(
+            side_effect=[
+                _log_page(_log_entries(5), 10, 1000),
+                Exception("HTTP 503: Service Unavailable"),
+            ]
+        )
+        result = await log_tool._handle_analyze_operations({"pages": 3})
+        text = result[0].text
+        assert "Pages Analyzed**: 1" in text
+        assert "Pages Analyzed**: 3" not in text
+        assert self.STOPPED_ON_PAGE_2 in text
+
+    @pytest.mark.asyncio
+    async def test_analyze_operations_on_a_failed_first_page(self, log_tool):
+        log_tool._make_api_call = AsyncMock(
+            side_effect=Exception("HTTP 503: Service Unavailable")
+        )
+        result = await log_tool._handle_analyze_operations({"pages": 3})
+        text = result[0].text
+        assert "Pages Analyzed**: 0" in text
+        assert "- **Stopped Early**: page 1 (page=0) failed" in text
+
+    @pytest.mark.asyncio
+    async def test_get_recent_logs_reports_the_pages_it_read(self, log_tool):
+        log_tool._make_api_call = AsyncMock(side_effect=[_log_page(_log_entries(5), 1, 5)])
+        result = await log_tool._handle_get_recent_logs({"pages": 3})
+        text = result[0].text
+        assert "Pages Retrieved**: 1" in text
+        assert "Stopped Early" not in text
+
+    @pytest.mark.asyncio
+    async def test_get_recent_logs_says_which_page_failed(self, log_tool):
+        log_tool._make_api_call = AsyncMock(
+            side_effect=[
+                _log_page(_log_entries(5), 10, 1000),
+                Exception("HTTP 503: Service Unavailable"),
+            ]
+        )
+        result = await log_tool._handle_get_recent_logs({"pages": 3})
+        text = result[0].text
+        assert "Pages Retrieved**: 1" in text
+        assert self.STOPPED_ON_PAGE_2 in text

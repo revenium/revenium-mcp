@@ -9,12 +9,41 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, patch, MagicMock
 
 
+from src.revenium_mcp_server.auth.tenant_context import TenantContext
 from src.revenium_mcp_server.onboarding.env_validation import API_AUTH_REJECTED_MESSAGE
 from src.revenium_mcp_server.tools_decomposed import setup_checklist as setup_checklist_module
 from src.revenium_mcp_server.tools_decomposed.setup_checklist import SetupChecklist
+
+
+@pytest.fixture(autouse=True)
+def _platform_answers_locally(monkeypatch):
+    """No test here reaches the network: the default client reads a fixed empty payload.
+
+    Tests that exercise the read itself replace ``get_client`` on their instance.
+    """
+    from unittest.mock import AsyncMock
+
+    client = MagicMock()
+    client.get_data_connected_sources = AsyncMock(return_value={})
+    client.get_slack_configurations = AsyncMock(return_value={"totalElements": 0})
+    monkeypatch.setattr(SetupChecklist, "get_client", AsyncMock(return_value=client))
+
+
+HOSTED_CALLER = TenantContext(
+    team_id="teamCallerA",
+    base_url="https://api.example.invalid",
+    api_key="rev_rk_callerA_0123456789",
+)
+
+
+def _client_whose_slack_read_fails():
+    client = MagicMock()
+    client.get_data_connected_sources = AsyncMock(return_value={})
+    client.get_slack_configurations = AsyncMock(side_effect=RuntimeError("slack down"))
+    return client
 
 
 @pytest.fixture
@@ -128,6 +157,18 @@ class TestShowChecklist:
         text = result[0].text
         assert "Complete Setup Checklist" in text
         assert "READY" in text or "[OK]" in text
+
+    @pytest.mark.asyncio
+    async def test_show_checklist_draws_unknown_slack_as_unknown(self, checklist_tool):
+        checklist_tool.get_client = AsyncMock(return_value=_client_whose_slack_read_fails())
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=_mock_validation_result(),
+        ):
+            result = await checklist_tool.handle_action("show_checklist", {})
+        text = result[0].text
+        assert "[?] **Slack Integration**" in text
+        assert "Could not check Slack on the platform" in text
 
     @pytest.mark.asyncio
     async def test_show_checklist_permission_denied_gives_scope_guidance(self, checklist_tool):
@@ -286,6 +327,31 @@ class TestCheckRequirements:
         assert "INCOMPLETE" in text
 
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["check_requirements", "show_checklist"])
+    async def test_hosted_caller_is_judged_by_its_request(self, checklist_tool, action):
+        """A hosted caller's key and team come with the request, not server settings."""
+        with patch(
+            "src.revenium_mcp_server.onboarding.env_validation.current_tenant_context",
+            return_value=HOSTED_CALLER,
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_onboarding_state",
+            return_value=_mock_onboarding_state(is_first_time=False),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=_mock_validation_result(),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_config_value",
+            return_value=None,
+        ):
+            result = await checklist_tool.handle_action(action, {})
+        text = result[0].text
+        assert "Missing" not in text
+        assert "INCOMPLETE" not in text
+        assert "Set this environment variable" not in text
+        assert HOSTED_CALLER.team_id in text
+
+
 class TestCheckOptional:
     """Test check_optional action."""
 
@@ -409,37 +475,44 @@ class TestGetRecommendations:
 
 
 class TestSlackSetupStatus:
-    """Test _check_slack_setup_status helper."""
+    """Slack status comes from the organization's configurations on the platform (BACK-4677)."""
 
-    @pytest.mark.asyncio
-    async def test_slack_configured(self, checklist_tool):
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_config_value",
-            return_value="slack-config-123",
-        ):
-            status = await checklist_tool._check_slack_setup_status()
+    def test_slack_configured(self, checklist_tool):
+        status = checklist_tool._slack_status_from_facts(True)
         assert status["configured"] is True
-        assert status["config_id"] == "slack-config-123"
+        assert status["recommendations"] == []
+
+    def test_slack_not_configured(self, checklist_tool):
+        status = checklist_tool._slack_status_from_facts(False)
+        assert status["configured"] is False
+        assert any("quick_setup" in rec for rec in status["recommendations"])
+
+    def test_slack_unknown_offers_no_setup_step(self, checklist_tool):
+        status = checklist_tool._slack_status_from_facts(None)
+        assert status["configured"] is None
+        assert status["status"] == "unknown"
+        assert status["recommendations"] == []
 
     @pytest.mark.asyncio
-    async def test_slack_not_configured(self, checklist_tool):
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_config_value",
-            return_value=None,
-        ):
-            status = await checklist_tool._check_slack_setup_status()
-        assert status["configured"] is False
-        assert len(status["recommendations"]) > 0
+    async def test_server_setting_does_not_decide_slack(self, checklist_tool):
+        """A default-channel setting on the server says nothing about the organization."""
+        from unittest.mock import AsyncMock
 
-    @pytest.mark.asyncio
-    async def test_slack_check_error_handled(self, checklist_tool):
+        client = MagicMock()
+        client.get_data_connected_sources = AsyncMock(return_value={})
+        client.get_slack_configurations = AsyncMock(return_value={"totalElements": 0})
+        checklist_tool.get_client = AsyncMock(return_value=client)
         with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=_mock_validation_result(),
+        ), patch(
             "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_config_value",
-            side_effect=RuntimeError("config error"),
+            side_effect=lambda key, *args: "slack-config-123"
+            if key == "REVENIUM_DEFAULT_SLACK_CONFIG_ID"
+            else None,
         ):
-            status = await checklist_tool._check_slack_setup_status()
-        assert status["configured"] is False
-        assert status["status"] == "error"
+            result = await checklist_tool.handle_action("check_optional", {})
+        assert "slack_management(action='quick_setup')" in result[0].text
 
 
 class TestDataIngestionStatus:
@@ -479,7 +552,11 @@ class TestDataIngestionStatus:
         """No client / endpoint failure must not break the status report."""
         from unittest.mock import AsyncMock
 
-        checklist_tool.get_client = AsyncMock(side_effect=Exception("no credentials"))
+        failing_client = MagicMock()
+        failing_client.get_data_connected_sources = AsyncMock(
+            side_effect=Exception("no credentials")
+        )
+        checklist_tool.get_client = AsyncMock(return_value=failing_client)
 
         with patch(
             "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
@@ -502,9 +579,11 @@ class TestDataIngestionHardening:
         """Raw exception text (auth/request details) stays in logs, not output."""
         from unittest.mock import AsyncMock
 
-        checklist_tool.get_client = AsyncMock(
+        failing_client = MagicMock()
+        failing_client.get_data_connected_sources = AsyncMock(
             side_effect=Exception("x-api-key hak_secret123 rejected by upstream")
         )
+        checklist_tool.get_client = AsyncMock(return_value=failing_client)
 
         with patch(
             "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
@@ -556,9 +635,9 @@ class TestDataIngestionHardening:
         mock_client = MagicMock()
         mock_client.get_data_connected_sources = AsyncMock(side_effect=hang)
         checklist_tool.get_client = AsyncMock(return_value=mock_client)
-        monkeypatch.setattr(
-            type(checklist_tool), "_INGESTION_FETCH_TIMEOUT_SECONDS", 0.05
-        )
+        from src.revenium_mcp_server.onboarding import platform_read
+
+        monkeypatch.setattr(platform_read, "PROBE_TIMEOUT_SECONDS", 0.05)
 
         with patch(
             "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",

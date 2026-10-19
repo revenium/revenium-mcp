@@ -10,10 +10,12 @@ from typing import Any, Dict, List
 
 from mcp.types import TextContent
 
-from ..config_store import get_config_value
+from ..common.default_slack_configuration import HOSTED_DEFAULT_LIFETIME_NOTE
 
 
-def format_configurations_list(response: Dict[str, Any], page: int) -> List[TextContent]:
+def format_configurations_list(
+    response: Dict[str, Any], page: int, size: int = 20
+) -> List[TextContent]:
     """Format configurations list response."""
     configurations = response.get("content", [])
     total_elements = response.get("totalElements", 0)
@@ -38,7 +40,7 @@ def format_configurations_list(response: Dict[str, Any], page: int) -> List[Text
     for i, config in enumerate(configurations, 1):
         result_text += format_single_config_summary(config, i)
 
-    result_text += format_pagination_info(page, total_pages)
+    result_text += format_pagination_info(page, total_pages, size)
     result_text += format_usage_instructions()
 
     return [TextContent(type="text", text=result_text)]
@@ -62,16 +64,22 @@ def format_single_config_summary(config: Dict[str, Any], index: int) -> str:
     )
 
 
-def format_pagination_info(page: int, total_pages: int) -> str:
+def format_pagination_info(page: int, total_pages: int, size: int = 20) -> str:
     """Format pagination information."""
     if total_pages <= 1:
         return ""
 
     result = "---\n\n**Navigation:**\n"
     if page > 0:
-        result += f"- Previous page: `slack_management(action='list_configurations', page={page-1})`\n"
+        result += (
+            f"- Previous page: `slack_management(action='list_configurations', "
+            f"page={page-1}, size={size})`\n"
+        )
     if page < total_pages - 1:
-        result += f"- Next page: `slack_management(action='list_configurations', page={page+1})`\n"
+        result += (
+            f"- Next page: `slack_management(action='list_configurations', "
+            f"page={page+1}, size={size})`\n"
+        )
 
     return result
 
@@ -85,7 +93,9 @@ def format_usage_instructions() -> str:
     )
 
 
-def format_configuration_details(config: Dict[str, Any], config_id: str) -> List[TextContent]:
+def format_configuration_details(
+    config: Dict[str, Any], config_id: str, *, is_default: bool = False
+) -> List[TextContent]:
     """Format configuration details response."""
     name = config.get("name", "Unnamed Configuration")
     # Use correct API field names from the actual response
@@ -102,9 +112,7 @@ def format_configuration_details(config: Dict[str, Any], config_id: str) -> List
     result_text += f"- **Created:** {created_date}\n"
     result_text += f"- **Updated:** {updated_date}\n\n"
 
-    # Check if this is the current default
-    current_default = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
-    if current_default == config_id:
+    if is_default:
         result_text += "**This is your current default Slack configuration.**\n\n"
 
     result_text += "**Actions:**\n"
@@ -117,39 +125,31 @@ def format_configuration_details(config: Dict[str, Any], config_id: str) -> List
 
 
 def format_default_set_success(
-    config: Dict[str, Any], config_id: str, *, ctx_is_set: bool = False
+    config: Dict[str, Any], config_id: str, *, hosted: bool = False
 ) -> List[TextContent]:
     """Format successful default configuration set response.
 
-    When ``ctx_is_set`` is True (multi-tenant mode), the response reflects that
-    the selection applies to the current request only and is not persisted
-    globally — per-tenant persistent default storage is deferred to Phase 2.
+    A hosted organization's default lives in the server's memory, so it has no
+    .env line to add and is forgotten when the server restarts or evicts it.
     """
     name = config.get("name", "Unnamed Configuration")
     # Use correct API field names from the actual response
     team_name = config.get("teamName") or config.get("team", {}).get("label", "Unknown Workspace")
     channel_name = config.get("channelName", "N/A")
 
-    if ctx_is_set:
-        result_text = "# Default Slack Configuration Set for This Session Only\n\n"
-        result_text += (
-            "_Per-tenant persistent default storage is deferred to Phase 2; "
-            "this selection applies to the current request only._\n\n"
-        )
-    else:
-        result_text = "# Default Slack Configuration Set\n\n"
-
+    result_text = "# Default Slack Configuration Set\n\n"
     result_text += f"**Configuration:** {name}\n"
     result_text += f"**Workspace:** {team_name}\n"
     result_text += f"**Channel:** {channel_name}\n"
     result_text += f"**ID:** `{config_id}`\n\n"
+    result_text += "This configuration will now be used as the default for new alerts"
 
-    if ctx_is_set:
+    if hosted:
         result_text += (
-            "This configuration will be used for the current request only.\n"
+            f" created by your organization on this server. {HOSTED_DEFAULT_LIFETIME_NOTE}\n"
         )
     else:
-        result_text += "This configuration will now be used as the default for new alerts.\n\n"
+        result_text += ".\n\n"
         result_text += "**Note:** To make persistent, add to your .env file:\n"
         result_text += f'```bash\nREVENIUM_DEFAULT_SLACK_CONFIG_ID="{config_id}"\n```\n'
 

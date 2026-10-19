@@ -160,6 +160,7 @@ class TestStandardizedExecutionResolvesAliases:
             "manage_cost_controls",
             "preview_department_group",
             {"action": "preview_department_group", "parent_department_id": 173},
+            ctx=None,
         )
 
 

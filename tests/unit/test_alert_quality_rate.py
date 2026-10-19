@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from revenium_mcp_server.common.error_handling import ToolError
 from revenium_mcp_server.alert_metrics import (
     METRIC_BUCKETS,
     QUALITY_RATE,
@@ -282,7 +283,7 @@ class TestUpdateAppliesTheSameRules:
     def _client(self, stored: Dict[str, Any]) -> MagicMock:
         client = MagicMock()
         client.get_anomaly_by_id = AsyncMock(return_value=stored)
-        client.update_anomaly = AsyncMock(return_value={"id": "anom_1", "name": "Quality floor"})
+        client.update_anomaly = AsyncMock(side_effect=lambda _anomaly_id, body: dict(body))
         return client
 
     def _stored(self) -> Dict[str, Any]:
@@ -301,10 +302,11 @@ class TestUpdateAppliesTheSameRules:
     async def test_adding_a_group_by_to_a_quality_rule_never_reaches_the_api(self, manager):
         client = self._client(self._stored())
 
-        result = await manager.update_anomaly(client, "anom_1", {"groupBy": "MODEL"})
+        with pytest.raises(ToolError) as exc_info:
+            await manager.update_anomaly(client, "anom_1", {"groupBy": "MODEL"})
 
         client.update_anomaly.assert_not_called()
-        assert "groupBy" in result[0].text
+        assert "groupBy" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_raising_the_sample_floor_reaches_the_api(self, manager):
@@ -320,10 +322,11 @@ class TestUpdateAppliesTheSameRules:
         stored["metricType"] = "TOTAL_COST"
         client = self._client(stored)
 
-        result = await manager.update_anomaly(client, "anom_1", {"minSampleCount": 50})
+        with pytest.raises(ToolError) as exc_info:
+            await manager.update_anomaly(client, "anom_1", {"minSampleCount": 50})
 
         client.update_anomaly.assert_not_called()
-        assert "minSampleCount" in result[0].text
+        assert "minSampleCount" in exc_info.value.message
 
 
 class TestRuleHelperIsTheSingleSource:

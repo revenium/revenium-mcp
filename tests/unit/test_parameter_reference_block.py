@@ -6,8 +6,12 @@ accepted values. A union carries both on its branches rather than at the top
 level, which is what most of these cases pin.
 """
 
+import importlib
+import re
+
 import pytest
 
+from src.revenium_mcp_server.tool_configuration.schema_slimming import THIN_SCHEMA_TOOLS
 from src.revenium_mcp_server.tools_decomposed.unified_tool_base import (
     _PARAMETER_DESCRIPTION_MAX,
     _format_parameter_line,
@@ -146,3 +150,60 @@ class TestAnalyticsValueListsHaveOneSource:
         # The generated reference quotes the same two lists.
         assert periods in text.split("## Parameters", 1)[1]
         assert f"one of {aggregations}" in text
+
+
+_THIN_TOOL_CLASSES = {
+    "manage_metering": ("metering_management", "MeteringManagement"),
+    "business_analytics_management": (
+        "business_analytics_management",
+        "BusinessAnalyticsManagement",
+    ),
+    "manage_alerts": ("alert_management", "AlertManagement"),
+    "manage_ai_insights": ("ai_insights_management", "AIInsightsManagement"),
+    "manage_tools": ("tool_management", "ToolManagement"),
+}
+
+_DISOWNING = re.compile(r"NOT ACCEPTED|Not accepted|refused")
+
+#: Listed names whose description still says they are refused, each waiting on
+#: its own change.
+_KNOWN_DISOWNED = {
+    # BACK-4624 (PR 444) leaves these two in the help after it lands; the
+    # tool-registry help needs a follow-up that removes them.
+    "manage_tools": {"granularity", "group"},
+    # Retired aliases: accepted at the top level and answered with a message
+    # naming the replacement. dry_run is accepted at the top level and answered
+    # with the refusal of the dry-run guard, since no analytics action previews.
+    "business_analytics_management": {"threshold", "breakdown_by", "dry_run"},
+}
+
+
+@pytest.mark.asyncio
+class TestReferenceHonesty:
+    """The reference header says every listed name works at the top level."""
+
+    @pytest.mark.parametrize("tool_name", sorted(THIN_SCHEMA_TOOLS))
+    async def test_no_listed_parameter_is_disowned_by_its_own_description(
+        self, tool_name
+    ):
+        module_name, class_name = _THIN_TOOL_CLASSES[tool_name]
+        module = importlib.import_module(
+            f"src.revenium_mcp_server.tools_decomposed.{module_name}"
+        )
+        tool = getattr(module, class_name)(ucm_helper=None)
+        result = await tool.handle_action("get_capabilities", {})
+        reference = "\n".join(part.text for part in result).split("## Parameters", 1)[-1]
+        listed = re.findall(r"^- `([^`]+)`", reference, re.MULTILINE)
+        properties = (await tool._get_input_schema())["properties"]
+
+        disowned = sorted(
+            name
+            for name in listed
+            if _DISOWNING.search(str(properties.get(name, {}).get("description", "")))
+            and name not in _KNOWN_DISOWNED.get(tool_name, set())
+        )
+
+        assert disowned == [], (
+            f"{tool_name}'s get_capabilities lists {disowned} under 'Pass any of these "
+            "as a top-level argument' while their own descriptions say they are refused."
+        )

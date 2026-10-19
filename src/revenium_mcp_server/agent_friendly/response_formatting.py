@@ -11,6 +11,31 @@ from typing import Any, Dict, List, Optional
 from mcp.types import TextContent
 
 
+def _is_past_last_page(page: int, total_pages: int, total_items: Optional[int]) -> bool:
+    """True when an empty page lies beyond a list that is known to have items."""
+    return isinstance(total_items, int) and total_items > 0 and page >= total_pages
+
+
+def _past_last_page_sentence(
+    page: int, size: int, total_pages: int, total_items: Optional[int]
+) -> str:
+    """Say which pages exist, naming only the page argument the caller passes."""
+    pages = max(total_pages, 1)
+    items_label = "1 item" if total_items == 1 else f"{total_items} items"
+    pages_label = "1 page" if pages == 1 else f"{pages} pages"
+    if pages == 1:
+        where = f"Pass page=0, size={size} for the only page."
+    else:
+        where = (
+            f"Pass page={pages - 1}, size={size} for the last page, "
+            f"or page=0, size={size} for the first."
+        )
+    return (
+        f"The page requested (page={page}) is past the last. "
+        f"The list has {items_label} on {pages_label}. {where}"
+    )
+
+
 class StandardResponse:
     """Base class for standardized MCP responses."""
 
@@ -138,7 +163,11 @@ class StandardResponse:
 
         content_parts = [" ".join(header_parts), ""]
 
-        if not items:
+        if not items and _is_past_last_page(page, total_pages, total_items):
+            content_parts.append(
+                _past_last_page_sentence(page, size, total_pages, total_items)
+            )
+        elif not items:
             content_parts.extend(
                 [
                     "No items found.",
@@ -175,9 +204,11 @@ class StandardResponse:
             if total_pages > 1:
                 content_parts.extend(["", "**Navigation:**"])
                 if page > 0:
-                    content_parts.append(f"• Previous page: page={page - 1}")
+                    content_parts.append(
+                        f"• Previous page: page={page - 1}, size={size}"
+                    )
                 if page + 1 < total_pages:
-                    content_parts.append(f"• Next page: page={page + 1}")
+                    content_parts.append(f"• Next page: page={page + 1}, size={size}")
 
         if notes:
             content_parts.append("")

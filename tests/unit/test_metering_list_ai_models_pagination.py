@@ -69,14 +69,14 @@ class TestListAiModelsPaginationCoercion:
 class TestSearchAiModelsPaginationCoercion:
     @pytest.mark.asyncio
     async def test_unparsable_page_returns_clean_formatted_response(self):
-        """search handler converts ToolError to format_error_response — must
-        still produce a clean message with no Python TypeError leak."""
+        """search handler raises the ToolError for the caller's error flag; it
+        must still carry a clean message with no Python TypeError leak."""
         mgmt = _make_mgmt()
-        result = await mgmt._handle_search_ai_models(
-            {"query": "gpt", "page": "not_a_number", "size": 5}
-        )
-        assert len(result) > 0
-        text = result[0].text
+        with pytest.raises(ToolError) as exc_info:
+            await mgmt._handle_search_ai_models(
+                {"query": "gpt", "page": "not_a_number", "size": 5}
+            )
+        text = exc_info.value.message
         assert "page" in text.lower()
         assert_no_framework_leak(text)
         assert "can only concatenate" not in text

@@ -327,9 +327,15 @@ class PaginationHelper:
         # Add pagination navigation hints
         navigation_hints = []
         if pagination.has_previous:
-            navigation_hints.append(f"⬅️ Previous: `page: {pagination.current_page - 1}`")
+            navigation_hints.append(
+                f"⬅️ Previous: `page: {pagination.current_page - 1}, "
+                f"size: {pagination.page_size}`"
+            )
         if pagination.has_next:
-            navigation_hints.append(f"➡️ Next: `page: {pagination.current_page + 1}`")
+            navigation_hints.append(
+                f"➡️ Next: `page: {pagination.current_page + 1}, "
+                f"size: {pagination.page_size}`"
+            )
 
         if navigation_hints:
             result_text += f"\n\n**Navigation:** {' | '.join(navigation_hints)}"

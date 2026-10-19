@@ -5,7 +5,7 @@ infrastructure from config_store.py and slack_setup_assistant patterns.
 """
 
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -22,11 +22,17 @@ from ..common.error_handling import (
 )
 from ..config_store import get_config_value
 from ..introspection.metadata import ToolCapability, ToolType
-from ..onboarding.detection_service import get_onboarding_state
+from ..onboarding.detection_service import (
+    RESTORE_PLATFORM_ACCESS_RECOMMENDATION,
+    get_onboarding_state,
+)
 from ..onboarding.env_validation import (
     API_AUTH_REJECTED_MESSAGE,
+    ValidationResult,
+    request_settings,
     validate_environment_variables,
 )
+from ..onboarding.platform_read import INGESTION_PATHWAYS, read_platform_facts
 from .unified_tool_base import ToolBase
 
 
@@ -119,6 +125,8 @@ class SetupChecklist(ToolBase):
                 )
                 return [TextContent(type="text", text=format_structured_error(error))]
 
+        except (PermissionError, ToolError):
+            raise
         except Exception as e:
             logger.error(f"Error in setup_checklist action {action}: {e}")
             error = ToolError(
@@ -140,14 +148,11 @@ class SetupChecklist(ToolBase):
         """Handle show_checklist action - complete setup checklist."""
         logger.debug("Showing complete setup checklist")
 
-        # Get onboarding state using existing infrastructure
-        onboarding_state = await get_onboarding_state()
+        facts = await read_platform_facts(await self.get_client())
+        validation_result = await validate_environment_variables(api_connectivity=facts.read)
+        onboarding_state = await get_onboarding_state(facts, validation_result)
 
-        # Get environment validation using existing infrastructure
-        validation_result = await validate_environment_variables()
-
-        # Check Slack setup using existing patterns
-        slack_status = await self._check_slack_setup_status()
+        slack_status = self._slack_status_from_facts(facts.has_slack)
 
         # Build complete checklist
         checklist_text = self._build_complete_checklist(
@@ -162,8 +167,7 @@ class SetupChecklist(ToolBase):
         """Handle check_requirements action - check only required items."""
         logger.debug("🔑 Checking required configuration items")
 
-        # Get validation result
-        validation_result = await validate_environment_variables()
+        validation_result = await validate_environment_variables(await self.get_client())
 
         # Build requirements checklist
         requirements_text = self._build_requirements_checklist(validation_result)
@@ -176,11 +180,9 @@ class SetupChecklist(ToolBase):
         """Handle check_optional action - check optional/recommended items."""
         logger.debug("Checking optional and recommended configuration items")
 
-        # Get validation result
-        validation_result = await validate_environment_variables()
-
-        # Check Slack setup
-        slack_status = await self._check_slack_setup_status()
+        facts = await read_platform_facts(await self.get_client())
+        validation_result = await validate_environment_variables(api_connectivity=facts.read)
+        slack_status = self._slack_status_from_facts(facts.has_slack)
 
         # Build optional checklist
         optional_text = self._build_optional_checklist(validation_result, slack_status)
@@ -193,52 +195,26 @@ class SetupChecklist(ToolBase):
         """Handle check_system_status action - check system connectivity and health."""
         logger.debug("Checking system status and connectivity")
 
-        # Get validation result
-        validation_result = await validate_environment_variables()
+        facts = await read_platform_facts(await self.get_client())
+        validation_result = await validate_environment_variables(api_connectivity=facts.read)
 
-        # Per-pathway data-ingestion status (best-effort — never blocks the report)
-        ingestion_status = await self._fetch_data_ingestion_status()
+        # Per-pathway data-ingestion status, from the same read
+        ingestion_status = self._ingestion_status_from_read(facts.read)
 
         # Build system status
         system_status_text = self._build_system_status(validation_result, ingestion_status)
 
         return [TextContent(type="text", text=system_status_text)]
 
-    # Ingestion pathways reported by the data-connected/sources endpoint,
-    # in display order, with the labels the platform uses for each.
-    _INGESTION_PATHWAYS = (
-        ("providerBilling", "Provider billing sync"),
-        ("sdkMetering", "SDK/API metering"),
-        ("codingAssistant", "Coding-assistant telemetry"),
-        ("traces", "Distributed traces"),
-    )
+    _INGESTION_PATHWAYS = INGESTION_PATHWAYS
 
-    # Hard bound on the optional ingestion fetch so a hanging endpoint can
-    # never stall the whole status report past this budget.
-    _INGESTION_FETCH_TIMEOUT_SECONDS = 10.0
-
-    async def _fetch_data_ingestion_status(self) -> Dict[str, Any]:
-        """Fetch per-pathway data-connection status, degrading to an error marker.
-
-        The system-status report must render even without credentials or
-        when the endpoint is unreachable, so failures are captured instead
-        of raised. The exception detail goes to the log only; the rendered
-        reason stays generic so upstream/auth specifics never reach callers.
-        """
-        import asyncio
-
-        try:
-            client = await self.get_client()
-            return await asyncio.wait_for(
-                client.get_data_connected_sources(),
-                timeout=self._INGESTION_FETCH_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            logger.debug("Data-ingestion status timed out")
-            return {"error": "the data-connected endpoint did not respond in time"}
-        except Exception as e:
-            logger.debug(f"Data-ingestion status unavailable: {e}")
-            return {"error": "could not reach the data-connected endpoint"}
+    @staticmethod
+    def _ingestion_status_from_read(read: Dict[str, Any]) -> Dict[str, Any]:
+        """Per-pathway data-connection status from the platform read, or an error marker."""
+        payload = read.get("payload")
+        if read.get("status") == "success" and isinstance(payload, dict):
+            return payload
+        return {"error": "could not read the data-connected endpoint"}
 
     async def _handle_get_recommendations(
         self, arguments: Dict[str, Any]
@@ -246,11 +222,12 @@ class SetupChecklist(ToolBase):
         """Handle get_recommendations action - get personalized recommendations."""
         logger.debug("Getting personalized setup recommendations")
 
-        # Get onboarding state
-        onboarding_state = await get_onboarding_state()
+        facts = await read_platform_facts(await self.get_client())
+        validation_result = await validate_environment_variables(api_connectivity=facts.read)
+        onboarding_state = await get_onboarding_state(facts, validation_result)
 
         # Build recommendations
-        recommendations_text = self._build_recommendations(onboarding_state)
+        recommendations_text = self._build_recommendations(onboarding_state, validation_result)
 
         return [TextContent(type="text", text=recommendations_text)]
 
@@ -355,51 +332,53 @@ Comprehensive setup status verification and configuration guidance for Revenium 
 """
         return [TextContent(type="text", text=examples)]
 
-    async def _check_slack_setup_status(self) -> Dict[str, Any]:
-        """Check Slack setup status using existing patterns.
-
-        Returns:
-            Dictionary with Slack setup status information
-        """
-        try:
-            # Use existing config_store patterns to check Slack configuration
-            slack_config_id = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
-
-            # Check if we have any Slack-related configuration
-            slack_configured = bool(slack_config_id)
-
-            # Try to get more detailed Slack status if possible
-            # This follows the pattern from slack_setup_assistant
-            status = {
-                "configured": slack_configured,
-                "config_id": slack_config_id,
-                "status": "configured" if slack_configured else "not_configured",
+    @staticmethod
+    def _slack_status_from_facts(has_slack: Optional[bool]) -> Dict[str, Any]:
+        """Slack status from the organization's Slack configurations on the platform."""
+        if has_slack is None:
+            return {
+                "configured": None,
+                "status": "unknown",
+                "status_text": "Could not check Slack on the platform",
                 "recommendations": [],
             }
-
-            if not slack_configured:
-                status["recommendations"] = [
-                    "Use slack_management(action='quick_setup') to configure Slack",
-                    "Set up Slack for real-time alert notifications",
-                    "Enable team collaboration through Slack integration",
-                ]
-
-            return status
-
-        except Exception as e:
-            logger.warning(f"Error checking Slack setup status: {e}")
+        if has_slack:
             return {
-                "configured": False,
-                "status": "error",
-                "error": str(e),
-                "recommendations": ["Check Slack configuration manually"],
+                "configured": True,
+                "status": "configured",
+                "status_text": "Configured on the platform",
+                "recommendations": [],
             }
+        return {
+            "configured": False,
+            "status": "not_configured",
+            "status_text": "Not configured",
+            "recommendations": [
+                "Use slack_management(action='quick_setup') to configure Slack",
+                "Set up Slack for real-time alert notifications",
+                "Enable team collaboration through Slack integration",
+            ],
+        }
+
+    @staticmethod
+    def _required_setting(var_name: str) -> Tuple[bool, str]:
+        """Whether a required setting is present for this caller, and how to show it."""
+        caller_settings = request_settings()
+        if caller_settings is not None:
+            return caller_settings[var_name]
+        value = get_config_value(var_name)
+        if var_name == "REVENIUM_API_KEY" and value:
+            return True, "SET (hidden)"
+        return bool(value), value or "NOT SET"
 
     def _build_complete_checklist(self, onboarding_state, validation_result, slack_status) -> str:
         """Build complete setup checklist."""
         checklist = "# **Complete Setup Checklist**\n\n"
         checklist += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-        checklist += f"**First-time User**: {'Yes' if onboarding_state.is_first_time else 'No'}\n\n"
+        first_time = {True: "Yes", False: "No", None: "Unknown - the platform could not be read"}[
+            onboarding_state.is_first_time
+        ]
+        checklist += f"**First-time User**: {first_time}\n\n"
 
         # Overall status
         overall_status = validation_result.summary.get("overall_status", False)
@@ -411,12 +390,12 @@ Comprehensive setup status verification and configuration guidance for Revenium 
         # Required configuration
         checklist += "## **Required Configuration**\n\n"
 
-        api_key_set = bool(get_config_value("REVENIUM_API_KEY"))
-        team_id_set = bool(get_config_value("REVENIUM_TEAM_ID"))
+        api_key_set = self._required_setting("REVENIUM_API_KEY")[0]
+        team_id_set, team_id_value = self._required_setting("REVENIUM_TEAM_ID")
 
         checklist += f"{'[OK]' if api_key_set else '❌'} **API Key (REVENIUM_API_KEY)**\n"
         if api_key_set:
-            checklist += "   - Status: Configured and ready\n"
+            checklist += "   - Status: Configured\n"
         else:
             checklist += "   - Status: ❌ Missing - Required for API access\n"
             checklist += "   - Action: Set your REVENIUM_API_KEY environment variable\n"
@@ -424,7 +403,6 @@ Comprehensive setup status verification and configuration guidance for Revenium 
 
         checklist += f"{'[OK]' if team_id_set else '❌'} **Team ID (REVENIUM_TEAM_ID)**\n"
         if team_id_set:
-            team_id_value = get_config_value("REVENIUM_TEAM_ID") or "SET"
             checklist += f"   - Status: Configured ({team_id_value})\n"
         else:
             checklist += "   - Status: ❌ Missing - Required for team access\n"
@@ -444,11 +422,11 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             checklist += "   - Action: Use verify_email_setup() to configure notifications\n"
         checklist += "\n"
 
-        slack_configured = slack_status.get("configured", False)
-        checklist += f"{'[OK]' if slack_configured else '[ ]'} **Slack Integration**\n"
-        if slack_configured:
-            config_id = slack_status.get("config_id", "SET")
-            checklist += f"   - Status: Configured ({config_id})\n"
+        slack_configured = slack_status.get("configured")
+        slack_icon = {True: "[OK]", False: "[ ]", None: "[?]"}[slack_configured]
+        checklist += f"{slack_icon} **Slack Integration**\n"
+        if slack_configured is not False:
+            checklist += f"   - Status: {slack_status.get('status_text')}\n"
         else:
             checklist += "   - Status: Not configured\n"
             checklist += "   - Action: Use slack_management(action='quick_setup')\n"
@@ -511,24 +489,22 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             checklist += "2. Test API connectivity with debug_auto_discovery()\n"
             checklist += "3. Run setup_checklist() again to verify\n"
         elif not api_works:
-            # Everything looks configured but the probe never ran - the key can
-            # live in the config cache while missing from the environment the
-            # probe reads. Completeness cannot be claimed without a read.
+            # Completeness cannot be claimed without a completed read.
             checklist += "## **Critical Next Steps**\n\n"
-            checklist += (
-                "1. API connectivity was not verified - the probe found no "
-                "REVENIUM_API_KEY in the process environment\n"
-            )
-            checklist += "2. Export REVENIUM_API_KEY, then test with debug_auto_discovery()\n"
+            checklist += "1. API connectivity was not verified\n"
+            checklist += "2. Run system_diagnostics(action='system_health') to see why\n"
             checklist += "3. Run setup_checklist() again to verify\n"
-        elif not email_set or not slack_configured:
+        elif not email_set or slack_configured is not True:
             checklist += "## **Recommended Next Steps**\n\n"
             step_num = 1
             if not email_set:
                 checklist += f"{step_num}. Set up email notifications for alerts\n"
                 step_num += 1
-            if not slack_configured:
+            if slack_configured is False:
                 checklist += f"{step_num}. Configure Slack integration for real-time updates\n"
+                step_num += 1
+            elif slack_configured is None:
+                checklist += f"{step_num}. Slack could not be checked on the platform; run setup_checklist() again to check it\n"
                 step_num += 1
             checklist += f"{step_num}. Use system_setup(action='setup_checklist') when ready\n"
         else:
@@ -555,12 +531,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
         all_required_set = True
 
         for var_name, description, is_critical in required_vars:
-            is_set = bool(get_config_value(var_name))
-            display_value = (
-                "SET (hidden)"
-                if var_name == "REVENIUM_API_KEY" and is_set
-                else (get_config_value(var_name) or "NOT SET")
-            )
+            is_set, display_value = self._required_setting(var_name)
 
             if not is_set:
                 all_required_set = False
@@ -577,12 +548,24 @@ Comprehensive setup status verification and configuration guidance for Revenium 
                 elif var_name == "REVENIUM_TEAM_ID":
                     requirements += "**How to Fix**: Export REVENIUM_TEAM_ID=your_team_id or enable auto-discovery\n"
             else:
-                requirements += "**Status**: [OK] Properly configured\n"
+                requirements += "**Status**: [OK] Set\n"
 
             requirements += "\n"
 
-        # Overall status
-        if all_required_set:
+        read = validation_result.api_connectivity
+        # Settings that are present prove nothing until the platform accepts them.
+        if all_required_set and read.get("status") != "success":
+            requirements += "## ⚠️ **Requirements Status: SET, NOT VERIFIED**\n\n"
+            requirements += (
+                "The required settings are present, but the platform read with them "
+                f"did not succeed: {read.get('error') or 'no answer'}\n\n"
+            )
+            requirements += "**Next Steps:**\n"
+            requirements += (
+                "- Run system_diagnostics(action='system_health') to see what is not working\n"
+            )
+            requirements += "- Run check_requirements() again once the platform can be read\n"
+        elif all_required_set:
             requirements += "## [OK] **Requirements Status: COMPLETE**\n\n"
             requirements += "All required configuration items are properly set!\n\n"
             requirements += "**Next Steps:**\n"
@@ -618,19 +601,46 @@ Comprehensive setup status verification and configuration guidance for Revenium 
         optional += "\n"
 
         # Slack integration
-        slack_configured = slack_status.get("configured", False)
-        slack_config_id = slack_status.get("config_id", "NOT SET")
+        slack_configured = slack_status.get("configured")
 
-        optional += f"## {'[OK]' if slack_configured else '❌'} **Slack Integration**\n"
+        slack_icon = {True: "[OK]", False: "❌", None: "[?]"}[slack_configured]
+        optional += f"## {slack_icon} **Slack Integration**\n"
         optional += "**Purpose**: Real-time notifications and team collaboration\n"
-        optional += f"**Status**: {slack_config_id}\n"
+        optional += f"**Status**: {slack_status.get('status_text')}\n"
         if slack_configured:
             optional += "**Benefit**: [OK] Real-time Slack notifications enabled\n"
-        else:
+        elif slack_configured is False:
             optional += "**Action**: Use slack_management(action='quick_setup')\n"
             optional += "**Benefit**: Get instant notifications and enable team collaboration\n"
         optional += "\n"
 
+        recommended = [email_set, slack_configured is True]
+        if validation_result.summary.get("credential_source") != "request":
+            server_section, auto_discovery_works = self._server_optional_settings(
+                validation_result
+            )
+            optional += server_section
+            recommended.append(auto_discovery_works)
+
+        # Summary
+        configured_count = sum(recommended)
+
+        optional += "##  **Optional Configuration Summary**\n\n"
+        optional += f"**Configured**: {configured_count}/{len(recommended)} recommended items\n\n"
+
+        if configured_count == len(recommended):
+            optional += " **Excellent!** All recommended items are configured.\n"
+        elif configured_count >= 1:
+            optional += " **Good progress!** Consider configuring remaining items for the best experience.\n"
+        else:
+            optional += " **Tip**: Configure these items to enhance your Revenium experience.\n"
+
+        return optional
+
+    @staticmethod
+    def _server_optional_settings(validation_result: ValidationResult) -> Tuple[str, bool]:
+        """Auto-discovery and optional settings of this server's own configuration."""
+        optional = ""
         # Auto-discovery status
         auto_discovery_works = validation_result.summary.get("auto_discovery_works", False)
         discovered_count = validation_result.discovered_config.get("discovered_count", 0)
@@ -665,74 +675,31 @@ Comprehensive setup status verification and configuration guidance for Revenium 
 
         optional += "\n"
 
-        # Summary
-        configured_count = sum([email_set, slack_configured, auto_discovery_works])
+        return optional, auto_discovery_works
 
-        optional += "##  **Optional Configuration Summary**\n\n"
-        optional += f"**Configured**: {configured_count}/3 recommended items\n\n"
-
-        if configured_count == 3:
-            optional += " **Excellent!** All recommended items are configured.\n"
-        elif configured_count >= 1:
-            optional += " **Good progress!** Consider configuring remaining items for the best experience.\n"
-        else:
-            optional += " **Tip**: Configure these items to enhance your Revenium experience.\n"
-
-        return optional
-
-    def _build_system_status(self, validation_result, ingestion_status=None) -> str:
-        """Build system status and connectivity check.
-
-        Args:
-            validation_result: Environment validation outcome
-            ingestion_status: Optional per-pathway data-connection payload
-                from get_data_connected_sources (or {"error": ...}); the
-                Data Ingestion section is omitted when None
-        """
-        system = "#  **System Status & Connectivity**\n\n"
-        system += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
-
-        # API connectivity
-        api_result = validation_result.api_connectivity
-        api_status = api_result.get("status", "unknown")
-
-        system += "##  **API Connectivity**\n\n"
-
+    @staticmethod
+    def _hosted_authentication_section(summary: Dict[str, Any], api_status: str) -> str:
+        """Authentication as the caller's own request proved it, not the server's settings."""
+        credential = "Sign-in" if summary.get("auth_mode") == "clerk" else "API key"
+        section = "##  **Authentication**\n\n"
         if api_status == "success":
-            system += "[OK] **Status**: Connected and working\n"
-            status_code = api_result.get("status_code", "unknown")
-            system += f"**Response Code**: {status_code}\n"
-            system += "**Test**: Successfully called /users/me endpoint\n"
-        elif api_status == "permission_denied":
-            # The key reached the API but read nothing - report the scope cause,
-            # not a connection failure and not "not tested".
-            system += "[FAIL] **Status**: Forbidden - no data could be read\n"
-            status_code = api_result.get("status_code", "unknown")
-            system += f"**Response Code**: {status_code}\n"
-            system += f"**Reason**: {api_result.get('error', 'Read access denied')}\n"
-        elif api_status == "failed":
-            system += "❌ **Status**: Connection failed\n"
-            status_code = api_result.get("status_code", "unknown")
-            system += f"**Response Code**: {status_code}\n"
-            # The probe reports its wording under "error"; it never sets "response",
-            # so reading that key dropped the 401 guidance from this view entirely.
-            default_error = (
-                API_AUTH_REJECTED_MESSAGE if status_code == 401 else "Unknown error"
-            )
-            error_response = api_result.get("error", default_error)
-            system += f"**Error**: {error_response}\n"
-        elif api_status == "error":
-            system += "❌ **Status**: Connection error\n"
-            error = api_result.get("error", "Unknown error")
-            system += f"**Error**: {error}\n"
+            section += "[OK] **Status**: Authentication working\n"
         else:
-            system += "⚠️ **Status**: Not tested\n"
-            error = api_result.get("error", "No API key available")
-            system += f"**Reason**: {error}\n"
+            section += "❌ **Status**: Not verified - see API Connectivity above\n"
+        section += f"**Credential**: {credential} sent with this request\n\n"
+        return section
 
-        system += "\n"
+    @staticmethod
+    def _server_settings_healthy(validation_result: ValidationResult) -> bool:
+        return bool(
+            validation_result.auth_config.get("status") == "success"
+            and validation_result.discovered_config.get("status") == "success"
+        )
 
-        # Auth configuration
+    @staticmethod
+    def _server_settings_sections(validation_result: ValidationResult, api_status: str) -> str:
+        """Authentication and auto-discovery as configured in this server's own settings."""
+        system = ""
         auth_result = validation_result.auth_config
         auth_status = auth_result.get("status", "unknown")
 
@@ -786,6 +753,66 @@ Comprehensive setup status verification and configuration guidance for Revenium 
 
         system += "\n"
 
+        return system
+
+    def _build_system_status(self, validation_result, ingestion_status=None) -> str:
+        """Build system status and connectivity check.
+
+        Args:
+            validation_result: Environment validation outcome
+            ingestion_status: Optional per-pathway data-connection payload
+                from get_data_connected_sources (or {"error": ...}); the
+                Data Ingestion section is omitted when None
+        """
+        system = "#  **System Status & Connectivity**\n\n"
+        system += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+
+        # API connectivity
+        api_result = validation_result.api_connectivity
+        api_status = api_result.get("status", "unknown")
+
+        system += "##  **API Connectivity**\n\n"
+
+        if api_status == "success":
+            system += "[OK] **Status**: Connected and working\n"
+            status_code = api_result.get("status_code", "unknown")
+            system += f"**Response Code**: {status_code}\n"
+            system += "**Test**: Read this organization's data-connected sources\n"
+        elif api_status == "permission_denied":
+            # The key reached the API but read nothing - report the scope cause,
+            # not a connection failure and not "not tested".
+            system += "[FAIL] **Status**: Forbidden - no data could be read\n"
+            status_code = api_result.get("status_code", "unknown")
+            system += f"**Response Code**: {status_code}\n"
+            system += f"**Reason**: {api_result.get('error', 'Read access denied')}\n"
+        elif api_status == "failed":
+            system += "❌ **Status**: Connection failed\n"
+            status_code = api_result.get("status_code", "unknown")
+            system += f"**Response Code**: {status_code}\n"
+            # The probe reports its wording under "error"; it never sets "response",
+            # so reading that key dropped the 401 guidance from this view entirely.
+            default_error = (
+                API_AUTH_REJECTED_MESSAGE if status_code == 401 else "Unknown error"
+            )
+            error_response = api_result.get("error", default_error)
+            system += f"**Error**: {error_response}\n"
+        elif api_status == "error":
+            system += "❌ **Status**: Connection error\n"
+            error = api_result.get("error", "Unknown error")
+            system += f"**Error**: {error}\n"
+        else:
+            system += "⚠️ **Status**: Not tested\n"
+            error = api_result.get("error", "No API key available")
+            system += f"**Reason**: {error}\n"
+
+        system += "\n"
+
+        hosted_caller = validation_result.summary.get("credential_source") == "request"
+        if hosted_caller:
+            system += self._hosted_authentication_section(validation_result.summary, api_status)
+        else:
+            system += self._server_settings_sections(validation_result, api_status)
+
         # Data ingestion by pathway (which sources are actually sending data)
         if ingestion_status is not None:
             system += "##  **Data Ingestion by Pathway**\n\n"
@@ -813,8 +840,8 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             system += "\n"
 
         # Overall system health
-        overall_healthy = (
-            api_status == "success" and auth_status == "success" and discovered_status == "success"
+        overall_healthy = api_status == "success" and (
+            hosted_caller or self._server_settings_healthy(validation_result)
         )
 
         system += "##  **Overall System Health**\n\n"
@@ -828,18 +855,38 @@ Comprehensive setup status verification and configuration guidance for Revenium 
 
         return system
 
-    def _build_recommendations(self, onboarding_state) -> str:
+    @staticmethod
+    def _slack_readiness_line(slack_configured: Optional[bool]) -> str:
+        if slack_configured is None:
+            return "- Slack could not be checked on the platform, so its state is unknown\n\n"
+        return "- Optional features are configured\n\n"
+
+    def _build_recommendations(self, onboarding_state, validation_result) -> str:
         """Build personalized recommendations based on setup status."""
         recommendations = "#  **Personalized Setup Recommendations**\n\n"
         recommendations += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
         setup_completion = onboarding_state.setup_completion
         user_recommendations = onboarding_state.recommendations
+        platform_read = validation_result.api_connectivity
 
         # Priority-based recommendations
         high_priority = []
         medium_priority = []
         low_priority = []
+
+        if platform_read.get("status") != "success":
+            high_priority.append(
+                {
+                    "title": "Restore Platform Access",
+                    "description": (
+                        "The platform could not be read, so setup could not be confirmed. "
+                        f"The read returned: {platform_read.get('error') or 'no answer'}"
+                    ),
+                    "action": "Run system_diagnostics(action='system_health') to see what is not working",
+                    "impact": "Critical - Nothing can be verified until the platform can be read",
+                }
+            )
 
         # Categorize recommendations by priority
         if not setup_completion.get("api_key_configured", False):
@@ -872,7 +919,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
                 }
             )
 
-        if not setup_completion.get("slack_configured", False):
+        if setup_completion.get("slack_configured") is False:
             medium_priority.append(
                 {
                     "title": "Configure Slack Integration",
@@ -924,12 +971,17 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             recommendations += "**Ready to Use:**\n"
             recommendations += "- All required configuration is in place\n"
             recommendations += "- System connectivity is working\n"
-            recommendations += "- Optional features are configured\n\n"
+            recommendations += self._slack_readiness_line(setup_completion.get("slack_configured"))
             recommendations += "**Next Steps:**\n"
             recommendations += (
                 "- Use system_setup(action='setup_checklist') to finish onboarding\n"
             )
             recommendations += "- Start exploring the full capabilities of your MCP server\n"
+
+        # The Restore Platform Access item above already says this.
+        user_recommendations = [
+            rec for rec in user_recommendations if rec != RESTORE_PLATFORM_ACCESS_RECOMMENDATION
+        ]
 
         # Add system-generated recommendations
         if user_recommendations:

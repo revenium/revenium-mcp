@@ -17,6 +17,9 @@ _embedded.items as an empty list, and skip metrics whose metricResult is
 missing/non-numeric (never fabricate 0).
 """
 
+import copy
+
+import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -180,13 +183,13 @@ class TestFetchAnalyticsEnvelope:
     @pytest.mark.asyncio
     async def test_returns_dict_response(self):
         analyzer = _analyzer_with_response(AGGREGATED_ENVELOPE)
-        result = await analyzer._fetch_analytics_envelope("profit_margin_per_customer", "THIRTY_DAYS")
+        result = (await analyzer._fetch_analytics_envelope("profit_margin_per_customer", "THIRTY_DAYS")).envelope
         assert result == AGGREGATED_ENVELOPE
 
     @pytest.mark.asyncio
     async def test_non_dict_response_becomes_empty_dict(self):
         analyzer = _analyzer_with_response(None)
-        result = await analyzer._fetch_analytics_envelope("profit_margin_per_customer", "THIRTY_DAYS")
+        result = (await analyzer._fetch_analytics_envelope("profit_margin_per_customer", "THIRTY_DAYS")).envelope
         assert result == {}
 
     @pytest.mark.asyncio
@@ -214,7 +217,7 @@ class TestAggregatedFamily:
     @pytest.mark.asyncio
     async def test_profit_margins_customer_flattens_groups(self):
         analyzer = _analyzer_with_response(AGGREGATED_ENVELOPE)
-        rows = await analyzer.get_profit_margins("THIRTY_DAYS", "customer")
+        rows = (await analyzer.get_profit_margins("THIRTY_DAYS", "customer")).rows
         assert len(rows) == 2
         names = {r["group"] for r in rows}
         assert names == {"acme-corp", "globex"}
@@ -238,7 +241,7 @@ class TestAggregatedFamily:
     @pytest.mark.asyncio
     async def test_top_movers_preserves_trend_fields(self):
         analyzer = _analyzer_with_response(TOP_MOVERS_ENVELOPE)
-        rows = await analyzer.get_top_movers("THIRTY_DAYS", group_by="model")
+        rows = (await analyzer.get_top_movers("THIRTY_DAYS", group_by="model")).rows
         gpt = next(r for r in rows if r["group"] == "gpt-4o")
         assert gpt["currentValue"] == 120.0
         assert gpt["previousValue"] == 80.0
@@ -261,19 +264,19 @@ class TestAggregatedFamily:
     @pytest.mark.asyncio
     async def test_vendor_costs_flattens(self):
         analyzer = _analyzer_with_response(AGGREGATED_ENVELOPE)
-        rows = await analyzer.get_vendor_costs("SEVEN_DAYS")
+        rows = (await analyzer.get_vendor_costs("SEVEN_DAYS")).rows
         assert len(rows) == 2
 
     @pytest.mark.asyncio
     async def test_task_performance_by_agent_empty(self):
         analyzer = _analyzer_with_response(EMPTY_ENVELOPE)
-        rows = await analyzer.get_task_performance_by_agent("SEVEN_DAYS")
+        rows = (await analyzer.get_task_performance_by_agent("SEVEN_DAYS")).rows
         assert rows == []
 
     @pytest.mark.asyncio
     async def test_missing_or_nonnumeric_metric_is_skipped(self):
         analyzer = _analyzer_with_response(MISSING_METRIC_AGG_ENVELOPE)
-        rows = await analyzer.get_profit_margins("THIRTY_DAYS", "customer")
+        rows = (await analyzer.get_profit_margins("THIRTY_DAYS", "customer")).rows
         # Only the "good" group survives — the missing and non-numeric ones are dropped.
         assert len(rows) == 1
         assert rows[0]["group"] == "good"
@@ -282,7 +285,7 @@ class TestAggregatedFamily:
     @pytest.mark.asyncio
     async def test_task_costs_aggregated_uses_aggregated_endpoint(self):
         analyzer = _analyzer_with_response(AGGREGATED_ENVELOPE)
-        rows = await analyzer.get_task_costs("THIRTY_DAYS", "aggregated")
+        rows = (await analyzer.get_task_costs("THIRTY_DAYS", "aggregated")).rows
         args, _kwargs = analyzer.client.get.call_args
         assert "cost-by-task-aggregated" in args[0]
         assert len(rows) == 2
@@ -296,7 +299,7 @@ class TestTimeseriesFamily:
     @pytest.mark.asyncio
     async def test_task_costs_timeseries_returns_buckets(self):
         analyzer = _analyzer_with_response(TIMESERIES_ENVELOPE)
-        buckets = await analyzer.get_task_costs("SEVEN_DAYS", "timeseries")
+        buckets = (await analyzer.get_task_costs("SEVEN_DAYS", "timeseries")).rows
         assert len(buckets) == 2
         first = buckets[0]
         assert first["startTimestamp"] == "2026-07-01T00:00:00Z"
@@ -321,11 +324,33 @@ class TestTimeseriesFamily:
         assert kwargs["params"]["agents"] == ["a1", "a2"]
 
     @pytest.mark.asyncio
-    async def test_token_breakdown_forwards_providers(self):
+    async def test_token_breakdown_sends_one_provider_twice(self):
+        """The platform answers a lone providers value with HTTP 400; the same name twice filters."""
+        first_page = {**copy.deepcopy(TIMESERIES_ENVELOPE), "page": {"number": 0, "totalPages": 2}}
+        second_page = copy.deepcopy(TIMESERIES_ENVELOPE)
+        analyzer = _analyzer_with_response(None)
+        analyzer.client.get = AsyncMock(side_effect=[first_page, second_page])
+        providers = ["openai"]
+
+        await analyzer.get_token_breakdown("SEVEN_DAYS", providers=providers)
+
+        assert providers == ["openai"]
+        assert analyzer.client.get.await_count == 2
+        for _args, kwargs in analyzer.client.get.call_args_list:
+            assert kwargs["params"]["providers"] == ["openai", "openai"]
+            wire = httpx.Request("GET", "https://analytics.test/x", params=kwargs["params"])
+            assert wire.url.params.get_list("providers") == ["openai", "openai"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "providers", [["openai", "anthropic"], ["openai", "openai"]]
+    )
+    async def test_token_breakdown_sends_two_providers_as_given(self, providers):
         analyzer = _analyzer_with_response(TIMESERIES_ENVELOPE)
-        await analyzer.get_token_breakdown("SEVEN_DAYS", providers=["openai"])
+        await analyzer.get_token_breakdown("SEVEN_DAYS", providers=providers)
         _args, kwargs = analyzer.client.get.call_args
-        assert kwargs["params"]["providers"] == ["openai"]
+        wire = httpx.Request("GET", "https://analytics.test/x", params=kwargs["params"])
+        assert wire.url.params.get_list("providers") == providers
 
     @pytest.mark.asyncio
     async def test_token_breakdown_omits_providers_when_none(self):
@@ -337,7 +362,7 @@ class TestTimeseriesFamily:
     @pytest.mark.asyncio
     async def test_team_costs_timeseries(self):
         analyzer = _analyzer_with_response(TIMESERIES_ENVELOPE)
-        buckets = await analyzer.get_team_costs("THIRTY_DAYS")
+        buckets = (await analyzer.get_team_costs("THIRTY_DAYS")).rows
         args, _kwargs = analyzer.client.get.call_args
         assert args[0].endswith("/cost-by-team")
         assert len(buckets) == 2
@@ -345,7 +370,7 @@ class TestTimeseriesFamily:
     @pytest.mark.asyncio
     async def test_token_vs_tool_cost_timeseries(self):
         analyzer = _analyzer_with_response(TIMESERIES_ENVELOPE)
-        buckets = await analyzer.get_token_vs_tool_cost("THIRTY_DAYS")
+        buckets = (await analyzer.get_token_vs_tool_cost("THIRTY_DAYS")).rows
         args, _kwargs = analyzer.client.get.call_args
         assert args[0].endswith("/token-vs-tool-cost")
         assert len(buckets) == 2
@@ -353,7 +378,7 @@ class TestTimeseriesFamily:
     @pytest.mark.asyncio
     async def test_empty_timeseries_returns_empty_list(self):
         analyzer = _analyzer_with_response(EMPTY_ENVELOPE)
-        buckets = await analyzer.get_task_costs("SEVEN_DAYS", "timeseries")
+        buckets = (await analyzer.get_task_costs("SEVEN_DAYS", "timeseries")).rows
         assert buckets == []
 
     @pytest.mark.asyncio
@@ -379,7 +404,7 @@ class TestTimeseriesFamily:
             }
         }
         analyzer = _analyzer_with_response(envelope)
-        buckets = await analyzer.get_task_costs("SEVEN_DAYS", "timeseries")
+        buckets = (await analyzer.get_task_costs("SEVEN_DAYS", "timeseries")).rows
         assert len(buckets) == 1
         groups = buckets[0]["groups"]
         assert len(groups) == 1
@@ -394,13 +419,13 @@ class TestScatterFamily:
     @pytest.mark.asyncio
     async def test_trace_cost_distribution_returns_datapoints(self):
         analyzer = _analyzer_with_response(SCATTER_ENVELOPE)
-        points = await analyzer.get_trace_cost_distribution("SEVEN_DAYS")
+        points = (await analyzer.get_trace_cost_distribution("SEVEN_DAYS")).rows
         assert points == SCATTER_ENVELOPE["dataPoints"]
 
     @pytest.mark.asyncio
     async def test_trace_cost_distribution_empty_when_no_datapoints(self):
         analyzer = _analyzer_with_response({"resourceType": "scatter_chart"})
-        points = await analyzer.get_trace_cost_distribution("SEVEN_DAYS")
+        points = (await analyzer.get_trace_cost_distribution("SEVEN_DAYS")).rows
         assert points == []
 
     @pytest.mark.asyncio
@@ -433,6 +458,6 @@ class TestFetchEnvelopeUnwrapBehavior:
             "resourceType": "scatter_chart",
             "dataPoints": [{"transactionId": "t1", "totalCost": 0.25}],
         })
-        result = await analyzer.get_trace_cost_distribution("THIRTY_DAYS")
+        result = (await analyzer.get_trace_cost_distribution("THIRTY_DAYS")).rows
         assert len(result) == 1
         assert result[0]["transactionId"] == "t1"

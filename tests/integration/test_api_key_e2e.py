@@ -26,6 +26,10 @@ from tests.integration.fixtures.back_864_canned_responses import PRODUCTS_LIST
 # ── Canned /users/me identity ─────────────────────────────────────
 
 _VALID_TOKEN = "rev_rk_valid_test_token_abc123"
+_LOCKED_OUT_TOKEN = "rev_rk_locked_out_token_abc123"
+_LOCKOUT_TEXT = (
+    "Too many failed requests. Please review your integration and retry after 42 seconds."
+)
 
 _USERS_ME_BODY = {
     "id": "usr_123",
@@ -55,6 +59,8 @@ def api_key_and_revenium_mock(httpserver):
     def _users_me_handler(request):
         from werkzeug.wrappers import Response
 
+        if request.headers.get("x-api-key", "") == _LOCKED_OUT_TOKEN:
+            return Response(_LOCKOUT_TEXT, status=429, content_type="text/plain")
         if request.headers.get("x-api-key", "") == _VALID_TOKEN:
             import json
             return Response(
@@ -220,3 +226,32 @@ async def test_api_key_identity_resolved_from_users_me(
         f"expected tenant_id=tenant_abc (from /users/me tenantId), "
         f"got tenant_id={identity.tenant_id!r}."
     )
+
+
+async def test_a_platform_lockout_at_sign_in_names_the_wait(mcp_http_server) -> None:
+    """BACK-4717: a /users/me 429 answers 429 with the wait, and a retry
+    inside the wait is answered without asking the platform again."""
+    first = await call_mcp_tool(
+        mcp_http_server["base_url"],
+        _LOCKED_OUT_TOKEN,
+        tool_name="manage_products",
+        arguments={"action": "list"},
+    )
+    second = await call_mcp_tool(
+        mcp_http_server["base_url"],
+        _LOCKED_OUT_TOKEN,
+        tool_name="manage_products",
+        arguments={"action": "list"},
+    )
+    users_me_calls = [
+        entry
+        for entry in mcp_http_server["httpserver"].log
+        if entry[0].path == "/profitstream/v2/api/users/me"
+    ]
+
+    assert first.status_code == 429, f"status={first.status_code} body={first.text!r}"
+    assert "42 seconds" in first.text
+    assert first.headers.get("retry-after") == "42"
+    assert second.status_code == 429, f"status={second.status_code} body={second.text!r}"
+    assert "seconds" in second.text
+    assert len(users_me_calls) == 1

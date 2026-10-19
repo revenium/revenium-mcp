@@ -17,6 +17,9 @@ Covers missed lines in BusinessAnalyticsManagement:
 - _format_api_error_details with ReveniumAPIError and generic exception
 """
 
+import re
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -25,6 +28,11 @@ from mcp.types import TextContent
 from src.revenium_mcp_server.tools_decomposed.business_analytics_management import (
     BusinessAnalyticsManagement,
 )
+from src.revenium_mcp_server.analytics.enhanced_spike_analyzer import (
+    EnhancedSpikeAnalyzer,
+    TemporalAnomaly,
+)
+from src.revenium_mcp_server.analytics.simple_cost_analyzer import PackRows
 from src.revenium_mcp_server.analytics.validation import ValidationError
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ToolError
@@ -191,9 +199,15 @@ class TestFormatApiErrorDetails:
     def test_formats_api_error_with_response_data_error_data(self, tool):
         err = ReveniumAPIError("forbidden")
         err.status_code = 403
-        err.response_data = {"error_data": "access denied"}
+        err.response_data = {
+            "error_data": {"timestamp": "2026-10-16T03:15:54Z", "path": "/profitstream/v2/api/x"}
+        }
         result = tool._format_api_error_details(err)
-        assert "access denied" in result
+        assert "**API Error**: forbidden" in result
+        assert "**HTTP Status**: 403" in result
+        assert "API Response" not in result
+        assert "'timestamp'" not in result
+        assert "'path'" not in result
 
     def test_formats_api_error_with_empty_error_data(self, tool):
         err = ReveniumAPIError("ok")
@@ -288,13 +302,15 @@ class TestHandleActionRouting:
 
     @pytest.mark.asyncio
     async def test_unsupported_action_get_cost_trends(self, _mock_engine_cls, _mock_analyzer_cls, tool):
-        result = await tool.handle_action("get_cost_trends", {})
-        assert "Not Supported" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool.handle_action("get_cost_trends", {})
+        assert "Not Supported" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_unsupported_action_unknown(self, _mock_engine_cls, _mock_analyzer_cls, tool):
-        result = await tool.handle_action("completely_unknown_action", {})
-        assert "Not Supported" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool.handle_action("completely_unknown_action", {})
+        assert "Not Supported" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_tool_error_inside_handle_action_is_reraised(self, _mock_engine_cls, _mock_analyzer_cls, tool):
@@ -338,22 +354,24 @@ class TestHandleGetCostSummary:
         assert mock_engine_cls.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_validation_error_returns_error_text(self, mock_engine_cls, tool):
+    async def test_validation_error_raises_error_text(self, mock_engine_cls, tool):
         mock_engine_cls.return_value.get_cost_summary = AsyncMock(
             side_effect=ValidationError("bad period", suggestions=["Use SEVEN_DAYS"])
         )
-        result = await tool._handle_get_cost_summary({})
-        assert "Validation Error" in result[0].text
-        assert "bad period" in result[0].text
-        assert "Use SEVEN_DAYS" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_cost_summary({})
+        assert "Validation Error" in exc.value.message
+        assert "bad period" in exc.value.message
+        assert "Use SEVEN_DAYS" in exc.value.message
 
     @pytest.mark.asyncio
-    async def test_generic_exception_returns_error_text(self, mock_engine_cls, tool):
+    async def test_generic_exception_raises_error_text(self, mock_engine_cls, tool):
         mock_engine_cls.return_value.get_cost_summary = AsyncMock(
             side_effect=RuntimeError("oops")
         )
-        result = await tool._handle_get_cost_summary({})
-        assert "Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_cost_summary({})
+        assert "Failed" in exc.value.message
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -367,17 +385,19 @@ class TestHandleGetProviderCosts:
         mock_engine_cls.return_value.get_provider_costs = AsyncMock(
             side_effect=ValidationError("invalid period", suggestions=["Try SEVEN_DAYS"])
         )
-        result = await tool._handle_get_provider_costs({})
-        assert "Provider Costs Validation Error" in result[0].text
-        assert "invalid period" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_provider_costs({})
+        assert "Provider Costs Validation Error" in exc.value.message
+        assert "invalid period" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_generic_exception_text(self, mock_engine_cls, tool):
         mock_engine_cls.return_value.get_provider_costs = AsyncMock(
             side_effect=RuntimeError("API failure")
         )
-        result = await tool._handle_get_provider_costs({})
-        assert "Provider Costs Analysis Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_provider_costs({})
+        assert "Provider Costs Analysis Failed" in exc.value.message
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -391,16 +411,18 @@ class TestHandleGetModelCosts:
         mock_engine_cls.return_value.get_model_costs = AsyncMock(
             side_effect=ValidationError("bad group", suggestions=["Use TOTAL"])
         )
-        result = await tool._handle_get_model_costs({})
-        assert "Model Costs Validation Error" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_model_costs({})
+        assert "Model Costs Validation Error" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_generic_exception_text(self, mock_engine_cls, tool):
         mock_engine_cls.return_value.get_model_costs = AsyncMock(
             side_effect=RuntimeError("crash")
         )
-        result = await tool._handle_get_model_costs({})
-        assert "Model Costs Analysis Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_model_costs({})
+        assert "Model Costs Analysis Failed" in exc.value.message
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -414,16 +436,18 @@ class TestHandleGetCustomerCosts:
         mock_engine_cls.return_value.get_customer_costs = AsyncMock(
             side_effect=ValidationError("missing param", suggestions=["add period"])
         )
-        result = await tool._handle_get_customer_costs({})
-        assert "Customer Costs Validation Error" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_customer_costs({})
+        assert "Customer Costs Validation Error" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_generic_exception_text(self, mock_engine_cls, tool):
         mock_engine_cls.return_value.get_customer_costs = AsyncMock(
             side_effect=Exception("error")
         )
-        result = await tool._handle_get_customer_costs({})
-        assert "Customer Costs Analysis Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_customer_costs({})
+        assert "Customer Costs Analysis Failed" in exc.value.message
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -437,16 +461,18 @@ class TestHandleGetApiKeyCosts:
         mock_engine_cls.return_value.get_api_key_costs = AsyncMock(
             side_effect=ValidationError("bad", suggestions=["fix it"])
         )
-        result = await tool._handle_get_api_key_costs({})
-        assert "API Key Costs Validation Error" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_api_key_costs({})
+        assert "API Key Costs Validation Error" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_generic_exception_text(self, mock_engine_cls, tool):
         mock_engine_cls.return_value.get_api_key_costs = AsyncMock(
             side_effect=Exception("down")
         )
-        result = await tool._handle_get_api_key_costs({})
-        assert "API Key Costs Analysis Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_api_key_costs({})
+        assert "API Key Costs Analysis Failed" in exc.value.message
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -460,16 +486,18 @@ class TestHandleGetAgentCosts:
         mock_engine_cls.return_value.get_agent_costs = AsyncMock(
             side_effect=ValidationError("bad", suggestions=["fix it"])
         )
-        result = await tool._handle_get_agent_costs({})
-        assert "Agent Costs Validation Error" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_agent_costs({})
+        assert "Agent Costs Validation Error" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_generic_exception_text(self, mock_engine_cls, tool):
         mock_engine_cls.return_value.get_agent_costs = AsyncMock(
             side_effect=Exception("down")
         )
-        result = await tool._handle_get_agent_costs({})
-        assert "Agent Costs Analysis Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_agent_costs({})
+        assert "Agent Costs Analysis Failed" in exc.value.message
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -489,59 +517,64 @@ class TestHandleAnalyzeCostAnomalies:
         assert "anomalies" in result[0].text
 
     @pytest.mark.asyncio
-    async def test_threshold_param_error_returns_guidance(self, mock_analyzer_cls, tool):
-        """Using 'threshold' instead of 'min_impact_threshold' returns error text with correct param name.
+    async def test_threshold_param_error_raises_guidance(self, mock_analyzer_cls, tool):
+        """Using 'threshold' instead of 'min_impact_threshold' raises with the correct param name.
 
-        create_structured_validation_error returns a ToolError (not ValidationError), so it is
-        caught by the outer `except Exception` handler in _handle_analyze_cost_anomalies, which
-        formats the ToolError message and includes 'min_impact_threshold' in the response body.
+        create_structured_validation_error returns a ToolError (not ValidationError), which
+        _handle_analyze_cost_anomalies lets through unchanged, so the caller reads the
+        refusal itself rather than a generic analysis failure wrapped around it.
         """
-        result = await tool._handle_analyze_cost_anomalies(
-            {"period": "SEVEN_DAYS", "threshold": 100.0}
-        )
-        assert "Cost Anomaly Analysis Failed" in result[0].text
-        assert "min_impact_threshold" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_analyze_cost_anomalies(
+                {"period": "SEVEN_DAYS", "threshold": 100.0}
+            )
+        assert "Analysis Failed" not in exc.value.message
+        assert "min_impact_threshold" in exc.value.message
 
     @pytest.mark.asyncio
-    async def test_breakdown_by_error_returns_error_text(self, mock_analyzer_cls, tool):
-        """Using 'breakdown_by' instead of 'include_dimensions' returns error text with correct param name.
+    async def test_breakdown_by_error_raises_error_text(self, mock_analyzer_cls, tool):
+        """Using 'breakdown_by' instead of 'include_dimensions' raises with the correct param name.
 
-        create_structured_validation_error returns a ToolError caught by `except Exception`,
-        and the ToolError message includes 'include_dimensions'.
+        create_structured_validation_error returns a ToolError that passes through unchanged,
+        and its message includes 'include_dimensions'.
         """
-        result = await tool._handle_analyze_cost_anomalies(
-            {"period": "SEVEN_DAYS", "breakdown_by": "providers"}
-        )
-        assert "Cost Anomaly Analysis Failed" in result[0].text
-        assert "include_dimensions" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_analyze_cost_anomalies(
+                {"period": "SEVEN_DAYS", "breakdown_by": "providers"}
+            )
+        assert "Analysis Failed" not in exc.value.message
+        assert "include_dimensions" in exc.value.message
 
     @pytest.mark.asyncio
-    async def test_missing_period_returns_error_text(self, mock_analyzer_cls, tool):
-        """Missing period returns error text explaining that period is required.
+    async def test_missing_period_raises_error_text(self, mock_analyzer_cls, tool):
+        """Missing period raises with text explaining that period is required.
 
-        create_structured_missing_parameter_error returns a ToolError caught by `except Exception`,
-        and the ToolError message includes 'period'.
+        create_structured_missing_parameter_error returns a ToolError that passes through
+        unchanged, and its message includes 'period'.
         """
-        result = await tool._handle_analyze_cost_anomalies({})
-        assert "Cost Anomaly Analysis Failed" in result[0].text
-        assert "period" in result[0].text.lower()
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_analyze_cost_anomalies({})
+        assert "Analysis Failed" not in exc.value.message
+        assert "period" in exc.value.message.lower()
 
     @pytest.mark.asyncio
-    async def test_validation_error_from_analyzer_returns_text(self, mock_analyzer_cls, tool):
+    async def test_validation_error_from_analyzer_raises_text(self, mock_analyzer_cls, tool):
         mock_analyzer_cls.return_value.analyze_temporal_anomalies = AsyncMock(
             side_effect=ValidationError("invalid sensitivity", suggestions=["use normal"])
         )
-        result = await tool._handle_analyze_cost_anomalies({"period": "SEVEN_DAYS"})
-        assert "Validation Error" in result[0].text
-        assert "invalid sensitivity" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_analyze_cost_anomalies({"period": "SEVEN_DAYS"})
+        assert "Validation Error" in exc.value.message
+        assert "invalid sensitivity" in exc.value.message
 
     @pytest.mark.asyncio
-    async def test_generic_exception_returns_error_text(self, mock_analyzer_cls, tool):
+    async def test_generic_exception_raises_error_text(self, mock_analyzer_cls, tool):
         mock_analyzer_cls.return_value.analyze_temporal_anomalies = AsyncMock(
             side_effect=RuntimeError("analyzer failed")
         )
-        result = await tool._handle_analyze_cost_anomalies({"period": "SEVEN_DAYS"})
-        assert "Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_analyze_cost_anomalies({"period": "SEVEN_DAYS"})
+        assert "Failed" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_defaults_applied_for_optional_params(self, mock_analyzer_cls, tool):
@@ -557,16 +590,17 @@ class TestHandleAnalyzeCostAnomalies:
 
     @pytest.mark.asyncio
     async def test_breakdown_by_none_value_handled(self, mock_analyzer_cls, tool):
-        """breakdown_by=None doesn't crash the dimension mapping and returns guidance text.
+        """breakdown_by=None doesn't crash the dimension mapping and raises with guidance text.
 
         Even when breakdown_by is None, the ToolError message still directs the user to
         use 'include_dimensions', confirming the None-safe branch ran without raising.
         """
-        result = await tool._handle_analyze_cost_anomalies(
-            {"period": "SEVEN_DAYS", "breakdown_by": None}
-        )
-        assert "Cost Anomaly Analysis Failed" in result[0].text
-        assert "include_dimensions" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_analyze_cost_anomalies(
+                {"period": "SEVEN_DAYS", "breakdown_by": None}
+            )
+        assert "Analysis Failed" not in exc.value.message
+        assert "include_dimensions" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_analyzer_created_per_request(self, mock_analyzer_cls, tool):
@@ -644,6 +678,7 @@ class TestFormatAnomalyResultsMarkdown:
                     "summary": "1 new agent",
                     "entities": [
                         {"entity_name": "NEW-BOT", "total_cost_impact": 50.0, "periods_active": 3},
+                        {"entity_name": "TINY-BOT", "total_cost_impact": 0.004, "periods_active": 1},
                     ],
                 },
             },
@@ -662,9 +697,72 @@ class TestFormatAnomalyResultsMarkdown:
         assert "**Anomalous time periods**: Monday, Wednesday" in out
         assert "## New Entities Detected" in out
         assert "NEW-BOT" in out
-        assert "$50.00 impact across 3 period(s)" in out
+        assert "$50.00 impact, active in 3 bucket(s)" in out
+        assert "**TINY-BOT**: $0.004 impact" in out
         assert "## Recommendations" in out
         assert "- Tag your credentials" in out
+
+    def test_percent_column_compares_with_the_same_normal_as_the_multiplier(self, fmt):
+        payload = {
+            "period_analyzed": "SEVEN_DAYS",
+            "sensitivity_used": "normal",
+            "total_anomalies_detected": 1,
+            "temporal_anomalies": [
+                {
+                    "entity_name": "CODEXCLI",
+                    "entity_type": "provider",
+                    "time_group_label": "Wednesday",
+                    "anomaly_value": 86.31,
+                    "normal_range_min": 0.0,
+                    "normal_range_max": 45.11,
+                    "z_score": 2.5,
+                    "severity_score": 23.5,
+                    "percentage_above_normal": 282.7,
+                },
+            ],
+        }
+        out = fmt(payload)
+        assert "| % vs Normal |" in out
+        assert "| % Above |" not in out
+
+    def test_the_answer_states_the_spike_as_its_cost_divided_by_normal(self, fmt):
+        analyzer = EnhancedSpikeAnalyzer(MagicMock())
+        analyzer.entity_dimension_map = {"CODEXCLI": "providers"}
+        spike = TemporalAnomaly(
+            entity_name="CODEXCLI", entity_type="provider",
+            time_group="2026-10-14T00:00:00.000Z", time_group_label="Wednesday",
+            anomaly_value=86.31, normal_range_min=0.0, normal_range_max=45.11,
+            z_score=2.5, severity_score=23.5, anomaly_type="entity_temporal",
+            context="test", percentage_above_normal=376.6,
+        )
+        out = fmt(analyzer._format_temporal_results([spike], "SEVEN_DAYS", "normal", ["providers"]))
+        assert "- **Cost multiplier**: 3.80" in out
+        assert "with 3.8x normal cost levels" in out
+        assert "| 282.7% |" in out
+
+    def test_partly_read_and_unread_reports_are_named_in_the_answer(self, fmt):
+        payload = {
+            "period_analyzed": "SEVEN_DAYS",
+            "sensitivity_used": "normal",
+            "total_anomalies_detected": 0,
+            "temporal_anomalies": [],
+            "entities_analyzed": {"providers": 1},
+            "dimensions_not_read": {"models": "HTTP 504: Gateway timeout"},
+            "dimensions_incomplete": {
+                "providers": "read 20 of 25 pages; buckets after 2026-10-13T23:59:59.999Z were not examined"
+            },
+        }
+        out = fmt(payload)
+        assert (
+            "> ⚠️ Not read, so not examined for anomalies: models (HTTP 504: Gateway timeout)"
+            in out
+        )
+        assert (
+            "> ⚠️ Partly read: providers: read 20 of 25 pages; buckets after "
+            "2026-10-13T23:59:59.999Z were not examined" in out
+        )
+        assert "- **models**: not read (HTTP 504: Gateway timeout)" in out
+        assert "- **providers**: 1" in out
 
     def test_pipe_in_entity_name_is_escaped(self, fmt):
         payload = {
@@ -727,9 +825,10 @@ class TestFormatAnomalyResultsMarkdown:
 class TestHandleUnsupportedActions:
     @pytest.mark.asyncio
     async def test_unsupported_action_message(self, tool):
-        result = await tool._handle_unsupported_action("mystery_action")
-        assert "mystery_action" in result[0].text
-        assert "Not Supported" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_unsupported_action("mystery_action")
+        assert "mystery_action" in exc.value.message
+        assert "Not Supported" in exc.value.message
 
 
 
@@ -800,9 +899,10 @@ class TestHandleGetUnpaidInvoiceTotals:
         mock_client.get_unpaid_invoice_totals = AsyncMock(side_effect=Exception("down"))
         tool.get_client = AsyncMock(return_value=mock_client)
 
-        result = await tool._handle_get_unpaid_invoice_totals({})
-        assert "Unpaid Invoice" in result[0].text
-        assert "Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_unpaid_invoice_totals({})
+        assert "Unpaid Invoice" in exc.value.message
+        assert "Failed" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_routed_via_handle_action(self, tool):
@@ -837,8 +937,9 @@ class TestHandleGetUnpaidInvoiceTotals:
         mock_client.get_unpaid_invoice_totals = AsyncMock(return_value=payload)
         tool.get_client = AsyncMock(return_value=mock_client)
 
-        result = await tool._handle_get_unpaid_invoice_totals({})
-        text = result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_unpaid_invoice_totals({})
+        text = exc.value.message
         assert "Failed" in text
         assert "None" not in text
         assert "Total outstanding**: 0" not in text
@@ -902,6 +1003,8 @@ class TestAnalyticsPackActions:
 
     def _mock_method(self, mock_cls, method_name, return_value):
         instance = MagicMock()
+        if isinstance(return_value, list):
+            return_value = PackRows(return_value)
         setattr(instance, method_name, AsyncMock(return_value=return_value))
         mock_cls.return_value = instance
         return instance
@@ -934,8 +1037,36 @@ class TestAnalyticsPackActions:
         instance = MagicMock()
         instance.get_task_costs = AsyncMock(side_effect=Exception("boom"))
         mock_cls.return_value = instance
-        result = await tool.handle_action("get_task_costs", {"period": "SEVEN_DAYS"})
-        assert "Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool.handle_action("get_task_costs", {"period": "SEVEN_DAYS"})
+        assert "Failed" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_single_metric_group_shows_the_value_alone(self, mock_cls, tool):
+        self._mock_method(mock_cls, "get_task_completion", [{
+            "group": "Tasks Completed", "label": "Tasks Completed",
+            "metricResult": 3457734, "metricType": "TASK_COMPLETION_AGGREGATED",
+        }])
+        result = await tool.handle_action(
+            "get_task_completion", {"period": "SEVEN_DAYS", "aggregation": "aggregated"}
+        )
+        assert "- **Tasks Completed**: 3,457,734" in result[0].text.split("\n")
+
+        self._mock_method(mock_cls, "get_vendor_costs", [{
+            "group": "anthropic", "label": "anthropic",
+            "metricResult": 2239.36, "metricType": "COST_METRIC_BY_VENDOR",
+        }])
+        result = await tool.handle_action("get_vendor_costs", {"period": "SEVEN_DAYS"})
+        assert "- **anthropic**: $2,239.36" in result[0].text.split("\n")
+
+        self._mock_method(mock_cls, "get_task_completion", [{
+            "group": "code-review", "label": "completed",
+            "metricResult": 12, "metricType": "TASK_COMPLETION_AGGREGATED",
+        }])
+        result = await tool.handle_action(
+            "get_task_completion", {"period": "SEVEN_DAYS", "aggregation": "aggregated"}
+        )
+        assert "- **code-review**: completed 12" in result[0].text.split("\n")
 
     # ── get_task_completion ───────────────────────────────────────────────
     @pytest.mark.asyncio
@@ -993,10 +1124,11 @@ class TestAnalyticsPackActions:
     @pytest.mark.asyncio
     async def test_profit_margins_invalid_dimension_rejected(self, mock_cls, tool):
         self._mock_method(mock_cls, "get_profit_margins", _AGG_ROWS)
-        result = await tool.handle_action(
-            "get_profit_margins", {"period": "THIRTY_DAYS", "dimension": "bogus"}
-        )
-        text = result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool.handle_action(
+                "get_profit_margins", {"period": "THIRTY_DAYS", "dimension": "bogus"}
+            )
+        text = exc.value.message
         assert "bogus" in text or "dimension" in text.lower()
         assert "customer" in text and "product" in text
 
@@ -1106,7 +1238,7 @@ class TestAnalyticsPackActions:
         result = await tool.handle_action("get_trace_cost_distribution", {"period": "SEVEN_DAYS"})
         assert "SEVEN_DAYS" in result[0].text
 
-    # ── overflow cap (>50 rows) ───────────────────────────────────────────
+    # ── overflow cap (>50 groups) ─────────────────────────────────────────
     @pytest.mark.asyncio
     async def test_aggregated_render_caps_at_50_rows(self, mock_cls, tool):
         rows = [
@@ -1116,10 +1248,131 @@ class TestAnalyticsPackActions:
         self._mock_method(mock_cls, "get_vendor_costs", rows)
         result = await tool.handle_action("get_vendor_costs", {"period": "SEVEN_DAYS"})
         text = result[0].text
-        # 50 rendered + overflow line naming the remaining 25
-        assert "g49" in text
-        assert "g50" not in text
-        assert "25 more" in text or "overflow" in text.lower() or "not shown" in text.lower()
+        # 50 costliest rendered, costliest first, + overflow line naming the remaining 25
+        bullets = [line for line in text.split("\n") if line.startswith("- **")]
+        assert len(bullets) == 50
+        assert bullets[0].startswith("- **g74**")
+        assert "**g25**" in text
+        assert "**g24**" not in text
+        assert "25 more vendors not shown" in text
+
+    @staticmethod
+    def _task_rows(costs_and_runs):
+        """Two platform-shaped rows per task: cost, then runs (None cost means no cost row)."""
+        rows = []
+        for name, cost, runs in costs_and_runs:
+            if cost is not None:
+                rows.append(
+                    {"group": name, "label": name, "metricResult": cost, "metricType": "COST_METRIC_BY_TASK"}
+                )
+            rows.append({"group": name, "label": name, "metricResult": runs, "metricType": "runs"})
+        return rows
+
+    @pytest.mark.asyncio
+    async def test_aggregated_task_costs_show_each_task_once_ranked_by_cost(self, mock_cls, tool):
+        rows = self._task_rows(
+            [
+                ("01-charter", 2105.76, 19259),
+                ("code-analysis", 9387.71, 500),
+                ("unknown", 29731.13, 1000),
+                ("zz-nocost", None, 40000),
+            ]
+        )
+        self._mock_method(mock_cls, "get_task_costs", rows)
+        result = await tool.handle_action(
+            "get_task_costs", {"period": "SEVEN_DAYS", "aggregation": "aggregated"}
+        )
+        text = result[0].text
+        bullets = [line for line in text.split("\n") if line.startswith("- **")]
+        assert len(bullets) == 4
+        assert [b.split("**")[1] for b in bullets] == [
+            "unknown", "code-analysis", "01-charter", "zz-nocost",
+        ]
+        assert "- **unknown**: cost $29,731.13, runs 1,000" in text.split("\n")
+
+    @pytest.mark.asyncio
+    async def test_aggregated_overflow_counts_hidden_tasks_not_lines(self, mock_cls, tool):
+        rows = self._task_rows([(f"t{i:02d}", float(i), 10) for i in range(60)])
+        self._mock_method(mock_cls, "get_task_costs", rows)
+        result = await tool.handle_action(
+            "get_task_costs", {"period": "SEVEN_DAYS", "aggregation": "aggregated"}
+        )
+        text = result[0].text
+        bullets = [line for line in text.split("\n") if line.startswith("- **")]
+        assert len(bullets) == 50
+        assert bullets[0].startswith("- **t59**")
+        assert "10 more tasks not shown" in text
+        assert "top 50 by cost" in text
+
+    @pytest.mark.asyncio
+    async def test_cost_ranked_list_without_any_cost_never_claims_a_top(self, mock_cls, tool):
+        rows = [
+            {"group": f"t{i:02d}", "label": f"t{i:02d}", "metricResult": 60 - i, "metricType": "runs"}
+            for i in range(60)
+        ]
+        self._mock_method(mock_cls, "get_task_costs", rows)
+        result = await tool.handle_action(
+            "get_task_costs", {"period": "SEVEN_DAYS", "aggregation": "aggregated"}
+        )
+        text = result[0].text
+        bullets = [line for line in text.split("\n") if line.startswith("- **")]
+        assert bullets[0].startswith("- **t00**")
+        assert "top" not in text.lower()
+        assert "showing the first 50 in the platform's order" in text
+
+    @pytest.mark.asyncio
+    async def test_unranked_aggregated_list_never_claims_a_top(self, mock_cls, tool):
+        rows = [
+            {"group": f"g{i}", "label": f"g{i}", "metricResult": float(60 - i), "metricType": "COUNT"}
+            for i in range(60)
+        ]
+        self._mock_method(mock_cls, "get_task_completion", rows)
+        result = await tool.handle_action(
+            "get_task_completion", {"period": "SEVEN_DAYS", "aggregation": "aggregated"}
+        )
+        text = result[0].text
+        assert "top" not in text.lower()
+        assert "showing the first 50" in text
+        bullets = [line for line in text.split("\n") if line.startswith("- **")]
+        assert bullets[0].startswith("- **g0**")
+
+    @pytest.mark.asyncio
+    async def test_top_movers_keep_platform_order(self, mock_cls, tool):
+        movers = [
+            {
+                "group": name,
+                "label": "cost",
+                "metricResult": value,
+                "metricType": "MONEY",
+                "currentValue": value,
+                "previousValue": 1.0,
+                "trend": "UP",
+            }
+            for name, value in (("small", 10.0), ("large", 500.0))
+        ]
+        self._mock_method(mock_cls, "get_top_movers", movers)
+        result = await tool.handle_action("get_top_movers", {"period": "THIRTY_DAYS"})
+        bullets = [line for line in result[0].text.split("\n") if line.startswith("- **")]
+        assert bullets[0].startswith("- **small**")
+        assert bullets[1].startswith("- **large**")
+
+    @pytest.mark.asyncio
+    async def test_scatter_points_never_claim_a_top(self, mock_cls, tool):
+        points = [
+            {
+                "transactionId": f"tx-{i}",
+                "agentName": "agent-a",
+                "totalCost": float(i),
+                "totalCalls": 5,
+                "distinctTools": 2,
+            }
+            for i in range(60)
+        ]
+        self._mock_method(mock_cls, "get_trace_cost_distribution", points)
+        result = await tool.handle_action("get_trace_cost_distribution", {"period": "SEVEN_DAYS"})
+        text = result[0].text
+        assert "10 more traces not shown" in text
+        assert "top" not in text.lower()
 
     # ── AuthenticationError re-raise ──────────────────────────────────────
     @pytest.mark.asyncio
@@ -1183,53 +1436,104 @@ class TestAnalyticsPackRenderingHardening:
 
     def test_scatter_missing_cost_renders_na(self, tool):
         text = tool._render_scatter_points(
-            [{"transactionId": "t1", "agentName": "a", "totalCalls": 1, "distinctTools": 1}],
+            PackRows([{"transactionId": "t1", "agentName": "a", "totalCalls": 1, "distinctTools": 1}]),
             period="SEVEN_DAYS",
         )
         assert "n/a" in text
         assert "None" not in text
 
-    def test_timeseries_no_orphan_header_on_truncation(self, tool):
+    def test_timeseries_renders_one_line_per_bucket_with_its_groups_side_by_side(self, tool):
         buckets = [
             {
-                "startTimestamp": f"2026-07-{d:02d}",
-                "endTimestamp": f"2026-07-{d:02d}",
+                "startTimestamp": "2026-07-01T00:00:00.000Z",
+                "endTimestamp": "2026-07-01T23:59:59.999Z",
                 "groups": [
-                    {"group": f"g{d}-{i}", "metrics": [{"label": "cost", "metricResult": 1.0, "metricType": "MONEY"}]}
-                    for i in range(30)
+                    {"group": f"g{i}", "metrics": [
+                        {"label": f"m{j}", "metricResult": 1.0, "metricType": None}
+                        for j in range(10)
+                    ]}
+                    for i in range(10)
                 ],
             }
-            for d in range(1, 4)
         ]
-        text = tool._render_timeseries_buckets(buckets, title="T", period="SEVEN_DAYS")
-        lines = text.split("\n")
-        # No header may be the last content line before the truncation notice
-        for i, line in enumerate(lines):
-            if line.startswith("**2026-07-"):
-                following = [l for l in lines[i+1:] if l.strip()]
-                assert following and (following[0].startswith("- ") or "(no data)" in following[0]), (
-                    f"orphan bucket header: {line!r}"
-                )
+        text = tool._render_timeseries_buckets(PackRows(buckets), title="T", period="SEVEN_DAYS")
+        bucket_lines = [line for line in text.split("\n") if line.startswith("- ")]
+        assert bucket_lines == [bucket_lines[0]]
+        assert bucket_lines[0].startswith("- **2026-07-01**: g0 (m0) 1, ")
+        assert bucket_lines[0].count(", ") == 99
 
-    def test_timeseries_cap_counts_rendered_lines(self, tool):
-        # One bucket, 10 groups × 10 metrics = 100 metric lines; cap is 50
-        buckets = [{
-            "startTimestamp": "2026-07-01", "endTimestamp": "2026-07-02",
-            "groups": [
-                {"group": f"g{i}", "metrics": [
-                    {"label": f"m{j}", "metricResult": 1.0, "metricType": None}
-                    for j in range(10)
-                ]}
-                for i in range(10)
-            ],
-        }]
-        text = tool._render_timeseries_buckets(buckets, title="T", period="SEVEN_DAYS")
-        metric_lines = [l for l in text.split("\n") if l.startswith("- ")]
-        assert len(metric_lines) <= tool._MAX_RENDERED_ROWS
+    def test_hourly_buckets_keep_their_times(self, tool):
+        """FRONT-3434: an EIGHT_HOURS series has several buckets on one date, so a
+        date-only label would hide which hour each figure belongs to."""
+        buckets = [
+            {
+                "startTimestamp": f"2026-10-09T{hour:02d}:00:00.000Z",
+                "endTimestamp": f"2026-10-09T{hour:02d}:59:59.999Z",
+                "groups": [{"group": "team-a", "metrics": [{"label": "team-a", "metricResult": 1.0}]}],
+            }
+            for hour in (10, 11, 12)
+        ]
+        text = tool._render_timeseries_buckets(PackRows(buckets), title="T", period="EIGHT_HOURS")
+        bucket_lines = [line for line in text.split("\n") if line.startswith("- ")]
+
+        assert len(bucket_lines) == 3
+        assert bucket_lines[0].startswith(
+            "- **2026-10-09T10:00:00.000Z → 2026-10-09T10:59:59.999Z**: team-a"
+        )
+        assert "- **2026-10-09**:" not in text
+
+    def test_timeseries_cap_counts_buckets(self, tool):
+        buckets = [
+            {"startTimestamp": f"day-{d}", "endTimestamp": f"day-{d}-end", "groups": []}
+            for d in range(tool._MAX_RENDERED_BUCKETS + 3)
+        ]
+        text = tool._render_timeseries_buckets(PackRows(buckets), title="T", period="TWELVE_MONTHS")
+        bucket_lines = [line for line in text.split("\n") if line.startswith("- ")]
+        assert len(bucket_lines) == tool._MAX_RENDERED_BUCKETS
+        assert "…and 3 more buckets not shown" in text
+
+    def test_timeseries_leaves_out_zero_entries_and_says_so(self, tool):
+        def group(name, value):
+            return {
+                "group": name,
+                "metrics": [{"label": name, "metricResult": value, "metricType": "MONEY"}],
+            }
+
+        buckets = [
+            {
+                "startTimestamp": "2026-07-01T00:00:00.000Z",
+                "endTimestamp": "2026-07-01T23:59:59.999Z",
+                "groups": [group("a", 1.5), group("b", 0.0), group("c", 0), group("d", 0.004)],
+            }
+        ]
+        text = tool._render_timeseries_buckets(PackRows(buckets), title="T", period="SEVEN_DAYS")
+        lines = text.split("\n")
+        assert "- **2026-07-01**: a $1.50, d $0.004" in lines
+        assert "_Entries at zero are left out._" in text
+
+    def test_timeseries_bucket_of_only_zeros_is_not_called_no_data(self, tool):
+        buckets = [
+            {
+                "startTimestamp": "2026-07-01T00:00:00.000Z",
+                "endTimestamp": "2026-07-01T23:59:59.999Z",
+                "groups": [
+                    {"group": "a", "metrics": [{"label": "a", "metricResult": 0.0, "metricType": "MONEY"}]}
+                ],
+            },
+            {
+                "startTimestamp": "2026-07-02T00:00:00.000Z",
+                "endTimestamp": "2026-07-02T23:59:59.999Z",
+                "groups": [],
+            },
+        ]
+        text = tool._render_timeseries_buckets(PackRows(buckets), title="T", period="SEVEN_DAYS")
+        bucket_lines = [line for line in text.split("\n") if line.startswith("- ")]
+        assert bucket_lines[0].endswith("nothing above zero")
+        assert bucket_lines[1].endswith("no data")
 
     def test_aggregated_row_includes_label_when_distinct(self, tool):
         text = tool._render_aggregated_rows(
-            [{"group": "Engineering", "label": "profit margin", "metricResult": 12.5, "metricType": "PERCENTAGE"}],
+            PackRows([{"group": "Engineering", "label": "profit margin", "metricResult": 12.5, "metricType": "PERCENTAGE"}]),
             title="T", period="SEVEN_DAYS", value_noun="rows",
         )
         assert "profit margin" in text
@@ -1238,7 +1542,7 @@ class TestAnalyticsPackRenderingHardening:
         """Contract failure: a non-numeric metricResult renders via the safe
         string path — no crash, no fabricated number."""
         text = tool._render_aggregated_rows(
-            [{"group": "openai", "metricResult": "not-a-number", "metricType": "MONEY"}],
+            PackRows([{"group": "openai", "metricResult": "not-a-number", "metricType": "MONEY"}]),
             title="T", period="SEVEN_DAYS", value_noun="rows",
         )
         assert "not-a-number" in text
@@ -1247,10 +1551,10 @@ class TestAnalyticsPackRenderingHardening:
     async def test_pack_handler_survives_malformed_analyzer_rows(self, tool):
         """The handler path renders malformed analyzer rows without crashing."""
         mock_analyzer = MagicMock()
-        mock_analyzer.get_vendor_costs = AsyncMock(return_value=[
+        mock_analyzer.get_vendor_costs = AsyncMock(return_value=PackRows([
             {"group": "openai", "metricResult": "not-a-number", "metricType": "MONEY"},
             {"group": "anthropic", "metricResult": None, "metricType": "MONEY"},
-        ])
+        ]))
         with patch(f"{_MOD}.SimpleCostAnalyzer", return_value=mock_analyzer):
             result = await tool._handle_get_vendor_costs({"period": "SEVEN_DAYS"})
         text = result[0].text
@@ -1305,7 +1609,7 @@ class TestHandleGetFilterOptions:
         assert "No values" in result[0].text
 
     @pytest.mark.asyncio
-    async def test_invalid_dimension_returns_validation_text(self, mock_engine_cls, tool):
+    async def test_invalid_dimension_raises_validation_text(self, mock_engine_cls, tool):
         mock_engine_cls.return_value.get_filter_options = AsyncMock(
             side_effect=ValidationError(
                 "Unknown filter dimension: 'widgets'",
@@ -1313,8 +1617,9 @@ class TestHandleGetFilterOptions:
                 suggestions=["Valid dimensions: agents, api-keys, models"],
             )
         )
-        result = await tool._handle_get_filter_options({"dimension": "widgets"})
-        text = result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_filter_options({"dimension": "widgets"})
+        text = exc.value.message
         assert "Validation Error" in text
         assert "widgets" in text
         assert "agents, api-keys, models" in text
@@ -1333,8 +1638,9 @@ class TestHandleGetFilterOptions:
         mock_engine_cls.return_value.get_filter_options = AsyncMock(
             side_effect=RuntimeError("down")
         )
-        result = await tool._handle_get_filter_options({"dimension": "models"})
-        assert "Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_filter_options({"dimension": "models"})
+        assert "Failed" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_routed_via_handle_action(self, mock_engine_cls, tool):
@@ -1377,11 +1683,12 @@ _INVOICE = {
 
 
 class TestHandleListInvoices:
-    def _client(self, items):
+    def _client(self, items, page=None):
         c = MagicMock()
-        c.get_invoices = AsyncMock(
-            return_value={"_embedded": {"invoiceResourceList": items}}
-        )
+        response = {"_embedded": {"invoiceResourceList": items}}
+        if page is not None:
+            response["page"] = page
+        c.get_invoices = AsyncMock(return_value=response)
         c._extract_embedded_data = MagicMock(return_value=items)
         return c
 
@@ -1393,8 +1700,8 @@ class TestHandleListInvoices:
         assert "INV-001" in text
         assert "FINALIZED" in text
         assert "UNPAID" in text
-        # money: fixed decimals trimmed, currency code printed (no symbol)
-        assert "1234.5 USD" in text
+        # money: two decimals, currency code printed (no symbol)
+        assert "1234.50 USD" in text
         assert "$" not in text
         # period rendered
         assert "2026-01-01" in text
@@ -1447,8 +1754,8 @@ class TestHandleListInvoices:
         assert kwargs["page"] == 1
         assert kwargs["size"] == 5
         assert kwargs["invoiceNumber"] == "INV-9"
-        assert kwargs["startDate"] == "2026-01-01"
-        assert kwargs["endDate"] == "2026-02-01"
+        assert kwargs["startDate"] == "2026-01-01T00:00:00.000Z"
+        assert kwargs["endDate"] == "2026-02-01T23:59:59.999Z"
         assert kwargs["payStates"] == ["UNPAID"]
         assert kwargs["states"] == ["FINALIZED"]
         assert kwargs["startingAmount"] == 10
@@ -1460,28 +1767,57 @@ class TestHandleListInvoices:
     async def test_unknown_filter_keys_not_forwarded(self, tool):
         client = self._client([])
         tool.get_client = AsyncMock(return_value=client)
-        await tool._handle_list_invoices({"bogus": "x", "action": "list_invoices"})
+        with pytest.raises(ToolError) as refusal:
+            await tool._handle_list_invoices({"bogus": "x", "action": "list_invoices"})
+        assert refusal.value.field == "bogus"
+        client.get_invoices.assert_not_awaited()
+
+        await tool._handle_list_invoices({"action": "list_invoices"})
         kwargs = client.get_invoices.call_args.kwargs
-        assert "bogus" not in kwargs
         assert "action" not in kwargs
 
     @pytest.mark.asyncio
-    async def test_overflow_cap_at_50(self, tool):
-        items = [dict(_INVOICE, invoiceNumber=f"INV-{i}") for i in range(60)]
-        tool.get_client = AsyncMock(return_value=self._client(items))
-        result = await tool._handle_list_invoices({})
+    async def test_every_row_of_a_full_page_is_printed_with_the_total_and_next_page(self, tool):
+        """size=100 printed 50 rows while page 1 starts at row 101, so rows
+        51 to 100 could never be reached."""
+        items = [dict(_INVOICE, invoiceNumber=f"INV-{i}") for i in range(100)]
+        page = {"number": 0, "size": 100, "totalElements": 148138, "totalPages": 1482}
+        tool.get_client = AsyncMock(return_value=self._client(items, page=page))
+        result = await tool._handle_list_invoices({"size": 100})
         text = result[0].text
-        assert "INV-49" in text
-        assert "INV-50" not in text
-        assert "10 more" in text
+        assert "INV-50 " in text
+        assert "INV-99 " in text
+        assert "more not shown" not in text
+        assert "Page 1 of 1482, 148138 invoices in all." in text
+        assert "Pass page=1 size=100 for the next page." in text
+
+    @pytest.mark.asyncio
+    async def test_last_page_has_no_next_page_call(self, tool):
+        page = {"number": 1481, "size": 100, "totalElements": 148138, "totalPages": 1482}
+        tool.get_client = AsyncMock(return_value=self._client([_INVOICE], page=page))
+        result = await tool._handle_list_invoices({"page": 1481, "size": 100})
+        text = result[0].text
+        assert "Page 1482 of 1482" in text
+        assert "for the next page" not in text
+
+    @pytest.mark.asyncio
+    async def test_page_past_the_last_names_the_total(self, tool):
+        page = {"number": 2000, "size": 100, "totalElements": 148138, "totalPages": 1482}
+        tool.get_client = AsyncMock(return_value=self._client([], page=page))
+        result = await tool._handle_list_invoices({"page": 2000, "size": 100})
+        text = result[0].text
+        assert "148138 invoices" in text
+        assert "past the last" in text
+        assert "No invoices found" not in text
 
     @pytest.mark.asyncio
     async def test_generic_exception_text(self, tool):
         client = MagicMock()
         client.get_invoices = AsyncMock(side_effect=Exception("boom"))
         tool.get_client = AsyncMock(return_value=client)
-        result = await tool._handle_list_invoices({})
-        assert "Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_list_invoices({})
+        assert "Failed" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_routed_via_handle_action(self, tool):
@@ -1504,12 +1840,44 @@ class TestHandleListInvoices:
 # list_refunds
 # ────────────────────────────────────────────────────────────────────────────
 
+_REFUND = {
+    "id": "3kTMd",
+    "amount": 125.5,
+    "currency": "USD",
+    "issuedDate": "2024-09-30T23:59:59Z",
+    "timestamp": "2024-09-15T12:00:00Z",
+    "created": "2024-09-01T00:00:00Z",
+    "label": "r-label",
+    "product": {"id": "p1", "label": "revvie-sdlc"},
+    "invoice": None,
+}
+
+
 class TestHandleListRefunds:
-    def _client(self, items):
+    def _client(self, items, page=None):
         c = MagicMock()
-        c.get_refunds = AsyncMock(return_value={"_embedded": {"refundResourceList": items}})
+        response = {"_embedded": {"refundResourceList": items}}
+        if page is not None:
+            response["page"] = page
+        c.get_refunds = AsyncMock(return_value=response)
         c._extract_embedded_data = MagicMock(return_value=items)
         return c
+
+    @pytest.mark.asyncio
+    async def test_refund_schema_fields_render_amount_issued_date_and_product(self, tool):
+        """A refund (RefundResource_Read) has amount, timestamp (when it was
+        issued), issuedDate (when it was applied to an invoice) and product,
+        not the invoice's totalAmount; no state column exists to print as n/a."""
+        tool.get_client = AsyncMock(return_value=self._client([_REFUND]))
+        result = await tool._handle_list_refunds({})
+        text = result[0].text
+        assert (
+            "- 3kTMd | 125.50 USD | issued 2024-09-15T12:00:00Z"
+            " | applied 2024-09-30T23:59:59Z | revvie-sdlc"
+        ) in text
+        assert "2024-09-01" not in text
+        assert "r-label" not in text
+        assert "n/a" not in text
 
     @pytest.mark.asyncio
     async def test_empty_state_message(self, tool):
@@ -1519,21 +1887,33 @@ class TestHandleListRefunds:
 
     @pytest.mark.asyncio
     async def test_success_renders_amount_with_currency(self, tool):
-        refund = {"totalAmount": 25, "currency": "USD", "state": "COMPLETE"}
+        refund = {"id": "r1", "amount": 25, "currency": "USD"}
         tool.get_client = AsyncMock(return_value=self._client([refund]))
         result = await tool._handle_list_refunds({})
         text = result[0].text
-        assert "25 USD" in text
+        assert "25.00 USD" in text
         assert "$" not in text
 
     @pytest.mark.asyncio
     async def test_null_amount_renders_na(self, tool):
-        refund = {"totalAmount": None, "currency": "USD"}
+        refund = {"id": "r1", "amount": None, "currency": "USD"}
         tool.get_client = AsyncMock(return_value=self._client([refund]))
         result = await tool._handle_list_refunds({})
         text = result[0].text
-        assert "n/a" in text
+        assert "- r1 | n/a | issued n/a | applied n/a | n/a" in text
+        assert " 0 USD" not in text
+        assert "0.0 USD" not in text
         assert "None" not in text
+
+    @pytest.mark.asyncio
+    async def test_every_row_of_a_full_page_is_printed_with_the_total(self, tool):
+        items = [dict(_REFUND, id=f"r{i}") for i in range(60)]
+        page = {"number": 0, "size": 60, "totalElements": 61, "totalPages": 2}
+        tool.get_client = AsyncMock(return_value=self._client(items, page=page))
+        result = await tool._handle_list_refunds({"size": 60})
+        text = result[0].text
+        assert "- r59 |" in text
+        assert "61 refunds in all." in text
 
     @pytest.mark.asyncio
     async def test_filter_mapping(self, tool):
@@ -1554,8 +1934,8 @@ class TestHandleListRefunds:
         assert kwargs["page"] == 2
         assert kwargs["size"] == 3
         assert kwargs["query"] == "acme"
-        assert kwargs["startDate"] == "2026-01-01"
-        assert kwargs["endDate"] == "2026-02-01"
+        assert kwargs["startDate"] == "2026-01-01T00:00:00.000Z"
+        assert kwargs["endDate"] == "2026-02-01T23:59:59.999Z"
         assert kwargs["minimum"] == 5
         assert kwargs["maximum"] == 50
 
@@ -1564,8 +1944,9 @@ class TestHandleListRefunds:
         client = MagicMock()
         client.get_refunds = AsyncMock(side_effect=Exception("boom"))
         tool.get_client = AsyncMock(return_value=client)
-        result = await tool._handle_list_refunds({})
-        assert "Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_list_refunds({})
+        assert "Failed" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_routed_via_handle_action(self, tool):
@@ -1597,12 +1978,100 @@ class TestHandleListPeriodCharges:
 
     @pytest.mark.asyncio
     async def test_success_renders_entries(self, tool):
-        charge = {"id": "pc_1", "label": "API calls", "transactionId": "tx_9"}
+        charge = {
+            "id": "pc_1",
+            "label": "tx_9",
+            "transactionId": "tx_9",
+            "charge": 1.5,
+            "currency": "USD",
+            "callCount": 3,
+            "type": "TRANSACTIONAL",
+            "chargeType": "CALL_COUNT_TRANSACTIONAL_CHARGE",
+            "product": {"id": "p1", "label": "API calls"},
+        }
         tool.get_client = AsyncMock(return_value=self._client([charge]))
         result = await tool._handle_list_period_charges({})
         text = result[0].text
         assert "pc_1" in text
+        assert "1.50 USD" in text
+        assert "3 calls" in text
         assert "API calls" in text
+
+    @pytest.mark.asyncio
+    async def test_line_shows_charge_calls_type_product_and_transaction_once(self, tool):
+        """The platform record holds the charge, currency, call count, both
+        types and the product; label repeats the transaction id."""
+        charge = {
+            "id": "Nj1ABBX",
+            "label": "d8a2e6d6-c8ee-48d7-851f-6d81d1ccc27d",
+            "charge": 0.2,
+            "currency": "USD",
+            "callCount": 1,
+            "type": "TRANSACTIONAL",
+            "chargeType": "CALL_COUNT_TRANSACTIONAL_CHARGE",
+            "resource": "tool:x:y",
+            "transactionId": "d8a2e6d6-c8ee-48d7-851f-6d81d1ccc27d",
+            "created": "2026-10-15T17:14:27.045Z",
+            "product": {"id": "p1", "label": "revvie-sdlc"},
+        }
+        tool.get_client = AsyncMock(return_value=self._client([charge]))
+        result = await tool._handle_list_period_charges({})
+        text = result[0].text
+        assert (
+            "- Nj1ABBX | 0.20 USD | 1 call | TRANSACTIONAL / CALL_COUNT_TRANSACTIONAL_CHARGE"
+            " | revvie-sdlc | tx=d8a2e6d6-c8ee-48d7-851f-6d81d1ccc27d | 2026-10-15T17:14:27.045Z"
+        ) in text
+        assert text.count("d8a2e6d6-c8ee-48d7-851f-6d81d1ccc27d") == 1
+        assert "tool:x:y" not in text
+
+    @pytest.mark.asyncio
+    async def test_sub_cent_charge_is_not_rendered_as_zero(self, tool):
+        charge = {"id": "pc_1", "transactionId": "tx_9", "charge": 0.004, "currency": "USD"}
+        tool.get_client = AsyncMock(return_value=self._client([charge]))
+        result = await tool._handle_list_period_charges({})
+        text = result[0].text
+        assert "0.004 USD" in text
+        assert "0 USD" not in text
+        assert "0.00 USD" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "amount,shown,hidden",
+        [
+            (0.23200000000000004, "| 0.232 USD |", "0.23200000000000004"),
+            (0.7999999999999999, "| 0.80 USD |", "0.7999"),
+            (1e-12, "| 0.000000000001 USD |", "0.00 USD"),
+            (1234.56789012345, "| 1234.56789012345 USD |", "1234.56789012 USD"),
+        ],
+    )
+    async def test_float_noise_in_a_charge_is_not_printed(self, tool, amount, shown, hidden):
+        charge = {"id": "EY199xX", "transactionId": "tx_9", "charge": amount, "currency": "USD"}
+        tool.get_client = AsyncMock(return_value=self._client([charge]))
+        text = (await tool._handle_list_period_charges({}))[0].text
+        assert shown in text
+        assert hidden not in text
+
+    @pytest.mark.asyncio
+    async def test_missing_charge_and_product_render_na_not_zero(self, tool):
+        """A missing charge, call count, type or product is n/a in its own
+        column, never a zero."""
+        charge = {"id": "pc_1", "transactionId": "tx_9", "charge": None, "currency": "USD"}
+        tool.get_client = AsyncMock(return_value=self._client([charge]))
+        result = await tool._handle_list_period_charges({})
+        text = result[0].text
+        assert "- pc_1 | n/a | n/a calls | n/a / n/a | n/a | tx=tx_9 | n/a" in text
+        assert " 0 USD" not in text
+        assert "0.0 USD" not in text
+        assert "None" not in text
+
+    @pytest.mark.asyncio
+    async def test_charge_below_a_billionth_is_not_rendered_as_zero(self, tool):
+        charge = {"id": "pc_1", "transactionId": "tx_9", "charge": 0.0000000005, "currency": "USD"}
+        tool.get_client = AsyncMock(return_value=self._client([charge]))
+        result = await tool._handle_list_period_charges({})
+        text = result[0].text
+        assert "0.0000000005 USD" in text
+        assert "0.00 USD" not in text
 
     @pytest.mark.asyncio
     async def test_empty_state_message(self, tool):
@@ -1620,6 +2089,18 @@ class TestHandleListPeriodCharges:
         text = result[0].text
         assert "More available" in text
         assert "cursor='NEXT-CUR'" in text
+
+    @pytest.mark.asyncio
+    async def test_every_row_of_the_page_is_printed_before_the_cursor_line(self, tool):
+        charges = [{"id": f"pc_{i}", "transactionId": f"tx_{i}"} for i in range(60)]
+        tool.get_client = AsyncMock(
+            return_value=self._client(charges, has_more=True, cursor="NEXT")
+        )
+        result = await tool._handle_list_period_charges({"size": 60})
+        text = result[0].text
+        assert "- pc_59 |" in text
+        assert "not shown" not in text
+        assert "cursor='NEXT'" in text
 
     @pytest.mark.asyncio
     async def test_no_continuation_line_when_not_has_more(self, tool):
@@ -1641,14 +2122,14 @@ class TestHandleListPeriodCharges:
                 "end_date": "2026-02-01",
                 "cursor": "CUR-1",
                 "size": 7,
-                "page": 3,  # must be ignored, never forwarded
+                "page": 0,  # the first page is accepted, never forwarded
             }
         )
         kwargs = client.get_period_charges.call_args.kwargs
         assert kwargs["size"] == 7
         assert kwargs["invoiceId"] == "inv_1"
-        assert kwargs["startDate"] == "2026-01-01"
-        assert kwargs["endDate"] == "2026-02-01"
+        assert kwargs["startDate"] == "2026-01-01T00:00:00.000Z"
+        assert kwargs["endDate"] == "2026-02-01T23:59:59.999Z"
         assert kwargs["cursor"] == "CUR-1"
         assert "page" not in kwargs
 
@@ -1657,8 +2138,9 @@ class TestHandleListPeriodCharges:
         client = MagicMock()
         client.get_period_charges = AsyncMock(side_effect=Exception("boom"))
         tool.get_client = AsyncMock(return_value=client)
-        result = await tool._handle_list_period_charges({})
-        assert "Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_list_period_charges({})
+        assert "Failed" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_routed_via_handle_action(self, tool):
@@ -1793,12 +2275,12 @@ class TestHandleListSkills:
         assert "action" not in kwargs
 
     @pytest.mark.asyncio
-    async def test_total_elements_rendered_in_header(self, tool):
-        tool.get_client = AsyncMock(
-            return_value=self._client([_SKILL], {"totalElements": 137})
-        )
-        result = await tool._handle_list_skills({})
-        assert "137 total" in result[0].text
+    async def test_total_elements_rendered_once_in_the_footer(self, tool):
+        page_info = {"number": 0, "size": 20, "totalElements": 137, "totalPages": 7}
+        tool.get_client = AsyncMock(return_value=self._client([_SKILL], page_info))
+        text = (await tool._handle_list_skills({}))[0].text
+        assert "Page 1 of 7, 137 skills in all." in text
+        assert "137 total" not in text
 
     @pytest.mark.asyncio
     async def test_null_cost_and_counts_render_na_not_zero(self, tool):
@@ -1817,13 +2299,16 @@ class TestHandleListSkills:
         assert "No skills" in result[0].text
 
     @pytest.mark.asyncio
-    async def test_overflow_cap_at_50(self, tool):
-        items = [dict(_SKILL, name=f"skill-{i}") for i in range(60)]
-        tool.get_client = AsyncMock(return_value=self._client(items))
-        text = (await tool._handle_list_skills({}))[0].text
-        assert "skill-49" in text
-        assert "skill-50 " not in text
-        assert "10 more" in text
+    async def test_every_row_of_a_full_page_is_printed_with_the_next_page(self, tool):
+        items = [dict(_SKILL, name=f"skill-{i}") for i in range(100)]
+        page_info = {"number": 0, "size": 100, "totalElements": 300, "totalPages": 3}
+        tool.get_client = AsyncMock(return_value=self._client(items, page_info))
+        text = (await tool._handle_list_skills({"size": 100}))[0].text
+        assert "- skill-99 " in text
+        assert "more not shown" not in text
+        assert "Page 1 of 3, 300 skills in all." in text
+        assert "Pass page=1 size=100 for the next page." in text
+        assert text.splitlines()[0] == "**Skills by Cost**"
 
     @pytest.mark.asyncio
     async def test_invalid_period_raises_structured_error(self, tool):
@@ -1861,8 +2346,9 @@ class TestHandleListSkills:
         client = MagicMock()
         client.get_skills = AsyncMock(side_effect=Exception("boom"))
         tool.get_client = AsyncMock(return_value=client)
-        result = await tool._handle_list_skills({})
-        assert "Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_list_skills({})
+        assert "Failed" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_routed_via_handle_action(self, tool):
@@ -1952,8 +2438,9 @@ class TestHandleGetSkill:
         client = MagicMock()
         client.get_skill_by_id = AsyncMock(side_effect=Exception("boom"))
         tool.get_client = AsyncMock(return_value=client)
-        result = await tool._handle_get_skill({"skill_id": "JMwX9g4"})
-        assert "Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_skill({"skill_id": "JMwX9g4"})
+        assert "Failed" in exc.value.message
 
     @pytest.mark.asyncio
     async def test_routed_via_handle_action(self, tool):
@@ -2007,7 +2494,9 @@ class TestSkillApiFeatureGate:
     @pytest.mark.asyncio
     async def test_list_skills_403_names_the_feature_flag(self, tool):
         tool.get_client = AsyncMock(return_value=self._gated_client("get_skills"))
-        text = (await tool._handle_list_skills({}))[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_list_skills({})
+        text = exc.value.message
         assert "skill-attribution" in text
         assert "feature flag" in text
         assert "enable it for this team" in text
@@ -2015,7 +2504,9 @@ class TestSkillApiFeatureGate:
     @pytest.mark.asyncio
     async def test_get_skill_403_names_the_feature_flag(self, tool):
         tool.get_client = AsyncMock(return_value=self._gated_client("get_skill_by_id"))
-        text = (await tool._handle_get_skill({"skill_id": "JMwX9g4"}))[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_get_skill({"skill_id": "JMwX9g4"})
+        text = exc.value.message
         assert "skill-attribution" in text
         assert "feature flag" in text
         assert "enable it for this team" in text
@@ -2024,14 +2515,18 @@ class TestSkillApiFeatureGate:
     async def test_403_does_not_blame_request_parameters(self, tool):
         """The old generic text sent callers chasing page/size/period/sort."""
         tool.get_client = AsyncMock(return_value=self._gated_client("get_skills"))
-        text = (await tool._handle_list_skills({}))[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_list_skills({})
+        text = exc.value.message
         assert "Optional parameters: page, size, period, sort" not in text
         assert "Supported periods:" not in text
 
     @pytest.mark.asyncio
     async def test_403_keeps_the_api_status_visible(self, tool):
         tool.get_client = AsyncMock(return_value=self._gated_client("get_skills"))
-        text = (await tool._handle_list_skills({}))[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_list_skills({})
+        text = exc.value.message
         assert "403" in text
 
     @pytest.mark.asyncio
@@ -2041,8 +2536,8 @@ class TestSkillApiFeatureGate:
         assert not tool._is_skill_api_gated(Exception("403"))
 
 
-class TestGetSkillNotFoundIsEmptyPeriod:
-    """A known skill with no usage in the window answers 404, not an empty body."""
+class TestGetSkillNotFoundIsAmbiguous:
+    """A 404 is either an empty window or an id that is not a skill of this team."""
 
     def _missing_client(self):
         c = MagicMock()
@@ -2077,10 +2572,49 @@ class TestGetSkillNotFoundIsEmptyPeriod:
         assert "THIRTY_DAYS" in text
 
     @pytest.mark.asyncio
-    async def test_404_does_not_blame_the_skill_id(self, tool):
+    async def test_404_does_not_use_the_failure_guidance(self, tool):
         tool.get_client = AsyncMock(return_value=self._missing_client())
         text = (await tool._handle_get_skill({"skill_id": "JMwX9g4"}))[0].text
         assert "`skill_id` is required" not in text
+
+    @pytest.mark.asyncio
+    async def test_404_says_the_id_may_not_name_a_skill_and_points_to_list_skills(self, tool):
+        tool.get_client = AsyncMock(return_value=self._missing_client())
+        text = (await tool._handle_get_skill(
+            {"skill_id": "5jgY4G", "period": "THIRTY_DAYS"}
+        ))[0].text
+        assert "may not name a skill of this team" in text
+        assert "`list_skills` to confirm" in text
+        assert "Failed" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("period", BusinessAnalyticsManagement._SKILL_PERIODS)
+    async def test_404_never_suggests_the_period_used_or_a_narrower_one(self, tool, period):
+        periods = BusinessAnalyticsManagement._SKILL_PERIODS
+        tool.get_client = AsyncMock(return_value=self._missing_client())
+        text = (await tool._handle_get_skill(
+            {"skill_id": "JMwX9g4", "period": period}
+        ))[0].text
+        wider_lines = [line for line in text.splitlines() if "wider period" in line]
+        if period == periods[-1]:
+            assert wider_lines == []
+            assert "is the widest period" in text
+            return
+        assert len(wider_lines) == 1
+        # Whole tokens, because HOUR is inside EIGHT_HOURS.
+        offered = set(re.findall(r"[A-Z_]{4,}", wider_lines[0]))
+        assert offered
+        assert offered.isdisjoint(periods[: periods.index(period) + 1])
+
+    @pytest.mark.asyncio
+    async def test_404_without_a_period_suggests_periods_wider_than_thirty_days(self, tool):
+        tool.get_client = AsyncMock(return_value=self._missing_client())
+        text = (await tool._handle_get_skill({"skill_id": "JMwX9g4"}))[0].text
+        wider_lines = [line for line in text.splitlines() if "wider period" in line]
+        assert len(wider_lines) == 1
+        assert "NINETY_DAYS" in wider_lines[0]
+        assert "SIX_MONTHS" in wider_lines[0]
+        assert "THIRTY_DAYS" not in wider_lines[0]
 
     @pytest.mark.asyncio
     async def test_genuine_failures_still_use_the_failure_path(self, tool):
@@ -2090,7 +2624,9 @@ class TestGetSkillNotFoundIsEmptyPeriod:
                 side_effect=ReveniumAPIError("nope", status_code=status)
             )
             tool.get_client = AsyncMock(return_value=client)
-            text = (await tool._handle_get_skill({"skill_id": "JMwX9g4"}))[0].text
+            with pytest.raises(ToolError) as exc:
+                await tool._handle_get_skill({"skill_id": "JMwX9g4"})
+            text = exc.value.message
             assert "Get Skill Failed" in text, status
 
     @pytest.mark.asyncio
@@ -2101,7 +2637,9 @@ class TestGetSkillNotFoundIsEmptyPeriod:
             side_effect=ReveniumAPIError("Not Found", status_code=404)
         )
         tool.get_client = AsyncMock(return_value=client)
-        text = (await tool._handle_list_skills({}))[0].text
+        with pytest.raises(ToolError) as exc:
+            await tool._handle_list_skills({})
+        text = exc.value.message
         assert "List Skills Failed" in text
 
 
@@ -2127,3 +2665,618 @@ class TestPeriodChargesCursorHint:
         text = result[0].text
         assert "cursor='None'" not in text
         assert "more" in text.lower()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# analyze_cost_anomalies when a dimension report cannot be read
+# ────────────────────────────────────────────────────────────────────────────
+
+class _AnomalyReports:
+    """Legacy dimension reports: 12 codexcli buckets with one spike, or a 504 for the named paths."""
+
+    def __init__(self, failing=()):
+        self.team_id = "team-1"
+        self.failing = failing
+
+    async def get(self, path, params=None, **kwargs):
+        if any(fragment in path for fragment in self.failing):
+            raise ReveniumAPIError("Gateway timeout", status_code=504)
+        costs = [20.0] * 12
+        costs[5] = 900.0
+        return [
+            {
+                "startTimestamp": f"2026-10-{day + 1:02d}T00:00:00.000Z",
+                "groups": [{"groupName": "codexcli", "metrics": [{"metricResult": cost}]}],
+            }
+            for day, cost in enumerate(costs)
+        ]
+
+
+class TestAnomalyAnswerWhenAReportFails:
+    """A report that could not be read is named in the answer, never counted as zero."""
+
+    async def _answer(self, tool, monkeypatch, dimensions, failing=()):
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+        tool.get_client = AsyncMock(return_value=_AnomalyReports(failing))
+        result = await tool._handle_analyze_cost_anomalies(
+            {"period": "SEVEN_DAYS", "include_dimensions": dimensions}
+        )
+        return result[0].text
+
+    @pytest.mark.asyncio
+    async def test_a_dimension_report_that_failed_is_named_not_read_in_the_answer(
+        self, tool, monkeypatch
+    ):
+        out = await self._answer(
+            tool, monkeypatch, ["providers", "models"], failing=("total-cost-by-model",)
+        )
+        assert "- **models**: not read (HTTP 504: Gateway timeout)" in out
+        assert "- **models**: 0" not in out
+        assert "- **providers**: 1" in out
+        assert "**Total anomalies detected:** 1" in out
+
+    @pytest.mark.asyncio
+    async def test_every_dimension_failing_is_an_error_not_zero_anomalies(self, tool, monkeypatch):
+        with pytest.raises(ToolError) as exc:
+            await self._answer(
+                tool,
+                monkeypatch,
+                ["providers", "models"],
+                failing=("total-cost-by-provider-over-time", "total-cost-by-model"),
+            )
+        out = exc.value.message
+        assert "Cost Anomaly Analysis Failed" in out
+        assert "providers: HTTP 504: Gateway timeout" in out
+        assert "models: HTTP 504: Gateway timeout" in out
+        assert "Total anomalies detected" not in out
+
+    @pytest.mark.asyncio
+    async def test_an_unsupported_dimension_is_named_not_read(self, tool, monkeypatch):
+        out = await self._answer(tool, monkeypatch, ["providers", "widgets"])
+        assert (
+            "- **widgets**: not read (not a supported dimension "
+            "(providers, models, api_keys, agents, customers, tokens))" in out
+        )
+        assert "- **providers**: 1" in out
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# analyze_cost_anomalies new-entity detection
+# ────────────────────────────────────────────────────────────────────────────
+
+_DIMENSION_PATHS = {
+    "total-cost-by-provider-over-time": "providers",
+    "cost-metrics-by-agents-over-time": "agents",
+    "cost-metrics-by-subscriber-credential": "api_keys",
+}
+
+
+def _months_from(year, month, count):
+    starts = []
+    for offset in range(count):
+        index = month - 1 + offset
+        starts.append(datetime(year + index // 12, index % 12 + 1, 1, tzinfo=timezone.utc))
+    return starts
+
+
+def _bucket_starts(period):
+    """The bucket starts the legacy report answers for each period."""
+    if period == "SEVEN_DAYS":
+        first = datetime(2026, 10, 3, tzinfo=timezone.utc)
+        return [first + timedelta(hours=12 * index) for index in range(14)]
+    if period == "THIRTY_DAYS":
+        first = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        return [first + timedelta(days=index) for index in range(30)]
+    if period == "TWELVE_MONTHS":
+        return _months_from(2025, 11, 12)
+    if period == "TWENTY_FOUR_HOURS":
+        first = datetime(2026, 10, 16, tzinfo=timezone.utc)
+        return [first + timedelta(hours=index) for index in range(24)]
+    if period == "EIGHT_HOURS":
+        first = datetime(2026, 10, 16, 8, tzinfo=timezone.utc)
+        return [first + timedelta(hours=index) for index in range(8)]
+    first = datetime(2026, 10, 16, 15, tzinfo=timezone.utc)
+    return [first + timedelta(minutes=15 * index) for index in range(4)]
+
+
+class _NewEntityReports:
+    """Legacy over-time reports answered by period, recording each (path, period) read.
+
+    ``costs`` maps (dimension, period) to {group name: one cost per bucket}, where
+    None leaves the group out of that bucket. A report not named answers openai
+    at $20 in every bucket. ``starts`` maps a period, or a (dimension, period),
+    to the bucket starts that report answers.
+    """
+
+    def __init__(self, costs=None, failing=(), starts=None, epoch_ms=False, reverse=False):
+        self.team_id = "team-1"
+        self.costs = costs or {}
+        self.failing = set(failing)
+        self.starts = starts or {}
+        self.epoch_ms = epoch_ms
+        self.reverse = reverse
+        self.calls = []
+
+    def _stamp(self, start):
+        if self.epoch_ms:
+            return int(start.timestamp() * 1000)
+        return f"{start:%Y-%m-%dT%H:%M:%S}.000Z"
+
+    async def get(self, path, params=None, **kwargs):
+        period = (params or {}).get("period")
+        self.calls.append((path, period))
+        dimension = next(name for fragment, name in _DIMENSION_PATHS.items() if fragment in path)
+        if (dimension, period) in self.failing:
+            raise ReveniumAPIError("Gateway timeout", status_code=504)
+        starts = self.starts.get(
+            (dimension, period), self.starts.get(period, _bucket_starts(period))
+        )
+        costs = self.costs.get((dimension, period), {"openai": [20.0] * len(starts)})
+        buckets = [
+            {
+                "startTimestamp": self._stamp(start),
+                "groups": [
+                    {"groupName": name, "metrics": [{"metricResult": series[index]}]}
+                    for name, series in costs.items()
+                    if series[index] is not None
+                ],
+            }
+            for index, start in enumerate(starts)
+        ]
+        if self.reverse:
+            buckets.reverse()
+        return buckets
+
+
+def _gap_provider_week():
+    """openai misses one baseline and one recent bucket; newprov has cost in buckets 9, 10 and 12."""
+    openai = [20.0] * 14
+    openai[1] = None
+    openai[11] = None
+    newprov = [None] * 9 + [50.0, 50.0, None, 50.0, None]
+    return {("providers", "SEVEN_DAYS"): {"openai": openai, "newprov": newprov}}
+
+
+def _section(answer):
+    """The New Entities part of the answer, up to the next top-level section."""
+    assert "## New Entities" in answer, answer
+    start = answer.index("## New Entities")
+    end = answer.find("\n## ", start + 1)
+    return answer[start:] if end == -1 else answer[start:end]
+
+
+async def _registered_answer(monkeypatch, reports, arguments):
+    """The answer the registered business_analytics_management tool gives, strings and all."""
+    from fastmcp import Client, FastMCP
+
+    from src.revenium_mcp_server.config_store import get_config_store
+    from src.revenium_mcp_server.introspection.integration import introspection_integration
+    from src.revenium_mcp_server.introspection.registry import IntrospectionRegistry
+    from src.revenium_mcp_server.tool_configuration.config import ToolConfig
+    from src.revenium_mcp_server.tool_configuration.registry import ToolConfigurationRegistry
+
+    store = get_config_store()
+    monkeypatch.setattr(store, "_discovered_configs", {})
+    monkeypatch.setattr(store, "_discovery_attempted", {store._DEFAULT_TENANT})
+    monkeypatch.setattr(introspection_integration.engine, "registry", IntrospectionRegistry())
+    monkeypatch.setattr(
+        BusinessAnalyticsManagement, "get_client", AsyncMock(return_value=reports)
+    )
+    mcp = FastMCP("new-entity-detection-test")
+    registry = ToolConfigurationRegistry(
+        tool_config=ToolConfig.create_for_testing(profile="business")
+    )
+    await registry._register_business_analytics_management(mcp)
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "business_analytics_management", arguments, raise_on_error=False
+        )
+    return "\n".join(getattr(block, "text", "") for block in result.content)
+
+
+class TestNewEntityDetectionAnswer:
+    """New-entity detection reports what appeared, when, and which window it compared."""
+
+    async def _answer(self, tool, monkeypatch, reports, period, **arguments):
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+        tool.get_client = AsyncMock(return_value=reports)
+        result = await tool._handle_analyze_cost_anomalies(
+            {"period": period, "detect_new_entities": True, **arguments}
+        )
+        return result[0].text
+
+    @pytest.mark.asyncio
+    async def test_a_provider_absent_from_the_baseline_is_reported_as_new_with_its_first_bucket_date(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+        reports = _NewEntityReports(_gap_provider_week())
+
+        answer = await _registered_answer(
+            monkeypatch,
+            reports,
+            {
+                "action": "analyze_cost_anomalies",
+                "period": "SEVEN_DAYS",
+                "detect_new_entities": "true",
+                "min_new_entity_threshold": "0",
+            },
+        )
+
+        section = _section(answer)
+        assert "**NEWPROV** (new)" in section
+        assert "first active 2026-10-07" in section
+        assert "active in 3 of 10 recent buckets" in section
+        assert "the 4 buckets starting 2026-10-03 00:00 UTC to 2026-10-04 12:00 UTC" in section
+        assert "no cost from 2026-10-03 00:00 UTC to 2026-10-04 12:00 UTC" in section
+        assert "OPENAI" not in section
+
+    @pytest.mark.asyncio
+    async def test_a_provider_dormant_in_the_baseline_is_reported_as_activated(
+        self, tool, monkeypatch
+    ):
+        zeroprov = [5.0] + [0.0] * 8 + [30.0] * 5
+        reports = _NewEntityReports(
+            {("providers", "SEVEN_DAYS"): {"openai": [20.0] * 14, "zeroprov": zeroprov}}
+        )
+
+        section = _section(await self._answer(tool, monkeypatch, reports, "SEVEN_DAYS"))
+
+        assert "**ZEROPROV** (activated)" in section
+        assert "**ZEROPROV** (new)" not in section
+        assert "first active 2026-10-07" in section
+        assert "no cost in 3 of 4 baseline buckets" in section
+
+    @pytest.mark.asyncio
+    async def test_twelve_months_reports_a_provider_new_in_the_monthly_buckets(
+        self, tool, monkeypatch
+    ):
+        reports = _NewEntityReports(
+            {
+                ("providers", "TWELVE_MONTHS"): {
+                    "openai": [20.0] * 12,
+                    "newprov": [None] * 8 + [40.0] * 4,
+                }
+            }
+        )
+
+        section = _section(await self._answer(tool, monkeypatch, reports, "TWELVE_MONTHS"))
+
+        assert "**NEWPROV** (new)" in section
+        assert "first active 2026-07-01" in section
+        assert "the 1 bucket starting 2025-11-01" in section
+        assert "the 11 buckets starting 2025-12-01 to 2026-10-01" in section
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("period", ["HOUR", "EIGHT_HOURS", "TWENTY_FOUR_HOURS"])
+    async def test_a_short_window_reads_seven_days_for_new_entity_detection(
+        self, tool, monkeypatch, period
+    ):
+        hourly = len(_bucket_starts(period))
+        reports = _NewEntityReports(
+            {
+                ("providers", period): {
+                    "openai": [20.0] * hourly,
+                    "hourprov": [None] + [10.0] * (hourly - 1),
+                },
+                ("providers", "SEVEN_DAYS"): {
+                    "openai": [20.0] * 14,
+                    "hourprov": [10.0] * 14,
+                    "newprov": [None] * 9 + [50.0] * 5,
+                },
+            }
+        )
+
+        answer = await self._answer(tool, monkeypatch, reports, period)
+
+        assert [called_period for _, called_period in reports.calls] == [period, "SEVEN_DAYS"]
+        header = answer.splitlines()[0]
+        assert header.startswith("# Cost Anomaly Analysis") and header.endswith(period)
+        assert (
+            f"New-entity detection read SEVEN_DAYS of data (the 14 buckets starting "
+            f"2026-10-03 00:00 UTC to 2026-10-09 12:00 UTC), because {period} is too short"
+        ) in answer
+        section = _section(answer)
+        assert "**NEWPROV** (new)" in section
+        assert "HOURPROV" not in section
+        assert "2026-10-16" not in section
+
+    @pytest.mark.asyncio
+    async def test_a_short_window_without_detection_sends_one_request(self, tool, monkeypatch):
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+        reports = _NewEntityReports()
+        tool.get_client = AsyncMock(return_value=reports)
+
+        result = await tool._handle_analyze_cost_anomalies({"period": "TWENTY_FOUR_HOURS"})
+
+        assert [called_period for _, called_period in reports.calls] == ["TWENTY_FOUR_HOURS"]
+        assert "SEVEN_DAYS" not in result[0].text
+        assert "New Entities" not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_detection_that_finds_nothing_says_so(self, tool, monkeypatch):
+        reports = _NewEntityReports(
+            {("providers", "SEVEN_DAYS"): {"openai": [20.0] * 14, "zeroall": [0.0] * 14}}
+        )
+
+        section = _section(await self._answer(tool, monkeypatch, reports, "SEVEN_DAYS"))
+
+        sentence = next(line for line in section.splitlines() if line.startswith("No new"))
+        assert sentence.startswith("No new provider appeared")
+        assert "agent" not in sentence
+        assert "the 10 buckets starting 2026-10-05 00:00 UTC to 2026-10-09 12:00 UTC" in sentence
+        assert "the 4 buckets starting 2026-10-03 00:00 UTC to 2026-10-04 12:00 UTC" in sentence
+        assert "ZEROALL" not in section
+
+    @pytest.mark.asyncio
+    async def test_a_failed_seven_day_read_is_named_and_anomalies_still_render(
+        self, tool, monkeypatch
+    ):
+        reports = _NewEntityReports(failing={("providers", "SEVEN_DAYS")})
+
+        answer = await self._answer(tool, monkeypatch, reports, "TWENTY_FOUR_HOURS")
+
+        assert "**Total anomalies detected:** 0" in answer
+        assert (
+            "New-entity detection could not run: the SEVEN_DAYS read it needs failed: "
+            "providers (HTTP 504: Gateway timeout)"
+        ) in _section(answer)
+
+    @pytest.mark.asyncio
+    async def test_a_seven_day_read_failing_for_agents_only_is_named(self, tool, monkeypatch):
+        reports = _NewEntityReports(
+            {
+                ("providers", "SEVEN_DAYS"): {
+                    "openai": [20.0] * 14,
+                    "newprov": [None] * 9 + [50.0] * 5,
+                }
+            },
+            failing={("agents", "SEVEN_DAYS")},
+        )
+
+        section = _section(
+            await self._answer(
+                tool,
+                monkeypatch,
+                reports,
+                "TWENTY_FOUR_HOURS",
+                include_dimensions=["providers", "agents"],
+            )
+        )
+
+        assert "**NEWPROV** (new)" in section
+        assert (
+            "Not read for new-entity detection, so not examined: "
+            "agents (HTTP 504: Gateway timeout)"
+        ) in section
+        sentence = next(line for line in section.splitlines() if "buckets starting" in line)
+        assert sentence.startswith("Examined providers:")
+        assert "agent" not in sentence
+
+    @pytest.mark.asyncio
+    async def test_reversed_epoch_millisecond_buckets_give_the_same_first_active_date(
+        self, tool, monkeypatch
+    ):
+        reports = _NewEntityReports(_gap_provider_week(), epoch_ms=True, reverse=True)
+
+        section = _section(await self._answer(tool, monkeypatch, reports, "SEVEN_DAYS"))
+
+        assert "**NEWPROV** (new)" in section
+        assert "first active 2026-10-07" in section
+        assert "active in 3 of 10 recent buckets" in section
+        assert "OPENAI" not in section
+
+    @pytest.mark.asyncio
+    async def test_same_name_in_two_dimensions_is_reported_once_with_its_type(
+        self, tool, monkeypatch
+    ):
+        reports = _NewEntityReports(
+            {
+                ("providers", "SEVEN_DAYS"): {"openai": [20.0] * 14, "shared": [20.0] * 14},
+                ("agents", "SEVEN_DAYS"): {
+                    "bot": [20.0] * 14,
+                    "shared": [None] * 9 + [40.0] * 5,
+                },
+            }
+        )
+
+        section = _section(
+            await self._answer(
+                tool,
+                monkeypatch,
+                reports,
+                "SEVEN_DAYS",
+                include_dimensions=["providers", "agents"],
+            )
+        )
+
+        assert section.count("**SHARED**") == 1
+        assert "### Agent (1)" in section
+        assert "### Provider" not in section
+
+    @pytest.mark.asyncio
+    async def test_thirty_days_splits_seven_baseline_buckets(self, tool, monkeypatch):
+        reports = _NewEntityReports(
+            {
+                ("providers", "THIRTY_DAYS"): {
+                    "openai": [20.0] * 30,
+                    "newprov": [None] * 7 + [30.0] * 23,
+                }
+            }
+        )
+
+        section = _section(await self._answer(tool, monkeypatch, reports, "THIRTY_DAYS"))
+
+        assert "the 7 buckets starting 2026-09-10 to 2026-09-16" in section
+        assert "**NEWPROV** (new)" in section
+        assert "first active 2026-09-17" in section
+        assert "active in 23 of 23 recent buckets" in section
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bucket_count", [0, 1])
+    async def test_too_few_buckets_says_detection_could_not_run(
+        self, tool, monkeypatch, bucket_count
+    ):
+        starts = _bucket_starts("SEVEN_DAYS")[:bucket_count]
+        reports = _NewEntityReports(
+            {("providers", "SEVEN_DAYS"): {"openai": [20.0] * bucket_count}},
+            starts={"SEVEN_DAYS": starts},
+        )
+
+        section = _section(await self._answer(tool, monkeypatch, reports, "SEVEN_DAYS"))
+
+        assert (
+            f"New-entity detection could not run: the report returned {bucket_count} "
+            f"bucket{'' if bucket_count == 1 else 's'}, and at least 2 are needed"
+        ) in section
+
+    @pytest.mark.asyncio
+    async def test_a_failed_agents_read_is_named_when_providers_return_too_few_buckets(
+        self, tool, monkeypatch
+    ):
+        reports = _NewEntityReports(
+            {("providers", "SEVEN_DAYS"): {"openai": [20.0]}},
+            failing={("agents", "SEVEN_DAYS")},
+            starts={("providers", "SEVEN_DAYS"): _bucket_starts("SEVEN_DAYS")[:1]},
+        )
+
+        section = _section(
+            await self._answer(
+                tool,
+                monkeypatch,
+                reports,
+                "TWENTY_FOUR_HOURS",
+                include_dimensions=["providers", "agents"],
+            )
+        )
+
+        assert (
+            "New-entity detection could not run: the report returned 1 bucket, "
+            "and at least 2 are needed"
+        ) in section
+        assert (
+            "Not read for new-entity detection, so not examined: "
+            "agents (HTTP 504: Gateway timeout)"
+        ) in section
+
+    @pytest.mark.asyncio
+    async def test_daily_agent_buckets_are_compared_on_their_own_grid(
+        self, tool, monkeypatch
+    ):
+        first = datetime(2026, 10, 3, tzinfo=timezone.utc)
+        daily = [first + timedelta(days=index) for index in range(7)]
+        reports = _NewEntityReports(
+            {
+                ("providers", "SEVEN_DAYS"): {
+                    "openai": [20.0] * 14,
+                    "newprov": [None] * 9 + [50.0] * 5,
+                },
+                ("agents", "SEVEN_DAYS"): {
+                    "steadybot": [10.0] * 7,
+                    "newagent": [None] * 2 + [5.0] * 5,
+                },
+            },
+            starts={("agents", "SEVEN_DAYS"): daily},
+        )
+
+        section = _section(
+            await self._answer(
+                tool,
+                monkeypatch,
+                reports,
+                "SEVEN_DAYS",
+                include_dimensions=["providers", "agents"],
+            )
+        )
+
+        assert "STEADYBOT" not in section
+        assert (
+            "Examined providers: compared the recent part, the 10 buckets starting "
+            "2026-10-05 00:00 UTC to 2026-10-09 12:00 UTC, with the baseline, the 4 "
+            "buckets starting 2026-10-03 00:00 UTC to 2026-10-04 12:00 UTC. Examined "
+            "agents: compared the recent part, the 5 buckets starting 2026-10-05 to "
+            "2026-10-09, with the baseline, the 2 buckets starting 2026-10-03 to "
+            "2026-10-04."
+        ) in section
+        assert "**NEWPROV** (new)" in section
+        assert "active in 5 of 10 recent buckets" in section
+        assert "no cost from 2026-10-03 00:00 UTC to 2026-10-04 12:00 UTC" in section
+        assert "**NEWAGENT** (new)" in section
+        assert "active in 5 of 5 recent buckets" in section
+        assert "no cost from 2026-10-03 to 2026-10-04" in section
+
+    @pytest.mark.asyncio
+    async def test_nothing_found_above_the_threshold_names_the_threshold(
+        self, tool, monkeypatch
+    ):
+        """A source below min_new_entity_threshold did appear, so the answer names the threshold (BACK-4813)."""
+        reports = _NewEntityReports(
+            {
+                ("providers", "SEVEN_DAYS"): {
+                    "openai": [20.0] * 14,
+                    "smallnew": [None] * 9 + [50.0] * 5,
+                }
+            }
+        )
+
+        section = _section(
+            await self._answer(
+                tool, monkeypatch, reports, "SEVEN_DAYS", min_new_entity_threshold=100000
+            )
+        )
+
+        sentence = next(line for line in section.splitlines() if line.startswith("No new"))
+        assert sentence.startswith(
+            "No new or activated provider reached $100,000.00 in the recent part"
+        )
+        assert "appeared" not in sentence
+        assert "SMALLNEW" not in section
+
+    @pytest.mark.asyncio
+    async def test_found_above_a_threshold_says_only_those_are_listed(
+        self, tool, monkeypatch
+    ):
+        reports = _NewEntityReports(
+            {
+                ("providers", "SEVEN_DAYS"): {
+                    "openai": [20.0] * 14,
+                    "newprov": [None] * 9 + [50.0] * 5,
+                    "smallnew": [None] * 9 + [1.0] * 5,
+                }
+            }
+        )
+
+        section = _section(
+            await self._answer(
+                tool, monkeypatch, reports, "SEVEN_DAYS", min_new_entity_threshold=100
+            )
+        )
+
+        assert "**NEWPROV** (new)" in section
+        assert "SMALLNEW" not in section
+        assert "Only sources that reached $100.00 in the recent part are listed." in section
+
+    @pytest.mark.asyncio
+    async def test_nothing_found_with_threshold_zero_says_nothing_appeared(
+        self, tool, monkeypatch
+    ):
+        reports = _NewEntityReports({("providers", "SEVEN_DAYS"): {"openai": [20.0] * 14}})
+
+        section = _section(
+            await self._answer(
+                tool, monkeypatch, reports, "SEVEN_DAYS", min_new_entity_threshold=0
+            )
+        )
+
+        sentence = next(line for line in section.splitlines() if line.startswith("No new"))
+        assert sentence.startswith("No new provider appeared in the recent part")
+        assert "Only sources that reached" not in section
+
+    @pytest.mark.asyncio
+    async def test_detect_new_entities_schema_names_activation(self, tool):
+        """The schema says detection reports activated sources, not only absent ones (BACK-4813)."""
+        schema = await tool._get_input_schema()
+
+        description = schema["properties"]["detect_new_entities"]["description"]
+        assert "activated" in description
+        assert "absent from the baseline" not in description

@@ -4,7 +4,8 @@ This module provides standardized error handling patterns used across the MCP se
 following FastMCP patterns for structured, agent-friendly error responses.
 """
 
-from typing import Any, Dict, List, NoReturn, Optional, Union
+import re
+from typing import Any, Dict, List, NoReturn, Optional, Sequence, Union
 
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
@@ -277,22 +278,12 @@ def format_structured_error(
             text += f"**Resource ID**: {error.resource_id}\n"
         text += "\n"
 
-    # Add suggestions if available
     if error.suggestions:
-        text += "**Suggestions**:\n"
-        for i, suggestion in enumerate(error.suggestions, 1):
-            text += f"{i}. {suggestion}\n"
-        text += "\n"
+        text += _suggestions_section(error.suggestions) + "\n"
 
-    # Add examples if available
-    if error.examples:
-        text += "**Examples**:\n"
-        for example_type, example_value in error.examples.items():
-            if isinstance(example_value, str):
-                text += f"- **{example_type}**: `{example_value}`\n"
-            elif isinstance(example_value, dict):
-                text += f"- **{example_type}**:\n```json\n{example_value}\n```\n"
-        text += "\n"
+    example_lines = _example_lines(error.examples)
+    if example_lines:
+        text += _examples_section(example_lines) + "\n"
 
     # Add context information if available
     if error.context and include_debug_info:
@@ -302,6 +293,89 @@ def format_structured_error(
         text += "\n"
 
     return text.strip()
+
+
+# The codes the tools raise for an action name they do not know. A refusal of
+# an action the tool does know uses another code (BUSINESS_RULE_VIOLATION).
+_UNKNOWN_ACTION_CODES = frozenset(
+    {ErrorCodes.ACTION_NOT_SUPPORTED, ErrorCodes.VALIDATION_ERROR}
+)
+
+
+def _suggestions_section(suggestions: Sequence[str]) -> str:
+    numbered = "".join(f"{i}. {s}\n" for i, s in enumerate(suggestions, 1))
+    return "**Suggestions**:\n" + numbered
+
+
+def _example_lines(examples: Dict[str, Any]) -> List[str]:
+    lines = []
+    for example_type, example_value in examples.items():
+        if isinstance(example_value, str):
+            lines.append(f"- **{example_type}**: `{example_value}`\n")
+        elif isinstance(example_value, dict):
+            lines.append(f"- **{example_type}**:\n```json\n{example_value}\n```\n")
+        elif isinstance(example_value, list):
+            items = ", ".join(f"`{item}`" for item in example_value)
+            lines.append(f"- **{example_type}**: {items}\n")
+    return lines
+
+
+def _examples_section(example_lines: Sequence[str]) -> str:
+    return "**Examples**:\n" + "".join(example_lines)
+
+
+def _names_action(action: str, text: str) -> bool:
+    return re.search(rf"(?<![\w]){re.escape(action)}(?![\w])", text) is not None
+
+
+def caller_message(error: ToolError, valid_actions: Sequence[str] = ()) -> str:
+    """The text a caller reads for a raised ``ToolError`` (BACK-4715).
+
+    The framework sends the caller only the exception message, so the
+    suggestions, examples and valid actions a handler attached were lost. This
+    appends whatever the message does not already carry. An unknown action
+    gains the tool's valid actions instead of its examples; any other refusal,
+    or an unknown action whose tool list could not be read, gains its
+    examples. The first line never changes, the error's ``context``
+    is never shown, and applying it twice gives the same text.
+
+    Args:
+        error: The raised error
+        valid_actions: The actions the tool advertises, when known
+
+    Returns:
+        The message followed by the guidance it was missing
+    """
+    text = error.message
+    lists_actions = (
+        bool(valid_actions)
+        and error.error_code in _UNKNOWN_ACTION_CODES
+        and error.field == "action"
+        and error.value not in valid_actions
+    )
+
+    sections = []
+    if lists_actions and any(not _names_action(a, text) for a in valid_actions):
+        sections.append("**Valid actions**: " + ", ".join(valid_actions) + "\n")
+
+    suggestions = [
+        s
+        for s in error.suggestions
+        if s not in text and not (lists_actions and s in valid_actions)
+    ]
+    if suggestions:
+        sections.append(_suggestions_section(suggestions))
+
+    if not lists_actions:
+        example_lines = [
+            line for line in _example_lines(error.examples) if line.strip() not in text
+        ]
+        if example_lines:
+            sections.append(_examples_section(example_lines))
+
+    if not sections:
+        return text
+    return "\n\n".join([text.rstrip("\n")] + [s.rstrip("\n") for s in sections])
 
 
 def create_structured_validation_error(
@@ -488,6 +562,8 @@ __all__ = [
     "ErrorCodes",
     "ToolError",
     "ResourceError",
+    "api_error_refusal",
+    "caller_message",
     "format_structured_error",
     "create_structured_validation_error",
     "create_structured_missing_parameter_error",
@@ -605,15 +681,43 @@ def _format_api_validation_error(
     Returns:
         List containing formatted error response with preserved validation details
     """
+    return [TextContent(type="text", text=_api_error_text(api_error, context))]
+
+
+def api_error_refusal(error: ReveniumAPIError, context: str) -> ToolError:
+    """A platform failure as a raised error the caller sees flagged (BACK-4715).
+
+    Args:
+        error: The platform failure
+        context: What the tool was doing, e.g. "listing AI models"
+
+    Returns:
+        ToolError carrying the same guidance ``format_error_response`` gives
+    """
+    status_code = getattr(error, "status_code", None)
+    return ToolError(
+        message=_api_error_text(error, context),
+        error_code=(
+            ErrorCodes.RESOURCE_NOT_FOUND if status_code == 404 else ErrorCodes.API_ERROR
+        ),
+    )
+
+
+# A request the platform rejected as invalid; anything else is not a
+# validation problem the caller can fix by changing the input.
+_VALIDATION_STATUSES = frozenset({400, 422})
+
+
+def _api_error_text(api_error: "ReveniumAPIError", context: str = "") -> str:
     error_message = api_error.message
     status_code = getattr(api_error, "status_code", None)
-    response_data = getattr(api_error, "response_data", None)
 
     # Extract specific validation details from the error message
     validation_context = _extract_validation_context(error_message, status_code)
 
-    # Build enhanced error response
-    error_text = "🚨 **API_VALIDATION_ERROR**\n\n"
+    is_validation = status_code in _VALIDATION_STATUSES
+    header = "API_VALIDATION_ERROR" if is_validation else "API_ERROR"
+    error_text = f"🚨 **{header}**\n\n"
 
     # Add user-friendly error message
     if validation_context["user_friendly_message"]:
@@ -646,12 +750,11 @@ def _format_api_validation_error(
     # Add technical details in collapsible section
     error_text += "\n<details><summary>Technical Details</summary>\n"
     error_text += f"**Status Code**: {status_code}\n"
-    error_text += f"**Original Message**: {error_message}\n"
-    if response_data:
-        error_text += f"**Response Data**: {response_data}\n"
+    if status_code is None or status_code < 500:
+        error_text += f"**Original Message**: {error_message}\n"
     error_text += "</details>"
 
-    return [TextContent(type="text", text=error_text)]
+    return error_text
 
 
 def _extract_validation_context(error_message: str, status_code: int) -> dict:

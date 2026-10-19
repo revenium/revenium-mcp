@@ -424,3 +424,34 @@ class TestCheckReferentialIntegrity:
         assert any(i.severity == ValidationSeverity.CRITICAL for i in result.issues)
 
 
+
+
+class TestDeletionWithIncompleteSubscriptionWalk:
+    """A product whose subscriptions could not all be read is never safe to delete."""
+
+    @pytest.mark.asyncio
+    async def test_incomplete_subscription_walk_blocks_product_deletion(
+        self, validator, mock_lookup_service, mock_nav_service
+    ):
+        nav_result = MagicMock()
+        nav_result.success = False
+        nav_result.related_entities = []
+        nav_result.incomplete = True
+        nav_result.error_message = "Could not read subscriptions page 1 (timeout)."
+        mock_nav_service.get_subscriptions_for_product = AsyncMock(return_value=nav_result)
+        mock_lookup_service.resolve_product = AsyncMock(return_value=MagicMock())
+
+        impact = await validator.analyze_deletion_impact("products", "prod_1")
+        validation = await validator.validate_hierarchy_operation({
+            "type": "delete",
+            "entity_type": "products",
+            "entity_id": "prod_1",
+        })
+
+        assert impact.safe_to_proceed is False
+        assert impact.impact_severity == ValidationSeverity.ERROR
+        assert validation.valid is False
+        assert any(
+            i.severity == ValidationSeverity.ERROR and "page 1" in i.message
+            for i in validation.issues
+        )

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 from ..auth.claims_middleware import current_tenant_context
 from .department_aliases import resolve_department_aliases
+from .dry_run_guard import normalise_dry_run, refuse_unsupported_dry_run
 from ..log_context import bind_tenant_context, clear_tenant_context, sanitize_error_message
 
 
@@ -51,10 +52,12 @@ async def standardized_tool_execution(
         UCMError: For UCM integration failures
     """
     from ..capability_manager.integration_service import ucm_integration_service
-    from ..common.error_handling import IntrospectionError, ToolExecutionError
+    from ..common.error_handling import IntrospectionError, ToolError, ToolExecutionError
     from ..introspection.integration import introspection_integration
 
     action, arguments = resolve_department_aliases(tool_name, action, arguments)
+    refuse_unsupported_dry_run(tool_name, action, arguments)
+    arguments = normalise_dry_run(arguments)
     if ctx is None:
         ctx = current_tenant_context()
     tokens = bind_tenant_context(ctx)
@@ -65,7 +68,7 @@ async def standardized_tool_execution(
         introspection_start = time.time()
         try:
             result = await introspection_integration.handle_tool_execution(
-                tool_name, action, arguments
+                tool_name, action, arguments, ctx=ctx
             )
             introspection_time = (time.time() - introspection_start) * 1000  # Convert to ms
 
@@ -111,6 +114,12 @@ async def standardized_tool_execution(
 
         except PermissionError:
             # Fail closed on auth failure — never retry via direct execution.
+            raise
+        except ToolError:
+            # The action ran and answered with a user-facing error. Running it
+            # again on a fresh tool instance would repeat its platform calls and
+            # waits only to raise the same error; introspection-layer failures
+            # (ToolExecutionError subclasses) still fall back below.
             raise
         except (IntrospectionError, Exception) as e:
             # Introspection failed, fall back to direct execution
@@ -170,8 +179,6 @@ async def standardized_tool_execution(
 
                 # Check if the direct execution error is a user-friendly ToolError
                 # If so, preserve just the user message without internal system details
-                from ..common.error_handling import ToolError
-
                 if isinstance(fallback_error, ToolError):
                     # Re-raise the ToolError directly to preserve user-friendly message
                     raise fallback_error
@@ -204,6 +211,40 @@ async def standardized_tool_execution(
         logger.error(
             f"PERFORMANCE: {tool_name}.{action} - ERROR after {total_time:.2f}ms: {str(e)}"
         )
+        from .error_handling import ToolError
+
+        if isinstance(e, ToolError):
+            await _carry_guidance_to_caller(e, tool_name, tool_class)
         raise
     finally:
         clear_tenant_context(tokens)
+
+
+async def _carry_guidance_to_caller(error: Any, tool_name: str, tool_class: Any) -> None:
+    """Put the error's guidance into the one string the framework sends the caller."""
+    from .error_handling import caller_message
+
+    valid_actions = (
+        await _valid_actions(tool_name, tool_class) if error.field == "action" else []
+    )
+    try:
+        text = caller_message(error, valid_actions)
+    except Exception as render_error:
+        logger.debug(f"Could not render guidance for {tool_name}: {render_error}")
+        return
+    error.message = text
+    error.args = (text,)
+
+
+async def _valid_actions(tool_name: str, tool_class: Any) -> List[str]:
+    """The tool's advertised actions; empty when they cannot be read."""
+    from ..introspection.integration import introspection_integration
+
+    try:
+        provider = await introspection_integration.engine.registry.get_provider(tool_name)
+        if provider is None or not hasattr(provider, "_get_supported_actions"):
+            provider = tool_class(ucm_helper=None)
+        return [str(action) for action in await provider._get_supported_actions()]
+    except Exception as lookup_error:
+        logger.debug(f"Could not read supported actions for {tool_name}: {lookup_error}")
+        return []

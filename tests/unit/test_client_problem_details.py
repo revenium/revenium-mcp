@@ -144,6 +144,153 @@ async def test_problem_json_without_code_field_yields_none_code(monkeypatch):
     assert "Something broke" in str(ei.value.message)
 
 
+async def _problem_details_error(monkeypatch, problem_body, status_code=400):
+    """Raise the client's error for one problem+json refusal and return it."""
+    import json as json_lib
+    from src.revenium_mcp_server.client import ReveniumAPIError, ReveniumClient
+
+    monkeypatch.setenv("REVENIUM_API_KEY", "hak_test_abcd1234")
+    monkeypatch.setenv("REVENIUM_BASE_URL", "https://example.invalid")
+    monkeypatch.setenv("REVENIUM_TEAM_ID", "team_1")
+
+    client = ReveniumClient()
+
+    async def fake_request(method, url, params=None, json=None, headers=None):
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.content = json_lib.dumps(problem_body).encode()
+        resp.text = json_lib.dumps(problem_body)
+        resp.reason_phrase = "Bad Request"
+        resp.headers = {"content-type": "application/problem+json"}
+        resp.is_success = False
+        resp.json = MagicMock(return_value=problem_body)
+        return resp
+
+    monkeypatch.setattr(client.client, "request", fake_request)
+
+    with pytest.raises(ReveniumAPIError) as ei:
+        await client.get("/api/v2/insights/runs", use_retry=False)
+    return ei.value
+
+
+RUN_STATUSES = ["running", "completed", "partial", "failed", "cancelled"]
+
+# The analytics service's live answer to list_runs with status BOGUS.
+BOGUS_STATUS_PROBLEM = {
+    "type": "about:blank",
+    "title": "Validation Error",
+    "status": 400,
+    "detail": "Invalid input",
+    "code": "VALIDATION_ERROR",
+    "errors": [
+        {
+            "received": "BOGUS",
+            "code": "invalid_enum_value",
+            "options": RUN_STATUSES,
+            "path": ["status"],
+            "message": (
+                "Invalid enum value. Expected 'running' | 'completed' | 'partial'"
+                " | 'failed' | 'cancelled', received 'BOGUS'"
+            ),
+        }
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_problem_json_errors_list_names_the_field_the_value_and_the_accepted_values(
+    monkeypatch,
+):
+    error = await _problem_details_error(monkeypatch, BOGUS_STATUS_PROBLEM)
+
+    assert error.code == "VALIDATION_ERROR"
+    assert error.status_code == 400
+    assert "Invalid input" in error.message
+    assert "status" in error.message
+    assert "BOGUS" in error.message
+    assert "running, completed, partial, failed, cancelled" in error.message
+    assert "[" not in error.message
+
+
+@pytest.mark.asyncio
+async def test_problem_json_errors_entry_without_options_still_names_the_field(monkeypatch):
+    body = {
+        "title": "Validation Error",
+        "status": 400,
+        "detail": "Invalid input",
+        "code": "VALIDATION_ERROR",
+        "errors": [{"code": "invalid_date", "path": ["startDate"], "message": "Invalid date"}],
+    }
+
+    error = await _problem_details_error(monkeypatch, body)
+
+    assert error.message.startswith("Invalid input")
+    assert "startDate: Invalid date" in error.message
+    assert "accepted values" not in error.message
+    assert "received" not in error.message
+
+
+@pytest.mark.asyncio
+async def test_problem_json_errors_with_a_nested_numeric_path_keeps_status_and_code(monkeypatch):
+    body = {
+        "title": "Validation Error",
+        "status": 400,
+        "detail": "Invalid input",
+        "code": "VALIDATION_ERROR",
+        "errors": [{"path": ["filters", 0, "name"], "message": "Required"}],
+    }
+
+    error = await _problem_details_error(monkeypatch, body)
+
+    assert "filters.0.name: Required" in error.message
+    assert error.status_code == 400
+    assert error.code == "VALIDATION_ERROR"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "errors",
+    [
+        "status is wrong",
+        {"path": ["status"], "message": "Required"},
+        ["status", 7, None],
+        [{"message": "Something about the body"}],
+    ],
+    ids=["a string", "a dict", "a list of non-dicts", "an entry with no field"],
+)
+async def test_problem_json_malformed_errors_keep_the_summary_status_and_code(
+    monkeypatch, errors
+):
+    body = {
+        "title": "Validation Error",
+        "status": 400,
+        "detail": "Invalid input",
+        "code": "VALIDATION_ERROR",
+        "errors": errors,
+    }
+
+    error = await _problem_details_error(monkeypatch, body)
+
+    assert error.message.startswith("Invalid input")
+    assert error.status_code == 400
+    assert error.code == "VALIDATION_ERROR"
+    assert "Unexpected error" not in error.message
+
+
+@pytest.mark.asyncio
+async def test_problem_json_errors_entry_without_a_field_prints_its_message(monkeypatch):
+    body = {
+        "title": "Validation Error",
+        "status": 400,
+        "detail": "Invalid input",
+        "errors": [{"message": "Something about the body"}],
+    }
+
+    error = await _problem_details_error(monkeypatch, body)
+
+    assert error.message.splitlines()[1:] == ["- Something about the body"]
+
+
 @pytest.mark.asyncio
 async def test_legacy_envelope_unaffected_by_problem_json_branch(monkeypatch):
     """A non-problem+json 4xx must still flow through the legacy error-text logic."""
@@ -750,3 +897,51 @@ async def test_trigger_recommendation_run_defaults_include_descendants_true(monk
 
     assert captured["body"]["filterDepartmentId"] == ""
     assert captured["body"]["filterIncludeDescendants"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [["not", "an", "object"], "just a string"])
+async def test_problem_json_with_a_non_object_body_keeps_the_status(monkeypatch, body):
+    error = await _problem_details_error(monkeypatch, body, status_code=400)
+
+    assert error.status_code == 400
+    assert error.code is None
+
+
+@pytest.mark.asyncio
+async def test_problem_json_error_text_is_sanitized_like_other_http_errors(monkeypatch):
+    problem = {
+        "detail": "Invalid input",
+        "errors": [
+            {
+                "path": ["status"],
+                "message": (
+                    "Not an io.hypercurrent.profitstream.model.entity.ExecutionStatus"
+                ),
+            }
+        ],
+    }
+
+    error = await _problem_details_error(monkeypatch, problem)
+
+    assert "ExecutionStatus" in error.message
+    assert "io.hypercurrent" not in error.message
+
+
+@pytest.mark.asyncio
+async def test_problem_json_error_lines_are_bounded(monkeypatch):
+    from src.revenium_mcp_server.client import _PROBLEM_LINE_MAX_CHARS
+
+    problem = {
+        "detail": "Invalid input",
+        "errors": [
+            {"path": ["status"], "message": f"Bad value {'x' * 5000}", "received": "x"}
+        ],
+    }
+
+    error = await _problem_details_error(monkeypatch, problem)
+
+    summary, *lines = error.message.split("\n")
+    assert lines
+    assert all(len(line) <= _PROBLEM_LINE_MAX_CHARS for line in lines)
+    assert "status" in lines[0]

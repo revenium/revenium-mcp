@@ -33,97 +33,6 @@ class SmartDefaultsEngine:
             "page_size": int(os.getenv("REVENIUM_DEFAULT_PAGE_SIZE", "20")),
         }
 
-    def get_product_defaults(self, product_type: str = "simple") -> Dict[str, Any]:
-        """Get smart defaults for product creation.
-
-        Args:
-            product_type: Type of product (simple, subscription, usage_based)
-
-        Returns:
-            Dictionary of default values for product creation
-        """
-        base_defaults = {
-            "version": "1.0.0",
-            "currency": self.env_defaults["currency"],
-            "coming_soon": False,
-            "published": True,
-            "tags": [],
-            "notification_addresses_on_invoice": [self.env_defaults["notification_email"]],
-        }
-
-        if product_type == "simple":
-            return {
-                **base_defaults,
-                "plan": {
-                    "type": "CHARGE",
-                    "name": "Basic Plan",
-                    "currency": self.env_defaults["currency"],
-                    "tiers": [
-                        {
-                            "name": "Standard Tier",
-                            "starting_from": 0,
-                            "up_to": None,
-                            "unit_amount": "0.00",
-                        }
-                    ],
-                },
-            }
-        elif product_type == "subscription":
-            return {
-                **base_defaults,
-                "plan": {
-                    "type": "SUBSCRIPTION",
-                    "name": "Monthly Subscription",
-                    "currency": self.env_defaults["currency"],
-                    "period": "MONTH",
-                    "period_count": 1,
-                    "trial_period": None,
-                    "trial_period_count": None,
-                    "graduated": False,
-                    "tiers": [
-                        {
-                            "name": "Monthly Tier",
-                            "starting_from": 0,
-                            "up_to": None,
-                            "unit_amount": "9.99",
-                            "flat_amount": "9.99",
-                        }
-                    ],
-                },
-            }
-        elif product_type == "usage_based":
-            return {
-                **base_defaults,
-                "plan": {
-                    "type": "USAGE",
-                    "name": "Usage-Based Plan",
-                    "currency": self.env_defaults["currency"],
-                    "graduated": True,
-                    "tiers": [
-                        {
-                            "name": "First 1000",
-                            "starting_from": 0,
-                            "up_to": 1000,
-                            "unit_amount": "0.01",
-                        },
-                        {
-                            "name": "Next 9000",
-                            "starting_from": 1000,
-                            "up_to": 10000,
-                            "unit_amount": "0.005",
-                        },
-                        {
-                            "name": "Over 10000",
-                            "starting_from": 10000,
-                            "up_to": None,
-                            "unit_amount": "0.001",
-                        },
-                    ],
-                },
-            }
-
-        return base_defaults
-
     def get_alert_defaults(self, alert_type: str = "threshold") -> Dict[str, Any]:
         """Get smart defaults for alert creation.
 
@@ -321,12 +230,7 @@ class SmartDefaultsEngine:
         enhanced_data = user_data.copy()
 
         # Apply tool-specific defaults
-        if tool_name == "manage_products" and action == "create":
-            product_type = self._detect_product_type(user_data)
-            defaults = self.get_product_defaults(product_type)
-            enhanced_data = self._merge_defaults(enhanced_data, defaults)
-
-        elif tool_name == "manage_alerts" and action == "create":
+        if tool_name == "manage_alerts" and action == "create":
             alert_type = user_data.get("alertType", "threshold")
             defaults = self.get_alert_defaults(alert_type)
             enhanced_data = self._merge_defaults(enhanced_data, defaults)
@@ -353,18 +257,6 @@ class SmartDefaultsEngine:
                     enhanced_data[key] = value
 
         return enhanced_data
-
-    def _detect_product_type(self, user_data: Dict[str, Any]) -> str:
-        """Detect the intended product type from user data."""
-        plan_data = user_data.get("plan", {})
-        plan_type = plan_data.get("type", "").upper()
-
-        if plan_type == "SUBSCRIPTION":
-            return "subscription"
-        elif plan_type == "USAGE":
-            return "usage_based"
-        else:
-            return "simple"
 
     def _merge_defaults(
         self, user_data: Dict[str, Any], defaults: Dict[str, Any]

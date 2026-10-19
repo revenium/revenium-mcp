@@ -16,6 +16,7 @@ from typing import Dict, Any
 
 from mcp.types import TextContent
 
+from src.revenium_mcp_server.alerts.semantic_processor import AlertSemanticProcessor
 from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
 from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.exceptions import ValidationError
@@ -24,6 +25,15 @@ from src.revenium_mcp_server.exceptions import ValidationError
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+
+def _make_tools_with_platform_client():
+    """Return (AlertManagement, mock_client) with the real create checks and no platform call."""
+    tools = AlertManagement()
+    client = MagicMock()
+    client.team_id = "team_test"
+    client.create_anomaly = AsyncMock(return_value={"id": "never"})
+    return tools, client
 
 
 def _make_tools_with_client():
@@ -91,48 +101,44 @@ class TestResolveNotificationEmail:
     def test_skips_dummy_env_email(self):
         """The dummy@email.com sentinel should be skipped."""
         tools = AlertManagement()
-        mock_config = MagicMock()
-        mock_config.default_email = "discovered@corp.com"
+        discovered_email = "discovered@corp.com"
         with patch.dict("os.environ", {"REVENIUM_DEFAULT_EMAIL": "dummy@email.com"}):
             with patch(
-                "src.revenium_mcp_server.config_store.get_discovered_config_sync",
-                return_value=mock_config,
+                "src.revenium_mcp_server.config_store.get_discovered_value",
+                return_value=discovered_email,
             ):
                 result = tools._resolve_notification_email(None)
         assert result == "discovered@corp.com"
 
     def test_falls_back_to_discovered_config(self):
         tools = AlertManagement()
-        mock_config = MagicMock()
-        mock_config.default_email = "discovered@test.com"
+        discovered_email = "discovered@test.com"
         with patch.dict("os.environ", {}, clear=True):
             with patch(
-                "src.revenium_mcp_server.config_store.get_discovered_config_sync",
-                return_value=mock_config,
+                "src.revenium_mcp_server.config_store.get_discovered_value",
+                return_value=discovered_email,
             ):
                 result = tools._resolve_notification_email(None)
         assert result == "discovered@test.com"
 
     def test_discovered_config_stripped(self):
         tools = AlertManagement()
-        mock_config = MagicMock()
-        mock_config.default_email = "  trimme@test.com  "
+        discovered_email = "  trimme@test.com  "
         with patch.dict("os.environ", {}, clear=True):
             with patch(
-                "src.revenium_mcp_server.config_store.get_discovered_config_sync",
-                return_value=mock_config,
+                "src.revenium_mcp_server.config_store.get_discovered_value",
+                return_value=discovered_email,
             ):
                 result = tools._resolve_notification_email(None)
         assert result == "trimme@test.com"
 
     def test_raises_validation_error_when_nothing_available(self):
         tools = AlertManagement()
-        mock_config = MagicMock()
-        mock_config.default_email = None
+        discovered_email = None
         with patch.dict("os.environ", {}, clear=True):
             with patch(
-                "src.revenium_mcp_server.config_store.get_discovered_config_sync",
-                return_value=mock_config,
+                "src.revenium_mcp_server.config_store.get_discovered_value",
+                return_value=discovered_email,
             ):
                 with pytest.raises(ValidationError) as exc_info:
                     tools._resolve_notification_email(None)
@@ -140,12 +146,11 @@ class TestResolveNotificationEmail:
 
     def test_raises_when_discovered_email_empty(self):
         tools = AlertManagement()
-        mock_config = MagicMock()
-        mock_config.default_email = "   "
+        discovered_email = "   "
         with patch.dict("os.environ", {}, clear=True):
             with patch(
-                "src.revenium_mcp_server.config_store.get_discovered_config_sync",
-                return_value=mock_config,
+                "src.revenium_mcp_server.config_store.get_discovered_value",
+                return_value=discovered_email,
             ):
                 with pytest.raises(ValidationError):
                     tools._resolve_notification_email(None)
@@ -158,12 +163,11 @@ class TestResolveNotificationEmail:
 
     def test_env_var_takes_precedence_over_discovered(self):
         tools = AlertManagement()
-        mock_config = MagicMock()
-        mock_config.default_email = "discovered@corp.com"
+        discovered_email = "discovered@corp.com"
         with patch.dict("os.environ", {"REVENIUM_DEFAULT_EMAIL": "env@corp.com"}):
             with patch(
-                "src.revenium_mcp_server.config_store.get_discovered_config_sync",
-                return_value=mock_config,
+                "src.revenium_mcp_server.config_store.get_discovered_value",
+                return_value=discovered_email,
             ):
                 result = tools._resolve_notification_email(None)
         assert result == "env@corp.com"
@@ -198,7 +202,7 @@ class TestResolveNotificationConfig:
         tools = AlertManagement()
         with patch.object(tools, "_resolve_notification_email", return_value="a@b.com"):
             with patch(
-                "src.revenium_mcp_server.config_store.get_config_value",
+                "src.revenium_mcp_server.tools_decomposed.alert_management.get_default_slack_config_id",
                 return_value="default-slack-id",
             ):
                 config = tools._resolve_notification_config("a@b.com")
@@ -208,7 +212,7 @@ class TestResolveNotificationConfig:
         tools = AlertManagement()
         with patch.object(tools, "_resolve_notification_email", return_value="a@b.com"):
             with patch(
-                "src.revenium_mcp_server.config_store.get_config_value",
+                "src.revenium_mcp_server.tools_decomposed.alert_management.get_default_slack_config_id",
                 return_value="default-slack-id",
             ):
                 config = tools._resolve_notification_config("a@b.com", "custom-slack")
@@ -354,12 +358,12 @@ class TestHandleCreateCumulativeUsageAlert:
         with patch.object(
             tools, "_resolve_notification_config", return_value=_notification_config()
         ):
-            result = await tools._handle_create_cumulative_usage_alert(
-                client,
-                {"threshold": 1000},
-            )
-        assert isinstance(result[0], TextContent)
-        assert "name" in result[0].text.lower()
+            with pytest.raises(ToolError) as exc_info:
+                await tools._handle_create_cumulative_usage_alert(
+                    client,
+                    {"threshold": 1000},
+                )
+        assert "name" in exc_info.value.message.lower()
 
     @pytest.mark.asyncio
     async def test_missing_threshold_returns_error(self):
@@ -367,12 +371,12 @@ class TestHandleCreateCumulativeUsageAlert:
         with patch.object(
             tools, "_resolve_notification_config", return_value=_notification_config()
         ):
-            result = await tools._handle_create_cumulative_usage_alert(
-                client,
-                {"name": "Test Alert"},
-            )
-        assert isinstance(result[0], TextContent)
-        assert "threshold" in result[0].text.lower()
+            with pytest.raises(ToolError) as exc_info:
+                await tools._handle_create_cumulative_usage_alert(
+                    client,
+                    {"name": "Test Alert"},
+                )
+        assert "threshold" in exc_info.value.message.lower()
 
     @pytest.mark.asyncio
     async def test_negative_threshold_returns_error(self):
@@ -380,26 +384,28 @@ class TestHandleCreateCumulativeUsageAlert:
         with patch.object(
             tools, "_resolve_notification_config", return_value=_notification_config()
         ):
-            result = await tools._handle_create_cumulative_usage_alert(
-                client,
-                {"name": "Test", "threshold": -50},
-            )
-        assert isinstance(result[0], TextContent)
-        assert "threshold" in result[0].text.lower()
+            with pytest.raises(ToolError) as exc_info:
+                await tools._handle_create_cumulative_usage_alert(
+                    client,
+                    {"name": "Test", "threshold": -50},
+                )
+        assert "threshold" in exc_info.value.message.lower()
 
     @pytest.mark.asyncio
-    async def test_zero_threshold_returns_error(self):
+    async def test_zero_threshold_creates_the_alert(self):
         tools, client = _make_tools_with_client()
         with patch.object(
             tools, "_resolve_notification_config", return_value=_notification_config()
         ):
-            result = await tools._handle_create_cumulative_usage_alert(
-                client,
-                {"name": "Test", "threshold": 0},
-            )
-        assert isinstance(result[0], TextContent)
-        # 0 is falsy, so it hits the "not threshold" check
-        assert "threshold" in result[0].text.lower()
+            with patch.object(
+                tools, "_post_alert_creation_prompting", new_callable=AsyncMock, return_value=""
+            ):
+                await tools._handle_create_cumulative_usage_alert(
+                    client,
+                    {"name": "Test", "threshold": 0},
+                )
+        call_data = tools.anomaly_manager.create_anomaly.call_args[0][1]
+        assert call_data["threshold"] == 0.0
 
     @pytest.mark.asyncio
     async def test_non_numeric_threshold_returns_error(self):
@@ -407,12 +413,12 @@ class TestHandleCreateCumulativeUsageAlert:
         with patch.object(
             tools, "_resolve_notification_config", return_value=_notification_config()
         ):
-            result = await tools._handle_create_cumulative_usage_alert(
-                client,
-                {"name": "Test", "threshold": "not-a-number"},
-            )
-        assert isinstance(result[0], TextContent)
-        assert "threshold" in result[0].text.lower()
+            with pytest.raises(ToolError) as exc_info:
+                await tools._handle_create_cumulative_usage_alert(
+                    client,
+                    {"name": "Test", "threshold": "not-a-number"},
+                )
+        assert "threshold" in exc_info.value.message.lower()
 
     @pytest.mark.asyncio
     async def test_invalid_period_returns_error(self):
@@ -420,26 +426,28 @@ class TestHandleCreateCumulativeUsageAlert:
         with patch.object(
             tools, "_resolve_notification_config", return_value=_notification_config()
         ):
-            result = await tools._handle_create_cumulative_usage_alert(
-                client,
-                {"name": "Test", "threshold": 100, "period": "biweekly"},
-            )
-        assert isinstance(result[0], TextContent)
-        assert "period" in result[0].text.lower()
+            with pytest.raises(ToolError) as exc_info:
+                await tools._handle_create_cumulative_usage_alert(
+                    client,
+                    {"name": "Test", "threshold": 100, "period": "biweekly"},
+                )
+        assert "period" in exc_info.value.message.lower()
 
     @pytest.mark.asyncio
-    async def test_notification_validation_error_returns_message(self):
+    async def test_notification_validation_error_raises_with_the_advice(self):
         tools, client = _make_tools_with_client()
         mock_err = ValidationError(message="No email found", field="email")
         with patch.object(
             tools, "_resolve_notification_config", side_effect=mock_err
         ):
-            result = await tools._handle_create_cumulative_usage_alert(
-                client,
-                {"name": "Test", "threshold": 100},
-            )
-        assert isinstance(result[0], TextContent)
-        assert "email" in result[0].text.lower() or "error" in result[0].text.lower()
+            with pytest.raises(ToolError) as exc_info:
+                await tools._handle_create_cumulative_usage_alert(
+                    client,
+                    {"name": "Test", "threshold": 100},
+                )
+        assert "No email found" in str(exc_info.value)
+        assert exc_info.value.field == "email"
+        tools.anomaly_manager.create_anomaly.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_api_error_returns_resource_error(self):
@@ -450,12 +458,12 @@ class TestHandleCreateCumulativeUsageAlert:
         with patch.object(
             tools, "_resolve_notification_config", return_value=_notification_config()
         ):
-            result = await tools._handle_create_cumulative_usage_alert(
-                client,
-                {"name": "Test", "threshold": 100},
-            )
-        assert isinstance(result[0], TextContent)
-        assert "failed" in result[0].text.lower()
+            with pytest.raises(ToolError) as exc_info:
+                await tools._handle_create_cumulative_usage_alert(
+                    client,
+                    {"name": "Test", "threshold": 100},
+                )
+        assert "failed" in exc_info.value.message.lower()
 
     @pytest.mark.asyncio
     async def test_period_case_insensitive(self):
@@ -747,18 +755,20 @@ class TestHandleCreateThresholdAlert:
         assert call_data["metricType"] == "TOKEN_COUNT"
 
     @pytest.mark.asyncio
-    async def test_notification_validation_error_returns_message(self):
+    async def test_notification_validation_error_raises_with_the_advice(self):
         tools, client = _make_tools_with_client()
         mock_err = ValidationError(message="No email", field="email")
         with patch.object(
             tools, "_resolve_notification_config", side_effect=mock_err
         ):
-            result = await tools._handle_create_threshold_alert(
-                client,
-                {"name": "Test", "threshold": 100},
-            )
-        assert isinstance(result[0], TextContent)
-        assert "No email" in result[0].text or "error" in result[0].text.lower()
+            with pytest.raises(ToolError) as exc_info:
+                await tools._handle_create_threshold_alert(
+                    client,
+                    {"name": "Test", "threshold": 100},
+                )
+        assert "No email" in str(exc_info.value)
+        assert exc_info.value.field == "email"
+        tools.anomaly_manager.create_anomaly.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_api_error_raises_tool_error(self):
@@ -836,7 +846,7 @@ class TestHandleCreateFromText:
         parsed = {"detection_rules": [{"type": "threshold"}], "name": "Parsed Alert"}
         tools.semantic_processor.parse_alert_request = MagicMock(return_value=parsed)
         await tools._handle_create_from_text(
-            client, {"text": "alert me when cost exceeds 100"}
+            client, {"text": "alert me when cost exceeds 100", "email": "a@b.com"}
         )
         tools.semantic_processor.parse_alert_request.assert_called_once()
         # Should pass parsed data to create_anomaly
@@ -871,7 +881,7 @@ class TestHandleCreateFromText:
             return_value={"name": "Fallback", "alertType": "THRESHOLD"},
         ) as mock_parse:
             await tools._handle_create_from_text(
-                client, {"text": "some alert text"}
+                client, {"text": "some alert text", "email": "a@b.com"}
             )
         mock_parse.assert_called_once()
 
@@ -886,7 +896,7 @@ class TestHandleCreateFromText:
         )
         with pytest.raises(ToolError):
             await tools._handle_create_from_text(
-                client, {"text": "alert me when cost exceeds 100"}
+                client, {"text": "alert me when cost exceeds 100", "email": "a@b.com"}
             )
 
     @pytest.mark.asyncio
@@ -900,7 +910,7 @@ class TestHandleCreateFromText:
         )
         with pytest.raises(ToolError) as exc_info:
             await tools._handle_create_from_text(
-                client, {"text": "alert me when cost exceeds 100"}
+                client, {"text": "alert me when cost exceeds 100", "email": "a@b.com"}
             )
         assert "Preserved error" in str(exc_info.value)
 
@@ -1012,6 +1022,50 @@ class TestSimpleParseAlertText:
         result = self._parse("alert on high usage")
         assert result["threshold"] == 100.0
 
+    @pytest.mark.parametrize(
+        "text, threshold, is_percentage",
+        [
+            ("alert-notification-email-p2: monthly budget of 999999 dollars", 999999.0, False),
+            ("budget for gpt-4 of 500 dollars", 500.0, False),
+            ("team-3 alert when cost exceeds $50 per hour", 50.0, False),
+            ("monthly budget for claude-3.5 of $1,200", 1200.0, False),
+            ("alert at 500", 500.0, False),
+            ("something weird 42", 42.0, False),
+            ("alert at 99.5", 99.5, False),
+            ("alert on high usage", 100.0, False),
+            ("daily budget 500 over 24 hours", 500.0, False),
+            ("weekly spending budget 2000 over 7 days", 2000.0, False),
+            ("Alert when total cost budget 500 over 15m", 500.0, False),
+            ("monthly budget 2000 for 5 models", 2000.0, False),
+            ("a 500-dollar monthly budget", 500.0, False),
+            ("cost above $.50", 0.5, False),
+            ("error rate above 2.5 percent", 2.5, True),
+            ("error rate above 5%", 5.0, True),
+        ],
+    )
+    def test_threshold_is_the_number_next_to_the_money_words(
+        self, text, threshold, is_percentage
+    ):
+        """BACK-4800: a digit in a name or a window is never the threshold."""
+        result = self._parse(text)
+        assert result["threshold"] == threshold
+        assert result["isPercentage"] is is_percentage
+
+    @pytest.mark.parametrize(
+        "text, is_percentage",
+        [
+            ("phase 2 alert when total cost hits 5 percent", True),
+            ("phase 2 alert when total cost hits 5 pct", True),
+            ("phase 2 alert when total cost hits 5%", True),
+            ("phase 2 alert when total cost hits 5 %", True),
+            ("phase 2 alert when total cost hits 500", False),
+        ],
+    )
+    def test_a_percent_word_makes_the_threshold_a_percentage(self, text, is_percentage):
+        """BACK-4839: "5 percent" is a percentage alert, not an absolute cost of 5."""
+        result = self._parse(text)
+        assert result["isPercentage"] is is_percentage
+
     # --- Name generation ---
 
     def test_short_text_name(self):
@@ -1037,51 +1091,24 @@ class TestSimpleParseAlertText:
         for field in required:
             assert field in result, f"Missing field: {field}"
 
-    def test_notification_fallback_when_config_raises(self):
-        """When _resolve_notification_config raises, fallback email logic runs."""
+    def test_a_resolver_that_finds_no_email_refuses_the_parse(self):
         tools = AlertManagement()
         with patch.object(
             tools,
             "_resolve_notification_config",
             side_effect=ValidationError(message="No email", field="email"),
         ):
-            with patch.dict("os.environ", {"REVENIUM_DEFAULT_EMAIL": "fallback@test.com"}):
-                result = tools._simple_parse_alert_text("budget alert at 500")
-        assert result["notificationAddresses"] == ["fallback@test.com"]
+            with pytest.raises(ValidationError):
+                tools._simple_parse_alert_text("budget alert at 500")
 
-    def test_notification_fallback_skips_dummy_email(self):
+    def test_a_passed_notification_config_is_used_as_is(self):
         tools = AlertManagement()
-        mock_config = MagicMock()
-        mock_config.default_email = "discovered@test.com"
-        with patch.object(
-            tools,
-            "_resolve_notification_config",
-            side_effect=ValidationError(message="No email", field="email"),
-        ):
-            with patch.dict("os.environ", {"REVENIUM_DEFAULT_EMAIL": "dummy@email.com"}):
-                with patch(
-                    "src.revenium_mcp_server.config_store.get_discovered_config_sync",
-                    return_value=mock_config,
-                ):
-                    result = tools._simple_parse_alert_text("alert at 100")
-        assert result["notificationAddresses"] == ["discovered@test.com"]
-
-    def test_notification_fallback_to_admin_default(self):
-        tools = AlertManagement()
-        mock_config = MagicMock()
-        mock_config.default_email = None
-        with patch.object(
-            tools,
-            "_resolve_notification_config",
-            side_effect=ValidationError(message="No email", field="email"),
-        ):
-            with patch.dict("os.environ", {}, clear=True):
-                with patch(
-                    "src.revenium_mcp_server.config_store.get_discovered_config_sync",
-                    return_value=mock_config,
-                ):
-                    result = tools._simple_parse_alert_text("alert at 100")
-        assert result["notificationAddresses"] == ["admin@example.com"]
+        config = _notification_config("passed@test.com", slack="slack_1")
+        with patch.object(tools, "_resolve_notification_config") as resolver:
+            result = tools._simple_parse_alert_text("alert at 100", config)
+        resolver.assert_not_called()
+        assert result["notificationAddresses"] == ["passed@test.com"]
+        assert result["slackConfigurations"] == ["slack_1"]
 
 
 # ===========================================================================
@@ -1134,15 +1161,17 @@ class TestHandleCreateSimple:
         assert call_data["threshold"] == 5.0
 
     @pytest.mark.asyncio
-    async def test_notification_error_returns_message(self):
+    async def test_notification_error_raises_with_the_advice(self):
         tools, client = _make_tools_with_client()
         mock_err = ValidationError(message="No email", field="email")
         with patch.object(
             tools, "_resolve_notification_config", side_effect=mock_err
         ):
-            result = await tools._handle_create_simple(client, {})
-        assert isinstance(result[0], TextContent)
-        assert "No email" in result[0].text or "error" in result[0].text.lower()
+            with pytest.raises(ToolError) as exc_info:
+                await tools._handle_create_simple(client, {})
+        assert "No email" in str(exc_info.value)
+        assert exc_info.value.field == "email"
+        tools.anomaly_manager.create_anomaly.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_api_error_raises_tool_error(self):
@@ -1195,6 +1224,7 @@ class TestHandleCreateSimple:
         assert "TOKEN_COUNT" in call_data["description"]
 
 
+@pytest.mark.usefixtures("alert_owner_email")
 class TestCreateFlatFieldMerge:
     """create must accept the flat top-level fields its own get_examples
     documents (name/alertType/metricType/threshold/email/...), assembling
@@ -1242,7 +1272,8 @@ class TestCreateFlatFieldMerge:
         assert data["threshold"] == 5  # flat fills the gap nested left open
 
     @pytest.mark.asyncio
-    async def test_flat_email_does_not_clobber_nested_notifications(self):
+    async def test_flat_email_joins_nested_notifications(self):
+        """BACK-4799: recipients are the union of the flat and nested ones."""
         tools, client = _make_tools_with_client()
         args = {
             "email": "flat@company.com",
@@ -1254,7 +1285,7 @@ class TestCreateFlatFieldMerge:
         await tools._handle_anomaly_operations(client, "create", args)
 
         data = tools.anomaly_manager.create_anomaly.call_args[0][1]
-        assert data["notificationAddresses"] == ["nested@company.com"]
+        assert data["notificationAddresses"] == ["flat@company.com", "nested@company.com"]
 
     @pytest.mark.asyncio
     async def test_create_with_no_fields_still_errors(self):
@@ -1288,7 +1319,7 @@ class TestCreateFlatFieldMerge:
         """The platform rejects ONE_MINUTE/FIVE_MINUTES for non-cumulative
         alerts with a message the client used to swallow — the tool must
         reject locally with the actionable message instead."""
-        tools, client = _make_tools_with_client()
+        tools, client = _make_tools_with_platform_client()
         args = {
             "name": "Spike",
             "alertType": "THRESHOLD",
@@ -1300,7 +1331,7 @@ class TestCreateFlatFieldMerge:
         with pytest.raises(ToolError) as exc_info:
             await tools._handle_anomaly_operations(client, "create", args)
         assert "FIFTEEN_MINUTES" in str(exc_info.value)
-        tools.anomaly_manager.create_anomaly.assert_not_called()
+        client.create_anomaly.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_direct_create_allows_cumulative_monthly(self):
@@ -1339,7 +1370,7 @@ class TestCreateFlatFieldMerge:
     async def test_direct_create_rejects_ten_minutes(self):
         """TEN_MINUTES never existed in the platform enum — same opaque
         failure as the banned periods, same local guard."""
-        tools, client = _make_tools_with_client()
+        tools, client = _make_tools_with_platform_client()
         args = {
             "name": "Spike",
             "alertType": "THRESHOLD",
@@ -1351,4 +1382,31 @@ class TestCreateFlatFieldMerge:
         with pytest.raises(ToolError) as exc_info:
             await tools._handle_anomaly_operations(client, "create", args)
         assert "FIFTEEN_MINUTES" in str(exc_info.value)
-        tools.anomaly_manager.create_anomaly.assert_not_called()
+        client.create_anomaly.assert_not_called()
+
+
+class TestAlertTextParserDefaultEmail:
+    """The alert text parser applies the same default-email rule as the alert tool."""
+
+    def test_parser_strips_the_env_email(self):
+        with patch.dict("os.environ", {"REVENIUM_DEFAULT_EMAIL": "  env@test.com  "}):
+            result = AlertSemanticProcessor().parse_alert_request("alert when cost exceeds 100")
+        assert result["notification_addresses"] == ["env@test.com"]
+
+    def test_parser_falls_back_to_the_discovered_email(self):
+        with patch.dict("os.environ", {"REVENIUM_DEFAULT_EMAIL": "dummy@email.com"}):
+            with patch(
+                "src.revenium_mcp_server.config_store.get_discovered_value",
+                return_value="discovered@corp.com",
+            ):
+                result = AlertSemanticProcessor().parse_alert_request("alert when cost exceeds 100")
+        assert result["notification_addresses"] == ["discovered@corp.com"]
+
+    def test_parser_names_no_recipient_when_nothing_is_known(self):
+        with patch.dict("os.environ", {}, clear=True):
+            with patch(
+                "src.revenium_mcp_server.config_store.get_discovered_value",
+                return_value=None,
+            ):
+                result = AlertSemanticProcessor().parse_alert_request("alert when cost exceeds 100")
+        assert result["notification_addresses"] == []

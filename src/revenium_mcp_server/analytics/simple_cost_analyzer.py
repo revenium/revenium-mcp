@@ -5,13 +5,38 @@ This module provides reliable cost analysis using only proven API endpoints.
 Focus on 95%+ success rate with simple, robust implementations.
 """
 
+import asyncio
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+from ..analytics_window import AnalyticsWindow
+from ..client import recording_retried_errors
+from ..constants import USER_COSTS_DEFAULT_PAGE_SIZE
 from ..endpoint_registry import resolve_analytics_request
+from .bucket_aggregation import metric_type_for, rank_entities
 from .department_costs import DEPARTMENT_COSTS_ENDPOINT_KEY, DepartmentCostsQuery
+from .envelope_reads import (
+    ENVELOPE_PAGE_SIZE,
+    EnvelopeRead,
+    UnreadPages,
+    envelope_items,
+    read_every_page,
+)
+from .paging import PageInfo
+from .ranked_rows import bare_cost, metric_total, rank_with_shares
+from .report_reads import fails_whole_call, read_failure_reason
+from ..tool_analytics_reports import (
+    COST_BY_TOOL_AGENT,
+    COST_BY_TOOL_AGGREGATED,
+    COST_BY_TOOL_PROVIDER,
+    TOP_TOOLS_BY_CALL_COUNT,
+    ToolReport,
+    ToolReportWindow,
+)
+from .tool_reports import ToolReportRead, read_tool_report
 from .validation import DEFAULT_USER_COST_SOURCES, ValidationError
 
 logger = logging.getLogger(__name__)
@@ -39,6 +64,151 @@ _FILTER_OPTION_DIMENSIONS = frozenset(
         "vendors",
     }
 )
+
+_USERS_FILTER_DIMENSION = "users"
+
+
+def _repeated_when_single(values: Sequence[str]) -> List[str]:
+    # specs/openapi/isotope.json, token-breakdown-by-type providers: "A single
+    # value is currently rejected with a 400, so to filter on one provider
+    # pass it twice."
+    return [values[0], values[0]] if len(values) == 1 else list(values)
+
+
+def _filter_options_cost_sources(
+    dimension: str, cost_sources: Optional[Sequence[str]]
+) -> Optional[Dict[str, Any]]:
+    """Query parameters that draw a filter-options list by cost source."""
+    if dimension == _USERS_FILTER_DIMENSION:
+        return {"costSources": list(cost_sources or DEFAULT_USER_COST_SOURCES)}
+    if cost_sources:
+        raise ValidationError(
+            f"Only the users list is drawn by cost source, not {dimension}",
+            field="filters.costSources",
+            suggestions=[
+                "Omit filters.costSources for this dimension",
+                "Use dimension='users' to list the people with spend from those sources",
+            ],
+        )
+    return None
+
+# Cost fields a bare model or customer row may carry, in the order they are read
+_BARE_COST_FIELDS = ("metricResult", "cost", "totalCost", "amount")
+
+AGENT_COSTS_ENDPOINT_KEY = "cost_metrics_by_agents_over_time"
+AGENT_COSTS_BY_COST_SOURCE_ENDPOINT_KEY = "cost_by_agent_by_cost_source"
+
+
+def agent_costs_endpoint_key(filters: Optional[Dict[str, Any]]) -> str:
+    """The registry key an agent cost read uses: only a cost-source filter forces the analytics route."""
+    if (filters or {}).get("costSources"):
+        return AGENT_COSTS_BY_COST_SOURCE_ENDPOINT_KEY
+    return AGENT_COSTS_ENDPOINT_KEY
+
+
+@dataclass(frozen=True)
+class SummaryPart:
+    """One of the cost reports the cost summary is built from."""
+
+    key: str
+    label: str
+    action: str
+    top_key: str
+
+
+COST_SUMMARY_PARTS = (
+    SummaryPart("provider_costs", "Providers", "get_provider_costs", "top_providers"),
+    SummaryPart("model_costs", "Models", "get_model_costs", "top_models"),
+    SummaryPart("customer_costs", "Customers", "get_customer_costs", "top_customers"),
+    SummaryPart("api_key_costs", "API keys", "get_api_key_costs", "top_api_keys"),
+    SummaryPart("agent_costs", "Agents", "get_agent_costs", "top_agents"),
+)
+
+
+def _top_contributors(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The three costliest rows that added cost, highest first."""
+    return [row for row in rows if row.get("cost", 0) > 0][:3]
+
+# Above the client's default 30-second request timeout, so one slow request can
+# still finish; a 12-month summary took 124.70 seconds on dev without a limit.
+COST_SUMMARY_PART_TIME_LIMIT_SECONDS = 45.0
+
+
+def summary_part_time_limit_text() -> str:
+    """The per-part time limit as the answer states it, e.g. "45 seconds"."""
+    return f"{COST_SUMMARY_PART_TIME_LIMIT_SECONDS:g} seconds"
+
+
+class TeamIdUnavailableError(Exception):
+    """The server has no team id to read cost reports for."""
+
+
+class CostSummaryUnreadError(Exception):
+    """No part of the cost summary could be read."""
+
+    def __init__(self, not_read: Dict[str, str]):
+        self.not_read = not_read
+        parts = {part.key: part for part in COST_SUMMARY_PARTS}
+        super().__init__(
+            "No part of the cost summary could be read: "
+            + "; ".join(
+                f"{parts[key].label} ({parts[key].action}): {reason}"
+                for key, reason in not_read.items()
+            )
+        )
+
+
+@dataclass(frozen=True)
+class PackRows:
+    """Rows of an analytics-pack read, carrying the pages left unread so no renderer can drop them."""
+
+    rows: List[Dict[str, Any]]
+    unread: Optional[UnreadPages] = None
+
+
+class RankedCosts(List[Dict[str, Any]]):
+    """Ranked cost rows, carrying the pages left unread so no renderer can drop them."""
+
+    def __init__(self, rows: List[Dict[str, Any]], unread: Optional[UnreadPages] = None):
+        super().__init__(rows)
+        self.unread = unread
+
+
+class ToolRows(List[Dict[str, Any]]):
+    """Tool report rows, carrying the window the platform was asked for and the pages left unread."""
+
+    def __init__(self, rows: List[Dict[str, Any]], read: ToolReportRead):
+        super().__init__(rows)
+        self.window = read.window
+        self.unread = read.unread
+
+
+@dataclass(frozen=True)
+class RankedRequest:
+    """A resolved ranked cost report request."""
+
+    endpoint_key: str
+    path: str
+    params: Dict[str, Any]
+    call_kwargs: Dict[str, Any]
+
+    @property
+    def routes_to_legacy_api(self) -> bool:
+        return not self.call_kwargs
+
+
+@dataclass(frozen=True)
+class RankedReportRead:
+    """A ranked report's response: every page's buckets on the analytics API, the raw body on the legacy one."""
+
+    response: Any
+    unread: Optional[UnreadPages] = None
+
+
+@dataclass(frozen=True)
+class UserCostsPage:
+    users: List[Dict[str, Any]]
+    paging: PageInfo
 
 
 class SimpleCostAnalyzer:
@@ -108,7 +278,7 @@ class SimpleCostAnalyzer:
         # Return original name if no mapping found (preserves unknown providers)
         return provider_name
 
-    async def get_provider_costs(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
+    async def get_provider_costs(self, period: AnalyticsWindow, aggregation: str) -> RankedCosts:
         """
         Get provider costs using proven API endpoint.
 
@@ -127,27 +297,16 @@ class SimpleCostAnalyzer:
                 f"Getting provider costs for period={period}, aggregation={aggregation}"
             )
 
-            # Get team_id from client (required for all analytics endpoints)
-            team_id = getattr(self.client, "team_id", None)
-            if not team_id:
-                # Try to get from environment as fallback
-                import os
-
-                team_id = os.getenv("REVENIUM_TEAM_ID")
-                if not team_id:
-                    raise Exception("Team ID not available from client or environment")
-
-            extra_old = {"group": aggregation} if aggregation else {}
-            path, params, call_kwargs = resolve_analytics_request(
-                "cost_metric_by_provider_over_time", team_id, period,
-                extra_old_params=extra_old,
+            request = self._resolve_ranked_request(
+                "cost_metric_by_provider_over_time", period, aggregation
             )
 
-            response = await self.client.get(path, params=params, **call_kwargs)
+            read = await self._read_ranked_report(request)
+            response = read.response
 
             if not response:
                 self.logger.warning("Empty response from provider costs API")
-                return []
+                return RankedCosts([])
 
             # Handle the actual API response format (list of provider data)
             if isinstance(response, list):
@@ -158,10 +317,10 @@ class SimpleCostAnalyzer:
 
             if not isinstance(data, list) or not data:
                 self.logger.warning(f"Unexpected or empty data format: {type(data)}")
-                return []
+                return RankedCosts([])
 
             # Process and rank the data
-            processed_data = self._process_provider_data(data)
+            processed_data = RankedCosts(self._process_provider_data(data, aggregation), read.unread)
 
             self.logger.info(f"Successfully retrieved {len(processed_data)} provider cost records")
             return processed_data
@@ -171,7 +330,7 @@ class SimpleCostAnalyzer:
             # Re-raise original exception to preserve API error details (status codes, response data, etc.)
             raise
 
-    async def get_model_costs(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
+    async def get_model_costs(self, period: AnalyticsWindow, aggregation: str) -> RankedCosts:
         """
         Get model costs using proven API endpoint.
 
@@ -188,25 +347,14 @@ class SimpleCostAnalyzer:
         try:
             self.logger.info(f"Getting model costs for period={period}, aggregation={aggregation}")
 
-            # Get team_id from client (required for all analytics endpoints)
-            team_id = getattr(self.client, "team_id", None)
-            if not team_id:
-                # Try to get from environment as fallback
-                import os
-
-                team_id = os.getenv("REVENIUM_TEAM_ID")
-                if not team_id:
-                    raise Exception("Team ID not available from client or environment")
-
-            extra_old = {"group": aggregation} if aggregation else {}
-            path, params, call_kwargs = resolve_analytics_request(
-                "cost_metric_by_model", team_id, period,
-                extra_old_params=extra_old,
+            request = self._resolve_ranked_request(
+                "cost_metric_by_model", period, aggregation
             )
 
-            self.logger.info(f"DEBUG: Making API call to {path} with params: {params}")
+            self.logger.info(f"DEBUG: Making API call to {request.path} with params: {request.params}")
 
-            response = await self.client.get(path, params=params, **call_kwargs)
+            read = await self._read_ranked_report(request)
+            response = read.response
 
             self.logger.info(f"DEBUG: Raw API response type: {type(response)}")
             if isinstance(response, (list, dict)):
@@ -235,7 +383,7 @@ class SimpleCostAnalyzer:
 
             # Handle direct response with groups (total endpoint format)
             if isinstance(data, dict) and "groups" in data:
-                model_totals = {}
+                model_totals: Dict[str, float] = {}
                 groups = data.get("groups", [])
                 self.logger.info(
                     f"DEBUG: Processing {len(groups)} groups from total endpoint response"
@@ -246,30 +394,15 @@ class SimpleCostAnalyzer:
                         continue
 
                     model_name = group.get("groupName", "Unknown Model")
-                    metrics = group.get("metrics", [])
+                    cost = metric_total(group.get("metrics", []))
+                    if cost is not None:
+                        model_totals[model_name] = model_totals.get(model_name, 0.0) + cost
+                        total_cost += cost
+                        self.logger.info(f"DEBUG: Found model {model_name} with cost ${cost}")
 
-                    for metric in metrics:
-                        if not isinstance(metric, dict):
-                            continue
-
-                        # Extract metricResult as shown in the API response example
-                        cost = float(metric.get("metricResult", 0))
-                        if cost > 0:
-                            if model_name not in model_totals:
-                                model_totals[model_name] = 0
-                            model_totals[model_name] += cost
-                            total_cost += cost
-                            self.logger.info(f"DEBUG: Found model {model_name} with cost ${cost}")
-
-                # Convert to list format
-                for model, cost in model_totals.items():
-                    processed_data.append(
-                        {
-                            "model": model,
-                            "cost": cost,
-                            "percentage": (cost / total_cost * 100) if total_cost > 0 else 0,
-                        }
-                    )
+                processed_data = [
+                    {"model": model, "cost": cost} for model, cost in model_totals.items()
+                ]
 
             # Try time-series format (list with nested groups)
             elif (
@@ -278,41 +411,11 @@ class SimpleCostAnalyzer:
                 and isinstance(data[0], dict)
                 and "groups" in data[0]
             ):
-                model_totals = {}
-
-                for i, time_entry in enumerate(data):
-                    if not isinstance(time_entry, dict):
-                        continue
-
-                    groups = time_entry.get("groups", [])
-                    for j, group in enumerate(groups):
-                        if not isinstance(group, dict):
-                            continue
-
-                        model_name = group.get("groupName", "Unknown Model")
-                        metrics = group.get("metrics", [])
-
-                        for k, metric in enumerate(metrics):
-                            if not isinstance(metric, dict):
-                                continue
-
-                            # Use metricResult as shown in the API response example
-                            cost = float(metric.get("metricResult", 0))
-                            if cost > 0:
-                                if model_name not in model_totals:
-                                    model_totals[model_name] = 0
-                                model_totals[model_name] += cost
-                                total_cost += cost
-
-                # Convert to list format
-                for model, cost in model_totals.items():
-                    processed_data.append(
-                        {
-                            "model": model,
-                            "cost": cost,
-                            "percentage": (cost / total_cost * 100) if total_cost > 0 else 0,
-                        }
-                    )
+                processed_data = rank_entities(
+                    data, aggregation, entity_key="model", default_name="Unknown Model",
+                    keep_nonpositive=True,
+                )
+                total_cost = sum(row["cost"] for row in processed_data)
 
             # Try direct format (simple list of model objects)
             else:
@@ -329,51 +432,30 @@ class SimpleCostAnalyzer:
                         or "Unknown Model"
                     )
 
-                    # Extract cost from nested metrics structure or direct fields
-                    cost = 0.0
-                    if (
-                        "metrics" in item
-                        and isinstance(item["metrics"], list)
-                        and len(item["metrics"]) > 0
-                    ):
-                        # Handle nested metrics structure: {'groupName': '...', 'metrics': [{'metricResult': 1200.0}]}
-                        for metric in item["metrics"]:
-                            if isinstance(metric, dict) and "metricResult" in metric:
-                                metric_result = metric.get("metricResult", 0)
-                                if isinstance(metric_result, (int, float)):
-                                    cost += metric_result
+                    # Nested metrics structure: {'groupName': '...', 'metrics': [{'metricResult': 1200.0}]}
+                    metrics = item.get("metrics")
+                    if isinstance(metrics, list) and metrics:
+                        cost = metric_total(metrics)
                     else:
-                        # Handle direct cost fields
-                        cost = float(
-                            item.get("metricResult", 0)
-                            or item.get("cost", 0)
-                            or item.get("totalCost", 0)
-                            or item.get("amount", 0)
-                            or 0
-                        )
+                        cost = bare_cost(item, _BARE_COST_FIELDS)
 
-                    if cost > 0:
+                    if cost is not None:
                         processed_data.append({"model": model_name, "cost": cost})
                         total_cost += cost
 
-                # Calculate percentages
-                for item in processed_data:
-                    item["percentage"] = (item["cost"] / total_cost * 100) if total_cost > 0 else 0
-
-            # Sort by cost (highest first)
-            processed_data.sort(key=lambda x: x["cost"], reverse=True)
+            rank_with_shares(processed_data)
 
             self.logger.info(
                 f"Successfully processed {len(processed_data)} model cost records, total: ${total_cost:.2f}"
             )
-            return processed_data
+            return RankedCosts(processed_data, read.unread)
 
         except Exception as e:
             self.logger.error(f"Failed to get model costs: {e}")
             # Re-raise original exception to preserve API error details (status codes, response data, etc.)
             raise
 
-    async def get_customer_costs(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
+    async def get_customer_costs(self, period: AnalyticsWindow, aggregation: str) -> RankedCosts:
         """
         Get customer costs using proven API endpoint.
 
@@ -392,25 +474,14 @@ class SimpleCostAnalyzer:
                 f"Getting customer costs for period={period}, aggregation={aggregation}"
             )
 
-            # Get team_id from client (required for all analytics endpoints)
-            team_id = getattr(self.client, "team_id", None)
-            if not team_id:
-                # Try to get from environment as fallback
-                import os
-
-                team_id = os.getenv("REVENIUM_TEAM_ID")
-                if not team_id:
-                    raise Exception("Team ID not available from client or environment")
-
-            extra_old = {"group": aggregation} if aggregation else {}
-            path, params, call_kwargs = resolve_analytics_request(
-                "cost_metric_by_organization", team_id, period,
-                extra_old_params=extra_old,
+            request = self._resolve_ranked_request(
+                "cost_metric_by_organization", period, aggregation
             )
 
-            self.logger.info(f"DEBUG: Making API call to {path} with params: {params}")
+            self.logger.info(f"DEBUG: Making API call to {request.path} with params: {request.params}")
 
-            response = await self.client.get(path, params=params, **call_kwargs)
+            read = await self._read_ranked_report(request)
+            response = read.response
 
             self.logger.info(f"DEBUG: Raw API response type: {type(response)}")
             # Handle the actual API response format
@@ -428,13 +499,15 @@ class SimpleCostAnalyzer:
             if not isinstance(data, list):
                 self.logger.warning(f"Unexpected data format: {type(data)}")
                 # Return debug info for unexpected format
-                return [
-                    {
-                        "customer": "DEBUG_INFO",
-                        "cost": 0,
-                        "debug": f"Unexpected data format: {type(data)}, response: {str(response)[:500]}",
-                    }
-                ]
+                return RankedCosts(
+                    [
+                        {
+                            "customer": "DEBUG_INFO",
+                            "cost": 0,
+                            "debug": f"Unexpected data format: {type(data)}, response: {str(response)[:500]}",
+                        }
+                    ]
+                )
 
             # Process the data - try multiple response formats with comprehensive debug logging
             processed_data = []
@@ -442,40 +515,11 @@ class SimpleCostAnalyzer:
 
             # Try time-series format first (like provider costs)
             if data and isinstance(data[0], dict) and "groups" in data[0]:
-                customer_totals = {}
-
-                for i, time_entry in enumerate(data):
-                    if not isinstance(time_entry, dict):
-                        continue
-
-                    groups = time_entry.get("groups", [])
-                    for j, group in enumerate(groups):
-                        if not isinstance(group, dict):
-                            continue
-
-                        customer_name = group.get("groupName", "Unknown Customer")
-                        metrics = group.get("metrics", [])
-
-                        for k, metric in enumerate(metrics):
-                            if not isinstance(metric, dict):
-                                continue
-
-                            cost = float(metric.get("metricResult", 0))
-                            if cost > 0:
-                                if customer_name not in customer_totals:
-                                    customer_totals[customer_name] = 0
-                                customer_totals[customer_name] += cost
-                                total_cost += cost
-
-                # Convert to list format
-                for customer, cost in customer_totals.items():
-                    processed_data.append(
-                        {
-                            "customer": customer,
-                            "cost": cost,
-                            "percentage": (cost / total_cost * 100) if total_cost > 0 else 0,
-                        }
-                    )
+                processed_data = rank_entities(
+                    data, aggregation, entity_key="customer", default_name="Unknown Customer",
+                    keep_nonpositive=True,
+                )
+                total_cost = sum(row["cost"] for row in processed_data)
 
             # Try direct format (simple list of customer objects)
             else:
@@ -491,36 +535,25 @@ class SimpleCostAnalyzer:
                         or item.get("groupName")
                         or "Unknown Customer"
                     )
-                    cost = float(
-                        item.get("metricResult", 0)
-                        or item.get("cost", 0)
-                        or item.get("totalCost", 0)
-                        or item.get("amount", 0)
-                        or 0
-                    )
+                    cost = bare_cost(item, _BARE_COST_FIELDS)
 
-                    if cost > 0:
+                    if cost is not None:
                         processed_data.append({"customer": customer_name, "cost": cost})
                         total_cost += cost
 
-                # Calculate percentages
-                for item in processed_data:
-                    item["percentage"] = (item["cost"] / total_cost * 100) if total_cost > 0 else 0
-
-            # Sort by cost (highest first)
-            processed_data.sort(key=lambda x: x["cost"], reverse=True)
+            rank_with_shares(processed_data)
 
             self.logger.info(
                 f"Successfully processed {len(processed_data)} customer cost records, total: ${total_cost:.2f}"
             )
-            return processed_data
+            return RankedCosts(processed_data, read.unread)
 
         except Exception as e:
             self.logger.error(f"Failed to get customer costs: {e}")
             # Re-raise original exception to preserve API error details (status codes, response data, etc.)
             raise
 
-    async def investigate_cost_spike(self, threshold: float, period: str) -> Dict[str, Any]:
+    async def investigate_cost_spike(self, threshold: float, period: AnalyticsWindow) -> Dict[str, Any]:
         """
         Investigate cost spikes above threshold by combining provider, model, and customer data.
 
@@ -633,7 +666,7 @@ class SimpleCostAnalyzer:
 
         return contributors
 
-    async def get_api_key_costs(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
+    async def get_api_key_costs(self, period: AnalyticsWindow, aggregation: str) -> RankedCosts:
         """
         Get API key costs using proven API endpoint.
 
@@ -652,25 +685,14 @@ class SimpleCostAnalyzer:
                 f"Getting API key costs for period={period}, aggregation={aggregation}"
             )
 
-            # Get team_id from client (required for all analytics endpoints)
-            team_id = getattr(self.client, "team_id", None)
-            if not team_id:
-                # Try to get from environment as fallback
-                import os
-
-                team_id = os.getenv("REVENIUM_TEAM_ID")
-                if not team_id:
-                    raise Exception("Team ID not available from client or environment")
-
-            extra_old = {"group": aggregation} if aggregation else {}
-            path, params, call_kwargs = resolve_analytics_request(
-                "cost_metrics_by_subscriber_credential", team_id, period,
-                extra_old_params=extra_old,
+            request = self._resolve_ranked_request(
+                "cost_metrics_by_subscriber_credential", period, aggregation
             )
 
-            self.logger.info(f"DEBUG: Making API call to {path} with params: {params}")
+            self.logger.info(f"DEBUG: Making API call to {request.path} with params: {request.params}")
 
-            response = await self.client.get(path, params=params, **call_kwargs)
+            read = await self._read_ranked_report(request)
+            response = read.response
 
             self.logger.info(f"DEBUG: Raw API response type: {type(response)}")
             if isinstance(response, (list, dict)):
@@ -680,7 +702,7 @@ class SimpleCostAnalyzer:
 
             if not response:
                 self.logger.warning("Empty response from API key costs API")
-                return []
+                return RankedCosts([])
 
             # Handle the actual API response format
             if isinstance(response, list):
@@ -691,10 +713,10 @@ class SimpleCostAnalyzer:
 
             if not isinstance(data, list) or not data:
                 self.logger.warning(f"Unexpected or empty data format: {type(data)}")
-                return []
+                return RankedCosts([])
 
             # Process and rank the data
-            processed_data = self._process_api_key_data(data)
+            processed_data = RankedCosts(self._process_api_key_data(data, aggregation), read.unread)
 
             self.logger.info(f"Successfully retrieved {len(processed_data)} API key cost records")
             return processed_data
@@ -705,8 +727,8 @@ class SimpleCostAnalyzer:
             raise
 
     async def get_agent_costs(
-        self, period: str, aggregation: str, filters: Optional[Dict[str, Any]] = None
-    ) -> List[Dict[str, Any]]:
+        self, period: AnalyticsWindow, aggregation: str, filters: Optional[Dict[str, Any]] = None
+    ) -> RankedCosts:
         """
         Get agent costs using proven API endpoint.
 
@@ -720,48 +742,21 @@ class SimpleCostAnalyzer:
             List of agent cost data
 
         Raises:
-            ValidationError: If costSources is requested while the legacy API
-                (which has no costSource param) is active
             Exception: If API call fails
         """
         try:
             self.logger.info(f"Getting agent costs for period={period}, aggregation={aggregation}")
 
-            # Get team_id from client (required for all analytics endpoints)
-            team_id = getattr(self.client, "team_id", None)
-            if not team_id:
-                # Try to get from environment as fallback
-                import os
-
-                team_id = os.getenv("REVENIUM_TEAM_ID")
-                if not team_id:
-                    raise Exception("Team ID not available from client or environment")
-
-            extra_old = {"group": aggregation} if aggregation else {}
             cost_sources = (filters or {}).get("costSources")
             extra_new = {"costSource": cost_sources} if cost_sources else None
-            path, params, call_kwargs = resolve_analytics_request(
-                "cost_metrics_by_agents_over_time", team_id, period,
-                extra_old_params=extra_old,
-                extra_new_params=extra_new,
+            request = self._resolve_ranked_request(
+                agent_costs_endpoint_key(filters), period, aggregation, extra_new
             )
 
-            # Empty call_kwargs means the legacy profitstream route was chosen,
-            # which has no costSource param — fail loudly rather than return
-            # unfiltered data the caller would read as filtered.
-            if cost_sources and not call_kwargs:
-                raise ValidationError(
-                    "The costSources filter requires the new analytics API",
-                    field="filters.costSources",
-                    suggestions=[
-                        "Set REVENIUM_USE_NEW_ANALYTICS_API=true to enable cost-source filtering",
-                        "Or omit filters.costSources to query the legacy endpoint",
-                    ],
-                )
+            self.logger.info(f"DEBUG: Making API call to {request.path} with params: {request.params}")
 
-            self.logger.info(f"DEBUG: Making API call to {path} with params: {params}")
-
-            response = await self.client.get(path, params=params, **call_kwargs)
+            read = await self._read_ranked_report(request)
+            response = read.response
 
             self.logger.info(f"DEBUG: Raw API response type: {type(response)}")
             if isinstance(response, (list, dict)):
@@ -771,7 +766,7 @@ class SimpleCostAnalyzer:
 
             if not response:
                 self.logger.warning("Empty response from agent costs API")
-                return []
+                return RankedCosts([])
 
             # Handle the actual API response format
             if isinstance(response, list):
@@ -782,10 +777,10 @@ class SimpleCostAnalyzer:
 
             if not isinstance(data, list) or not data:
                 self.logger.warning(f"Unexpected or empty data format: {type(data)}")
-                return []
+                return RankedCosts([])
 
             # Process and rank the data
-            processed_data = self._process_agent_data(data)
+            processed_data = RankedCosts(self._process_agent_data(data, aggregation), read.unread)
 
             self.logger.info(f"Successfully retrieved {len(processed_data)} agent cost records")
             return processed_data
@@ -796,84 +791,49 @@ class SimpleCostAnalyzer:
             raise
 
     async def get_user_costs(
-        self, period: str, aggregation: str, filters: Optional[Dict[str, Any]] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Get user costs using the new ClickHouse-backed analytics API.
-
-        Returns cost, request count, and token usage broken down by subscriber
-        email from AiMetricsCosted. Requires the new analytics API (FRONT-931).
+        self,
+        period: AnalyticsWindow,
+        aggregation: str,
+        filters: Optional[Dict[str, Any]] = None,
+        page: int = 0,
+        size: int = USER_COSTS_DEFAULT_PAGE_SIZE,
+    ) -> UserCostsPage:
+        """One page of cost, requests and tokens per subscriber email (new analytics API).
 
         Args:
             period: Time period (API-verified values only)
             aggregation: Aggregation type (API-verified values only)
             filters: Optional dict with array params: agents, providers, models,
                 users, costSources (DEFAULT_USER_COST_SOURCES when omitted)
+            page: Zero-based page number
+            size: Users per page, at most the platform's maximum of 100
 
         Returns:
-            List of user cost data with cost, requests, and tokens per user
-
-        Raises:
-            Exception: If API call fails
+            The users on the requested page and where that page sits in the report
         """
-        try:
-            self.logger.info("Getting user costs for period=%s, aggregation=%s", period, aggregation)
+        self.logger.info("Getting user costs for period=%s, aggregation=%s", period, aggregation)
 
-            team_id = self._get_team_id()
+        extra_new: Dict[str, Any] = dict(filters) if filters else {}
+        # The endpoint's own default is coding_assistant alone; ask for every
+        # source so the answer does not depend on how the tenant's traffic is classified.
+        extra_new.setdefault("costSources", list(DEFAULT_USER_COST_SOURCES))
+        extra_new.update(self._metric_type_param(aggregation))
+        extra_new["page"] = page
+        extra_new["size"] = size
+        path, params, call_kwargs = resolve_analytics_request(
+            "cost_metric_by_user_aggregated",
+            self._get_team_id(),
+            period,
+            extra_old_params={"group": aggregation} if aggregation else {},
+            extra_new_params=extra_new,
+        )
 
-            extra_old = {"group": aggregation} if aggregation else {}
-            extra_new = dict(filters) if filters else {}
-            # The endpoint's own default is coding_assistant alone, which is empty
-            # for tenants whose spend is API-metered; ask for every source so the
-            # answer does not depend on how the tenant classifies its traffic.
-            if "costSources" not in extra_new:
-                extra_new["costSources"] = list(DEFAULT_USER_COST_SOURCES)
-            if aggregation and "aggregation" not in extra_new:
-                extra_new["aggregation"] = aggregation
-            path, params, call_kwargs = resolve_analytics_request(
-                "cost_metric_by_user_aggregated", team_id, period,
-                extra_old_params=extra_old,
-                extra_new_params=extra_new,
-            )
+        envelope = await self._get_envelope(path, params, call_kwargs)
+        users = self._process_user_data(self._envelope_items(envelope))
+        self.logger.info("Retrieved %d user cost records", len(users))
+        return UserCostsPage(users=users, paging=PageInfo.from_envelope(envelope))
 
-            self.logger.debug("User costs API call to %s", path)
-
-            response = await self.client.get(path, params=params, **call_kwargs)
-
-            if not response:
-                self.logger.warning("Empty response from user costs API")
-                return []
-
-            # The new API returns HAL+JSON with _embedded.items
-            if isinstance(response, dict):
-                embedded = response.get("_embedded", {})
-                items = embedded.get("items", [])
-                if items:
-                    data = items
-                elif "groups" in response:
-                    # Fallback: legacy groups format
-                    data = [response]
-                else:
-                    data = response.get("data", [])
-            elif isinstance(response, list):
-                data = response
-            else:
-                data = []
-
-            if not data:
-                self.logger.warning("No user cost data found")
-                return []
-
-            processed_data = self._process_user_data(data)
-
-            self.logger.info("Successfully retrieved %d user cost records", len(processed_data))
-            return processed_data
-
-        except Exception as e:
-            self.logger.error("Failed to get user costs: %s", e)
-            raise
-
-    async def get_transaction_count(self, period: str) -> Optional[int]:
+    async def get_transaction_count(self, period: AnalyticsWindow) -> Optional[int]:
         """Get the team's aggregate transaction count for a period.
 
         Single total from the new-API transaction-count-by-team endpoint.
@@ -919,7 +879,10 @@ class SimpleCostAnalyzer:
         return int(value)
 
     async def get_analytics_filter_options(
-        self, dimension: str, period: str
+        self,
+        dimension: str,
+        period: str,
+        cost_sources: Optional[Sequence[str]] = None,
     ) -> List[str]:
         """Enumerate the valid filter values for an analytics dimension.
 
@@ -933,6 +896,10 @@ class SimpleCostAnalyzer:
                 published kebab-case form before validation.
             period: Time period (API-verified values only) — bounds the window
                 the values are drawn from.
+            cost_sources: Cost sources the users list is drawn from. Defaults
+                to DEFAULT_USER_COST_SOURCES, the sources get_user_costs reads,
+                because the platform's own default for this list is
+                coding_assistant only.
 
         Returns:
             The list of valid filter values (plain strings) for the dimension.
@@ -942,6 +909,8 @@ class SimpleCostAnalyzer:
                 dimensions. Raised before any API call — an unknown dimension
                 404s upstream with a poor body, so the allowlist is enforced
                 client-side and the valid list is handed back to the caller.
+                Also raised when cost_sources is given for any dimension but
+                users, the only list the platform draws by cost source.
         """
         # Normalize: trim, lowercase, snake_case -> kebab-case. This lets both
         # ``api_keys`` and ``api-keys`` resolve to the canonical ``api-keys``.
@@ -956,7 +925,10 @@ class SimpleCostAnalyzer:
 
         team_id = self._get_team_id()
         path, params, call_kwargs = resolve_analytics_request(
-            "analytics_filter_options", team_id, period
+            "analytics_filter_options",
+            team_id,
+            period,
+            extra_new_params=_filter_options_cost_sources(normalized, cost_sources),
         )
         # Registry entry is dimension-agnostic (base path only); the concrete
         # dimension is appended here as a path segment.
@@ -994,9 +966,74 @@ class SimpleCostAnalyzer:
                 values.append(str(item))
         return values
 
-    async def get_cost_summary(self, period: str, aggregation: str) -> Dict[str, Any]:
+    async def _read_summary_parts(
+        self, period: AnalyticsWindow, aggregation: str
+    ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, str]]:
+        """Read the five summary parts at once.
+
+        Returns:
+            The rows of each part read, and the reason for each part not read
+
+        Raises:
+            CostSummaryUnreadError: When no part could be read
+        """
+        # A missing team id fails the whole call, not each part
+        self._get_team_id()
+        outcomes = await asyncio.gather(
+            *(self._read_summary_part(part, period, aggregation) for part in COST_SUMMARY_PARTS),
+            return_exceptions=True,
+        )
+
+        rows: Dict[str, List[Dict[str, Any]]] = {}
+        not_read: Dict[str, str] = {}
+        for part, outcome in zip(COST_SUMMARY_PARTS, outcomes):
+            if isinstance(outcome, BaseException):
+                raise outcome
+            if isinstance(outcome, str):
+                not_read[part.key] = outcome
+            else:
+                rows[part.key] = outcome
+        if not rows:
+            raise CostSummaryUnreadError(not_read)
+        return rows, not_read
+
+    async def _read_summary_part(
+        self, part: SummaryPart, period: AnalyticsWindow, aggregation: str
+    ) -> Union[List[Dict[str, Any]], str]:
+        """Read one summary part within its time limit, or say why it could not be read."""
+        scope = asyncio.timeout(COST_SUMMARY_PART_TIME_LIMIT_SECONDS)
+        try:
+            with recording_retried_errors() as retried:
+                async with scope:
+                    rows: List[Dict[str, Any]] = await getattr(self, part.action)(
+                        period, aggregation
+                    )
+            return rows
+        except Exception as error:
+            if isinstance(error, TimeoutError) and scope.expired():
+                reason = f"not read within {summary_part_time_limit_text()}"
+                if retried.last is not None:
+                    reason += f"; the platform last answered {read_failure_reason(retried.last)}"
+                self.logger.error(f"Cost summary part {part.key} {reason}")
+                return reason
+            if fails_whole_call(error):
+                raise
+            self.logger.error(f"Cost summary part {part.key} not read: {error}")
+            return read_failure_reason(error)
+
+    async def get_cost_summary(self, period: AnalyticsWindow, aggregation: str) -> Dict[str, Any]:
         """
         Get enhanced cost summary combining all 5 data sources.
+
+        The five parts are read at once. A part that fails is named in
+        ``not_read`` with its reason; its breakdown entry is None and its top
+        list empty. The total is the provider sum, so it is None when the
+        provider part was not read. Each part has
+        ``COST_SUMMARY_PART_TIME_LIMIT_SECONDS``, whatever the request timeout;
+        a part still reading then is cancelled and named as not read within
+        that time. A top list holds only rows that added
+        cost: $0 and credit rows count in the breakdown and the total but are
+        not contributors.
 
         Args:
             period: Time period (API-verified values only)
@@ -1006,45 +1043,39 @@ class SimpleCostAnalyzer:
             Enhanced cost summary data with all 5 dimensions
 
         Raises:
-            Exception: If API call fails
+            CostSummaryUnreadError: If no part could be read
+            Exception: If an authentication or configuration error stops the read
         """
         try:
             self.logger.info(
                 f"Getting enhanced cost summary for period={period}, aggregation={aggregation}"
             )
 
-            # Get data from all 5 sources for comprehensive summary
-            provider_costs = await self.get_provider_costs(period, aggregation)
-            model_costs = await self.get_model_costs(period, aggregation)
-            customer_costs = await self.get_customer_costs(period, aggregation)
-            api_key_costs = await self.get_api_key_costs(period, aggregation)
-            agent_costs = await self.get_agent_costs(period, aggregation)
+            rows, not_read = await self._read_summary_parts(period, aggregation)
+            cost_breakdown: Dict[str, Optional[float]] = {
+                part.key: (
+                    sum(item.get("cost", 0) for item in rows[part.key])
+                    if part.key in rows
+                    else None
+                )
+                for part in COST_SUMMARY_PARTS
+            }
+            total_cost = cost_breakdown["provider_costs"]
 
-            # Calculate total cost (use provider costs as primary reference)
-            total_cost = sum(item.get("cost", 0) for item in provider_costs)
-
-            # Build enhanced summary with all 5 dimensions
-            summary = {
+            summary: Dict[str, Any] = {
                 "total_cost": total_cost,
-                "cost_breakdown": {
-                    "provider_costs": total_cost,
-                    "model_costs": sum(item.get("cost", 0) for item in model_costs),
-                    "customer_costs": sum(item.get("cost", 0) for item in customer_costs),
-                    "api_key_costs": sum(item.get("cost", 0) for item in api_key_costs),
-                    "agent_costs": sum(item.get("cost", 0) for item in agent_costs),
-                },
-                "top_providers": provider_costs[:3],  # Top 3
-                "top_models": model_costs[:3],  # Top 3
-                "top_customers": customer_costs[:3],  # Top 3
-                "top_api_keys": api_key_costs[:3],  # Top 3 - NEW
-                "top_agents": agent_costs[:3],  # Top 3 - NEW
+                "cost_breakdown": cost_breakdown,
                 "period": period,
                 "aggregation": aggregation,
                 "timestamp": datetime.utcnow().isoformat(),
+                "not_read": not_read,
             }
+            for part in COST_SUMMARY_PARTS:
+                summary[part.top_key] = _top_contributors(rows.get(part.key, []))
 
             self.logger.info(
-                f"Enhanced cost summary completed: total_cost=${total_cost:,.2f}, dimensions=5"
+                f"Enhanced cost summary completed: total_cost={total_cost}, "
+                f"parts read={len(rows)}, parts not read={sorted(not_read)}"
             )
             return summary
 
@@ -1053,103 +1084,18 @@ class SimpleCostAnalyzer:
             # Re-raise original exception to preserve API error details (status codes, response data, etc.)
             raise
 
-    def _process_provider_data(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Process and rank provider cost data using proven working logic from existing code."""
-        provider_totals = {}
-
-        # Use the proven working logic from cost_analytics_processor._process_breakdown_data
-        try:
-            # Handle both single dict and list of dicts response formats
-            responses = data if isinstance(data, list) else [data]
-
-            for response in responses:
-                if not isinstance(response, dict):
-                    continue
-
-                # Handle two different API response structures:
-                # 1. Customer format: dict with groups → metrics → metricResult
-                # 2. Provider format: direct list of dicts with groupName → metrics → metricResult
-
-                if "groups" in response:
-                    # Customer format: {'groups': [{'groupName': '...', 'metrics': [...]}]}
-                    groups = response.get("groups", [])
-                    if not isinstance(groups, list):
-                        continue
-
-                    for group_data in groups:
-                        if not isinstance(group_data, dict):
-                            continue
-
-                        # Extract provider name using proven method
-                        raw_provider_name = group_data.get("groupName", "Unknown Provider")
-                        provider_name = self._normalize_provider_name(raw_provider_name)
-                        metrics = group_data.get("metrics", [])
-
-                        if not isinstance(metrics, list):
-                            continue
-
-                        group_cost = 0.0
-                        for metric in metrics:
-                            if not isinstance(metric, dict):
-                                continue
-
-                            # Use the proven metricResult extraction
-                            metric_result = metric.get("metricResult", 0)
-                            if isinstance(metric_result, (int, float)):
-                                group_cost += metric_result
-
-                        # Aggregate by provider name to avoid duplicates
-                        if group_cost > 0:
-                            if provider_name not in provider_totals:
-                                provider_totals[provider_name] = 0.0
-                            provider_totals[provider_name] += group_cost
-
-                else:
-                    # Provider format: direct dict with groupName → metrics → metricResult
-                    # This handles the case where response is already a group item
-                    raw_provider_name = response.get("groupName", "Unknown Provider")
-                    provider_name = self._normalize_provider_name(raw_provider_name)
-                    metrics = response.get("metrics", [])
-
-                    if not isinstance(metrics, list):
-                        continue
-
-                    group_cost = 0.0
-                    for metric in metrics:
-                        if not isinstance(metric, dict):
-                            continue
-
-                        # Use the proven metricResult extraction
-                        metric_result = metric.get("metricResult", 0)
-                        if isinstance(metric_result, (int, float)):
-                            group_cost += metric_result
-
-                    # Aggregate by provider name to avoid duplicates
-                    if group_cost > 0:
-                        if provider_name not in provider_totals:
-                            provider_totals[provider_name] = 0.0
-                        provider_totals[provider_name] += group_cost
-
-        except Exception as e:
-            self.logger.error(f"Error processing provider data: {e}")
-            return []
-
-        # Convert to list format and calculate total
-        processed_data = []
-        total_cost = sum(provider_totals.values())
-
-        for provider_name, cost in provider_totals.items():
-            processed_data.append(
-                {
-                    "provider": provider_name,
-                    "cost": cost,
-                    "percentage": (cost / total_cost * 100) if total_cost > 0 else 0,
-                }
-            )
-
-        # Sort by cost descending
-        processed_data.sort(key=lambda x: x.get("cost", 0), reverse=True)
-        return processed_data
+    def _process_provider_data(
+        self, data: List[Dict[str, Any]], aggregation: str
+    ) -> List[Dict[str, Any]]:
+        """One row per provider (names normalized) with a numeric figure, its buckets combined by ``aggregation``."""
+        return rank_entities(
+            data,
+            aggregation,
+            entity_key="provider",
+            default_name="Unknown Provider",
+            name_of=self._normalize_provider_name,
+            keep_nonpositive=True,
+        )
 
     def _process_model_data(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Process and rank model cost data."""
@@ -1217,145 +1163,32 @@ class SimpleCostAnalyzer:
             "timestamp": datetime.utcnow().isoformat(),
         }
 
-    def _process_api_key_data(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Process and rank API key cost data following existing patterns."""
-        processed_data = []
-        total_cost = 0.0
+    def _process_api_key_data(
+        self, data: List[Dict[str, Any]], aggregation: str
+    ) -> List[Dict[str, Any]]:
+        """One row per API key, its buckets combined by ``aggregation``."""
+        return rank_entities(
+            data,
+            aggregation,
+            entity_key="api_key",
+            default_name="Unknown API Key",
+            keep_nonpositive=True,
+        )
+    def _process_agent_data(
+        self, data: List[Dict[str, Any]], aggregation: str
+    ) -> List[Dict[str, Any]]:
+        """One row per agent name, its buckets combined by ``aggregation``.
 
-        # Handle multiple response formats with comprehensive debug logging
-        try:
-            # Handle both single dict and list of dicts response formats
-            responses = data if isinstance(data, list) else [data]
-
-            for response in responses:
-                if not isinstance(response, dict):
-                    continue
-
-                # Handle API response structure similar to customer costs
-                if "groups" in response:
-                    # Format: {'groups': [{'groupName': 'api-key-name', 'metrics': [...]}]}
-                    groups = response.get("groups", [])
-                    if not isinstance(groups, list):
-                        continue
-
-                    for group_data in groups:
-                        if not isinstance(group_data, dict):
-                            continue
-
-                        # Extract API key name
-                        api_key_name = group_data.get("groupName", "Unknown API Key")
-                        metrics = group_data.get("metrics", [])
-
-                        if not isinstance(metrics, list):
-                            continue
-
-                        group_cost = 0.0
-                        for metric in metrics:
-                            if not isinstance(metric, dict):
-                                continue
-
-                            # Use the proven metricResult extraction
-                            metric_result = metric.get("metricResult", 0)
-                            if isinstance(metric_result, (int, float)):
-                                group_cost += metric_result
-
-                        if group_cost > 0:
-                            processed_data.append({"api_key": api_key_name, "cost": group_cost})
-                            total_cost += group_cost
-
-                else:
-                    # Direct format: dict with groupName → metrics → metricResult
-                    api_key_name = response.get("groupName", "Unknown API Key")
-                    metrics = response.get("metrics", [])
-
-                    if not isinstance(metrics, list):
-                        continue
-
-                    group_cost = 0.0
-                    for metric in metrics:
-                        if not isinstance(metric, dict):
-                            continue
-
-                        # Use the proven metricResult extraction
-                        metric_result = metric.get("metricResult", 0)
-                        if isinstance(metric_result, (int, float)):
-                            group_cost += metric_result
-
-                    if group_cost > 0:
-                        processed_data.append({"api_key": api_key_name, "cost": group_cost})
-                        total_cost += group_cost
-
-        except Exception as e:
-            self.logger.error(f"Error processing API key data: {e}")
-            return []
-
-        # Calculate percentages
-        for item in processed_data:
-            item["percentage"] = (item["cost"] / total_cost * 100) if total_cost > 0 else 0
-
-        # Sort by cost descending
-        processed_data.sort(key=lambda x: x.get("cost", 0), reverse=True)
-        return processed_data
-
-    def _process_agent_data(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Process and rank agent cost data following existing patterns.
-
-        Aggregates by agent name so multiple backend rows sharing the same
-        groupName collapse into one row with summed cost. The upstream
-        analytics endpoint does not expose a secondary identifier per row,
-        so an agent that appears N times is treated as one logical agent
-        rather than emitting N identical-looking entries.
+        The analytics endpoint exposes no secondary identifier per row, so every
+        entry sharing a groupName is the same logical agent.
         """
-        cost_by_agent: Dict[str, float] = {}
-
-        try:
-            responses = data if isinstance(data, list) else [data]
-
-            for response in responses:
-                if not isinstance(response, dict):
-                    continue
-
-                if "groups" in response:
-                    groups = response.get("groups", [])
-                    if not isinstance(groups, list):
-                        continue
-                    group_items = groups
-                else:
-                    group_items = [response]
-
-                for group_data in group_items:
-                    if not isinstance(group_data, dict):
-                        continue
-
-                    agent_name = group_data.get("groupName", "Unknown Agent")
-                    metrics = group_data.get("metrics", [])
-                    if not isinstance(metrics, list):
-                        continue
-
-                    for metric in metrics:
-                        if not isinstance(metric, dict):
-                            continue
-                        metric_result = metric.get("metricResult", 0)
-                        if isinstance(metric_result, (int, float)):
-                            cost_by_agent[agent_name] = (
-                                cost_by_agent.get(agent_name, 0.0) + metric_result
-                            )
-
-        except Exception as e:
-            self.logger.error(f"Error processing agent data: {e}")
-            return []
-
-        processed_data = [
-            {"agent": name, "cost": cost}
-            for name, cost in cost_by_agent.items()
-            if cost > 0
-        ]
-        total_cost = sum(item["cost"] for item in processed_data)
-        for item in processed_data:
-            item["percentage"] = (item["cost"] / total_cost * 100) if total_cost > 0 else 0
-        processed_data.sort(key=lambda x: x.get("cost", 0), reverse=True)
-        return processed_data
-
+        return rank_entities(
+            data,
+            aggregation,
+            entity_key="agent",
+            default_name="Unknown Agent",
+            keep_nonpositive=True,
+        )
     def _process_user_data(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Process user cost data from the cost-by-user-aggregated endpoint.
 
@@ -1435,99 +1268,73 @@ class SimpleCostAnalyzer:
             }
         return None
 
-    # ── Tool cost methods (use direct client calls, not endpoint_registry) ──
-
     def _get_team_id(self) -> str:
         """Get team_id from client or environment. Raises if unavailable."""
         team_id = getattr(self.client, "team_id", None)
         if not team_id:
             team_id = os.getenv("REVENIUM_TEAM_ID")
             if not team_id:
-                raise Exception("Team ID not available from client or environment")
+                raise TeamIdUnavailableError("Team ID not available from client or environment")
         return team_id
 
-    async def get_tool_costs(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
-        """Get tool costs using aggregated cost-by-tool endpoint."""
-        try:
-            self.logger.info(f"Getting tool costs for period={period}, aggregation={aggregation}")
-            team_id = self._get_team_id()
-            # aggregation is not passed: this endpoint doesn't support it as a query param;
-            # it's accepted here for pipeline consistency with other analytics actions.
-            response = await self.client.get_cost_by_tool_aggregated(teamId=team_id, period=period)
-            if not response:
-                return []
-            # The endpoint serves the grouped envelope (groupName = toolId,
-            # metrics[].metricResult = cost) — same shape as the sibling
-            # tool-analytics actions, so it goes through the same parser.
-            # include_all_totals: parity with get_model_costs (renders $0.00
-            # rows) and honesty for refunds/credits — a zero or negative total
-            # must not silently vanish from the tool breakdown.
-            return self._process_grouped_metrics(
-                response,
-                entity_key="tool",
-                metric_key="cost",
-                include_all_totals=True,
-                compute_share=True,
-            )
-        except Exception as e:
-            self.logger.error(f"Failed to get tool costs: {e}")
-            raise
+    async def get_tool_costs(self, period: AnalyticsWindow, aggregation: str) -> ToolRows:
+        """Cost per tool over the window, each with its share of the total.
 
-    async def get_top_tools(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
-        """Get top tools by call count."""
-        try:
-            self.logger.info(f"Getting top tools for period={period}, aggregation={aggregation}")
-            team_id = self._get_team_id()
-            # aggregation is not passed: this endpoint doesn't support it as a query param;
-            # it's accepted here for pipeline consistency with other analytics actions.
-            response = await self.client.get_top_tools_by_call_count(teamId=team_id, period=period)
-            if not response:
-                return []
-            return self._process_grouped_metrics(response, entity_key="tool", metric_key="call_count")
-        except Exception as e:
-            self.logger.error(f"Failed to get top tools: {e}")
-            raise
+        ``aggregation`` is accepted for parity with the other cost actions; the
+        endpoint has no such parameter. Zero and negative totals are kept, so a
+        refunded or free tool does not vanish from the breakdown.
+        """
+        read = await self._read_tool_report(COST_BY_TOOL_AGGREGATED, period)
+        rows = self._process_grouped_metrics(
+            read.items,
+            entity_key="tool",
+            metric_key="cost",
+            include_all_totals=True,
+            compute_share=True,
+        )
+        return ToolRows(rows, read)
 
-    async def get_tool_costs_by_agent(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
-        """Get tool costs grouped by agent."""
-        try:
-            self.logger.info(f"Getting tool costs by agent for period={period}, aggregation={aggregation}")
-            team_id = self._get_team_id()
-            # aggregation is not passed: this endpoint doesn't support it as a query param;
-            # it's accepted here for pipeline consistency with other analytics actions.
-            response = await self.client.get_cost_by_tool_agent(teamId=team_id, period=period)
-            if not response:
-                return []
-            return self._process_grouped_metrics(response, entity_key="agent", metric_key="cost")
-        except Exception as e:
-            self.logger.error(f"Failed to get tool costs by agent: {e}")
-            raise
+    async def get_top_tools(self, period: AnalyticsWindow, aggregation: str) -> ToolRows:
+        """Tools ranked by call count over the window."""
+        read = await self._read_tool_report(TOP_TOOLS_BY_CALL_COUNT, period)
+        return ToolRows(
+            self._process_grouped_metrics(read.items, entity_key="tool", metric_key="call_count"),
+            read,
+        )
 
-    async def get_tool_costs_by_provider(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
-        """Get tool costs grouped by provider."""
-        try:
-            self.logger.info(f"Getting tool costs by provider for period={period}, aggregation={aggregation}")
-            team_id = self._get_team_id()
-            # aggregation is not passed: this endpoint doesn't support it as a query param;
-            # it's accepted here for pipeline consistency with other analytics actions.
-            response = await self.client.get_cost_by_tool_provider(teamId=team_id, period=period)
-            if not response:
-                return []
-            return self._process_grouped_metrics(response, entity_key="provider", metric_key="cost")
-        except Exception as e:
-            self.logger.error(f"Failed to get tool costs by provider: {e}")
-            raise
+    async def get_tool_costs_by_agent(self, period: AnalyticsWindow, aggregation: str) -> ToolRows:
+        """Tool cost per agent over the window."""
+        read = await self._read_tool_report(COST_BY_TOOL_AGENT, period)
+        return ToolRows(
+            self._process_grouped_metrics(read.items, entity_key="agent", metric_key="cost"),
+            read,
+        )
+
+    async def get_tool_costs_by_provider(self, period: AnalyticsWindow, aggregation: str) -> ToolRows:
+        """Tool cost per provider over the window, summed across the report's time buckets."""
+        read = await self._read_tool_report(COST_BY_TOOL_PROVIDER, period)
+        return ToolRows(
+            self._process_grouped_metrics(read.items, entity_key="provider", metric_key="cost"),
+            read,
+        )
+
+    async def _read_tool_report(self, report: ToolReport, period: AnalyticsWindow) -> ToolReportRead:
+        self.logger.info("Reading %s for %s", report.client_method, period)
+        return await read_tool_report(self.client, report, ToolReportWindow.of(period))
 
     def _process_grouped_metrics(
         self,
-        response: Any,
+        items: List[Dict[str, Any]],
         entity_key: str,
         metric_key: str,
         *,
         include_all_totals: bool = False,
         compute_share: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Process grouped metrics response (groupName + metrics[].metricResult).
+        """One row per group name, its metricResult values summed across every item.
+
+        An item is either a group (groupName + metrics) or a time bucket whose
+        ``groups`` hold them, so a group that appears in many buckets is one row.
 
         Args:
             include_all_totals: When True, groups whose total is zero or
@@ -1536,56 +1343,48 @@ class SimpleCostAnalyzer:
             compute_share: When True and the summed totals are positive, each
                 entry gains a ``percentage`` share of the sum.
         """
-        processed = []
-        responses = response if isinstance(response, list) else [response]
-        for item in responses:
-            if not isinstance(item, dict):
+        totals: Dict[str, float] = {}
+        for group in self._metric_groups(items):
+            total = self._group_total(group)
+            if total is None:
                 continue
-            if "groups" in item:
-                for group in item.get("groups", []):
-                    if not isinstance(group, dict):
-                        continue
-                    entry = self._extract_group_entry(
-                        group, entity_key, metric_key, include_all_totals=include_all_totals
-                    )
-                    if entry:
-                        processed.append(entry)
-            else:
-                entry = self._extract_group_entry(
-                    item, entity_key, metric_key, include_all_totals=include_all_totals
-                )
-                if entry:
-                    processed.append(entry)
+            name = group.get("groupName", f"Unknown {entity_key.title()}")
+            totals[name] = totals.get(name, 0.0) + total
+        processed: List[Dict[str, Any]] = [
+            {entity_key: name, metric_key: total}
+            for name, total in totals.items()
+            if total > 0 or include_all_totals
+        ]
         processed.sort(key=lambda x: x.get(metric_key, 0), reverse=True)
         if compute_share:
-            total = sum(entry[metric_key] for entry in processed)
-            if total > 0:
+            grand_total = sum(entry[metric_key] for entry in processed)
+            if grand_total > 0:
                 for entry in processed:
-                    entry["percentage"] = (entry[metric_key] / total) * 100
+                    entry["percentage"] = (entry[metric_key] / grand_total) * 100
         return processed
 
-    def _extract_group_entry(
-        self,
-        group: Dict[str, Any],
-        entity_key: str,
-        metric_key: str,
-        *,
-        include_all_totals: bool = False,
-    ) -> Optional[Dict[str, Any]]:
-        """Extract a single entry from a group dict with groupName + metrics."""
-        name = group.get("groupName", f"Unknown {entity_key.title()}")
+    @staticmethod
+    def _metric_groups(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        groups: List[Dict[str, Any]] = []
+        for item in items:
+            if "groups" in item:
+                groups.extend(g for g in item.get("groups") or [] if isinstance(g, dict))
+            else:
+                groups.append(item)
+        return groups
+
+    @staticmethod
+    def _group_total(group: Dict[str, Any]) -> Optional[float]:
         metrics = group.get("metrics", [])
         if not isinstance(metrics, list):
             return None
-        total = 0.0
-        for metric in metrics:
-            if isinstance(metric, dict):
-                val = metric.get("metricResult", 0)
-                if isinstance(val, (int, float)):
-                    total += val
-        if total > 0 or include_all_totals:
-            return {entity_key: name, metric_key: total}
-        return None
+        return float(
+            sum(
+                metric.get("metricResult", 0)
+                for metric in metrics
+                if isinstance(metric, dict) and isinstance(metric.get("metricResult", 0), (int, float))
+            )
+        )
 
     # ──────────────────────────────────────────────────────────────────────
     # BACK-2376 task / profitability / spend-mover analytics pack
@@ -1608,9 +1407,11 @@ class SimpleCostAnalyzer:
     async def _fetch_analytics_envelope(
         self,
         key: str,
-        period: str,
+        period: AnalyticsWindow,
         extra_new_params: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        *,
+        every_page: bool = True,
+    ) -> EnvelopeRead:
         """Fetch a new-API analytics envelope for ``key`` and ``period``.
 
         Resolves the request through the registry (force_new → Bearer on the
@@ -1618,11 +1419,72 @@ class SimpleCostAnalyzer:
         non-dict / empty response is normalized to ``{}`` so callers can parse
         uniformly. ``extra_new_params`` is merged into the new-API query string
         (e.g. ``{"groupBy": "model"}``, ``{"providers": [...]}``).
+
+        The endpoints page their rows (20 by default), so unless ``every_page``
+        is False the read asks for ENVELOPE_PAGE_SIZE rows a page and appends
+        the rows of every further page to ``_embedded.items``, stopping after
+        ENVELOPE_MAX_PAGES pages; a read that stopped there says so in the
+        returned ``unread``. A caller that pages the report itself passes False.
         """
-        team_id = self._get_team_id()
+        extra = dict(extra_new_params or {})
+        if every_page:
+            extra["size"] = ENVELOPE_PAGE_SIZE
         path, params, call_kwargs = resolve_analytics_request(
-            key, team_id, period, extra_new_params=extra_new_params
+            key, self._get_team_id(), period, extra_new_params=extra or None
         )
+        if not every_page:
+            return EnvelopeRead(await self._get_envelope(path, params, call_kwargs))
+        return await self._read_every_page(key, path, params, call_kwargs)
+
+    def _resolve_ranked_request(
+        self,
+        key: str,
+        period: AnalyticsWindow,
+        aggregation: str,
+        extra_new_params: Optional[Dict[str, Any]] = None,
+    ) -> RankedRequest:
+        path, params, call_kwargs = resolve_analytics_request(
+            key,
+            self._get_team_id(),
+            period,
+            extra_old_params={"group": aggregation} if aggregation else {},
+            extra_new_params={
+                **(extra_new_params or {}),
+                **self._metric_type_param(aggregation),
+                "size": ENVELOPE_PAGE_SIZE,
+            },
+        )
+        return RankedRequest(key, path, params, call_kwargs)
+
+    @staticmethod
+    def _metric_type_param(aggregation: str) -> Dict[str, str]:
+        """The analytics API's name for the aggregation; the legacy API reads it as ``group``."""
+        return {"metricType": metric_type_for(aggregation)} if aggregation else {}
+
+    async def _read_ranked_report(self, request: RankedRequest) -> RankedReportRead:
+        """Read a ranked cost report: every page of buckets on the analytics API.
+
+        The legacy profitstream route answers one unpaged list, which is
+        handed back untouched.
+        """
+        if request.routes_to_legacy_api:
+            return RankedReportRead(await self.client.get(request.path, params=request.params))
+        read = await self._read_every_page(
+            request.endpoint_key, request.path, request.params, request.call_kwargs
+        )
+        return RankedReportRead(self._envelope_items(read.envelope), read.unread)
+
+    async def _read_every_page(
+        self, key: str, path: str, params: Dict[str, Any], call_kwargs: Dict[str, Any]
+    ) -> EnvelopeRead:
+        async def fetch_page(page_params: Dict[str, Any]) -> Dict[str, Any]:
+            return await self._get_envelope(path, page_params, call_kwargs)
+
+        return await read_every_page(key, fetch_page, params)
+
+    async def _get_envelope(
+        self, path: str, params: Dict[str, Any], call_kwargs: Dict[str, Any]
+    ) -> Dict[str, Any]:
         self.logger.debug("Analytics pack call to %s params=%s", path, params)
         # unwrap_hal_embedded=False: the client's default unwrap collapses the
         # envelope to the _embedded list (A/B) or [] (scatter has no _embedded),
@@ -1633,21 +1495,7 @@ class SimpleCostAnalyzer:
         )
         return response if isinstance(response, dict) else {}
 
-    @staticmethod
-    def _envelope_items(response: Any) -> List[Dict[str, Any]]:
-        """Return ``_embedded.items`` from an analytics envelope.
-
-        The fetch always requests the full envelope (unwrap_hal_embedded=False)
-        and normalizes non-dicts to {}, so this only ever sees a dict; anything
-        else yields an empty list (a clean empty state).
-        """
-        if not isinstance(response, dict):
-            return []
-        embedded = response.get("_embedded", {})
-        if not isinstance(embedded, dict):
-            return []
-        items = embedded.get("items", [])
-        return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
+    _envelope_items = staticmethod(envelope_items)
 
     def _metric_result_or_none(self, metric: Dict[str, Any]) -> Optional[float]:
         """Return a numeric ``metricResult`` or None (logged) — never fabricate 0."""
@@ -1677,7 +1525,7 @@ class SimpleCostAnalyzer:
             preserved.append(dict(metric))
         return preserved
 
-    def _flatten_aggregated_items(self, response: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _flatten_aggregated_items(self, read: EnvelopeRead) -> PackRows:
         """Flatten envelope B into one row per (group, numeric metric).
 
         Each row is ``{"group": groupName, **metric}`` — the metric's own fields
@@ -1686,13 +1534,13 @@ class SimpleCostAnalyzer:
         out entirely (numeric honesty).
         """
         rows: List[Dict[str, Any]] = []
-        for item in self._envelope_items(response):
+        for item in self._envelope_items(read.envelope):
             name = item.get("groupName", "Unknown")
             for metric in self._flatten_metrics(item.get("metrics", [])):
                 rows.append({"group": name, **metric})
-        return rows
+        return PackRows(rows, read.unread)
 
-    def _flatten_timeseries_items(self, response: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _flatten_timeseries_items(self, read: EnvelopeRead) -> PackRows:
         """Flatten envelope A into timeseries buckets with per-bucket groups.
 
         Returns ``[{startTimestamp, endTimestamp, groups: [{group, metrics}]}]``.
@@ -1700,7 +1548,7 @@ class SimpleCostAnalyzer:
         of its groups drop (an empty ``groups`` list is still an honest bucket).
         """
         buckets: List[Dict[str, Any]] = []
-        for item in self._envelope_items(response):
+        for item in self._envelope_items(read.envelope):
             groups: List[Dict[str, Any]] = []
             for group in item.get("groups", []) or []:
                 if not isinstance(group, dict):
@@ -1716,43 +1564,43 @@ class SimpleCostAnalyzer:
                     "groups": groups,
                 }
             )
-        return buckets
+        return PackRows(buckets, read.unread)
 
     # ── Public analytics-pack methods ─────────────────────────────────────
 
-    async def get_task_costs(self, period: str, aggregation: str) -> List[Dict[str, Any]]:
+    async def get_task_costs(self, period: AnalyticsWindow, aggregation: str) -> PackRows:
         """Cost by task type. ``aggregation='aggregated'`` → totals (envelope B);
         anything else → timeseries buckets (envelope A)."""
         if str(aggregation).lower() == "aggregated":
-            response = await self._fetch_analytics_envelope("cost_by_task_aggregated", period)
-            return self._flatten_aggregated_items(response)
-        response = await self._fetch_analytics_envelope("cost_by_task", period)
-        return self._flatten_timeseries_items(response)
+            read = await self._fetch_analytics_envelope("cost_by_task_aggregated", period)
+            return self._flatten_aggregated_items(read)
+        read = await self._fetch_analytics_envelope("cost_by_task", period)
+        return self._flatten_timeseries_items(read)
 
     async def get_task_completion(
-        self, period: str, aggregation: str, agents: Optional[List[str]] = None
-    ) -> List[Dict[str, Any]]:
+        self, period: AnalyticsWindow, aggregation: str, agents: Optional[List[str]] = None
+    ) -> PackRows:
         """Task completion counts. ``aggregation='aggregated'`` → totals
         (envelope B); otherwise timeseries buckets (envelope A). ``agents``
         optionally filters to specific agent ids."""
         extra = {"agents": agents} if agents else None
         if str(aggregation).lower() == "aggregated":
-            response = await self._fetch_analytics_envelope(
+            read = await self._fetch_analytics_envelope(
                 "task_completion_aggregated", period, extra_new_params=extra
             )
-            return self._flatten_aggregated_items(response)
-        response = await self._fetch_analytics_envelope(
+            return self._flatten_aggregated_items(read)
+        read = await self._fetch_analytics_envelope(
             "task_completion", period, extra_new_params=extra
         )
-        return self._flatten_timeseries_items(response)
+        return self._flatten_timeseries_items(read)
 
-    async def get_task_performance_by_agent(self, period: str) -> List[Dict[str, Any]]:
+    async def get_task_performance_by_agent(self, period: AnalyticsWindow) -> PackRows:
         """Per-agent task performance (envelope B). Often empty on dev — an
         empty list is a normal outcome, not an error."""
-        response = await self._fetch_analytics_envelope("task_performance_by_agent", period)
-        return self._flatten_aggregated_items(response)
+        read = await self._fetch_analytics_envelope("task_performance_by_agent", period)
+        return self._flatten_aggregated_items(read)
 
-    async def get_profit_margins(self, period: str, dimension: str) -> List[Dict[str, Any]]:
+    async def get_profit_margins(self, period: AnalyticsWindow, dimension: str) -> PackRows:
         """Profit margin per ``dimension`` (``customer`` or ``product``),
         envelope B. Raises ValueError for any other dimension."""
         key_by_dimension = {
@@ -1764,54 +1612,59 @@ class SimpleCostAnalyzer:
             raise ValueError(
                 f"Unsupported profit-margin dimension {dimension!r}; expected 'customer' or 'product'"
             )
-        response = await self._fetch_analytics_envelope(key, period)
-        return self._flatten_aggregated_items(response)
+        read = await self._fetch_analytics_envelope(key, period)
+        return self._flatten_aggregated_items(read)
 
     async def get_top_movers(
-        self, period: str, group_by: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
+        self, period: AnalyticsWindow, group_by: Optional[str] = None
+    ) -> PackRows:
         """Biggest spend movers (envelope B), each row carrying currentValue,
         previousValue and trend. ``group_by`` (e.g. 'model', 'agent') is
         forwarded as the API's ``groupBy`` param when provided."""
         extra = {"groupBy": group_by} if group_by else None
-        response = await self._fetch_analytics_envelope("top_movers", period, extra_new_params=extra)
-        return self._flatten_aggregated_items(response)
+        read = await self._fetch_analytics_envelope("top_movers", period, extra_new_params=extra)
+        return self._flatten_aggregated_items(read)
 
     async def get_token_breakdown(
-        self, period: str, providers: Optional[List[str]] = None
-    ) -> List[Dict[str, Any]]:
+        self, period: AnalyticsWindow, providers: Optional[List[str]] = None
+    ) -> PackRows:
         """Token breakdown by type over time (envelope A). ``providers``
         optionally restricts the breakdown to specific providers."""
-        extra = {"providers": providers} if providers else None
-        response = await self._fetch_analytics_envelope(
+        extra = {"providers": _repeated_when_single(providers)} if providers else None
+        read = await self._fetch_analytics_envelope(
             "token_breakdown_by_type", period, extra_new_params=extra
         )
-        return self._flatten_timeseries_items(response)
+        return self._flatten_timeseries_items(read)
 
     async def get_department_costs(self, query: DepartmentCostsQuery) -> Dict[str, Any]:
         """Cost by department as the full envelope: departmentSetup sits beside _embedded."""
-        return await self._fetch_analytics_envelope(
-            DEPARTMENT_COSTS_ENDPOINT_KEY, query.period, extra_new_params=query.request_params()
+        read = await self._fetch_analytics_envelope(
+            DEPARTMENT_COSTS_ENDPOINT_KEY,
+            query.period,
+            extra_new_params=query.request_params(),
+            every_page=False,
         )
+        return read.envelope
 
-    async def get_team_costs(self, period: str) -> List[Dict[str, Any]]:
+    async def get_team_costs(self, period: AnalyticsWindow) -> PackRows:
         """Cost by team over time (envelope A timeseries buckets)."""
-        response = await self._fetch_analytics_envelope("cost_by_team_timeseries", period)
-        return self._flatten_timeseries_items(response)
+        read = await self._fetch_analytics_envelope("cost_by_team_timeseries", period)
+        return self._flatten_timeseries_items(read)
 
-    async def get_vendor_costs(self, period: str) -> List[Dict[str, Any]]:
+    async def get_vendor_costs(self, period: AnalyticsWindow) -> PackRows:
         """Cost by vendor (envelope B aggregated totals)."""
-        response = await self._fetch_analytics_envelope("cost_by_vendor", period)
-        return self._flatten_aggregated_items(response)
+        read = await self._fetch_analytics_envelope("cost_by_vendor", period)
+        return self._flatten_aggregated_items(read)
 
-    async def get_token_vs_tool_cost(self, period: str) -> List[Dict[str, Any]]:
+    async def get_token_vs_tool_cost(self, period: AnalyticsWindow) -> PackRows:
         """Token cost vs tool cost over time (envelope A timeseries buckets)."""
-        response = await self._fetch_analytics_envelope("token_vs_tool_cost", period)
-        return self._flatten_timeseries_items(response)
+        read = await self._fetch_analytics_envelope("token_vs_tool_cost", period)
+        return self._flatten_timeseries_items(read)
 
-    async def get_trace_cost_distribution(self, period: str) -> List[Dict[str, Any]]:
+    async def get_trace_cost_distribution(self, period: AnalyticsWindow) -> PackRows:
         """Per-trace cost scatter (envelope C). Returns the top-level
         ``dataPoints`` list as-is; missing/empty → empty list."""
-        response = await self._fetch_analytics_envelope("trace_cost_distribution", period)
-        points = response.get("dataPoints", [])
-        return [p for p in points if isinstance(p, dict)] if isinstance(points, list) else []
+        read = await self._fetch_analytics_envelope("trace_cost_distribution", period)
+        points = read.envelope.get("dataPoints", [])
+        rows = [p for p in points if isinstance(p, dict)] if isinstance(points, list) else []
+        return PackRows(rows, read.unread)

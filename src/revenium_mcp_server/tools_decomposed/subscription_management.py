@@ -5,9 +5,7 @@ tool with internal composition, following the proven alert/source/customer manag
 """
 
 import json
-import os
 import re
-import time
 from datetime import datetime, timezone
 from typing import NoReturn, TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 
@@ -26,10 +24,17 @@ from ..common.error_handling import (
     create_structured_validation_error,
     raise_refusal,
 )
+from ..common.formatting import format_page_count_heading
 from ..common.partial_update_handler import PartialUpdateHandler
+from ..common.sample_coverage import (
+    describe_sample,
+    platform_total,
+    reference_id,
+    share_of_sample,
+)
 from ..common.update_configs import UpdateConfigFactory
 from ..common.validation import SAFE_INT_MAX, apply_filter_allowlist
-from ..config_store import get_config_value
+from ..config_store import configured_default_email, get_config_value
 from ..exceptions import ValidationError
 from ..hierarchy import (
     get_cross_tier_validator,
@@ -44,6 +49,7 @@ from ..introspection.metadata import (
     ToolType,
     UsagePattern,
 )
+from ..schema_discovery import SUBSCRIPTION_EXAMPLE_TYPES
 from .unified_tool_base import ToolBase
 
 
@@ -133,6 +139,9 @@ _MAX_SUBSCRIPTIONS_PAGE = 1_000_000
 # Upper bound on the size parameter (matches PaginationPerformanceManager.MAXIMUM_LIMIT).
 _MAX_SUBSCRIPTIONS_SIZE = 100
 
+# How many products a name-only create offers when it asks which one to use.
+_QUICK_CREATE_PRODUCT_CHOICES = 5
+
 
 def _validate_subscriptions_pagination(page: Any, size: Any) -> None:
     """Reject malformed page / size before they reach the API client.
@@ -209,6 +218,198 @@ def _validate_subscriptions_pagination(page: Any, size: Any) -> None:
         )
 
 
+def _ask_which_product(
+    subscription_data: Dict[str, Any], products: List[Dict[str, Any]], total: Optional[int]
+) -> NoReturn:
+    """Refuse a create that names no product, offering the products it can use.
+
+    BACK-4709: a subscription bills a customer for one product, so picking one
+    on the caller's behalf would create a billable subscription on a product
+    nobody chose. The refusal raises so the envelope carries the error flag.
+    """
+    retry = _create_retry_example(subscription_data, _MISSING_FIELD_PLACEHOLDERS)
+    address_ask = (
+        ""
+        if subscription_data.get("clientEmailAddress")
+        else "\n\nAlso supply `clientEmailAddress`, the address the subscription's invoices go to."
+    )
+    if not products:
+        raise_refusal(
+            "**No products available**\n\n"
+            "A subscription bills a customer for one product, and this organization has none. "
+            "Create one with `manage_products`, then retry with its id:\n\n"
+            f"`{retry}`",
+            error_code=ErrorCodes.MISSING_PARAMETER,
+            field="product_id",
+        )
+
+    choices = []
+    for product in products:
+        id_note = product.get("id") if product.get("published") else f"{product.get('id')}, unpublished"
+        choices.append(f"- {product.get('name') or '(unnamed)'} ({id_note})")
+    if total is not None and total > len(products):
+        shown = f" (showing {len(products)} of {total}; use discover_products to see more)"
+    elif total is None and len(products) >= _QUICK_CREATE_PRODUCT_CHOICES:
+        shown = f" (showing the first {len(products)}; use discover_products to see more)"
+    else:
+        shown = ""
+    raise_refusal(
+        "**Which product?**\n\n"
+        "A subscription bills a customer for one product, so `product_id` is required. "
+        f"Choose one of these products{shown}:\n"
+        + "\n".join(choices)
+        + address_ask
+        + f"\n\n**Retry**: `{retry}`",
+        error_code=ErrorCodes.MISSING_PARAMETER,
+        field="product_id",
+    )
+
+
+def _create_retry_example(
+    subscription_data: Dict[str, Any],
+    placeholders: Dict[str, str],
+    extra: Optional[Dict[str, Any]] = None,
+) -> str:
+    """A create call that keeps every field the caller sent and marks what is missing.
+
+    `placeholders` maps a required field to the text shown when the caller left it
+    out; `product_id` counts as present when the caller sent `productId`.
+    """
+    data = dict(subscription_data)
+    for key, placeholder in placeholders.items():
+        present = data.get(key) or (key == "product_id" and data.get("productId"))
+        if not present:
+            data[key] = placeholder
+    retry = {"action": "create", "subscription_data": data, **(extra or {})}
+    return json.dumps(retry, separators=(",", ":"), default=str)
+
+
+_MISSING_FIELD_PLACEHOLDERS = {
+    "product_id": "<id>",
+    "clientEmailAddress": "<invoice address>",
+}
+
+
+def _refuse_missing_invoice_address(subscription_data: Dict[str, Any]) -> NoReturn:
+    """Refuse a quick create that names no invoice address and has no default to use."""
+    retry = _create_retry_example(subscription_data, _MISSING_FIELD_PLACEHOLDERS)
+    raise_refusal(
+        "**Missing Required Field**\n\n"
+        "**Field**: `clientEmailAddress`, the address the subscription's invoices go to\n\n"
+        "No invoice address was given and REVENIUM_DEFAULT_EMAIL holds none, so nothing "
+        "was created. Supply the address of the customer being billed.\n\n"
+        f"**Retry**: `{retry}`",
+        error_code=ErrorCodes.MISSING_PARAMETER,
+        field="clientEmailAddress",
+    )
+
+
+def _default_address_note(address: str) -> str:
+    return (
+        f"Invoice address {address} came from REVENIUM_DEFAULT_EMAIL; "
+        "pass clientEmailAddress to invoice someone else."
+    )
+
+
+# Keys a create accepts as aliases or controls rather than as subscription fields.
+_CREATE_ONLY_KEYS = frozenset({"product_id", "auto_generate", "dry_run"})
+
+
+def _unstored_fields_note(subscription_data: Any) -> str:
+    """Name the caller's fields the platform drops on create, or "" when there are none."""
+    if not isinstance(subscription_data, dict):
+        return ""
+    unstored = sorted(
+        key
+        for key in subscription_data
+        if key not in _SUBSCRIPTION_WRITE_FIELDS and key not in _CREATE_ONLY_KEYS
+    )
+    return f"Not stored by the platform: {', '.join(unstored)}." if unstored else ""
+
+
+# BACK-4709: the search inputs, each sent as the platform's one `query` term,
+# most specific first (subscription_nlp sends the first one it extracted).
+_NAMED_SEARCH_TERM_KEYS = ("subscriber_email", "customer_name", "product_name")
+_SEARCH_TERM_KEYS = (*_NAMED_SEARCH_TERM_KEYS, "search_query")
+
+# The row fields the platform `query` matches; nested objects carry their name
+# in `name` or `label` (organizations arrive with `name` null).
+_SEARCH_MATCH_PATHS = (
+    "name",
+    "subscriberEmail",
+    "clientEmailAddress",
+    "organization.name",
+    "organization.label",
+    "product.name",
+    "product.label",
+)
+
+# The fields that count as a match for each specific input; search_query takes any.
+_SEARCH_TERM_FIELDS = {
+    "subscriber_email": ("subscriberEmail", "clientEmailAddress"),
+    "customer_name": ("organization.name", "organization.label"),
+    "product_name": ("product.name", "product.label"),
+}
+
+# How total_found_basis names the field a specific input searches.
+_SEARCH_TERM_FIELD_LABELS = {
+    "subscriber_email": "the subscriber email",
+    "customer_name": "the organization name",
+    "product_name": "the product name",
+}
+
+
+def _total_found_basis(key: str, term: str) -> str:
+    """Say what the platform total counts for a search on `term` sent as `key`."""
+    counted = (
+        "total_found counts every subscription whose name, client username or email, "
+        f"organization name or product name contains '{term}'"
+    )
+    label = _SEARCH_TERM_FIELD_LABELS.get(key)
+    if label is None:
+        return counted + "."
+    return (
+        f"{counted}, not only those matching on {label}; "
+        f"exact_field_matches_on_page counts this page's rows matching on {label}."
+    )
+
+
+_SEARCH_MATCH_BASIS = (
+    "The platform matches the term as a case-insensitive substring of the subscription "
+    "name, the client's username or email, the organization name and the product name; "
+    "underscores and percent signs in the term match any character. total_found counts "
+    "every platform match; each row's matched_on lists the fields on it that contain the "
+    "term, and exact_field_matches_on_page counts the rows on this page that matched on "
+    "the field searched."
+)
+
+
+def _search_terms(arguments: Dict[str, Any]) -> Dict[str, str]:
+    """The search inputs that carry a term, trimmed; None and blank mean absent."""
+    terms = {}
+    for key in _SEARCH_TERM_KEYS:
+        value = arguments.get(key)
+        if value is None:
+            continue
+        value = str(value).strip()
+        if value:
+            terms[key] = value
+    return terms
+
+
+def _fields_containing(subscription: Dict[str, Any], term: str) -> List[str]:
+    """The `_SEARCH_MATCH_PATHS` on a row whose text contains `term`, case-insensitively."""
+    term_lower = term.lower()
+    matched = []
+    for path in _SEARCH_MATCH_PATHS:
+        value: Any = subscription
+        for key in path.split("."):
+            value = value.get(key) if isinstance(value, dict) else None
+        if isinstance(value, str) and term_lower in value.lower():
+            matched.append(path)
+    return matched
+
+
 # BACK-2944: the invoice address is documented as an email address, so reject anything
 # that is not one locally instead of forwarding it to the platform, which derives a user
 # from whatever string it is handed. Same pattern as the email checks in models.py.
@@ -259,6 +460,119 @@ def _normalize_client_email_field(data: Dict[str, Any]) -> None:
     """Validate and trim data["clientEmailAddress"] in place when the key is present."""
     if "clientEmailAddress" in data:
         data["clientEmailAddress"] = _validate_client_email_address(data["clientEmailAddress"])
+
+
+_EXPIRATION_ROUTE_NOTE = (
+    "The only non-destructive route the API exposes is "
+    "`update(subscription_id=..., subscription_data={'expiration': ...})`, which sets "
+    "an expiration date; this server cannot confirm that it stops billing on the platform."
+)
+
+# The fields of SubscriptionResource_Write in specs/openapi/hypercurrent.json that a
+# caller would change; the write contract has no status, description or metadata.
+_UPDATABLE_FIELDS_HINT = ("name", "expiration", "clientEmailAddress", "productId")
+
+# The SubscriptionResource_Write properties the spec does not mark readOnly (the platform
+# ignores readOnly ones on a write), plus subscriberId, which the subscriptions update
+# config sends although the spec omits it.
+_SUBSCRIPTION_WRITE_FIELDS = frozenset(
+    {
+        "account",
+        "accountId",
+        "additionalInvoiceRecipients",
+        "allowImmediateCancellation",
+        "charge",
+        "client",
+        "clientEmailAddress",
+        "credentialIds",
+        "expiration",
+        "externalQuoteId",
+        "identityProvider",
+        "name",
+        "namedOrganizationIds",
+        "namedSubscribers",
+        "notificationAddressesOnCreation",
+        "notificationAddressesOnQuotaThreshold",
+        "organization",
+        "organizationId",
+        "owner",
+        "ownerId",
+        "periodEnd",
+        "periodStart",
+        "product",
+        "productId",
+        "sendToSubscriber",
+        "start",
+        "subscriberEmail",
+        "subscriberId",
+        "subscriptionId",
+        "tags",
+        "team",
+        "teamId",
+        "tierQuotaNotificationThreshold",
+        "trialEnd",
+        "wentOverSubscriptionQuota",
+    }
+)
+
+# Words of a subscription_nlp query that are never part of the search term.
+_NLP_NON_TERM_WORDS = frozenset(
+    {
+        "list",
+        "show",
+        "subs",
+        "display",
+        "view",
+        "see",
+        "search",
+        "find",
+        "get",
+        "subscription",
+        "subscriptions",
+        "for",
+        "with",
+        "me",
+        "all",
+        "the",
+        "of",
+        "by",
+    }
+)
+# "for product popcorn" names a product: the word after "for" is a kind, not a customer.
+_NLP_KIND_WORDS = r"(?:products?|customers?|organizations?)"
+_NLP_TOKEN_PUNCTUATION = ".,;:!?\"'()[]{}"
+
+_SUPPORTING_DATA_TYPES = ("all", "organizations", "products", "subscribers", "credentials")
+
+_CANCEL_NOT_OFFERED_MESSAGE = (
+    "**Cancel is not available**\n\n"
+    "The Revenium platform has no cancel operation for subscriptions, so nothing was "
+    "changed. `delete(subscription_id=...)` permanently removes the subscription record. "
+    + _EXPIRATION_ROUTE_NOTE
+)
+
+
+def _supporting_data_type(data_type: Any) -> str:
+    """Return the get_supporting_data category, refusing one the action cannot answer.
+
+    An unknown category used to answer with an empty result that read as "no data".
+    """
+    normalized = data_type.strip().lower() if isinstance(data_type, str) else data_type
+    if normalized not in _SUPPORTING_DATA_TYPES:
+        raise create_structured_validation_error(
+            message=(
+                f"data_type '{data_type}' is not a supporting data category; "
+                f"use one of: {', '.join(_SUPPORTING_DATA_TYPES)}"
+            ),
+            field="data_type",
+            value=data_type,
+            suggestions=["Omit data_type to get every category"],
+            examples={
+                "usage": "get_supporting_data(data_type='products')",
+                "valid_values": list(_SUPPORTING_DATA_TYPES),
+            },
+        )
+    return cast(str, normalized)
 
 
 class SubscriptionManager:
@@ -389,7 +703,7 @@ class SubscriptionManager:
                 validation_result.update(
                     {
                         "error": "Product is not published and cannot be used for subscriptions",
-                        "recommendation": "Contact administrator to publish the product or choose a different product",
+                        "recommendation": "Publish the product and attach a data source with manage_products update, or choose a different product",
                     }
                 )
             else:
@@ -437,6 +751,8 @@ class SubscriptionManager:
             "subscriptions": subscriptions,
             "pagination": page_info,
             "total_found": len(subscriptions),
+            "total_records": platform_total(page_info),
+            "page": page,
         }
 
     async def get_subscription(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -623,61 +939,10 @@ class SubscriptionManager:
         }
 
     async def create_subscription(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Create new subscription with Context7 auto-generation support."""
+        """Create a subscription from subscription_data; nothing is auto-generated here."""
         subscription_data = arguments.get("subscription_data")
-        name = arguments.get("name")
 
-        # Context7 auto-generation: Handle case where user provides only name
-        if not subscription_data and name:
-            # Auto-generate subscription_data from minimal user input
-            # First, get the first available product
-            try:
-                products_response = await self.client.get_products(page=0, size=1)
-                products = self.client._extract_embedded_data(products_response)
-
-                if not products:
-                    raise create_structured_validation_error(
-                        message="No products available for subscription creation",
-                        field="product_id",
-                        value="none_available",
-                        suggestions=[
-                            "Create a product first using manage_products tool",
-                            "Use manage_products(action='list') to see available products",
-                        ],
-                    )
-
-                first_product = products[0]
-                product_id = first_product.get("id")
-
-                # Generate email from name
-                email_name = name.lower().replace(" ", ".").replace("@", "").replace(".", "")
-                generated_email = f"{email_name}@example.com"
-
-                subscription_data = {
-                    "name": name,
-                    "description": f"Subscription for {name}",
-                    "productId": product_id,
-                    "clientEmailAddress": generated_email,
-                }
-
-                logger.info(
-                    f"Context7 auto-generation: Created subscription_data for '{name}' with product {product_id}"
-                )
-
-            except Exception as e:
-                logger.error(f"Context7 auto-generation failed: {e}")
-                raise create_structured_validation_error(
-                    message="Unable to auto-generate subscription data",
-                    field="name",
-                    value=name,
-                    suggestions=[
-                        "Provide explicit subscription_data parameter",
-                        "Ensure products exist using manage_products tool",
-                        "Use get_examples() to see full subscription templates",
-                    ],
-                )
-
-        elif not subscription_data:
+        if not subscription_data:
             raise create_structured_missing_parameter_error(
                 parameter_name="subscription_data",
                 action="create subscription",
@@ -687,7 +952,6 @@ class SubscriptionManager:
                     "example_data": {
                         "product_id": "prod_123",
                         "clientEmailAddress": "customer@company.com",
-                        "billing_cycle": "monthly",
                     },
                     "billing_safety": "⚠️ CRITICAL: Subscription creation initiates billing - ensure all data is correct",
                     "field_descriptions": {
@@ -751,9 +1015,50 @@ class SubscriptionManager:
                 examples={
                     "usage": "update(subscription_id='sub_123', subscription_data={'name': 'Updated Subscription'})",
                     "partial_update": "Only provide the fields you want to update",
-                    "updatable_fields": ["name", "description", "metadata", "status"],
+                    "updatable_fields": list(_UPDATABLE_FIELDS_HINT),
                     "billing_safety": "🔒 BILLING SAFETY: Partial updates preserve existing subscription configuration while changing specific fields",
                 },
+            )
+
+        if not isinstance(subscription_data, dict):
+            raise create_structured_validation_error(
+                message=(
+                    "subscription_data must be an object of the fields to change, "
+                    "so nothing was changed"
+                ),
+                field="subscription_data",
+                value=subscription_data,
+                suggestions=["Pass subscription_data as an object, for example {'name': 'New name'}"],
+                examples={"updatable_fields": list(_UPDATABLE_FIELDS_HINT)},
+            )
+
+        if "status" in subscription_data:
+            raise create_structured_validation_error(
+                message=(
+                    "Subscriptions have no status field, so nothing was updated. "
+                    + _EXPIRATION_ROUTE_NOTE
+                ),
+                field="status",
+                value=subscription_data["status"],
+                suggestions=["Remove status from subscription_data"],
+                examples={"updatable_fields": list(_UPDATABLE_FIELDS_HINT)},
+            )
+
+        unstored = sorted(set(subscription_data) - _SUBSCRIPTION_WRITE_FIELDS)
+        if unstored:
+            suggestions = [f"Remove {', '.join(unstored)} from subscription_data"]
+            if "product_id" in unstored:
+                suggestions.append("Use productId to move the subscription to another product")
+            raise create_structured_validation_error(
+                message=(
+                    f"The platform would not store {', '.join(unstored)} on a subscription, "
+                    "so nothing was changed. Fields you can update include: "
+                    + ", ".join(_UPDATABLE_FIELDS_HINT)
+                ),
+                field=unstored[0],
+                value=unstored,
+                suggestions=suggestions,
+                examples={"updatable_fields": list(_UPDATABLE_FIELDS_HINT)},
             )
 
         # A partial update can rewrite the billing identity, so it gets the same check the
@@ -775,24 +1080,6 @@ class SubscriptionManager:
         _sanitize_undefined_sentinels(result)
         return result
 
-    async def cancel_subscription(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Cancel subscription."""
-        subscription_id = arguments.get("subscription_id")
-        if not subscription_id:
-            raise create_structured_missing_parameter_error(
-                parameter_name="subscription_id",
-                action="cancel subscription",
-                examples={
-                    "usage": "cancel(subscription_id='sub_123')",
-                    "valid_format": "Subscription ID should be a string identifier",
-                    "example_ids": ["sub_123", "subscription_456", "billing_789"],
-                    "billing_safety": "🔒 BILLING SAFETY: Subscription cancellation stops billing - ensure correct subscription ID",
-                },
-            )
-
-        result = await self.client.cancel_subscription(subscription_id)
-        return result
-
     async def delete_subscription(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Delete subscription permanently."""
         subscription_id = arguments.get("subscription_id")
@@ -808,13 +1095,12 @@ class SubscriptionManager:
                 },
             )
 
-        # Use the same cancel_subscription method since it uses DELETE endpoint
-        result = await self.client.cancel_subscription(subscription_id)
+        result = await self.client.delete_subscription(subscription_id)
         return result
 
     async def get_supporting_data(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get supporting data for subscription creation (organizations, products, subscribers, credentials)."""
-        data_type = arguments.get("data_type", "all")
+        data_type = _supporting_data_type(arguments.get("data_type", "all"))
         page = arguments.get("page", 0)
         size = arguments.get("size", 100)
         search_query = arguments.get("search_query", "")
@@ -901,80 +1187,61 @@ class SubscriptionManager:
             return result
 
     async def search_subscriptions(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Search subscriptions with advanced filtering."""
-        search_query = arguments.get("search_query", "")
-        customer_name = arguments.get("customer_name", "")
-        product_name = arguments.get("product_name", "")
-        subscriber_email = arguments.get("subscriber_email", "")
-        page = arguments.get("page", 0)
-        size = arguments.get("size", 50)  # Get more for filtering
-        _validate_subscriptions_pagination(page, size)
+        """Search subscriptions with the platform's own search over all subscriptions.
 
-        # Get all subscriptions first
-        response = await self.client.get_subscriptions(page=page, size=size)
+        BACK-4709: the platform `query` matches one term across every
+        subscription, so the term is sent as `query` and the platform total is
+        reported. Filtering one page locally could never match: platform rows
+        carry no `customer` or `subscriber` key.
+        """
+        terms = _search_terms(arguments)
+        page = arguments.get("page", 0)
+        size = arguments.get("size", 50)
+        _validate_subscriptions_pagination(page, size)
+        if len(terms) > 1:
+            raise create_structured_validation_error(
+                message=(
+                    "The platform search takes one search term; pass only one of "
+                    f"{', '.join(terms)}"
+                ),
+                field=next(iter(terms)),
+                value=terms,
+                suggestions=[
+                    "Search by the most specific term, then read each row's matched_on",
+                ],
+            )
+
+        key, term = next(iter(terms.items()), (None, None))
+        filters = {"query": term} if term else {}
+        response = await self.client.get_subscriptions(page=page, size=size, **filters)
         subscriptions = self.client._extract_embedded_data(response)
         page_info = self.client._extract_pagination_info(response)
 
-        # Apply client-side filtering
-        filtered_subscriptions = []
-
-        for subscription in subscriptions:
-            matches = True
-
-            # General search query filter
-            if search_query:
-                search_lower = search_query.lower()
-                searchable_text = " ".join(
-                    [
-                        str(subscription.get("name", "")),
-                        str(subscription.get("customer", "")),
-                        str(subscription.get("product", "")),
-                        str(subscription.get("subscriber", "")),
-                        str(subscription.get("description", "")),
-                    ]
-                ).lower()
-
-                if search_lower not in searchable_text:
-                    matches = False
-
-            # Specific field filters
-            if customer_name and matches:
-                customer_lower = customer_name.lower()
-                sub_customer = str(subscription.get("customer", "")).lower()
-                if customer_lower not in sub_customer:
-                    matches = False
-
-            if product_name and matches:
-                product_lower = product_name.lower()
-                sub_product = str(subscription.get("product", "")).lower()
-                if product_lower not in sub_product:
-                    matches = False
-
-            if subscriber_email and matches:
-                email_lower = subscriber_email.lower()
-                sub_email = str(subscription.get("subscriber", "")).lower()
-                if email_lower not in sub_email:
-                    matches = False
-
-            if matches:
-                filtered_subscriptions.append(subscription)
-
         # BACK-1311: normalize nested `"undefined"` placeholders + locale dates.
-        _sanitize_undefined_sentinels(filtered_subscriptions)
+        _sanitize_undefined_sentinels(subscriptions)
 
-        return {
+        exact_matches = 0
+        if term:
+            wanted = _SEARCH_TERM_FIELDS.get(key or "")
+            for subscription in subscriptions:
+                matched_on = _fields_containing(subscription, term)
+                subscription["matched_on"] = matched_on
+                if matched_on and (wanted is None or any(path in wanted for path in matched_on)):
+                    exact_matches += 1
+
+        result: Dict[str, Any] = {
             "action": "search_subscriptions",
-            "search_criteria": {
-                "search_query": search_query,
-                "customer_name": customer_name,
-                "product_name": product_name,
-                "subscriber_email": subscriber_email,
-            },
-            "subscriptions": filtered_subscriptions,
-            "total_found": len(filtered_subscriptions),
-            "original_total": len(subscriptions),
+            "search_criteria": {key: terms.get(key, "") for key in _SEARCH_TERM_KEYS},
+            "subscriptions": subscriptions,
+            "total_found": platform_total(page_info),
+            "returned": len(subscriptions),
             "pagination": page_info,
         }
+        if term:
+            result["match_basis"] = _SEARCH_MATCH_BASIS
+            result["total_found_basis"] = _total_found_basis(key or "", term)
+            result["exact_field_matches_on_page"] = exact_matches
+        return result
 
     async def subscription_nlp(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Process natural language queries for subscription management."""
@@ -1000,6 +1267,12 @@ class SubscriptionManager:
         # Intent classification
         intent = self._classify_subscription_intent(query)
         entities = self._extract_subscription_entities(query)
+        if intent == "list_subscriptions" and any(
+            entities.get(key) for key in _NAMED_SEARCH_TERM_KEYS
+        ):
+            # "show subscriptions for popcorn" asks about one customer, not every subscription;
+            # leftover words (search_query) in "list all active subscriptions" do not.
+            intent = "search_subscriptions"
 
         # Route to appropriate action based on intent
         if intent == "list_subscriptions":
@@ -1012,16 +1285,13 @@ class SubscriptionManager:
             )
 
         elif intent == "search_subscriptions":
-            return await self.search_subscriptions(
-                {
-                    "search_query": entities.get("search_query", ""),
-                    "customer_name": entities.get("customer_name", ""),
-                    "product_name": entities.get("product_name", ""),
-                    "subscriber_email": entities.get("subscriber_email", ""),
-                    "page": entities.get("page", 0),
-                    "size": entities.get("size", 20),
-                }
-            )
+            # BACK-4709: the platform search takes one term; the extractor also
+            # keeps the whole sentence as search_query, so send the most specific.
+            search_arguments = {"page": entities.get("page", 0), "size": entities.get("size", 20)}
+            term_key = next((key for key in _SEARCH_TERM_KEYS if entities.get(key)), None)
+            if term_key:
+                search_arguments[term_key] = entities[term_key]
+            return await self.search_subscriptions(search_arguments)
 
         elif intent == "get_subscription":
             if entities.get("subscription_id"):
@@ -1050,7 +1320,7 @@ class SubscriptionManager:
                 "next_steps": [
                     "Use discover_products() to find available products",
                     "Use validate_product_for_subscription() to verify product",
-                    "Use create_simple() or create() with explicit parameters",
+                    "Use create() with explicit product_id and clientEmailAddress",
                 ],
                 "warning": "⚠️ Natural language subscription creation requires explicit product_id and clientEmailAddress for billing safety",
             }
@@ -1121,9 +1391,10 @@ class SubscriptionManager:
 
         # Extract customer/organization names
         customer_patterns = [
+            r"for\s+(?:customers?|organizations?)\s+([a-zA-Z0-9\-_]+)",
             r"customer\s+([a-zA-Z0-9\-_]+)",
             r"organization\s+([a-zA-Z0-9\-_]+)",
-            r"for\s+([a-zA-Z0-9\-_]+)",
+            rf"for\s+(?!{_NLP_KIND_WORDS}\b)([a-zA-Z0-9\-_]+)",
             r"globaltech",
             r"nexus-research",
             r"innovate",
@@ -1143,6 +1414,7 @@ class SubscriptionManager:
 
         # Extract product names
         product_patterns = [
+            r"for\s+products?\s+([a-zA-Z0-9\-_\s]+)",
             r"product\s+([a-zA-Z0-9\-_\s]+)",
             r"with\s+([a-zA-Z0-9\-_\s]+)\s+product",
             r"automated billing",
@@ -1190,20 +1462,11 @@ class SubscriptionManager:
         elif any(word in query_lower for word in ["credential", "credentials"]):
             entities["data_type"] = "credentials"
 
-        # Extract general search query (remove intent words)
-        search_query = query_lower
-        for remove_word in [
-            "list",
-            "show",
-            "display",
-            "search",
-            "find",
-            "get",
-            "subscription",
-            "subscriptions",
-        ]:
-            search_query = search_query.replace(remove_word, "")
-        search_query = search_query.strip()
+        # The general search term: the query's words without the intent and filler words
+        words = (word.strip(_NLP_TOKEN_PUNCTUATION) for word in query_lower.split())
+        search_query = " ".join(
+            word for word in words if word and word not in _NLP_NON_TERM_WORDS
+        )
 
         if search_query and len(search_query) > 2:
             entities["search_query"] = search_query
@@ -1324,12 +1587,13 @@ class SubscriptionManager:
                     suggestions=[
                         "Publish the product first using manage_products with action='update'",
                         "Set published: true in the product configuration",
+                        "A product needs a data source as well as publication to take subscriptions; pick one with manage_sources(action='list')",
                         "Verify the product is ready for subscription creation",
                         "Check product status and configuration",
                     ],
                     examples={
                         "product_status": f"{product.get('name', 'Unknown')} (unpublished)",
-                        "publish_command": "manage_products(action='update', product_id='prod_123', product_data={'published': True})",
+                        "publish_command": "manage_products(action='update', product_id='prod_123', product_data={'published': True, 'sourceIds': ['<source id>']})",
                         "verification": "manage_products(action='get', product_id='prod_123')",
                         "billing_safety": "🔒 BILLING SAFETY: Only published products can be used for subscriptions to prevent billing errors",
                     },
@@ -1639,6 +1903,17 @@ class SubscriptionManager:
         return analysis
 
 
+def _unknown_example_template(example_type: str) -> Dict[str, Any]:
+    return {
+        "error": (
+            f"No subscription template named '{example_type}'; "
+            f"use one of: {', '.join(SUBSCRIPTION_EXAMPLE_TYPES)}"
+        ),
+        "example_type": example_type,
+        "available_types": list(SUBSCRIPTION_EXAMPLE_TYPES),
+    }
+
+
 class SubscriptionValidator:
     """Internal manager for subscription validation and schema discovery with UCM integration."""
 
@@ -1793,14 +2068,23 @@ class SubscriptionValidator:
                     and len(schema_examples["examples"]) > 0
                 ):
                     return cast(Dict[str, Any], schema_examples)
+                if example_type:
+                    return _unknown_example_template(example_type)
                 # If schema discovery returns empty, fall back to static examples
                 logger.info("Schema discovery returned empty examples, using fallback")
             except Exception as e:
                 logger.warning(f"Schema discovery failed, using fallback examples: {e}")
 
         # Use fallback examples
-        if example_type and example_type in fallback_examples:
-            return {"examples": [fallback_examples[example_type]]}
+        if example_type:
+            matches = [
+                example
+                for key, example in fallback_examples.items()
+                if example_type in (key, example["example_type"])
+            ]
+            if not matches:
+                return _unknown_example_template(example_type)
+            return {"examples": matches}
 
         return {"examples": list(fallback_examples.values())}
 
@@ -1835,6 +2119,47 @@ class SubscriptionValidator:
         )
 
 
+_LIFECYCLE_STATES = ("active", "expired", "not_started", "unknown")
+
+_LIFECYCLE_BASIS = (
+    "The platform returns no status field for a subscription, so each state is "
+    "read from the record's start, expiration and trialEnd dates as of {as_of}: "
+    "active = started and not expired, expired = expiration passed, "
+    "not_started = start still ahead, trial = active with trialEnd still ahead."
+)
+
+
+def _parse_instant(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _subscription_lifecycle(subscription: Dict[str, Any], now: datetime) -> str:
+    start = _parse_instant(subscription.get("start"))
+    if start is None:
+        return "unknown"
+    if start > now:
+        return "not_started"
+    expiration = _parse_instant(subscription.get("expiration"))
+    if expiration is not None and expiration <= now:
+        return "expired"
+    return "active"
+
+
+def _is_in_trial(subscription: Dict[str, Any], now: datetime) -> bool:
+    trial_end = _parse_instant(subscription.get("trialEnd"))
+    return (
+        trial_end is not None
+        and trial_end > now
+        and _subscription_lifecycle(subscription, now) == "active"
+    )
+
+
 class SubscriptionAnalytics:
     """Internal processor for subscription analytics and metrics."""
 
@@ -1853,46 +2178,32 @@ class SubscriptionAnalytics:
 
         response = await self.client.get_subscriptions(page=page, size=size, **filters)
         subscriptions = self.client._extract_embedded_data(response)
-        page_info = self.client._extract_pagination_info(response)
-
-        total_subscriptions = page_info.get("totalElements", len(subscriptions))
-        active_subscriptions = len([s for s in subscriptions if s.get("status") == "active"])
-        trial_subscriptions = len([s for s in subscriptions if s.get("status") == "trial"])
-        cancelled_subscriptions = len([s for s in subscriptions if s.get("status") == "cancelled"])
-
-        # Calculate revenue metrics (placeholder - would need actual billing data)
-        monthly_subscriptions = len(
-            [s for s in subscriptions if s.get("billing_period") == "monthly"]
-        )
-        yearly_subscriptions = len(
-            [s for s in subscriptions if s.get("billing_period") == "yearly"]
-        )
+        total_subscriptions = platform_total(self.client._extract_pagination_info(response))
+        covered = len(subscriptions)
+        now = datetime.now(timezone.utc)
+        lifecycles = [_subscription_lifecycle(sub, now) for sub in subscriptions]
+        counts = {state: lifecycles.count(state) for state in _LIFECYCLE_STATES}
+        in_trial = sum(1 for sub in subscriptions if _is_in_trial(sub, now))
 
         metrics = {
             "total_subscriptions": total_subscriptions,
-            "active_subscriptions": active_subscriptions,
-            "trial_subscriptions": trial_subscriptions,
-            "cancelled_subscriptions": cancelled_subscriptions,
-            "conversion_rate": (
-                (active_subscriptions / total_subscriptions * 100) if total_subscriptions > 0 else 0
-            ),
-            "trial_rate": (
-                (trial_subscriptions / total_subscriptions * 100) if total_subscriptions > 0 else 0
-            ),
-            "churn_rate": (
-                (cancelled_subscriptions / total_subscriptions * 100)
-                if total_subscriptions > 0
-                else 0
-            ),
-            "billing_distribution": {
-                "monthly": monthly_subscriptions,
-                "yearly": yearly_subscriptions,
-                "other": total_subscriptions - monthly_subscriptions - yearly_subscriptions,
-            },
-            "sample_size": len(subscriptions),
+            "sample": describe_sample(page, covered, total_subscriptions),
+            "active_subscriptions": counts["active"],
+            "trial_subscriptions": in_trial,
+            "expired_subscriptions": counts["expired"],
+            "not_started_subscriptions": counts["not_started"],
+            "subscriptions_without_readable_start": counts["unknown"],
+            "active_rate_in_sample": share_of_sample(counts["active"], covered),
+            "trial_rate_in_sample": share_of_sample(in_trial, covered),
+            "expired_rate_in_sample": share_of_sample(counts["expired"], covered),
             "products_represented": len(
-                set(s.get("product_id") for s in subscriptions if s.get("product_id"))
+                {
+                    product_id
+                    for sub in subscriptions
+                    if (product_id := reference_id(sub, "product", "productId"))
+                }
             ),
+            "lifecycle_basis": _LIFECYCLE_BASIS.format(as_of=now.isoformat()),
         }
 
         return metrics
@@ -2222,7 +2533,7 @@ class SubscriptionManagement(ToolBase):
                 )
             elif action in ["get_capabilities", "get_examples", "validate", "get_agent_summary"]:
                 return await self._handle_discovery_actions(action, arguments)
-            elif action in ["get_product_details", "get_credentials", "create_with_credentials"]:
+            elif action in ["get_product_details", "get_credentials"]:
                 return await self._handle_hierarchy_actions(action, arguments, hierarchy_manager)
             else:
                 return self._handle_unknown_action(action)
@@ -2246,7 +2557,13 @@ class SubscriptionManagement(ToolBase):
             return [
                 TextContent(
                     type="text",
-                    text=f"Found {result['total_found']} subscriptions (page {arguments.get('page', 0) + 1}):\n\n"
+                    text=format_page_count_heading(
+                        "subscriptions",
+                        len(result["subscriptions"]),
+                        result["pagination"],
+                        result["page"],
+                    )
+                    + "\n\n"
                     + json.dumps(result, indent=2),
                 )
             ]
@@ -2265,6 +2582,8 @@ class SubscriptionManagement(ToolBase):
             subscription_data = arguments.get("subscription_data", {})
             auto_generate = arguments.get("auto_generate", True)  # Default to Context7 simple mode
             dry_run = arguments.get("dry_run", False)
+            default_address_note = ""
+            unstored_note = _unstored_fields_note(subscription_data)
 
             # Auto-generation mode: Fill in missing required fields with smart defaults
             if auto_generate:
@@ -2274,78 +2593,41 @@ class SubscriptionManagement(ToolBase):
                     raise_refusal(
                         "**Missing Required Field**\n\n"
                         "**Field**: `name` (required for all subscription creation)\n\n"
-                        '**Example**: `{"action":"create","subscription_data":{"name":"Monthly Subscription"}}`\n\n'
-                        "**Auto-Generation**: Enabled (will auto-generate product_id from available products, clientEmailAddress from defaults)",
+                        '**Example**: `{"action":"create","subscription_data":{"name":"Monthly Subscription","product_id":"prod_123","clientEmailAddress":"user@company.com"}}`\n\n'
+                        "**Product**: when `product_id` is missing you are asked which product to use",
                         error_code=ErrorCodes.MISSING_PARAMETER,
                         field="name",
                     )
 
-                # Apply smart auto-generation logic
-                enhanced_subscription_data = {
-                    "name": name,
-                    "description": subscription_data.get("description")
-                    or f"Subscription for {name}",
-                }
+                enhanced_subscription_data: Dict[str, Any] = {"name": name}
+                auto_filled: List[str] = []
 
-                # Auto-generate product_id if not provided
+                # BACK-4709: ask which product rather than pick one
                 if not subscription_data.get("product_id") and not subscription_data.get(
                     "productId"
                 ):
-                    # Try to find a default or first available product
-                    try:
-                        products_result = await subscription_manager.client.get_paginated(
-                            "products", page=0, size=1
-                        )
-                        if products_result and len(products_result) > 0:
-                            enhanced_subscription_data["product_id"] = products_result[0]["id"]
-                            logger.info(f"Auto-generated product_id: {products_result[0]['id']}")
-                        else:
-                            return [
-                                TextContent(
-                                    type="text",
-                                    text="**Auto-Generation Failed**\n\n"
-                                    f"**Issue**: No products available for auto-generation\n\n"
-                                    f"**Solution**: Create a product first using `manage_products` or provide explicit product_id:\n"
-                                    f"```json\n"
-                                    f'{{"action":"create","subscription_data":{{"name":"{name}","product_id":"your_product_id"}}}}\n'
-                                    f"```\n\n"
-                                    f"**Tip**: Use `manage_products(action='list')` to see available products",
-                                )
-                            ]
-                    except Exception as e:
-                        logger.warning(f"Failed to auto-generate product_id: {e}")
-                        return [
-                            TextContent(
-                                type="text",
-                                text=f"**Auto-Generation Error**\n\n"
-                                f"**Issue**: Could not auto-generate product_id\n\n"
-                                f"**Solution**: Provide explicit product_id:\n"
-                                f"```json\n"
-                                f'{{"action":"create","subscription_data":{{"name":"{name}","product_id":"your_product_id"}}}}\n'
-                                f"```",
-                            )
-                        ]
+                    client = subscription_manager.client
+                    response = await client.get_products(
+                        page=0, size=_QUICK_CREATE_PRODUCT_CHOICES
+                    )
+                    _ask_which_product(
+                        subscription_data,
+                        client._extract_embedded_data(response),
+                        platform_total(client._extract_pagination_info(response)),
+                    )
                 else:
                     enhanced_subscription_data["product_id"] = subscription_data.get(
                         "product_id"
                     ) or subscription_data.get("productId")
 
-                # Auto-generate clientEmailAddress if not provided
                 if not subscription_data.get("clientEmailAddress"):
-                    # Try to get from environment or use a test default
-                    default_email = os.getenv("REVENIUM_DEFAULT_EMAIL")
-                    if default_email:
-                        enhanced_subscription_data["clientEmailAddress"] = default_email
-                        logger.info(
-                            f"Auto-generated clientEmailAddress from REVENIUM_DEFAULT_EMAIL: {default_email}"
-                        )
-                    else:
-                        enhanced_subscription_data["clientEmailAddress"] = (
-                            f"user-{int(time.time())}@example.com"
-                        )
-                        logger.info(
-                            f"Auto-generated test clientEmailAddress: {enhanced_subscription_data['clientEmailAddress']}"
-                        )
+                    default_email = configured_default_email()
+                    if not default_email:
+                        _refuse_missing_invoice_address(subscription_data)
+                    enhanced_subscription_data["clientEmailAddress"] = default_email
+                    auto_filled.append("clientEmailAddress")
+                    default_address_note = _default_address_note(default_email)
+                    logger.info("Filled clientEmailAddress from REVENIUM_DEFAULT_EMAIL")
                 else:
                     enhanced_subscription_data["clientEmailAddress"] = subscription_data[
                         "clientEmailAddress"
@@ -2359,6 +2641,7 @@ class SubscriptionManagement(ToolBase):
                 # Update arguments with enhanced data
                 arguments = arguments.copy()
                 arguments["subscription_data"] = enhanced_subscription_data
+                _normalize_client_email_field(enhanced_subscription_data)
 
                 if dry_run:
                     mode_text = "AUTO-GENERATION"
@@ -2371,42 +2654,44 @@ class SubscriptionManagement(ToolBase):
                             f"{json.dumps(enhanced_subscription_data, indent=2)}\n"
                             f"```\n\n"
                             f"**Auto-Generation:** Enabled\n"
-                            f"**Auto-Generated Fields:** product_id, clientEmailAddress, description\n\n"
-                            f"**Next Step:** Remove `dry_run: true` to create the subscription",
+                            f"**Auto-Generated Fields:** {', '.join(auto_filled) or 'none'}\n\n"
+                            + (f"{default_address_note}\n\n" if default_address_note else "")
+                            + "**Next Step:** Remove `dry_run: true` to create the subscription",
                         )
                     ]
             else:
                 # Expert mode: strict validation, no auto-generation
+                expert_retry = _create_retry_example(
+                    subscription_data, _MISSING_FIELD_PLACEHOLDERS, {"auto_generate": False}
+                )
                 if not subscription_data.get("product_id") and not subscription_data.get(
                     "productId"
                 ):
-                    return [
-                        TextContent(
-                            type="text",
-                            text=f"**Missing Required Field**\n\n"
-                            f"**Field**: `product_id` (required in expert mode)\n\n"
-                            f"**Solution**: Provide product_id explicitly:\n"
-                            f"```json\n"
-                            f'{{"action":"create","subscription_data":{{"name":"{subscription_data.get("name", "Subscription")}","product_id":"your_product_id","clientEmailAddress":"user@company.com"}},"auto_generate":false}}\n'
-                            f"```\n\n"
-                            f"**Tip**: Use `auto_generate=true` for smart defaults, or use `manage_products(action='list')` to find product IDs",
-                        )
-                    ]
+                    raise_refusal(
+                        "**Missing Required Field**\n\n"
+                        "**Field**: `product_id` (required in expert mode)\n\n"
+                        "**Solution**: Provide product_id explicitly:\n"
+                        f"```json\n{expert_retry}\n```\n\n"
+                        "**Tip**: Quick create asks which product to use. It does not pick one. "
+                        "Use `manage_products(action='list')` to find product ids",
+                        error_code=ErrorCodes.MISSING_PARAMETER,
+                        field="product_id",
+                    )
 
                 if not subscription_data.get("clientEmailAddress"):
-                    return [
-                        TextContent(
-                            type="text",
-                            text=f"**Missing Required Field**\n\n"
-                            f"**Field**: `clientEmailAddress` (required in expert mode)\n\n"
-                            f"**Solution**: Provide clientEmailAddress explicitly:\n"
-                            f"```json\n"
-                            f'{{"action":"create","subscription_data":{{"name":"{subscription_data.get("name", "Subscription")}","product_id":"{subscription_data.get("product_id", "your_product_id")}","clientEmailAddress":"user@company.com"}},"auto_generate":false}}\n'
-                            f"```\n\n"
-                            f"**Tip**: Use `auto_generate=true` for smart defaults",
-                        )
-                    ]
+                    raise_refusal(
+                        "**Missing Required Field**\n\n"
+                        "**Field**: `clientEmailAddress` (required in expert mode)\n\n"
+                        "**Solution**: Provide clientEmailAddress explicitly:\n"
+                        f"```json\n{expert_retry}\n```\n\n"
+                        "**Tip**: Every create needs the address the invoices go to; quick "
+                        "create fills it from REVENIUM_DEFAULT_EMAIL when that is set and "
+                        "refuses otherwise",
+                        error_code=ErrorCodes.MISSING_PARAMETER,
+                        field="clientEmailAddress",
+                    )
 
+                _normalize_client_email_field(subscription_data)
                 if dry_run:
                     # Parity with live create: the backend rejects a subscription
                     # whose product does not resolve, so the preview must too.
@@ -2415,19 +2700,17 @@ class SubscriptionManagement(ToolBase):
                         try:
                             await subscription_manager.client.get_product_by_id(dry_product_id)
                         except ReveniumAPIError as exc:
-                            return [
-                                TextContent(
-                                    type="text",
-                                    text=(
-                                        "**Dry Run Validation Failed** — the live create "
-                                        f"would reject this payload:\n\n"
-                                        f"**Field**: `product_id`\n"
-                                        f"**Value**: `{dry_product_id}`\n"
-                                        f"**Problem**: product does not resolve ({exc})\n\n"
-                                        "**Tip**: Use `manage_products(action='list')` to find valid product IDs"
-                                    ),
-                                )
-                            ]
+                            raise_refusal(
+                                "**Dry Run Validation Failed**: the live create "
+                                "would reject this payload:\n\n"
+                                "**Field**: `product_id`\n"
+                                f"**Value**: `{dry_product_id}`\n"
+                                f"**Problem**: product does not resolve ({exc})\n\n"
+                                "**Tip**: Use `manage_products(action='list')` to find valid product IDs",
+                                error_code=ErrorCodes.VALIDATION_ERROR,
+                                field="product_id",
+                                value=dry_product_id,
+                            )
                     mode_text = "EXPLICIT CONFIGURATION"
                     return [
                         TextContent(
@@ -2446,10 +2729,14 @@ class SubscriptionManagement(ToolBase):
             # Proceed with actual creation
             result = await subscription_manager.create_subscription(arguments)
             mode_text = "with auto-generation" if auto_generate else "with explicit configuration"
+            notes = "".join(
+                f"{note}\n\n" for note in (default_address_note, unstored_note) if note
+            )
             return [
                 TextContent(
                     type="text",
                     text=f"**✅ Subscription Created Successfully** ({mode_text})\n\n"
+                    + notes
                     + json.dumps(result, indent=2),
                 )
             ]
@@ -2464,22 +2751,20 @@ class SubscriptionManagement(ToolBase):
                 )
             ]
         elif action == "cancel":
-            result = await subscription_manager.cancel_subscription(arguments)
-            subscription_id = arguments.get("subscription_id")
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Subscription {subscription_id} cancelled successfully:\n\n"
-                    + json.dumps(result, indent=2),
-                )
-            ]
+            raise_refusal(
+                _CANCEL_NOT_OFFERED_MESSAGE,
+                error_code=ErrorCodes.BUSINESS_RULE_VIOLATION,
+                field="action",
+                value=action,
+            )
         elif action == "delete":
             result = await subscription_manager.delete_subscription(arguments)
             subscription_id = arguments.get("subscription_id")
             return [
                 TextContent(
                     type="text",
-                    text=f"Subscription {subscription_id} deleted successfully:\n\n"
+                    text=f"Subscription {subscription_id} deleted successfully. "
+                    "The record was permanently removed and can no longer be read:\n\n"
                     + json.dumps(result, indent=2),
                 )
             ]
@@ -2518,25 +2803,7 @@ class SubscriptionManagement(ToolBase):
         self, action: str, arguments: Dict[str, Any], subscription_manager: Any
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle subscription creation actions."""
-        if action == "create_simple":
-            result = await subscription_manager.create_simple(arguments)
-            return [
-                TextContent(
-                    type="text",
-                    text="Simple subscription created successfully:\n\n"
-                    + json.dumps(result, indent=2),
-                )
-            ]
-        elif action == "create_from_text":
-            result = await subscription_manager.create_from_text(arguments)
-            return [
-                TextContent(
-                    type="text",
-                    text="🔒 **Safe Subscription Created from Text**\n\n"
-                    + json.dumps(result, indent=2),
-                )
-            ]
-        elif action == "discover_products":
+        if action == "discover_products":
             result = await subscription_manager.discover_products(arguments)
             return [
                 TextContent(
@@ -2633,15 +2900,6 @@ class SubscriptionManagement(ToolBase):
                     + json.dumps(result, indent=2),
                 )
             ]
-        elif action == "create_with_credentials":
-            result = await hierarchy_manager.create_with_credentials(arguments)
-            return [
-                TextContent(
-                    type="text",
-                    text="🔗 **Subscription and Credentials Created Successfully**\n\n"
-                    + json.dumps(result, indent=2),
-                )
-            ]
         raise ValueError(f"Unhandled hierarchy action: {action}")
 
     async def _handle_validate_action(
@@ -2668,6 +2926,7 @@ class SubscriptionManagement(ToolBase):
                 },
             )
 
+        _normalize_client_email_field(dict(subscription_data))
         dry_run = arguments.get("dry_run", True)
         result = await self.validator.validate_configuration(subscription_data, dry_run)
         return self._format_validation_response(result)
@@ -2689,7 +2948,7 @@ class SubscriptionManagement(ToolBase):
                 "For subscription creation, use 'create' with auto-generation for simple subscriptions or auto_generate=false for expert mode",
             ],
             examples={
-                "basic_actions": ["list", "get", "create", "update", "cancel", "delete"],
+                "basic_actions": ["list", "get", "create", "update", "delete"],
                 "creation_actions": ["create"],
                 "discovery_actions": [
                     "get_capabilities",
@@ -2707,12 +2966,10 @@ class SubscriptionManagement(ToolBase):
                 "hierarchy_actions": [
                     "get_product_details",
                     "get_credentials",
-                    "create_with_credentials",
                 ],
                 "billing_safety_actions": {
                     "discover_products": "Find available products safely",
                     "validate_product_for_subscription": "Verify product before subscription creation",
-                    "create_from_text": "Enhanced with billing safety checks",
                 },
             },
         )
@@ -2771,20 +3028,29 @@ class SubscriptionManagement(ToolBase):
 - `auto_generate` - Enable smart defaults (default: true)
 - `dry_run` - Preview without creating (optional)
 - `page`, `size` - For list operations
+- `search_query` - Free text for search_subscriptions, discover_products and get_supporting_data
+- `customer_name`, `subscriber_email`, `product_name` - Narrow search_subscriptions
+- `data_type` - The get_supporting_data category, one of: """ + ", ".join(
+            _SUPPORTING_DATA_TYPES
+        ) + """
+- `query` - The question for subscription_nlp
+- `example_type` - The get_examples template, one of: """ + ", ".join(
+            SUBSCRIPTION_EXAMPLE_TYPES
+        ) + """
 
 ## **SUBSCRIPTION MANAGEMENT OVERVIEW**
 
 ### **What Subscriptions Are**
 - **Customer billing relationships** that define ongoing payment arrangements
 - **Product-customer connections** that activate service access and billing
-- **Lifecycle entities** with states from trial through active to cancelled
+- **Lifecycle entities** that run from start through an optional trial to expiration
 - **Revenue generators** that drive recurring business income
 
 ### **Key Concepts**
 - **Subscriptions** connect customers to products with billing terms
 - **Billing Periods** define payment frequency (monthly, yearly, etc.)
 - **Trial Periods** allow customers to test before committing
-- **Lifecycle States** track subscription status and transitions
+- **Expiration** ends a subscription on a set date (subscriptions have no status field)
 
 ## **Quick Start Commands**
 
@@ -2800,13 +3066,13 @@ get_examples()                                 # See working templates
 get_capabilities()                             # Understand requirements
 validate(subscription_data={...}, dry_run=True) # Test before creating
 create(subscription_data={...})               # Create the subscription
-create(subscription_data={"name": "Monthly Subscription"}) # Quick creation with auto-generation
+create(subscription_data={"name": "Monthly Subscription", "product_id": "prod_123", "clientEmailAddress": "user@company.com"})
 ```
 
 ### **Manage Subscriptions**
 ```bash
 update(subscription_id="sub_123", subscription_data={...}) # Update existing
-cancel(subscription_id="sub_123")                         # Cancel subscription
+delete(subscription_id="sub_123")                         # Permanently delete (no cancel exists; update with an expiration date is the non-destructive route)
 get_metrics()                                             # Analyze performance
 ```
 
@@ -2814,8 +3080,10 @@ get_metrics()                                             # Analyze performance
 ```bash
 get_product_details(subscription_id="sub_123")           # Find product for subscription
 get_credentials(subscription_id="sub_123")               # Find all related credentials
-create_with_credentials(subscription_data={...}, credentials_data={...})  # Create linked entities
-```"""
+```
+
+To give a new subscription an API key, create the subscription, then call
+`manage_subscriber_credentials(action="create", ...)` with `subscriptionIds=[<new id>]`."""
 
         # Add UCM-enhanced billing periods if available
         if ucm_capabilities and "billing_periods" in ucm_capabilities:
@@ -2909,7 +3177,7 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
     - IMPORTANT NOTE:  payment method integration is not currently supported in the MCP. This must be managed manually within the Revenium application.
 
 ## **Next Steps**
-1. Use `get_examples(example_type='...')` to see working templates
+1. Use `get_examples(example_type='""" + SUBSCRIPTION_EXAMPLE_TYPES[1] + """')` to see a working template
 2. Use `validate(subscription_data={...})` to test configurations
 3. Use `create(subscription_data={...})` to create subscriptions"""
 
@@ -2992,8 +3260,8 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
             available_types = examples.get("available_types", [])
             raise create_structured_validation_error(
                 message=examples["error"],
-                field="examples",
-                value=examples.get("type", "unknown"),
+                field="example_type",
+                value=examples.get("example_type", "unknown"),
                 suggestions=[
                     (
                         f"Available types: {', '.join(available_types)}"
@@ -3006,8 +3274,8 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
                 ],
                 examples={
                     "available_types": available_types,
-                    "usage": "get_examples(example_type='basic')",
-                    "common_types": ["basic", "advanced", "validation", "billing_safety"],
+                    "usage": f"get_examples(example_type='{SUBSCRIPTION_EXAMPLE_TYPES[1]}')",
+                    "common_types": list(SUBSCRIPTION_EXAMPLE_TYPES),
                     "billing_safety": "BILLING SAFETY: Examples help ensure correct subscription configuration",
                 },
             )
@@ -3095,7 +3363,7 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
             {
                 "title": "Create Monthly Subscription",
                 "description": "Set up a standard monthly subscription for a customer",
-                "example": "create_simple(product_id='prod_123', clientEmailAddress='user@company.com')",
+                "example": "create(subscription_data={'name': 'Monthly Subscription', 'product_id': 'prod_123', 'clientEmailAddress': 'user@company.com'})",
             },
             {
                 "title": "List Active Subscriptions",
@@ -3108,9 +3376,9 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
                 "example": "update(subscription_id='sub_123', subscription_data={...})",
             },
             {
-                "title": "Cancel Subscription",
-                "description": "Cancel an active subscription with proper lifecycle handling",
-                "example": "cancel(subscription_id='sub_123')",
+                "title": "Delete Subscription",
+                "description": "Permanently delete a subscription record (the platform has no cancel operation)",
+                "example": "delete(subscription_id='sub_123')",
             },
             {
                 "title": "Subscription Analytics",
@@ -3125,7 +3393,7 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
             "VALIDATE: Use validate_product_for_subscription(product_id='...') to verify product safety",
             "REVIEW: Call get_capabilities() to see subscription options and business rules",
             "CREATE SAFELY: Always specify explicit product_id and clientEmailAddress in subscription creation",
-            "MONITOR: Use list(), get(), update(), cancel(), or get_metrics() for ongoing management",
+            "MONITOR: Use list(), get(), update(), or get_metrics() for ongoing management",
         ]
 
         # Define next actions
@@ -3138,7 +3406,7 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
         ]
 
         return self.formatter.format_agent_summary_response(
-            description="Manage customer subscriptions with full lifecycle support including creation, updates, cancellation, and billing management",
+            description="Manage customer subscriptions with full lifecycle support including creation, updates, deletion, and billing management",
             key_capabilities=key_capabilities,
             common_use_cases=common_use_cases,
             quick_start_steps=quick_start_steps,
@@ -3157,26 +3425,32 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
                     "get": {"subscription_id": "str"},
                     "create": {"subscription_data": "dict"},
                     "update": {"subscription_id": "str", "subscription_data": "dict"},
-                    "cancel": {"subscription_id": "str"},
+                    "delete": {"subscription_id": "str"},
                 },
                 examples=[
                     "list(page=0, size=10)",
                     "get(subscription_id='sub_123')",
-                    "create(subscription_data={'product_id': 'prod_123', 'clientEmailAddress': 'user@company.com'})",
+                    "create(subscription_data={'name': 'Monthly Subscription', 'product_id': 'prod_123', 'clientEmailAddress': 'user@company.com'})",
                 ],
                 limitations=[
                     "Requires valid API authentication",
-                    "Subscription cancellation may have billing implications",
+                    "The platform has no cancel operation; delete permanently removes the record",
+                    _EXPIRATION_ROUTE_NOTE,
                     "Some fields are immutable after creation",
                 ],
             ),
             ToolCapability(
                 name="Subscription Analytics",
                 description="Subscription metrics and performance analysis",
-                parameters={"get_metrics": {"filters": "dict", "date_range": "dict"}},
+                parameters={
+                    "get_metrics": {
+                        "filters": "dict (query, type, sort)",
+                        "page": "int",
+                        "size": "int",
+                    }
+                },
                 examples=[
                     "get_metrics(filters={'query': 'enterprise'})",
-                    "get_metrics(date_range={'start': '2024-01-01', 'end': '2024-12-31'})",
                 ],
             ),
             ToolCapability(
@@ -3191,22 +3465,6 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
                     "get_quota_consumed(subscription_id='sub_123')",
                 ],
             ),
-            ToolCapability(
-                name="Enhanced Creation",
-                description="Simplified subscription creation with smart defaults",
-                parameters={
-                    "create_simple": {
-                        "product_id": "str",
-                        "clientEmailAddress": "str",
-                        "type": "str",
-                    },
-                    "create_from_text": {"text": "str"},
-                },
-                examples=[
-                    "create_simple(product_id='prod_123', clientEmailAddress='user@company.com', type='monthly')",
-                    "create_from_text(text='Create monthly subscription for premium service')",
-                ],
-            ),
         ]
 
     async def _get_supported_actions(self) -> List[str]:
@@ -3218,10 +3476,7 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
             "get_quota_consumed",
             "create",
             "update",
-            "cancel",
             "delete",
-            "create_simple",
-            "create_from_text",
             "get_metrics",
             "discover_products",
             "validate_product_for_subscription",
@@ -3236,7 +3491,6 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
             # Hierarchy actions
             "get_product_details",
             "get_credentials",
-            "create_with_credentials",
         ]
 
     async def _get_input_schema(self) -> Dict[str, Any]:
@@ -3347,7 +3601,7 @@ create_with_credentials(subscription_data={...}, credentials_data={...})  # Crea
         """Get agent summary."""
         return """**Subscription Management Tool**
 
-Comprehensive subscription lifecycle management for the Revenium platform. Handle creation, updates, cancellation, and analytics for customer subscriptions with intelligent validation and business rule enforcement.
+Comprehensive subscription lifecycle management for the Revenium platform. Handle creation, updates, deletion, and analytics for customer subscriptions with intelligent validation and business rule enforcement.
 
 **Key Features:**
 • Complete CRUD operations with validation
@@ -3360,10 +3614,10 @@ Comprehensive subscription lifecycle management for the Revenium platform. Handl
         """Get quick start guide."""
         return [
             "Start with get_capabilities() to understand subscription requirements",
-            "Use get_examples(example_type='...') to see working subscription templates",
+            f"Use get_examples(example_type='{SUBSCRIPTION_EXAMPLE_TYPES[1]}') to see a working subscription template",
             "Validate configurations with validate(subscription_data={...}, dry_run=True)",
-            "Create subscriptions with create(subscription_data={...}) or create_simple(...)",
-            "Monitor and manage with list(), get(), update(), and cancel() actions",
+            "Create subscriptions with create(subscription_data={...})",
+            "Monitor and manage with list(), get(), update(), and delete() actions",
             "Analyze performance with get_metrics() for subscription analytics",
         ]
 

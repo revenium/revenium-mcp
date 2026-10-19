@@ -12,6 +12,7 @@ from src.revenium_mcp_server.alert_operators import (
     REJECTED_OPERATORS,
 )
 from src.revenium_mcp_server.models import AlertType
+from src.revenium_mcp_server.common.error_handling import ToolError
 from mcp.types import TextContent
 
 
@@ -114,10 +115,11 @@ class TestAlertManagement:
                 "notificationAddresses": ["test@example.com"]
             }
         }
-        result = await alert_tools.handle_action("validate", arguments)
+        with pytest.raises(ToolError) as exc_info:
+            await alert_tools.handle_action("validate", arguments)
 
-        assert len(result) >= 1
-        assert isinstance(result[0], TextContent)
+        assert "alertType" in exc_info.value.message
+        assert "ucm" not in exc_info.value.message.lower()
 
     @pytest.mark.asyncio
     async def test_unknown_action_raises_error(self, alert_tools):
@@ -128,6 +130,19 @@ class TestAlertManagement:
             await alert_tools.handle_action("completely_invalid_action_xyz", {})
 
         assert "unknown action" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_capabilities_state_the_alert_history_date_forms(self, alert_tools):
+        """The accepted start/end forms are documented (BACK-4703)."""
+        result = await alert_tools.handle_action("get_capabilities", {})
+        text = result[0].text
+
+        assert "yyyy-MM-dd" in text
+        assert "offset" in text
+        assert "a time of day without Z or an offset is refused" in text
+        assert 'filters={"start": "2026-10-01", "end": "2026-10-15"}' in text
+        assert "UTC timestamps with millisecond precision" in text
+        assert "as UTC milliseconds" not in text
 
     @pytest.mark.asyncio
     async def test_create_simple_preview(self, alert_tools):
@@ -260,38 +275,35 @@ class TestAlertUpdateFlexibleParams:
 
     @pytest.mark.asyncio
     async def test_update_missing_anomaly_id_error(self, alert_tools):
-        """Test that update without anomaly_id returns appropriate error."""
-        result = await alert_tools.handle_action("update", {
-            "anomaly_data": {"threshold": 200}
-        })
+        """Update without anomaly_id is refused with the error flag set."""
+        with pytest.raises(ToolError) as exc_info:
+            await alert_tools.handle_action("update", {
+                "anomaly_data": {"threshold": 200}
+            })
 
-        assert len(result) >= 1
-        assert isinstance(result[0], TextContent)
-        text = result[0].text.lower()
-        assert "anomaly_id" in text or "missing" in text
+        assert "anomaly_id" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
     async def test_update_missing_update_data_error(self, alert_tools):
-        """Test that update without any update data returns helpful error."""
-        result = await alert_tools.handle_action("update", {
-            "anomaly_id": "test_alert_123"
-        })
+        """Update without any update data is refused with the error flag set."""
+        with pytest.raises(ToolError) as exc_info:
+            await alert_tools.handle_action("update", {
+                "anomaly_id": "test_alert_123"
+            })
 
-        assert len(result) >= 1
-        assert isinstance(result[0], TextContent)
-        text = result[0].text.lower()
-        # Should mention the flexible parameter options
-        assert "update" in text or "param" in text or "data" in text
+        text = str(exc_info.value)
+        assert "update_data" in text
+        assert 'email="user@example.com"' in text
 
     @pytest.mark.asyncio
     async def test_update_error_shows_all_updatable_fields(self, alert_tools):
         """Test that update error message shows expanded updatable fields list."""
-        result = await alert_tools.handle_action("update", {
-            "anomaly_id": "test_alert_123"
-        })
+        with pytest.raises(ToolError) as exc_info:
+            await alert_tools.handle_action("update", {
+                "anomaly_id": "test_alert_123"
+            })
 
-        assert len(result) >= 1
-        text = result[0].text
+        text = str(exc_info.value)
 
         # Should include expanded updatable fields from P2 enhancement
         expected_fields = ["name", "threshold", "enabled", "description", "tags", "metricType"]
@@ -300,16 +312,14 @@ class TestAlertUpdateFlexibleParams:
 
     @pytest.mark.asyncio
     async def test_update_invalid_anomaly_data_type_error(self, alert_tools):
-        """Test that non-dict anomaly_data returns type error."""
-        result = await alert_tools.handle_action("update", {
-            "anomaly_id": "test_alert_123",
-            "anomaly_data": "not a dict"
-        })
+        """Non-dict anomaly_data is refused with the error flag set."""
+        with pytest.raises(ToolError) as exc_info:
+            await alert_tools.handle_action("update", {
+                "anomaly_id": "test_alert_123",
+                "anomaly_data": "not a dict"
+            })
 
-        assert len(result) >= 1
-        assert isinstance(result[0], TextContent)
-        text = result[0].text.lower()
-        assert "dict" in text or "object" in text or "type" in text
+        assert "dict" in str(exc_info.value).lower()
 
     # =========================================================================
     # POSITIVE TESTS - Verify parameter merging logic works correctly
@@ -374,7 +384,7 @@ class TestAlertUpdateFlexibleParams:
             },
             # Direct params should override
             "threshold": 999,
-            "tags": ["high-priority"]
+            "enabled": False
         })
 
         # Verify the mock was called
@@ -392,7 +402,7 @@ class TestAlertUpdateFlexibleParams:
         assert passed_data.get("name") == "Base Name", "anomaly_data value should be preserved"
         assert passed_data.get("description") == "From anomaly_data"
         # Direct param that wasn't in anomaly_data should be added
-        assert passed_data.get("tags") == ["high-priority"]
+        assert passed_data.get("enabled") is False
 
     @pytest.mark.asyncio
     async def test_update_with_new_p2_fields(self, alert_tools_with_mock):
@@ -400,7 +410,6 @@ class TestAlertUpdateFlexibleParams:
         result = await alert_tools_with_mock.handle_action("update", {
             "anomaly_id": "alert_p2",
             "description": "P2 field test",
-            "tags": ["test", "p2"],
             "metricType": "TOTAL_COST",
             "period": "HOUR",
             "triggerAfterPersistsDuration": "PT5M"
@@ -415,33 +424,23 @@ class TestAlertUpdateFlexibleParams:
 
         # All P2 fields should be passed through
         assert passed_data.get("description") == "P2 field test"
-        assert passed_data.get("tags") == ["test", "p2"]
         assert passed_data.get("metricType") == "TOTAL_COST"
         assert passed_data.get("period") == "HOUR"
         assert passed_data.get("triggerAfterPersistsDuration") == "PT5M"
 
     @pytest.mark.asyncio
-    async def test_update_ignores_non_updatable_fields(self, alert_tools_with_mock):
-        """Test that fields not in updatable_fields list are ignored."""
-        result = await alert_tools_with_mock.handle_action("update", {
-            "anomaly_id": "alert_filter",
-            "name": "Valid Field",
-            "invalid_field": "Should be ignored",
-            "another_invalid": 123
-        })
+    async def test_update_refuses_non_updatable_fields(self, alert_tools_with_mock):
+        """A flat argument update cannot apply is refused, not dropped."""
+        with pytest.raises(ToolError) as refusal:
+            await alert_tools_with_mock.handle_action("update", {
+                "anomaly_id": "alert_filter",
+                "name": "Valid Field",
+                "invalid_field": "Should be refused",
+                "another_invalid": 123
+            })
 
-        # Verify the mock was called
-        alert_tools_with_mock.anomaly_manager.update_anomaly.assert_called_once()
-
-        # Get the call arguments
-        call_args = alert_tools_with_mock.anomaly_manager.update_anomaly.call_args
-        passed_data = call_args[0][2]
-
-        # Valid field should be present
-        assert passed_data.get("name") == "Valid Field"
-        # Invalid fields from direct params should NOT be present
-        assert "invalid_field" not in passed_data
-        assert "another_invalid" not in passed_data
+        assert "another_invalid, invalid_field" in str(refusal.value)
+        alert_tools_with_mock.anomaly_manager.update_anomaly.assert_not_called()
 
 
 class TestAlertManagementIntegration:

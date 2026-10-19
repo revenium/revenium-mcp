@@ -14,7 +14,7 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..common.error_handling import (
     create_structured_validation_error,
-    format_structured_error,
+    raise_structured_error,
 )
 from ..introspection.metadata import ToolCapability, ToolType
 from .slack_configuration_management import SlackConfigurationManagement
@@ -301,7 +301,7 @@ All actions support the same parameters as their original tools for 100% compati
             },
         )
 
-        return [TextContent(type="text", text=format_structured_error(error))]
+        raise_structured_error(error)
 
     async def _get_supported_actions(self) -> List[str]:
         """Get all supported actions from consolidated tool."""
@@ -358,7 +358,7 @@ All actions support the same parameters as their original tools for 100% compati
                 name="Setup Assistant",
                 description="Intelligent setup guidance and configuration recommendations",
                 parameters={
-                    "guided_setup": {"skip_prompts": "bool"},
+                    "guided_setup": {},
                     "quick_setup": {"dry_run": "bool"},
                     "setup_status": {},
                     "detect_and_recommend": {},

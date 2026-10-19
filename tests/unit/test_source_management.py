@@ -4,15 +4,58 @@ Tests the SourceManager and SourceManagement classes from the decomposed tools m
 Focuses on CRUD operations, auto-generation logic, validation, and error handling.
 """
 
+import copy
+import json
+
 import pytest
+from loguru import logger
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.tools_decomposed.source_management import (
     SourceManager,
     SourceManagement,
 )
-from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.auth import AuthConfig
+from src.revenium_mcp_server.client import ReveniumAPIError, ReveniumClient
+from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from mcp.types import TextContent
+
+
+STORED_SOURCE = {
+    "id": "src_1",
+    "name": "gateway",
+    "description": "old",
+    "version": "1.0.0",
+    "type": "API",
+    "owner": {"id": "owner_1", "label": "x"},
+    "team": {"id": "team_src", "label": "x"},
+    "tags": ["old-tag"],
+    "metadata": "k=old",
+}
+
+PREVIEW_BODY_HEADING = "**Body the update would send:**"
+
+
+def _recording_source_client() -> ReveniumClient:
+    """A real client whose source GET serves STORED_SOURCE and whose PUT is recorded."""
+    client = ReveniumClient(
+        auth_config=AuthConfig(
+            api_key="test-key-xyz",
+            team_id="team_abc",
+            base_url="https://api.test.revenium.ai",
+            timeout=5.0,
+            max_retries=0,
+        )
+    )
+    client.get_source_by_id = AsyncMock(return_value=json.loads(json.dumps(STORED_SOURCE)))
+    client.put = AsyncMock(return_value={"id": "src_1"})
+    return client
+
+
+def _previewed_body(preview_text: str) -> dict:
+    assert PREVIEW_BODY_HEADING in preview_text
+    body_text = preview_text.split(PREVIEW_BODY_HEADING, 1)[1].split("**Dry Run:**", 1)[0]
+    return json.loads(body_text)
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +86,24 @@ def source_manager(mock_client):
 def source_mgmt():
     """Create SourceManagement instance (top-level tool)."""
     return SourceManagement()
+
+
+async def _create_source_body(source_mgmt, arguments):
+    """Run handle_action("create") against a stub client; return (create body, result)."""
+    with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+        mock_client = MagicMock()
+        mock_client.team_id = "test_team"
+        mock_gc.return_value = mock_client
+        mock_client.create_source = AsyncMock(return_value={"id": "s_new"})
+
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value",
+            return_value=None,
+        ):
+            result = await source_mgmt.handle_action("create", arguments)
+
+    mock_client.create_source.assert_called_once()
+    return mock_client.create_source.call_args[0][0], result
 
 
 # ===========================================================================
@@ -357,6 +418,29 @@ class TestSourceManagementHandleAction:
         assert "1 sources" in result[0].text
 
     @pytest.mark.asyncio
+    async def test_list_heading_counts_the_page_against_the_platform_total(self, source_mgmt):
+        """The list heading names the platform total, not the rows on the page."""
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            mock_client.get_sources = AsyncMock(return_value={})
+            mock_client._extract_embedded_data.return_value = [
+                {"id": f"s{i}", "name": "API"} for i in range(20)
+            ]
+            mock_client._extract_pagination_info.return_value = {
+                "size": 20,
+                "number": 0,
+                "totalPages": 25,
+                "totalElements": 500,
+            }
+
+            result = await source_mgmt.handle_action("list", {})
+
+        heading, body = result[0].text.split("\n\n", 1)
+        assert heading == "Found 20 of 500 sources (page 1 of 25):"
+        assert json.loads(body)["total_records"] == 500
+
+    @pytest.mark.asyncio
     async def test_get_action_returns_source_details(self, source_mgmt):
         """Get action returns source details."""
         with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
@@ -401,7 +485,7 @@ class TestSourceManagementHandleAction:
     async def test_update_dry_run_returns_preview(self, source_mgmt):
         """Update with dry_run=True returns preview."""
         with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
-            mock_gc.return_value = MagicMock()
+            mock_gc.return_value = _recording_source_client()
 
             result = await source_mgmt.handle_action(
                 "update",
@@ -410,6 +494,59 @@ class TestSourceManagementHandleAction:
 
         assert len(result) >= 1
         assert "DRY RUN" in result[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [400, 404])
+    async def test_update_dry_run_for_a_missing_source_raises_not_found(
+        self, source_mgmt, status_code
+    ):
+        """BACK-4818: a preview of an edit to a source that does not exist fails like the get does."""
+        client = MagicMock()
+        client.team_id = "test_team_id_456"
+        client.get_source_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("Invalid Source ID", status_code=status_code)
+        )
+        client.update_source = AsyncMock()
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = client
+            with pytest.raises(ReveniumAPIError) as not_found:
+                await source_mgmt.handle_action(
+                    "update",
+                    {
+                        "source_id": "zzzzzz9",
+                        "source_data": {"description": "x"},
+                        "dry_run": True,
+                    },
+                )
+
+        assert "Invalid Source ID" in not_found.value.message
+        client.update_source.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_dry_run_body_equals_the_put_body_the_update_sends(self, source_mgmt):
+        """BACK-4818: the preview shows exactly the body the real update would PUT."""
+        client = _recording_source_client()
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = client
+            preview = await source_mgmt.handle_action(
+                "update",
+                {
+                    "source_id": "src_1",
+                    "source_data": {"type": "api", "description": "x"},
+                    "dry_run": True,
+                },
+            )
+            assert client.put.await_count == 0
+            await source_mgmt.handle_action(
+                "update",
+                {"source_id": "src_1", "source_data": {"type": "api", "description": "x"}},
+            )
+
+        put_body = client.put.await_args.kwargs["data"]
+        assert put_body["description"] == "x"
+        assert put_body["type"] == "API"
+        assert put_body["teamId"] == "team_src"
+        assert _previewed_body(preview[0].text) == json.loads(json.dumps(put_body, default=str))
 
     @pytest.mark.asyncio
     async def test_delete_dry_run_returns_preview(self, source_mgmt):
@@ -446,6 +583,225 @@ class TestSourceManagementHandleAction:
 
         assert len(result) >= 1
         assert "successfully" in result[0].text.lower()
+
+    @pytest.mark.asyncio
+    async def test_create_auto_generate_keeps_every_caller_field(self, source_mgmt):
+        """BACK-4662: the default create path sends every field the caller gave."""
+        source_data = {
+            "name": "src-a",
+            "type": "api",
+            "tags": ["x"],
+            "externalId": "e1",
+            "externalUsagePlanId": "p1",
+            "description": "d",
+            "version": "2.0.0",
+            "metadata": "m",
+            "meteringElementDefinitionIds": ["e1"],
+            "autoDiscoveryEnabled": True,
+            "sourceClassifications": ["c"],
+            "teamId": "other",
+        }
+        before = copy.deepcopy(source_data)
+
+        body, result = await _create_source_body(source_mgmt, {"source_data": source_data})
+
+        assert "successfully" in result[0].text.lower()
+        assert body["name"] == "src-a"
+        assert body["type"] == "API"
+        assert body["tags"] == ["x"]
+        assert body["externalId"] == "e1"
+        assert body["externalUsagePlanId"] == "p1"
+        assert body["description"] == "d"
+        assert body["version"] == "2.0.0"
+        assert body["metadata"] == "m"
+        assert body["meteringElementDefinitionIds"] == ["e1"]
+        assert body["autoDiscoveryEnabled"] is True
+        assert body["sourceClassifications"] == ["c"]
+        assert body["teamId"] == "test_team"
+        assert source_data == before
+
+    @pytest.mark.asyncio
+    async def test_create_auto_generate_fills_only_empty_fields(self, source_mgmt):
+        """Auto-generation fills the fields the caller left empty and no others."""
+        body, _ = await _create_source_body(
+            source_mgmt, {"source_data": {"name": "src-b", "description": "", "tags": []}}
+        )
+
+        assert body["description"] == "REST API source for src-b"
+        assert body["version"] == "1.0.0"
+        assert body["type"] == "API"
+        assert body["sourceType"] == "API"
+        assert body["tags"] == []
+
+    @pytest.mark.asyncio
+    async def test_create_auto_generate_tags_none_becomes_empty_list(self, source_mgmt):
+        """None for tags or type counts as left empty."""
+        body, _ = await _create_source_body(
+            source_mgmt, {"source_data": {"name": "n", "tags": None, "type": None}}
+        )
+
+        assert body["tags"] == []
+        assert body["type"] == "API"
+
+    @pytest.mark.asyncio
+    async def test_create_auto_generate_upper_cases_caller_source_type(self, source_mgmt):
+        """A caller's lowercase sourceType is sent upper-cased, as type is."""
+        body, _ = await _create_source_body(
+            source_mgmt, {"source_data": {"name": "n", "type": "api", "sourceType": "api"}}
+        )
+
+        assert body["sourceType"] == "API"
+
+    @pytest.mark.asyncio
+    async def test_create_log_line_redacts_connection_string_and_authentication(
+        self, source_mgmt
+    ):
+        """BACK-4662: credentials the create path now forwards never reach the log."""
+        captured = []
+        sink_id = logger.add(captured.append, level="DEBUG", format="{message}")
+        try:
+            body, _ = await _create_source_body(
+                source_mgmt,
+                {
+                    "connection_string": "postgres://u:conn-secret-123@db/x",
+                    "source_data": {
+                        "name": "DB",
+                        "type": "api",
+                        "url": "https://user:url-secret-456@api.example.com",
+                        "authentication": {"type": "bearer", "token": "auth-secret-789"},
+                    },
+                },
+            )
+        finally:
+            logger.remove(sink_id)
+
+        logged = "".join(str(message) for message in captured)
+        assert "SOURCE DEBUG" in logged
+        for secret in ("conn-secret-123", "url-secret-456", "auth-secret-789"):
+            assert secret not in logged
+        # The platform still receives every field.
+        assert body["configuration"]["connection_string"] == "postgres://u:conn-secret-123@db/x"
+        assert body["configuration"]["authentication"]["token"] == "auth-secret-789"
+        assert body["configuration"]["url"] == "https://user:url-secret-456@api.example.com"
+
+    @pytest.mark.asyncio
+    async def test_validate_auto_generate_keeps_caller_tags(self, source_mgmt):
+        """BACK-4662: default-path validate checks the caller's fields, not a rebuilt payload."""
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = MagicMock()
+            with patch.object(
+                source_mgmt.validator,
+                "validate_configuration",
+                MagicMock(return_value={"valid": True, "errors": [], "warnings": []}),
+            ) as mock_validate:
+                await source_mgmt.handle_action(
+                    "validate",
+                    {"source_data": {"name": "v", "tags": ["x"], "externalId": "e1"}},
+                )
+
+        validated = mock_validate.call_args[0][0]
+        assert validated["name"] == "v"
+        assert validated["tags"] == ["x"]
+        assert validated["externalId"] == "e1"
+
+    @pytest.mark.asyncio
+    async def test_validate_lowercase_type_still_validates(self, source_mgmt):
+        """A lowercase type on the default validate path is still accepted."""
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = MagicMock()
+            result = await source_mgmt.handle_action(
+                "validate", {"source_data": {"name": "v", "type": "api", "tags": ["x"]}}
+            )
+
+        assert "Validation Successful" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_create_accepts_top_level_name_type_and_url(self, source_mgmt):
+        """BACK-4662: the top-level name, type and url the tool advertises create a source."""
+        body, result = await _create_source_body(
+            source_mgmt, {"name": "My API", "type": "api", "url": "https://api.example.com"}
+        )
+
+        assert "successfully" in result[0].text.lower()
+        assert body["name"] == "My API"
+        assert body["type"] == "API"
+        assert body["configuration"]["url"] == "https://api.example.com"
+
+    @pytest.mark.asyncio
+    async def test_create_source_data_name_wins_over_top_level(self, source_mgmt):
+        """A source_data value wins over the same field given at the top level."""
+        body, _ = await _create_source_body(
+            source_mgmt,
+            {"name": "top", "type": "stream", "source_data": {"name": "inner", "type": "api"}},
+        )
+
+        assert body["name"] == "inner"
+        assert body["type"] == "API"
+
+    @pytest.mark.asyncio
+    async def test_create_explicit_mode_accepts_top_level_name(self, source_mgmt):
+        """Explicit mode (auto_generate false) also sees the top-level name."""
+        with patch.object(
+            source_mgmt.validator,
+            "validate_configuration",
+            MagicMock(return_value={"valid": True, "errors": [], "warnings": []}),
+        ):
+            body, result = await _create_source_body(
+                source_mgmt, {"name": "Explicit", "type": "API", "auto_generate": False}
+            )
+
+        assert "successfully" in result[0].text.lower()
+        assert body["name"] == "Explicit"
+
+    @pytest.mark.asyncio
+    async def test_validate_accepts_top_level_name(self, source_mgmt):
+        """validate with a top-level name and no source_data validates that name."""
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = MagicMock()
+            with patch.object(
+                source_mgmt.validator,
+                "validate_configuration",
+                MagicMock(return_value={"valid": True, "errors": [], "warnings": []}),
+            ) as mock_validate:
+                await source_mgmt.handle_action("validate", {"name": "v", "type": "api"})
+
+        validated = mock_validate.call_args[0][0]
+        assert validated["name"] == "v"
+        assert validated["type"] == "API"
+
+    @pytest.mark.asyncio
+    async def test_create_stream_url_folds_into_url(self, source_mgmt):
+        """A stream source's top-level stream_url is sent as its url, not under its own name."""
+        body, _ = await _create_source_body(
+            source_mgmt,
+            {"name": "Events", "type": "stream", "stream_url": "wss://stream.example.com"},
+        )
+
+        assert body["configuration"]["url"] == "wss://stream.example.com"
+        assert "stream_url" not in body
+
+    @pytest.mark.asyncio
+    async def test_unknown_action_error_suggests_only_real_actions(self, source_mgmt):
+        """BACK-4662: the unknown-action error never points at create_source."""
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = MagicMock()
+
+            with pytest.raises(ToolError) as exc_info:
+                await source_mgmt.handle_action("create_source", {"name": "x"})
+
+        assert exc_info.value.error_code == ErrorCodes.ACTION_NOT_SUPPORTED
+        assert "create" in exc_info.value.examples["basic_actions"]
+        guidance = json.dumps(exc_info.value.suggestions) + json.dumps(exc_info.value.examples)
+        assert "create_source" not in guidance
+
+    @pytest.mark.asyncio
+    async def test_tool_capabilities_advertise_only_real_actions(self, source_mgmt):
+        """No capability names create_source in its parameters or examples."""
+        capabilities = await source_mgmt._get_tool_capabilities()
+
+        for capability in capabilities:
+            advertised = json.dumps(capability.parameters) + json.dumps(capability.examples)
+            assert "create_source" not in advertised, capability.name
 
     @pytest.mark.asyncio
     async def test_get_examples_returns_text(self, source_mgmt):

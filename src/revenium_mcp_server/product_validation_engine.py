@@ -674,7 +674,11 @@ class ProductValidationEngine:
                             field="sourceIds",
                             value=None,
                             error="Products with ratingAggregations require sourceIds field",
-                            suggestion="Add 'sourceIds': ['QOjOkbW'] to assign the product to a data source",
+                            suggestion=(
+                                "Add 'sourceIds': [<source id>] with a source id from "
+                                "manage_sources(action='list'); usage-based products need "
+                                "a data source"
+                            ),
                             severity="error",
                         )
                     )

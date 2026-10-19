@@ -20,6 +20,8 @@ existed before this fix).
 
 from __future__ import annotations
 
+from typing import Optional
+
 from ..auth import AuthenticationError
 from .error_handling import ErrorCodes, ToolError
 
@@ -93,5 +95,35 @@ def auth_scope_unresolved_to_tool_error() -> UnauthorizedToolError:
             "Retry the request — auto-discovery may complete before the next call.",
             "Set REVENIUM_TEAM_ID explicitly to bypass auto-discovery.",
             "Verify the API key has read access to /users/me for scope discovery.",
+        ],
+    )
+
+
+class PlatformLockoutToolError(UnauthorizedToolError):
+    """The platform asked this API key to wait: not a sign-in problem, so never "sign in again"."""
+
+
+def platform_lockout_to_tool_error(wait_seconds: Optional[int]) -> PlatformLockoutToolError:
+    """Envelope for an HTTP 429 met while resolving the team at the first call.
+
+    ``None`` is a 429 that stated no wait.
+    """
+    from ..platform_lockout import lockout_message
+
+    wait_advice = (
+        "Wait a moment before the next call."
+        if wait_seconds is None
+        else f"Wait {wait_seconds} seconds before the next call; calls sent sooner are "
+        "answered here without reaching the platform."
+    )
+    return PlatformLockoutToolError(
+        message=lockout_message(wait_seconds),
+        error_code=ErrorCodes.API_RATE_LIMIT,
+        field="authorization",
+        value=None,
+        suggestions=[
+            wait_advice,
+            "Repeated failed requests (for example guessed ids) can make the platform "
+            "pause a key again.",
         ],
     )

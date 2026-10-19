@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
@@ -11,6 +11,9 @@ from loguru import logger
 from .auth_events import emit_auth_event
 from .tenant_context import TenantContext
 from .tenant_resolver import TenantResolver
+
+if TYPE_CHECKING:
+    from .caller_profile import CallerProfileLookup
 
 _current_tenant: ContextVar[Optional[TenantContext]] = ContextVar(
     "revenium_tenant_context", default=None
@@ -30,8 +33,13 @@ class TenantContextMiddleware(Middleware):
     and stores the result in _current_tenant so ToolBase.execute() can read it.
     """
 
-    def __init__(self, resolver: TenantResolver) -> None:
+    def __init__(
+        self,
+        resolver: TenantResolver,
+        profile_lookup: Optional["CallerProfileLookup"] = None,
+    ) -> None:
         self._resolver = resolver
+        self._profile_lookup = profile_lookup
 
     async def on_call_tool(
         self, context: MiddlewareContext, call_next: CallNext
@@ -53,6 +61,9 @@ class TenantContextMiddleware(Middleware):
                 reason="tenant_resolution_rejected",
             )
             raise  # FastMCP wraps it as a JSON-RPC error inside HTTP 200
+
+        if self._profile_lookup is not None:
+            tenant_ctx = await self._profile_lookup.with_profile(tenant_ctx)
 
         reset_token = _current_tenant.set(tenant_ctx)
         try:

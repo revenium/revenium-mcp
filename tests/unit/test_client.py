@@ -112,6 +112,66 @@ class TestReveniumClient:
                 await client._request("GET", "/profitstream/v2/api/products")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "timeout_error, wording",
+        [
+            (httpx.ReadTimeout, "the platform did not answer"),
+            (httpx.WriteTimeout, "could not finish sending"),
+            (httpx.ConnectTimeout, "could not connect to the platform for"),
+            (httpx.PoolTimeout, "no free connection to the platform for"),
+        ],
+        ids=["read", "write", "connect", "pool"],
+    )
+    async def test_a_platform_timeout_names_the_operation_and_the_wait(
+        self, mock_env_vars, timeout_error, wording
+    ):
+        client = ReveniumClient()
+        client.client = httpx.AsyncClient(timeout=httpx.Timeout(7.5))
+        try:
+            with patch.object(
+                client.client, "request", new_callable=AsyncMock, side_effect=timeout_error("")
+            ):
+                with pytest.raises(ReveniumAPIError) as failed:
+                    await client._request("GET", "/profitstream/v2/api/products")
+        finally:
+            await client.client.aclose()
+
+        message = str(failed.value)
+        assert message.startswith("Request failed: ")
+        assert f"{wording} GET /profitstream/v2/api/products within 7.5 seconds" in message
+        assert message.endswith(f"({timeout_error.__name__})")
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_without_a_limit_drops_the_wait(self, mock_env_vars):
+        client = ReveniumClient()
+        client.client = httpx.AsyncClient(timeout=httpx.Timeout(None))
+        try:
+            with patch.object(
+                client.client, "request", new_callable=AsyncMock, side_effect=httpx.ReadTimeout("")
+            ):
+                with pytest.raises(ReveniumAPIError) as failed:
+                    await client._request("GET", "/profitstream/v2/api/products")
+        finally:
+            await client.client.aclose()
+
+        message = str(failed.value)
+        assert "did not answer GET /profitstream/v2/api/products" in message
+        assert "within" not in message
+        assert message.endswith("(ReadTimeout)")
+
+    @pytest.mark.asyncio
+    async def test_a_transport_error_without_text_names_its_type(self, mock_env_vars):
+        client = ReveniumClient()
+
+        with patch.object(
+            client.client, "request", new_callable=AsyncMock, side_effect=httpx.ConnectError("")
+        ):
+            with pytest.raises(ReveniumAPIError) as failed:
+                await client._request("GET", "/profitstream/v2/api/products")
+
+        assert str(failed.value) == "Request failed: ConnectError"
+
+    @pytest.mark.asyncio
     async def test_request_empty_response(self, mock_env_vars):
         """Test API request with empty response."""
         client = ReveniumClient()

@@ -2,6 +2,7 @@
 
 import pytest
 
+from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.tools_decomposed.metering_management import MeteringManagement
 
 
@@ -58,10 +59,12 @@ class TestMeteringManagement:
     @pytest.mark.asyncio
     async def test_list_ai_models(self, metering_manager):
         """list_ai_models returns substantive text (model list or structured error)."""
-        result = await metering_manager.handle_action("list_ai_models", {})
-
-        assert len(result) >= 1
-        text = result[0].text
+        try:
+            result = await metering_manager.handle_action("list_ai_models", {})
+            assert len(result) >= 1
+            text = result[0].text
+        except ToolError as error:
+            text = error.message
         # Either returns a list of AI models or a structured error — either way non-empty
         assert len(text) > 20
         # Must mention models/AI context or be a structured error response

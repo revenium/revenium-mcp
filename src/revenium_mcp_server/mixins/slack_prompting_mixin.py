@@ -9,6 +9,7 @@ into existing tools to enhance user experience with proactive Slack notification
 import re
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
+from ..common.default_slack_configuration import get_default_slack_config_id
 from ..config_store import get_config_value
 
 
@@ -78,7 +79,7 @@ class SlackPromptingMixin:
                 response = await client.get_slack_configurations(page=0, size=1)
                 total_configs = response.get("totalElements", 0)
 
-            default_config = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
+            default_config = get_default_slack_config_id()
 
             # Build the prompt based on current state
             prompt_data = {
@@ -300,7 +301,7 @@ class SlackPromptingMixin:
         try:
             if not slack_config_id:
                 # Try to get default configuration
-                slack_config_id = get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID")
+                slack_config_id = get_default_slack_config_id()
 
             if not slack_config_id:
                 # No configuration available
@@ -394,7 +395,7 @@ class SlackPromptingMixin:
                 auto_add_value.lower() == "true" if auto_add_value else False
             ),
             "prompt_frequency": get_config_value("REVENIUM_SLACK_PROMPT_FREQUENCY", "always"),
-            "default_config_id": get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID"),
+            "default_config_id": get_default_slack_config_id(),
         }
 
     def set_slack_prompting_preference(self, preference: str, value: str) -> bool:
@@ -412,9 +413,9 @@ class SlackPromptingMixin:
             and would leak preferences across tenants in multi-tenant mode.
             The mixin has no ``ctx`` reachable here and no current callers, so
             the env write is left as-is pending Phase-2 per-tenant preference
-            storage. When this method is wired up, thread ``ctx`` through and
-            apply the same ``if ctx is None`` guard used in
-            ``slack_setup_assistant._handle_select_default_configuration``.
+            storage. When this method is wired up, keep the preference per
+            organization the way ``common/default_slack_configuration.py``
+            keeps the default Slack configuration.
         """
         try:
             import os

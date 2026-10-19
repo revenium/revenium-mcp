@@ -4,8 +4,9 @@ This module consolidates enhanced_source_tools.py + source_tools.py into a singl
 tool with internal composition, following the proven alert management template.
 """
 
+import copy
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -22,7 +23,9 @@ from ..common.error_handling import (
     create_structured_validation_error,
     raise_refusal,
 )
+from ..common.formatting import format_page_count_heading
 from ..common.pagination_performance import validate_pagination_with_performance
+from ..common.sample_coverage import platform_total
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.ucm_config import log_ucm_status, should_suppress_ucm_warnings
@@ -52,6 +55,93 @@ _SOURCE_FILTER_MAP: Dict[str, str] = {
     "type": "type",
     "sort": "sort",
 }
+
+# Description auto-generated for a source whose caller left it empty, by type.
+_AUTO_SOURCE_DESCRIPTIONS: Dict[str, str] = {
+    "API": "REST API source for {name}",
+    "STREAM": "Stream source for {name}",
+    "AI": "AI source for {name}",
+}
+
+
+def _is_empty_source_value(key: str, value: Any) -> bool:
+    """True when the caller left a source field empty (None, "" or []; a non-string type)."""
+    if key == "type" and not isinstance(value, str):
+        return True
+    return value is None or value == "" or value == []
+
+
+def _with_auto_generated_source_fields(source_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of `source_data` with only the fields the caller left empty filled in.
+
+    BACK-4662: every field the caller gave (tags, externalId, externalUsagePlanId, ...)
+    is kept. teamId and ownerId are dropped so SourceManager.create_source fills them
+    from the server's configuration. The caller's dict is never mutated.
+    """
+    merged: Dict[str, Any] = {
+        "version": "1.0.0",
+        "syncedWithApiGateway": False,
+        "autoDiscoveryEnabled": False,
+        "tags": [],
+        "sourceClassifications": [],
+    }
+    merged.update(
+        {k: v for k, v in copy.deepcopy(source_data).items() if not _is_empty_source_value(k, v)}
+    )
+
+    source_type = merged.get("type", "API").upper()
+    merged["type"] = source_type
+    if isinstance(merged.get("sourceType"), str):
+        # The backend rejects lowercase enum values; normalize like type.
+        merged["sourceType"] = merged["sourceType"].upper()
+    elif "sourceType" not in merged:
+        merged["sourceType"] = source_type if source_type in VALID_SOURCE_TYPES else "UNKNOWN"
+    if "description" not in merged:
+        template = _AUTO_SOURCE_DESCRIPTIONS.get(source_type, "Source for {name}")
+        merged["description"] = template.format(name=merged.get("name"))
+
+    merged.pop("teamId", None)
+    merged.pop("ownerId", None)
+    return merged
+
+
+# Source fields left out of the create log line: they can carry secrets.
+_UNLOGGED_SOURCE_FIELDS = frozenset({"configuration", "authentication", "connection_string", "url"})
+
+# Source fields the registered manage_sources tool also accepts at the top level.
+_TOP_LEVEL_SOURCE_FIELDS = ("name", "type", "url", "description", "version", "connection_string")
+
+
+def _merge_top_level_source_fields(arguments: Dict[str, Any]) -> None:
+    """Fold the top-level source fields into `arguments["source_data"]` (BACK-4662).
+
+    A `source_data` value wins over the same field given at the top level. A stream
+    source's `stream_url` or an AI source's `model_endpoint` becomes its `url` when no
+    url was given; neither is forwarded under its own name. The caller's `source_data`
+    dict is copied, never mutated.
+    """
+    nested = arguments.get("source_data")
+    if nested is not None and not isinstance(nested, dict):
+        return
+
+    merged: Dict[str, Any] = {
+        field: arguments[field]
+        for field in _TOP_LEVEL_SOURCE_FIELDS
+        if arguments.get(field) is not None
+    }
+    merged.update(nested or {})
+
+    stream_url = merged.pop("stream_url", None) or arguments.get("stream_url")
+    model_endpoint = merged.pop("model_endpoint", None) or arguments.get("model_endpoint")
+    if not merged.get("url"):
+        declared_type = merged.get("type")
+        declared_type = declared_type.lower() if isinstance(declared_type, str) else ""
+        if declared_type == "stream" and stream_url:
+            merged["url"] = stream_url
+        elif declared_type == "ai" and model_endpoint:
+            merged["url"] = model_endpoint
+
+    arguments["source_data"] = merged
 
 
 class SourceManager:
@@ -102,6 +192,8 @@ class SourceManager:
             "action": "list",
             "sources": sources,
             "pagination": page_info,
+            "page": page,
+            "total_records": platform_total(page_info),
             "total_found": len(sources),
         }
 
@@ -131,7 +223,7 @@ class SourceManager:
                 parameter_name="source_data",
                 action="create source",
                 examples={
-                    "usage": "create_source(name='API Source', type='api', url='https://api.example.com')",
+                    "usage": "create(source_data={'name': 'API Source', 'type': 'api', 'url': 'https://api.example.com'})",
                     "required_fields": ["name", "type"],
                     "example_data": {
                         "name": "API Source",
@@ -185,14 +277,21 @@ class SourceManager:
         if configuration:
             source_data["configuration"] = configuration
 
-        # DEBUG: Log the source data being sent
-        logger.info(f"SOURCE DEBUG: Creating source with data: {json.dumps(source_data, indent=2)}")
+        # DEBUG: Log the source data being sent, without the fields that can carry a
+        # connection string, credentials or a credentialed URL (BACK-4662)
+        logged_data = {
+            key: "[REDACTED]" if key in _UNLOGGED_SOURCE_FIELDS else value
+            for key, value in source_data.items()
+        }
+        logger.info(f"SOURCE DEBUG: Creating source with data: {json.dumps(logged_data, indent=2)}")
 
         result = await self.client.create_source(source_data)
         return result
 
-    async def update_source(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Update existing source using PartialUpdateHandler."""
+    def _require_update_arguments(
+        self, arguments: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+        """The source id and the changes an update needs, or a refusal naming the missing one."""
         source_id = arguments.get("source_id")
         source_data = arguments.get("source_data")
 
@@ -216,6 +315,7 @@ class SourceManager:
                     "usage": "update(source_id='src_123', source_data={'url': 'https://new-api.example.com'})",
                     "partial_update": "Only provide the fields you want to update",
                     "updatable_fields": ["name", "url", "configuration"],
+                    "metadata": "Send metadata as a string of name=value pairs separated by commas, such as 'region=eu, tier=gold'; the keys sent are merged into the source's stored metadata. A comma always ends a value",
                     "integration_context": "INTEGRATION: Partial updates preserve existing source configuration while changing specific fields",
                 },
             )
@@ -224,19 +324,28 @@ class SourceManager:
         # lowercase input that create silently accepts (the backend rejects
         # lowercase on update with a 400; create masks it via .upper()).
         self._normalize_source_type(source_data)
+        return source_id, source_data
 
-        # Get update configuration for sources
-        config = self.update_config_factory.get_config("sources")
-
-        # Use PartialUpdateHandler for the update operation
-        result = await self.update_handler.update_with_merge(
+    async def preview_update(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Read the source and return the body update_source would send, sending nothing."""
+        source_id, source_data = self._require_update_arguments(arguments)
+        body = await self.update_handler.build_update_payload(
             resource_id=source_id,
             partial_data=source_data,
-            config=config,
+            config=self.update_config_factory.get_config("sources"),
             action_context="update source",
         )
+        return {"source_id": source_id, "changes": source_data, "body": body}
 
-        return result
+    async def update_source(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Update existing source using PartialUpdateHandler."""
+        source_id, source_data = self._require_update_arguments(arguments)
+        return await self.update_handler.update_with_merge(
+            resource_id=source_id,
+            partial_data=source_data,
+            config=self.update_config_factory.get_config("sources"),
+            action_context="update source",
+        )
 
     async def delete_source(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Delete source."""
@@ -321,7 +430,6 @@ class SourceValidator:
             "create",
             "update",
             "delete",
-            "create_from_text",
             "validate",
             "get_capabilities",
             "get_examples",
@@ -567,54 +675,6 @@ class SourceEnhancementProcessor:
         result = await self.client.create_source(source_config)
         return result
 
-    async def create_from_text(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Create source from natural language description."""
-        text = arguments.get("text", "")
-        if not text:
-            raise create_structured_missing_parameter_error(
-                parameter_name="text",
-                action="create source from natural language",
-                examples={
-                    "usage": "create_from_description(text='Create API source for customer data from https://api.customer.com')",
-                    "valid_format": "Natural language description including source type and connection details",
-                    "example_descriptions": [
-                        "Create API source for customer data from https://api.customer.com",
-                        "Set up database connection to PostgreSQL server at db.company.com",
-                        "Add webhook source for real-time events from payment system",
-                    ],
-                    "integration_context": "INTEGRATION: Natural language source creation establishes data connections based on description",
-                },
-            )
-
-        # Simple text parsing for demonstration
-        # In a real implementation, this would use NLP
-        source_name = f"Source from text: {text[:30]}..."
-        source_config = {
-            "name": source_name,
-            "description": f"Source created from: {text}",
-            "version": "1.0.0",
-            "type": "API",
-            "sourceType": "UNKNOWN",  # API requires this field
-            "syncedWithApiGateway": False,
-            "autoDiscoveryEnabled": False,
-            "tags": [],
-            "sourceClassifications": [],
-        }
-
-        # Add required fields from client environment
-        source_config["teamId"] = self.client.team_id
-        owner_id = get_config_value("REVENIUM_OWNER_ID")
-        if owner_id:
-            source_config["ownerId"] = owner_id
-        else:
-            # Skip ownerId if not available - let API handle default
-            logger.warning(
-                "REVENIUM_OWNER_ID not available from configuration store, API will use default owner"
-            )
-
-        result = await self.client.create_source(source_config)
-        return result
-
 
 class SourceManagement(ToolBase):
     """Consolidated source management tool with internal composition."""
@@ -716,10 +776,6 @@ class SourceManagement(ToolBase):
                     ),
                 },
                 # Utility parameters
-                "text": {
-                    "type": "string",
-                    "description": "Natural language description for create_from_text action",
-                },
                 "dry_run": {
                     "type": "boolean",
                     "description": "Validate only without executing for create, update, delete operations",
@@ -789,7 +845,9 @@ class SourceManagement(ToolBase):
         examples_text += '{"action": "create", "source_data": {"name": "AI Model", "type": "ai", "url": "https://api.openai.com"}}\n'
         examples_text += "```\n\n"
 
-        examples_text += "## **Single Pattern - All Fields in source_data**\n\n"
+        examples_text += "## **Preferred Pattern - Fields in source_data**\n\n"
+        examples_text += "Top-level `name`, `type`, `url`, `description` and `version` are also accepted; "
+        examples_text += "a `source_data` value wins when both are given.\n\n"
         examples_text += "**Minimal** (Just name - everything else auto-generated):\n"
         examples_text += "```json\n"
         examples_text += '{"action": "create", "source_data": {"name": "MyAPI"}}\n'
@@ -816,7 +874,6 @@ class SourceManagement(ToolBase):
             # Get client and initialize managers
             client = await self.get_client(ctx=ctx)
             source_manager = SourceManager(client)
-            enhancement_processor = SourceEnhancementProcessor(client)
 
             # Handle introspection actions
             if action == "get_tool_metadata":
@@ -829,7 +886,10 @@ class SourceManagement(ToolBase):
                 return [
                     TextContent(
                         type="text",
-                        text=f"Found {result['total_found']} sources (page {arguments.get('page', 0) + 1}):\n\n"
+                        text=format_page_count_heading(
+                            "sources", len(result["sources"]), result["pagination"], result["page"]
+                        )
+                        + "\n\n"
                         + json.dumps(result, indent=2),
                     )
                 ]
@@ -846,6 +906,7 @@ class SourceManagement(ToolBase):
 
             elif action == "create":
                 # Enhanced unified create action with auto-generation support
+                _merge_top_level_source_fields(arguments)
                 source_data = arguments.get("source_data", {})
                 auto_generate = arguments.get(
                     "auto_generate", True
@@ -860,71 +921,16 @@ class SourceManagement(ToolBase):
                         raise_refusal(
                             "**Missing Required Field**\n\n"
                             "**Field**: `name` (required for all source creation)\n\n"
-                            '**Example**: `{"action":"create","source_data":{"name":"My API"}}`\n\n'
+                            '**Example**: `{"action":"create","source_data":{"name":"My API"}}` '
+                            'or `{"action":"create","name":"My API"}`\n\n'
                             "**Auto-Generation**: Enabled (will auto-generate description, version, type)",
                             error_code=ErrorCodes.MISSING_PARAMETER,
                             field="name",
                         )
 
-                    # Apply smart auto-generation logic from create_source
-                    source_type = source_data.get("type", "api").lower()
-                    url = source_data.get("url")
-
-                    # Build enhanced source_data with auto-generated fields
-                    enhanced_source_data = {
-                        "name": name,
-                        "description": source_data.get("description") or f"Source for {name}",
-                        "version": source_data.get("version") or "1.0.0",
-                        "type": "API" if source_type == "api" else source_type.upper(),
-                        "sourceType": (
-                            source_type.upper()
-                            if source_type in ["api", "stream", "ai"]
-                            else "UNKNOWN"
-                        ),
-                        "syncedWithApiGateway": False,
-                        "autoDiscoveryEnabled": False,
-                        "tags": [],
-                        "sourceClassifications": [],
-                    }
-
-                    # Type-specific auto-generation
-                    if source_type == "api":
-                        enhanced_source_data.update(
-                            {
-                                "description": source_data.get("description")
-                                or f"REST API source for {name}",
-                                "type": "API",
-                                "sourceType": "API",
-                            }
-                        )
-                        if url:
-                            enhanced_source_data["url"] = url
-                    elif source_type == "stream":
-                        enhanced_source_data.update(
-                            {
-                                "description": source_data.get("description")
-                                or f"Stream source for {name}",
-                                "type": "STREAM",
-                                "sourceType": "STREAM",
-                            }
-                        )
-                        if url:
-                            enhanced_source_data["url"] = url
-                    elif source_type == "ai":
-                        enhanced_source_data.update(
-                            {
-                                "description": source_data.get("description")
-                                or f"AI source for {name}",
-                                "type": "AI",
-                                "sourceType": "AI",
-                            }
-                        )
-                        if url:
-                            enhanced_source_data["url"] = url
-
-                    # Replace source_data with enhanced version
-                    arguments["source_data"] = enhanced_source_data
-                    source_data = enhanced_source_data
+                    # Fill only the fields the caller left empty (BACK-4662)
+                    source_data = _with_auto_generated_source_fields(source_data)
+                    arguments["source_data"] = source_data
 
                 # Validation: Skip strict validation in auto-generate mode, use UCM validation otherwise
                 if not auto_generate:
@@ -1002,14 +1008,15 @@ class SourceManagement(ToolBase):
                 # Handle dry_run mode for update operations
                 dry_run = arguments.get("dry_run", False)
                 if dry_run:
-                    source_id = arguments.get("source_id")
-                    source_data = arguments.get("source_data", {})
+                    preview = await source_manager.preview_update(arguments)
                     return [
                         TextContent(
                             type="text",
                             text=f"**DRY RUN MODE - Source Update**\n\n"
-                            f"**Would update source:** {source_id}\n"
-                            f"**Changes:** {json.dumps(source_data, indent=2)}\n\n"
+                            f"**Would update source:** {preview['source_id']}\n"
+                            f"**Changes:** {json.dumps(preview['changes'], indent=2, default=str)}\n\n"
+                            f"**Body the update would send:**\n"
+                            f"{json.dumps(preview['body'], indent=2, default=str)}\n\n"
                             f"**Dry Run:** True (no actual update performed)",
                         )
                     ]
@@ -1047,18 +1054,6 @@ class SourceManagement(ToolBase):
                     )
                 ]
 
-            # Enhanced operations
-
-            elif action == "create_from_text":
-                result = await enhancement_processor.create_from_text(arguments)
-                return [
-                    TextContent(
-                        type="text",
-                        text="Source created from text successfully:\n\n"
-                        + json.dumps(result, indent=2),
-                    )
-                ]
-
             # Validation and discovery operations
             elif action == "get_capabilities":
                 # Use centralized schema as single source of truth
@@ -1083,6 +1078,7 @@ class SourceManagement(ToolBase):
                 return [TextContent(type="text", text=examples)]
 
             elif action == "validate":
+                _merge_top_level_source_fields(arguments)
                 source_data = arguments.get("source_data")
                 auto_generate = arguments.get("auto_generate", True)  # Get auto_generate parameter
 
@@ -1107,69 +1103,14 @@ class SourceManagement(ToolBase):
                                 type="text",
                                 text="**Validation Failed**\n\n"
                                 "**Field**: `name` (required for validation)\n\n"
-                                '**Example**: `{"action":"validate","source_data":{"name":"My API"},"auto_generate":true}`\n\n'
+                                '**Example**: `{"action":"validate","source_data":{"name":"My API"},"auto_generate":true}` '
+                                'or `{"action":"validate","name":"My API"}`\n\n'
                                 "**Auto-Generation**: Enabled (will auto-generate description, version, type)",
                             )
                         ]
 
-                    # Apply same auto-generation logic as create action
-                    source_type = source_data.get("type", "api").lower()
-                    url = source_data.get("url")
-
-                    # Build enhanced source_data with auto-generated fields
-                    enhanced_source_data = {
-                        "name": name,
-                        "description": source_data.get("description") or f"Source for {name}",
-                        "version": source_data.get("version") or "1.0.0",
-                        "type": "API" if source_type == "api" else source_type.upper(),
-                        "sourceType": (
-                            source_type.upper()
-                            if source_type in ["api", "stream", "ai"]
-                            else "UNKNOWN"
-                        ),
-                        "syncedWithApiGateway": False,
-                        "autoDiscoveryEnabled": False,
-                        "tags": [],
-                        "sourceClassifications": [],
-                    }
-
-                    # Type-specific auto-generation (same as create action)
-                    if source_type == "api":
-                        enhanced_source_data.update(
-                            {
-                                "description": source_data.get("description")
-                                or f"REST API source for {name}",
-                                "type": "API",
-                                "sourceType": "API",
-                            }
-                        )
-                        if url:
-                            enhanced_source_data["url"] = url
-                    elif source_type == "stream":
-                        enhanced_source_data.update(
-                            {
-                                "description": source_data.get("description")
-                                or f"Stream source for {name}",
-                                "type": "STREAM",
-                                "sourceType": "STREAM",
-                            }
-                        )
-                        if url:
-                            enhanced_source_data["url"] = url
-                    elif source_type == "ai":
-                        enhanced_source_data.update(
-                            {
-                                "description": source_data.get("description")
-                                or f"AI source for {name}",
-                                "type": "AI",
-                                "sourceType": "AI",
-                            }
-                        )
-                        if url:
-                            enhanced_source_data["url"] = url
-
-                    # Use enhanced data for validation
-                    source_data = enhanced_source_data
+                    # Same auto-generation as the create action (BACK-4662)
+                    source_data = _with_auto_generated_source_fields(source_data)
 
                 dry_run = arguments.get("dry_run", True)
                 result = self.validator.validate_configuration(source_data, dry_run)
@@ -1216,11 +1157,11 @@ class SourceManagement(ToolBase):
                         "Use get_capabilities() to see all available source types and authentication methods",
                         "Check the action name for typos",
                         "Use get_examples() to see working source configuration templates",
-                        "For source creation, use 'create_source' for basic sources",
+                        "For source creation, use 'create' with source_data={'name': ...}",
                     ],
                     examples={
                         "basic_actions": ["list", "get", "create", "update", "delete"],
-                        "creation_actions": ["create_source", "create_from_text"],
+                        "creation_actions": ["create"],
                         "discovery_actions": [
                             "get_capabilities",
                             "get_examples",
@@ -1230,7 +1171,7 @@ class SourceManagement(ToolBase):
                         "metadata_actions": ["get_tool_metadata"],
                         "example_usage": {
                             "list_sources": "list(page=0, size=10)",
-                            "create_api_source": "create_source(name='My API', type='api', url='https://api.example.com')",
+                            "create_api_source": "create(source_data={'name': 'My API', 'type': 'api', 'url': 'https://api.example.com'})",
                             "validate_config": "validate(source_data={...}, dry_run=True)",
                         },
                     },
@@ -1257,10 +1198,12 @@ class SourceManagement(ToolBase):
 
         # CRITICAL: Parameter Organization (prevents agent confusion about container pattern)
         result_text += "## **🔧 Parameter Organization** \n\n"
-        result_text += "**Creation fields** must be nested in `source_data` container:\n"
+        result_text += "**Creation fields** go in the `source_data` container (preferred):\n"
         result_text += "```json\n"
         result_text += '{"action": "create", "source_data": {"name": "My API", "type": "api", "url": "https://example.com"}}\n'
-        result_text += "```\n\n"
+        result_text += "```\n"
+        result_text += "Top-level `name`, `type`, `url`, `description` and `version` are also accepted; "
+        result_text += "a `source_data` value wins when both are given.\n\n"
         result_text += "**Top-level parameters** for tool behavior:\n"
         result_text += "- `action` - What operation to perform\n"
         result_text += "- `source_id` - For get/update/delete operations\n"
@@ -1542,7 +1485,7 @@ class SourceManagement(ToolBase):
                 examples=[
                     "list(page=0, size=10)",
                     "get(source_id='src_123')",
-                    "create_source(name='My API', type='api', url='https://api.example.com')",
+                    "create(source_data={'name': 'My API', 'type': 'api', 'url': 'https://api.example.com'})",
                 ],
                 limitations=[
                     "Requires valid API authentication",
@@ -1560,12 +1503,10 @@ class SourceManagement(ToolBase):
                 name="Enhanced Source Creation",
                 description="Simplified source creation with smart defaults",
                 parameters={
-                    "create_source": {"name": "str", "type": "str", "url": "str"},
-                    "create_from_text": {"text": "str"},
+                    "create": {"name": "str", "type": "str", "url": "str"},
                 },
                 examples=[
-                    "create_source(name='My API', type='api', url='https://api.example.com')",
-                    "create_from_text(text='Create API source for external data')",
+                    "create(name='My API', type='api', url='https://api.example.com')",
                 ],
             ),
         ]

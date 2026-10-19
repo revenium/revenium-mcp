@@ -26,15 +26,32 @@ at once.
 """
 
 import ast
+import importlib
 import pathlib
+import re
 from typing import Dict, List, Optional, Set, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+from fastmcp import FastMCP
 
 from src.revenium_mcp_server.client import ReveniumAPIError
+from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.tool_configuration.config import ToolConfig
+from src.revenium_mcp_server.tool_configuration.registry import (
+    ToolConfigurationRegistry,
+)
 from src.revenium_mcp_server.tools_decomposed.metering_management import (
     MeteringManagement,
+)
+from tests.unit._registered_tool_harness import (
+    CALLER_API_KEY,
+    CallerContextMiddleware,
+    RegisteredTools,
+    answer_text,
+    caller_context,
+    isolate_server_settings,
 )
 
 TOOLS_DIR = (
@@ -428,3 +445,340 @@ class TestMeteringAnalyzeRecentTransactionsIsReachable:
             get_client.return_value = client
             with pytest.raises(ReveniumAPIError):
                 await mgmt.handle_action("analyze_recent_transactions", {})
+
+
+REGISTRY_PATH = TOOLS_DIR.parent / "tool_configuration" / "registry.py"
+UNKNOWN_ACTION = "fs_no_such_action"
+LOCAL_DEAD_PLATFORM = "http://127.0.0.1:9"
+
+# Tools the caller-facing list check does not cover yet, each with the reason.
+ANSWER_CHECK_OUT_OF_SCOPE: Dict[str, str] = {
+    "business_analytics_management": (
+        "returns its refusals as text and dispatches actions it does not "
+        "advertise; owned by the analytics lane (PR 489). Drop when that merges."
+    ),
+}
+
+# Routes a tool dispatches without advertising them, so no list built from
+# the advertised contract can name them. A new hidden route fails the guard.
+DISPATCHED_BUT_UNADVERTISED: Dict[str, Dict[str, str]] = {
+    "manage_subscriptions": {
+        "cancel": "always refuses (cancel is not offered); must never be listed",
+    },
+    "manage_alerts": {
+        "test_ucm_integration": "debug route, not a customer action",
+        "get_metrics": "refused as unavailable: the platform has no per-alert metrics read (BACK-4703)",
+    },
+    "manage_sources": {
+        "debug_ucm": "debug route, not a customer action",
+    },
+    "manage_tools": {
+        "restore": "retired, always refuses, never listed (BACK-2935)",
+    },
+}
+
+
+def _registered_tool_classes() -> Dict[str, str]:
+    """Tool name to class name, read from the registry's execution calls."""
+    tree = ast.parse(REGISTRY_PATH.read_text(encoding="utf-8"))
+    found: Dict[str, str] = {"tool_introspection": "ToolIntrospection"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        keywords = {kw.arg: kw.value for kw in node.keywords}
+        name, cls = keywords.get("tool_name"), keywords.get("tool_class")
+        if isinstance(name, ast.Constant) and isinstance(cls, ast.Name):
+            found[name.value] = cls.id
+    return found
+
+
+REGISTERED_TOOL_CLASSES = _registered_tool_classes()
+MODULE_BY_CLASS = {class_name: module for module, class_name in TOOL_CLASSES}
+
+
+def _business_tools() -> List[str]:
+    from src.revenium_mcp_server.tool_configuration.profiles import (
+        PROFILE_DEFINITIONS,
+    )
+
+    return sorted(PROFILE_DEFINITIONS["business"])
+
+
+def _tool_class(tool: str):
+    class_name = REGISTERED_TOOL_CLASSES[tool]
+    module = importlib.import_module(
+        "src.revenium_mcp_server.tools_decomposed."
+        + MODULE_BY_CLASS[class_name].removesuffix(".py")
+    )
+    return getattr(module, class_name)
+
+
+async def _advertised(tool: str) -> List[str]:
+    return list(await _tool_class(tool)(ucm_helper=None)._get_supported_actions())
+
+
+async def _raised_first_line(tool: str, action: str, arguments: Dict) -> str:
+    try:
+        await _tool_class(tool)(ucm_helper=None).handle_action(action, arguments)
+    except ToolError as error:
+        return error.message.splitlines()[0]
+    return "<the handler returned instead of raising>"
+
+
+def _times_named(action: str, text: str) -> int:
+    pattern = rf"(?<![A-Za-z0-9_]){re.escape(action)}(?![A-Za-z0-9_])"
+    return len(re.findall(pattern, text))
+
+
+async def _call_registered(monkeypatch, tmp_path, tool, arguments, auth_mode="env"):
+    monkeypatch.chdir(tmp_path)
+    isolate_server_settings(monkeypatch, auth_mode)
+    tenant = None
+    if auth_mode == "env":
+        monkeypatch.setenv("REVENIUM_BASE_URL", LOCAL_DEAD_PLATFORM)
+    else:
+        tenant = caller_context(LOCAL_DEAD_PLATFORM, api_key=CALLER_API_KEY)
+    mcp = FastMCP("unknown-action-answers")
+    registry = ToolConfigurationRegistry(
+        tool_config=ToolConfig.create_for_testing(profile="business")
+    )
+    await registry._register_single_tool(mcp, tool)
+    middleware = CallerContextMiddleware()
+    mcp.add_middleware(middleware)
+    return await RegisteredTools(mcp, middleware).call(tool, arguments, tenant=tenant)
+
+
+ANSWER_CHECKED_TOOLS = [
+    tool for tool in _business_tools() if tool not in ANSWER_CHECK_OUT_OF_SCOPE
+]
+
+
+class TestEveryRegisteredToolNamesItsActions:
+    """A wrong action name gets an error that lists what the tool accepts.
+
+    BACK-4715: handlers built the list of valid actions, suggestions and a
+    usage example, then the server sent the caller only the first line of the
+    refusal (and three tools returned the refusal as a normal answer).
+    """
+
+    def test_every_business_tool_maps_to_a_tool_class(self):
+        missing = [t for t in _business_tools() if t not in REGISTERED_TOOL_CLASSES]
+        assert not missing
+
+    @pytest.mark.parametrize("tool", ANSWER_CHECKED_TOOLS)
+    async def test_unknown_action_is_an_error_that_lists_every_advertised_action(
+        self, tool, monkeypatch, tmp_path
+    ):
+        result = await _call_registered(
+            monkeypatch, tmp_path, tool, {"action": UNKNOWN_ACTION}
+        )
+        text = answer_text(result)
+
+        assert result.is_error is True, text
+        first_line = await _raised_first_line(
+            tool, UNKNOWN_ACTION, {"action": UNKNOWN_ACTION}
+        )
+        assert text.splitlines()[0] == f"Error calling tool '{tool}': {first_line}"
+        unnamed = [a for a in await _advertised(tool) if not _times_named(a, text)]
+        assert not unnamed, f"{tool} answer omits {unnamed}:\n{text}"
+        assert text.count("**Valid actions**") <= 1
+        assert "Debug Context" not in text
+        assert "Response Data" not in text
+
+    @pytest.mark.parametrize("tool", _business_tools())
+    def test_dispatched_actions_are_advertised_or_named_exempt(self, tool):
+        if tool in ANSWER_CHECK_OUT_OF_SCOPE:
+            pytest.skip(f"{tool}: {ANSWER_CHECK_OUT_OF_SCOPE[tool]}")
+        class_name = REGISTERED_TOOL_CLASSES[tool]
+        tree = ast.parse(
+            (TOOLS_DIR / MODULE_BY_CLASS[class_name]).read_text(encoding="utf-8")
+        )
+        cls = _class_node(tree, class_name)
+        supported_fn = next(
+            n
+            for n in cls.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "_get_supported_actions"
+        )
+        dispatched, _ = _dispatched_action_names(
+            _dispatch_bodies(cls), _module_level_string_sets(tree)
+        )
+        identifier_shaped = {a for a in dispatched if a.isidentifier()}
+        hidden = identifier_shaped - _advertised_action_names(supported_fn)
+
+        assert hidden == set(DISPATCHED_BUT_UNADVERTISED.get(tool, {}))
+
+    async def test_missing_subscription_id_shows_the_usage_example(
+        self, monkeypatch, tmp_path
+    ):
+        result = await _call_registered(
+            monkeypatch,
+            tmp_path,
+            "manage_subscriptions",
+            {"action": "get_billed_amount"},
+        )
+        text = answer_text(result)
+
+        assert result.is_error is True
+        assert text.splitlines()[0] == (
+            "Error calling tool 'manage_subscriptions': "
+            "Required parameter 'subscription_id' is missing"
+        )
+        assert "get_billed_amount(subscription_id='sub_123')" in text
+
+    async def test_cancel_refusal_does_not_list_the_actions(
+        self, monkeypatch, tmp_path
+    ):
+        result = await _call_registered(
+            monkeypatch, tmp_path, "manage_subscriptions", {"action": "cancel"}
+        )
+
+        assert result.is_error is True
+        assert "Valid actions" not in answer_text(result)
+
+    @pytest.mark.parametrize(
+        "arguments, field, phrase",
+        [
+            (
+                {
+                    "action": "create",
+                    "auto_generate": False,
+                    "subscription_data": {"name": "Sub", "product_id": "p1"},
+                },
+                "clientEmailAddress",
+                "Missing Required Field",
+            ),
+            (
+                {"action": "create", "subscription_data": {"name": "Sub", "product_id": "p1"}},
+                "clientEmailAddress",
+                "invoices",
+            ),
+            (
+                {
+                    "action": "update",
+                    "subscription_id": "sub1",
+                    "subscription_data": {"description": "x"},
+                },
+                "description",
+                "nothing was changed",
+            ),
+        ],
+    )
+    async def test_subscription_write_refusals_carry_the_error_flag(
+        self, arguments, field, phrase, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("REVENIUM_DEFAULT_EMAIL", raising=False)
+        sent: List[str] = []
+        original_request = httpx.AsyncClient.request
+
+        async def recording_request(self, method, url, *args, **kwargs):
+            sent.append(str(method).upper())
+            return await original_request(self, method, url, *args, **kwargs)
+
+        monkeypatch.setattr(httpx.AsyncClient, "request", recording_request)
+
+        result = await _call_registered(
+            monkeypatch, tmp_path, "manage_subscriptions", arguments
+        )
+        text = answer_text(result)
+
+        assert result.is_error is True, text
+        assert field in text
+        assert phrase in text
+        assert [m for m in sent if m in ("POST", "PUT")] == []
+
+    async def test_ai_insights_names_each_action_once(self, monkeypatch, tmp_path):
+        result = await _call_registered(
+            monkeypatch, tmp_path, "manage_ai_insights", {"action": UNKNOWN_ACTION}
+        )
+        text = answer_text(result)
+
+        assert result.is_error is True
+        assert text.count("**Valid actions**") == 1
+        assert _times_named("get_run", text) == 1
+
+    async def test_hosted_api_key_caller_gets_the_same_list(
+        self, monkeypatch, tmp_path
+    ):
+        result = await _call_registered(
+            monkeypatch,
+            tmp_path,
+            "manage_subscriptions",
+            {"action": UNKNOWN_ACTION},
+            auth_mode="api_key",
+        )
+        text = answer_text(result)
+
+        assert result.is_error is True
+        advertised = await _advertised("manage_subscriptions")
+        unnamed = [a for a in advertised if not _times_named(a, text)]
+        assert not unnamed, text
+
+
+REMOVED_ROUTES = [
+    ("manage_sources", "create_from_text"),
+    ("manage_workflows", "validate"),
+]
+
+
+class TestRemovedRoutesGetTheUnknownActionAnswer:
+    """BACK-4806: two hidden routes were dead ends and are gone.
+
+    Source create_from_text wrote a junk source ("Source from text: ...",
+    sourceType UNKNOWN) into the caller's organization with no preview, and
+    workflow validate only printed a deprecation notice. Each now gets the
+    normal unknown-action answer, which lists the real actions.
+    """
+
+    @pytest.mark.parametrize(("tool", "action"), REMOVED_ROUTES)
+    async def test_a_removed_route_is_refused_with_the_real_action_list(
+        self, tool, action, monkeypatch, tmp_path
+    ):
+        result = await _call_registered(monkeypatch, tmp_path, tool, {"action": action})
+        text = answer_text(result)
+
+        assert result.is_error is True, text
+        assert text.splitlines()[0] == (
+            f"Error calling tool '{tool}': Unknown action '{action}' is not supported"
+        )
+        unnamed = [a for a in await _advertised(tool) if not _times_named(a, text)]
+        assert not unnamed, f"{tool} answer omits {unnamed}:\n{text}"
+
+    async def test_source_create_from_text_writes_nothing(self):
+        client = MagicMock()
+        client.create_source = AsyncMock(return_value={"id": "src_junk"})
+        tool = _tool_class("manage_sources")(ucm_helper=None)
+
+        with patch.object(tool, "get_client", new_callable=AsyncMock) as get_client:
+            get_client.return_value = client
+            with pytest.raises(ToolError) as refused:
+                await tool.handle_action(
+                    "create_from_text", {"text": "Create API source for data"}
+                )
+
+        assert refused.value.message == "Unknown action 'create_from_text' is not supported"
+        client.create_source.assert_not_awaited()
+
+    async def test_no_source_surface_names_create_from_text(self):
+        tool = _tool_class("manage_sources")(ucm_helper=None)
+        capabilities = await tool.validator.get_capabilities()
+        introspection = await tool._get_tool_capabilities()
+        with patch.object(tool, "get_client", new_callable=AsyncMock):
+            with pytest.raises(ToolError) as unknown:
+                await tool.handle_action(UNKNOWN_ACTION, {})
+
+        surfaces = {
+            "capabilities": repr(capabilities),
+            "introspection": repr(introspection),
+            "unknown-action examples": repr(unknown.value.examples),
+        }
+        naming = [name for name, text in surfaces.items() if "create_from_text" in text]
+        assert not naming
+
+    async def test_workflow_unknown_action_answer_names_no_deprecated_validate(self):
+        tool = _tool_class("manage_workflows")(ucm_helper=None)
+
+        with pytest.raises(ToolError) as unknown:
+            await tool.handle_action(UNKNOWN_ACTION, {})
+
+        assert not _times_named("validate", repr(unknown.value.examples))

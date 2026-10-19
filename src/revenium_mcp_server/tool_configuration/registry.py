@@ -7,6 +7,7 @@ This registry conditionally registers tools based on the ToolConfig settings,
 enabling profile-based tool loading (starter/business).
 """
 
+import json
 from typing import Dict, Any, Optional, List, Union
 from loguru import logger
 from fastmcp import FastMCP
@@ -20,14 +21,193 @@ from ..common.validation import (
     preprocess_numeric_parameters,
     preprocess_boolean_parameters,
     preprocess_array_parameters,
+    refuse_arguments_the_action_ignores,
     validate_string_params,
 )
+from ..tools_decomposed.customer_management import (
+    CUSTOMER_DATA_ARGUMENTS,
+    CUSTOMER_DATA_READERS,
+)
 from ..tools_decomposed.dynamic_decorators import dynamic_mcp_tool
+from ..tools_decomposed.metering_elements_management import OVERRIDES_READERS
 from .schema_slimming import (
     apply_schema_slimming,
     apply_thin_tool_defaults,
     merge_params_argument,
 )
+
+
+# The individual credential fields manage_subscriber_credentials declares. Create
+# reads them only when credential_data is absent; update reads only
+# credential_data, so the closure folds them in for the other cases.
+CREDENTIAL_FIELD_ARGUMENTS = (
+    "label",
+    "externalId",
+    "externalSecret",
+    "tags",
+    "subscriptionIds",
+)
+
+
+def _json_object_argument(name: str, raw: Any, example: str) -> Dict[str, Any]:
+    """Return an argument that must hold an object, decoding JSON text, or refuse it."""
+    import json
+
+    from ..common.error_handling import ErrorCodes, ToolError
+
+    parsed = raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+    if not isinstance(parsed, dict):
+        raise ToolError(
+            message=f"Invalid JSON for {name}: {name} must be a JSON object.",
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field=name,
+            value=None,
+            suggestions=[f"Send {name} as a JSON object, for example {example}"],
+        )
+    return parsed
+
+
+def _json_array_argument(name: str, raw: str, example: str) -> List[Any]:
+    """Decode a JSON-string argument that must hold an array, or refuse it."""
+    import json
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
+    if not isinstance(parsed, list):
+        raise _not_a_json_array_error(
+            name, f"Send {name} as a JSON array, for example {example}"
+        )
+    return parsed
+
+
+def _not_a_json_array_error(name: str, suggestion: str) -> Exception:
+    from ..common.error_handling import ErrorCodes, ToolError
+
+    return ToolError(
+        message=f"Invalid JSON for {name}: {name} must be a JSON array.",
+        error_code=ErrorCodes.VALIDATION_ERROR,
+        field=name,
+        value=None,
+        suggestions=[suggestion],
+    )
+
+
+def _invalid_json_error(
+    name: str, exc: json.JSONDecodeError, hint: str
+) -> Exception:
+    """The refusal for a JSON-string argument that does not parse.
+
+    FastMCP logs a raised error's message and a data argument can carry a
+    secret, so the refusal names where parsing failed instead of quoting it.
+    """
+    from ..common.error_handling import ErrorCodes, ToolError
+
+    return ToolError(
+        message=(
+            f"Invalid JSON for {name}: {exc.msg} at line {exc.lineno} "
+            f"column {exc.colno}. {hint}"
+        ),
+        error_code=ErrorCodes.VALIDATION_ERROR,
+        field=name,
+        value=None,
+        suggestions=[hint],
+    )
+
+
+def _decode_json_argument(name: str, raw: str, hint: str) -> Any:
+    """Decode a JSON-string argument of any JSON type, or refuse it by raising.
+
+    FastMCP sets a reply's error flag only when the tool raises, so a refusal
+    the closure returned read to an agent as a completed write.
+    """
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _invalid_json_error(name, exc, hint) from exc
+
+
+def _starts_like_json(raw: str) -> bool:
+    stripped = raw.strip()
+    return stripped[:1] in ("[", "{", '"') or stripped == "null"
+
+
+def _list_argument_hint(name: str) -> str:
+    return (
+        f'Send {name} as a JSON array, for example ["alpha", "beta"]. A single '
+        "value that starts with [, { or a quote, or the word null, goes inside "
+        'the array, for example ["[draft] notes"].'
+    )
+
+
+def _json_list_arguments(
+    arguments: Dict[str, Any], names: List[str]
+) -> Dict[str, Any]:
+    """Decode the list arguments sent as JSON strings, or refuse them by raising.
+
+    Each takes a JSON array or a plain single value: a plain string such as
+    "openai" reaches the handler unchanged, as it always has, and a bare
+    number or true/false is a plain value, sent as typed. A string that starts
+    with [, { or a quote, or is the word null, must be a JSON array: handing it
+    on stored or filtered on the raw text. A single value that itself starts
+    that way goes inside an array.
+    """
+    for name in names:
+        raw = arguments.get(name)
+        if isinstance(raw, str) and _starts_like_json(raw):
+            hint = _list_argument_hint(name)
+            if not isinstance(_decode_json_argument(name, raw, hint), list):
+                raise _not_a_json_array_error(name, hint)
+    return preprocess_array_parameters(arguments, names)
+
+
+def _fold_credential_fields(arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Merge the individual credential fields into credential_data.
+
+    Returns the merged credential_data, or None when nothing is folded. A field
+    sent both ways with different values is refused rather than silently lost.
+    """
+    from ..common.error_handling import ErrorCodes, ToolError
+
+    supplied = {
+        key: arguments[key]
+        for key in CREDENTIAL_FIELD_ARGUMENTS
+        if arguments.get(key) is not None
+    }
+    credential_data = arguments.get("credential_data")
+    action = arguments.get("action")
+    folds = action == "update" or (action == "create" and bool(credential_data))
+    if not supplied or not folds:
+        return None
+    if credential_data is not None and not isinstance(credential_data, dict):
+        return None
+
+    merged = dict(credential_data or {})
+    conflicts = sorted(
+        key for key, value in supplied.items() if key in merged and merged[key] != value
+    )
+    if conflicts:
+        raise ToolError(
+            message=(
+                "Conflicting values for "
+                + ", ".join(conflicts)
+                + ": sent both as a top-level argument and inside credential_data."
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field=conflicts[0],
+            suggestions=[
+                "Send each credential field once, either top-level or inside "
+                "credential_data"
+            ],
+        )
+    merged.update(supplied)
+    return merged
 
 
 # Tool registration priority order following logical user journey hierarchy
@@ -282,6 +462,7 @@ class ToolConfigurationRegistry:
             include_pull_requests: Optional[Union[bool, str]] = None,
             pr_limit: Optional[Union[int, str]] = None,
             pr_offset: Optional[Union[int, str]] = None,
+            people_offset: Optional[Union[int, str]] = None,
             # PR-health action queue: get_pr_health_queue
             per_cause: Optional[Union[int, str]] = None,
             # PR-health department narrowing (org_unit_id is its deprecated alias, see
@@ -362,6 +543,7 @@ class ToolConfigurationRegistry:
                 "include_pull_requests": include_pull_requests,
                 "pr_limit": pr_limit,
                 "pr_offset": pr_offset,
+                "people_offset": people_offset,
                 "per_cause": per_cause,
                 "department_id": department_id,
                 "org_unit_id": org_unit_id,
@@ -405,10 +587,8 @@ class ToolConfigurationRegistry:
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
 
             # ARRAY PREPROCESSING: Convert string array parameters to actual Python lists.
-            # pay_states/states follow the anomaly_ids precedent: a JSON array string
-            # is parsed to a list; a non-array string is left as-is for the tool to reject.
             array_params = ["include_dimensions", "providers", "agents", "pay_states", "states"]
-            arguments = preprocess_array_parameters(arguments, array_params)
+            arguments = _json_list_arguments(arguments, array_params)
 
             # Remove None values
             arguments = {k: v for k, v in arguments.items() if v is not None}
@@ -435,7 +615,7 @@ class ToolConfigurationRegistry:
             alert_id: Optional[str] = None,
             name: Optional[str] = None,
             metric: Optional[str] = None,
-            threshold: Optional[Union[float, str]] = None,
+            threshold: Optional[Union[bool, float, str]] = None,
             isPercentage: Optional[Union[bool, str]] = None,
             period: Optional[str] = None,
             period_minutes: Optional[Union[float, str]] = None,
@@ -444,7 +624,7 @@ class ToolConfigurationRegistry:
             triggerAfterPersistsDuration: Optional[str] = None,
             periodDuration: Optional[str] = None,
             filters: Optional[dict] = None,
-            # BACK-3170: page/size/resource_type default after the params
+            # BACK-3170: page/size default after the params
             # merge, not here — see apply_thin_tool_defaults.
             page: Optional[int] = None,
             size: Optional[int] = None,
@@ -519,57 +699,22 @@ class ToolConfigurationRegistry:
             # AlertManagement as a raw string.
             anomaly_data_value = arguments.get("anomaly_data")
             if isinstance(anomaly_data_value, str):
-                try:
-                    import json
-                    arguments["anomaly_data"] = json.loads(anomaly_data_value)
-                except json.JSONDecodeError:
-                    # Return helpful error message for malformed JSON
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**Invalid JSON String for anomaly_data**\n\n"
-                             f"**Error**: anomaly_data appears to be malformed JSON: `{anomaly_data_value}`\n\n"
-                             f"**Solution**: Send anomaly_data as proper JSON object:\n"
-                             f"```json\n"
-                             f'{{\n'
-                             f'  \"action\": \"create\",\n'
-                             f'  \"anomaly_data\": {{\n'
-                             f'    \"name\": \"Alert Name\",\n'
-                             f'    \"alertType\": \"THRESHOLD\",\n'
-                             f'    \"metricType\": \"TOTAL_COST\",\n'
-                             f'    \"threshold\": 100\n'
-                             f'  }}\n'
-                             f'}}\n'
-                             f"```\n\n"
-                             f"**Alternative**: Use convenience methods like `create_threshold_alert(name=\"Alert\", threshold=100)`\n\n"
-                             f"**Not as string**: `\"anomaly_data\": \"{{\\\"name\\\": \\\"Alert\\\"}}\"`"
-                    )]
+                arguments["anomaly_data"] = _decode_json_argument(
+                    "anomaly_data",
+                    anomaly_data_value,
+                    'Send anomaly_data as a JSON object, e.g. {"name": "Alert Name", '
+                    '"alertType": "THRESHOLD", "metricType": "TOTAL_COST", '
+                    '"threshold": 100}, or use '
+                    'create_threshold_alert(name="Alert", threshold=100).',
+                )
 
             # anomaly_ids must end up a list so the bulk get_budget_progress
             # path never receives a non-list.
             anomaly_ids_value = arguments.get("anomaly_ids")
             if isinstance(anomaly_ids_value, str):
-                import json
-                try:
-                    decoded_anomaly_ids = json.loads(anomaly_ids_value)
-                except json.JSONDecodeError:
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**Invalid JSON String for anomaly_ids**\n\n"
-                             f"**Error**: anomaly_ids appears to be malformed JSON: `{anomaly_ids_value}`\n\n"
-                             f"**Solution**: Send anomaly_ids as a JSON array of strings, "
-                             f'e.g. `["anom_1", "anom_2"]`.'
-                    )]
-                if not isinstance(decoded_anomaly_ids, list):
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**Invalid anomaly_ids**\n\n"
-                             f"**Error**: expected a JSON array of ids, got `{anomaly_ids_value}`\n\n"
-                             f'**Solution**: Send anomaly_ids as a JSON array, e.g. `["anom_1", "anom_2"]`.'
-                    )]
-                arguments["anomaly_ids"] = decoded_anomaly_ids
+                arguments["anomaly_ids"] = _json_array_argument(
+                    "anomaly_ids", anomaly_ids_value, '["anom_1", "anom_2"]'
+                )
 
             arguments = apply_thin_tool_defaults("manage_alerts", arguments)
 
@@ -578,7 +723,7 @@ class ToolConfigurationRegistry:
             arguments = preprocess_numeric_parameters(arguments, {'page': int, 'size': int})
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
-            boolean_params = ["dry_run", "confirm", "enabled", "include_trend"]
+            boolean_params = ["dry_run", "confirm", "enabled", "include_trend", "isPercentage"]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
 
             # Remove None values
@@ -864,6 +1009,9 @@ class ToolConfigurationRegistry:
             input_tokens: Optional[Union[StrictInt, str]] = None,
             output_tokens: Optional[Union[StrictInt, str]] = None,
             duration_ms: Optional[Union[StrictInt, str]] = None,
+            reasoning_tokens: Optional[Union[StrictInt, str]] = None,
+            cache_creation_tokens: Optional[Union[StrictInt, str]] = None,
+            cache_read_tokens: Optional[Union[StrictInt, str]] = None,
             organization_id: Optional[str] = None,
             subscription_id: Optional[str] = None,
             product_id: Optional[str] = None,
@@ -883,6 +1031,55 @@ class ToolConfigurationRegistry:
             request_time: Optional[str] = None,
             response_time: Optional[str] = None,
             completion_start_time: Optional[str] = None,
+            # Completions read filters and submission trace fields. get_capabilities
+            # lists them as top-level arguments, so they are declared here; the
+            # handlers read the same names whether they arrive here or in params.
+            # They are not in numeric_params: a value is forwarded as sent, the
+            # same as through params.
+            start_date: Optional[str] = None,
+            end_date: Optional[str] = None,
+            total_cost_min: Optional[Union[StrictInt, float, str]] = None,
+            total_cost_max: Optional[Union[StrictInt, float, str]] = None,
+            request_duration_min: Optional[Union[StrictInt, str]] = None,
+            request_duration_max: Optional[Union[StrictInt, str]] = None,
+            subscriber_id: Optional[str] = None,
+            subscriber_email: Optional[str] = None,
+            credential_name: Optional[str] = None,
+            model_source: Optional[str] = None,
+            input_token_count_min: Optional[Union[StrictInt, str]] = None,
+            input_token_count_max: Optional[Union[StrictInt, str]] = None,
+            output_token_count_min: Optional[Union[StrictInt, str]] = None,
+            output_token_count_max: Optional[Union[StrictInt, str]] = None,
+            reasoning_token_count_min: Optional[Union[StrictInt, str]] = None,
+            reasoning_token_count_max: Optional[Union[StrictInt, str]] = None,
+            cached_token_count_min: Optional[Union[StrictInt, str]] = None,
+            cached_token_count_max: Optional[Union[StrictInt, str]] = None,
+            total_token_count_min: Optional[Union[StrictInt, str]] = None,
+            total_token_count_max: Optional[Union[StrictInt, str]] = None,
+            input_token_cost_min: Optional[Union[StrictInt, float, str]] = None,
+            input_token_cost_max: Optional[Union[StrictInt, float, str]] = None,
+            output_token_cost_min: Optional[Union[StrictInt, float, str]] = None,
+            output_token_cost_max: Optional[Union[StrictInt, float, str]] = None,
+            time_to_first_token_min: Optional[Union[StrictInt, str]] = None,
+            time_to_first_token_max: Optional[Union[StrictInt, str]] = None,
+            mediation_latency_min: Optional[Union[StrictInt, str]] = None,
+            mediation_latency_max: Optional[Union[StrictInt, str]] = None,
+            temperature_min: Optional[Union[StrictInt, float, str]] = None,
+            temperature_max: Optional[Union[StrictInt, float, str]] = None,
+            response_quality_score_min: Optional[Union[StrictInt, float, str]] = None,
+            response_quality_score_max: Optional[Union[StrictInt, float, str]] = None,
+            operation_type: Optional[str] = None,
+            system_fingerprint: Optional[str] = None,
+            environment: Optional[str] = None,
+            region: Optional[str] = None,
+            credential_alias: Optional[str] = None,
+            trace_type: Optional[str] = None,
+            trace_name: Optional[str] = None,
+            parent_transaction_id: Optional[str] = None,
+            transaction_name: Optional[str] = None,
+            operation_subtype: Optional[str] = None,
+            retry_number: Optional[Union[StrictInt, str]] = None,
+            usage_metadata: Optional[Union[dict, str]] = None,
             page: Optional[Union[int, str]] = None,
             size: Optional[Union[int, str]] = None,
             query: Optional[str] = None,
@@ -944,7 +1141,7 @@ class ToolConfigurationRegistry:
             # real caller choice and is forwarded as false.
             include_coding_assistants: Optional[Union[bool, str]] = None,
             # BACK-3170: per-action parameters may also arrive as one object so
-            # the advertised schema does not have to list all 52 of them. See
+            # the advertised schema does not have to list each of them. See
             # schema_slimming.merge_params_argument.
             params: Optional[dict] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
@@ -956,6 +1153,9 @@ class ToolConfigurationRegistry:
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "duration_ms": duration_ms,
+                "reasoning_tokens": reasoning_tokens,
+                "cache_creation_tokens": cache_creation_tokens,
+                "cache_read_tokens": cache_read_tokens,
                 "organization_id": organization_id,
                 "subscription_id": subscription_id,
                 "product_id": product_id,
@@ -967,6 +1167,51 @@ class ToolConfigurationRegistry:
                 "request_time": request_time,
                 "response_time": response_time,
                 "completion_start_time": completion_start_time,
+                # Completions read filters and submission trace fields
+                "start_date": start_date,
+                "end_date": end_date,
+                "total_cost_min": total_cost_min,
+                "total_cost_max": total_cost_max,
+                "request_duration_min": request_duration_min,
+                "request_duration_max": request_duration_max,
+                "subscriber_id": subscriber_id,
+                "subscriber_email": subscriber_email,
+                "credential_name": credential_name,
+                "model_source": model_source,
+                "input_token_count_min": input_token_count_min,
+                "input_token_count_max": input_token_count_max,
+                "output_token_count_min": output_token_count_min,
+                "output_token_count_max": output_token_count_max,
+                "reasoning_token_count_min": reasoning_token_count_min,
+                "reasoning_token_count_max": reasoning_token_count_max,
+                "cached_token_count_min": cached_token_count_min,
+                "cached_token_count_max": cached_token_count_max,
+                "total_token_count_min": total_token_count_min,
+                "total_token_count_max": total_token_count_max,
+                "input_token_cost_min": input_token_cost_min,
+                "input_token_cost_max": input_token_cost_max,
+                "output_token_cost_min": output_token_cost_min,
+                "output_token_cost_max": output_token_cost_max,
+                "time_to_first_token_min": time_to_first_token_min,
+                "time_to_first_token_max": time_to_first_token_max,
+                "mediation_latency_min": mediation_latency_min,
+                "mediation_latency_max": mediation_latency_max,
+                "temperature_min": temperature_min,
+                "temperature_max": temperature_max,
+                "response_quality_score_min": response_quality_score_min,
+                "response_quality_score_max": response_quality_score_max,
+                "operation_type": operation_type,
+                "system_fingerprint": system_fingerprint,
+                "environment": environment,
+                "region": region,
+                "credential_alias": credential_alias,
+                "trace_type": trace_type,
+                "trace_name": trace_name,
+                "parent_transaction_id": parent_transaction_id,
+                "transaction_name": transaction_name,
+                "operation_subtype": operation_subtype,
+                "retry_number": retry_number,
+                "usage_metadata": usage_metadata,
                 "page": page,
                 "size": size,
                 "query": query,
@@ -1021,11 +1266,20 @@ class ToolConfigurationRegistry:
             arguments = merge_params_argument(arguments, params)
             arguments = apply_thin_tool_defaults("manage_metering", arguments)
 
+            raw_usage_metadata = arguments.get("usage_metadata")
+            if isinstance(raw_usage_metadata, str):
+                arguments["usage_metadata"] = _json_object_argument(
+                    "usage_metadata", raw_usage_metadata, '{"trace_id": "trace-123"}'
+                )
+
             # NUMERIC PREPROCESSING: Convert string numeric parameters to appropriate types
             numeric_params = {
                 'input_tokens': int,
                 'output_tokens': int,
                 'duration_ms': int,
+                'reasoning_tokens': int,
+                'cache_creation_tokens': int,
+                'cache_read_tokens': int,
                 'page': int,
                 'size': int,
                 'wait_seconds': int,
@@ -1049,7 +1303,7 @@ class ToolConfigurationRegistry:
 
             # ARRAY PREPROCESSING: Convert string array parameters to actual Python lists
             array_params = ["transaction_ids"]
-            arguments = preprocess_array_parameters(arguments, array_params)
+            arguments = _json_list_arguments(arguments, array_params)
 
             # Remove None values
             arguments = {k: v for k, v in arguments.items() if v is not None}
@@ -1095,29 +1349,12 @@ class ToolConfigurationRegistry:
             # SMART INPUT PREPROCESSING: Handle agent interface serialization issues for source_data
             processed_source_data = source_data
             if isinstance(source_data, str):
-                try:
-                    import json
-                    processed_source_data = json.loads(source_data)
-                except json.JSONDecodeError:
-                    # Return helpful error message for malformed JSON
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**❌ Invalid JSON String for source_data**\n\n"
-                             f"**Error**: source_data appears to be malformed JSON: `{source_data}`\n\n"
-                             f"**Solution**: Send source_data as proper JSON object:\n"
-                             f"```json\n"
-                             f'{{\n'
-                             f'  \"action\": \"create\",\n'
-                             f'  \"source_data\": {{\n'
-                             f'    \"name\": \"Source Name\",\n'
-                             f'    \"type\": \"API\",\n'
-                             f'    \"description\": \"Source Description\"\n'
-                             f'  }}\n'
-                             f'}}\n'
-                             f"```\n\n"
-                             f"**Alternative**: Use convenience methods for simpler setup"
-                    )]
+                processed_source_data = _decode_json_argument(
+                    "source_data",
+                    source_data,
+                    'Send source_data as a JSON object, e.g. {"name": "Source Name", '
+                    '"type": "API", "description": "Source Description"}.',
+                )
 
             # Map arguments
             arguments = {
@@ -1206,56 +1443,26 @@ class ToolConfigurationRegistry:
                     ],
                 )
 
-            processed_context = context
             if isinstance(context, str):
                 if len(context) > _MAX_JSON_STRING_BYTES:
                     _reject_oversized_json("context", context)
-                try:
-                    import json
-                    processed_context = json.loads(context)
-                    arguments["context"] = processed_context
-                except json.JSONDecodeError:
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**❌ Invalid JSON String for context**\n\n"
-                             f"**Error**: context appears to be malformed JSON: `{context[:200]}`\n\n"
-                             f"**Solution**: Send context as a proper JSON object."
-                    )]
+                arguments["context"] = _decode_json_argument(
+                    "context", context, "Send context as a JSON object."
+                )
 
-            processed_workflow_data = workflow_data
             if isinstance(workflow_data, str):
                 if len(workflow_data) > _MAX_JSON_STRING_BYTES:
                     _reject_oversized_json("workflow_data", workflow_data)
-                try:
-                    import json
-                    processed_workflow_data = json.loads(workflow_data)
-                    arguments["workflow_data"] = processed_workflow_data
-                except json.JSONDecodeError:
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**❌ Invalid JSON String for workflow_data**\n\n"
-                             f"**Error**: workflow_data appears to be malformed JSON: `{workflow_data[:200]}`\n\n"
-                             f"**Solution**: Send workflow_data as a proper JSON object."
-                    )]
+                arguments["workflow_data"] = _decode_json_argument(
+                    "workflow_data", workflow_data, "Send workflow_data as a JSON object."
+                )
 
-            processed_step_result = step_result
             if isinstance(step_result, str):
                 if len(step_result) > _MAX_JSON_STRING_BYTES:
                     _reject_oversized_json("step_result", step_result)
-                try:
-                    import json
-                    processed_step_result = json.loads(step_result)
-                    arguments["step_result"] = processed_step_result
-                except json.JSONDecodeError:
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**❌ Invalid JSON String for step_result**\n\n"
-                             f"**Error**: step_result appears to be malformed JSON: `{step_result[:200]}`\n\n"
-                             f"**Solution**: Send step_result as a proper JSON object."
-                    )]
+                arguments["step_result"] = _decode_json_argument(
+                    "step_result", step_result, "Send step_result as a JSON object."
+                )
 
             numeric_params = {"page": int, "size": int}
             arguments = preprocess_numeric_parameters(arguments, numeric_params)
@@ -1298,7 +1505,23 @@ class ToolConfigurationRegistry:
             filters: Optional[dict] = None,
             dry_run: Optional[Union[bool, str]] = None,
             email: Optional[str] = None,
-            name: Optional[str] = None
+            name: Optional[str] = None,
+            # Inputs the guidance, examples and natural-language actions read,
+            # and the individual create fields the create error describes.
+            # `description` stays undeclared: on create the handler reads it as
+            # natural-language input, so a label-like value would reroute the
+            # write.
+            text: Optional[str] = None,
+            scenario: Optional[str] = None,
+            customer_info: Optional[Union[dict, str]] = None,
+            issue_description: Optional[str] = None,
+            operation: Optional[str] = None,
+            example_type: Optional[str] = None,
+            label: Optional[str] = None,
+            externalId: Optional[str] = None,
+            externalSecret: Optional[str] = None,
+            tags: Optional[Union[List[str], str]] = None,
+            subscriptionIds: Optional[Union[List[str], str]] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
             # Map arguments
             arguments = {
@@ -1313,42 +1536,48 @@ class ToolConfigurationRegistry:
                 "filters": filters,
                 "dry_run": dry_run,
                 "email": email,
-                "name": name
+                "name": name,
+                "text": text,
+                "scenario": scenario,
+                "customer_info": customer_info,
+                "issue_description": issue_description,
+                "operation": operation,
+                "example_type": example_type,
+                "label": label,
+                "externalId": externalId,
+                "externalSecret": externalSecret,
+                "tags": tags,
+                "subscriptionIds": subscriptionIds,
             }
 
             # SMART INPUT PREPROCESSING: Handle agent interface serialization issues for credential_data
-            processed_credential_data = credential_data
             if isinstance(credential_data, str):
-                try:
-                    import json
-                    processed_credential_data = json.loads(credential_data)
-                    arguments["credential_data"] = processed_credential_data
-                except json.JSONDecodeError:
-                    # Return helpful error message for malformed JSON
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**❌ Invalid JSON String for credential_data**\n\n"
-                             f"**Error**: credential_data appears to be malformed JSON: `{credential_data}`\n\n"
-                             f"**Solution**: Send credential_data as proper JSON object:\n"
-                             f"```json\n"
-                             f'{{\n'
-                             f'  \"action\": \"create\",\n'
-                             f'  \"credential_data\": {{\n'
-                             f'    \"label\": \"API Key Name\",\n'
-                             f'    \"subscriberId\": \"sub_123\",\n'
-                             f'    \"organizationId\": \"org_456\",\n'
-                             f'    \"externalId\": \"key_789\",\n'
-                             f'    \"externalSecret\": \"secret_value\"\n'
-                             f'  }}\n'
-                             f'}}\n'
-                             f"```\n\n"
-                             f"**Alternative**: Use individual parameters for simpler setup"
-                    )]
+                arguments["credential_data"] = _decode_json_argument(
+                    "credential_data",
+                    credential_data,
+                    'Send credential_data as a JSON object, e.g. {"label": "API Key Name", '
+                    '"subscriberId": "sub_123", "organizationId": "org_456", '
+                    '"externalId": "key_789", "externalSecret": "secret_value"}, '
+                    "or use the individual parameters.",
+                )
+
+            if isinstance(customer_info, str):
+                arguments["customer_info"] = _json_object_argument(
+                    "customer_info",
+                    customer_info,
+                    '{"name": "Acme Corp", "email": "ops@acme.example"}',
+                )
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
             boolean_params = ["dry_run"]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
+
+            # ARRAY PREPROCESSING: Convert string array parameters to actual Python lists
+            arguments = _json_list_arguments(arguments, ["tags", "subscriptionIds"])
+
+            folded_credential_data = _fold_credential_fields(arguments)
+            if folded_credential_data is not None:
+                arguments["credential_data"] = folded_credential_data
 
             # Remove None values
             arguments = {k: v for k, v in arguments.items() if v is not None}
@@ -1383,7 +1612,15 @@ class ToolConfigurationRegistry:
             filters: Optional[dict] = None,
             auto_generate: Union[bool, str] = True,
             dry_run: Optional[Union[bool, str]] = None,
-            example_type: Optional[str] = None
+            example_type: Optional[str] = None,
+            subscription_data: Optional[Union[dict, str]] = None,
+            text: Optional[str] = None,
+            requirements: Optional[str] = None,
+            pricing_model: Optional[str] = None,
+            monthly_price: Optional[Union[float, str]] = None,
+            per_unit_price: Optional[Union[float, str]] = None,
+            setup_fee: Optional[Union[float, str]] = None,
+            setup_fee_type: Optional[str] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
             # Map arguments
             arguments = {
@@ -1401,71 +1638,57 @@ class ToolConfigurationRegistry:
                 "filters": filters or {},
                 "auto_generate": auto_generate,
                 "dry_run": dry_run,
-                "example_type": example_type
+                "example_type": example_type,
+                "subscription_data": subscription_data,
+                "text": text,
+                "requirements": requirements,
+                "pricing_model": pricing_model,
+                "monthly_price": monthly_price,
+                "per_unit_price": per_unit_price,
+                "setup_fee": setup_fee,
+                "setup_fee_type": setup_fee_type,
             }
+
+            if isinstance(subscription_data, str):
+                arguments["subscription_data"] = _json_object_argument(
+                    "subscription_data",
+                    subscription_data,
+                    '{"name": "Customer Subscription", '
+                    '"clientEmailAddress": "customer@company.com", '
+                    '"organizationId": "<organization id>"}',
+                )
 
             # SMART INPUT PREPROCESSING: Handle agent interface serialization issues for product_data
             processed_product_data = product_data
             if isinstance(product_data, str):
-                try:
-                    import json
-                    processed_product_data = json.loads(product_data)
-                    arguments["product_data"] = processed_product_data
-                except json.JSONDecodeError:
-                    # Return helpful error message for malformed JSON
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**❌ Invalid JSON String for product_data**\n\n"
-                             f"**Error**: product_data appears to be malformed JSON: `{product_data}`\n\n"
-                             f"**Solution**: Send product_data as proper JSON object:\n"
-                             f"```json\n"
-                             f'{{\n'
-                             f'  \"action\": \"create\",\n'
-                             f'  \"product_data\": {{\n'
-                             f'    \"name\": \"Product Name\",\n'
-                             f'    \"description\": \"Product Description\",\n'
-                             f'    \"version\": \"1.0.0\",\n'
-                             f'    \"plan\": {{\n'
-                             f'      \"type\": \"SUBSCRIPTION\",\n'
-                             f'      \"name\": \"Plan Name\"\n'
-                             f'    }}\n'
-                             f'  }}\n'
-                             f'}}\n'
-                             f"```\n\n"
-                             f"**Alternative**: Use convenience methods for simpler setup"
-                    )]
+                processed_product_data = _decode_json_argument(
+                    "product_data",
+                    product_data,
+                    'Send product_data as a JSON object, e.g. {"name": "Product Name", '
+                    '"description": "Product Description", "version": "1.0.0", '
+                    '"plan": {"type": "SUBSCRIPTION", "name": "Plan Name"}}.',
+                )
+                arguments["product_data"] = processed_product_data
 
             # SMART INPUT PREPROCESSING: Handle agent interface serialization issues for resource_data
             processed_resource_data = resource_data
             if isinstance(resource_data, str):
-                try:
-                    import json
-                    processed_resource_data = json.loads(resource_data)
-                    arguments["resource_data"] = processed_resource_data
-                except json.JSONDecodeError:
-                    # Return helpful error message for malformed JSON
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**❌ Invalid JSON String for resource_data**\n\n"
-                             f"**Error**: resource_data appears to be malformed JSON: `{resource_data}`\n\n"
-                             f"**Solution**: Send resource_data as proper JSON object:\n"
-                             f"```json\n"
-                             f'{{\n'
-                             f'  \"action\": \"create\",\n'
-                             f'  \"resource_data\": {{\n'
-                             f'    \"name\": \"Product Name\",\n'
-                             f'    \"description\": \"Product Description\",\n'
-                             f'    \"version\": \"1.0.0\"\n'
-                             f'  }}\n'
-                             f'}}\n'
-                             f"```\n\n"
-                             f"**Alternative**: Use convenience methods for simpler setup"
-                    )]
+                processed_resource_data = _decode_json_argument(
+                    "resource_data",
+                    resource_data,
+                    'Send resource_data as a JSON object, e.g. {"name": "Product Name", '
+                    '"description": "Product Description", "version": "1.0.0"}.',
+                )
+                arguments["resource_data"] = processed_resource_data
 
             # NUMERIC PREPROCESSING: Convert string numeric parameters to appropriate types
-            numeric_params = {'page': int, 'size': int}
+            numeric_params = {
+                'page': int,
+                'size': int,
+                'monthly_price': float,
+                'per_unit_price': float,
+                'setup_fee': float,
+            }
             arguments = preprocess_numeric_parameters(arguments, numeric_params)
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
@@ -1497,6 +1720,10 @@ class ToolConfigurationRegistry:
             resource_type: Optional[str] = None,
             resource_id: Optional[str] = None,
             resource_data: Optional[Union[dict, str]] = None,
+            user_data: Optional[Union[dict, str]] = None,
+            organization_data: Optional[Union[dict, str]] = None,
+            subscriber_data: Optional[Union[dict, str]] = None,
+            team_data: Optional[Union[dict, str]] = None,
             email: Optional[str] = None,
             # Specific ID parameters for different resource types
             organization_id: Optional[str] = None,
@@ -1539,6 +1766,10 @@ class ToolConfigurationRegistry:
                 "resource_type": resource_type,
                 "resource_id": resource_id,
                 "resource_data": resource_data,
+                "user_data": user_data,
+                "organization_data": organization_data,
+                "subscriber_data": subscriber_data,
+                "team_data": team_data,
                 "email": email,
                 "organization_id": organization_id,
                 "user_id": user_id,
@@ -1583,57 +1814,40 @@ class ToolConfigurationRegistry:
                 # Keep resource_id for backward compatibility
                 # arguments["resource_id"] = resource_id
 
-            # PARAMETER MAPPING: Map resource_data to specific data parameters based on resource_type
-            if resource_data and resource_type:
-                if resource_type == "organizations":
-                    arguments["organization_data"] = resource_data
-                elif resource_type == "users":
-                    arguments["user_data"] = resource_data
-                elif resource_type == "subscribers":
-                    arguments["subscriber_data"] = resource_data
-                elif resource_type == "teams":
-                    arguments["team_data"] = resource_data
-
-            # SMART INPUT PREPROCESSING: Handle agent interface serialization issues for resource_data
-            processed_resource_data = resource_data
             if isinstance(resource_data, str):
-                try:
-                    import json
-                    processed_resource_data = json.loads(resource_data)
-                    arguments["resource_data"] = processed_resource_data
+                arguments["resource_data"] = _json_object_argument(
+                    "resource_data",
+                    resource_data,
+                    '{"name": "Updated Organization Name"} with '
+                    'resource_type="organizations" and resource_id="org_123".',
+                )
+            for data_argument in CUSTOMER_DATA_ARGUMENTS.values():
+                raw_data = arguments[data_argument]
+                if isinstance(raw_data, str):
+                    arguments[data_argument] = _json_object_argument(
+                        data_argument, raw_data, '{"name": "Acme Corp"}'
+                    )
+            from ..tools_decomposed.customer_management import CustomerManagement
 
-                    # CRITICAL FIX: Update the specific data parameters that were mapped earlier
-                    # This prevents "'str' object has no attribute 'copy'" errors in the tool
-                    if resource_type:
-                        if resource_type == "organizations":
-                            arguments["organization_data"] = processed_resource_data
-                        elif resource_type == "users":
-                            arguments["user_data"] = processed_resource_data
-                        elif resource_type == "subscribers":
-                            arguments["subscriber_data"] = processed_resource_data
-                        elif resource_type == "teams":
-                            arguments["team_data"] = processed_resource_data
+            # Before the mapping below, so resource_data is never refused under
+            # the per-type name it is copied into.
+            refuse_arguments_the_action_ignores(
+                action,
+                arguments,
+                CUSTOMER_DATA_ARGUMENTS.values(),
+                honoured_by=CUSTOMER_DATA_READERS,
+                known_actions=await CustomerManagement()._get_supported_actions(),
+            )
 
-                except json.JSONDecodeError:
-                    # Return helpful error message for malformed JSON
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**❌ Invalid JSON String for resource_data**\n\n"
-                             f"**Error**: resource_data appears to be malformed JSON: `{resource_data}`\n\n"
-                             f"**Solution**: Send resource_data as proper JSON object:\n"
-                             f"```json\n"
-                             f'{{\n'
-                             f'  \"action\": \"update\",\n'
-                             f'  \"resource_type\": \"organizations\",\n'
-                             f'  \"resource_id\": \"org_123\",\n'
-                             f'  \"resource_data\": {{\n'
-                             f'    \"name\": \"Updated Organization Name\"\n'
-                             f'  }}\n'
-                             f'}}\n'
-                             f"```\n\n"
-                             f"**Alternative**: Use convenience methods for simpler setup"
-                    )]
+            # PARAMETER MAPPING: resource_data fills the per-type data argument
+            # resource_type names; an explicitly sent one wins.
+            mapped_argument = CUSTOMER_DATA_ARGUMENTS.get(resource_type or "")
+            if (
+                mapped_argument
+                and arguments["resource_data"] is not None
+                and arguments[mapped_argument] is None
+            ):
+                arguments[mapped_argument] = arguments["resource_data"]
 
             # NUMERIC PREPROCESSING: Convert string numeric parameters to appropriate types
             # The PR-health thresholds are whole days and the tool rejects anything that is
@@ -1657,8 +1871,7 @@ class ToolConfigurationRegistry:
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
 
             # ARRAY PREPROCESSING: Convert string array parameters to actual Python lists.
-            # A non-array string is left as-is so the tool raises its own structured error.
-            arguments = preprocess_array_parameters(
+            arguments = _json_list_arguments(
                 arguments,
                 [
                     "marketplace_names",
@@ -1672,8 +1885,6 @@ class ToolConfigurationRegistry:
             # Remove None values
             arguments = {k: v for k, v in arguments.items() if v is not None}
 
-            # Import tool class
-            from ..tools_decomposed.customer_management import CustomerManagement
             from ..common.tool_execution import standardized_tool_execution
 
             # Use standardized execution path
@@ -1696,8 +1907,15 @@ class ToolConfigurationRegistry:
             product_id: Optional[str] = None,
             customer_name: Optional[str] = None,
             subscriber_email: Optional[str] = None,
+            search_query: Optional[str] = None,
+            product_name: Optional[str] = None,
+            data_type: Optional[str] = None,
+            query: Optional[str] = None,
+            example_type: Optional[str] = None,
             page: int = 0,
-            size: int = 20,
+            # BACK-4630: None lets each action apply its own default page size
+            # (list 20, get_metrics 100); a signature value always reaches the handler.
+            size: Optional[int] = None,
             filters: Optional[dict] = None,
             auto_generate: Union[bool, str] = True,
             dry_run: Optional[Union[bool, str]] = None
@@ -1705,29 +1923,13 @@ class ToolConfigurationRegistry:
             # SMART INPUT PREPROCESSING: Handle agent interface serialization issues for subscription_data
             processed_subscription_data = subscription_data
             if isinstance(subscription_data, str):
-                try:
-                    import json
-                    processed_subscription_data = json.loads(subscription_data)
-                except json.JSONDecodeError:
-                    # Return helpful error message for malformed JSON
-                    from mcp.types import TextContent
-                    return [TextContent(
-                        type="text",
-                        text=f"**❌ Invalid JSON String for subscription_data**\n\n"
-                             f"**Error**: subscription_data appears to be malformed JSON: `{subscription_data}`\n\n"
-                             f"**Solution**: Send subscription_data as proper JSON object:\n"
-                             f"```json\n"
-                             f'{{\n'
-                             f'  \"action\": \"create\",\n'
-                             f'  \"subscription_data\": {{\n'
-                             f'    \"name\": \"Subscription Name\",\n'
-                             f'    \"productId\": \"product_123\",\n'
-                             f'    \"subscriberEmail\": \"user@example.com\"\n'
-                             f'  }}\n'
-                             f'}}\n'
-                             f"```\n\n"
-                             f"**Alternative**: Use convenience methods for simpler setup"
-                    )]
+                processed_subscription_data = _decode_json_argument(
+                    "subscription_data",
+                    subscription_data,
+                    'Send subscription_data as a JSON object, e.g. '
+                    '{"name": "Subscription Name", "productId": "product_123", '
+                    '"subscriberEmail": "user@example.com"}.',
+                )
 
             # Map arguments
             arguments = {
@@ -1737,6 +1939,11 @@ class ToolConfigurationRegistry:
                 "product_id": product_id,
                 "customer_name": customer_name,
                 "subscriber_email": subscriber_email,
+                "search_query": search_query,
+                "product_name": product_name,
+                "data_type": data_type,
+                "query": query,
+                "example_type": example_type,
                 "page": page,
                 "size": size,
                 "filters": filters or {},
@@ -1773,13 +1980,12 @@ class ToolConfigurationRegistry:
             element_id: Optional[str] = None,
             element_data: Optional[Union[dict, str]] = None,
             template_name: Optional[str] = None,
+            overrides: Optional[Union[dict, str]] = None,
             name: Optional[str] = None,
             page: int = 0,
             size: int = 20,
             filters: Optional[dict] = None,
-            dry_run: Optional[Union[bool, str]] = None,
-            source_id: Optional[str] = None,
-            element_ids: Optional[List[str]] = None
+            dry_run: Optional[Union[bool, str]] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
             # SMART INPUT PREPROCESSING: Handle agent interface serialization issues for element_data
             processed_element_data = element_data
@@ -1787,13 +1993,12 @@ class ToolConfigurationRegistry:
                 try:
                     import json
                     processed_element_data = json.loads(element_data)
-                except json.JSONDecodeError:
-                    # Return helpful error message for malformed JSON
+                except json.JSONDecodeError as exc:
                     from mcp.types import TextContent
-                    return [TextContent(
+                    refusal = [TextContent(
                         type="text",
                         text=f"**❌ Invalid JSON String for element_data**\n\n"
-                             f"**Error**: element_data appears to be malformed JSON: `{element_data}`\n\n"
+                             f"**Error**: element_data is not valid JSON: {exc.msg} at line {exc.lineno} column {exc.colno}\n\n"
                              f"**Solution**: Send element_data as proper JSON object:\n"
                              f"```json\n"
                              f'{{\n'
@@ -1805,8 +2010,11 @@ class ToolConfigurationRegistry:
                              f'  }}\n'
                              f'}}\n'
                              f"```\n\n"
-                             f"**Alternative**: Use convenience methods like `create_from_template(template_name=\"totalCost\")`"
+                             f"**Alternative**: Use convenience methods like `create_from_template(template_name=\"shippingCost\")`"
                     )]
+                    raise _invalid_json_error(
+                        "element_data", exc, refusal[0].text
+                    ) from exc
 
             # Map arguments
             arguments = {
@@ -1814,14 +2022,26 @@ class ToolConfigurationRegistry:
                 "element_id": element_id,
                 "element_data": processed_element_data,
                 "template_name": template_name,
+                "overrides": overrides,
                 "name": name,
                 "page": page,
                 "size": size,
                 "filters": filters or {},
-                "dry_run": dry_run,
-                "source_id": source_id,
-                "element_ids": element_ids
+                "dry_run": dry_run
             }
+            if isinstance(overrides, str):
+                arguments["overrides"] = _json_object_argument(
+                    "overrides", overrides, '{"description": "Custom description"}'
+                )
+            from ..tools_decomposed.metering_elements_management import MeteringElementsManagement
+
+            refuse_arguments_the_action_ignores(
+                action,
+                arguments,
+                ("overrides",),
+                honoured_by=OVERRIDES_READERS,
+                known_actions=await MeteringElementsManagement()._get_supported_actions(),
+            )
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
             boolean_params = ["dry_run"]
@@ -1830,8 +2050,6 @@ class ToolConfigurationRegistry:
             # Remove None values
             arguments = {k: v for k, v in arguments.items() if v is not None}
 
-            # Import tool class
-            from ..tools_decomposed.metering_elements_management import MeteringElementsManagement
             from ..common.tool_execution import standardized_tool_execution
 
             # Use standardized execution path
@@ -1940,25 +2158,11 @@ class ToolConfigurationRegistry:
             # and moves on. That is the BACK-2937 shape, closed inside the tools
             # and still open here. The economics arguments arrived with the same
             # defect copied from its neighbours (BACK-3090), so all six are
-            # converted together and the closure now has one rule; the
-            # caller-facing wording is unchanged.
-            import json
-
+            # converted together and the closure now has one rule.
             for name, hint in MANAGE_JOBS_JSON_ARGUMENTS:
                 raw = arguments.get(name)
-                if not isinstance(raw, str):
-                    continue
-                try:
-                    arguments[name] = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    from ..common.error_handling import ErrorCodes, ToolError
-                    raise ToolError(
-                        message=f"Invalid JSON for {name}: `{raw}`. {hint}",
-                        error_code=ErrorCodes.VALIDATION_ERROR,
-                        field=name,
-                        value=raw,
-                        suggestions=[hint],
-                    ) from exc
+                if isinstance(raw, str):
+                    arguments[name] = _decode_json_argument(name, raw, hint)
 
             # The filters default, applied only after every string has had its
             # chance to be refused above.
@@ -2017,6 +2221,7 @@ class ToolConfigurationRegistry:
             tool_type: Optional[_JSONScalar] = None,
             tool_description: Optional[_JSONScalar] = None,
             tool_provider: Optional[_JSONScalar] = None,
+            provider: Optional[_JSONScalar] = None,
             period: Optional[_JSONScalar] = None,
             group: Optional[_JSONScalar] = None,
             # BACK-3170: per-action parameters may also arrive as one object.
@@ -2041,6 +2246,7 @@ class ToolConfigurationRegistry:
                 "tool_type": tool_type,
                 "tool_description": tool_description,
                 "tool_provider": tool_provider,
+                "provider": provider,
                 "period": period,
                 "group": group,
             }
@@ -2063,6 +2269,7 @@ class ToolConfigurationRegistry:
                     "tool_type",
                     "tool_description",
                     "tool_provider",
+                    "provider",
                     "period",
                     "group",
                 ],
@@ -2072,17 +2279,10 @@ class ToolConfigurationRegistry:
             # SMART INPUT PREPROCESSING: Handle agent interface serialization
             for dict_param in ("tool_data", "event_data", "filters"):
                 val = arguments.get(dict_param)
-                if isinstance(val, str):
-                    try:
-                        import json
-                        arguments[dict_param] = json.loads(val)
-                    except json.JSONDecodeError:
-                        from mcp.types import TextContent as TC
-                        return [TC(
-                            type="text",
-                            text=f"Invalid JSON for {dict_param}: `{val}`. "
-                                 f"Send as a proper JSON object."
-                        )]
+                if val is not None:
+                    arguments[dict_param] = _json_object_argument(
+                        dict_param, val, '{"key": "value"}'
+                    )
 
             # Default filters only AFTER the decode loop: `or {}` would swallow
             # filters="" and the refusal above would never fire (BACK-3090's
@@ -2157,26 +2357,11 @@ class ToolConfigurationRegistry:
             for dict_param in ("agent_data", "filters"):
                 val = arguments.get(dict_param)
                 if isinstance(val, str):
-                    try:
-                        import json
-                        arguments[dict_param] = json.loads(val)
-                    except json.JSONDecodeError:
-                        from mcp.types import TextContent as TC
-                        return [TC(
-                            type="text",
-                            text=f"Invalid JSON for {dict_param}: `{val}`. "
-                                 f"Send as a proper JSON object."
-                        )]
-                    # A JSON scalar/array parses fine but is not an object;
-                    # reject here so the manager never calls .get()/.items()
-                    # on a non-dict and leaks a generic execution error.
-                    if not isinstance(arguments[dict_param], dict):
-                        from mcp.types import TextContent as TC
-                        return [TC(
-                            type="text",
-                            text=f"Invalid {dict_param}: expected a JSON object, "
-                                 f"got `{val}`. Send as a proper JSON object."
-                        )]
+                    # A JSON array or scalar parses but is refused too, so the
+                    # manager never calls .get()/.items() on a non-dict.
+                    arguments[dict_param] = _json_object_argument(
+                        dict_param, val, '{"key": "value"}'
+                    )
 
             # NUMERIC PREPROCESSING
             numeric_params = {'page': int, 'size': int}
@@ -2295,26 +2480,11 @@ class ToolConfigurationRegistry:
             for dict_param in ("control_data", "filters"):
                 val = arguments.get(dict_param)
                 if isinstance(val, str):
-                    try:
-                        import json
-                        arguments[dict_param] = json.loads(val)
-                    except json.JSONDecodeError:
-                        from mcp.types import TextContent as TC
-                        return [TC(
-                            type="text",
-                            text=f"Invalid JSON for {dict_param}: `{val}`. "
-                                 f"Send as a proper JSON object."
-                        )]
-                    # A JSON scalar/array parses fine but is not an object;
-                    # reject here so the manager never calls .get()/.items()
-                    # on a non-dict and leaks a generic execution error.
-                    if not isinstance(arguments[dict_param], dict):
-                        from mcp.types import TextContent as TC
-                        return [TC(
-                            type="text",
-                            text=f"Invalid {dict_param}: expected a JSON object, "
-                                 f"got `{val}`. Send as a proper JSON object."
-                        )]
+                    # A JSON array or scalar parses but is refused too, so the
+                    # manager never calls .get()/.items() on a non-dict.
+                    arguments[dict_param] = _json_object_argument(
+                        dict_param, val, '{"key": "value"}'
+                    )
 
             # NUMERIC PREPROCESSING
             numeric_params = {'page': int, 'size': int}

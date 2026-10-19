@@ -318,16 +318,23 @@ class CredentialNLPProcessor:
 
         elif intent == CredentialIntent.LINK_SUBSCRIPTION:
             suggestions.append(
-                "Use dry_run=true to preview billing impact before linking subscription"
+                "Read the subscription with get to review billing impact before "
+                "linking; only credential create previews with dry_run=true"
             )
             suggestions.append("Verify subscription is active and properly configured")
 
         elif intent == CredentialIntent.UPDATE:
-            suggestions.append("Use dry_run=true to preview changes before applying updates")
+            suggestions.append(
+                "Read the credential with get before applying updates; "
+                "only credential create previews with dry_run=true"
+            )
 
         # Business context suggestions
         if context["billing_implications"]:
-            suggestions.append("Consider using dry_run mode to validate billing implications")
+            suggestions.append(
+                "Use dry_run=true on create to validate billing implications "
+                "before the credential is made"
+            )
 
         return suggestions
 

@@ -73,6 +73,8 @@ class AlertSchemaDiscovery(BaseSchemaDiscovery):
         Returns:
             Capabilities dictionary for alerts and anomalies with user-validated metrics
         """
+        from ..alerts.alert_periods import accepted_period_durations  # noqa: PLC0415
+
         # Get metrics from single source of truth (MetricType enum)
         all_metrics = [metric.value for metric in MetricType]
 
@@ -115,22 +117,7 @@ class AlertSchemaDiscovery(BaseSchemaDiscovery):
             "filter_operators": list(FILTER_OPERATORS),
             "filter_row_shape": FILTER_IN_OPERATOR_NOTE,
             "time_periods": {
-                "period_duration": [
-                    "ONE_MINUTE",
-                    "FIVE_MINUTES",
-                    "TEN_MINUTES",
-                    "FIFTEEN_MINUTES",
-                    "THIRTY_MINUTES",
-                    "ONE_HOUR",
-                    "TWO_HOURS",
-                    "SIX_HOURS",
-                    "TWELVE_HOURS",
-                    "ONE_DAY",
-                    "THREE_DAYS",
-                    "SEVEN_DAYS",
-                    "FOURTEEN_DAYS",
-                    "THIRTY_DAYS",
-                ],
+                "period_duration": list(accepted_period_durations()),
                 "trigger_after_persists_duration": [
                     "FIVE_MINUTES",
                     "TEN_MINUTES",

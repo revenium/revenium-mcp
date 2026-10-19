@@ -160,8 +160,9 @@ def _console_format(record: Dict[str, Any]) -> str:
     """Loguru format callable that renders `extra` kwargs inline on stderr.
 
     Returns a loguru format template; the extras segment is pre-rendered with
-    curly braces escaped so values containing '{' or '}' don't collide with
-    loguru's own placeholder substitution.
+    curly braces and '<' escaped so values containing '{', '}' or a colour-tag
+    lookalike such as '<your-environment>' don't collide with loguru's own
+    placeholder substitution or colour markup.
     """
     extras = {
         k: v for k, v in record["extra"].items()
@@ -169,7 +170,9 @@ def _console_format(record: Dict[str, Any]) -> str:
     }
     if extras:
         rendered = " ".join(f"{k}={v!r}" for k, v in extras.items())
-        extras_segment = " | " + rendered.replace("{", "{{").replace("}", "}}")
+        extras_segment = " | " + (
+            rendered.replace("{", "{{").replace("}", "}}").replace("<", r"\<")
+        )
     else:
         extras_segment = ""
     return (

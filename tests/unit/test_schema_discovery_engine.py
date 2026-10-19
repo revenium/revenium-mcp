@@ -50,6 +50,23 @@ class TestGetExamples:
                     for ex in filtered.get("examples", [])
                 )
 
+    def test_subscription_examples_filter_on_their_template_name(self):
+        from src.revenium_mcp_server.schema_discovery import SubscriptionSchemaDiscovery
+
+        result = SubscriptionSchemaDiscovery().get_subscription_examples("annual_billing")
+
+        assert [ex["name"] for ex in result["examples"]] == ["Annual Subscription"]
+
+    def test_subscription_template_names_match_the_advertised_names(self):
+        from src.revenium_mcp_server.schema_discovery import (
+            SUBSCRIPTION_EXAMPLE_TYPES,
+            SubscriptionSchemaDiscovery,
+        )
+
+        templates = SubscriptionSchemaDiscovery().get_subscription_examples()["examples"]
+
+        assert tuple(ex["example_type"] for ex in templates) == SUBSCRIPTION_EXAMPLE_TYPES
+
 
 class TestValidateConfiguration:
     def test_valid_anomaly_config(self, engine):

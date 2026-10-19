@@ -4,7 +4,7 @@ This module provides enhanced pagination validation with graduated performance w
 and monitoring capabilities to optimize user experience and system performance.
 
 Following development best practices:
-- Graduated performance warnings (25, 40, 50 items)
+- Graduated performance warnings (25, 40, 100 items)
 - Performance tier classification
 - Execution time monitoring
 - User guidance for optimal pagination
@@ -21,11 +21,13 @@ from loguru import logger
 class PaginationPerformanceManager:
     """Manages pagination performance with graduated warnings and monitoring."""
 
+    # The platform serves at most 100 rows per page and silently clamps larger sizes to 100.
+    MAXIMUM_LIMIT = 100
+
     # Performance tier thresholds
     OPTIMAL_THRESHOLD = 25
     MEDIUM_THRESHOLD = 40
-    HIGH_THRESHOLD = 50
-    MAXIMUM_LIMIT = 50  # Revenium API absolute maximum
+    HIGH_THRESHOLD = MAXIMUM_LIMIT
 
     def __init__(self):
         """Initialize pagination performance manager."""

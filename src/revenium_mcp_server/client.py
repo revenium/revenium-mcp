@@ -12,9 +12,11 @@ import json
 import os
 import re
 import uuid as _uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Required, Tuple, TypedDict, Union, cast
+from typing import Any, Dict, Iterator, List, Optional, Required, Set, Tuple, TypedDict, Union, cast
 from urllib.parse import quote, urljoin
 
 import httpx
@@ -22,17 +24,26 @@ from loguru import logger
 
 from .api_field_mapper import APIFieldMapper
 from .auth import AuthConfig, AuthenticationError, get_auth_config, get_bearer_auth_headers
-from .config_store import get_config_value
+from .config_store import get_config_store, get_config_value
 from .endpoint_registry import (
     DEFAULT_APP_BASE_URL,
     KNOWN_APP_BASE_URLS,
     get_endpoint_config,
     get_endpoint_path,
+    is_production_platform,
     paired_app_base_url,
+    pairing_example,
 )
 from .exceptions import AlertToolsError
-from .log_context import redact_headers
+from .log_context import (
+    MIN_MASKED_SECRET_LENGTH,
+    mask_secret_values,
+    redact_headers,
+    redact_secrets,
+    secret_field_values,
+)
 from .logging_config import async_operation_context
+from .platform_lockout import lockout_message, platform_lockouts, stated_wait_seconds
 
 
 # SeatUtilizationService.MAX_RANGE_DAYS upstream. The server rejects a span of
@@ -83,8 +94,46 @@ def _new_idempotency_key() -> str:
     return str(_uuid.uuid4())
 
 
+# A read that met a server error is resent at most once (Jason's D12): repeated
+# resends multiplied across page walks and the tool-level rerun.
+READ_SERVER_ERROR_RETRIES = 1
+
+
+def _retries_for(method: str, configured: int) -> int:
+    if method.upper() == "GET":
+        return min(configured, READ_SERVER_ERROR_RETRIES)
+    return configured
+
+
 def _idempotency_headers(key: Optional[str] = None) -> Dict[str, str]:
     return {"Idempotency-Key": key if key is not None else _new_idempotency_key()}
+
+
+class RetriedErrors:
+    """The last platform error a retry answered, for a caller that cuts reads short."""
+
+    def __init__(self) -> None:
+        self.last: Optional["ReveniumAPIError"] = None
+
+
+_retried_errors: ContextVar[Optional[RetriedErrors]] = ContextVar("retried_errors", default=None)
+
+
+@contextmanager
+def recording_retried_errors() -> Iterator[RetriedErrors]:
+    """Record the errors _request_with_retry retries within this context."""
+    record = RetriedErrors()
+    token = _retried_errors.set(record)
+    try:
+        yield record
+    finally:
+        _retried_errors.reset(token)
+
+
+def _note_retried_error(error: "ReveniumAPIError") -> None:
+    record = _retried_errors.get()
+    if record is not None:
+        record.last = error
 
 
 class ConnectionPoolConfig:
@@ -208,6 +257,15 @@ class ReveniumAPIError(Exception):
         super().__init__(self.message)
 
 
+class OrganizationNameUnresolvedError(ValueError):
+    """An organization name the search cannot turn into exactly one id."""
+
+    def __init__(self, message: str, matched_ids: Optional[List[Any]] = None) -> None:
+        self.message = message
+        self.matched_ids = list(matched_ids or [])
+        super().__init__(message)
+
+
 # BACK-1313: HTTP error sanitizers. The dev backend sometimes returns plain-text
 # error bodies with a Python dict-repr suffix (`<msg> - {'error': '<msg>'}`)
 # and an internal `Error ID: <name>_<digits>` token. Both leak framework
@@ -267,6 +325,13 @@ def _strip_internal_class_names(text: str) -> str:
     return _FQ_CLASS_NAME.sub(r"\1", text)
 
 
+_LOGGED_RESPONSE_TEXT_LIMIT = 1000
+
+
+def _head(text: Optional[str]) -> Optional[str]:
+    return text[:_LOGGED_RESPONSE_TEXT_LIMIT] if text else None
+
+
 def _sanitize_error_text(text: str) -> str:
     """Apply the HTTP-error sanitizers in the right order.
 
@@ -275,6 +340,126 @@ def _sanitize_error_text(text: str) -> str:
     names anywhere in what is left. All three helpers are idempotent.
     """
     return _strip_internal_class_names(_strip_dict_repr_suffix(_strip_internal_error_id(text)))
+
+
+_TIMEOUT_PHASES: Dict[type, Tuple[str, str]] = {
+    httpx.ReadTimeout: ("read", "the platform did not answer"),
+    httpx.WriteTimeout: ("write", "could not finish sending"),
+    httpx.ConnectTimeout: ("connect", "could not connect to the platform for"),
+    httpx.PoolTimeout: ("pool", "no free connection to the platform for"),
+}
+
+
+def _transport_failure_message(
+    error: httpx.RequestError, method: str, endpoint: str, timeout: Any
+) -> str:
+    """The caller-facing text for a request that never got an HTTP answer.
+
+    httpx raises its timeouts with no message, so the text names the
+    operation, the phase that ran out and the wait the client applied.
+    """
+    error_type = type(error).__name__
+    phase = _TIMEOUT_PHASES.get(type(error))
+    if phase is None:
+        return f"Request failed: {str(error) or error_type}"
+    attribute, wording = phase
+    seconds = getattr(timeout, attribute, None)
+    wait = (
+        f" within {seconds:g} seconds"
+        if isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
+        else ""
+    )
+    return f"Request failed: {wording} {method} {endpoint}{wait} ({error_type})"
+
+
+_PROBLEM_ERRORS_SHOWN = 10
+_PROBLEM_OPTIONS_SHOWN = 20
+_PROBLEM_RECEIVED_MAX_CHARS = 100
+_PROBLEM_LINE_MAX_CHARS = 300
+
+
+def _more_suffix(total: int, shown: int) -> str:
+    return f", and {total - shown} more" if total > shown else ""
+
+
+def _problem_received_text(received: Any) -> Optional[str]:
+    if received is None:
+        return "null"
+    if isinstance(received, (str, int, float, bool)):
+        text = str(received)
+    else:
+        try:
+            text = json.dumps(received)
+        except (TypeError, ValueError):
+            return None
+    return text[:_PROBLEM_RECEIVED_MAX_CHARS]
+
+
+def _problem_error_field(entry: Dict[str, Any]) -> str:
+    path = entry.get("path")
+    if isinstance(path, list):
+        return ".".join(str(part) for part in path)
+    for candidate in (path, entry.get("field")):
+        if candidate not in (None, ""):
+            return str(candidate)
+    return ""
+
+
+def _problem_error_line(entry: Dict[str, Any]) -> str:
+    field = _problem_error_field(entry)
+    message = str(entry.get("message") or "invalid value")
+    details: List[str] = []
+    if "received" in entry:
+        received = _problem_received_text(entry["received"])
+        if received is not None:
+            details.append(f"received: {received}")
+    options = entry.get("options")
+    if isinstance(options, list) and options:
+        shown = ", ".join(str(option) for option in options[:_PROBLEM_OPTIONS_SHOWN])
+        details.append(
+            f"accepted values: {shown}"
+            f"{_more_suffix(len(options), _PROBLEM_OPTIONS_SHOWN)}"
+        )
+    line = f"- {field}: {message}" if field else f"- {message}"
+    if details:
+        line = f"{line} ({'; '.join(details)})"
+    if len(line) > _PROBLEM_LINE_MAX_CHARS:
+        return f"{line[: _PROBLEM_LINE_MAX_CHARS - 3]}..."
+    return line
+
+
+def _problem_details_message(problem: Any, status_code: int) -> str:
+    """The caller-facing text of an RFC 7807 refusal.
+
+    The summary (`detail`, else `title`) followed by one line per entry of the
+    analytics service's `errors` list, so the caller learns which field was
+    refused, what was received and which values are accepted. The text is
+    sanitized like every other HTTP error. Never raises:
+    this runs while the error is being built, and a failure here would replace
+    the refusal's status and code with an unexpected-error wrapper.
+    """
+    if not isinstance(problem, dict):
+        return f"HTTP {status_code}"
+    summary = _sanitize_error_text(
+        str(problem.get("detail") or problem.get("title") or f"HTTP {status_code}")
+    )
+    try:
+        errors = problem.get("errors")
+        if not isinstance(errors, list):
+            return summary
+        entries = [entry for entry in errors if isinstance(entry, dict)]
+        lines = [_problem_error_line(entry) for entry in entries[:_PROBLEM_ERRORS_SHOWN]]
+        if len(entries) > _PROBLEM_ERRORS_SHOWN:
+            lines.append(f"- and {len(entries) - _PROBLEM_ERRORS_SHOWN} more")
+    except Exception:
+        return summary
+    return _sanitize_error_text("\n".join([summary, *lines]))
+
+
+# The organizations list narrows by `query` server side, so an exact name is
+# normally on the first page; the cap bounds a loose query that matches many.
+_ORGANIZATION_NAME_SCAN_MAX_PAGES = 10
+_ORGANIZATION_NAME_SCAN_PAGE_SIZE = 100
 
 
 class ReveniumClient:
@@ -337,7 +522,18 @@ class ReveniumClient:
                 from .common.auth_response_envelope import (
                     auth_error_to_tool_error,
                     auth_scope_unresolved_to_tool_error,
+                    platform_lockout_to_tool_error,
                 )
+
+                store = get_config_store()
+                seconds_left = store.discovery_lockout_seconds()
+                if seconds_left is not None or store.discovery_rate_limited():
+                    logger.warning(
+                        "Failed to load auth configuration: team discovery held by a "
+                        "platform lockout",
+                        seconds_left=seconds_left,
+                    )
+                    raise platform_lockout_to_tool_error(seconds_left) from exc
 
                 exc_msg = str(exc)
                 if "REVENIUM_TEAM_ID" in exc_msg:
@@ -483,9 +679,10 @@ class ReveniumClient:
         if "anomaly" in (endpoint or ""):
             return (
                 "**Suggestions:**\n"
-                "• Use convenience methods: create_threshold_alert() or create_cumulative_usage_alert()\n"
-                "• Ensure all required fields are provided: name, alertType, metricType, operatorType, threshold\n"
-                "• Check that field values match expected formats (e.g., alertType: 'THRESHOLD')\n"
+                "• Check the error above for the field the platform refused; a value outside its accepted list (a period, persist duration or operator) is the usual cause\n"
+                "• A bare field name after the platform's message is a required field that was not sent\n"
+                "• To clear an optional setting such as triggerAfterPersistsDuration, send null\n"
+                "• Use get_examples() for a valid alert payload, or create_threshold_alert() for a ready-made threshold alert\n"
                 "• Review the debug logs for detailed request data"
             )
         resource_label, _ = self._resource_label_from_endpoint(endpoint or "")
@@ -632,10 +829,6 @@ class ReveniumClient:
         if status_code >= 500:
             return True
 
-        # Retry on rate limiting (429)
-        if status_code == 429:
-            return True
-
         # Retry on timeout (408)
         if status_code == 408:
             return True
@@ -675,6 +868,7 @@ class ReveniumClient:
         """
         if max_retries is None:
             max_retries = self.auth_config.max_retries
+        max_retries = _retries_for(method, max_retries)
 
         last_error = None
 
@@ -697,6 +891,7 @@ class ReveniumClient:
                 # Check if we should retry
                 status_code = getattr(e, "status_code", None)
                 if attempt < max_retries and status_code and self._should_retry(status_code):
+                    _note_retried_error(e)
                     # Calculate delay with exponential backoff
                     delay = min(2**attempt, 30)  # Cap at 30 seconds
 
@@ -761,9 +956,20 @@ class ReveniumClient:
         team_id = self.team_id
         return {"teamId": team_id} if team_id else {}
 
+    def _own_credentials(self) -> Set[str]:
+        """The credential this client sends, to mask wherever the platform echoes it."""
+        return {
+            credential
+            for credential in (self.auth_config.api_key, self.auth_config.clerk_jwt)
+            if credential and len(credential) >= MIN_MASKED_SECRET_LENGTH
+        }
+
     @staticmethod
     def _team_scope_refusal(
-        response: httpx.Response, params: Optional[Dict[str, Any]], use_bearer: bool
+        response: httpx.Response,
+        params: Optional[Dict[str, Any]],
+        use_bearer: bool,
+        secrets: Set[str],
     ) -> Optional[ReveniumAPIError]:
         """The structured refusal for an analytics-host 403 caused by the ``teamId`` sent.
 
@@ -783,7 +989,159 @@ class ReveniumClient:
         payload = body if isinstance(body, dict) else {}
         if payload.get("code") not in (None, TEAM_NOT_IN_MEMBERSHIP):
             return None
-        return TeamScopeForbiddenError(str(team_id), response_data=payload or None)
+        return TeamScopeForbiddenError(
+            str(team_id), response_data=redact_secrets(payload, secrets) or None
+        )
+
+    def _secret_free_error(
+        self,
+        response: httpx.Response,
+        params: Optional[Dict[str, Any]],
+        json_data: Optional[Dict[str, Any]],
+    ) -> Tuple[Any, str, Set[str]]:
+        try:
+            raw_error_data = response.json()
+            body_is_json = True
+        except Exception:
+            raw_error_data, body_is_json = None, False
+
+        echoed_secrets = (
+            secret_field_values(json_data)
+            | secret_field_values(params)
+            | secret_field_values(raw_error_data)
+            | self._own_credentials()
+        )
+        error_data = redact_secrets(raw_error_data, echoed_secrets)
+
+        error_text = ""
+        try:
+            if body_is_json:
+                error_text = self._format_error_response(error_data)
+        except Exception:
+            body_is_json = False
+        if not body_is_json:
+            error_text = mask_secret_values(response.text, echoed_secrets) or (
+                f"HTTP {response.status_code} {response.reason_phrase}"
+            )
+        # BACK-1313: strip backend leak shapes (Python dict-repr suffix
+        # and internal `Error ID:` token) before they reach the caller.
+        return error_data, _sanitize_error_text(error_text), echoed_secrets
+
+    def _log_error_response(
+        self,
+        response: httpx.Response,
+        *,
+        method: str,
+        url: str,
+        endpoint: str,
+        params: Optional[Dict[str, Any]],
+        json_data: Optional[Dict[str, Any]],
+        error_data: Any,
+        error_text: str,
+        echoed_secrets: Set[str],
+        operation_id: Any,
+    ) -> None:
+        logger.error(
+            "API error response",
+            method=method,
+            url=url,
+            endpoint=endpoint,
+            status_code=response.status_code,
+            error_text=error_text,
+            error_data=error_data,
+            operation_id=operation_id,
+        )
+
+        raw_response_debug = {
+            "http_status_code": response.status_code,
+            "http_reason_phrase": response.reason_phrase,
+            "response_headers": redact_headers(dict(response.headers)),
+            "response_text": _head(mask_secret_values(response.text, echoed_secrets)),
+            "response_content_length": len(response.content) if response.content else 0,
+            "parsed_error_data": error_data,
+            "formatted_error_text": error_text,
+            "request_method": method,
+            "request_url": str(url),
+            "request_params": redact_secrets(params, echoed_secrets),
+            "request_json": redact_secrets(json_data, echoed_secrets),
+            "request_headers": redact_headers(dict(self.client.headers)),
+        }
+        logger.error(
+            "Raw HTTP response debug",
+            method=method,
+            url=url,
+            status_code=response.status_code,
+            raw_response_debug=raw_response_debug,
+            operation_id=operation_id,
+        )
+
+    def _unpaired_analytics_host_message(self, status_code: int, error_text: str) -> str:
+        """A non-production platform with no known analytics pairing sent analytics
+        reads to the production analytics host, which refuses that platform's keys."""
+        example = pairing_example(self._KNOWN_APP_BASE_URLS)
+        return (
+            f"HTTP {status_code}: {error_text}\n\n"
+            "**Likely cause:** REVENIUM_BASE_URL points at a non-production Revenium "
+            "platform with no known analytics pairing, so analytics requests went to "
+            f"the production analytics host {DEFAULT_APP_BASE_URL}.\n\n"
+            "**To fix:** set REVENIUM_APP_BASE_URL to the analytics host of that "
+            "platform" + (f" (for example, {example})" if example else "") + ".\n"
+            "See README.md for the full env var reference."
+        )
+
+    @staticmethod
+    def _refuse_inside_a_platform_wait(
+        credential: str, url: str, method: str, endpoint: str
+    ) -> None:
+        seconds_left = platform_lockouts.remaining(credential, url)
+        if seconds_left is None:
+            return
+        logger.warning(
+            "API request held by a platform lockout",
+            method=method,
+            endpoint=endpoint,
+            seconds_left=seconds_left,
+        )
+        raise ReveniumAPIError(lockout_message(seconds_left), status_code=429)
+
+    @staticmethod
+    def _platform_lockout_error(
+        response: httpx.Response,
+        error_data: Any,
+        error_text: str,
+        credential: str,
+        url: str,
+    ) -> Optional[ReveniumAPIError]:
+        """The refusal for a 429 that states a wait, recorded so later calls hold off.
+
+        A 429 that states no wait returns None and is reported like any other
+        HTTP error; it is never resent either.
+        """
+        if response.status_code != 429:
+            return None
+        is_problem = "application/problem+json" in response.headers.get(
+            "content-type", ""
+        ).lower()
+        problem = error_data if is_problem and isinstance(error_data, dict) else None
+        platform_text = (
+            _problem_details_message(problem, 429) if problem is not None else error_text
+        )
+        wait = stated_wait_seconds(response.headers, response.text)
+        if wait is None:
+            return None
+        platform_lockouts.record(credential, url, wait)
+        if problem is not None:
+            return ReveniumAPIError(
+                message=lockout_message(wait, platform_text),
+                status_code=429,
+                response_data=problem,
+                code=problem.get("code"),
+            )
+        return ReveniumAPIError(
+            message=lockout_message(wait, platform_text),
+            status_code=429,
+            response_data={"error_data": error_data},
+        )
 
     async def _request(
         self,
@@ -835,6 +1193,9 @@ class ReveniumClient:
         else:
             url = self._build_url(endpoint)
 
+        credential = self.auth_config.bearer_credential
+        self._refuse_inside_a_platform_wait(credential, url, method, endpoint)
+
         async with async_operation_context(
             f"api_request_{method}_{endpoint.replace('/', '_')}",
             "api_call",
@@ -876,9 +1237,34 @@ class ReveniumClient:
 
                 # Check for HTTP errors
                 if response.status_code >= 400:
-                    team_scope_refusal = self._team_scope_refusal(response, params, use_bearer)
+                    team_scope_refusal = self._team_scope_refusal(
+                        response, params, use_bearer, self._own_credentials()
+                    )
                     if team_scope_refusal is not None:
                         raise team_scope_refusal
+
+                    error_data, error_text, echoed_secrets = self._secret_free_error(
+                        response, params, json_data
+                    )
+
+                    self._log_error_response(
+                        response,
+                        method=method,
+                        url=url,
+                        endpoint=endpoint,
+                        params=params,
+                        json_data=json_data,
+                        error_data=error_data,
+                        error_text=error_text,
+                        echoed_secrets=echoed_secrets,
+                        operation_id=operation_id,
+                    )
+
+                    lockout = self._platform_lockout_error(
+                        response, error_data, error_text, credential, url
+                    )
+                    if lockout is not None:
+                        raise lockout
 
                     # RFC 7807 problem-details path. AI Insights endpoints (and any future
                     # endpoint adopting this format) carry a structured `code` field that
@@ -887,85 +1273,25 @@ class ReveniumClient:
                     # everything else.
                     content_type = response.headers.get("content-type", "").lower()
                     if "application/problem+json" in content_type:
-                        try:
-                            problem = response.json()
-                        except Exception:
-                            problem = {}
+                        problem = error_data if isinstance(error_data, dict) else {}
                         raise ReveniumAPIError(
                             message=(
-                                problem.get("detail")
-                                or problem.get("title")
-                                or f"HTTP {response.status_code}"
+                                _problem_details_message(problem, response.status_code)
                             ),
                             status_code=response.status_code,
                             response_data=problem,
-                            code=problem.get("code"),
+                            code=(
+                                problem.get("code") if isinstance(problem, dict) else None
+                            ),
                         )
-
-                    error_data = None
-                    error_text = ""
-
-                    try:
-                        # Try to parse JSON error response
-                        error_data = response.json()
-                        error_text = self._format_error_response(error_data)
-                    except Exception:
-                        # Fallback to raw text
-                        error_text = (
-                            response.text or f"HTTP {response.status_code} {response.reason_phrase}"
-                        )
-
-                    # BACK-1313: strip backend leak shapes (Python dict-repr suffix
-                    # and internal `Error ID:` token) before they reach the caller.
-                    error_text = _sanitize_error_text(error_text)
-
-                    # COMPREHENSIVE ERROR DEBUGGING - Capture everything before error translation
-                    raw_response_debug = {
-                        "http_status_code": response.status_code,
-                        "http_reason_phrase": response.reason_phrase,
-                        "response_headers": redact_headers(dict(response.headers)),
-                        "response_text": (
-                            response.text[:1000] if response.text else None
-                        ),  # First 1000 chars
-                        "response_content_length": len(response.content) if response.content else 0,
-                        "parsed_error_data": error_data,
-                        "formatted_error_text": error_text,
-                        "request_method": method,
-                        "request_url": str(url),
-                        "request_params": params,
-                        "request_json": json_data,
-                        "request_headers": redact_headers(dict(self.client.headers)),
-                    }
-
-                    # Enhanced logging for debugging
-                    logger.error(
-                        "API error response",
-                        method=method,
-                        url=url,
-                        endpoint=endpoint,
-                        status_code=response.status_code,
-                        error_text=error_text,
-                        error_data=error_data,
-                        operation_id=operation_id,
-                    )
-
-                    # Log comprehensive debug information
-                    logger.error(
-                        "Raw HTTP response debug",
-                        method=method,
-                        url=url,
-                        status_code=response.status_code,
-                        raw_response_debug=raw_response_debug,
-                        operation_id=operation_id,
-                    )
 
                     # Enhanced error handling for specific error types
                     if "invalid json format" in error_text.lower() or "json" in error_text.lower():
                         # Provide more helpful error message for JSON format issues
                         enhanced_message = (
-                            f"API Request Failed - JSON Format Issue\n\n"
+                            f"API Request Failed - Request Data Refused\n\n"
                             f"The API server could not process the request data. This typically happens when:\n"
-                            f"• Required fields are missing or have invalid values\n"
+                            f"• A field value is outside what the platform accepts, or a required field is missing\n"
                             f"• Field values don't match expected formats\n"
                             f"• Data validation failed on the server side\n\n"
                             f"Original error: {error_text}\n\n"
@@ -1009,27 +1335,12 @@ class ReveniumClient:
                         and response.status_code in (401, 403, 404)
                         and base_url == DEFAULT_APP_BASE_URL
                         and not get_config_value("REVENIUM_APP_BASE_URL", None)
+                        and not is_production_platform(
+                            get_config_value("REVENIUM_BASE_URL", None)
+                        )
                     ):
-                        # Bearer call to the default prod app host failing with an auth/not-found
-                        # status, while REVENIUM_APP_BASE_URL was never configured. Most common
-                        # cause is a non-prod REVENIUM_API_KEY used against the prod analytics
-                        # host because the operator forgot to point REVENIUM_APP_BASE_URL at
-                        # their analytics host. The raw response typically reads
-                        # "Invalid or inactive API key" which hides the real cause.
-                        enhanced_message = (
-                            f"HTTP {response.status_code} from analytics host "
-                            f"{DEFAULT_APP_BASE_URL} (default).\n\n"
-                            f"Original response: {error_text}\n\n"
-                            "**Likely cause:** REVENIUM_APP_BASE_URL is not set, so the client "
-                            "defaulted to the production analytics host. If your "
-                            "REVENIUM_API_KEY belongs to a dev/staging environment, it will "
-                            "be rejected there.\n\n"
-                            "**To fix:**\n"
-                            "• Set REVENIUM_APP_BASE_URL to the analytics host that matches "
-                            "your REVENIUM_API_KEY (e.g. https://app.<your-environment>.revenium.ai).\n"
-                            "• Or, if you intend to use the production analytics host, verify "
-                            "that your API key is a production key.\n"
-                            "• See README.md for the full env var reference."
+                        enhanced_message = self._unpaired_analytics_host_message(
+                            response.status_code, error_text
                         )
                         comprehensive_error = ReveniumAPIError(
                             message=enhanced_message,
@@ -1097,9 +1408,12 @@ class ReveniumClient:
                     method=method,
                     url=url,
                     error=str(e),
+                    error_type=type(e).__name__,
                     operation_id=operation_id,
                 )
-                raise ReveniumAPIError(f"Request failed: {str(e)}")
+                raise ReveniumAPIError(
+                    _transport_failure_message(e, method, endpoint, self.client.timeout)
+                )
             except Exception as e:
                 logger.error(
                     "Unexpected error",
@@ -1347,6 +1661,10 @@ class ReveniumClient:
             logger.error("Product creation failed: {}", str(e))
             raise
 
+    def prepare_product_update_body(self, product_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the body update_product sends for this product data."""
+        return APIFieldMapper.map_product_fields(product_data)
+
     async def update_product(self, product_id: str, product_data: Dict[str, Any]) -> Dict[str, Any]:
         """Update an existing product with enhanced validation and field mapping.
 
@@ -1362,8 +1680,7 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
 
-        # Map internal field names to API field names
-        mapped_data = APIFieldMapper.map_product_fields(product_data)
+        mapped_data = self.prepare_product_update_body(product_data)
 
         # Log the request for debugging
         logger.info(f"Updating product: {product_id}")
@@ -1487,14 +1804,14 @@ class ReveniumClient:
             params=params,
         ))
 
-    async def cancel_subscription(self, subscription_id: str) -> Dict[str, Any]:
-        """Cancel a subscription.
+    async def delete_subscription(self, subscription_id: str) -> Dict[str, Any]:
+        """Permanently delete a subscription record.
 
         Args:
             subscription_id: The subscription ID
 
         Returns:
-            Cancellation response
+            Deletion response
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.delete(
@@ -2483,7 +2800,10 @@ class ReveniumClient:
         ``7d``, ``30d``, ``90d`` and ``custom`` (compared lowercased); the value
         is sent verbatim rather than gated on a local enum so a new period the
         platform adds is immediately usable. ``custom`` requires ``startDate``
-        and ``endDate`` as ISO instants; the other periods ignore them.
+        and ``endDate`` as ISO instants, of which the platform keeps the UTC
+        calendar day, end day included; the other periods ignore them. The
+        handler turns calendar dates into those instants
+        (``utc_instant_bounds`` in ``analytics_window``).
         ``provider`` optionally narrows the report to one provider. The bound
         search object also carries usageType/minCost/maxCost and, since the
         BACK-2877 drift of 2026-09-03, ``apiKey`` — but the coverage service
@@ -2795,16 +3115,18 @@ class ReveniumClient:
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/users/{user_id}", params=params))
     async def get_user_by_email(self, email: str) -> Dict[str, Any]:
-        """Get a user by email address.
+        """Get a user by email address through the lookup-by-email endpoint.
+
+        The platform has no email path segment for users; the lookup reads the
+        email as a query value and answers 404 when nobody matches.
 
         Args:
-            email: The user's email address
+            email: The user's email address; surrounding spaces are ignored
 
         Returns:
             User data
         """
-        params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/users/email/{email}", params=params))
+        return await self.lookup_user_by_email(email.strip())
 
     async def lookup_user_by_email(self, email: str) -> Dict[str, Any]:
         """Look up a user by exact email match via the lookup-by-email endpoint.
@@ -2891,16 +3213,18 @@ class ReveniumClient:
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/subscribers/{subscriber_id}", params=params))
     async def get_subscriber_by_email(self, email: str) -> Dict[str, Any]:
-        """Get a subscriber by email address.
+        """Get a subscriber by email address through the lookup-by-email endpoint.
+
+        The platform has no email path segment for subscribers; the lookup reads the
+        email as a query value and answers 404 when nobody matches.
 
         Args:
-            email: The subscriber's email address
+            email: The subscriber's email address; surrounding spaces are ignored
 
         Returns:
             Subscriber data
         """
-        params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/subscribers/email/{email}", params=params))
+        return await self.lookup_subscriber_by_email(email.strip())
 
     async def lookup_subscriber_by_email(self, email: str) -> Dict[str, Any]:
         """Look up a subscriber by exact email match via the lookup-by-email endpoint.
@@ -3084,50 +3408,81 @@ class ReveniumClient:
         return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/credentials/{credential_id}"))
     # Helper methods for credential management
     async def resolve_subscriber_email_to_id(self, email: str) -> Optional[str]:
-        """Resolve subscriber email to subscriber ID.
+        """Resolve a subscriber email to the subscriber's id.
+
+        Asks the platform's lookup-by-email endpoint, so every subscriber is
+        reachable, not only those on the first page of the list.
 
         Args:
             email: Subscriber email address
 
         Returns:
-            Subscriber ID if found, None otherwise
+            The subscriber's `id`, or None when no subscriber has that email.
+
+        Raises:
+            ReveniumAPIError: Any refusal other than the lookup's 404, so an
+                outage is never reported as "not found".
         """
         try:
-            # Get subscribers and find by email
-            response = await self.get_subscribers(page=0, size=100)
-            subscribers = self._extract_embedded_data(response)
-
-            for subscriber in subscribers:
-                if subscriber.get("email") == email:
-                    return cast(Optional[str], subscriber.get("id"))
-
+            subscriber: Any = await self.lookup_subscriber_by_email(email)
+        except ReveniumAPIError as e:
+            if e.status_code == 404:
+                return None
+            raise
+        if not isinstance(subscriber, dict):
             return None
-        except Exception as e:
-            logger.error(f"Error resolving subscriber email to ID: {e}")
-            return None
+        return cast(Optional[str], subscriber.get("id"))
 
     async def resolve_organization_name_to_id(self, name: str) -> Optional[str]:
-        """Resolve organization name to organization ID.
+        """Resolve an exact organization name to the organization's id.
+
+        Pages through the organizations list narrowed by `query`, up to
+        `_ORGANIZATION_NAME_SCAN_MAX_PAGES` pages, matching the name exactly.
 
         Args:
             name: Organization name
 
         Returns:
-            Organization ID if found, None otherwise
+            The organization's id, or None when no organization has that name.
+
+        Raises:
+            OrganizationNameUnresolvedError: When two organizations share the
+                name, or when the scan stops at the page cap with pages unread
+                so the name cannot be confirmed unique or found.
+            ReveniumAPIError: On any platform refusal.
         """
-        try:
-            # Get organizations and find by name
-            response = await self.get_organizations(page=0, size=100)
-            organizations = self._extract_embedded_data(response)
-
-            for org in organizations:
-                if org.get("name") == name:
-                    return cast(Optional[str], org.get("id"))
-
-            return None
-        except Exception as e:
-            logger.error(f"Error resolving organization name to ID: {e}")
-            return None
+        matches: List[Any] = []
+        page = 0
+        scan_complete = False
+        while page < _ORGANIZATION_NAME_SCAN_MAX_PAGES:
+            response = await self.get_organizations(
+                page=page, size=_ORGANIZATION_NAME_SCAN_PAGE_SIZE, query=name
+            )
+            matches.extend(
+                org.get("id")
+                for org in self._extract_embedded_data(response)
+                if org.get("name") == name
+            )
+            total_pages = self._extract_pagination_info(response).get("totalPages") or 1
+            page += 1
+            if page >= total_pages:
+                scan_complete = True
+                break
+        if len(matches) > 1:
+            raise OrganizationNameUnresolvedError(
+                f"{len(matches)} organizations are named '{name}' "
+                f"(ids: {', '.join(str(org_id) for org_id in matches)}); "
+                "pass organizationId to choose one",
+                matched_ids=matches,
+            )
+        if not scan_complete:
+            raise OrganizationNameUnresolvedError(
+                f"Organization lookup for '{name}' stopped after "
+                f"{_ORGANIZATION_NAME_SCAN_MAX_PAGES} pages and could not confirm "
+                "the name is unique or found; pass organizationId instead",
+                matched_ids=matches,
+            )
+        return cast(Optional[str], matches[0]) if matches else None
 
     # Organizations API methods
     async def get_organizations(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
@@ -3342,10 +3697,11 @@ class ReveniumClient:
     async def get_team_pr_health_settings(self, team_id: str) -> Dict[str, Any]:
         """Get the team's PR-health settings.
 
-        The response carries the *effective* values: the platform substitutes its
-        own defaults when the team has never configured them, including a
-        cutoffDate that falls back to the organization's first AI-telemetry day
-        (flagged by cutoffDateIsDefault).
+        The response carries the *effective* thresholds: the platform substitutes
+        its own defaults when the team has never configured them. cutoffDate is
+        the team's own date only, null when it has none (cutoffDateIsDefault is
+        then true); PR-health counts then start at defaultCountsSince, six months
+        before today (UTC).
 
         Args:
             team_id: The team ID
@@ -3353,7 +3709,8 @@ class ReveniumClient:
         Returns:
             Settings data carrying agingDays, rottingDays, assistedOnly,
             automationPatterns, builtInAutomationPatterns, cutoffDate,
-            cutoffDateIsDefault, defaultCutoffDate and excludedRepos
+            cutoffDateIsDefault, defaultCountsSince, defaultCutoffDate and
+            excludedRepos
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.get(
@@ -3374,8 +3731,8 @@ class ReveniumClient:
         Every other field is optional: the server leaves assistedOnly,
         automationPatterns, cutoffDate and excludedRepos unchanged when they are
         absent or null, and an empty list clears automationPatterns or
-        excludedRepos. builtInAutomationPatterns and defaultCutoffDate are
-        read-only.
+        excludedRepos. builtInAutomationPatterns, cutoffDateIsDefault,
+        defaultCountsSince and defaultCutoffDate are read-only echoes.
 
         The server also enforces agingDays < rottingDays and clamps both fields
         to 1..365; violating either is a 400.
@@ -3912,20 +4269,6 @@ class ReveniumClient:
             "/profitstream/v2/api/sources/metrics/ai/data-connected/sources", params=params
         ))
 
-    async def get_anomaly_metrics(self, anomaly_id: str) -> Dict[str, Any]:
-        """Get metrics from AI anomaly builder.
-
-        Args:
-            anomaly_id: The anomaly ID
-
-        Returns:
-            Anomaly metrics data
-        """
-        params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/sources/ai/anomaly/{anomaly_id}/metric", params=params
-        ))
-
     async def search_provider_api_keys(
         self,
         query: Optional[str] = None,
@@ -4168,6 +4511,18 @@ class ReveniumClient:
             logger.error("Metering element definition creation failed: {}", str(e))
             raise
 
+    def prepare_metering_element_update_body(
+        self, element_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Return the body update_metering_element_definition sends for this element data.
+
+        The configured team fills in when teamId is absent or null (a system element).
+        """
+        body = dict(element_data)
+        if body.get("teamId") is None:
+            body["teamId"] = self.auth_config.team_id
+        return body
+
     async def update_metering_element_definition(
         self, element_id: str, element_data: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -4180,9 +4535,7 @@ class ReveniumClient:
         Returns:
             Updated metering element definition data
         """
-        # Ensure teamId is in the request body
-        if "teamId" not in element_data:
-            element_data["teamId"] = self.auth_config.team_id
+        element_data = self.prepare_metering_element_update_body(element_data)
 
         logger.info(f"Updating metering element definition: {element_id}")
         logger.debug(f"Element data: {json.dumps(element_data, indent=2, default=str)}")
@@ -4306,21 +4659,16 @@ class ReveniumClient:
             Job data
         """
         params = self._add_team_id_to_params({})
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/jobs/{job_id}", params=params))
-    async def get_job_transactions(self, job_id: str, page: int = 0, size: int = 20) -> Dict[str, Any]:
-        """Get transactions for a specific job.
-
-        Args:
-            job_id: The job identifier
-            page: Page number (0-based)
-            size: Number of items per page
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/jobs/{self._quote_path_segment(job_id)}", params=params))
+    async def get_job_transactions(self, job_id: str) -> Dict[str, Any]:
+        """Get every transaction of a job, ordered by time.
 
         Returns:
-            Response containing transactions data and pagination info
+            The platform body ``{"transactions": [...], "totalCount": N}``; the
+            operation takes no paging parameters.
         """
-        params: Dict[str, Any] = {"page": page, "size": size}
-        params = self._add_team_id_to_params(params)
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/jobs/{job_id}/transactions", params=params))
+        params = self._add_team_id_to_params({})
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/jobs/{self._quote_path_segment(job_id)}/transactions", params=params))
     async def get_job_roi(self, job_id: str) -> Dict[str, Any]:
         """Get ROI metrics for a specific job.
 
@@ -4331,7 +4679,7 @@ class ReveniumClient:
             ROI metrics data
         """
         params = self._add_team_id_to_params({})
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/jobs/{job_id}/roi", params=params))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/jobs/{self._quote_path_segment(job_id)}/roi", params=params))
     async def get_job_types(self) -> Dict[str, Any]:
         """Get available job types.
 
@@ -4410,7 +4758,7 @@ class ReveniumClient:
         # the plural "/outcomes" spelling this once used came from narrative docs and
         # appears in no machine-readable contract. Re-verify against the generated
         # spec, not prose, before changing it again.
-        return cast(Dict[str, Any], await self.post(f"/profitstream/v2/api/jobs/{job_id}/outcome", data=outcome_data, params=params))
+        return cast(Dict[str, Any], await self.post(f"/profitstream/v2/api/jobs/{self._quote_path_segment(job_id)}/outcome", data=outcome_data, params=params))
 
     async def amend_job_outcome(self, job_id: str, outcome_data: Dict[str, Any]) -> Dict[str, Any]:
         """Amend the outcome already reported for a job (BACK-3091).
@@ -4426,7 +4774,7 @@ class ReveniumClient:
 
         ``use_retry=False`` is the load-bearing argument here, and the ONLY
         call in this file that turns the transport retry off for that reason.
-        ``_should_retry`` resends on 408, 429 and every 5xx, and each amendment
+        ``_should_retry`` resends on 408 and every 5xx, and each amendment
         appends a JobOutcomeRevision row: a transient error arriving after the
         origin already committed would turn one amendment into two, and the
         caller would see a single success. The application-level "never retry a
@@ -4454,7 +4802,7 @@ class ReveniumClient:
             ReveniumAPIError: With status_code 409 if expectedEntityVersion is stale
         """
         params = self._add_team_id_to_params({})
-        return cast(Dict[str, Any], await self.patch(f"/profitstream/v2/api/jobs/{job_id}/outcome", data=outcome_data, params=params, use_retry=False))
+        return cast(Dict[str, Any], await self.patch(f"/profitstream/v2/api/jobs/{self._quote_path_segment(job_id)}/outcome", data=outcome_data, params=params, use_retry=False))
 
     @staticmethod
     def _quote_path_segment(value: str) -> str:
@@ -4487,20 +4835,20 @@ class ReveniumClient:
     # The declaration a job type's ROI is measured against:
     # GET/PUT .../economics, GET/POST .../baselines, POST .../facts, plus the
     # per-job POST .../outcome/metrics. Shaped like the job methods above --
-    # literal platform path plus _add_team_id_to_params -- with two rules that
-    # are not shared with them:
+    # literal platform path plus _add_team_id_to_params -- with two rules:
     #
     # 1. The ``{type}`` path segment is caller-supplied free text, not an
     #    opaque platform id, so it is percent-encoded before it reaches the
-    #    URL by _quote_path_segment. A job type containing a slash, a space or
-    #    a dot-segment would otherwise change which endpoint is called.
+    #    URL by _quote_path_segment, as every job method's ``{job_id}`` segment
+    #    is. A job type containing a slash, a space or a dot-segment would
+    #    otherwise change which endpoint is called.
     # 2. The three appends pass ``use_retry=False`` for the reason
     #    ``amend_job_outcome`` does: they are not idempotent. A second delivery
     #    of a baseline is a second version, and a second delivery of a fact is
     #    a second fact (or a 409 against the active-fact constraint for a write
     #    that already landed), and neither operation declares an idempotency
-    #    key for the platform to dedupe on. ``_should_retry`` resends on 408,
-    #    429 and every 5xx, so a transient error arriving after the origin
+    #    key for the platform to dedupe on. ``_should_retry`` resends on 408
+    #    and every 5xx, so a transient error arriving after the origin
     #    committed would duplicate the row while the caller saw one success.
     #    The revenium-python-sdk draws the same line on the same endpoints
     #    (``_NON_IDEMPOTENT_RETRY_STATUSES`` in
@@ -4629,10 +4977,7 @@ class ReveniumClient:
         ``job_id`` is percent-encoded for the reason the ``{type}`` segment is:
         ``agenticJobId`` is a user-supplied external identifier, not an opaque
         platform id, so a value carrying a slash would otherwise change which
-        endpoint is called. The older job methods in this block still
-        interpolate their ids raw; they are deliberately out of scope here --
-        changing the URL those produce is a behaviour change for every existing
-        caller and belongs in its own ticket, not smuggled into this one.
+        endpoint is called. Every job method encodes its id the same way.
 
         Args:
             job_id: The agentic job identifier
@@ -4661,7 +5006,8 @@ class ReveniumClient:
         empty collection means the session has never been attributed — it is not
         an error.
 
-        Shaped like ``get_job_by_id``: path parameter plus
+        Shaped like ``get_job_by_id``: path parameter, encoded by
+        ``_quote_path_segment`` into one segment, plus
         ``_add_team_id_to_params``. ``teamId`` is declared optional by the
         operation, but that optionality applies to METERING-scoped API keys
         only, where the platform resolves the team from the key itself. The MCP
@@ -4681,7 +5027,8 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params({})
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/sessions/{session_id}/attribution", params=params
+            f"/profitstream/v2/api/sessions/{self._quote_path_segment(session_id)}/attribution",
+            params=params,
         ))
 
     # Tool Registry API methods
@@ -4888,6 +5235,21 @@ class ReveniumClient:
             )
         return url
 
+    def _tool_analytics_request(self, filters: Dict[str, Any]) -> Dict[str, Any]:
+        """The GET arguments of one page of a tool analytics report, answered as the whole envelope.
+
+        ``filters`` carry the platform's parameter names (startDate, endDate,
+        toolIds, providers, page, size). The envelope is kept whole rather than
+        unwrapped to its items so the reader keeps the ``page`` block that says
+        how many pages remain, and the ``period`` the platform read.
+        """
+        return {
+            "params": {**filters, **self._resolved_team_param()},
+            "base_url": self._get_app_base_url(),
+            "use_bearer": True,
+            "unwrap_hal_embedded": False,
+        }
+
     async def get_cost_by_tool(self, **filters: Any) -> Dict[str, Any]:
         """Cost breakdown by tool over time.
 
@@ -4897,13 +5259,7 @@ class ReveniumClient:
         Returns:
             Cost breakdown data by tool
         """
-        params = {**filters, **self._resolved_team_param()}
-        return cast(Dict[str, Any], await self.get(
-            "/api/v2/analytics/cost-by-tool",
-            params=params,
-            base_url=self._get_app_base_url(),
-            use_bearer=True,
-        ))
+        return cast(Dict[str, Any], await self.get("/api/v2/analytics/cost-by-tool", **self._tool_analytics_request(filters)))
 
     async def get_cost_by_tool_aggregated(self, **filters: Any) -> Dict[str, Any]:
         """Aggregated cost per tool.
@@ -4914,13 +5270,7 @@ class ReveniumClient:
         Returns:
             Aggregated cost data per tool
         """
-        params = {**filters, **self._resolved_team_param()}
-        return cast(Dict[str, Any], await self.get(
-            "/api/v2/analytics/cost-by-tool-aggregated",
-            params=params,
-            base_url=self._get_app_base_url(),
-            use_bearer=True,
-        ))
+        return cast(Dict[str, Any], await self.get("/api/v2/analytics/cost-by-tool-aggregated", **self._tool_analytics_request(filters)))
 
     async def get_cost_by_tool_agent(self, **filters: Any) -> Dict[str, Any]:
         """Tool cost grouped by agent.
@@ -4931,13 +5281,7 @@ class ReveniumClient:
         Returns:
             Cost data grouped by agent
         """
-        params = {**filters, **self._resolved_team_param()}
-        return cast(Dict[str, Any], await self.get(
-            "/api/v2/analytics/cost-by-tool-agent",
-            params=params,
-            base_url=self._get_app_base_url(),
-            use_bearer=True,
-        ))
+        return cast(Dict[str, Any], await self.get("/api/v2/analytics/cost-by-tool-agent", **self._tool_analytics_request(filters)))
 
     async def get_agent_tool_breakdown(self, **filters: Any) -> Dict[str, Any]:
         """Cost per (agent, tool) pair.
@@ -4948,13 +5292,7 @@ class ReveniumClient:
         Returns:
             Cost breakdown by agent-tool pair
         """
-        params = {**filters, **self._resolved_team_param()}
-        return cast(Dict[str, Any], await self.get(
-            "/api/v2/analytics/agent-tool-breakdown",
-            params=params,
-            base_url=self._get_app_base_url(),
-            use_bearer=True,
-        ))
+        return cast(Dict[str, Any], await self.get("/api/v2/analytics/agent-tool-breakdown", **self._tool_analytics_request(filters)))
 
     async def get_cost_by_tool_provider(self, **filters: Any) -> Dict[str, Any]:
         """Cost by tool provider over time.
@@ -4965,13 +5303,7 @@ class ReveniumClient:
         Returns:
             Cost data by tool provider
         """
-        params = {**filters, **self._resolved_team_param()}
-        return cast(Dict[str, Any], await self.get(
-            "/api/v2/analytics/cost-by-tool-provider",
-            params=params,
-            base_url=self._get_app_base_url(),
-            use_bearer=True,
-        ))
+        return cast(Dict[str, Any], await self.get("/api/v2/analytics/cost-by-tool-provider", **self._tool_analytics_request(filters)))
 
     async def get_cost_by_tool_provider_aggregated(self, **filters: Any) -> Dict[str, Any]:
         """Aggregated cost by provider.
@@ -4982,13 +5314,7 @@ class ReveniumClient:
         Returns:
             Aggregated cost data by provider
         """
-        params = {**filters, **self._resolved_team_param()}
-        return cast(Dict[str, Any], await self.get(
-            "/api/v2/analytics/cost-by-tool-provider-aggregated",
-            params=params,
-            base_url=self._get_app_base_url(),
-            use_bearer=True,
-        ))
+        return cast(Dict[str, Any], await self.get("/api/v2/analytics/cost-by-tool-provider-aggregated", **self._tool_analytics_request(filters)))
 
     async def get_top_tools_by_call_count(self, **filters: Any) -> Dict[str, Any]:
         """Top 20 tools by call count.
@@ -4999,13 +5325,7 @@ class ReveniumClient:
         Returns:
             Top tools ranked by call count
         """
-        params = {**filters, **self._resolved_team_param()}
-        return cast(Dict[str, Any], await self.get(
-            "/api/v2/analytics/top-tools-by-call-count",
-            params=params,
-            base_url=self._get_app_base_url(),
-            use_bearer=True,
-        ))
+        return cast(Dict[str, Any], await self.get("/api/v2/analytics/top-tools-by-call-count", **self._tool_analytics_request(filters)))
 
     TEAM_MEDIANS_ASSISTANTS = "claude-code"
 
@@ -5055,13 +5375,7 @@ class ReveniumClient:
         Returns:
             Success rate data per tool
         """
-        params = {**filters, **self._resolved_team_param()}
-        return cast(Dict[str, Any], await self.get(
-            "/api/v2/analytics/tool-success-rate",
-            params=params,
-            base_url=self._get_app_base_url(),
-            use_bearer=True,
-        ))
+        return cast(Dict[str, Any], await self.get("/api/v2/analytics/tool-success-rate", **self._tool_analytics_request(filters)))
 
     async def get_tool_latency(self, **filters: Any) -> Dict[str, Any]:
         """Average execution duration per tool.
@@ -5072,13 +5386,7 @@ class ReveniumClient:
         Returns:
             Latency data per tool
         """
-        params = {**filters, **self._resolved_team_param()}
-        return cast(Dict[str, Any], await self.get(
-            "/api/v2/analytics/tool-latency",
-            params=params,
-            base_url=self._get_app_base_url(),
-            use_bearer=True,
-        ))
+        return cast(Dict[str, Any], await self.get("/api/v2/analytics/tool-latency", **self._tool_analytics_request(filters)))
 
     async def get_tool_filter_options(self) -> Dict[str, Any]:
         """Available tool IDs for filter dropdowns.

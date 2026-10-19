@@ -4,6 +4,7 @@ This module provides management functionality for triggered alerts
 in the Revenium platform.
 """
 
+import math
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -16,13 +17,79 @@ except ImportError:
 
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
+from ..alert_operators import OPERATOR_LABELS, threshold_is_percentage
+from ..analytics_window import CalendarRangeError, utc_instant_bounds
 from ..client import ReveniumAPIError, ReveniumClient
-from ..date_parser import DateRangeParser
+from ..common.error_handling import ErrorCodes, ToolError
+from ..date_parser import DEFAULT_WINDOW_DAYS, DateRangeParser
 from ..exceptions import AlertNotFoundError, ValidationError
+from ..log_context import sanitize_error_message
 from ..models import MetricType
 
 PRE_RULE_ACTIVITY_LABEL = "Pre-Rule Activity"
 PRE_RULE_ACTIVITY_VALUE = "Counted (usage from before the rule was created)"
+
+# snake_case filter name -> camelCase query parameter, bounded to what the
+# endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
+# AIAlertController.find: @RequestParam teamId / type / start / end /
+# anomalyId / ownerId / resolved plus a Pageable (page, size, sort). teamId and
+# page/size are set by the client. There is no `severity` and no `status` on
+# this endpoint; both were being sent by the natural-language path and
+# discarded upstream.
+ALERT_FILTER_MAP: Dict[str, str] = {
+    "type": "type",
+    "start": "start",
+    "end": "end",
+    "anomaly_id": "anomalyId",
+    "owner_id": "ownerId",
+    "resolved": "resolved",
+    "sort": "sort",
+}
+
+ALERT_HISTORY_DATE_FORMS = (
+    "start and end take a yyyy-MM-dd day (an end day covers the whole UTC day) "
+    "or an ISO-8601 instant with Z or an offset, such as 2026-10-01T09:30:00Z or "
+    "2026-10-01T09:30:00+02:00; a time of day without Z or an offset is refused. "
+    "Both are sent to the platform as UTC timestamps with millisecond precision."
+)
+
+# A short or boolean value (resolved=true, type=X) would match almost any reason.
+_SHORTEST_VALUE_NAMED_IN_A_REFUSAL = 4
+_CALLER_FILTER_NAMES = {sent: caller for caller, sent in ALERT_FILTER_MAP.items()}
+_WINDOW_FILTER_NAMES = {"start_date": "filters.start", "end_date": "filters.end"}
+
+
+def _caller_name(key: str, window_from_query: bool) -> str:
+    if window_from_query and key in ("start", "end"):
+        return "query"
+    return f"filters.{_CALLER_FILTER_NAMES.get(key, key)}"
+
+
+def _refused_filter_names(
+    reason: str, sent_filters: Dict[str, Any], window_from_query: bool
+) -> List[str]:
+    names = [
+        _caller_name(key, window_from_query)
+        for key, value in sent_filters.items()
+        if not isinstance(value, bool)
+        and len(str(value)) >= _SHORTEST_VALUE_NAMED_IN_A_REFUSAL
+        and str(value) in reason
+    ]
+    return list(dict.fromkeys(names))
+
+
+def _platform_refusal(
+    exc: ReveniumAPIError, sent_filters: Dict[str, Any], window_from_query: bool
+) -> ToolError:
+    reason = sanitize_error_message(exc.message)
+    named = _refused_filter_names(reason, sent_filters, window_from_query)
+    fields = ", ".join(named) or "filters"
+    return ToolError(
+        message=f"The platform refused the alert history filters ({fields}): {reason}",
+        error_code=ErrorCodes.INVALID_PARAMETER,
+        field=named[0] if named else "filters",
+        suggestions=[ALERT_HISTORY_DATE_FORMS],
+    )
 
 
 
@@ -49,6 +116,54 @@ except ImportError:
             raise ValidationError("Invalid alert ID", field="alert_id", value=alert_id)
         return str(alert_id.strip())
 
+
+
+_DECIMALS_SHOWN = 6
+_SMALLEST_VALUE_AT_SIX_DECIMALS = 1e-6
+_SIGNIFICANT_DIGITS_BELOW_A_MILLIONTH = 2
+
+
+def _decimals_for(value: float) -> int:
+    """Six, or enough to show the first two significant digits of a smaller value."""
+    magnitude = abs(value)
+    if magnitude == 0 or magnitude >= _SMALLEST_VALUE_AT_SIX_DECIMALS:
+        return _DECIMALS_SHOWN
+    return _SIGNIFICANT_DIGITS_BELOW_A_MILLIONTH - 1 - math.floor(math.log10(magnitude))
+
+
+def _trimmed_decimals(value: float, minimum: int = 0) -> str:
+    """The value's decimals with trailing zeros trimmed, keeping at least ``minimum``."""
+    whole, _, fraction = f"{value:,.{_decimals_for(value)}f}".partition(".")
+    fraction = fraction.rstrip("0").ljust(minimum, "0")
+    return f"{whole}.{fraction}" if fraction else whole
+
+
+def format_alert_value(value: float, metric_type: str, is_percentage: bool = False) -> str:
+    """One alert value in full: a cost metric in dollars, anything else with every digit.
+
+    No K or M shortening: a $1,023.49 overshoot of a $1,000 limit must not
+    read 1.0K beside "> 1.0K".
+    """
+    if "COST" in metric_type and not is_percentage:
+        sign = "-" if value < 0 else ""
+        magnitude = abs(value)
+        if magnitude >= 1:
+            return f"{sign}${magnitude:,.2f}"
+        return f"{sign}${_trimmed_decimals(magnitude, minimum=2)}"
+    if float(value).is_integer():
+        return f"{int(value):,}"
+    return _trimmed_decimals(value)
+
+
+def _window_line(start: Optional[str], end: Optional[str], note: str = "") -> str:
+    """The line an alert history answer uses to say which window it read."""
+    if start and end:
+        return f"**Window:** {start} to {end} (UTC){note}"
+    if start:
+        return f"**Window:** from {start} (UTC){note}"
+    if end:
+        return f"**Window:** up to {end} (UTC){note}"
+    return ""
 
 
 class AlertManager:
@@ -187,27 +302,60 @@ class AlertManager:
         """
         logger.info(f"Listing alerts: page={page}, size={size}")
 
-        # Parse natural language query if provided
-        if query:
-            parsed_filters = self._parse_natural_language_query(query)
-            if filters:
-                filters.update(parsed_filters)
-            else:
-                filters = parsed_filters
+        filters = dict(filters) if filters else {}
 
-        # Call the client method
-        response = await client.get_alerts(page=page, size=size, **(filters or {}))
+        # A date range named in the question wins over explicit filters. An
+        # undated question with no explicit dates reads the default window,
+        # and the answer says so.
+        default_window_note = ""
+        window_from_query = False
+        if query:
+            date_range = self.date_parser.match_date_range(query)
+            if date_range is not None:
+                filters.update(date_range)
+                window_from_query = True
+            elif filters.get("start") is None and filters.get("end") is None:
+                filters.update(self.date_parser.default_window())
+                window_from_query = True
+                default_window_note = (
+                    " (no date range recognized in the question, so the last "
+                    f"{DEFAULT_WINDOW_DAYS} days)"
+                )
+
+        # The platform takes start and end only as yyyy-MM-ddTHH:mm:ss.SSSZ.
+        try:
+            start, end = utc_instant_bounds(filters.get("start"), filters.get("end"))
+        except CalendarRangeError as exc:
+            reason = str(exc).replace("start_date", "start").replace("end_date", "end")
+            raise ToolError(
+                message=f"Window refused: {reason}",
+                error_code=ErrorCodes.INVALID_PARAMETER,
+                field="query" if window_from_query else _WINDOW_FILTER_NAMES.get(exc.field, "filters"),
+                suggestions=[ALERT_HISTORY_DATE_FORMS],
+            ) from exc
+        for key, bound in (("start", start), ("end", end)):
+            if bound is None:
+                filters.pop(key, None)
+            else:
+                filters[key] = bound
+        window_line = _window_line(start, end, default_window_note)
+
+        try:
+            response = await client.get_alerts(page=page, size=size, **filters)
+        except ReveniumAPIError as exc:
+            if exc.status_code == 400:
+                raise _platform_refusal(exc, filters, window_from_query) from exc
+            raise
 
         # Extract alerts from response
         alerts = client._extract_embedded_data(response)
         page_info = client._extract_pagination_info(response)
 
         if not alerts:
-            return [
-                TextContent(
-                    type="text", text="📋 **No alerts found**\n\nNo alerts match your criteria."
-                )
-            ]
+            no_alerts_text = "📋 **No alerts found**\n\nNo alerts match your criteria."
+            if window_line:
+                no_alerts_text += f"\n\n{window_line}"
+            return [TextContent(type="text", text=no_alerts_text)]
 
         # Format the response with enhanced field mapping
         alert_list = []
@@ -256,7 +404,9 @@ class AlertManager:
         result_text = (
             f"**AI Alerts** (Page {current_page} of {total_pages})\n\n"
             f'**Note**: These are a history of triggered alerts. To see alert definitions/rules, use `resource_type="anomalies"` with `action="list"`\n\n'
-            f"Found {len(alerts)} alerts (Total: {total_elements})\n\n" + "\n\n".join(alert_list)
+            f"Found {len(alerts)} alerts (Total: {total_elements})\n\n"
+            + (f"{window_line}\n\n" if window_line else "")
+            + "\n\n".join(alert_list)
         )
 
         if query:
@@ -282,20 +432,27 @@ class AlertManager:
 
         logger.info(f"Getting alert: {alert_id}")
 
-        # Call the API client method. The Revenium alerts service returns
-        # 404 for never-existed ids, 403 for ids the caller cannot access,
-        # and 500 in some legacy edge cases — all three mean "this id has
-        # no actionable alert" from the caller's POV. Fold them into a
-        # single AlertNotFoundError so the @handle_alert_tool_errors
-        # decorator renders the rich "alert not found" envelope instead
-        # of the catch-all "Unexpected Error" fallback at the bottom of
-        # error_handlers.py (BACK-1142; same shape as BACK-1098 on
-        # manage_tools).
+        # On dev a well-formed id this team has no alert under answers 403
+        # (404 for one that never existed), folded into AlertNotFoundError
+        # (BACK-1142). A malformed id answers 400, which ReveniumClient._request
+        # already reports as "Invalid Alert ID". A 5xx is a broken service, not
+        # a missing alert (BACK-4705).
         try:
             alert = await client.get_alert_by_id(alert_id)
         except ReveniumAPIError as e:
-            if e.status_code in (403, 404, 500):
+            if e.status_code in (403, 404):
                 raise AlertNotFoundError(alert_id) from e
+            if e.status_code is not None and e.status_code >= 500:
+                raise ToolError(
+                    message=(
+                        f"The alerts service answered HTTP {e.status_code} (a server "
+                        f"error) while reading alert '{alert_id}'. This does not mean "
+                        "the alert is missing; try again shortly."
+                    ),
+                    error_code=ErrorCodes.API_ERROR,
+                    field="alert_id",
+                    value=alert_id,
+                ) from e
             raise
 
         # Enhanced field extraction for alert history
@@ -687,61 +844,36 @@ class AlertManager:
         if isinstance(anomaly, dict):
             operator_type = anomaly.get("operatorType")
             threshold = anomaly.get("threshold")
-            is_percentage = anomaly.get("isPercentage", False)
 
             if operator_type and threshold is not None:
-                # Map operator types to readable symbols
-                operator_mapping = {
-                    "GREATER_THAN": ">",
-                    "GREATER_THAN_OR_EQUAL_TO": "≥",
-                    "LESS_THAN": "<",
-                    "LESS_THAN_OR_EQUAL_TO": "≤",
-                    "EQUALS": "=",
-                    "NOT_EQUALS": "≠",
-                    # Refused on create/update, still stored on existing alerts.
-                    "EQUAL_TO": "=",
-                    "NOT_EQUAL_TO": "≠",
-                }
-
-                operator_symbol = operator_mapping.get(operator_type, operator_type)
-
-                # Format threshold value
-                if is_percentage:
-                    threshold_str = f"{threshold}%"
-                else:
-                    # Format large numbers nicely
-                    if threshold >= 1000000:
-                        threshold_str = f"{threshold/1000000:.1f}M"
-                    elif threshold >= 1000:
-                        threshold_str = f"{threshold/1000:.1f}K"
-                    else:
-                        threshold_str = str(threshold)
-
+                operator_symbol = OPERATOR_LABELS.get(operator_type, operator_type)
+                threshold_str = self._format_threshold(alert, threshold)
                 return f"{operator_symbol} {threshold_str}"
 
         # Fallback to direct alert fields
         operator_type = alert.get("operatorType")
         threshold = alert.get("threshold")
-        is_percentage = alert.get("isPercentage", False)
 
         if operator_type and threshold is not None:
-            operator_mapping = {
-                "GREATER_THAN": ">",
-                "GREATER_THAN_OR_EQUAL_TO": "≥",
-                "LESS_THAN": "<",
-                "LESS_THAN_OR_EQUAL_TO": "≤",
-                "EQUALS": "=",
-                "NOT_EQUALS": "≠",
-                # Refused on create/update, still stored on existing alerts.
-                "EQUAL_TO": "=",
-                "NOT_EQUAL_TO": "≠",
-            }
-
-            operator_symbol = operator_mapping.get(operator_type, operator_type)
-            threshold_str = f"{threshold}%" if is_percentage else str(threshold)
+            operator_symbol = OPERATOR_LABELS.get(operator_type, operator_type)
+            threshold_str = self._format_threshold(alert, threshold)
             return f"{operator_symbol} {threshold_str}"
 
         return "N/A"
+
+    def _format_threshold(self, alert: Dict[str, Any], threshold: Any) -> str:
+        """A rule threshold: a percentage as given, a number in the metric's unit."""
+        if self._extract_is_percentage(alert):
+            return f"{threshold}%"
+        if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
+            return format_alert_value(threshold, self._extract_metric_type(alert))
+        return str(threshold)
+
+    def _extract_is_percentage(self, alert: Dict[str, Any]) -> bool:
+        """Whether the rule's values are percentages: the nested anomaly first."""
+        anomaly = alert.get("anomaly")
+        rule = {**alert, **anomaly} if isinstance(anomaly, dict) else alert
+        return threshold_is_percentage(rule)
 
     def _extract_metric_type(self, alert: Dict[str, Any]) -> str:
         """Extract metric type from alert history response."""
@@ -795,16 +927,13 @@ class AlertManager:
         # For alert history, get the actual value that triggered the alert
         triggered_value = alert.get("triggeredValue")
         if triggered_value is not None:
-            # Format large numbers nicely
-            if isinstance(triggered_value, (int, float)):
-                if triggered_value >= 1000000:
-                    return f"{triggered_value/1000000:.1f}M"
-                elif triggered_value >= 1000:
-                    return f"{triggered_value/1000:.1f}K"
-                else:
-                    return str(triggered_value)
-            else:
-                return str(triggered_value)
+            if isinstance(triggered_value, (int, float)) and not isinstance(triggered_value, bool):
+                return format_alert_value(
+                    triggered_value,
+                    self._extract_metric_type(alert),
+                    self._extract_is_percentage(alert),
+                )
+            return str(triggered_value)
         return "N/A"
 
     def _extract_alert_type(self, alert: Dict[str, Any]) -> str:

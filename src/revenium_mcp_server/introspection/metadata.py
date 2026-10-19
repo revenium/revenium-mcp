@@ -9,6 +9,13 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
+from ..auth.auth_mode import credentials_are_per_request
+
+HOSTED_PERFORMANCE_METRICS_NOTE = (
+    "Performance metrics are not shown on the hosted server: one server process "
+    "answers many organizations, so its counts would mix their calls together."
+)
+
 
 class ToolType(Enum):
     """Tool type classification."""
@@ -124,7 +131,12 @@ class ToolMetadata:
     tags: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert metadata to dictionary format."""
+        """Convert metadata to dictionary format.
+
+        The performance block depends on AUTH_MODE: when credentials are per
+        request (api_key or clerk) it is None and a performance_metrics_note
+        key says why, because the counters are shared by every organization.
+        """
         return {
             "name": self.name,
             "description": self.description,
@@ -174,19 +186,7 @@ class ToolMetadata:
                 }
                 for pattern in self.usage_patterns
             ],
-            "performance_metrics": {
-                "avg_response_time_ms": self.performance_metrics.avg_response_time_ms,
-                "success_rate": self.performance_metrics.success_rate,
-                "total_executions": self.performance_metrics.total_executions,
-                "error_count": self.performance_metrics.error_count,
-                "last_execution": (
-                    self.performance_metrics.last_execution.isoformat()
-                    if self.performance_metrics.last_execution
-                    else None
-                ),
-                "peak_response_time_ms": self.performance_metrics.peak_response_time_ms,
-                "min_response_time_ms": self.performance_metrics.min_response_time_ms,
-            },
+            **self._performance_metrics_fields(),
             "agent_summary": self.agent_summary,
             "quick_start_guide": self.quick_start_guide,
             "common_use_cases": self.common_use_cases,
@@ -194,6 +194,27 @@ class ToolMetadata:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "tags": self.tags,
+        }
+
+    def _performance_metrics_fields(self) -> Dict[str, Any]:
+        if credentials_are_per_request():
+            return {
+                "performance_metrics": None,
+                "performance_metrics_note": HOSTED_PERFORMANCE_METRICS_NOTE,
+            }
+        pm = self.performance_metrics
+        return {
+            "performance_metrics": {
+                "avg_response_time_ms": pm.avg_response_time_ms,
+                "success_rate": pm.success_rate,
+                "total_executions": pm.total_executions,
+                "error_count": pm.error_count,
+                "last_execution": (
+                    pm.last_execution.isoformat() if pm.last_execution else None
+                ),
+                "peak_response_time_ms": pm.peak_response_time_ms,
+                "min_response_time_ms": pm.min_response_time_ms,
+            }
         }
 
 

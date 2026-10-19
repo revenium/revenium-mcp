@@ -26,6 +26,8 @@ from ..common.error_handling import (
     create_structured_missing_parameter_error,
     raise_unknown_action_error,
 )
+from ..common.formatting import format_page_count_heading
+from ..common.sample_coverage import platform_total
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..introspection.metadata import (
     ToolCapability,
@@ -125,6 +127,7 @@ class AgentManager:
             "agents": agents,
             "pagination": page_info,
             "total_found": len(agents),
+            "total_records": platform_total(page_info),
             "page": page,
         }
 
@@ -866,7 +869,13 @@ class AgentManagement(ToolBase):
                 return [
                     TextContent(
                         type="text",
-                        text=f"Found {result['total_found']} agents (page {result.get('page', 0) + 1}):\n\n"
+                        text=format_page_count_heading(
+                            "agents",
+                            len(result["agents"]),
+                            result["pagination"],
+                            result["page"],
+                        )
+                        + "\n\n"
                         + json.dumps(result, indent=2),
                     )
                 ]

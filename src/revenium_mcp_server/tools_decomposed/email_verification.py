@@ -14,6 +14,7 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
+from ..auth.auth_mode import read_auth_mode
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
@@ -109,6 +110,8 @@ class EmailVerification(ToolBase):
                 )
                 return [TextContent(type="text", text=format_structured_error(error))]
 
+        except ToolError:
+            raise
         except Exception as e:
             logger.error(f"Error in verify_email_setup action {action}: {e}")
             error = ToolError(
@@ -138,6 +141,20 @@ class EmailVerification(ToolBase):
 
     async def _handle_update_email(self, arguments: Dict[str, Any]) -> List[TextContent]:
         """Handle update_email action - update notification email address."""
+        # BACK-4679: the only store is the server-local configuration cache,
+        # which on the hosted server belongs to no organization.
+        if read_auth_mode() in ("clerk", "api_key"):
+            raise ToolError(
+                message=(
+                    "Setting a notification email is not available on the hosted server. "
+                    "Nothing was saved."
+                ),
+                error_code=ErrorCodes.ACTION_NOT_SUPPORTED,
+                field="action",
+                value="update_email",
+                suggestions=["Give the address on each alert with the email argument of manage_alerts"],
+            )
+
         logger.debug("✏️ Updating email configuration")
 
         # Get email from arguments
@@ -156,7 +173,7 @@ class EmailVerification(ToolBase):
                     "system_context": "📧 SYSTEM: Email will be used for alert notifications and system updates",
                 },
             )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            raise error
 
         try:
             # Validate email using existing validation infrastructure
@@ -189,31 +206,25 @@ Your notification email has been updated and will be used for:
 """
                 return [TextContent(type="text", text=update_text)]
             else:
-                error_text = f"""# ❌ **Email Configuration Update Failed**
+                raise ToolError(
+                    message=f"The notification email {validated_email} was not saved.",
+                    error_code=ErrorCodes.TOOL_ERROR,
+                    field="email",
+                    value=validated_email,
+                    suggestions=[
+                        "This server stores it only in its local configuration cache "
+                        "(.revenium_cache in the server's working directory), and no valid "
+                        "cache exists or it could not be written",
+                        "Set REVENIUM_DEFAULT_EMAIL in the server's environment and restart the server",
+                    ],
+                )
 
-**Email**: {validated_email}
-**Status**: Failed to update configuration
-**Timestamp**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
-
-## 🔧 **Troubleshooting**
-
-This might be due to:
-- Cache write permissions
-- Configuration file access issues
-- System configuration problems
-
-**Recommendations**:
-1. Check system permissions
-2. Verify configuration directory access
-3. Try again after a moment
-4. Contact system administrator if issue persists
-"""
-                return [TextContent(type="text", text=error_text)]
-
+        except ToolError:
+            raise
         except Exception as e:
             logger.error(f"Error updating email configuration: {e}")
-            error = ToolError(
-                message="Failed to update email configuration",
+            raise ToolError(
+                message=f"The notification email {email} was not saved: {e}",
                 error_code=ErrorCodes.VALIDATION_ERROR,
                 field="email",
                 value=str(email),
@@ -223,8 +234,7 @@ This might be due to:
                     "Try with a different email address",
                     "Use validate_email() to test format first",
                 ],
-            )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            ) from e
 
     async def _handle_validate_email(self, arguments: Dict[str, Any]) -> List[TextContent]:
         """Handle validate_email action - validate email format without updating."""
@@ -346,10 +356,13 @@ This email address is ready to use! You can:
 
             # Update the configuration field
             # This uses the same pattern as the config_cache system
-            await _default_cache.update_config_field("REVENIUM_DEFAULT_EMAIL", validated_email)
+            saved = await _default_cache.update_config_field(
+                "REVENIUM_DEFAULT_EMAIL", validated_email
+            )
 
-            logger.info(f"✅ Email configuration updated to: {validated_email}")
-            return True
+            if saved:
+                logger.info(f"✅ Email configuration updated to: {validated_email}")
+            return saved
 
         except Exception as e:
             logger.error(f"❌ Failed to update email configuration: {e}")
@@ -485,9 +498,11 @@ This email address is ready to use! You can:
             # Test email format validation
             try:
                 validated_email = InputValidator.validate_email(current_email)
+                format_valid = True
                 test += "**Format Validation**: ✅ Valid\n"
                 test += f"**Normalized Form**: {validated_email}\n"
             except Exception as e:
+                format_valid = False
                 test += f"**Format Validation**: ❌ Invalid - {str(e)}\n"
 
             test += "\n## 📧 **Email Analysis**\n\n"
@@ -514,14 +529,34 @@ This email address is ready to use! You can:
 
             test += "## 🎯 **Test Results Summary**\n\n"
             test += "- **Email Present**: ✅ Yes\n"
-            test += "- **Format Valid**: ✅ Yes (if validation passed)\n"
-            test += "- **Ready for Notifications**: ✅ Yes\n\n"
+            if format_valid:
+                test += "- **Format Valid**: ✅ Yes\n"
+                test += "- **Ready for Notifications**: ✅ Yes\n\n"
 
-            test += "## 📬 **Next Steps**\n\n"
-            test += "Your email configuration is ready! You can now:\n"
-            test += "1. Set up alerts with `manage_alerts()`\n"
-            test += "2. Configure Slack with `slack_management(action='quick_setup')`\n"
-            test += "3. Check overall setup with `setup_checklist()`\n"
+                test += "## 📬 **Next Steps**\n\n"
+                test += "Your email configuration is ready! You can now:\n"
+                test += "1. Set up alerts with `manage_alerts()`\n"
+                test += "2. Configure Slack with `slack_management(action='quick_setup')`\n"
+                test += "3. Check overall setup with `system_setup(action='setup_checklist')`\n"
+            else:
+                test += "- **Format Valid**: ❌ No\n"
+                test += "- **Ready for Notifications**: ❌ No\n\n"
+
+                test += "## 🔧 **Fix the Address**\n\n"
+                test += (
+                    "The configured address is not a valid email, "
+                    "so notifications cannot be delivered to it.\n"
+                )
+                test += "1. Check a replacement with `system_setup(action='validate_email', email='your@email.com')`\n"
+                if read_auth_mode() in ("clerk", "api_key"):
+                    # update_email is refused on the hosted server.
+                    test += (
+                        "2. Give the address on each alert with the email argument, for example "
+                        "`manage_alerts(action='create_simple', threshold=100, email='your@email.com')`\n"
+                    )
+                else:
+                    test += "2. Set it with `system_setup(action='update_email', email='your@email.com')`\n"
+                    test += "3. If that says it was not saved, set REVENIUM_DEFAULT_EMAIL in the server's environment and restart the server\n"
 
         else:
             test += "## ❌ **No Email Configuration Found**\n\n"

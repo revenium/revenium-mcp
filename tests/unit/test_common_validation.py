@@ -267,6 +267,18 @@ class TestValidatePaginationParams:
             validate_pagination_params({"size": 101}, action="list")
         assert exc.value.field == "size"
 
+    @pytest.mark.parametrize("size", [101, "101"])
+    def test_too_large_size_suggestions_name_the_range(self, size):
+        """BACK-4795: a well-typed size out of range needs range advice, not type advice."""
+        with pytest.raises(ToolError) as exc:
+            validate_pagination_params({"size": size}, action="list_widgets")
+        suggestions = exc.value.suggestions
+        assert any("between 1 and 100" in hint for hint in suggestions), suggestions
+        assert not any("digit-only" in hint for hint in suggestions), suggestions
+        assert all("list_widgets" in hint for hint in suggestions), suggestions
+        # The message is unchanged; it repeats the value as sent.
+        assert exc.value.message == f"size must be an integer in [1, 100], got {size!r}"
+
     def test_bool_rejected(self):
         """True/False are int subclasses in Python — should be rejected, not coerced."""
         with pytest.raises(ToolError) as exc:

@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
-from ..common.error_handling import create_structured_validation_error, format_structured_error
+from ..common.error_handling import create_structured_validation_error, raise_structured_error
 from ..introspection.metadata import ToolCapability, ToolType
 from .configuration_status import ConfigurationStatus
 from .debug_auto_discovery import DebugAutoDiscovery
@@ -371,7 +371,7 @@ All actions support the same parameters as their original tools for 100% compati
             },
         )
 
-        return [TextContent(type="text", text=format_structured_error(error))]
+        raise_structured_error(error)
 
     async def _get_supported_actions(self) -> List[str]:
         """Get all supported actions from consolidated tool."""
@@ -387,19 +387,19 @@ All actions support the same parameters as their original tools for 100% compati
                 name="Configuration Analysis",
                 description="Detailed environment variable analysis and system configuration validation",
                 parameters={
-                    "environment_variables": {"include_sensitive": "bool", "format_output": "str"},
+                    "environment_variables": {},
                     "auto_discovery": {},
                     "onboarding_status": {},
-                    "system_health": {"include_recommendations": "bool"},
+                    "system_health": {},
                 },
                 examples=[
-                    "environment_variables(include_sensitive=False)",
-                    "system_health(include_recommendations=True)",
+                    "environment_variables()",
+                    "system_health()",
                     "auto_discovery()",
                     "onboarding_status()",
                 ],
                 limitations=[
-                    "Sensitive environment variables require explicit permission",
+                    "API keys are always shown as SET (hidden)",
                     "Some diagnostics require API connectivity",
                 ],
             ),
@@ -407,10 +407,10 @@ All actions support the same parameters as their original tools for 100% compati
                 name="Auto-Discovery Debugging",
                 description="Comprehensive auto-discovery diagnostics and troubleshooting",
                 parameters={
-                    "debug": {"include_recommendations": "bool"},
+                    "debug": {},
                 },
                 examples=[
-                    "debug(include_recommendations=True)",
+                    "debug()",
                 ],
                 limitations=[
                     "Requires valid API configuration for full diagnostics",

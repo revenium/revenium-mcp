@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from revenium_mcp_server.common.error_handling import ToolError
 from revenium_mcp_server.alert_operators import (
     ACCEPTED_OPERATORS,
     CHANGE_OPERATORS,
@@ -445,7 +446,7 @@ class TestUpdatePathAcceptList:
     def _client(self, stored: Dict[str, Any]) -> MagicMock:
         client = MagicMock()
         client.get_anomaly_by_id = AsyncMock(return_value=stored)
-        client.update_anomaly = AsyncMock(return_value={"id": "anom_1", "name": "Alert"})
+        client.update_anomaly = AsyncMock(side_effect=lambda anomaly_id, body: {**body, "id": anomaly_id})
         return client
 
     def _stored(self, operator="GREATER_THAN", alert_type="THRESHOLD") -> Dict[str, Any]:
@@ -468,10 +469,11 @@ class TestUpdatePathAcceptList:
         """Dev answers this PUT with HTTP 400; the MCP has to answer it first."""
         client = self._client(self._stored())
 
-        result = await manager.update_anomaly(client, "anom_1", {field: operator})
+        with pytest.raises(ToolError) as exc_info:
+            await manager.update_anomaly(client, "anom_1", {field: operator})
 
         client.update_anomaly.assert_not_called()
-        text = result[0].text
+        text = exc_info.value.message
         assert "not supported for AI alerts" in text
         for alternative in COMPARISON_OPERATORS:
             assert alternative in text
@@ -481,36 +483,39 @@ class TestUpdatePathAcceptList:
         """GREATER_THAN_OR_EQUAL is not a platform operatorType value."""
         client = self._client(self._stored())
 
-        result = await manager.update_anomaly(
-            client, "anom_1", {"operatorType": "GREATER_THAN_OR_EQUAL"}
-        )
+        with pytest.raises(ToolError) as exc_info:
+            await manager.update_anomaly(
+                client, "anom_1", {"operatorType": "GREATER_THAN_OR_EQUAL"}
+            )
 
         client.update_anomaly.assert_not_called()
-        assert "Invalid operatorType value" in result[0].text
+        assert "Invalid operatorType value" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_update_to_an_operator_the_alert_type_refuses_is_caught(self, manager):
         """acceptedOperatorsFor(RELATIVE_CHANGE) is the change operators only."""
         client = self._client(self._stored(operator="PERCENT_INCREASE", alert_type="RELATIVE_CHANGE"))
 
-        result = await manager.update_anomaly(
-            client, "anom_1", {"operatorType": "GREATER_THAN"}
-        )
+        with pytest.raises(ToolError) as exc_info:
+            await manager.update_anomaly(
+                client, "anom_1", {"operatorType": "GREATER_THAN"}
+            )
 
         client.update_anomaly.assert_not_called()
-        assert "RELATIVE_CHANGE" in result[0].text
+        assert "RELATIVE_CHANGE" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_switching_alert_type_rechecks_the_stored_operator(self, manager):
         """The caller moved the other half of the pairing; same 400 otherwise."""
         client = self._client(self._stored(operator="GREATER_THAN"))
 
-        result = await manager.update_anomaly(
-            client, "anom_1", {"alert_type": "RELATIVE_CHANGE"}
-        )
+        with pytest.raises(ToolError) as exc_info:
+            await manager.update_anomaly(
+                client, "anom_1", {"alert_type": "RELATIVE_CHANGE"}
+            )
 
         client.update_anomaly.assert_not_called()
-        assert "GREATER_THAN" in result[0].text
+        assert "GREATER_THAN" in exc_info.value.message
 
     @pytest.mark.parametrize("operator", list(ACCEPTED_OPERATORS))
     @pytest.mark.asyncio
@@ -524,22 +529,24 @@ class TestUpdatePathAcceptList:
 
     @pytest.mark.parametrize("operator", list(REJECTED_OPERATORS))
     @pytest.mark.asyncio
-    async def test_an_unrelated_update_to_a_stored_refused_operator_still_goes_out(
+    async def test_an_unrelated_update_to_a_stored_refused_operator_names_the_fix(
         self, manager, operator
     ):
-        """Renaming an alert the platform stored with EQUAL_TO must stay possible."""
+        """The platform re-checks the stored operator on every update, a rename included (D67)."""
         client = self._client(self._stored(operator=operator))
 
-        result = await manager.update_anomaly(client, "anom_1", {"name": "New Name"})
+        with pytest.raises(ToolError) as refusal:
+            await manager.update_anomaly(client, "anom_1", {"name": "New Name"})
 
-        assert client.update_anomaly.call_args[0][1]["operatorType"] == operator
-        text = result[0].text
-        assert f"stores operatorType {operator}" in text
-        assert "no longer accepts on create or update" in text
+        client.update_anomaly.assert_not_called()
+        assert f"This alert's stored operatorType {operator} is no longer accepted" in str(
+            refusal.value
+        )
+        assert "include operatorType with one of" in str(refusal.value)
 
 
 class TestEnableDisableWithAStoredRefusedOperator:
-    """Enable and disable resubmit the whole stored definition."""
+    """Enable and disable resend the whole stored definition, so the platform's rules run on it first."""
 
     def _tool(self):
         from revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
@@ -565,26 +572,27 @@ class TestEnableDisableWithAStoredRefusedOperator:
 
     @pytest.mark.parametrize("operator", list(REJECTED_OPERATORS))
     @pytest.mark.parametrize(
-        ("handler", "expected_enabled"),
-        [("_handle_enable_anomaly", True), ("_handle_disable_anomaly", False)],
+        ("handler", "action"),
+        [("_handle_enable_anomaly", "enable"), ("_handle_disable_anomaly", "disable")],
     )
     @pytest.mark.asyncio
-    async def test_the_call_goes_out_and_names_the_stored_operator(
-        self, operator, handler, expected_enabled
+    async def test_a_stored_refused_operator_is_refused_before_any_request(
+        self, operator, handler, action
     ):
         client = self._client(operator)
 
-        result = await getattr(self._tool(), handler)(client, {"anomaly_id": "anom_1"})
+        with pytest.raises(ToolError) as refusal:
+            await getattr(self._tool(), handler)(client, {"anomaly_id": "anom_1"})
 
-        sent = client.update_anomaly.call_args[0][1]
-        assert sent["enabled"] is expected_enabled
-        assert sent["operatorType"] == operator
-        assert f"stores operatorType {operator}" in result[0].text
+        assert f"stored operatorType {operator} is no longer accepted" in refusal.value.message
+        assert f"before you {action} this alert" in refusal.value.message
+        client.update_anomaly.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_an_ordinary_alert_gets_no_note(self):
+    async def test_an_ordinary_alert_is_enabled(self):
         client = self._client("GREATER_THAN")
 
         result = await self._tool()._handle_enable_anomaly(client, {"anomaly_id": "anom_1"})
 
-        assert "stores operatorType" not in result[0].text
+        assert client.update_anomaly.call_args[0][1]["enabled"] is True
+        assert "Alert Enabled Successfully" in result[0].text

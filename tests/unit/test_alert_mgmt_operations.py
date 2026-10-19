@@ -9,13 +9,21 @@ Covers:
           _handle_toggle_anomaly_status, _handle_get_anomaly_status
 """
 
+import ast
+import re
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from mcp.types import TextContent
 
 from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
+from src.revenium_mcp_server.alerts.anomaly_manager import AnomalyManager
+from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.alert_operators import rejected_operator_message
+from src.revenium_mcp_server.validators import InputValidator
+from tests.unit.anomaly_platform_fake import FakeAnomalyPlatform, answer
 
 
 # ---------------------------------------------------------------------------
@@ -191,38 +199,43 @@ class TestHandleUpdate:
 
     @pytest.mark.asyncio
     async def test_update_dry_run_success(self, alert_mgmt, mock_client):
-        """Dry run returns validation result without calling API."""
+        """Dry run answers through the preview, which runs the update's checks and never writes."""
+        expected = [TextContent(type="text", text="**DRY RUN MODE**")]
+        alert_mgmt.anomaly_manager.preview_update = AsyncMock(return_value=expected)
+        alert_mgmt.anomaly_manager.update_anomaly = AsyncMock()
         result = await alert_mgmt._handle_update(mock_client, {
             "resource_type": "anomalies",
             "dry_run": True,
             "anomaly_id": "123",
             "anomaly_data": {"name": "Test"}
         })
-        text = _text(result)
-        assert "DRY RUN" in text
-        assert "valid" in text.lower()
+        assert result == expected
+        alert_mgmt.anomaly_manager.preview_update.assert_awaited_once_with(
+            mock_client, "123", {"name": "Test"}
+        )
+        alert_mgmt.anomaly_manager.update_anomaly.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_update_dry_run_missing_id(self, alert_mgmt, mock_client):
-        """Dry run with missing anomaly_id returns failure message."""
-        result = await alert_mgmt._handle_update(mock_client, {
-            "resource_type": "anomalies",
-            "dry_run": True,
-            "anomaly_data": {"name": "Test"}
-        })
-        text = _text(result)
-        assert "Missing" in text or "Failed" in text
+        """Dry run with missing anomaly_id is refused like the live update."""
+        with pytest.raises(ToolError) as refusal:
+            await alert_mgmt._handle_update(mock_client, {
+                "resource_type": "anomalies",
+                "dry_run": True,
+                "anomaly_data": {"name": "Test"}
+            })
+        assert refusal.value.field == "anomaly_id"
 
     @pytest.mark.asyncio
     async def test_update_dry_run_missing_data(self, alert_mgmt, mock_client):
-        """Dry run with missing anomaly_data returns failure message."""
-        result = await alert_mgmt._handle_update(mock_client, {
-            "resource_type": "anomalies",
-            "dry_run": True,
-            "anomaly_id": "123"
-        })
-        text = _text(result)
-        assert "Missing" in text or "Failed" in text
+        """Dry run with nothing to change is refused like the live update."""
+        with pytest.raises(ToolError) as refusal:
+            await alert_mgmt._handle_update(mock_client, {
+                "resource_type": "anomalies",
+                "dry_run": True,
+                "anomaly_id": "123"
+            })
+        assert refusal.value.field == "update_data"
 
 
 class TestHandleDelete:
@@ -316,6 +329,165 @@ class TestHandleQuery:
         with pytest.raises(ToolError) as exc_info:
             await alert_mgmt._handle_query(mock_client, {"resource_type": "invalid"})
         assert "invalid" in str(exc_info.value).lower()
+
+
+def _refusing_platform(error):
+    client = MagicMock()
+    client.team_id = "team_test"
+    client.get_alerts = AsyncMock(side_effect=error)
+    tools = AlertManagement()
+    tools.get_client = AsyncMock(return_value=client)
+    return tools, client
+
+
+class TestAlertHistoryRefusalsReachTheCaller:
+    """The platform's reason for refusing an alert history read reaches the caller (BACK-4703)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reason, named, not_named",
+        [
+            (
+                "Invalid date format: 2026-10-01T00:00:00.000Z",
+                "filters.start",
+                "filters.end",
+            ),
+            (
+                "Invalid date format: 2026-10-15T23:59:59.999Z",
+                "filters.end",
+                "filters.start",
+            ),
+            ("Request could not be read", "filters", "filters.start"),
+        ],
+    )
+    async def test_list_platform_refusal_keeps_the_reason_and_names_the_filter(
+        self, reason, named, not_named
+    ):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        tools, _ = _refusing_platform(ReveniumAPIError(f"HTTP 400: {reason}", status_code=400))
+
+        with pytest.raises(ToolError) as exc_info:
+            await tools.handle_action(
+                "list",
+                {
+                    "resource_type": "alerts",
+                    "filters": {"start": "2026-10-01", "end": "2026-10-15"},
+                },
+            )
+
+        message = str(exc_info.value)
+        assert reason in message
+        assert named in message
+        assert not_named not in message
+
+    @pytest.mark.asyncio
+    async def test_query_platform_refusal_keeps_the_reason_and_names_the_filter(self):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        tools, client = _refusing_platform(
+            ReveniumAPIError(
+                "HTTP 400: Invalid date format: 2026-10-01T00:00:00.000Z", status_code=400
+            )
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await tools.handle_action(
+                "query",
+                {
+                    "resource_type": "alerts",
+                    "query": "show high cost alerts",
+                    "filters": {"start": "2026-10-01", "end": "2026-10-15"},
+                },
+            )
+
+        message = str(exc_info.value)
+        assert "Invalid date format" in message
+        assert "filters.start" in message
+        assert client.get_alerts.await_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action, query",
+        [
+            ("query", "show high cost alerts"),
+            ("query", "show alerts in the last 7 days"),
+            ("list", "show alerts in the last 7 days"),
+        ],
+    )
+    async def test_a_refused_window_from_the_question_names_the_query(self, action, query):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        async def refuse_the_start(**sent):
+            raise ReveniumAPIError(f"HTTP 400: Invalid date format: {sent['start']}", status_code=400)
+
+        tools, _ = _refusing_platform(None)
+        client = await tools.get_client()
+        client.get_alerts = AsyncMock(side_effect=refuse_the_start)
+
+        with pytest.raises(ToolError) as exc_info:
+            await tools.handle_action(action, {"resource_type": "alerts", "query": query})
+
+        message = str(exc_info.value)
+        assert "Invalid date format" in message
+        assert "filters.start" not in message
+        assert "(query)" in message
+        assert exc_info.value.field == "query"
+
+    @pytest.mark.asyncio
+    async def test_list_other_platform_errors_keep_their_message(self):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        tools, _ = _refusing_platform(
+            ReveniumAPIError("HTTP 500: Internal Server Error", status_code=500)
+        )
+
+        with pytest.raises(Exception) as exc_info:
+            await tools.handle_action(
+                "list", {"resource_type": "alerts", "filters": {"start": "2026-10-01", "end": "2026-10-15"}}
+            )
+
+        assert "HTTP 500: Internal Server Error" in str(exc_info.value)
+        assert "Failed to list alerts" not in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_platform_refusal_is_sanitized(self):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        tools, _ = _refusing_platform(
+            ReveniumAPIError(
+                "HTTP 400: Invalid date format: 2026-10-01T00:00:00.000Z "
+                "see https://internal.example/x at /srv/app/file.py",
+                status_code=400,
+            )
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await tools.handle_action(
+                "list", {"resource_type": "alerts", "filters": {"start": "2026-10-01", "end": "2026-10-15"}}
+            )
+
+        message = str(exc_info.value)
+        assert "Invalid date format" in message
+        assert "internal.example" not in message
+        assert "/srv/app/file.py" not in message
+
+    @pytest.mark.asyncio
+    async def test_refusal_names_the_filter_as_the_caller_wrote_it(self):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        tools, _ = _refusing_platform(
+            ReveniumAPIError("HTTP 400: Unknown anomaly: rule_5jgY4G", status_code=400)
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await tools.handle_action(
+                "list", {"resource_type": "alerts", "filters": {"anomaly_id": "rule_5jgY4G"}}
+            )
+
+        message = str(exc_info.value)
+        assert "filters.anomaly_id" in message
+        assert "anomalyId" not in message
 
 
 # ===========================================================================
@@ -566,8 +738,10 @@ class TestHandleEnableAllAnomalies:
         ]
         mock_client.get_anomaly_by_id.side_effect = RuntimeError("not found")
 
-        result = await alert_mgmt._handle_enable_all_anomalies(mock_client, {"confirm": True})
-        text = _text(result)
+        flagged, text = await answer(
+            alert_mgmt._handle_enable_all_anomalies(mock_client, {"confirm": True})
+        )
+        assert flagged is True
         assert "Failed" in text
 
     @pytest.mark.asyncio
@@ -651,8 +825,10 @@ class TestHandleDisableAllAnomalies:
         ]
         mock_client.get_anomaly_by_id.side_effect = RuntimeError("not found")
 
-        result = await alert_mgmt._handle_disable_all_anomalies(mock_client, {"confirm": True})
-        text = _text(result)
+        flagged, text = await answer(
+            alert_mgmt._handle_disable_all_anomalies(mock_client, {"confirm": True})
+        )
+        assert flagged is True
         assert "Failed" in text
 
     @pytest.mark.asyncio
@@ -840,6 +1016,7 @@ class TestHandleGetAnomalyStatus:
 # BACK-1136 — periodDuration accepted as flat kwarg on create/update
 # ===========================================================================
 
+@pytest.mark.usefixtures("alert_owner_email")
 class TestPeriodDurationFlatKwarg:
     """Regression for BACK-1136 — periodDuration is documented in get_examples
     but the MCP signature previously omitted it, so the FastMCP-generated
@@ -849,7 +1026,7 @@ class TestPeriodDurationFlatKwarg:
 
     @pytest.mark.asyncio
     async def test_create_injects_flat_period_duration_into_empty_anomaly_data(
-        self, alert_mgmt, mock_client
+        self, alert_mgmt, mock_client, alert_owner_email
     ):
         """A flat periodDuration with no anomaly_data wraps into a dict and
         reaches anomaly_manager.create_anomaly."""
@@ -860,7 +1037,11 @@ class TestPeriodDurationFlatKwarg:
             mock_client, "create", {"periodDuration": "FIFTEEN_MINUTES"}
         )
         called_data = alert_mgmt.anomaly_manager.create_anomaly.call_args[0][1]
-        assert called_data == {"periodDuration": "FIFTEEN_MINUTES"}
+        assert called_data == {
+            "periodDuration": "FIFTEEN_MINUTES",
+            "notificationAddresses": [alert_owner_email],
+            "slackConfigurations": [],
+        }
 
     @pytest.mark.asyncio
     async def test_create_merges_flat_period_duration_when_anomaly_data_lacks_it(
@@ -920,6 +1101,7 @@ class TestPeriodDurationFlatKwarg:
         assert called_data["periodDuration"] == "MONTHLY"
 
 
+@pytest.mark.usefixtures("alert_owner_email")
 class TestTriggerAfterPersistsDurationFlatKwarg:
     """Parallel regression to TestPeriodDurationFlatKwarg: triggerAfterPersistsDuration
     is exposed as a top-level kwarg and documented in get_examples payloads, so a
@@ -928,7 +1110,7 @@ class TestTriggerAfterPersistsDurationFlatKwarg:
 
     @pytest.mark.asyncio
     async def test_create_injects_flat_trigger_into_empty_anomaly_data(
-        self, alert_mgmt, mock_client
+        self, alert_mgmt, mock_client, alert_owner_email
     ):
         """A flat triggerAfterPersistsDuration with no anomaly_data wraps into a dict."""
         alert_mgmt.anomaly_manager.create_anomaly = AsyncMock(
@@ -938,7 +1120,11 @@ class TestTriggerAfterPersistsDurationFlatKwarg:
             mock_client, "create", {"triggerAfterPersistsDuration": "FIFTEEN_MINUTES"}
         )
         called_data = alert_mgmt.anomaly_manager.create_anomaly.call_args[0][1]
-        assert called_data == {"triggerAfterPersistsDuration": "FIFTEEN_MINUTES"}
+        assert called_data == {
+            "triggerAfterPersistsDuration": "FIFTEEN_MINUTES",
+            "notificationAddresses": [alert_owner_email],
+            "slackConfigurations": [],
+        }
 
     @pytest.mark.asyncio
     async def test_create_merges_flat_trigger_when_anomaly_data_lacks_it(
@@ -983,6 +1169,7 @@ class TestTriggerAfterPersistsDurationFlatKwarg:
         assert called_data["triggerAfterPersistsDuration"] == "ONE_HOUR"
 
 
+@pytest.mark.usefixtures("alert_owner_email")
 class TestFlatKwargInjectionPreservesFalsyValues:
     """Regression for code-review feedback (PR #150): the injection guard must
     use `is not None` (not truthiness) so falsy-but-explicitly-passed values
@@ -1031,7 +1218,9 @@ class TestFlatKwargInjectionPreservesFalsyValues:
         assert called_data["triggerAfterPersistsDuration"] == ""
 
     @pytest.mark.asyncio
-    async def test_create_skips_truly_absent_fields(self, alert_mgmt, mock_client):
+    async def test_create_skips_truly_absent_fields(
+        self, alert_mgmt, mock_client, alert_owner_email
+    ):
         """When neither flat kwarg is passed (key absent or None), neither
         is injected — the loop must distinguish absent from explicitly empty."""
         alert_mgmt.anomaly_manager.create_anomaly = AsyncMock(
@@ -1049,7 +1238,11 @@ class TestFlatKwargInjectionPreservesFalsyValues:
         called_data = alert_mgmt.anomaly_manager.create_anomaly.call_args[0][1]
         assert "periodDuration" not in called_data
         assert "triggerAfterPersistsDuration" not in called_data
-        assert called_data == {"name": "Spike"}
+        assert called_data == {
+            "name": "Spike",
+            "notificationAddresses": [alert_owner_email],
+            "slackConfigurations": [],
+        }
 
 
 # ===========================================================================
@@ -1176,6 +1369,7 @@ class TestAlertListPaginationValidation:
         assert_no_framework_leak(exc.value.message)
 
 
+@pytest.mark.usefixtures("alert_owner_email")
 class TestDryRunLiveParity:
     """dry_run must accept-or-reject exactly like live create — a false-green
     dry-run tells the caller a create will succeed when it will 400."""
@@ -1191,16 +1385,18 @@ class TestDryRunLiveParity:
         tools = AlertManagement()
         client = MagicMock()
         tools.get_client = AsyncMock(return_value=client)
-        result = await tools.handle_action(
-            "create",
-            {
-                "dry_run": True,
-                "anomaly_data": {"name": "Spike", "alertType": "THRESHOLD"},
-            },
+        flagged, text = await answer(
+            tools.handle_action(
+                "create",
+                {
+                    "dry_run": True,
+                    "anomaly_data": {"name": "Spike", "alertType": "THRESHOLD"},
+                },
+            )
         )
-        text = result[0].text
+        assert flagged is True
         assert "ready for creation" not in text.lower()
-        assert "detection_rules or direct api format" in text.lower() or "error" in text.lower()
+        assert "detection_rules or direct api format" in text.lower()
 
     @pytest.mark.asyncio
     async def test_dry_run_accepts_payload_live_would_accept(self):
@@ -1230,7 +1426,7 @@ class TestDryRunLiveParity:
 
     @pytest.mark.asyncio
     async def test_dry_run_lets_unexpected_errors_propagate(self):
-        """Only validation failures become 'Dry Run Validation Failed' — a
+        """Only validation failures become a flagged refusal. A
         programming error inside the validator must reach error monitoring."""
         from unittest.mock import patch as _patch
         from src.revenium_mcp_server.tools_decomposed.alert_management import (
@@ -1805,3 +2001,690 @@ class TestHandleGetBudgetProgress:
     async def test_progress_in_supported_actions(self, alert_mgmt):
         actions = await alert_mgmt._get_supported_actions()
         assert "get_budget_progress" in actions
+
+
+VALIDATE_EXAMPLE = {
+    "name": "Validation Test",
+    "metricType": "TOTAL_COST",
+    "threshold": 100,
+    "alertType": "THRESHOLD",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("alert_owner_email")
+class TestValidateChecksWhatCreateChecks:
+    """validate answers what create would answer, without creating anything."""
+
+    @staticmethod
+    def _tools(platform):
+        tools = AlertManagement()
+        tools.get_client = AsyncMock(return_value=platform)
+        return tools
+
+    async def test_validate_answers_valid_for_the_tools_own_example(self):
+        platform = FakeAnomalyPlatform([])
+        flagged, text = await answer(
+            self._tools(platform).handle_action("validate", {"anomaly_data": dict(VALIDATE_EXAMPLE)})
+        )
+
+        assert flagged is False
+        assert '"valid": true' in text
+        assert "test_ucm_integration" not in text
+        assert platform.created_bodies == []
+
+    async def test_validate_refuses_a_blocked_operator_with_the_reason_create_gives(self):
+        platform = FakeAnomalyPlatform([])
+        tools = self._tools(platform)
+        alert = {**VALIDATE_EXAMPLE, "operatorType": "EQUAL_TO"}
+
+        validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(alert)}))
+        created = await answer(tools.handle_action("create", {"anomaly_data": dict(alert)}))
+
+        assert rejected_operator_message("EQUAL_TO") in validated[1]
+        assert rejected_operator_message("EQUAL_TO") in created[1]
+        assert validated[0] == created[0]
+        assert '"valid": true' not in validated[1]
+        assert platform.created_bodies == []
+
+    async def test_validate_refuses_detection_rules_create_cannot_convert(self):
+        platform = FakeAnomalyPlatform([])
+        tools = self._tools(platform)
+        rule = {"rule_type": "THRESHOLD", "metric": "total_cost", "operator": "contains",
+                "value": "openai", "time_window": "15m"}
+        alert = {"name": "Validation Test", "detection_rules": [rule]}
+
+        validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(alert)}))
+        created = await answer(tools.handle_action("create", {"anomaly_data": dict(alert)}))
+
+        assert "Failed to convert to API format" in validated[1]
+        assert "Failed to convert to API format" in created[1]
+        assert validated[0] == created[0]
+        assert '"valid": true' not in validated[1]
+        assert platform.created_bodies == []
+
+    async def test_validate_refuses_detection_rules_that_convert_to_a_short_period(self):
+        platform = FakeAnomalyPlatform([])
+        tools = self._tools(platform)
+        rule = {"rule_type": "THRESHOLD", "metric": "total_cost", "operator": ">", "value": 100,
+                "time_window": "5m"}
+        alert = {"name": "Validation Test", "detection_rules": [rule]}
+
+        validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(alert)}))
+        created = await answer(tools.handle_action("create", {"anomaly_data": dict(alert)}))
+
+        assert validated == created
+        assert validated[0] is True
+        assert "FIFTEEN_MINUTES" in validated[1]
+        assert platform.created_bodies == []
+
+    async def test_validate_and_create_accept_a_detection_rule_with_no_window_at_fifteen_minutes(self):
+        platform = FakeAnomalyPlatform([])
+        tools = self._tools(platform)
+        rule = {"rule_type": "THRESHOLD", "metric": "total_cost", "operator": ">", "value": 100}
+        alert = {"name": "Validation Test", "detection_rules": [rule]}
+
+        validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(alert)}))
+        await tools.handle_action("create", {"anomaly_data": dict(alert)})
+
+        assert validated[0] is False
+        assert '"periodDuration": "FIFTEEN_MINUTES"' in validated[1]
+        assert platform.created_bodies[-1]["periodDuration"] == "FIFTEEN_MINUTES"
+
+    async def test_validate_refuses_a_period_create_refuses(self):
+        platform = FakeAnomalyPlatform([])
+        tools = self._tools(platform)
+        alert = {**VALIDATE_EXAMPLE, "periodDuration": "FIVE_MINUTES"}
+
+        validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(alert)}))
+        created = await answer(tools.handle_action("create", {"anomaly_data": dict(alert)}))
+
+        assert validated == created
+        assert validated[0] is True
+        assert platform.created_bodies == []
+
+    async def test_validate_without_an_alert_carries_the_error_flag(self):
+        tools = self._tools(FakeAnomalyPlatform([]))
+
+        with pytest.raises(ToolError) as refusal:
+            await tools.handle_action("validate", {})
+
+        assert refusal.value.field == "anomaly_data"
+
+
+class TestPrepareCreateRefusesEveryShortPeriod:
+    """prepare_create applies the short-period rule to every input shape it accepts."""
+
+    def test_a_direct_format_body_with_a_five_minute_period_is_refused(self):
+        alert = {**VALIDATE_EXAMPLE, "operatorType": "GREATER_THAN", "periodDuration": "FIVE_MINUTES"}
+
+        with pytest.raises(ToolError) as refusal:
+            AnomalyManager().prepare_create(alert, "team")
+
+        assert refusal.value.field == "periodDuration"
+
+    def test_a_budget_body_with_a_five_minute_period_is_refused_too(self):
+        alert = {
+            **VALIDATE_EXAMPLE,
+            "alertType": "CUMULATIVE_USAGE",
+            "operatorType": "GREATER_THAN",
+            "periodDuration": "FIVE_MINUTES",
+        }
+
+        with pytest.raises(ToolError) as refusal:
+            AnomalyManager().prepare_create(alert, "team")
+
+        assert refusal.value.field == "periodDuration"
+
+
+@pytest.mark.parametrize(
+    "notification_fields, expected_slack",
+    [
+        ({"slackConfigurations": ["slack_1"]}, ["slack_1"]),
+        ({"slack_configurations": ["slack_1"]}, ["slack_1"]),
+        ({"slackConfigId": "slack_1"}, ["slack_1"]),
+    ],
+    ids=["slackConfigurations", "slack_configurations", "slackConfigId"],
+)
+def test_detection_rules_create_sends_the_recipients_and_slack_it_was_given(
+    notification_fields, expected_slack
+):
+    """BACK-4799: a detection_rules create keeps the recipients and Slack channel it names."""
+    alert = {
+        "name": "alert-create-recipients-and-text-rules",
+        "detection_rules": [
+            {"rule_type": "THRESHOLD", "metric": "total_cost", "operator": ">",
+             "value": 5, "time_window": "15m"}
+        ],
+        "notificationAddresses": ["a@b.test"],
+        **notification_fields,
+    }
+
+    api_data = AnomalyManager().prepare_create(alert, "team")
+
+    assert api_data["notificationAddresses"] == ["a@b.test"]
+    assert api_data["slackConfigurations"] == expected_slack
+
+
+ALERT_TOOL_SOURCES = (
+    "src/revenium_mcp_server/tools_decomposed/alert_management.py",
+    "src/revenium_mcp_server/alerts/anomaly_manager.py",
+)
+# Calls the alert tool's text may name that are not its own actions: other MCP tools.
+OTHER_TOOL_CALLS = frozenset({"slack_management"})
+ACTION_CALL = re.compile(r"\b([a-z][a-z_]*)\(")
+
+
+class _RefusingPlatform(FakeAnomalyPlatform):
+    async def create_anomaly(self, body):
+        raise ReveniumAPIError("platform said no", status_code=500)
+
+
+@pytest.mark.asyncio
+class TestBudgetAlertErrorNamesRealActions:
+    async def test_a_failed_budget_alert_suggests_only_listed_actions_and_arguments(self):
+        tools = AlertManagement()
+        tools.get_client = AsyncMock(return_value=_RefusingPlatform([]))
+
+        _, text = await answer(
+            tools.handle_action(
+                "create_cumulative_usage_alert",
+                {"name": "Budget", "threshold": 1000, "period": "monthly", "email": "ops@example.com"},
+            )
+        )
+
+        assert "platform said no" in text
+        supported = set(await tools._get_supported_actions())
+        assert set(ACTION_CALL.findall(text)) <= supported
+        assert "alert_data" not in text
+
+
+@pytest.mark.asyncio
+class TestNoPublishedStringNamesAMissingAction:
+    async def test_no_published_string_names_an_action_the_tool_lacks(self):
+        supported = set(await AlertManagement()._get_supported_actions())
+        named = set()
+        for path in ALERT_TOOL_SOURCES:
+            with open(path, encoding="utf-8") as source:
+                tree = ast.parse(source.read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    named.update(ACTION_CALL.findall(node.value))
+
+        assert named - OTHER_TOOL_CALLS - supported == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("alert_owner_email")
+class TestBudgetAlertsKeepTheFifteenMinuteFloor:
+    """The platform refuses a check period under 15 minutes on budget alerts too."""
+
+    BUDGET = {
+        "name": "Budget check",
+        "metricType": "TOTAL_COST",
+        "threshold": 1000,
+        "alertType": "CUMULATIVE_USAGE",
+        "periodDuration": "FIVE_MINUTES",
+    }
+
+    async def test_validate_and_create_refuse_a_five_minute_budget_alert_alike(self):
+        platform = FakeAnomalyPlatform([])
+        tools = AlertManagement()
+        tools.get_client = AsyncMock(return_value=platform)
+
+        validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(self.BUDGET)}))
+        created = await answer(tools.handle_action("create", {"anomaly_data": dict(self.BUDGET)}))
+
+        assert validated == created
+        assert validated[0] is True
+        assert "DAILY, WEEKLY, MONTHLY, QUARTERLY" in validated[1]
+        assert "FIFTEEN_MINUTES or longer" not in validated[1]
+        assert platform.created_bodies == []
+
+    async def test_a_create_that_skips_the_tool_assembly_is_refused_too(self):
+        platform = FakeAnomalyPlatform([])
+        tools = AlertManagement()
+
+        with pytest.raises(ToolError) as refusal:
+            await tools.anomaly_manager.create_anomaly(platform, dict(self.BUDGET))
+
+        assert refusal.value.field == "periodDuration"
+        assert platform.created_bodies == []
+
+    @pytest.mark.parametrize("period", ["FIFTEEN_MINUTES", "THIRTY_MINUTES", "ONE_HOUR"])
+    async def test_validate_and_create_refuse_a_budget_period_shorter_than_a_day_alike(self, period):
+        platform = FakeAnomalyPlatform([])
+        tools = AlertManagement()
+        tools.get_client = AsyncMock(return_value=platform)
+        alert = {**self.BUDGET, "periodDuration": period}
+
+        validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(alert)}))
+        created = await answer(tools.handle_action("create", {"anomaly_data": dict(alert)}))
+
+        assert validated == created
+        assert validated[0] is True
+        assert "DAILY, WEEKLY, MONTHLY, QUARTERLY" in validated[1]
+        assert platform.created_bodies == []
+
+    async def test_a_daily_budget_alert_is_valid(self):
+        platform = FakeAnomalyPlatform([])
+        tools = AlertManagement()
+        tools.get_client = AsyncMock(return_value=platform)
+        alert = {**self.BUDGET, "periodDuration": "DAILY"}
+
+        flagged, text = await answer(tools.handle_action("validate", {"anomaly_data": alert}))
+
+        assert flagged is False
+        assert '"valid": true' in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("alert_owner_email")
+class TestTwentyFourHoursIsNotAPeriod:
+    """The platform has no TWENTY_FOUR_HOURS tracking period; a day is DAILY."""
+
+    async def test_validate_and_create_refuse_twenty_four_hours_alike(self):
+        platform = FakeAnomalyPlatform([])
+        tools = AlertManagement()
+        tools.get_client = AsyncMock(return_value=platform)
+        alert = {**VALIDATE_EXAMPLE, "periodDuration": "TWENTY_FOUR_HOURS"}
+
+        validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(alert)}))
+        created = await answer(tools.handle_action("create", {"anomaly_data": dict(alert)}))
+
+        assert validated == created
+        assert validated[0] is True
+        assert "DAILY" in validated[1]
+        assert '"valid": true' not in validated[1]
+        assert platform.created_bodies == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("alert_owner_email")
+class TestValidateRefusesPeriodsThePlatformHasNot:
+    """validate and create agree with the platform on every converted or sent period."""
+
+    @staticmethod
+    def _tools(platform):
+        tools = AlertManagement()
+        tools.get_client = AsyncMock(return_value=platform)
+        return tools
+
+    @staticmethod
+    def _rule_alert(time_window):
+        rule = {"rule_type": "THRESHOLD", "metric": "total_cost", "operator": ">",
+                "value": 100, "time_window": time_window}
+        return {"name": "Validation Test", "detection_rules": [rule]}
+
+    async def test_a_one_day_time_window_becomes_daily(self):
+        platform = FakeAnomalyPlatform([])
+        tools = self._tools(platform)
+
+        validated = await answer(
+            tools.handle_action("validate", {"anomaly_data": self._rule_alert("1d")})
+        )
+        await tools.handle_action("create", {"anomaly_data": self._rule_alert("1d")})
+
+        assert validated[0] is False
+        assert '"periodDuration": "DAILY"' in validated[1]
+        assert platform.created_bodies[-1]["periodDuration"] == "DAILY"
+
+    @pytest.mark.parametrize("time_window", ["2h", "4h", "8h"])
+    async def test_a_time_window_with_no_platform_period_is_refused_by_validate_and_create(
+        self, time_window
+    ):
+        platform = FakeAnomalyPlatform([])
+        tools = self._tools(platform)
+
+        validated = await answer(
+            tools.handle_action("validate", {"anomaly_data": self._rule_alert(time_window)})
+        )
+        created = await answer(
+            tools.handle_action("create", {"anomaly_data": self._rule_alert(time_window)})
+        )
+
+        assert validated == created
+        assert validated[0] is True
+        assert '"valid": true' not in validated[1]
+        assert "15m" in validated[1] and "1d" in validated[1]
+        assert platform.created_bodies == []
+
+    async def test_a_provider_threshold_alert_under_a_day_is_refused_by_validate_and_create(self):
+        platform = FakeAnomalyPlatform([])
+        tools = self._tools(platform)
+        alert = {**VALIDATE_EXAMPLE, "dataSource": "PROVIDER", "periodDuration": "FIFTEEN_MINUTES"}
+
+        validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(alert)}))
+        created = await answer(tools.handle_action("create", {"anomaly_data": dict(alert)}))
+
+        assert validated == created
+        assert validated[0] is True
+        assert "DAILY, WEEKLY, MONTHLY" in validated[1]
+        assert platform.created_bodies == []
+
+    async def test_a_provider_threshold_alert_at_daily_is_valid(self):
+        platform = FakeAnomalyPlatform([])
+        alert = {**VALIDATE_EXAMPLE, "dataSource": "PROVIDER", "periodDuration": "DAILY"}
+
+        validated = await answer(
+            self._tools(platform).handle_action("validate", {"anomaly_data": dict(alert)})
+        )
+
+        assert validated[0] is False
+        assert '"valid": true' in validated[1]
+
+    @pytest.mark.parametrize("period", ["daily", "ONE_DAY", "TWO_HOURS"])
+    async def test_a_period_the_platform_has_no_name_for_is_refused_by_validate_and_create(
+        self, period
+    ):
+        platform = FakeAnomalyPlatform([])
+        tools = self._tools(platform)
+        alert = {**VALIDATE_EXAMPLE, "periodDuration": period}
+
+        validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(alert)}))
+        created = await answer(tools.handle_action("create", {"anomaly_data": dict(alert)}))
+
+        assert validated == created
+        assert validated[0] is True
+        assert platform.created_bodies == []
+
+
+class TestAPeriodRefusalSuggestsOnlyPeriodsCreateAccepts:
+    def test_every_period_the_five_minute_refusal_names_is_one_create_accepts(self):
+        alert = {**VALIDATE_EXAMPLE, "operatorType": "GREATER_THAN", "periodDuration": "FIVE_MINUTES"}
+        with pytest.raises(ToolError) as refusal:
+            AnomalyManager().prepare_create(alert, "team")
+        suggested = re.findall(r"\b[A-Z]+(?:_[A-Z]+)+\b|\b(?:DAILY|WEEKLY|MONTHLY|QUARTERLY)\b",
+                               " ".join(refusal.value.suggestions or []))
+
+        assert suggested
+        for period in set(suggested) - {"FIVE_MINUTES"}:
+            AnomalyManager().prepare_create({**alert, "periodDuration": period}, "team")
+
+
+@pytest.mark.asyncio
+async def test_the_period_help_names_the_provider_periods_and_no_period_create_refuses():
+    schema = await AlertManagement()._get_input_schema()
+    help_text = schema["properties"]["periodDuration"]["description"]
+
+    assert "dataSource PROVIDER takes DAILY, WEEKLY, MONTHLY only" in help_text
+    listed = re.search(r"\(([A-Z_, ]+)\)", help_text).group(1).split(", ")
+    assert "THIRTY_DAYS" in listed
+    for period in listed:
+        AnomalyManager().prepare_create(
+            {**VALIDATE_EXAMPLE, "operatorType": "GREATER_THAN", "periodDuration": period}, "team"
+        )
+
+
+PROVIDER_TYPE_RULE = "a provider-sourced alert takes THRESHOLD or CUMULATIVE_USAGE only"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("alert_owner_email")
+class TestValidateAgreesWithCreateOnTheDataSource:
+    """validate refuses the data source create refuses, before anything reaches the platform."""
+
+    @staticmethod
+    def _tools(platform):
+        tools = AlertManagement()
+        tools.get_client = AsyncMock(return_value=platform)
+        return tools
+
+    @pytest.mark.parametrize("period", ["DAILY", "WEEKLY", "MONTHLY", "FIFTEEN_MINUTES"])
+    async def test_a_provider_relative_change_alert_is_refused_by_validate_and_create(self, period):
+        platform = FakeAnomalyPlatform([])
+        tools = self._tools(platform)
+        alert = {
+            **VALIDATE_EXAMPLE,
+            "alertType": "RELATIVE_CHANGE",
+            "dataSource": "PROVIDER",
+            "periodDuration": period,
+        }
+
+        validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(alert)}))
+        created = await answer(tools.handle_action("create", {"anomaly_data": dict(alert)}))
+
+        assert validated == created
+        assert validated[0] is True
+        assert PROVIDER_TYPE_RULE in validated[1]
+        assert "DAILY, WEEKLY, MONTHLY" not in validated[1]
+        assert '"valid": true' not in validated[1]
+        assert platform.created_bodies == []
+
+    @pytest.mark.parametrize("data_source", ["provider", "sdk", "Provider", "API"])
+    async def test_a_data_source_other_than_sdk_or_provider_is_refused_by_validate_and_create(
+        self, data_source
+    ):
+        platform = FakeAnomalyPlatform([])
+        tools = self._tools(platform)
+        alert = {**VALIDATE_EXAMPLE, "dataSource": data_source, "periodDuration": "DAILY"}
+
+        validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(alert)}))
+        created = await answer(tools.handle_action("create", {"anomaly_data": dict(alert)}))
+
+        assert validated == created
+        assert validated[0] is True
+        assert "SDK" in validated[1] and "PROVIDER" in validated[1]
+        assert '"valid": true' not in validated[1]
+        assert platform.created_bodies == []
+
+    @pytest.mark.parametrize("data_source", ["SDK", "PROVIDER"])
+    async def test_an_exact_data_source_is_valid(self, data_source):
+        platform = FakeAnomalyPlatform([])
+        alert = {**VALIDATE_EXAMPLE, "dataSource": data_source, "periodDuration": "DAILY"}
+
+        validated = await answer(
+            self._tools(platform).handle_action("validate", {"anomaly_data": dict(alert)})
+        )
+
+        assert validated[0] is False
+        assert '"valid": true' in validated[1]
+
+
+class TestATimeWindowRefusalSuggestsOnlyWindowsTheRuleAccepts:
+    @staticmethod
+    def _rule(time_window):
+        return {"rule_type": "THRESHOLD", "metric": "total_cost", "operator": ">",
+                "value": 100, "time_window": time_window}
+
+    def test_every_window_the_threshold_refusal_names_passes_the_rule_check(self):
+        with pytest.raises(ToolError) as refusal:
+            AnomalyManager().prepare_create(
+                {"name": "Validation Test", "detection_rules": [self._rule("2h")]}, "team"
+            )
+        suggested = refusal.value.suggestions[0].split(": ", 1)[1].split(", ")
+
+        assert suggested
+        for window in suggested:
+            InputValidator.validate_detection_rule(self._rule(window))
+
+
+RELATIVE_CHANGE_ALERT = {
+    "name": "Provider change",
+    "metricType": "TOTAL_COST",
+    "threshold": 20,
+    "alertType": "RELATIVE_CHANGE",
+    "operatorType": "INCREASES_BY",
+    "dataSource": "PROVIDER",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("alert_owner_email")
+class TestPlatformPeriodRulesForDataSources:
+    """The platform has no period for a relative-change alert on a provider source, and takes dataSource in upper case."""
+
+    @staticmethod
+    async def _validate_and_create(alert):
+        platform = FakeAnomalyPlatform([])
+        tools = AlertManagement()
+        tools.get_client = AsyncMock(return_value=platform)
+        validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(alert)}))
+        created = await answer(tools.handle_action("create", {"anomaly_data": dict(alert)}))
+        return validated, created, platform
+
+    @pytest.mark.parametrize("period", [None, "DAILY", "WEEKLY", "MONTHLY"])
+    async def test_a_provider_relative_change_alert_is_refused_with_the_platform_rule(self, period):
+        alert = dict(RELATIVE_CHANGE_ALERT)
+        if period:
+            alert["periodDuration"] = period
+
+        validated, created, platform = await self._validate_and_create(alert)
+
+        assert validated == created
+        assert validated[0] is True
+        assert "RELATIVE_CHANGE" in validated[1] and "PROVIDER" in validated[1]
+        assert '"valid": true' not in validated[1]
+        assert platform.created_bodies == []
+
+    async def test_a_relative_change_alert_without_a_provider_source_is_valid(self):
+        alert = {key: value for key, value in RELATIVE_CHANGE_ALERT.items() if key != "dataSource"}
+
+        flagged, text = (await self._validate_and_create(alert))[0]
+
+        assert flagged is False
+        assert '"valid": true' in text
+
+    async def test_a_lower_case_data_source_is_refused_naming_the_upper_case_one(self):
+        alert = {**VALIDATE_EXAMPLE, "operatorType": "GREATER_THAN", "dataSource": "provider",
+                 "periodDuration": "DAILY"}
+
+        validated, created, platform = await self._validate_and_create(alert)
+
+        assert validated == created
+        assert validated[0] is True
+        assert "PROVIDER" in validated[1]
+        assert platform.created_bodies == []
+
+    async def test_a_threshold_window_refusal_suggests_only_windows_a_threshold_rule_takes(self):
+        rule = {"rule_type": "THRESHOLD", "metric": "total_cost", "operator": ">", "value": 100,
+                "time_window": "2h"}
+
+        validated, created, _ = await self._validate_and_create(
+            {"name": "Validation Test", "detection_rules": [rule]}
+        )
+
+        assert validated[0] == created[0]
+        assert "time_window 2h" in validated[1]
+        assert "1h" in validated[1]
+        for calendar_name in ("daily", "weekly", "monthly", "quarterly"):
+            assert calendar_name not in validated[1]
+
+
+PROVIDER_THRESHOLD_ALERT = {
+    **VALIDATE_EXAMPLE,
+    "operatorType": "GREATER_THAN",
+    "dataSource": "PROVIDER",
+    "periodDuration": "DAILY",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("alert_owner_email")
+class TestValidateAgreesWithCreateOnTheProviderMetricAndFilters:
+    """A provider alert takes only the platform's provider metrics and filter dimensions."""
+
+    @staticmethod
+    async def _validate_and_create(alert):
+        platform = FakeAnomalyPlatform([])
+        tools = AlertManagement()
+        tools.get_client = AsyncMock(return_value=platform)
+        validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(alert)}))
+        created = await answer(tools.handle_action("create", {"anomaly_data": dict(alert)}))
+        return validated, created, platform
+
+    @pytest.mark.parametrize(
+        "alert_type, metric",
+        [
+            ("THRESHOLD", "ERROR_RATE"),
+            ("THRESHOLD", "COST_PER_TRANSACTION"),
+            ("THRESHOLD", "CACHED_TOKEN_COUNT"),
+            ("CUMULATIVE_USAGE", "ERROR_RATE"),
+        ],
+    )
+    async def test_a_provider_alert_on_a_metric_the_platform_refuses_is_refused_by_validate_and_create(
+        self, alert_type, metric
+    ):
+        alert = {**PROVIDER_THRESHOLD_ALERT, "alertType": alert_type, "metricType": metric}
+
+        validated, created, platform = await self._validate_and_create(alert)
+
+        assert validated == created
+        assert validated[0] is True
+        assert f"metricType {metric} is not supported for provider alerts" in validated[1]
+        assert '"valid": true' not in validated[1]
+        assert platform.created_bodies == []
+
+    @pytest.mark.parametrize("dimension", ["ORGANIZATION", "AGENT"])
+    async def test_a_provider_alert_on_a_filter_dimension_the_platform_refuses_is_refused_by_validate_and_create(
+        self, dimension
+    ):
+        alert = {
+            **PROVIDER_THRESHOLD_ALERT,
+            "filters": [{"dimension": dimension, "operator": "IS", "value": "x"}],
+        }
+
+        validated, created, platform = await self._validate_and_create(alert)
+
+        assert validated == created
+        assert validated[0] is True
+        assert f"filter dimension {dimension} is not supported for provider alerts" in validated[1]
+        assert "WORKSPACE, API_KEY, MODEL or PROVIDER" in validated[1]
+        assert '"valid": true' not in validated[1]
+        assert platform.created_bodies == []
+
+    @pytest.mark.parametrize(
+        "metric", ["TOTAL_COST", "TOKEN_COUNT", "INPUT_TOKEN_COUNT", "OUTPUT_TOKEN_COUNT"]
+    )
+    async def test_a_provider_alert_on_every_provider_metric_is_valid(self, metric):
+        alert = {**PROVIDER_THRESHOLD_ALERT, "metricType": metric}
+
+        flagged, text = (await self._validate_and_create(alert))[0]
+
+        assert flagged is False
+        assert '"valid": true' in text
+
+    @pytest.mark.parametrize("dimension", ["WORKSPACE", "API_KEY", "MODEL", "PROVIDER"])
+    async def test_a_provider_alert_on_every_provider_filter_dimension_is_valid(self, dimension):
+        alert = {
+            **PROVIDER_THRESHOLD_ALERT,
+            "filters": [{"dimension": dimension, "operator": "IS", "value": "x"}],
+        }
+
+        flagged, text = (await self._validate_and_create(alert))[0]
+
+        assert flagged is False
+        assert '"valid": true' in text
+
+    async def test_an_sdk_alert_on_a_metric_providers_refuse_is_still_valid(self):
+        alert = {**PROVIDER_THRESHOLD_ALERT, "dataSource": "SDK", "metricType": "ERROR_RATE",
+                 "periodDuration": "ONE_HOUR"}
+
+        flagged, text = (await self._validate_and_create(alert))[0]
+
+        assert flagged is False
+        assert '"valid": true' in text
+
+    async def test_a_null_data_source_is_accepted_by_validate_and_create(self):
+        alert = {**PROVIDER_THRESHOLD_ALERT, "dataSource": None, "periodDuration": "ONE_HOUR"}
+
+        validated, created, platform = await self._validate_and_create(alert)
+
+        assert validated[0] is False
+        assert '"valid": true' in validated[1]
+        assert created[0] is False
+        assert len(platform.created_bodies) == 1
+
+
+def test_the_api_key_filter_guidance_names_exactly_the_provider_lists():
+    from src.revenium_mcp_server.alerts.update_fidelity import (
+        PROVIDER_FILTER_DIMENSIONS,
+        PROVIDER_METRICS,
+    )
+    from src.revenium_mcp_server.tools_decomposed.alert_management import (
+        API_KEY_FILTER_GUIDANCE,
+    )
+
+    for name in (*PROVIDER_METRICS, *PROVIDER_FILTER_DIMENSIONS):
+        assert name in API_KEY_FILTER_GUIDANCE
+    assert "a token metric" not in API_KEY_FILTER_GUIDANCE

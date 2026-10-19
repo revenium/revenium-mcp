@@ -460,3 +460,51 @@ async def test_override_with_none_team_ids_claim_fails_closed():
     ):
         with pytest.raises(PermissionError, match="not available"):
             await mw.on_call_tool(MagicMock(), call_next)
+
+
+@pytest.mark.asyncio
+async def test_a_platform_lockout_at_sign_in_is_answered_429_with_the_wait(lockout_clock):
+    """BACK-4717: the HTTP answer names the platform's wait, not a bad token."""
+    import httpx
+    from fastmcp.server.auth.middleware import RequireAuthMiddleware
+    from starlette.applications import Starlette
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
+
+    from src.revenium_mcp_server.auth.api_key_validator import ApiKeyValidator
+
+    platform = MagicMock()
+    platform.get = AsyncMock(
+        return_value=httpx.Response(
+            429,
+            text="Too many failed requests. Please retry after 42 seconds.",
+            request=httpx.Request("GET", "https://platform.test/users/me"),
+        )
+    )
+    verifier = ApiKeyTokenVerifier(
+        validator=ApiKeyValidator(platform_base_url="https://platform.test"),
+        base_url="https://mcp.test.io",
+    )
+
+    async def _tool(scope, receive, send):
+        await PlainTextResponse("tool ran")(scope, receive, send)
+
+    app = Starlette(
+        routes=[Route("/mcp", RequireAuthMiddleware(_tool, required_scopes=[]))],
+        middleware=verifier.get_middleware(),
+    )
+    with patch(
+        "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
+        return_value=platform,
+    ):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="https://mcp.test.io"
+        ) as http:
+            response = await http.get(
+                "/mcp", headers={"Authorization": "Bearer rev_rk_abcdef123456"}
+            )
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "42"
+    assert "42 seconds" in response.text
+    assert "tool ran" not in response.text

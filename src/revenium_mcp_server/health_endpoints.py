@@ -6,6 +6,13 @@ These endpoints are auth-exempt by FastMCP design: custom routes added via
 ``register_health_endpoints(mcp)`` once during server construction is enough;
 no extra opt-out is required for clerk mode.
 
+``/ready`` answers for the server itself. ``/health`` is liveness and always
+answers 200 without waiting on any external call; its body also reports the
+platform's answer to a keyless HEAD of the platform root
+(``_last_platform_probe``, rendered by ``_platform_state``) in every auth
+mode, refreshing it in the background when stale (``_kick_refresh``). That
+refresh never sends a key. The platform's status code never affects readiness.
+
 In stdio mode the routes are registered but never reachable (no HTTP server
 binds). This matches FastMCP's native pattern and keeps
 ``create_enhanced_server`` free of transport branching.
@@ -16,7 +23,8 @@ import asyncio
 import os
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -40,6 +48,8 @@ class _ProbeResult:
     ok: bool
     reason: str | None  # None when ok=True
     expires_at: float  # time.monotonic() ceiling for this cached result
+    status_code: int | None = None  # platform HTTP answer; None when unanswered
+    checked_at: float | None = None  # time.time() of the probe, for /health
 
 
 # Module-level cache state. Tests zero this via the reset_health_cache
@@ -47,34 +57,51 @@ class _ProbeResult:
 # thundering-herd probes when TTL expires under concurrent traffic.
 _last_probe: _ProbeResult | None = None
 _probe_lock = asyncio.Lock()
+_last_platform_probe: _ProbeResult | None = None
+# Held so the background refresh /health starts is not garbage-collected.
+_refresh_task: asyncio.Task[_ProbeResult] | None = None
 
 
 def _expires_at() -> float:
     return time.monotonic() + PROBE_TTL_SECONDS
 
 
+def _failed(reason: str) -> _ProbeResult:
+    return _ProbeResult(False, reason, _expires_at(), checked_at=time.time())
+
+
 async def _probe_platform_reachable() -> _ProbeResult:
     """HEAD the platform base URL with a tight timeout. No key required.
 
-    Any HTTP response (even 401/404) proves the host is reachable, which is all
-    readiness needs in api_key mode (per-request keys are validated per call).
+    Any HTTP response (even 401/404/5xx) proves the host is reachable, which is
+    all readiness needs in api_key mode (per-request keys are validated per
+    call). Every result is recorded in ``_last_platform_probe`` for /health;
+    the status code never affects readiness.
     """
+    global _last_platform_probe
+    _last_platform_probe = await _head_platform()
+    return _last_platform_probe
+
+
+async def _head_platform() -> _ProbeResult:
     base = os.getenv("REVENIUM_BASE_URL", "").strip().rstrip("/")
     if not base:
-        return _ProbeResult(False, _REASON_UNREACHABLE, _expires_at())
+        return _failed(_REASON_UNREACHABLE)
 
     from .client import get_shared_http_client
 
     try:
-        await asyncio.wait_for(
+        response = await asyncio.wait_for(
             get_shared_http_client().head(base),
             timeout=PROBE_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
-        return _ProbeResult(False, _REASON_TIMEOUT, _expires_at())
+        return _failed(_REASON_TIMEOUT)
     except Exception:
-        return _ProbeResult(False, _REASON_UNREACHABLE, _expires_at())
-    return _ProbeResult(True, None, _expires_at())
+        return _failed(_REASON_UNREACHABLE)
+    return _ProbeResult(
+        True, None, _expires_at(), response.status_code, time.time()
+    )
 
 
 async def _probe_revenium() -> _ProbeResult:
@@ -98,19 +125,18 @@ async def _probe_revenium() -> _ProbeResult:
             timeout=PROBE_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
-        return _ProbeResult(False, _REASON_TIMEOUT, _expires_at())
+        return _failed(_REASON_TIMEOUT)
     except Exception:
         # Defence in depth: validate_api_key already classifies HTTP/connect
         # errors into the dict it returns. Reaching this branch means
         # something more fundamental broke (DNS, TLS, library bug,
         # misconfigured client). Treat as unreachable.
-        return _ProbeResult(False, _REASON_UNREACHABLE, _expires_at())
+        return _failed(_REASON_UNREACHABLE)
 
     if result["valid"]:
-        return _ProbeResult(True, None, _expires_at())
+        return _ProbeResult(True, None, _expires_at(), checked_at=time.time())
     status = result.get("status_code")
-    reason = _REASON_AUTH if status in (401, 403) else _REASON_UNREACHABLE
-    return _ProbeResult(False, reason, _expires_at())
+    return _failed(_REASON_AUTH if status in (401, 403) else _REASON_UNREACHABLE)
 
 
 async def _get_ready_status() -> _ProbeResult:
@@ -121,14 +147,56 @@ async def _get_ready_status() -> _ProbeResult:
     one probe.
     """
     global _last_probe
-    now = time.monotonic()
-    if _last_probe is not None and _last_probe.expires_at > now:
+    if _is_fresh(_last_probe):
         return _last_probe
     async with _probe_lock:
-        if _last_probe is not None and _last_probe.expires_at > time.monotonic():
+        if _is_fresh(_last_probe):
             return _last_probe
         _last_probe = await _probe_revenium()
         return _last_probe
+
+
+def _is_fresh(probe: _ProbeResult | None) -> TypeGuard[_ProbeResult]:
+    return probe is not None and probe.expires_at > time.monotonic()
+
+
+def _platform_state(probe: _ProbeResult | None) -> dict[str, Any]:
+    """The platform's state as last seen by the keyless HEAD, for /health.
+
+    Exposes only the status code, the time and the closed reason enum; never
+    the base URL or any error text.
+    """
+    if probe is None or probe.checked_at is None:
+        return {
+            "status_code": None,
+            "checked_at": None,
+            "age_seconds": None,
+            "error": None,
+        }
+    return {
+        "status_code": probe.status_code,
+        "checked_at": datetime.fromtimestamp(
+            probe.checked_at, tz=timezone.utc
+        ).isoformat(),
+        "age_seconds": round(time.time() - probe.checked_at, 1),
+        "error": probe.reason if probe.status_code is None else None,
+    }
+
+
+def _retrieve_refresh_exception(task: asyncio.Task[_ProbeResult]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+def _kick_refresh() -> None:
+    """Start one background keyless HEAD unless one is already running."""
+    global _refresh_task
+    if _refresh_task is not None and not _refresh_task.done():
+        return
+    _refresh_task = asyncio.get_running_loop().create_task(
+        _probe_platform_reachable()
+    )
+    _refresh_task.add_done_callback(_retrieve_refresh_exception)
 
 
 def register_health_endpoints(mcp: "FastMCP") -> None:
@@ -141,7 +209,10 @@ def register_health_endpoints(mcp: "FastMCP") -> None:
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request: Request) -> Response:
-        return JSONResponse({"status": "healthy"})
+        probe = _last_platform_probe
+        if not _is_fresh(probe):
+            _kick_refresh()
+        return JSONResponse({"status": "healthy", "platform": _platform_state(probe)})
 
     @mcp.custom_route("/ready", methods=["GET"])
     async def ready(request: Request) -> Response:

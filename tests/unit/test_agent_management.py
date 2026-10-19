@@ -19,6 +19,7 @@ from src.revenium_mcp_server.tools_decomposed.agent_management import (
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from mcp.types import TextContent
+from tests.unit._helpers_list_heading import LIST_HEADING_CASES, heading_and_body, rows
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +489,25 @@ class TestAgentManagementActions:
         assert "list_discovered" in exc_info.value.message
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("page_info, row_count, page, heading, total", LIST_HEADING_CASES)
+    async def test_list_heading_counts_the_page_against_the_platform_total(
+        self, agent_mgmt, mock_client, page_info, row_count, page, heading, total
+    ):
+        """The heading counts the page against the platform total, not the rows alone."""
+        mock_client._extract_embedded_data.return_value = rows(row_count)
+        mock_client._extract_pagination_info.return_value = page_info
+        mock_client.get_agents.return_value = {}
+        agent_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await agent_mgmt.handle_action("list", {"page": page, "size": 20})
+
+        shown_heading, body = heading_and_body(result[0].text)
+        assert shown_heading == heading.format(noun="agents")
+        assert body["total_records"] == total
+        assert body["page"] == page
+        assert body["total_found"] == row_count
+
+    @pytest.mark.asyncio
     async def test_list_action_formats_result(self, agent_mgmt, mock_client):
         mock_client._extract_embedded_data.return_value = [{"id": "agt_1"}]
         mock_client._extract_pagination_info.return_value = {"totalPages": 1, "totalElements": 1}
@@ -496,7 +516,7 @@ class TestAgentManagementActions:
 
         result = await agent_mgmt.handle_action("list", {"page": 0, "size": 20})
 
-        assert "Found 1 agents" in result[0].text
+        assert result[0].text.startswith("Found 1 of 1 agents (page 1 of 1):\n\n")
 
     @pytest.mark.asyncio
     async def test_tool_error_propagates(self, agent_mgmt, mock_client):

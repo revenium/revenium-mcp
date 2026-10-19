@@ -42,7 +42,7 @@ class AuthLoggingOIDCProxy(OIDCProxy):
         NOTE: This overrides a FastMCP-internal method
         (``OAuthProxy._uses_alternate_verification``) and relies on FastMCP
         calling it to decide whether to swap the validated AccessToken back to
-        the upstream access token. Verified against fastmcp >=3.2.0,<4.0.0;
+        the upstream access token. Verified against fastmcp 3.2.0 through 4.0.10;
         revisit on FastMCP upgrades — if this method is renamed/removed/inverted,
         ID-token forwarding breaks silently.
 
@@ -64,7 +64,7 @@ class AuthLoggingOIDCProxy(OIDCProxy):
         (``OAuthProxy._handle_idp_callback``, bound as the endpoint for the
         proxy's redirect path in ``get_routes``) and relies on FastMCP not
         reading the ``iss`` authorization-response parameter itself. Verified
-        against fastmcp >=3.2.0,<4.0.0; revisit on FastMCP upgrades — if the
+        against fastmcp 3.2.0 through 4.0.10; revisit on FastMCP upgrades — if the
         handler is renamed, or if FastMCP grows its own RFC 9207 support, this
         wrapper becomes dead code or a double check.
 

@@ -42,6 +42,8 @@ from ..common.error_handling import (
     create_structured_missing_parameter_error,
     raise_unknown_action_error,
 )
+from ..common.formatting import format_page_count_heading
+from ..common.sample_coverage import platform_total
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..introspection.metadata import (
     ToolCapability,
@@ -488,6 +490,7 @@ class CostControlsManager:
             "cost_controls": controls,
             "pagination": page_info,
             "total_found": len(controls),
+            "total_records": platform_total(page_info),
             "page": page,
         }
 
@@ -1581,7 +1584,13 @@ class CostControlsManagement(ToolBase):
                 return [
                     TextContent(
                         type="text",
-                        text=f"Found {result['total_found']} cost controls (page {result.get('page', 0) + 1}):\n\n"
+                        text=format_page_count_heading(
+                            "cost controls",
+                            len(result["cost_controls"]),
+                            result["pagination"],
+                            result["page"],
+                        )
+                        + "\n\n"
                         + json.dumps(self._compact_list(result), indent=2),
                     )
                 ]
@@ -1861,5 +1870,6 @@ class CostControlsManagement(ToolBase):
             "cost_controls": compact_entries,
             "pagination": result.get("pagination"),
             "total_found": result.get("total_found"),
+            "total_records": result.get("total_records"),
             "page": result.get("page"),
         }

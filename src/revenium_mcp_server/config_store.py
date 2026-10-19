@@ -7,10 +7,49 @@ discovered from the API without manipulating environment variables.
 
 import asyncio
 import os
+import threading
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 from loguru import logger
+
+from . import platform_lockout
+from .constants import DEFAULT_BASE_URL
+
+if TYPE_CHECKING:
+    from .auth.tenant_context import TenantContext
+
+
+_CALLER_IDENTITY_FIELDS = {
+    "REVENIUM_TEAM_ID": "team_id",
+    "REVENIUM_TENANT_ID": "tenant_id",
+    "REVENIUM_OWNER_ID": "owner_id",
+    "REVENIUM_DEFAULT_EMAIL": "email",
+}
+
+
+def _signed_in_caller_for(env_var_name: str) -> Optional["TenantContext"]:
+    """The hosted request's TenantContext when env_var_name is part of the caller's identity.
+
+    On a hosted request those settings must never come from the server's
+    environment, cache or discovery, which describe whoever owns the
+    server-wide key.
+    """
+    if env_var_name not in _CALLER_IDENTITY_FIELDS:
+        return None
+    from .auth.claims_middleware import current_tenant_context
+
+    return current_tenant_context()
+
+
+def _discovery_credential() -> Tuple[Optional[str], str]:
+    """The key and platform address env-mode discovery sends /users/me with."""
+    return os.getenv("REVENIUM_API_KEY"), os.getenv("REVENIUM_BASE_URL") or DEFAULT_BASE_URL
+
+
+def _caller_identity_value(caller: "TenantContext", env_var_name: str) -> Optional[str]:
+    value: Optional[str] = getattr(caller, _CALLER_IDENTITY_FIELDS[env_var_name])
+    return value
 
 
 @dataclass
@@ -52,15 +91,40 @@ class ConfigurationStore:
             self._initialized = True
             self._discovered_configs: Dict[str, DiscoveredConfig] = {}
             self._discovery_attempted: set = set()
+            self._discovery_retry_at: Dict[str, float] = {}
+            self._discovery_rate_limited = False
+            self._retry_lock = threading.Lock()
+
+    def discovery_lockout_seconds(self) -> Optional[int]:
+        """Seconds left of a platform wait on the discovery key, or None when clear."""
+        api_key, base_url = _discovery_credential()
+        if not api_key:
+            return None
+        return platform_lockout.platform_lockouts.remaining(api_key, base_url)
+
+    def discovery_rate_limited(self) -> bool:
+        """True when the latest discovery was refused with HTTP 429, with or without a wait."""
+        return self._discovery_rate_limited
+
+    def _discovery_due(self, team_id: str) -> bool:
+        """True for a team never discovered, or the first lookup after a lockout ends."""
+        if team_id not in self._discovery_attempted:
+            return True
+        with self._retry_lock:
+            retry_at = self._discovery_retry_at.get(team_id)
+            if retry_at is None or platform_lockout.now() < retry_at:
+                return False
+            self._discovery_retry_at.pop(team_id, None)
+            return True
 
     async def get_configuration(self, team_id: str = _DEFAULT_TENANT) -> DiscoveredConfig:
-        if team_id not in self._discovery_attempted:
+        if self._discovery_due(team_id):
             await self._attempt_discovery(team_id)
 
         return self._discovered_configs.get(team_id, DiscoveredConfig())
 
     def get_configuration_sync(self, team_id: str = _DEFAULT_TENANT) -> DiscoveredConfig:
-        if team_id not in self._discovery_attempted:
+        if self._discovery_due(team_id):
             try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
@@ -85,10 +149,13 @@ class ConfigurationStore:
 
     async def _attempt_discovery(self, team_id: str = _DEFAULT_TENANT) -> None:
         self._discovery_attempted.add(team_id)
+        self._discovery_rate_limited = False
+
+        from .auto_discovery import DiscoveryLockedOutError
 
         try:
             # Check if we have an API key
-            api_key = os.getenv("REVENIUM_API_KEY")
+            api_key, base_url = _discovery_credential()
             if not api_key:
                 logger.info("No API key available for auto-discovery")
                 return
@@ -99,7 +166,6 @@ class ConfigurationStore:
             from .auto_discovery import AutoDiscoveryService
 
             # Perform discovery
-            base_url = os.getenv("REVENIUM_BASE_URL")
             discovery_service = AutoDiscoveryService(api_key, base_url)
             discovered_values = await discovery_service.discover_configuration()
 
@@ -119,6 +185,21 @@ class ConfigurationStore:
                 f"Auto-discovery successful: {len(self._discovered_configs[team_id].to_dict())} values discovered"
             )
 
+        except DiscoveryLockedOutError as locked:
+            # No fallback request and no empty config cached: the first lookup
+            # after the wait (or the next lookup, when none was stated) runs
+            # discovery again.
+            self._discovery_rate_limited = True
+            with self._retry_lock:
+                self._discovery_retry_at[team_id] = platform_lockout.now() + (
+                    locked.wait_seconds or 0
+                )
+            logger.warning(
+                "Auto-discovery held by a platform lockout",
+                seconds_left=locked.wait_seconds,
+            )
+            return
+
         except Exception as e:
             # Auto-discovery is optional - log at DEBUG level to avoid alarming users
             # The server works fine without auto-discovery
@@ -131,9 +212,7 @@ class ConfigurationStore:
 
                 import httpx
 
-                api_key = os.getenv("REVENIUM_API_KEY")
-                from .constants import DEFAULT_BASE_URL
-                base_url = os.getenv("REVENIUM_BASE_URL", DEFAULT_BASE_URL)
+                api_key, base_url = _discovery_credential()
 
                 if api_key and base_url:
                     logger.info("🔧 Attempting manual configuration extraction as fallback...")
@@ -184,74 +263,85 @@ class ConfigurationStore:
     def get_value_with_override(
         self, env_var_name: str, default: Optional[str] = None, team_id: str = _DEFAULT_TENANT
     ) -> Optional[str]:
-        # First check for cached user overrides (highest priority)
+        caller = _signed_in_caller_for(env_var_name)
+        if caller is not None:
+            return _caller_identity_value(caller, env_var_name) or default
+
+        return (
+            self._cached_override(env_var_name)
+            or os.getenv(env_var_name)
+            or self._discovered_value(env_var_name, team_id)
+            or default
+        )
+
+    def get_discovered_value(
+        self, env_var_name: str, team_id: str = _DEFAULT_TENANT
+    ) -> Optional[str]:
+        caller = _signed_in_caller_for(env_var_name)
+        if caller is not None:
+            return _caller_identity_value(caller, env_var_name)
+        return self._discovered_value(env_var_name, team_id)
+
+    def _discovered_value(self, env_var_name: str, team_id: str) -> Optional[str]:
+        if self._discovery_due(team_id):
+            self._discover_from_sync_code(team_id)
+
+        discovered = self._discovered_configs.get(team_id)
+        if not discovered:
+            return None
+        field_map = {
+            "REVENIUM_API_KEY": discovered.api_key,
+            "REVENIUM_TEAM_ID": discovered.team_id,
+            "REVENIUM_TENANT_ID": discovered.tenant_id,
+            "REVENIUM_OWNER_ID": discovered.owner_id,
+            "REVENIUM_DEFAULT_EMAIL": discovered.default_email,
+            "REVENIUM_DEFAULT_SLACK_CONFIG_ID": discovered.default_slack_config_id,
+            "REVENIUM_BASE_URL": discovered.base_url,
+            "REVENIUM_APP_BASE_URL": discovered.app_base_url,
+        }
+        return field_map.get(env_var_name) or None
+
+    def _discover_from_sync_code(self, team_id: str) -> None:
+        try:
+            try:
+                asyncio.get_running_loop()
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(self._run_discovery_in_thread, team_id)
+                    future.result(timeout=10)
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(self._attempt_discovery(team_id))
+                finally:
+                    loop.close()
+        except Exception as e:
+            logger.warning(f"Discovery failed in get_value_with_override: {e}")
+
+    @staticmethod
+    def _cached_override(env_var_name: str) -> Optional[str]:
         try:
             from .config_cache import _default_cache
 
             cached_config = _default_cache.load_config_sync()
             if cached_config and env_var_name in cached_config:
-                cached_value = cached_config[env_var_name]
-                if cached_value:
-                    return cached_value
+                return cached_config[env_var_name] or None
         except Exception as e:
             logger.debug(f"Could not check cached overrides: {e}")
-
-        # Second check environment variable (explicit override)
-        env_value = os.getenv(env_var_name)
-        if env_value:
-            return env_value
-
-        if team_id not in self._discovery_attempted:
-            # Trigger discovery synchronously - handle existing event loop
-            try:
-                import asyncio
-
-                try:
-                    # Try to get the current event loop
-                    loop = asyncio.get_running_loop()
-                    # If we're in an async context, create a task
-                    import concurrent.futures
-
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(self._run_discovery_in_thread, team_id)
-                        future.result(timeout=10)  # 10 second timeout
-                except RuntimeError:
-                    # No event loop running, create a new one
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        loop.run_until_complete(self._attempt_discovery(team_id))
-                    finally:
-                        loop.close()
-            except Exception as e:
-                logger.warning(f"Discovery failed in get_value_with_override: {e}")
-
-        discovered = self._discovered_configs.get(team_id)
-        if discovered:
-            field_map = {
-                "REVENIUM_API_KEY": discovered.api_key,
-                "REVENIUM_TEAM_ID": discovered.team_id,
-                "REVENIUM_TENANT_ID": discovered.tenant_id,
-                "REVENIUM_OWNER_ID": discovered.owner_id,
-                "REVENIUM_DEFAULT_EMAIL": discovered.default_email,
-                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": discovered.default_slack_config_id,
-                "REVENIUM_BASE_URL": discovered.base_url,
-                "REVENIUM_APP_BASE_URL": discovered.app_base_url,
-            }
-            discovered_value = field_map.get(env_var_name)
-            if discovered_value:
-                return discovered_value
-
-        # Return default if provided
-        return default
+        return None
 
     def clear_cache(self, team_id: Optional[str] = None):
         if team_id is None:
             self._discovered_configs.clear()
             self._discovery_attempted.clear()
+            self._discovery_retry_at.clear()
+            self._discovery_rate_limited = False
         else:
             self._discovered_configs.pop(team_id, None)
             self._discovery_attempted.discard(team_id)
+            self._discovery_retry_at.pop(team_id, None)
 
 
 # Global instance
@@ -276,7 +366,10 @@ def get_discovered_config_sync() -> DiscoveredConfig:
 
 
 def get_config_value(env_var_name: str, default: Optional[str] = None) -> Optional[str]:
-    """Get configuration value with override pattern: env var → discovered → default.
+    """Get configuration value with override pattern: cache → env var → discovered → default.
+
+    On a hosted request the caller's own team, tenant, owner and email (from the
+    request's TenantContext) replace every other source for those settings.
 
     This is the recommended way to access Revenium configuration values.
 
@@ -293,3 +386,38 @@ def get_config_value(env_var_name: str, default: Optional[str] = None) -> Option
     """
     store = get_config_store()
     return store.get_value_with_override(env_var_name, default)
+
+
+def get_environment_value(env_var_name: str) -> Optional[str]:
+    """The environment variable, or on a hosted request the caller's own identity value."""
+    caller = _signed_in_caller_for(env_var_name)
+    if caller is not None:
+        return _caller_identity_value(caller, env_var_name)
+    return os.getenv(env_var_name)
+
+
+def get_discovered_value(env_var_name: str) -> Optional[str]:
+    """The auto-discovered value, or on a hosted request the caller's own identity value."""
+    return get_config_store().get_discovered_value(env_var_name)
+
+
+_PLACEHOLDER_EMAIL = "dummy@email.com"
+
+
+def _usable_email(email: Optional[str]) -> Optional[str]:
+    stripped = (email or "").strip()
+    if not stripped or stripped == _PLACEHOLDER_EMAIL:
+        return None
+    return stripped
+
+
+def configured_default_email() -> Optional[str]:
+    """REVENIUM_DEFAULT_EMAIL when it holds a real address; on a hosted request, the caller's own."""
+    return _usable_email(get_environment_value("REVENIUM_DEFAULT_EMAIL"))
+
+
+def default_notification_email() -> Optional[str]:
+    """REVENIUM_DEFAULT_EMAIL, else the discovered one; on a hosted request, the caller's own."""
+    return configured_default_email() or _usable_email(
+        get_discovered_value("REVENIUM_DEFAULT_EMAIL")
+    )

@@ -147,7 +147,7 @@ class CredentialBusinessContext:
                     "Billing coverage is 100% for active customers",
                 ],
                 troubleshooting_tips=[
-                    "Use dry_run mode to test changes before applying",
+                    "Use dry_run to preview create and validate only; other actions refuse it",
                     "Coordinate with customers before making credential changes",
                     "Maintain audit trail of all changes made",
                     "Schedule regular audits to prevent issues from accumulating",
@@ -338,7 +338,7 @@ class CredentialBusinessContext:
                 "Updated configuration will affect ongoing billing calculations"
             )
             impact["mitigation_steps"] = [
-                "Use dry_run to preview changes",
+                "Use dry_run to preview create and validate only; other actions refuse it",
                 "Coordinate with customer for secret updates",
                 "Monitor billing automation after changes",
             ]

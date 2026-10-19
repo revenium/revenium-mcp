@@ -205,9 +205,17 @@ class APIFieldMapper:
     def map_plan_fields(plan_data: Dict[str, Any]) -> Dict[str, Any]:
         """Map plan fields from internal format to API format."""
         mapped = {}
+        # The platform's Plan schema takes setupFees; snake_case fees are mapped
+        # and appended after any camelCase fees, whichever key comes first.
+        camel_setup_fees: List[Any] = []
+        snake_setup_fees: List[Dict[str, Any]] = []
+        has_setup_fees = False
 
         for internal_field, value in plan_data.items():
-            if internal_field == "tiers" and isinstance(value, list):
+            if internal_field == "setupFees" and isinstance(value, list):
+                camel_setup_fees = list(value)
+                has_setup_fees = True
+            elif internal_field == "tiers" and isinstance(value, list):
                 # Map nested tier fields
                 mapped["tiers"] = [APIFieldMapper.map_tier_fields(tier) for tier in value]
             elif internal_field == "rating_aggregations" and isinstance(value, list):
@@ -217,13 +225,17 @@ class APIFieldMapper:
                 ]
             elif internal_field == "setup_fees" and isinstance(value, list):
                 # Map nested setup fee fields
-                mapped["setups"] = [APIFieldMapper.map_setup_fee_fields(sf) for sf in value]
+                snake_setup_fees = [APIFieldMapper.map_setup_fee_fields(sf) for sf in value]
+                has_setup_fees = True
             elif internal_field == "elements" and isinstance(value, list):
                 # Map nested element fields
                 mapped["elements"] = [APIFieldMapper.map_element_fields(elem) for elem in value]
             else:
                 api_field = APIFieldMapper.PLAN_FIELD_MAPPING.get(internal_field, internal_field)
                 mapped[api_field] = value
+
+        if has_setup_fees:
+            mapped["setupFees"] = camel_setup_fees + snake_setup_fees
 
         return mapped
 
@@ -241,8 +253,6 @@ class APIFieldMapper:
                 mapped[api_field] = value
 
         # Add any required fields that might be missing
-        if "published" not in mapped:
-            mapped["published"] = True
         if "notifyClientOnInvoice" not in mapped:
             mapped["notifyClientOnInvoice"] = False
         if "paymentSource" not in mapped:

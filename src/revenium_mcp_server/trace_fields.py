@@ -1,7 +1,9 @@
 """Trace field extraction for AI transaction tracing support.
 
 This module provides functions to extract tracing fields from usage_metadata arguments
-and environment variables for distributed tracing and observability.
+and, on a local single-key server only, environment variables for distributed tracing
+and observability. A hosted server (AUTH_MODE clerk or api_key) serves many customers,
+so its own process settings never fill a customer's tracing fields.
 
 Follows the same pattern as revenium-middleware-openai-python-internal.
 """
@@ -9,6 +11,8 @@ Follows the same pattern as revenium-middleware-openai-python-internal.
 import os
 import re
 from typing import Any, Dict, Optional
+
+from .auth.auth_mode import read_auth_mode
 
 
 # Environment variable mappings for each trace field
@@ -58,6 +62,8 @@ TRACE_TYPE_MAX_LENGTH = 128
 TRACE_TYPE_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
 TRACE_NAME_MAX_LENGTH = 256
 
+_HOSTED_AUTH_MODES = ("clerk", "api_key")
+
 
 def _get_env_value(field_name: str) -> Optional[str]:
     """Get value from environment variables for a trace field.
@@ -66,8 +72,11 @@ def _get_env_value(field_name: str) -> Optional[str]:
         field_name: The snake_case field name
 
     Returns:
-        The value from the first matching environment variable, or None
+        The value from the first matching environment variable, or None.
+        Always None on a hosted server.
     """
+    if read_auth_mode() in _HOSTED_AUTH_MODES:
+        return None
     env_vars = TRACE_FIELD_ENV_VARS.get(field_name, [])
     for env_var in env_vars:
         value = os.getenv(env_var)
@@ -151,6 +160,9 @@ def get_trace_field_value(
     field_name: str, arguments: Dict[str, Any], usage_metadata: Optional[Dict[str, Any]] = None
 ) -> Optional[Any]:
     """Get a trace field value with priority: arguments > usage_metadata > env var.
+
+    The env var fallback applies on a local single-key server only (AUTH_MODE env);
+    a hosted server never fills a field from its own environment.
 
     Args:
         field_name: The field name (can be camelCase or snake_case)

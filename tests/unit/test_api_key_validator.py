@@ -14,6 +14,7 @@ from src.revenium_mcp_server.auth.api_key_validator import (
     InvalidTokenError,
     KeyExpiredError,
     KeySuspendedError,
+    PlatformLockoutValidationError,
 )
 
 USERS_ME = {
@@ -212,7 +213,7 @@ async def test_5xx_falls_through_to_base_error():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [404, 429, 500, 503])
+@pytest.mark.parametrize("status", [404, 500, 503])
 async def test_non_rejection_statuses_are_not_classified_as_invalid_token(status):
     """Only 401/403 mean "bad key"; everything else stays the generic error."""
     v, client = _validator_with_response(_resp(status, text="upstream said no"))
@@ -224,6 +225,94 @@ async def test_non_rejection_statuses_are_not_classified_as_invalid_token(status
             await v.validate("rev_rk_abcdef123456")
     assert not isinstance(exc_info.value, InvalidTokenError)
     assert f"Unexpected status {status}" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_a_429_with_no_stated_wait_is_neither_an_invalid_token_nor_a_lockout(
+    lockout_clock,
+):
+    """BACK-4717: with no wait to hold the key for, a 429 stays the generic error."""
+    from src.revenium_mcp_server.platform_lockout import platform_lockouts
+
+    resp = _resp(429, text="Too many requests")
+    resp.headers = {}
+    v, client = _validator_with_response(resp)
+    with patch(
+        "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
+        return_value=client,
+    ):
+        with pytest.raises(ApiKeyValidationError) as exc_info:
+            await v.validate("rev_rk_abcdef123456")
+        with pytest.raises(ApiKeyValidationError):
+            await v.validate("rev_rk_abcdef123456")
+    assert not isinstance(exc_info.value, (InvalidTokenError, PlatformLockoutValidationError))
+    assert "Unexpected status 429" in str(exc_info.value)
+    assert platform_lockouts.remaining("rev_rk_abcdef123456", "https://platform.test") is None
+    assert client.get.await_count == 2
+
+
+def _lockout_429():
+    import httpx
+
+    return httpx.Response(
+        429,
+        text=(
+            "Too many failed requests. Please review your integration and "
+            "retry after 42 seconds."
+        ),
+        request=httpx.Request("GET", "https://platform.test/profitstream/v2/api/users/me"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_lockout_at_validation_names_the_wait_and_holds_the_key(lockout_clock):
+    """BACK-4717: a 429 from /users/me names the wait; a retry inside it sends nothing."""
+    v, client = _validator_with_response(_lockout_429())
+    with patch(
+        "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
+        return_value=client,
+    ):
+        with pytest.raises(ApiKeyValidationError) as first:
+            await v.validate("rev_rk_abcdef123456")
+        lockout_clock.advance(2)
+        with pytest.raises(ApiKeyValidationError) as held:
+            await v.validate("rev_rk_abcdef123456")
+    assert not isinstance(first.value, InvalidTokenError)
+    assert "42 seconds" in str(first.value)
+    assert "40 seconds" in str(held.value)
+    assert client.get.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_cached_key_held_by_a_tool_call_lockout_is_refused_with_the_wait(
+    lockout_clock,
+):
+    """A 429 met by a tool call after sign-in holds later sign-ins of the cached key."""
+    from src.revenium_mcp_server.auth import AuthConfig
+    from src.revenium_mcp_server.client import ReveniumAPIError, ReveniumClient
+
+    token = "rev_rk_abcdef123456"
+    v, client = _validator_with_response(_resp(200, json_body=USERS_ME))
+    with patch(
+        "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
+        return_value=client,
+    ):
+        await v.validate(token)
+        tool_client = ReveniumClient(
+            auth_config=AuthConfig(
+                api_key=token, team_id="team_xyz", base_url="https://platform.test"
+            )
+        )
+        with patch.object(
+            tool_client.client, "request", new_callable=AsyncMock, return_value=_lockout_429()
+        ):
+            with pytest.raises(ReveniumAPIError):
+                await tool_client.get("/profitstream/v2/api/products")
+        lockout_clock.advance(2)
+        with pytest.raises(PlatformLockoutValidationError) as held:
+            await v.validate(f"Bearer {token}")
+    assert held.value.wait_seconds == 40
+    assert client.get.await_count == 1
 
 
 @pytest.mark.asyncio

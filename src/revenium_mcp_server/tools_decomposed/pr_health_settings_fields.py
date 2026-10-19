@@ -22,23 +22,29 @@ PR_HEALTH_REPO_PATTERN = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 _ISO_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 # Every stored or derived field a read renders beside the threshold pair, in the
-# order the API declares them. builtInAutomationPatterns, cutoffDateIsDefault and
-# defaultCutoffDate are echoes the tool never sends back.
+# order the API declares them. builtInAutomationPatterns, cutoffDateIsDefault,
+# defaultCountsSince and defaultCutoffDate are echoes the tool never sends back.
 PR_HEALTH_DISPLAY_FIELDS = (
     "assistedOnly",
     "automationPatterns",
     "builtInAutomationPatterns",
     "cutoffDate",
     "cutoffDateIsDefault",
+    "defaultCountsSince",
     "defaultCutoffDate",
     "excludedRepos",
 )
 
 PR_HEALTH_FIELDS_NOTE = (
-    "cutoffDate is the effective cutoff - pull requests opened before it are left out of "
-    "every PR-health figure: the team's own date, else the organization's first "
-    "AI-telemetry day (cutoffDateIsDefault true, also shown as defaultCutoffDate), else "
-    "null for no cutoff. excludedRepos (owner/repo) are left out of every figure. "
+    "cutoffDate is the team's own cutoff, null when it has none: pull requests opened "
+    "before it are left out of every PR-health figure. Without one, counts start at "
+    "defaultCountsSince (six months before today, UTC), and cutoffDateIsDefault is true while "
+    "that default applies. Without a team cutoff, defaultCutoffDate, the organization's "
+    "first coding-assistant day, is where priced figures start (pricedSince is cutoffDate, "
+    "else defaultCutoffDate): the breakdown and trend count as priced only pull requests "
+    "opened on or after pricedSince, and the get_pr_health dollar estimates multiply those "
+    "priced counts. "
+    "excludedRepos (owner/repo) are left out of every figure. "
     "automationPatterns are the team's custom regular expressions, applied beside the "
     "read-only builtInAutomationPatterns, that put a matching pull request in the "
     "automation bucket. assistedOnly is the team default for pricing and listing "

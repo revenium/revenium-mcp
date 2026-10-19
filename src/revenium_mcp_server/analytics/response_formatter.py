@@ -7,7 +7,7 @@ using composition with dedicated formatter classes for single responsibility.
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .formatters import (
     AgentCostsFormatter,
@@ -21,6 +21,7 @@ from .formatters import (
     ToolCostsFormatter,
     UserCostsFormatter,
 )
+from .paging import PageInfo
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +125,11 @@ class ResponseFormatter:
         return self.api_key_costs_formatter.format(data, params)
 
     def format_agent_costs_response(
-        self, data: List[Dict[str, Any]], period: str, aggregation: str
+        self,
+        data: List[Dict[str, Any]],
+        period: str,
+        aggregation: str,
+        endpoint_key: Optional[str] = None,
     ) -> str:
         """
         Format agent costs response using dedicated formatter.
@@ -133,28 +138,37 @@ class ResponseFormatter:
             data: Agent cost data from API
             period: Time period used
             aggregation: Aggregation type used
+            endpoint_key: Registry key the rows were read with, so the scope
+                note follows the route; the formatter's own key when omitted
 
         Returns:
             Formatted response string
         """
-        params = {"period": period, "aggregation": aggregation}
+        params: Dict[str, Any] = {"period": period, "aggregation": aggregation}
+        if endpoint_key:
+            params["endpoint_key"] = endpoint_key
         return self.agent_costs_formatter.format(data, params)
 
     def format_user_costs_response(
-        self, data: List[Dict[str, Any]], period: str, aggregation: str
+        self,
+        data: List[Dict[str, Any]],
+        period: str,
+        aggregation: str,
+        paging: Optional[PageInfo] = None,
     ) -> str:
         """
         Format user costs response using dedicated formatter.
 
         Args:
-            data: User cost data from API
+            data: The users on one page of the report
             period: Time period used
             aggregation: Aggregation type used
+            paging: Where that page sits in the report, when the platform said
 
         Returns:
             Formatted response string
         """
-        params = {"period": period, "aggregation": aggregation}
+        params = {"period": period, "aggregation": aggregation, "paging": paging or PageInfo()}
         return self.user_costs_formatter.format(data, params)
 
     def format_tool_costs_response(

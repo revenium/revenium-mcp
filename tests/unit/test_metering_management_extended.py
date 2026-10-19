@@ -5,13 +5,22 @@ and various discovery/integration actions that were previously uncovered.
 Mocks self.get_client() to avoid real API calls.
 """
 
+import ast
+
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from mcp.types import TextContent
 
+from src.revenium_mcp_server.auth.tenant_scope import LOCAL_TENANT_SCOPE
+from src.revenium_mcp_server.client import ReveniumAPIError
+from src.revenium_mcp_server.common.auth_response_envelope import (
+    auth_scope_unresolved_to_tool_error,
+)
+from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from src.revenium_mcp_server.tools_decomposed.metering_management import (
+    _LOOKUP_DEFAULT_PAGE_SIZE,
     MeteringManagement,
     MeteringTransactionManager,
 )
@@ -703,12 +712,12 @@ class TestHandleActionTransactionStatusFound:
 
         mgmt, _ = _make_mgmt_with_client()
         # Pre-populate the transaction store
-        mgmt.transaction_manager.transaction_store["tx_found"] = {
+        mgmt.transaction_manager.transaction_store.put(LOCAL_TENANT_SCOPE, "tx_found", {
             "payload": {"model": "gpt-4", "provider": "OPENAI"},
             "timestamp": datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
             "verified": True,
             "submitted": True,
-        }
+        })
         result = await mgmt.handle_action("get_transaction_status", {"transaction_id": "tx_found"})
         text = result[0].text
         assert "Found" in text or "found" in text.lower()
@@ -897,6 +906,242 @@ class TestHandleActionLookupTransactions:
         assert "**Parent Transaction ID**: tx_parent_9" in text
         assert "**Operation Subtype**: summarize" in text
         assert "**Agentic Job ID**: job-abc-123" in text
+
+    @pytest.mark.asyncio
+    async def test_adjusted_settings_are_named_in_the_answer(self):
+        mgmt, client = _make_mgmt_with_client()
+        client.get = AsyncMock(return_value={"_embedded": {"aICompletionMetricResourceList": []}})
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await mgmt.handle_action(
+                "lookup_transactions",
+                {"transaction_ids": ["tx_late"], "max_retries": 50},
+            )
+        text = result[0].text
+        assert "**Adjusted**: max_retries 50 is above the limit of 10; used 10" in text
+        assert text.index("**Adjusted**") > text.index("Transaction tx_late")
+
+    @pytest.mark.asyncio
+    async def test_full_lookup_shows_the_reasoning_token_count(self):
+        """BACK-4794: the count a submit stores is read back."""
+        mgmt, _ = _make_mgmt_with_client()
+        lookup_result = {
+            "summary": {
+                "total_requested": 1,
+                "found_count": 1,
+                "missing_count": 0,
+                "sources": {"session": 0, "api": 1},
+            },
+            "results": [
+                {
+                    "transaction_id": "tx_full",
+                    "found": True,
+                    "source": "api",
+                    "transaction_data": {
+                        "model": "gpt-4o",
+                        "provider": "OPENAI",
+                        "inputTokenCount": 1000,
+                        "outputTokenCount": 500,
+                        "requestDuration": 3000,
+                        "totalCost": 0.05,
+                        "cacheReadTokenCount": 40,
+                        "reasoningTokenCount": 100,
+                    },
+                },
+            ],
+            "configuration": {},
+        }
+        with patch.object(
+            mgmt.transaction_manager,
+            "lookup_transactions",
+            new_callable=AsyncMock,
+            return_value=lookup_result,
+        ):
+            result = await mgmt.handle_action(
+                "lookup_transactions",
+                {"transaction_ids": ["tx_full"], "return_transaction_data": "full"},
+            )
+        text = result[0].text
+        assert "\n- **Reasoning Tokens**: 100\n" in text
+        # A top-level bullet, not a line inside the Cache Tokens section.
+        cache_start = text.index("- **Cache Tokens**:")
+        cache_end = text.index("\n- **", cache_start + 1)
+        assert "Reasoning Tokens" not in text[cache_start:cache_end]
+
+    @pytest.mark.asyncio
+    async def test_full_recent_lookup_shows_the_reasoning_token_count(self):
+        mgmt, client = _make_mgmt_with_client()
+        client.get = AsyncMock(
+            return_value=_completions_page(
+                [
+                    {
+                        "transactionId": "tx_recent",
+                        "model": "gpt-4o",
+                        "provider": "OPENAI",
+                        "reasoningTokenCount": 7,
+                    }
+                ]
+            )
+        )
+        text = await mgmt._handle_lookup_recent_transactions(
+            client, {"page": 0, "page_size": 5, "return_transaction_data": "full"}
+        )
+        assert "\n- **Reasoning Tokens**: 7\n" in text
+
+
+
+def _completions_page(transactions, total_pages=1):
+    return {
+        "_embedded": {"aICompletionMetricResourceList": transactions},
+        "page": {"totalPages": total_pages},
+    }
+
+
+class TestLookupPlatformFailureIsAnError:
+    """A platform error, refused access or timeout during a lookup answers as
+    an error naming it, never as "Not Found": a developer told a transaction
+    does not exist may resubmit one that does."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure,cause",
+        [
+            (ReveniumAPIError("HTTP 503: Service Unavailable", status_code=503), "HTTP 503"),
+            (ReveniumAPIError("HTTP 403: Forbidden", status_code=403), "HTTP 403"),
+            (ReveniumAPIError("Request failed: Request timed out after 30s"), "timed out"),
+        ],
+        ids=["503", "403", "timeout"],
+    )
+    async def test_platform_failure_is_not_reported_as_not_found(self, failure, cause):
+        mgmt, client = _make_mgmt_with_client()
+        client.get = AsyncMock(side_effect=failure)
+
+        with pytest.raises(ToolError) as raised:
+            await mgmt.handle_action(
+                "lookup_transactions", {"transaction_ids": ["tx_fs_verify_1"]}
+            )
+
+        error = raised.value
+        assert error.error_code == ErrorCodes.API_ERROR
+        assert error.field == "transaction_ids"
+        lines = error.message.splitlines()
+        failed_lines = [line for line in lines if line.startswith("- tx_fs_verify_1: ")]
+        assert len(failed_lines) == 1 and cause in failed_lines[0]
+        not_found_line = next(line for line in lines if line.startswith("Not found:"))
+        assert "tx_fs_verify_1" not in not_found_line
+        assert any("403" in s for s in error.suggestions)
+
+    @pytest.mark.asyncio
+    async def test_failure_after_a_searched_page_says_incomplete(self):
+        mgmt, client = _make_mgmt_with_client()
+        client.get = AsyncMock(
+            side_effect=[
+                _completions_page([{"transactionId": "tx_other"}], total_pages=5),
+                ReveniumAPIError("HTTP 502: Bad Gateway", status_code=502),
+            ]
+        )
+
+        with pytest.raises(ToolError) as raised:
+            await mgmt.handle_action("lookup_transactions", {"transaction_ids": ["tx_deep"]})
+
+        failed_line = next(
+            line for line in raised.value.message.splitlines() if line.startswith("- tx_deep: ")
+        )
+        assert "HTTP 502" in failed_line
+        assert "incomplete" in failed_line
+        assert "1 page" in failed_line
+
+    @pytest.mark.asyncio
+    async def test_found_ids_survive_a_failure_beside_them(self):
+        mgmt, client = _make_mgmt_with_client()
+        mgmt.transaction_manager.transaction_store.put(
+            LOCAL_TENANT_SCOPE, "tx_session", {"payload": {"model": "gpt-4"}, "verified": False}
+        )
+
+        async def platform(endpoint, params=None, **kwargs):
+            if params["transactionId"] == "tx_bad":
+                raise ReveniumAPIError("HTTP 503: Service Unavailable", status_code=503)
+            return _completions_page([{"transactionId": params["transactionId"]}])
+
+        client.get = AsyncMock(side_effect=platform)
+
+        with pytest.raises(ToolError) as raised:
+            await mgmt.handle_action(
+                "lookup_transactions",
+                {"transaction_ids": ["tx_session", "tx_ok", "tx_bad"]},
+            )
+
+        lines = raised.value.message.splitlines()
+        assert lines[0] == "Transaction lookup failed for 1 of 3: the platform did not answer."
+        found_line = next(line for line in lines if line.startswith("Found:"))
+        assert "tx_session" in found_line and "tx_ok" in found_line
+        assert "tx_bad" not in found_line
+        assert raised.value.value == ["tx_bad"]
+
+    @pytest.mark.asyncio
+    async def test_ids_still_polling_when_a_failure_stops_are_unfinished_not_missing(self):
+        mgmt, client = _make_mgmt_with_client()
+        searched = []
+
+        async def platform(endpoint, params=None, **kwargs):
+            searched.append(params["transactionId"])
+            if params["transactionId"] == "tx_bad":
+                raise ReveniumAPIError("HTTP 503: Service Unavailable", status_code=503)
+            return _completions_page([])
+
+        client.get = AsyncMock(side_effect=platform)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as sleep, pytest.raises(
+            ToolError
+        ) as raised:
+            await mgmt.handle_action(
+                "lookup_transactions",
+                {"transaction_ids": ["tx_late", "tx_bad"], "max_retries": 3},
+            )
+
+        sleep.assert_not_called()
+        lines = raised.value.message.splitlines()
+        not_found_line = next(line for line in lines if line.startswith("Not found:"))
+        assert "tx_late" not in not_found_line
+        unfinished_line = next(line for line in lines if line.startswith("Not found yet"))
+        assert "tx_late" in unfinished_line
+        assert any("not found yet" in s for s in raised.value.suggestions)
+
+    @pytest.mark.asyncio
+    async def test_unreadable_answer_is_not_called_a_platform_outage(self):
+        mgmt, client = _make_mgmt_with_client()
+        client.get = AsyncMock(
+            return_value={"_embedded": {"aICompletionMetricResourceList": ["not-a-record"]}}
+        )
+
+        with pytest.raises(ToolError) as raised:
+            await mgmt.handle_action("lookup_transactions", {"transaction_ids": ["tx_odd"]})
+
+        lines = raised.value.message.splitlines()
+        assert lines[0] == "Transaction lookup failed for 1 of 1: the search did not complete."
+        assert "the platform did not answer" not in raised.value.message
+        failed_line = next(line for line in lines if line.startswith("- tx_odd: "))
+        assert "could not read the answer" in failed_line
+
+    @pytest.mark.asyncio
+    async def test_auth_error_in_search_is_not_relabelled(self):
+        mgmt, client = _make_mgmt_with_client()
+        type(client).team_id = PropertyMock(side_effect=auth_scope_unresolved_to_tool_error())
+
+        with pytest.raises(ToolError) as raised:
+            await mgmt.handle_action("lookup_transactions", {"transaction_ids": ["tx_1"]})
+
+        assert raised.value.error_code == ErrorCodes.AUTH_SCOPE_UNRESOLVED
+
+    @pytest.mark.asyncio
+    async def test_real_empty_search_still_says_not_found(self):
+        mgmt, client = _make_mgmt_with_client()
+        client.get = AsyncMock(return_value=_completions_page([]))
+
+        result = await mgmt.handle_action("lookup_transactions", {"transaction_ids": ["tx_gone"]})
+
+        text = result[0].text
+        assert "❌ **Not Found**" in text
+        assert "**Summary**: 0/1 transactions found" in text
 
 
 # ===========================================================================
@@ -1270,11 +1515,11 @@ class TestSubmitTransactionInternals:
             ) as rc:
                 rc.get_cached_response = AsyncMock(return_value=None)
                 rc.set_cached_response = AsyncMock()
-                result = await mgr.submit_transaction(client, VALID_TX.copy())
+                result = await mgr.submit_transaction(client, VALID_TX.copy(), LOCAL_TENANT_SCOPE)
 
         assert result["status"] == "submitted"
-        assert result["transaction_id"] in mgr.transaction_store
-        stored = mgr.transaction_store[result["transaction_id"]]
+        stored = mgr.transaction_store.get(LOCAL_TENANT_SCOPE, result["transaction_id"])
+        assert stored is not None
         assert stored["submitted"] is True
         assert stored["verified"] is False
 
@@ -1293,7 +1538,7 @@ class TestSubmitTransactionInternals:
             ) as rc:
                 rc.get_cached_response = AsyncMock(return_value=cached_resp)
                 rc.set_cached_response = AsyncMock()
-                result = await mgr.submit_transaction(client, VALID_TX.copy())
+                result = await mgr.submit_transaction(client, VALID_TX.copy(), LOCAL_TENANT_SCOPE)
 
         # API should NOT have been called since cache hit
         client.post.assert_not_called()
@@ -1314,7 +1559,7 @@ class TestSubmitTransactionInternals:
             ) as rc:
                 rc.get_cached_response = AsyncMock(return_value=None)
                 rc.set_cached_response = AsyncMock()
-                result = await mgr.submit_transaction(client, args)
+                result = await mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         call_data = client.post.call_args
         payload = call_data[1].get("data") if call_data[1] else call_data[0][1]
@@ -1331,7 +1576,7 @@ class TestSubmitTransactionInternals:
             return_value={"valid": True, "message": "ok"},
         ):
             with pytest.raises(Exception) as exc_info:
-                await mgr.submit_transaction(client, args)
+                await mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
             assert "time_to_first_token" in str(exc_info.value).lower() or "positive" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
@@ -1345,7 +1590,7 @@ class TestSubmitTransactionInternals:
             return_value={"valid": True, "message": "ok"},
         ):
             with pytest.raises(Exception):
-                await mgr.submit_transaction(client, args)
+                await mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
 
 # ===========================================================================
@@ -1362,7 +1607,7 @@ class TestLookupTransactionsInternals:
         params = mgr._extract_lookup_parameters({"transaction_ids": ["tx_1"]})
         assert params["transaction_ids"] == ["tx_1"]
         assert params["max_retries"] == 3
-        assert params["page_size"] == 1000
+        assert params["page_size"] == _LOOKUP_DEFAULT_PAGE_SIZE
 
     @pytest.mark.asyncio
     async def test_build_configuration_object(self):
@@ -1371,13 +1616,16 @@ class TestLookupTransactionsInternals:
             "wait_seconds": 30,
             "max_retries": 3,
             "retry_interval": 15,
-            "search_page_range": 50,
+            "search_page_range": 10,
             "page_size": 1000,
             "early_termination": True,
+            "adjustments": ["page_size 5000 is above the limit of 1000; used 1000"],
         }
         config = mgr._build_configuration_object(params)
         assert config["max_retries"] == 3
         assert config["page_size"] == 1000
+        assert config["wait_seconds"] == 30
+        assert config["adjustments"] == params["adjustments"]
 
     @pytest.mark.asyncio
     async def test_search_transaction_pages_finds_transaction(self):
@@ -1483,8 +1731,8 @@ class TestLookupTransactionsInternals:
     @pytest.mark.asyncio
     async def test_process_session_results(self):
         mgr = MeteringTransactionManager()
-        mgr.transaction_store["tx_session"] = {"payload": {"model": "gpt-4"}, "verified": False}
-        results, remaining = await mgr._process_session_results(["tx_session", "tx_api"])
+        mgr.transaction_store.put(LOCAL_TENANT_SCOPE, "tx_session", {"payload": {"model": "gpt-4"}, "verified": False})
+        results, remaining = await mgr._process_session_results(["tx_session", "tx_api"], LOCAL_TENANT_SCOPE)
         assert len(results) == 1
         assert results[0]["source"] == "session"
         assert remaining == ["tx_api"]
@@ -1692,6 +1940,20 @@ class TestBuildIntegrationCapabilitiesContent:
         assert "requestDuration" in integration_content, (
             "Integration guide should use camelCase field 'requestDuration'"
         )
+
+    @pytest.mark.asyncio
+    async def test_python_example_runs_outside_the_server_package(self, integration_content):
+        """The pasted Python example must not import from the server's own package."""
+        marker = "### **Python Integration Example**\n```python\n"
+        block = integration_content.split(marker, 1)[1].split("```", 1)[0]
+        tree = ast.parse(block)
+        relative = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.level > 0
+        ]
+        assert not relative, "Python example uses a relative (server-internal) import"
+        assert "DEFAULT_BASE_URL" not in block
+        assert 'os.getenv("REVENIUM_BASE_URL", "https://api.revenium.ai")' in block
 
 
 # ===========================================================================
@@ -1950,7 +2212,7 @@ class TestSessionStoredTransactionRendersItsFields:
     def _store(self, mgmt):
         from datetime import datetime, timezone
 
-        mgmt.transaction_manager.transaction_store["tx_sess_cache"] = {
+        mgmt.transaction_manager.transaction_store.put(LOCAL_TENANT_SCOPE, "tx_sess_cache", {
             "payload": {
                 "transactionId": "tx_sess_cache",
                 "model": "claude-sonnet-4",
@@ -1967,7 +2229,7 @@ class TestSessionStoredTransactionRendersItsFields:
             "timestamp": datetime(2026, 9, 9, 12, 0, 0, tzinfo=timezone.utc),
             "verified": False,
             "submitted": True,
-        }
+        })
 
     @pytest.mark.asyncio
     async def test_full_detail_shows_the_cache_section(self):
@@ -2022,3 +2284,16 @@ class TestSessionStoredTransactionRendersItsFields:
         mgmt = MeteringManagement()
         odd = {"submitted": True, "payload": "not-a-dict"}
         assert mgmt._unwrap_session_transaction(odd) is odd
+
+
+class TestJavascriptGuideNamesThePackage:
+    """The JavaScript guide has to name the package it tells the reader to install."""
+
+    @pytest.mark.asyncio
+    async def test_guide_names_the_npm_package_it_refers_to(self):
+        text = (await MeteringManagement()._get_javascript_integration_guide("general"))[0].text
+        assert "npm install @revenium/middleware" in text
+        assert "npm packages above" not in text
+        assert "Node.js Packages" not in text
+        assert "REVENIUM_METERING_API_KEY" in text
+        assert "REVENIUM_API_KEY=" not in text

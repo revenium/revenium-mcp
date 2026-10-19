@@ -8,8 +8,10 @@ This tool provides business analytics capabilities including:
 - Cost summary reports
 """
 
+import json
 import math
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -17,9 +19,13 @@ from typing import (
     Callable,
     ClassVar,
     Dict,
+    FrozenSet,
     List,
+    NamedTuple,
+    NoReturn,
     Optional,
     Sequence,
+    Tuple,
     Union,
     cast,
 )
@@ -32,14 +38,49 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
 from ..analytics.department_costs import DepartmentCostsQuery, parse_department_costs
-from ..analytics.enhanced_spike_analyzer import EnhancedSpikeAnalyzer
+from ..analytics.enhanced_spike_analyzer import (
+    EnhancedSpikeAnalyzer,
+    ANALYTICS_API_KEY_CAP,
+    ANALYTICS_API_KEY_ROLLUP_GROUP,
+    describe_part,
+    detection_span_groups,
+    spans_for_entity_type,
+)
+from ..analytics.metric_units import (
+    format_comparison_value,
+    format_metric_result,
+    render_dollars,
+    render_usd,
+)
+from ..analytics.formatters.base_formatter import COST_SOURCE_RULE
 from ..analytics.formatters.department_costs_formatter import DepartmentCostsFormatter
 from ..analytics.formatters.user_costs_formatter import UserCostsFormatter
-from ..analytics.simple_analytics_engine import SimpleAnalyticsEngine
-from ..analytics.simple_cost_analyzer import SimpleCostAnalyzer
-from ..analytics.validation import AnalyticsValidator, ValidationError
+from ..analytics.formatters.base_formatter import BaseFormattingUtilities
+from ..analytics.simple_analytics_engine import COST_SUMMARY_RETRY_ADVICE, SimpleAnalyticsEngine
+from ..analytics.envelope_reads import with_unread_pages_notice
+from ..analytics.paging import PageInfo, counted, pagination_lines, past_last_page_sentence
+from ..analytics.simple_cost_analyzer import (
+    PackRows,
+    SimpleCostAnalyzer,
+    summary_part_time_limit_text,
+)
+from ..analytics.response_formatter import ResponseFormatter
+from ..analytics.statistical_anomaly_detector import format_bucket_start
+from ..analytics.validation import (
+    AnalyticsValidator,
+    ValidationError,
+    listed_names,
+    unread_narrowing_refusal,
+)
+from ..analytics_window import (
+    CALENDAR_RANGE_MAX_DAYS,
+    AnalyticsWindow,
+    CalendarRangeError,
+    utc_instant_bounds,
+)
 from ..auth import AuthenticationError
 from ..client import SEAT_UTILIZATION_MAX_RANGE_DAYS, ReveniumAPIError
+from ..constants import ANALYTICS_MAX_PAGE_SIZE, USER_COSTS_DEFAULT_PAGE_SIZE
 from ..endpoint_registry import NewApiRequiredError, requires_new_api_flag
 from ..introspection.metadata import ToolCapability
 from .unified_tool_base import ToolBase
@@ -60,6 +101,7 @@ from ..common.error_handling import (
     ToolError,
     create_structured_missing_parameter_error,
     create_structured_validation_error,
+    raise_refusal,
 )
 from ..common.department_aliases import deprecated_argument_properties
 from ..common.numeric_param_validator import coerce_numeric_param
@@ -80,12 +122,61 @@ COST_PERIOD_VALUES = (
 )
 #: The two longer windows only the skill-usage reads accept, on top of the above.
 SKILL_ONLY_PERIOD_VALUES = ("NINETY_DAYS", "SIX_MONTHS")
+
+# Entities listed per type in the anomaly answer's New Entities section
+NEW_ENTITY_LIST_CAP = 25
+_DETECTION_NOUNS = {"providers": "provider", "agents": "agent", "api_keys": "API key"}
 #: get_coverage_ratio takes its own lower-case window names.
 COVERAGE_PERIOD_VALUES = ("24h", "7d", "30d", "90d", "custom")
+
+_BILLING_DATE_FILTERS = ("start_date", "end_date")
 #: Statistical roll-ups accepted by `group`, and by `aggregation` as its alias.
 AGGREGATION_VALUES = ("TOTAL", "MEAN", "MAXIMUM", "MINIMUM")
 #: Response shapes the task pack's `aggregation` selects instead.
 TASK_AGGREGATION_VALUES = ("timeseries", "aggregated")
+
+
+#: The cost actions that take start_date/end_date in place of period.
+CALENDAR_RANGE_ACTIONS = (
+    "get_provider_costs",
+    "get_model_costs",
+    "get_customer_costs",
+    "get_api_key_costs",
+    "get_agent_costs",
+    "get_user_costs",
+    "get_department_costs",
+    "get_cost_summary",
+    "get_transaction_count",
+    "get_team_costs",
+    "get_vendor_costs",
+    "get_task_costs",
+    "get_task_completion",
+    "get_task_performance",
+    "get_profit_margins",
+    "get_top_movers",
+    "get_token_breakdown",
+    "get_token_vs_tool_cost",
+    "get_trace_cost_distribution",
+    "get_tool_costs",
+    "get_top_tools",
+    "get_tool_costs_by_agent",
+    "get_tool_costs_by_provider",
+)
+#: The calendar-month read every start_date/end_date explanation shows.
+_CALENDAR_MONTH_EXAMPLE: Dict[str, str] = {
+    "action": "get_provider_costs",
+    "start_date": "2026-09-01",
+    "end_date": "2026-09-30",
+}
+_CALENDAR_MONTH_CALL = (
+    f"{_CALENDAR_MONTH_EXAMPLE['action']}(start_date='{_CALENDAR_MONTH_EXAMPLE['start_date']}', "
+    f"end_date='{_CALENDAR_MONTH_EXAMPLE['end_date']}')"
+)
+
+
+#: How the analytics endpoints write the first and last instant of a daily bucket.
+_DAY_START_TIME = "T00:00:00.000"
+_DAY_END_TIME = "T23:59:59.999"
 
 
 def _values(values: Sequence[str]) -> str:
@@ -111,6 +202,16 @@ def _strip_user_costs_section(capabilities: str) -> str:
     return capabilities[:start] + capabilities[end:]
 
 
+class _MergedPerson(NamedTuple):
+    """One person of the get_merged_prs list: totals, and their non-empty days when the report has days."""
+
+    login: str
+    sort_login: str
+    merged: Optional[int]
+    coding: Optional[int]
+    days: Optional[List[Dict[str, Any]]]
+
+
 class BusinessAnalyticsManagement(ToolBase):
     """Business Analytics Management Tool.
 
@@ -126,16 +227,11 @@ class BusinessAnalyticsManagement(ToolBase):
     tool_type: ClassVar[ToolType] = ToolType.ANALYTICS
 
     def _format_api_error_details(self, error: Exception) -> str:
-        """Format API error with detailed information for debugging."""
+        """The platform's cleaned-up error message and HTTP status, never its raw body."""
         if isinstance(error, ReveniumAPIError):
             error_details = f"**API Error**: {error.message}"
             if hasattr(error, "status_code") and error.status_code:
                 error_details += f"\n**HTTP Status**: {error.status_code}"
-            if hasattr(error, "response_data") and error.response_data:
-                # Extract useful error information without overwhelming output
-                if isinstance(error.response_data, dict):
-                    if "error_data" in error.response_data and error.response_data["error_data"]:
-                        error_details += f"\n**API Response**: {error.response_data['error_data']}"
             return error_details
         else:
             return f"**Error**: {str(error)}"
@@ -237,6 +333,12 @@ class BusinessAnalyticsManagement(ToolBase):
             # not paginate today, but enforcing the shared contract keeps the
             # error envelope consistent with manage_tools.
             arguments = validate_pagination_params(arguments, action=action)
+
+            refusal = unread_narrowing_refusal(action, arguments)
+            if refusal is not None:
+                raise_refusal(
+                    ResponseFormatter().format_error_response(refusal.message, refusal.suggestions)
+                )
 
             # Route to appropriate handler
             if action == "get_capabilities":
@@ -398,15 +500,16 @@ class BusinessAnalyticsManagement(ToolBase):
 - Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response)
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
             raise
         except Exception as e:
             logger.error(f"Error in get_cost_summary: {e}")
             error_details = self._format_api_error_details(e)
+            troubleshooting = "\n".join(f"- {line}" for line in COST_SUMMARY_RETRY_ADVICE)
             error_response = f"""❌ **Cost Summary Analysis Failed**
 
 {error_details}
@@ -414,21 +517,19 @@ class BusinessAnalyticsManagement(ToolBase):
 If you're seeing this error, please report it as it indicates a reliability issue.
 
 **Troubleshooting:**
-- Check that the time period is valid (HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS)
-- Verify that aggregation is valid (TOTAL, MEAN, MAXIMUM, MINIMUM)
-- Ensure there is data available for the specified period
-- Try a different time period or aggregation
+{troubleshooting}
 
 **For Help:**
 - Use `get_capabilities()` to see supported parameters
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     async def _handle_get_capabilities(
         self,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Return summary of capabilities in business analytics suite."""
+        range_actions = await self._calendar_range_actions()
         capabilities = """
 # Business Analytics Capabilities
 
@@ -453,12 +554,15 @@ If you're seeing this error, please report it as it indicates a reliability issu
 6. **get_user_costs**
    - Analyze costs by user email (subscriber)
    - Returns cost, request count, and token usage per user
+   - Paged with page (zero-based) and size (1 to """ + str(ANALYTICS_MAX_PAGE_SIZE) + """, default """ + str(USER_COSTS_DEFAULT_PAGE_SIZE) + """); the answer ends with
+     "Page X of Y, N users in all" and the call for the next page, and when the report has more
+     than one page its totals are labelled as this page's only
    - Reports only rows whose subscriber email is populated
+   - Each person's total only: a group or aggregation other than TOTAL is refused
    - Without filters.costSources it asks for every cost source per user
      (filters.costSources=["coding_assistant", "revenium_metered", "provider_billing"]); pass a
-     subset to narrow it. Coding-assistant usage is real spend under revenium_metered or
-     provider_billing when the team pays for that assistant at API rates and an estimate under
-     coding_assistant otherwise, so never conclude from one source being empty
+     subset to narrow it. Which source holds a call is the rule under "Cost sources" below, so
+     never conclude from one source being empty
    - The web app's AI by Employee view remains the authoritative per-employee coding-assistant report
    - Per-person billed spend (the platform's billing per-person view) is not exposed by this tool
      at all: only anthropic_enterprise and github_copilot attribute spend to a named person at the
@@ -468,10 +572,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
 
 6a. **get_transaction_count**
    - Total transaction volume for your team over a period (real count, not derived from cost)
-   - Single aggregate number; same universe as the v2 analytics cost actions - coding-assistant
-     usage is real spend for the assistants the team pays for at API rates (apiRateProviders) and an
-     estimate under the coding_assistant cost source otherwise, traffic billed as real provider spend
-     is counted regardless, and no cost action applies a different rule
+   - Single aggregate number; same universe as the v2 analytics cost actions - a call carrying a
+     coding-assistant provider or agent is counted only when the team pays API rates for that
+     assistant (apiRateProviders), calls through a per-call-billed host such as Bedrock are counted
+     regardless, and no cost action applies a different rule
    - Deliberately narrower than manage_metering's transaction lookups, which include coding-assistant
      records by default; use those to verify whether Claude Code / Gemini CLI data arrived
 
@@ -486,15 +590,20 @@ If you're seeing this error, please report it as it indicates a reliability issu
    - Adoption rate is seatsUsed (the trailing 30-day active count) / seatsPaid — never dailyActive / seatsPaid
    - Withheld counts render as 'unavailable (withheld by vendor)', never 0; a day missing either adoption input shows no rate
    - An empty census means no Claude Enterprise connection for the team, which is reported as such rather than as zero seats
+   - A requested day the census did not return is named as having no census, never left out silently
    - A census freshness line reports censusState, whether the latest Claude Enterprise sync read the census: READ, UNREAD (the most recent sync in the last 3 days could not read it, so the counts may be stale) or UNKNOWN (no sync completed in the last 3 days); a response without censusState renders as unknown, never READ
 
 6c. **list_invoices / list_refunds / list_period_charges**
    - Read-only billing listings; numeric-honest amounts (missing → 'n/a', never a fabricated 0)
+   - start_date / end_date on all three: yyyy-MM-dd calendar days (the whole UTC day, both days included) or ISO-8601 instants with Z or an offset; pass both or neither
+   - starting_amount / ending_amount on list_invoices: whole numbers, 0 or more (a fraction is refused, a blank is ignored)
    - list_invoices / list_refunds: page-numbered; list_period_charges: cursor/keyset (no page param)
+   - Every row of the page is printed (size 1 to 100); list_invoices and list_refunds end with the page, the total and the call for the next page (repeat the same filters with it)
 
 6d. **list_skills / get_skill**
    - Cost by skill: the skill catalog and its usage (cost, calls, traces) in one paged listing
    - list_skills sorts by totalCost,DESC by default; get_skill takes skill_id and adds first/last seen
+   - list_skills prints every row of the page (size 1 to 100) and ends with the page, the total and the call for the next page
    - period also accepts NINETY_DAYS and SIX_MONTHS here, which the cost-analysis actions do not
    - Requires skill attribution to be enabled for the team; both actions answer 403 until it is
 
@@ -504,21 +613,22 @@ If you're seeing this error, please report it as it indicates a reliability issu
    - Aging/rotting classify by INACTIVITY (days since the PR's last provider-side activity), not by age
    - Drafts are counted separately and excluded; at-risk (rotting, still open) and wasted (closed unmerged) stay separate
    - Requires source (github|gitlab), start_date and end_date; the window must span fewer than 366 days
-   - Dollar figures are client-side ESTIMATES (count x avgCostPerMergedPr), never billed amounts
+   - Dollar figures are client-side ESTIMATES (priced count x avgCostPerMergedPr), never billed amounts
    - Thresholds come from the team settings and are echoed in the report; the same settings also hold the cutoff date, excluded repositories, automation patterns and assisted-only default. Read them with manage_customers get_pr_health_settings and change them with update_pr_health_settings
    - The report lists at most 50 engineers; page through all of them with get_pr_health_engineers
    - Optional department_id narrows every figure to one department (include_descendants=true adds its subtree)
-   - The header echoes the cutoff date and excluded repositories the team settings applied
+   - The header echoes the cutoff date and excluded repositories the team settings applied, and the date counts start from (countsSince) when the platform sends it
 
 6e1. **get_pr_health_engineers / get_pr_health_prs / get_pr_health_pull_requests**
    - Same source/start_date/end_date window and 366-day rule as get_pr_health, same organization scope
    - Same optional department_id / include_descendants narrowing, plus assisted_only=true to keep only AI-assisted PRs
-   - get_pr_health_engineers: every engineer row, paged (page, size) and sorted server-side (sort_by authorLogin|openPrs|agingPrs|rottingPrs|closedUnmerged|oldestInactiveDays, sort_dir asc|desc); query keeps the engineers whose login or mapped email contains it
+   - get_pr_health_engineers: every engineer row, paged (page, size) and sorted server-side (sort_by authorLogin|openPrs|agingPrs|rottingPrs|closedUnmerged|mergedPrs|aiShare|rotRate|departmentLabel|oldestInactiveDays, sort_dir asc|desc); query keeps the engineers whose login or mapped email contains it
    - get_pr_health_prs: one engineer's open PRs (bucketed ROTTING/AGING/ACTIVE/DRAFT) and PRs closed without merge; author (the login from the engineer rows) is required
-   - get_pr_health_pull_requests: the flat PR list behind the report, paged, filterable by bucket (AUTOMATION|ROTTING|AGING|ACTIVE|DRAFT|CLOSED_UNMERGED), author, repo, ticket and triaged (EXCLUDE|ONLY), sort_by inactivity|age
+   - get_pr_health_pull_requests: the flat PR list behind the report, paged, filterable by bucket (AUTOMATION|ROTTING|AGING|ACTIVE|DRAFT|CLOSED_UNMERGED), author, repo, ticket and triaged (EXCLUDE|ONLY), sort_by inactivity|age|repo|author|review
    - get_pr_health_pull_requests also takes cause (AUTOMATION|STUCK_DRAFT|AUTHOR_GONE|APPROVED_NOT_MERGED|CHANGES_REQUESTED_QUIET|WAITING_ON_REVIEW|ON_PACE) for the open PRs of one action-queue cause; cause and bucket cannot be combined
    - Without bucket the pull-request list holds every bucket except AUTOMATION, and triaged defaults to EXCLUDE: pull requests someone dismissed or snoozed in the app are left out unless triaged=ONLY is passed
    - Each PR row shows its bucket, draft flag and AI-assisted flag; inactivity and age stay separate figures
+   - Every count starts at the report's countsSince (get_pr_health shows it): the team's cutoff date, else six months before today (UTC).
 
 6e1a. **get_pr_health_repositories**
    - Every repository of your organization holding open PRs, with its open count and whether the team excludes it
@@ -533,19 +643,28 @@ If you're seeing this error, please report it as it indicates a reliability issu
    - assisted_only applies to the breakdown, the queue and the follow-through
    - Triage (dismiss, snooze, undo) is not available here: the queue and the pull-request list leave dismissed and snoozed pull requests out unless triaged=ONLY is passed
    - No dollars come back from the breakdown or the trend: their priced counts are the pull requests opened on or after the report's pricedSince
+   - The breakdown, the queue and the trend count from the report's countsSince (get_pr_health shows it): the team's cutoff date, else six months before today (UTC). The follow-through counts only pull requests opened on or after the report's pricedSince
 
 6e2. **get_merged_prs**
    - Merged pull-request counts for your own organization, per person (default) or per repository (group_by='repository')
    - Requires source, start_date and end_date; granularity window (default), day (under 35 days), week or month (under 400 days)
    - email, include_members and include_pull_requests need group_by='repository'; pr_limit (1-200) and pr_offset need include_pull_requests=true
+   - Per-person grouping lists people busiest first with empty days left out; people_offset pages the people (not with group_by)
    - Truncated repository or pull-request lists are always flagged; a missing VCS credential is stated, never shown as zero merges
 
 6f. **get_coverage_ratio**
    - How much of the providers' billed spend Revenium actually metered, plus the hidden (unmetered) spend
-   - period picks the comparison window (24h, 7d, 30d, 90d, custom + start_date/end_date; default 30d); optional provider filter
+   - period picks a rolling comparison window (24h, 7d, 30d, 90d; default 30d); start_date/end_date pick a calendar range instead, and both together are refused unless period is custom; optional provider filter
+   - the dates are yyyy-MM-dd calendar days (the whole UTC day, both ends included) or ISO-8601 instants with Z or an offset; the header names the UTC days read
    - A null coverage ratio is NOT zero coverage: state carries NO_INTEGRATION / ZERO_SPEND_PERIOD / DATA_UNAVAILABLE
+   - A VALID report can still withhold the aggregate: the platform publishes it only when every compared provider (billing credential connected and overlapping the window) billed something in it, so the report names the compared rows that billed nothing and prints metered over billed across the compared rows as a labelled diagnostic, never as the coverage ratio
+   - With provider set, only a billing credential of exactly that provider is matched on the current
+     platform: provider=ANTHROPIC answers NO_INTEGRATION when the only Anthropic credential is a Claude
+     Enterprise connection, while the call without provider shows the Anthropic row with it counted
    - trend is a signed percentage-point delta vs. the previous window; 0.0 pp is a real answer, only null means no prior period
-   - Per-provider rows report that provider's SHARE of total billed spend plus its metered/billed amounts — the share is not a per-provider coverage
+   - Per-provider rows are named by their label (e.g. "Anthropic Console", "Claude Enterprise"), falling back to the provider code, and list their billing credential names when the platform sends them
+   - A row's ratio is that provider's Revenium-metered spend divided by its billed spend, next to its metered/billed amounts
+   - The aggregate ratio and hidden spend cover only rows with a billing credential; usage with no key connected to compare it against is listed but left out, and needs its provider key connected in Revenium's Manage Connections
    - Two metered totals when the platform sends them: inside the comparison (what the ratio and hidden spend came from) and outside it (metered spend with no billing credential to compare against)
    - Metered spend outside the comparison is NOT hidden spend: hidden spend is billed and not metered, the other is metered with nothing to compare
    - A per-provider 'billing credential connected: no' row is metered-only and is excluded from the aggregate ratio and hidden spend
@@ -556,7 +675,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 
 6g. **get_filter_options**
    - Enumerate the valid filter values for a dimension (providers, models, agents, tasks, and the rest)
-   - Use it before passing a filter value to any cost action, so the value is one the platform knows
+   - Use it before passing a filter value to the per-user cost report or get_department_costs, so the value is one the platform knows; get_agent_costs filters only by costSources, which it does not list; the provider, model, customer, API key, cost summary and tool cost reports take no filters and refuse them
 
 6h. **get_department_costs**
    - Cost, requests and tokens per department for the team your credentials resolve to, over the whole period
@@ -568,18 +687,22 @@ If you're seeing this error, please report it as it indicates a reliability issu
 
 7. **get_cost_summary**
    - Generate a summary report of recent AI spending (includes all dimensions)
+   - Each of its five parts has """ + summary_part_time_limit_text() + """ to answer, whatever REVENIUM_HTTP_TIMEOUT says; a part not read in time is named with the action that reads it alone, and the others are shown
 
 7a. **get_tool_costs**
-   - Cost breakdown by tool over time
+   - Cost per tool over the whole window, with each tool's share of the total
 
 7b. **get_top_tools**
-   - Top tools ranked by cost
+   - Tools ranked by call count
 
 7c. **get_tool_costs_by_agent**
-   - Tool cost breakdown segmented by agent
+   - Tool cost per agent
 
 7d. **get_tool_costs_by_provider**
-   - Tool cost breakdown segmented by provider
+   - Tool cost per tool provider, summed over the window
+
+   The four tool cost actions take period, or start_date and end_date in its place, read every
+   page of the report, and name in the answer the exact startDate and endDate the platform was asked for.
 
 7e. **get_agent_summary**
    - Agent-friendly overview of this tool's surface
@@ -656,9 +779,28 @@ If you're seeing this error, please report it as it indicates a reliability issu
 {"action": "analyze_cost_anomalies", "period": "SEVEN_DAYS", "min_impact_threshold": 50.0}
 ```
 
+**Cost sources (costSources), on every cost action that reads the analytics API:** """ + COST_SOURCE_RULE + """
+The legacy analytics endpoints take no costSources and follow the tenant's coding-assistant filter
+policy instead: they count coding-assistant records unless that policy excludes them.
+
+**A calendar range instead of a rolling period:** """ + _values(range_actions) + """ take
+start_date and end_date in place of period: yyyy-MM-dd, both or neither, both days included, at
+most """ + str(CALENDAR_RANGE_MAX_DAYS) + """ days. The report header shows the exact range. A range is always read from
+the analytics API, whichever API the action uses for a named period.
+```json
+// September as a calendar month
+""" + json.dumps(_CALENDAR_MONTH_EXAMPLE) + """
+```
+
 ## Supported Parameter Values
-- **Time Periods**: """ + _values(COST_PERIOD_VALUES) + """
-- **Aggregations**: """ + _values(AGGREGATION_VALUES) + """
+- **Time Periods**: """ + _values(COST_PERIOD_VALUES) + """. Names are read in any case
+(seven_days is SEVEN_DAYS); any other name is refused with the supported list, including
+""" + _values(SKILL_ONLY_PERIOD_VALUES) + """, which only list_skills and get_skill take.
+- **Aggregations**: """ + _values(AGGREGATION_VALUES) + """. The provider, model, customer, API key
+and agent reports read the window in time slices; TOTAL adds the slices up, MAXIMUM is the largest
+slice's figure, MINIMUM the smallest and MEAN the average over the slices with a value. On the
+analytics API (every start_date/end_date range) the aggregation is sent as the platform's
+metricType (sum, avg, max, min).
 """
         if requires_new_api_flag(UserCostsFormatter.ENDPOINT_KEY):
             capabilities = _strip_user_costs_section(capabilities)
@@ -714,6 +856,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
         self, _arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Return examples only for currently implemented features."""
+        range_actions = await self._calendar_range_actions()
         examples = """
 # Business Analytics Examples
 
@@ -743,8 +886,19 @@ If you're seeing this error, please report it as it indicates a reliability issu
 ```
 **Purpose**: Analyze costs by AI provider over specified time period
 **Parameters**:
-- `period` (required): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- `period` (required unless `start_date`/`end_date` replace it): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - `group` (optional): TOTAL, MEAN, MAXIMUM, MINIMUM (defaults to TOTAL)
+
+### A calendar month instead of a rolling period
+```json
+""" + json.dumps(_CALENDAR_MONTH_EXAMPLE, indent=2) + """
+```
+**Purpose**: Read September 1 to September 30 (UTC) rather than the last 30 days
+**Parameters**:
+- `start_date` and `end_date`: yyyy-MM-dd, both or neither, both days included, start_date not after
+  end_date, at most """ + str(CALENDAR_RANGE_MAX_DAYS) + """ days; they replace `period`, which must then be left out
+- Accepted by """ + _values(range_actions) + """
+- Always read from the analytics API, whichever API the action uses for a named period
 
 ### get_model_costs
 ```json
@@ -756,7 +910,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 ```
 **Purpose**: Analyze costs by AI model over specified time period
 **Parameters**:
-- `period` (required): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- `period` (required unless `start_date`/`end_date` replace it): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - `group` (optional): TOTAL, MEAN, MAXIMUM, MINIMUM (defaults to TOTAL)
 
 ### get_customer_costs
@@ -769,7 +923,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 ```
 **Purpose**: Analyze costs by customer over specified time period
 **Parameters**:
-- `period` (required): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- `period` (required unless `start_date`/`end_date` replace it): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - `group` (optional): TOTAL, MEAN, MAXIMUM, MINIMUM (defaults to TOTAL)
 
 ### get_api_key_costs
@@ -782,7 +936,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 ```
 **Purpose**: Analyze costs by API key over specified time period
 **Parameters**:
-- `period` (required): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- `period` (required unless `start_date`/`end_date` replace it): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - `group` (optional): TOTAL, MEAN, MAXIMUM, MINIMUM (defaults to TOTAL)
 
 ### get_agent_costs
@@ -795,12 +949,11 @@ If you're seeing this error, please report it as it indicates a reliability issu
 ```
 **Purpose**: Analyze costs by agent/application over specified time period
 **Parameters**:
-- `period` (required): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- `period` (required unless `start_date`/`end_date` replace it): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - `group` (optional): TOTAL, MEAN, MAXIMUM, MINIMUM (defaults to TOTAL)
 - `filters` (optional): `{"costSources": [...]}` restricts results to specific cost sources.
   Valid values: `revenium_metered` (costs metered by Revenium), `provider_billing`
   (costs imported from provider billing). Omit to include the platform default cost picture.
-  Requires the new analytics API.
 
 ```json
 // Agent costs from provider billing imports only
@@ -822,7 +975,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 ```
 **Purpose**: Cost, requests and tokens per department for your team over the period
 **Parameters**:
-- `period` (required): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- `period` (required unless `start_date`/`end_date` replace it): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - `group` (optional): TOTAL, MEAN, MAXIMUM, MINIMUM (defaults to TOTAL)
 - `filters` (optional): arrays under `agents`, `providers`, `models`, `users` (subscriber emails), `costSources`
   (defaults to `["coding_assistant", "revenium_metered", "provider_billing"]`, as on get_user_costs)
@@ -849,10 +1002,11 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
   "period": "THIRTY_DAYS"
 }
 ```
-**Purpose**: Enumerate the valid filter values for a dimension (agents, models, providers, ...) so you use real names in the cost endpoints' `filters` arguments instead of guessing
+**Purpose**: Enumerate the valid filter values for a dimension (agents, models, providers, ...) so you use real names in the `filters` of get_user_costs and get_department_costs (agents, providers, models, users) instead of guessing; get_agent_costs filters only by costSources, which this does not list; the provider, model, customer, API key, cost summary and tool cost reports take no filters and refuse them
 **Parameters**:
 - `dimension` (required): agents, api-keys, customers, model-sources, models, organizations, products, providers, task-types, teams, tool-providers, tools, users, vendors
 - `period` (optional, defaults to THIRTY_DAYS): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- `filters` (optional, users dimension only): `{"costSources": ["coding_assistant", "revenium_metered", "provider_billing"]}`; defaults to all three, the same sources get_user_costs reads, so the list names everyone that report names
 
 ### get_unpaid_invoice_totals
 ```json
@@ -876,7 +1030,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 - `from_date` (required): first UTC day, inclusive, ISO yyyy-MM-dd
 - `to_date` (required): last UTC day, inclusive, ISO yyyy-MM-dd; the range may not exceed 366 days
 - `team_id` (optional): team hashid; defaults to the team on your credentials
-**Reading the output**: adoption rate is seatsUsed / seatsPaid, where seatsUsed is the trailing 30-day active count (the basis Anthropic's own console uses). A count the vendor withheld renders as 'unavailable (withheld by vendor)', never 0, and its day shows no adoption rate. An empty census reports no Claude Enterprise connection — a different problem from a withheld count. The census freshness line, shown even for an empty census, reports `censusState` with `censusCheckedAt`: `READ` means the latest Claude Enterprise sync read the census, `UNREAD` means the most recent sync in the last 3 days could not read it so the counts may be stale, and `UNKNOWN` means no sync completed in the last 3 days. A response without `censusState` renders as unknown, never as `READ`.
+**Reading the output**: adoption rate is seatsUsed / seatsPaid, where seatsUsed is the trailing 30-day active count (the basis Anthropic's own console uses). A count the vendor withheld renders as 'unavailable (withheld by vendor)', never 0, and its day shows no adoption rate. An empty census reports no Claude Enterprise connection, a different problem from a withheld count. A requested day the census did not return is named as having no census, never left out silently; after a `READ` sync, the day before the sync's UTC day and later days are said to have ended too recently for that sync to include them, not called gaps. The census freshness line, shown even for an empty census, reports `censusState` with `censusCheckedAt`: `READ` means the latest Claude Enterprise sync read the census, `UNREAD` means the most recent sync in the last 3 days could not read it so the counts may be stale, and `UNKNOWN` means no sync completed in the last 3 days. A response without `censusState` renders as unknown, never as `READ`.
 
 ### get_task_costs
 ```json
@@ -1006,7 +1160,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
   "states": ["FINALIZED"]
 }
 ```
-**Purpose**: List invoices with a compact per-entry line (number, state, pay status, total amount + currency code, period). Amounts are numeric-honest: a missing/non-numeric total renders `n/a`, never a fabricated `0`.
+**Purpose**: List invoices with a compact per-entry line (number, state, pay status, total amount + currency code, period). Amounts are numeric-honest: a missing/non-numeric total renders `n/a`, never a fabricated `0`. Every row of the page is printed, and the answer ends with the page, the total and the page and size to pass next (repeat the same filters).
 **Parameters** (all optional): `page`, `size`, `invoice_number`, `start_date`, `end_date`, `pay_states`, `states`, `starting_amount`, `ending_amount`
 
 ### list_refunds
@@ -1016,7 +1170,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
   "query": "acme"
 }
 ```
-**Purpose**: List refunds (empty on most tenants). Same rendering discipline as list_invoices.
+**Purpose**: List refunds (empty on most tenants). Each line shows the refund id, amount + currency code, when it was issued, when it was applied to an invoice, and product. Same rendering and paging discipline as list_invoices.
 **Parameters** (all optional): `page`, `size`, `query`, `start_date`, `end_date`, `minimum`, `maximum`
 
 ### list_period_charges
@@ -1027,7 +1181,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
   "invoice_id": "inv_1"
 }
 ```
-**Purpose**: List period charges. Uses cursor/keyset pagination — there is NO page parameter. When more results exist the response ends with a line telling you the `cursor` value to pass next.
+**Purpose**: List period charges. Each line shows the charge id, charge + currency code, call count, type / charge type, product, transaction id and created time. Uses cursor/keyset pagination — there is NO page parameter and no total. When more results exist the response ends with a line telling you the `cursor` value to pass next.
 **Parameters** (all optional): `size`, `invoice_id`, `start_date`, `end_date`, `cursor`
 
 ### list_skills
@@ -1054,7 +1208,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 **Parameters**:
 - `skill_id` (required): the skill identifier
 - `period` (optional, defaults to THIRTY_DAYS): same enum as `list_skills`
-**Note**: a skill with no recorded usage inside the window reports an empty result, not a failure — widen `period` before concluding the id is wrong.
+**Note**: a 404 means either no recorded usage inside the window or an id that is not one of this team's skills; confirm the id with `list_skills` before widening `period`.
 
 ### get_pr_health
 ```json
@@ -1076,7 +1230,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 - aging and rotting classify by INACTIVITY (days since the PR's last provider-side activity), not by age; `ageDays` and `inactiveDays` are reported separately
 - draft PRs are counted separately and excluded from the aging/rotting figures
 - at-risk (rotting, still open) and wasted (closed without merge) are separate figures — adding them double-counts open work as waste
-- only `avgCostPerMergedPr` comes from the platform; every dollar figure is a client-side ESTIMATE (count x that average) and is labelled as one
+- `avgCostPerMergedPr` is the platform's cost basis (the organization's coding-assistant cost divided by every pull request in the window); every dollar figure is a client-side ESTIMATE in USD (priced count x that average, the priced count being the AI-assisted pull requests opened on or after the report's `Priced since`) and is labelled as one
 - the window scopes the closed/merged counts and the cost basis; the open-PR figures reflect the current synced state
 
 ### get_pr_health_engineers
@@ -1093,8 +1247,9 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 }
 ```
 **Purpose**: every engineer row of the PR-health report, one server-sorted page at a time.
-**Parameters**: the `get_pr_health` window (required) plus optional `page`, `size`, `sort_by` (authorLogin, openPrs, agingPrs, rottingPrs, closedUnmerged, oldestInactiveDays), `sort_dir` (asc, desc) and `query` (keeps the engineers whose login or mapped email contains it, case-insensitively; at most 100 characters).
+**Parameters**: the `get_pr_health` window (required) plus optional `page`, `size`, `sort_by` (authorLogin, openPrs, agingPrs, rottingPrs, closedUnmerged, mergedPrs, aiShare, rotRate, departmentLabel, oldestInactiveDays), `sort_dir` (asc, desc) and `query` (keeps the engineers whose login or mapped email contains it, case-insensitively; at most 100 characters).
 **Narrowing** (all three drill-downs): optional `department_id`, `include_descendants` (needs `department_id`) and `assisted_only` (true keeps only AI-assisted pull requests).
+**Counting window** (all three drill-downs): Every count starts at the report's countsSince (get_pr_health shows it): the team's cutoff date, else six months before today (UTC).
 
 ### get_pr_health_prs
 ```json
@@ -1122,7 +1277,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 }
 ```
 **Purpose**: the flat, paged list of every pull request behind the report.
-**Parameters**: the `get_pr_health` window plus optional `bucket` (AUTOMATION, ROTTING, AGING, ACTIVE, DRAFT, CLOSED_UNMERGED), `author`, `repo` (owner/repo, case-insensitive), `ticket` (the ticket id read from the PR's title or branch, at most 80 characters), `triaged` (EXCLUDE, ONLY), `page`, `size`, `sort_by` (inactivity, age) and `sort_dir` (asc, desc).
+**Parameters**: the `get_pr_health` window plus optional `bucket` (AUTOMATION, ROTTING, AGING, ACTIVE, DRAFT, CLOSED_UNMERGED), `author`, `repo` (owner/repo, case-insensitive), `ticket` (the ticket id read from the PR's title or branch, at most 80 characters), `triaged` (EXCLUDE, ONLY), `page`, `size`, `sort_by` (inactivity, age, repo, author, review) and `sort_dir` (asc, desc).
 **Cause**: optional `cause` (AUTOMATION, STUCK_DRAFT, AUTHOR_GONE, APPROVED_NOT_MERGED, CHANGES_REQUESTED_QUIET, WAITING_ON_REVIEW, ON_PACE) lists only the open pull requests of that action-queue cause; the window then filters nothing, and it cannot be combined with `bucket`.
 **Defaults**: without `bucket` the list holds every bucket except AUTOMATION; `bucket=AUTOMATION` lists the open automation pull requests. `triaged` defaults to EXCLUDE, so pull requests someone dismissed or snoozed in the app are left out unless `triaged=ONLY` is passed, which lists just those.
 
@@ -1150,7 +1305,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 ```
 **Purpose**: where the report's figures come from, one row per repository, engineer or department, with open, aging, at-risk, wasted and merged counts and their priced parts.
 **Parameters**: the `get_pr_health` window plus `group_by` (required: repo, engineer or department) and optional `page`, `size` (1-100, default 5), `sort_by` (rottingPrs, closedUnmerged, openPrs, name, share), `sort_dir`, `department_id`, `include_descendants` and `assisted_only`.
-**Reading the answer**: a group appears only when it holds an open pull request or one closed without merging; the totals are whole across every group. A repository row flags when it had no human merge in the last 90 days. Department rows carry the `department_id` to pass back for exactly that row's figures. No dollars are returned.
+**Reading the answer**: a group appears only when it holds an open pull request or one closed without merging; the totals are whole across every group. A repository row flags when it had no human merge in the last 90 days. Department rows carry the `department_id` to pass back for exactly that row's figures. No dollars are returned. Counts start at the report's countsSince (get_pr_health shows it).
 
 ### get_pr_health_queue
 ```json
@@ -1163,7 +1318,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 ```
 **Purpose**: the open pull requests that need a decision, grouped by why: AUTOMATION, STUCK_DRAFT, AUTHOR_GONE, APPROVED_NOT_MERGED, CHANGES_REQUESTED_QUIET, WAITING_ON_REVIEW, ON_PACE. Each pull request takes the first cause that matches.
 **Parameters**: `source` (required); optional `per_cause` (rows shown per group, 1-50, default 8), `sort_by` (inactivity, age, repo, author, review), `sort_dir`, `author`, `repo`, `ticket`, `triaged` (EXCLUDE, ONLY), `department_id`, `include_descendants` and `assisted_only`. No window: the queue holds open pull requests only.
-**Reading the answer**: every group states its whole count; page through one with `get_pr_health_pull_requests(cause=...)`. `triaged` defaults to EXCLUDE, so pull requests someone dismissed or snoozed in the app are left out of every group except AUTOMATION.
+**Reading the answer**: every group states its whole count; page through one with `get_pr_health_pull_requests(cause=...)`. `triaged` defaults to EXCLUDE, so pull requests someone dismissed or snoozed in the app are left out of every group except AUTOMATION. Counts start at the report's countsSince (get_pr_health shows it).
 
 ### get_pr_health_trend
 ```json
@@ -1177,7 +1332,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 ```
 **Purpose**: closed-without-merge and at-risk pull requests per day, week or month, each with its AI-assisted part.
 **Parameters**: `source` (required). Without `start_date` and `end_date` the trend is the 26 calendar weeks ending with the current one; with both (fewer than 366 days apart) `granularity` picks day (fewer than 92 days apart), week (default) or month. Optional `department_id` and `include_descendants`.
-**Reading the answer**: the current bucket is the period so far; past at-risk counts are reconstructed and may read high; buckets before the synced history are marked not covered. No dollars are returned.
+**Reading the answer**: the current bucket is the period so far; past at-risk counts are reconstructed and may read high; buckets before the synced history are marked not covered. No dollars are returned. Counts start at the report's countsSince (get_pr_health shows it).
 
 ### get_pr_health_follow_through
 ```json
@@ -1188,7 +1343,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 ```
 **Purpose**: whether the pull requests PR Health flagged as rotting got fixed: how many were merged, closed without merging or are still open, and the estimated at-risk spend then and now.
 **Parameters**: `source` (required); optional `start_date` and `end_date` together (fewer than 366 days apart) to count only the flags taken on those days, `department_id`, `include_descendants` and `assisted_only`.
-**Reading the answer**: dollar figures are platform estimates priced at a cost per merged pull request; a basis with no merges or no recorded coding-assistant spend reads n/a, never 0.
+**Reading the answer**: dollar figures are platform estimates priced at a cost per merged pull request; a basis with no merges or no recorded coding-assistant spend reads n/a, never 0. Only pull requests opened on or after the report's pricedSince are counted.
 
 ### get_merged_prs
 ```json
@@ -1209,6 +1364,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 - `group_by` (optional): `repository` for one row per repository; works with granularity=window only
 - `email`, `include_members`, `include_pull_requests`: need `group_by='repository'`
 - `pr_limit` (1-200) and `pr_offset`: page the merged pull-request list; need `include_pull_requests=true`
+- `people_offset`: page the ranked people of the per-person grouping (default 0); not with `group_by`
 **Reading the answer**: truncated repository and pull-request lists are always flagged, and a tenant with no VCS credential connected is told so instead of seeing zero merges.
 
 ### get_coverage_ratio
@@ -1221,7 +1377,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 **Purpose**: Provider metering coverage — how much of the providers' billed spend Revenium actually metered, the hidden (unmetered) spend, and the per-provider breakdown.
 **Parameters**:
 - `provider` (optional): a single provider name; omit to cover every connected provider
-**Scope**: the team is resolved from your credentials. `period` picks the comparison window — `24h`, `7d`, `30d` (default), `90d`, or `custom` with `start_date`/`end_date` as ISO instants. The value is passed through verbatim, so a newer platform period also works.
+**Scope**: the team is resolved from your credentials. `period` picks a rolling comparison window: `24h`, `7d`, `30d` (default) or `90d`. `start_date` and `end_date` alone pick a calendar range instead (`get_coverage_ratio(start_date='2026-09-01', end_date='2026-09-30')`); a named period sent with dates is refused, and `custom` with both dates reads the same range. Each date is a `yyyy-MM-dd` calendar day, which covers the whole UTC day with both ends included (`start_date='2026-09-01'`, `end_date='2026-09-30'` is all of September), or an ISO-8601 instant with `Z` or an offset, which is converted to UTC. The `period` value is passed through verbatim, so a newer platform period also works.
 **Reading the numbers**:
 - a coverage ratio of `n/a` is NOT zero coverage — `state` says which of `NO_INTEGRATION`, `ZERO_SPEND_PERIOD` or `DATA_UNAVAILABLE` produced it
 - `hiddenSpend` is billed-but-not-metered spend, so it is the gap to close, not additional cost; it can also be null
@@ -1230,7 +1386,9 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 - a `byProvider` row with `billingCredentialConnected: false` reports metered spend whose invoice Revenium cannot see: no ratio, and deliberately excluded from the aggregate ratio and `hiddenSpend`
 - `meteredBasis` says where the metered figures came from — the window, the store/table, and a `transform` other than `none` naming what reshaped the row sums
 - `trend` is a signed PERCENTAGE-POINT delta against the previous window (current ratio minus previous), so `0.0 pp` means coverage held steady and is a real answer; only a null means there was no prior period
-- each `byProvider` row's ratio is that provider's SHARE of total billed spend, not its coverage — compare the row's `metered` against its `billing` to see one provider's gap; a row `state` of `no-data` means it reported nothing to compare
+- each `byProvider` row is named by its `label` (for example `Anthropic Console` or `Claude Enterprise`), or by `provider` when the platform sends no label; `credentialNames` lists the billing credentials the row reports
+- each `byProvider` row's ratio is that row's Revenium-metered spend divided by its billed spend (the same measure as the aggregate, per row); a row `state` of `no-data` means it reported nothing to compare
+- the aggregate ratio and `hiddenSpend` cover only rows that have a billing credential. A row labelled like "Anthropic API usage, no Console key" is metered usage with no invoice to compare against; connect the key in Revenium's Manage Connections to bring it in
 - no amount carries a currency code: the report does not send one, so figures print bare rather than under an invented denomination
 - coding-assistant usage is a yes/no PRESENCE FLAG, never a dollar figure; `no` does not prove there was none. When the platform sets `codingAssistantUsageUnknown` (the check could not complete), the report or row renders `unknown` instead; an older platform build without that field reports an incomplete check as `no`
 - a `byProvider` row with a `revisionWindowStart` says that provider's figures from that day onward may still be restated; a row without one has final figures
@@ -1261,7 +1419,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 ```
 **Purpose**: Generate a summary report of recent AI spending with top contributors from all categories (providers, models, customers)
 **Parameters**:
-- `period` (required): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- `period` (required unless `start_date`/`end_date` replace it): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - `group` (optional): TOTAL, MEAN, MAXIMUM, MINIMUM (defaults to TOTAL)
 
 ### analyze_cost_anomalies
@@ -1287,9 +1445,13 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 
 **New Entity Detection (Phase 1)**:
 - Supported dimensions: providers, agents, api_keys (models and customers excluded - no time-series endpoints)
-- Detects entities introduced in recent period but absent from baseline period
-- Uses dynamic baseline approach: 7-day uses 2-day baseline, 30-day uses 7-day baseline
-- Gracefully degrades unsupported periods (HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS) to SEVEN_DAYS)
+- Detects entities with cost in the recent part of the window and none (new) or little (activated) in the baseline
+- The baseline is a share of the buckets the platform returned: the first 2/7 for SEVEN_DAYS, 7/30 for THIRTY_DAYS, 1/12 (one month) for TWELVE_MONTHS
+- Short windows (HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS) read seven days (SEVEN_DAYS) for detection; the anomalies keep the requested window
+- The answer names the recent and baseline spans, says when nothing new appeared, and says why when detection could not run
+- With min_new_entity_threshold the answer names the threshold, both when nothing reached it and when it limited the list
+- New and activated sources are counted apart in the summary
+- On the analytics route only the """ + str(ANALYTICS_API_KEY_CAP) + """ costliest API keys are named; the """ + ANALYTICS_API_KEY_ROLLUP_GROUP + """ group is not compared, and the answer says so
 
 **Parameter Guidelines:**
 - Use `min_impact_threshold` (not `threshold`)
@@ -1333,7 +1495,12 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 
 Use `get_capabilities()` for current status.
 """
-        return [TextContent(type="text", text=response)]
+        raise_refusal(
+            response,
+            error_code=ErrorCodes.ACTION_NOT_SUPPORTED,
+            field="action",
+            value=action,
+        )
 
     async def _handle_get_provider_costs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -1368,9 +1535,9 @@ Use `get_capabilities()` for current status.
 - Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response)
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
             raise
@@ -1384,7 +1551,7 @@ Use `get_capabilities()` for current status.
 If you're seeing this error, please report it as it indicates a reliability issue.
 
 **Troubleshooting:**
-- Verify your parameters: period (required), aggregation (optional, defaults to TOTAL)
+- Verify your parameters: period, or start_date and end_date (yyyy-MM-dd, both days included) in its place; aggregation (optional, defaults to TOTAL)
 - Check that you have data for the specified time period
 - Try a different time period if no data is available
 
@@ -1396,7 +1563,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to check current status
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     async def _handle_get_transaction_count(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -1429,9 +1596,9 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to see supported parameters
 - Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response)
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             raise
         except Exception as e:
@@ -1452,7 +1619,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to check current status
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     async def _handle_get_filter_options(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -1460,8 +1627,8 @@ If you're seeing this error, please report it as it indicates a reliability issu
         """Handle get_filter_options — enumerate valid filter values for a dimension.
 
         Lets callers discover the real entity names (agents, models, providers,
-        ...) the cost endpoints' ``filters`` arguments expect, so they stop
-        guessing names and getting empty results.
+        users) that the ``filters`` of get_user_costs and get_department_costs
+        apply, so they stop guessing names and getting empty results.
         """
         try:
             logger.info("Processing get_filter_options request")
@@ -1490,9 +1657,9 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to see supported parameters
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response)
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             raise
         except Exception as e:
@@ -1514,7 +1681,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to check current status
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     async def _handle_get_unpaid_invoice_totals(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -1526,6 +1693,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
         UNPAID invoices contribute their full amount and PARTIALLY_PAID ones
         their remaining balance.
         """
+        self._refuse_billing_arguments_not_applied(arguments, "get_unpaid_invoice_totals")
         try:
             logger.info("Processing get_unpaid_invoice_totals request")
 
@@ -1551,7 +1719,7 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
             logger.info("Unpaid invoice totals retrieved successfully")
             return [TextContent(type="text", text=response)]
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             raise
         except Exception as e:
@@ -1568,7 +1736,7 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 **For Help:**
 - Use `get_capabilities()` to check current status
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     # ──────────────────────────────────────────────────────────────────────
     # Claude Enterprise seat census (BACK-2762)
@@ -1583,6 +1751,8 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
     #                          would read as "no seats assigned".
     # ──────────────────────────────────────────────────────────────────────
     _SEAT_MAX_DAY_ROWS: ClassVar[int] = 60
+    # Runs of missing census days named one by one before the rest are counted.
+    _SEAT_MAX_MISSING_RUNS: ClassVar[int] = 10
     _SEAT_NO_CONNECTION_MESSAGE: ClassVar[str] = (
         "No Claude Enterprise connection found for this team. The platform returned a "
         "seat census with no days in it, which is what an organization that has never "
@@ -1627,6 +1797,116 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
         "a census state this client does not recognise, so how fresh these seat counts "
         "are is unknown"
     )
+
+    @classmethod
+    def _today_utc(cls) -> date:
+        """Today's UTC calendar day; a seam so tests can pin the clock."""
+        return datetime.now(timezone.utc).date()
+
+    @staticmethod
+    def _census_check_day(census: Dict[str, Any]) -> Optional[date]:
+        """The UTC day of the sync that read the census, or None without a usable one.
+
+        Only a READ sync read a census, and only an instant with an offset names
+        a UTC day; anything else leaves the caller on today's split.
+        """
+        state, checked_at = census.get("censusState"), census.get("censusCheckedAt")
+        if not isinstance(state, str) or state.strip() != "READ" or not isinstance(checked_at, str):
+            return None
+        try:
+            instant = datetime.fromisoformat(checked_at.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if instant.tzinfo is None:
+            return None
+        return instant.astimezone(timezone.utc).date()
+
+    @classmethod
+    def _render_missing_seat_days(
+        cls,
+        from_date: str,
+        to_date: str,
+        days: List[Dict[str, Any]],
+        census: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        """Name every requested day the census did not return.
+
+        The daily list shows only the days the platform sent, so without this a
+        skipped day is indistinguishable from a range that never included it.
+        With a READ sync time, a day is a gap only when it ended at least a full
+        UTC day before the sync's day: the sync at 01:00 UTC on the 17th
+        returned no 16th, so days from the day before the sync's day up to
+        today are said to have ended too recently, and today and later days
+        have simply not been taken yet. Without a sync time, days before today
+        are gaps and today and later days have not been taken yet.
+        """
+        first = datetime.strptime(from_date, "%Y-%m-%d").date()
+        last = datetime.strptime(to_date, "%Y-%m-%d").date()
+        requested = [first + timedelta(days=n) for n in range((last - first).days + 1)]
+        returned = {day.get("date") for day in days}
+        missing = [day for day in requested if day.isoformat() not in returned]
+        if not missing:
+            return []
+
+        today = cls._today_utc()
+        census = census or {}
+        check_day = cls._census_check_day(census)
+        if check_day is None:
+            first_not_yet = today
+        else:
+            first_not_yet = min(check_day, today) - timedelta(days=1)
+        gaps = [day for day in missing if day < first_not_yet]
+        recent = [day for day in missing if first_not_yet <= day < today]
+        not_yet = [day for day in missing if day >= today]
+
+        lines = [""]
+        if gaps:
+            runs: List[List[date]] = []
+            for day in gaps:
+                if runs and day - runs[-1][-1] == timedelta(days=1):
+                    runs[-1].append(day)
+                else:
+                    runs.append([day])
+            shown = ", ".join(
+                run[0].isoformat()
+                if len(run) == 1
+                else f"{run[0].isoformat()} through {run[-1].isoformat()}"
+                for run in runs[: cls._SEAT_MAX_MISSING_RUNS]
+            )
+            tail = ""
+            if len(runs) > cls._SEAT_MAX_MISSING_RUNS:
+                rest = sum(len(run) for run in runs[cls._SEAT_MAX_MISSING_RUNS :])
+                tail = (
+                    f", and {rest} more {'day' if rest == 1 else 'days'} "
+                    f"through {gaps[-1].isoformat()}"
+                )
+            lines.append(
+                f"**Days with no census**: the platform returned no census for "
+                f"{len(gaps)} of the {len(requested)} requested days: {shown}{tail}. "
+                "Those days are absent from the list above, not days with zero seats."
+            )
+        for group, ended in ((recent, True), (not_yet, False)):
+            if not group:
+                continue
+            count = len(group)
+            lead = "" if len(lines) > 1 else "**Days with no census**: "
+            them = "it" if count == 1 else "them"
+            opening = (
+                f"{lead}{count} requested {'day' if count == 1 else 'days'} from "
+                f"{group[0].isoformat()}"
+            )
+            if ended:
+                lines.append(
+                    f"{opening} ended too recently for the latest census sync "
+                    f"({str(census.get('censusCheckedAt')).strip()}) to include {them}; "
+                    f"the vendor may not have published {them} yet."
+                )
+            else:
+                lines.append(
+                    f"{opening} {'is' if count == 1 else 'are'} today or later, "
+                    f"so no census has been taken for {them} yet."
+                )
+        return lines
 
     @classmethod
     def _render_census_freshness(cls, census: Dict[str, Any]) -> str:
@@ -1785,7 +2065,7 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 
         Mirrors _handle_get_unpaid_invoice_totals: build the client, make one
         flat platform read, re-raise AuthenticationError so the MCP envelope
-        sets isError=true, and turn any other failure into troubleshooting text.
+        sets isError=true, and raise any other failure as troubleshooting text.
         """
         from_date, to_date = self._validate_seat_utilization_request(arguments)
         team_id = arguments.get("team_id")
@@ -1924,6 +2204,7 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
                     f"a narrower from_date/to_date to retrieve the remainder._"
                 )
 
+            lines.extend(self._render_missing_seat_days(from_date, to_date, days, census))
             lines.extend(["", census_freshness])
 
             logger.info("Seat utilization retrieved successfully")
@@ -1957,7 +2238,7 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 **For Help:**
 - Use `get_capabilities()` to check current status
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     # ──────────────────────────────────────────────────────────────────────
     # BACK-2376 task / profitability / spend-mover analytics pack (10 actions)
@@ -1965,25 +2246,37 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
     # Each handler mirrors _handle_get_unpaid_invoice_totals: build the client,
     # call SimpleCostAnalyzer directly (no engine indirection — these render
     # their own compact tables), re-raise AuthenticationError so the MCP
-    # envelope sets isError=true, and turn any other failure into troubleshooting
+    # envelope sets isError=true, and raise any other failure as troubleshooting
     # text. Period is passed through to the analyzer, which forwards it to
     # resolve_analytics_request (an unknown period falls back to a 30-day window,
     # matching the sibling analytics actions).
     # ──────────────────────────────────────────────────────────────────────
 
     _MAX_RENDERED_ROWS: ClassVar[int] = 50
+    # One line per bucket, enough for a daily series over the longest calendar range.
+    _MAX_RENDERED_BUCKETS: ClassVar[int] = CALENDAR_RANGE_MAX_DAYS
+
+    @staticmethod
+    def _is_money_type(metric_type: Optional[str]) -> bool:
+        """True when metricType names a money amount (MONEY, CURRENCY, or a COST_* type)."""
+        mtype = (metric_type or "").upper()
+        return mtype in ("MONEY", "CURRENCY") or "COST" in mtype.split("_")
 
     @staticmethod
     def _format_metric_value(value: Any, metric_type: Optional[str]) -> str:
-        """Label a metric value as money, percentage, or plain count from metricType."""
+        """Label a metric value with its unit: the exact-metricType unit from
+        format_metric_result first, else money, percentage, or plain count."""
+        labelled = format_metric_result(value, metric_type)
+        if labelled is not None:
+            return labelled
         if value is None:
             # Numeric honesty: an absent value renders n/a, never the None literal.
             return "n/a"
         if not isinstance(value, (int, float)):
             return str(value)
+        if BusinessAnalyticsManagement._is_money_type(metric_type):
+            return render_dollars(value)
         mtype = (metric_type or "").upper()
-        if mtype in ("MONEY", "COST", "CURRENCY"):
-            return f"${value:,.2f}"
         if mtype == "PERCENTAGE":
             return f"{value:.2f}%"
         # Plain numeric (counts, durations, unknown) — keep it honest, no unit invented.
@@ -1992,90 +2285,192 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
         return f"{value:,}" if isinstance(value, int) else f"{value:,.4f}"
 
     def _render_aggregated_rows(
-        self, rows: List[Dict[str, Any]], *, title: str, period: str, value_noun: str
+        self,
+        result: PackRows,
+        *,
+        title: str,
+        period: AnalyticsWindow,
+        value_noun: str,
+        rank_by_cost: bool = False,
     ) -> str:
-        """Render envelope-B rows (one per group/metric) as a capped bullet list."""
+        """Render envelope-B rows (one per group/metric) as one capped bullet per group.
+
+        A group's metrics share its bullet. A label that differs from the group
+        always names its metric; with more than one metric, the others are
+        named "cost" for a money type, else by their metric type. The cap
+        counts groups. With
+        rank_by_cost the groups with a money amount come first, largest amount
+        first, and the overflow line says so; otherwise the platform's order is
+        kept and the overflow line says that instead of claiming a top.
+        """
+        rows = result.rows
         if not rows:
-            return self._empty_state(title, period)
+            return self._with_unread_pages_notice(self._empty_state(title, period), result)
+        groups: Dict[Any, List[Dict[str, Any]]] = {}
+        for row in rows:
+            groups.setdefault(row.get("group", "Unknown"), []).append(row)
+        ordered = list(groups.items())
+        ranked = False
+        if rank_by_cost:
+            ordered, ranked = self._rank_groups_by_cost(ordered)
         lines = [f"**{title}** (period: {period})", ""]
-        for row in rows[: self._MAX_RENDERED_ROWS]:
-            group = row.get("group", "Unknown")
-            value = self._format_metric_value(row.get("metricResult"), row.get("metricType"))
-            extras = []
-            label = row.get("label")
-            if label and label != group:
-                # Distinct metric label carries information (e.g. which metric
-                # within the group) — dropping it loses data.
-                extras.append(str(label))
-            if "trend" in row:
-                extras.append(f"trend {row['trend']}")
-            if "currentValue" in row and "previousValue" in row:
-                cur = self._format_metric_value(row.get("currentValue"), row.get("metricType"))
-                prev = self._format_metric_value(row.get("previousValue"), row.get("metricType"))
-                extras.append(f"{prev} → {cur}")
-            suffix = f" ({', '.join(extras)})" if extras else ""
-            lines.append(f"- **{group}**: {value}{suffix}")
-        overflow = len(rows) - self._MAX_RENDERED_ROWS
+        for group, group_rows in ordered[: self._MAX_RENDERED_ROWS]:
+            parts = [
+                self._aggregated_metric_part(group, row, named=len(group_rows) > 1)
+                for row in group_rows
+            ]
+            lines.append(f"- **{group}**: {', '.join(parts)}")
+        overflow = len(ordered) - self._MAX_RENDERED_ROWS
         if overflow > 0:
+            how = (
+                f"the top {self._MAX_RENDERED_ROWS} by cost"
+                if ranked
+                else f"the first {self._MAX_RENDERED_ROWS} in the platform's order"
+            )
             lines.append("")
-            lines.append(f"_…and {overflow} more {value_noun} not shown (showing top {self._MAX_RENDERED_ROWS})._")
-        return "\n".join(lines)
+            lines.append(f"_…and {overflow} more {value_noun} not shown (showing {how})._")
+        return self._with_unread_pages_notice("\n".join(lines), result)
+
+    def _rank_groups_by_cost(
+        self, groups: List[Tuple[Any, List[Dict[str, Any]]]]
+    ) -> Tuple[List[Tuple[Any, List[Dict[str, Any]]]], bool]:
+        """Groups with a money amount first (largest amount first), the rest in their given order.
+
+        The flag says whether any group had a money amount: with none, nothing
+        was ranked and the list must not be called a top.
+        """
+        costed: List[Tuple[float, Tuple[Any, List[Dict[str, Any]]]]] = []
+        uncosted = []
+        for entry in groups:
+            amounts = [
+                row["metricResult"]
+                for row in entry[1]
+                if self._is_money_type(row.get("metricType"))
+                and isinstance(row.get("metricResult"), (int, float))
+                and not isinstance(row.get("metricResult"), bool)
+            ]
+            if amounts:
+                costed.append((max(amounts), entry))
+            else:
+                uncosted.append(entry)
+        costed.sort(key=lambda pair: pair[0], reverse=True)
+        return [entry for _, entry in costed] + uncosted, bool(costed)
+
+    def _aggregated_metric_part(
+        self, group: Any, row: Dict[str, Any], named: bool = True
+    ) -> str:
+        """One metric of a group's bullet: its name, value, and trend or previous-to-current figures.
+
+        With named false the derived name ("cost" or the metric type) is left
+        out; a label that differs from the group is still shown.
+        """
+        metric_type = row.get("metricType")
+        label = row.get("label")
+        if label and label != group:
+            name = str(label)
+        elif not named:
+            name = ""
+        elif self._is_money_type(metric_type):
+            name = "cost"
+        elif metric_type:
+            name = str(metric_type).lower().replace("_", " ")
+        else:
+            name = ""
+        value = self._format_metric_value(row.get("metricResult"), metric_type)
+        extras = []
+        if "trend" in row:
+            extras.append(f"trend {row['trend']}")
+        if "currentValue" in row and "previousValue" in row:
+            cur = format_comparison_value(row.get("currentValue"), metric_type) or (
+                self._format_metric_value(row.get("currentValue"), metric_type)
+            )
+            prev = format_comparison_value(row.get("previousValue"), metric_type) or (
+                self._format_metric_value(row.get("previousValue"), metric_type)
+            )
+            extras.append(f"{prev} → {cur}")
+        suffix = f" ({', '.join(extras)})" if extras else ""
+        return f"{name} {value}{suffix}" if name else f"{value}{suffix}"
 
     def _render_timeseries_buckets(
-        self, buckets: List[Dict[str, Any]], *, title: str, period: str
+        self, result: PackRows, *, title: str, period: AnalyticsWindow
     ) -> str:
-        """Render envelope-A buckets (timestamped groups) as a capped list."""
+        """Render envelope-A buckets one line each, the bucket's groups side by side."""
+        buckets = result.rows
         if not buckets:
-            return self._empty_state(title, period)
+            return self._with_unread_pages_notice(self._empty_state(title, period), result)
         lines = [f"**{title}** (period: {period})", ""]
-        rendered = 0
-        truncated = False
-        for bucket in buckets:
-            if rendered >= self._MAX_RENDERED_ROWS:
-                truncated = True
-                break
-            start = bucket.get("startTimestamp", "?")
-            end = bucket.get("endTimestamp", "?")
-            groups = bucket.get("groups", [])
-            # Build the bucket atomically so a truncation on its boundary never
-            # leaves an orphan header with zero data lines under it.
-            bucket_lines = [f"**{start} → {end}**"]
-            if not groups:
-                bucket_lines.append("- (no data)")
-            for group in groups:
-                if rendered >= self._MAX_RENDERED_ROWS:
-                    truncated = True
-                    break
-                name = group.get("group", "Unknown")
-                for metric in group.get("metrics", []):
-                    if rendered >= self._MAX_RENDERED_ROWS:
-                        truncated = True
-                        break
-                    label = metric.get("label", "value")
-                    value = self._format_metric_value(
-                        metric.get("metricResult"), metric.get("metricType")
-                    )
-                    bucket_lines.append(f"- {name} — {label}: {value}")
-                    # The cap counts rendered metric lines, not groups — a
-                    # group with many metrics must not blow the budget.
-                    rendered += 1
-                if truncated:
-                    break
-            if len(bucket_lines) > 1 or not groups:
-                lines.extend(bucket_lines)
-            if truncated:
-                break
-        if truncated:
+        shown = buckets[: self._MAX_RENDERED_BUCKETS]
+        lines += [self._timeseries_bucket_line(bucket) for bucket in shown]
+        if any(self._timeseries_bucket_has_zero(bucket) for bucket in shown):
             lines.append("")
-            lines.append(f"_Output truncated at {self._MAX_RENDERED_ROWS} rows; narrow the period for the full series._")
-        return "\n".join(lines)
+            lines.append("_Entries at zero are left out._")
+        overflow = len(buckets) - self._MAX_RENDERED_BUCKETS
+        if overflow > 0:
+            lines.append("")
+            lines.append(
+                f"_…and {overflow} more buckets not shown (showing the first "
+                f"{self._MAX_RENDERED_BUCKETS}); narrow the period for the rest._"
+            )
+        return self._with_unread_pages_notice("\n".join(lines), result)
+
+    def _timeseries_bucket_line(self, bucket: Dict[str, Any]) -> str:
+        entries = [
+            entry
+            for group in bucket.get("groups", []) or []
+            for entry in self._timeseries_group_entries(group)
+        ]
+        # Groups that were all at zero are not the same as a bucket with no groups.
+        empty_text = "nothing above zero" if bucket.get("groups") else "no data"
+        return f"- **{self._timeseries_bucket_label(bucket)}**: {', '.join(entries) or empty_text}"
+
+    @staticmethod
+    def _is_exact_zero(value: Any) -> bool:
+        """True for a number that is exactly 0; a value that only rounds to $0.00 is not."""
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0
+
+    def _timeseries_bucket_has_zero(self, bucket: Dict[str, Any]) -> bool:
+        return any(
+            self._is_exact_zero(metric.get("metricResult"))
+            for group in bucket.get("groups", []) or []
+            for metric in group.get("metrics", [])
+        )
+
+    @staticmethod
+    def _timeseries_bucket_label(bucket: Dict[str, Any]) -> str:
+        """The day alone for a whole-day bucket; both timestamps for any other bucket."""
+        start, end = bucket.get("startTimestamp"), bucket.get("endTimestamp")
+        whole_day = (
+            isinstance(start, str)
+            and isinstance(end, str)
+            and start[:10] == end[:10]
+            and start[10:].startswith(_DAY_START_TIME)
+            and end[10:].startswith(_DAY_END_TIME)
+        )
+        if whole_day:
+            return str(start)[:10]
+        return f"{start or '?'} → {end or '?'}"
+
+    def _timeseries_group_entries(self, group: Dict[str, Any]) -> List[str]:
+        name = group.get("group", "Unknown")
+        entries = []
+        for metric in group.get("metrics", []):
+            if self._is_exact_zero(metric.get("metricResult")):
+                continue
+            label = metric.get("label")
+            value = self._format_metric_value(metric.get("metricResult"), metric.get("metricType"))
+            qualifier = f" ({label})" if label and label != name else ""
+            entries.append(f"{name}{qualifier} {value}")
+        return entries
 
     def _render_scatter_points(
-        self, points: List[Dict[str, Any]], *, period: str
+        self, result: PackRows, *, period: AnalyticsWindow
     ) -> str:
         """Render envelope-C scatter dataPoints as a capped list."""
+        points = result.rows
         if not points:
-            return self._empty_state("Trace Cost Distribution", period)
+            return self._with_unread_pages_notice(
+                self._empty_state("Trace Cost Distribution", period), result
+            )
         lines = [f"**Trace Cost Distribution** (period: {period})", ""]
         for point in points[: self._MAX_RENDERED_ROWS]:
             tx = point.get("transactionId", "?")
@@ -2087,11 +2482,14 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
         overflow = len(points) - self._MAX_RENDERED_ROWS
         if overflow > 0:
             lines.append("")
-            lines.append(f"_…and {overflow} more traces not shown (showing top {self._MAX_RENDERED_ROWS})._")
-        return "\n".join(lines)
+            lines.append(
+                f"_…and {overflow} more traces not shown (showing the first "
+                f"{self._MAX_RENDERED_ROWS} in the platform's order)._"
+            )
+        return self._with_unread_pages_notice("\n".join(lines), result)
 
     @staticmethod
-    def _empty_state(title: str, period: str) -> str:
+    def _empty_state(title: str, period: AnalyticsWindow) -> str:
         return (
             f"**{title}** (period: {period})\n\n"
             f"No data found for the period **{period}**. "
@@ -2106,7 +2504,7 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 {error_details}
 
 **Troubleshooting:**
-- Verify your parameters: period (optional, defaults to a recent window)
+- Verify your parameters: period (optional, defaults to a recent window), or start_date and end_date (yyyy-MM-dd, both days included) in its place
 - Supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - Try a different time period if no data is available
 
@@ -2115,11 +2513,57 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 - Use `get_examples()` to see working examples
 """
 
+    @staticmethod
+    def _pack_window(arguments: Dict[str, Any]) -> AnalyticsWindow:
+        """The calendar range when start_date/end_date are given, else the period (SEVEN_DAYS by default).
+
+        The period is read case-insensitively and must be one of COST_PERIOD_VALUES.
+
+        Raises:
+            ToolError: If the period is not supported, or the range is malformed
+                or comes with a period too
+        """
+        try:
+            return AnalyticsValidator().validate_window(arguments, default_period="SEVEN_DAYS")
+        except ValidationError as error:
+            raise create_structured_validation_error(
+                message=error.message,
+                field=error.field,
+                value=arguments.get(error.field) if error.field else None,
+                suggestions=error.suggestions,
+                examples={"calendar_month": _CALENDAR_MONTH_EXAMPLE},
+            ) from None
+
+    @staticmethod
+    def _pack_names(arguments: Dict[str, Any], name: str) -> Optional[List[str]]:
+        """The names a report is narrowed to, as a list, or None when the argument is absent.
+
+        Raises:
+            ToolError: If the argument is empty, blank or not a name, before any read
+        """
+        value = arguments.get(name)
+        if value is None:
+            return None
+        try:
+            return listed_names(name, value, field=name)
+        except ValidationError as error:
+            raise create_structured_validation_error(
+                message=error.message,
+                field=error.field,
+                value=value,
+                suggestions=error.suggestions,
+            ) from None
+
+    @staticmethod
+    def _with_unread_pages_notice(text: str, result: PackRows) -> str:
+        """Say so when the read stopped before the platform's last page."""
+        return with_unread_pages_notice(text, result.unread)
+
     async def _handle_get_task_costs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Cost by task type — timeseries by default, totals when aggregation='aggregated'."""
-        period = arguments.get("period") or "SEVEN_DAYS"
+        period = self._pack_window(arguments)
         aggregation = arguments.get("aggregation") or "timeseries"
         try:
             client = await self.get_client(ctx=ctx)
@@ -2127,24 +2571,27 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
             data = await analyzer.get_task_costs(period, aggregation)
             if str(aggregation).lower() == "aggregated":
                 text = self._render_aggregated_rows(
-                    data, title="Cost by Task", period=period, value_noun="tasks"
+                    data, title="Cost by Task", period=period, value_noun="tasks", rank_by_cost=True
                 )
             else:
                 text = self._render_timeseries_buckets(data, title="Cost by Task", period=period)
             return [TextContent(type="text", text=text)]
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in get_task_costs: {e}")
-            return [TextContent(type="text", text=self._analytics_pack_error("Cost by Task", e))]
+            raise_refusal(
+                self._analytics_pack_error("Cost by Task", e),
+                error_code=ErrorCodes.API_ERROR,
+            )
 
     async def _handle_get_task_completion(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Task completion counts — timeseries by default, optionally filtered by agents."""
-        period = arguments.get("period") or "SEVEN_DAYS"
+        period = self._pack_window(arguments)
         aggregation = arguments.get("aggregation") or "timeseries"
-        agents = arguments.get("agents")
+        agents = self._pack_names(arguments, "agents")
         try:
             client = await self.get_client(ctx=ctx)
             analyzer = SimpleCostAnalyzer(client)
@@ -2156,17 +2603,20 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
             else:
                 text = self._render_timeseries_buckets(data, title="Task Completion", period=period)
             return [TextContent(type="text", text=text)]
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in get_task_completion: {e}")
-            return [TextContent(type="text", text=self._analytics_pack_error("Task Completion", e))]
+            raise_refusal(
+                self._analytics_pack_error("Task Completion", e),
+                error_code=ErrorCodes.API_ERROR,
+            )
 
     async def _handle_get_task_performance(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Per-agent task performance (aggregated). Empty is a normal outcome."""
-        period = arguments.get("period") or "SEVEN_DAYS"
+        period = self._pack_window(arguments)
         try:
             client = await self.get_client(ctx=ctx)
             analyzer = SimpleCostAnalyzer(client)
@@ -2175,19 +2625,20 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
                 rows, title="Task Performance by Agent", period=period, value_noun="agents"
             )
             return [TextContent(type="text", text=text)]
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in get_task_performance: {e}")
-            return [
-                TextContent(type="text", text=self._analytics_pack_error("Task Performance by Agent", e))
-            ]
+            raise_refusal(
+                self._analytics_pack_error("Task Performance by Agent", e),
+                error_code=ErrorCodes.API_ERROR,
+            )
 
     async def _handle_get_profit_margins(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Profit margin per customer (default) or product — dimension is validated."""
-        period = arguments.get("period") or "SEVEN_DAYS"
+        period = self._pack_window(arguments)
         dimension = (arguments.get("dimension") or "customer")
         if str(dimension).lower() not in ("customer", "product"):
             text = (
@@ -2197,7 +2648,7 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
                 "- Use `dimension='customer'` for profit margin per customer\n"
                 "- Use `dimension='product'` for profit margin per product\n"
             )
-            return [TextContent(type="text", text=text)]
+            raise_refusal(text, field="dimension", value=dimension)
         try:
             client = await self.get_client(ctx=ctx)
             analyzer = SimpleCostAnalyzer(client)
@@ -2209,17 +2660,20 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
                 value_noun=f"{dimension}s",
             )
             return [TextContent(type="text", text=text)]
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in get_profit_margins: {e}")
-            return [TextContent(type="text", text=self._analytics_pack_error("Profit Margins", e))]
+            raise_refusal(
+                self._analytics_pack_error("Profit Margins", e),
+                error_code=ErrorCodes.API_ERROR,
+            )
 
     async def _handle_get_top_movers(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Biggest spend movers, each with current/previous value and trend."""
-        period = arguments.get("period") or "SEVEN_DAYS"
+        period = self._pack_window(arguments)
         group_by = arguments.get("group_by")
         try:
             client = await self.get_client(ctx=ctx)
@@ -2229,18 +2683,21 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
                 rows, title="Top Spend Movers", period=period, value_noun="movers"
             )
             return [TextContent(type="text", text=text)]
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in get_top_movers: {e}")
-            return [TextContent(type="text", text=self._analytics_pack_error("Top Spend Movers", e))]
+            raise_refusal(
+                self._analytics_pack_error("Top Spend Movers", e),
+                error_code=ErrorCodes.API_ERROR,
+            )
 
     async def _handle_get_token_breakdown(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Token breakdown by type over time, optionally filtered by providers."""
-        period = arguments.get("period") or "SEVEN_DAYS"
-        providers = arguments.get("providers")
+        period = self._pack_window(arguments)
+        providers = self._pack_names(arguments, "providers")
         try:
             client = await self.get_client(ctx=ctx)
             analyzer = SimpleCostAnalyzer(client)
@@ -2249,55 +2706,62 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
                 buckets, title="Token Breakdown by Type", period=period
             )
             return [TextContent(type="text", text=text)]
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in get_token_breakdown: {e}")
-            return [
-                TextContent(type="text", text=self._analytics_pack_error("Token Breakdown by Type", e))
-            ]
+            raise_refusal(
+                self._analytics_pack_error("Token Breakdown by Type", e),
+                error_code=ErrorCodes.API_ERROR,
+            )
 
     async def _handle_get_team_costs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Cost by team over time."""
-        period = arguments.get("period") or "SEVEN_DAYS"
+        period = self._pack_window(arguments)
         try:
             client = await self.get_client(ctx=ctx)
             analyzer = SimpleCostAnalyzer(client)
             buckets = await analyzer.get_team_costs(period)
             text = self._render_timeseries_buckets(buckets, title="Cost by Team", period=period)
             return [TextContent(type="text", text=text)]
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in get_team_costs: {e}")
-            return [TextContent(type="text", text=self._analytics_pack_error("Cost by Team", e))]
+            raise_refusal(
+                self._analytics_pack_error("Cost by Team", e),
+                error_code=ErrorCodes.API_ERROR,
+            )
 
     async def _handle_get_vendor_costs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Cost by vendor (aggregated totals)."""
-        period = arguments.get("period") or "SEVEN_DAYS"
+        period = self._pack_window(arguments)
         try:
             client = await self.get_client(ctx=ctx)
             analyzer = SimpleCostAnalyzer(client)
             rows = await analyzer.get_vendor_costs(period)
             text = self._render_aggregated_rows(
-                rows, title="Cost by Vendor", period=period, value_noun="vendors"
+                rows, title="Cost by Vendor", period=period, value_noun="vendors", rank_by_cost=True
             )
             return [TextContent(type="text", text=text)]
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in get_vendor_costs: {e}")
-            return [TextContent(type="text", text=self._analytics_pack_error("Cost by Vendor", e))]
+            raise_refusal(
+                self._analytics_pack_error("Cost by Vendor", e),
+                error_code=ErrorCodes.API_ERROR,
+            )
 
     async def _handle_get_token_vs_tool_cost(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Token cost vs tool cost over time."""
-        period = arguments.get("period") or "SEVEN_DAYS"
+        period = self._pack_window(arguments)
         try:
             client = await self.get_client(ctx=ctx)
             analyzer = SimpleCostAnalyzer(client)
@@ -2306,30 +2770,34 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
                 buckets, title="Token vs Tool Cost", period=period
             )
             return [TextContent(type="text", text=text)]
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in get_token_vs_tool_cost: {e}")
-            return [TextContent(type="text", text=self._analytics_pack_error("Token vs Tool Cost", e))]
+            raise_refusal(
+                self._analytics_pack_error("Token vs Tool Cost", e),
+                error_code=ErrorCodes.API_ERROR,
+            )
 
     async def _handle_get_trace_cost_distribution(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Per-trace cost scatter distribution."""
-        period = arguments.get("period") or "SEVEN_DAYS"
+        period = self._pack_window(arguments)
         try:
             client = await self.get_client(ctx=ctx)
             analyzer = SimpleCostAnalyzer(client)
             points = await analyzer.get_trace_cost_distribution(period)
             text = self._render_scatter_points(points, period=period)
             return [TextContent(type="text", text=text)]
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in get_trace_cost_distribution: {e}")
-            return [
-                TextContent(type="text", text=self._analytics_pack_error("Trace Cost Distribution", e))
-            ]
+            raise_refusal(
+                self._analytics_pack_error("Trace Cost Distribution", e),
+                error_code=ErrorCodes.API_ERROR,
+            )
     # ── Billing reads ──────────────────────────────────────────────────────
     # snake_case arg → camelCase API param allowlists, per endpoint.
     # Verified 2026-08-28 against hypercurrent origin/develop: every name below
@@ -2358,6 +2826,189 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
         "start_date": "startDate",
         "end_date": "endDate",
     }
+    _BILLING_PAGING_ARGUMENTS: ClassVar[FrozenSet[str]] = frozenset({"action", "page", "size"})
+    _BILLING_ARGUMENTS_BY_ACTION: ClassVar[Dict[str, FrozenSet[str]]] = {
+        "list_invoices": frozenset(_INVOICE_FILTER_MAP) | _BILLING_PAGING_ARGUMENTS,
+        "list_refunds": frozenset(_REFUND_FILTER_MAP) | _BILLING_PAGING_ARGUMENTS,
+        "list_period_charges": (
+            frozenset(_PERIOD_CHARGE_FILTER_MAP)
+            | (_BILLING_PAGING_ARGUMENTS - {"page"})
+            | {"cursor"}
+        ),
+        "get_unpaid_invoice_totals": _BILLING_PAGING_ARGUMENTS,
+    }
+    _BILLING_RANGE_BOUNDS: ClassVar[FrozenSet[str]] = frozenset(
+        {*_BILLING_DATE_FILTERS, "starting_amount", "ending_amount", "minimum", "maximum"}
+    )
+
+    @classmethod
+    def _refuse_billing_arguments_not_applied(cls, arguments: Dict[str, Any], action: str) -> None:
+        """Refuse an argument this billing read does not apply, or a blank filter, before any read.
+
+        The platform answers every row for a parameter it does not declare and
+        for a blank one, so the answer would read as narrowed. Dates and
+        amounts keep their own checks in _with_billing_instants and
+        _with_whole_amounts.
+
+        Raises:
+            ToolError: Naming the first such argument
+        """
+        accepted = cls._BILLING_ARGUMENTS_BY_ACTION[action]
+        own_filters = sorted(accepted - cls._BILLING_PAGING_ARGUMENTS - {"cursor"})
+        sent = {
+            name: value
+            for name, value in arguments.items()
+            if value not in (None, {}) and value is not False
+        }
+        if action == "list_period_charges" and str(sent.get("page")) == "0":
+            del sent["page"]
+        for name, value in sent.items():
+            if name == "page" and action == "list_period_charges":
+                raise create_structured_validation_error(
+                    message=(
+                        "list_period_charges pages with cursor, not page, so a call "
+                        "with page would answer the first page again. Nothing was read."
+                    ),
+                    field=name,
+                    value=value,
+                    suggestions=["Pass the cursor from the previous page to read the next"],
+                )
+            if name not in accepted:
+                raise create_structured_validation_error(
+                    message=(
+                        f"{action} does not apply {name}, so a call with it would answer "
+                        "every row as if it were narrowed. Nothing was read."
+                    ),
+                    field=name,
+                    value=value,
+                    suggestions=cls._billing_refusal_suggestions(action, name, own_filters),
+                )
+        for name in own_filters:
+            if name not in cls._BILLING_RANGE_BOUNDS and cls._is_blank_billing_filter(sent.get(name)):
+                raise create_structured_validation_error(
+                    message=(
+                        f"{action} cannot apply a blank {name}: the platform would answer "
+                        "every row as if it were narrowed. Nothing was read."
+                    ),
+                    field=name,
+                    value=sent[name],
+                    suggestions=[f"Pass a value for {name}, or leave {name} out"],
+                )
+
+    @classmethod
+    def _billing_refusal_suggestions(
+        cls, action: str, name: str, own_filters: List[str]
+    ) -> List[str]:
+        if not own_filters:
+            return [f"{action} takes no filters: call it without {name}"]
+        suggestions = [f"{action} applies: {', '.join(own_filters)}"]
+        if name == "period" and "start_date" in own_filters:
+            suggestions.append("For a window, pass start_date and end_date")
+        others = [
+            other
+            for other, names in cls._BILLING_ARGUMENTS_BY_ACTION.items()
+            if other != action and name in names
+        ]
+        if others:
+            suggestions.append(f"{name} is applied by {', '.join(others)}")
+        return suggestions
+
+    @staticmethod
+    def _is_blank_billing_filter(value: Any) -> bool:
+        if isinstance(value, str):
+            return not value.strip()
+        if isinstance(value, list):
+            return not value or any(
+                item is None or (isinstance(item, str) and not item.strip()) for item in value
+            )
+        return False
+
+    def _with_billing_instants(self, arguments: Dict[str, Any], action: str) -> Dict[str, Any]:
+        """The arguments with start_date and end_date as the UTC instants the billing lists take.
+
+        The platform parses each bound as an ISO-8601 instant and answers a bare
+        day with HTTP 400, so a yyyy-MM-dd day is sent as its first (start) or
+        last (end) millisecond, the way the cost reports read it. The two go
+        together: list_invoices ignores a lone startDate (every invoice comes
+        back as if filtered) and the other lists answer a lone bound with 400.
+        """
+        suggestions = [
+            *self._COVERAGE_DATE_FORMS,
+            "Pass start_date and end_date together, or leave both out",
+            "start_date must not be after end_date",
+        ]
+        examples = {"correct_usage": {"action": action, "start_date": "2026-09-01", "end_date": "2026-09-30"}}
+        for field in ("start_date", "end_date"):
+            value = arguments.get(field)
+            if isinstance(value, str) and not value.strip():
+                raise create_structured_validation_error(
+                    message=(
+                        f"{field} is empty: pass a yyyy-MM-dd day or an ISO-8601 instant "
+                        "with Z or an offset, or leave both dates out"
+                    ),
+                    field=field,
+                    value=value,
+                    suggestions=suggestions,
+                    examples=examples,
+                )
+        given = [field for field in ("start_date", "end_date") if arguments.get(field) is not None]
+        if len(given) == 1:
+            missing = "end_date" if given == ["start_date"] else "start_date"
+            raise create_structured_validation_error(
+                message=f"{given[0]} needs {missing}: start_date and end_date go together, pass both or neither",
+                field=missing,
+                value=None,
+                suggestions=suggestions,
+                examples=examples,
+            )
+        try:
+            start, end = utc_instant_bounds(arguments.get("start_date"), arguments.get("end_date"))
+        except CalendarRangeError as error:
+            raise create_structured_validation_error(
+                message=str(error),
+                field=error.field,
+                value=arguments.get(error.field),
+                suggestions=suggestions,
+                examples=examples,
+            ) from None
+        return {**arguments, "start_date": start, "end_date": end}
+
+    # list_invoices amount bounds the platform binds to int64 (Long): a value
+    # sent as "100.0" is refused with HTTP 400, so they go out as whole numbers.
+    _WHOLE_AMOUNT_FILTERS: ClassVar[Tuple[str, ...]] = ("starting_amount", "ending_amount")
+
+    def _with_whole_amounts(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """The arguments with each amount filter as a whole number; a blank one is left out."""
+        whole = dict(arguments)
+        for field in self._WHOLE_AMOUNT_FILTERS:
+            value = whole.get(field)
+            if value is None:
+                continue
+            refusal = create_structured_validation_error(
+                message=f"{field} takes a whole number of 0 or more, such as 100: {value!r}",
+                field=field,
+                value=value,
+                suggestions=["Pass a whole amount, e.g. starting_amount=100 and ending_amount=500"],
+                examples={"correct_usage": {"action": "list_invoices", "starting_amount": 100, "ending_amount": 500}},
+            )
+            if isinstance(value, bool):
+                raise refusal
+            if isinstance(value, str) and not value.strip():
+                del whole[field]
+                continue
+            try:
+                amount = float(value)
+            except (TypeError, ValueError):
+                raise refusal from None
+            if not math.isfinite(amount) or amount != int(amount):
+                raise refusal
+            # The registry hands both amounts over as floats, so a value is exact
+            # only up to 2**53; an int from a direct caller keeps its value.
+            exact = value if isinstance(value, int) else int(amount)
+            if exact < 0 or exact > self._INT64_MAX:
+                raise refusal
+            whole[field] = exact
+        return whole
 
     @staticmethod
     def _map_billing_filters(
@@ -2368,34 +3019,71 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
         Only keys present in ``allowlist`` (and non-None) are forwarded;
         everything else — including reserved keys like page/size/action —
         is dropped so unknown or reserved keys never reach the API.
+
+        Raises:
+            ToolError: If a date filter is blank, before any platform call
         """
         mapped: Dict[str, Any] = {}
         for snake, camel in allowlist.items():
             value = arguments.get(snake)
+            if snake in _BILLING_DATE_FILTERS and isinstance(value, str) and not value.strip():
+                raise create_structured_validation_error(
+                    message=(
+                        f"{snake} is empty: pass an ISO 8601 date such as "
+                        f"2026-09-01T00:00:00Z, or leave {snake} out"
+                    ),
+                    field=snake,
+                    value=value,
+                )
             if value is not None:
                 mapped[camel] = value
         return mapped
 
     @staticmethod
-    def _render_money(amount: Any, currency: Any) -> str:
-        """Render a monetary amount with its currency code.
+    def _with_currency_code(text: str, currency: Any) -> str:
+        """Append the currency code when present; never an invented symbol."""
+        code = str(currency).strip() if isinstance(currency, str) and currency.strip() else ""
+        return f"{text} {code}".strip()
 
-        Numeric honesty: a missing/null/non-numeric amount renders ``n/a`` —
-        never a fabricated ``0``. Numbers print with trailing zeros trimmed
-        and no invented currency symbol; the currency code is appended when
-        present (e.g. ``"1234.5 USD"``, ``"n/a"``).
+    @staticmethod
+    def _render_billing_amount(amount: Any, currency: Any) -> str:
+        """Render a billed or refunded amount with its currency code.
+
+        Whole cents print with two decimals (``125.5`` -> ``"125.50 USD"``);
+        a sub-cent amount keeps its digits (``0.004`` -> ``"0.004 USD"``)
+        rather than rounding to a fabricated ``0.00``. A missing, null or
+        non-numeric amount renders ``n/a``, never ``0``.
         """
         if isinstance(amount, bool) or not isinstance(amount, (int, float)):
             return "n/a"
-        # Fixed decimals trimmed: 1234.50 -> "1234.5", 25.0 -> "25".
-        text = f"{amount:.2f}".rstrip("0").rstrip(".")
-        code = str(currency).strip() if isinstance(currency, str) and currency.strip() else ""
-        return f"{text} {code}".strip()
+        if not math.isfinite(amount):
+            return "n/a"
+        # Rounds to 15 significant digits: drops the binary noise a sum leaves
+        # (0.23200000000000004 -> 0.232) but would also round an amount that
+        # genuinely carries 16 or 17; pads to two decimals only when no digit is lost.
+        exact = Decimal(format(amount, ".15g"))
+        exponent = exact.as_tuple().exponent
+        text = format(exact, ".2f" if isinstance(exponent, int) and exponent >= -2 else "f")
+        return BusinessAnalyticsManagement._with_currency_code(text, currency)
+
+    @staticmethod
+    def _render_resource_label(value: Any) -> str:
+        """The label of a linked resource (such as a product), else its id, else ``n/a``."""
+        if not isinstance(value, dict):
+            return "n/a"
+        for key in ("label", "id"):
+            text = value.get(key)
+            if isinstance(text, str) and text.strip():
+                return text
+        return "n/a"
 
     async def _handle_list_invoices(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """List invoices (page-numbered) with a compact per-entry line."""
+        self._refuse_billing_arguments_not_applied(arguments, "list_invoices")
+        arguments = self._with_billing_instants(arguments, "list_invoices")
+        arguments = self._with_whole_amounts(arguments)
         try:
             logger.info("Processing list_invoices request")
             client = await self.get_client(ctx=ctx)
@@ -2405,36 +3093,43 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 
             response = await client.get_invoices(page=page, size=size, **filters)
             invoices = client._extract_embedded_data(response)
+            info = PageInfo.from_envelope(response) if isinstance(response, dict) else PageInfo()
 
             if not invoices:
+                total = info.total_elements
+                if total is not None and total > 0:
+                    past_last = past_last_page_sentence(info, counted(total, "invoice", "invoices"))
+                    return [TextContent(type="text", text=f"**Invoices**\n\n{past_last}")]
                 return [TextContent(type="text", text="**Invoices**\n\nNo invoices found for the given filters.")]
 
-            cap = 50
+            # Every row of the page is printed: size is already bounded by
+            # validate_pagination_params, and the next page starts after row size.
             lines = ["**Invoices**", ""]
-            for inv in invoices[:cap]:
+            for inv in invoices:
                 # `or "n/a"`: real invoices carry explicit nulls (endDate on
                 # open invoices, live-verified) — .get(key, default) misses them.
                 number = inv.get("invoiceNumber") or "n/a"
                 state = inv.get("state") or "n/a"
                 pay_status = inv.get("invoicePayStatus") or "n/a"
-                money = self._render_money(inv.get("totalAmount"), inv.get("currency"))
+                money = self._render_billing_amount(inv.get("totalAmount"), inv.get("currency"))
                 start = inv.get("startDate") or "n/a"
                 end = inv.get("endDate") or "n/a"
                 lines.append(
                     f"- {number} | {state} | {pay_status} | {money} | {start} → {end}"
                 )
-            if len(invoices) > cap:
+            footer = pagination_lines(info, "invoice", "invoices")
+            if footer:
                 lines.append("")
-                lines.append(f"… {len(invoices) - cap} more not shown (page size {size}).")
+                lines.extend(footer)
 
             return [TextContent(type="text", text="\n".join(lines))]
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in list_invoices: {e}")
             error_details = self._format_api_error_details(e)
-            return [TextContent(type="text", text=f"""**List Invoices Failed**
+            raise_refusal(f"""**List Invoices Failed**
 
 {error_details}
 
@@ -2444,12 +3139,14 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 
 **For Help:**
 - Use `get_capabilities()` to check current status
-""")]
+""", error_code=ErrorCodes.API_ERROR)
 
     async def _handle_list_refunds(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """List refunds (page-numbered) with a compact per-entry line."""
+        self._refuse_billing_arguments_not_applied(arguments, "list_refunds")
+        arguments = self._with_billing_instants(arguments, "list_refunds")
         try:
             logger.info("Processing list_refunds request")
             client = await self.get_client(ctx=ctx)
@@ -2459,29 +3156,41 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 
             response = await client.get_refunds(page=page, size=size, **filters)
             refunds = client._extract_embedded_data(response)
+            info = PageInfo.from_envelope(response) if isinstance(response, dict) else PageInfo()
 
             if not refunds:
+                total = info.total_elements
+                if total is not None and total > 0:
+                    past_last = past_last_page_sentence(info, counted(total, "refund", "refunds"))
+                    return [TextContent(type="text", text=f"**Refunds**\n\n{past_last}")]
                 return [TextContent(type="text", text="**Refunds**\n\nNo refunds found for the given filters (this is normal on most tenants).")]
 
-            cap = 50
             lines = ["**Refunds**", ""]
-            for refund in refunds[:cap]:
-                money = self._render_money(refund.get("totalAmount"), refund.get("currency"))
-                state = refund.get("state") or "n/a"
-                created = refund.get("created") or refund.get("startDate") or "n/a"
-                lines.append(f"- {money} | {state} | {created}")
-            if len(refunds) > cap:
+            for refund in refunds:
+                # A refund (RefundResource_Read) carries amount, not the
+                # invoice's totalAmount, and has no state. timestamp is when it
+                # was issued; issuedDate is when it was applied to an invoice.
+                rid = refund.get("id") or "n/a"
+                money = self._render_billing_amount(refund.get("amount"), refund.get("currency"))
+                issued = refund.get("timestamp") or "n/a"
+                applied = refund.get("issuedDate") or "n/a"
+                product = self._render_resource_label(refund.get("product"))
+                lines.append(
+                    f"- {rid} | {money} | issued {issued} | applied {applied} | {product}"
+                )
+            footer = pagination_lines(info, "refund", "refunds")
+            if footer:
                 lines.append("")
-                lines.append(f"… {len(refunds) - cap} more not shown (page size {size}).")
+                lines.extend(footer)
 
             return [TextContent(type="text", text="\n".join(lines))]
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in list_refunds: {e}")
             error_details = self._format_api_error_details(e)
-            return [TextContent(type="text", text=f"""**List Refunds Failed**
+            raise_refusal(f"""**List Refunds Failed**
 
 {error_details}
 
@@ -2491,12 +3200,14 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 
 **For Help:**
 - Use `get_capabilities()` to check current status
-""")]
+""", error_code=ErrorCodes.API_ERROR)
 
     async def _handle_list_period_charges(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """List period charges (cursor/keyset pagination — never a page arg)."""
+        self._refuse_billing_arguments_not_applied(arguments, "list_period_charges")
+        arguments = self._with_billing_instants(arguments, "list_period_charges")
         try:
             logger.info("Processing list_period_charges request")
             client = await self.get_client(ctx=ctx)
@@ -2513,17 +3224,28 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
             if not charges:
                 return [TextContent(type="text", text="**Period Charges**\n\nNo period charges found for the given filters.")]
 
-            cap = 50
+            # Every row of the page is printed; the cursor line below reaches the rest.
             lines = ["**Period Charges**", ""]
-            for charge in charges[:cap]:
+            for charge in charges:
+                # label repeats the transaction id and resource is an internal
+                # path, so neither is printed.
                 cid = charge.get("id") or "n/a"
-                label = charge.get("label") or "n/a"
+                money = self._render_billing_amount(charge.get("charge"), charge.get("currency"))
+                call_count = charge.get("callCount")
+                calls = (
+                    counted(call_count, "call", "calls")
+                    if isinstance(call_count, int) and not isinstance(call_count, bool)
+                    else "n/a calls"
+                )
+                charge_kind = charge.get("type") or "n/a"
+                charge_type = charge.get("chargeType") or "n/a"
+                product = self._render_resource_label(charge.get("product"))
                 tx = charge.get("transactionId") or "n/a"
                 created = charge.get("created") or "n/a"
-                lines.append(f"- {cid} | {label} | tx={tx} | {created}")
-            if len(charges) > cap:
-                lines.append("")
-                lines.append(f"… {len(charges) - cap} more on this page not shown (page size {size}).")
+                lines.append(
+                    f"- {cid} | {money} | {calls} | {charge_kind} / {charge_type}"
+                    f" | {product} | tx={tx} | {created}"
+                )
 
             # Cursor/keyset continuation — only when the server says there's more.
             if isinstance(response, dict) and response.get("hasMore"):
@@ -2542,12 +3264,12 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 
             return [TextContent(type="text", text="\n".join(lines))]
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in list_period_charges: {e}")
             error_details = self._format_api_error_details(e)
-            return [TextContent(type="text", text=f"""**List Period Charges Failed**
+            raise_refusal(f"""**List Period Charges Failed**
 
 {error_details}
 
@@ -2558,7 +3280,7 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 
 **For Help:**
 - Use `get_capabilities()` to check current status
-""")]
+""", error_code=ErrorCodes.API_ERROR)
 
     # ── Skill usage reads ──────────────────────────────────────────────────
     # Arg allowlists in the _map_billing_filters sense; the mapping is identity
@@ -2623,7 +3345,7 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
     def _render_count(value: Any) -> str:
         """Render an integer counter, or ``n/a`` when it is absent.
 
-        Numeric honesty, as with _render_money: a missing or non-integer
+        Numeric honesty: a missing or non-integer
         counter must not read as a real zero. Bools are ints in Python, so
         they are excluded explicitly.
         """
@@ -2642,17 +3364,25 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
         """
         return isinstance(error, ReveniumAPIError) and error.status_code == 403
 
+    @classmethod
+    def _wider_skill_periods(cls, requested: str) -> List[str]:
+        """The next two skill periods wider than ``requested``, in enum order.
+
+        Empty for the widest period, so a not-found answer never offers the
+        period just used or a narrower one as a way to find more usage.
+        """
+        i = cls._SKILL_PERIODS.index(requested)
+        return cls._SKILL_PERIODS[i + 1 : i + 3]
+
     @staticmethod
     def _is_skill_missing(error: Exception) -> bool:
         """True when a skills call answered 404."""
         return isinstance(error, ReveniumAPIError) and error.status_code == 404
 
-    def _render_skill_api_gated(
-        self, action: str, error: Exception
-    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Render the 403 refusal as a tenant-enablement problem, not a bad call."""
+    def _raise_skill_api_gated(self, action: str, error: Exception) -> NoReturn:
+        """Refuse a 403 as a tenant-enablement problem, not a bad call."""
         error_details = self._format_api_error_details(error)
-        return [TextContent(type="text", text=f"""**Skill Usage API Not Enabled for This Team**
+        raise_refusal(f"""**Skill Usage API Not Enabled for This Team**
 
 {error_details}
 
@@ -2665,7 +3395,7 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 
 **For Help:**
 - Use `get_capabilities()` to check current status ({action} is listed there)
-""")]
+""", error_code=ErrorCodes.API_ERROR)
 
     async def _handle_list_skills(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -2687,43 +3417,47 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
             page_info = client._extract_pagination_info(response)
 
             if not skills:
+                # An empty page of a non-empty list is past the last page, not
+                # an organization without skills.
+                info = PageInfo.from_envelope({"page": page_info})
+                if info.total_elements is not None and info.total_elements > 0:
+                    sentence = past_last_page_sentence(info, counted(info.total_elements, "skill", "skills"))
+                    return [TextContent(type="text", text=f"**Skills by Cost**\n\n{sentence}")]
                 return [TextContent(type="text", text="**Skills by Cost**\n\nNo skills found for the given filters.")]
 
-            total = page_info.get("totalElements")
-            header = "**Skills by Cost**"
-            if isinstance(total, int) and not isinstance(total, bool):
-                header += f" (page {page + 1}, {total} total)"
-            cap = 50
-            lines = [header, ""]
-            for skill in skills[:cap]:
+            # Every row of the page is printed, as list_invoices does: size is
+            # bounded by validate_pagination_params and the footer reaches the rest.
+            lines = ["**Skills by Cost**", ""]
+            for skill in skills:
                 # `or "n/a"`: every provenance field is explicitly nullable in
                 # the response schema — .get(key, default) misses those nulls.
                 name = skill.get("name") or "n/a"
                 skill_id = skill.get("id") or "n/a"
                 origin = skill.get("originCategory") or "n/a"
                 source = skill.get("source") or "n/a"
-                cost = self._render_money(skill.get("totalCost"), None)
+                cost = render_usd(skill.get("totalCost"))
                 calls = self._render_count(skill.get("callCount"))
                 traces = self._render_count(skill.get("traceCount"))
                 lines.append(
                     f"- {name} ({skill_id}) | {origin} | {source} | "
                     f"{cost} | {calls} calls | {traces} traces"
                 )
-            if len(skills) > cap:
+            footer = pagination_lines(PageInfo.from_envelope({"page": page_info}), "skill", "skills")
+            if footer:
                 lines.append("")
-                lines.append(f"… {len(skills) - cap} more not shown (page size {size}).")
+                lines.extend(footer)
 
             return [TextContent(type="text", text="\n".join(lines))]
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             if self._is_skill_api_gated(e):
                 logger.warning("list_skills refused with 403 (skill attribution likely disabled)")
-                return self._render_skill_api_gated("list_skills", e)
+                self._raise_skill_api_gated("list_skills", e)
             logger.error(f"Error in list_skills: {e}")
             error_details = self._format_api_error_details(e)
-            return [TextContent(type="text", text=f"""**List Skills Failed**
+            raise_refusal(f"""**List Skills Failed**
 
 {error_details}
 
@@ -2734,7 +3468,7 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 
 **For Help:**
 - Use `get_capabilities()` to check current status
-""")]
+""", error_code=ErrorCodes.API_ERROR)
 
     async def _handle_get_skill(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -2777,7 +3511,7 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
                 f"- **Kind**: {skill.get('kind') or 'n/a'}",
                 f"- **Plugin**: {skill.get('pluginName') or 'n/a'}",
                 f"- **Marketplace**: {skill.get('marketplaceName') or 'n/a'}",
-                f"- **Total cost**: {self._render_money(skill.get('totalCost'), None)}",
+                f"- **Total cost**: {render_usd(skill.get('totalCost'))}",
                 f"- **Calls**: {self._render_count(skill.get('callCount'))}",
                 f"- **Traces**: {self._render_count(skill.get('traceCount'))}",
                 f"- **First seen**: {skill.get('firstSeen') or 'n/a'}",
@@ -2785,29 +3519,44 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
             ]
             return [TextContent(type="text", text="\n".join(lines))]
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             if self._is_skill_api_gated(e):
                 logger.warning("get_skill refused with 403 (skill attribution likely disabled)")
-                return self._render_skill_api_gated("get_skill", e)
+                self._raise_skill_api_gated("get_skill", e)
             if self._is_skill_missing(e):
-                # The detail endpoint answers 404 — not an empty body — for a
-                # known skill with no attributed usage in the requested window,
-                # so 404 is the empty state and not evidence of a bad skill_id.
-                logger.info("get_skill returned 404 (no usage in the requested period)")
+                # The detail endpoint answers the same 404 for a known skill
+                # with no attributed usage in the window and for an id that is
+                # not a skill of this team, so the answer names both readings
+                # rather than asserting the skill exists.
+                logger.info(
+                    "get_skill returned 404 (no usage in the period, or not a skill of this team)"
+                )
                 requested = str(arguments.get("period") or "THIRTY_DAYS").upper()
+                wider = self._wider_skill_periods(requested)
+                if wider:
+                    widen_step = (
+                        f"- Try a wider period ({', '.join(wider)}): usage is only "
+                        "reported for the window you ask for"
+                    )
+                else:
+                    widen_step = (
+                        f"- {requested} is the widest period; a wider window will not "
+                        "find usage that this one missed"
+                    )
                 return [TextContent(type="text", text=f"""**Skill Detail**
 
-No usage recorded for skill '{skill_id}' in the requested period ({requested}).
+No usage recorded for '{skill_id}' in the requested period ({requested}), or the id may not name a skill of this team: the platform answers not found for both.
 
 **Next steps:**
-- Try a wider period (e.g. THIRTY_DAYS, NINETY_DAYS) — usage is only reported for the window you ask for
+- Use `list_skills` to confirm '{skill_id}' is one of this team's skill ids; an id of another kind (an alert, a product) is not a skill id
+{widen_step}
 - Use `list_skills` at the same period to see which skills did record usage
 """)]
             logger.error(f"Error in get_skill: {e}")
             error_details = self._format_api_error_details(e)
-            return [TextContent(type="text", text=f"""**Get Skill Failed**
+            raise_refusal(f"""**Get Skill Failed**
 
 {error_details}
 
@@ -2818,7 +3567,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
 
 **For Help:**
 - Use `get_capabilities()` to check current status
-""")]
+""", error_code=ErrorCodes.API_ERROR)
 
     # ── Developer PR-health report ─────────────────────────────────────────
     # The report itself is flat, not a HAL collection: totals, engineers[] and
@@ -2842,12 +3591,13 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         "team-addressed and are read/changed with manage_customers get_pr_health_settings)."
     )
     # Every dollar figure below is derived, not billed. Stated on the report itself
-    # because the platform returns only avgCostPerMergedPr as a cost basis.
+    # because avgCostPerMergedPr is an organization average, not a price per pull request.
     _PR_HEALTH_ESTIMATE_NOTE: ClassVar[str] = (
-        "These are ESTIMATES computed here as count x avgCostPerMergedPr, an org-average "
-        "basis — not billed amounts. Never add them to billed cost, and never add at-risk "
-        "and wasted together: rotting PRs are still open work, closed-unmerged PRs are "
-        "already spent."
+        "These are ESTIMATES computed here, not billed amounts: priced count x "
+        "avgCostPerMergedPr, the priced count being the AI-assisted pull requests opened on "
+        "or after Priced since and the basis an organization average. Never add them to "
+        "billed cost, and never add at-risk and wasted together: rotting PRs are still open "
+        "work, closed-unmerged PRs are already spent."
     )
     _PR_HEALTH_GITLAB_NOTE: ClassVar[str] = (
         "GitLab writes no per-pull-request rows today, so this list is empty for "
@@ -2861,9 +3611,13 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         "agingPrs",
         "rottingPrs",
         "closedUnmerged",
+        "mergedPrs",
+        "aiShare",
+        "rotRate",
+        "departmentLabel",
         "oldestInactiveDays",
     ]
-    _PR_HEALTH_PULL_REQUEST_SORT_FIELDS: ClassVar[List[str]] = ["inactivity", "age"]
+    _PR_HEALTH_PULL_REQUEST_SORT_FIELDS: ClassVar[List[str]] = ["inactivity", "age", "repo", "author", "review"]
     _VCS_SORT_DIRECTIONS: ClassVar[List[str]] = ["asc", "desc"]
     _PR_HEALTH_BUCKETS: ClassVar[List[str]] = [
         "AUTOMATION",
@@ -3140,7 +3894,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         if isinstance(value, str) and value.strip().lower() in canonical:
             return canonical[value.strip().lower()]
         raise create_structured_validation_error(
-            message=f"Unsupported {field} for {action}: {value!r}",
+            message=f"Unsupported {field} for {action}: {value!r}. Use one of: {', '.join(choices)}",
             field=field,
             value=value,
             suggestions=["Use one of: " + ", ".join(choices), f"Omit {field} to use the platform default"],
@@ -3196,10 +3950,10 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         is no estimate to give, and a fabricated 0 would read as "no money at risk".
         """
         if isinstance(count, bool) or not isinstance(count, int):
-            return "n/a"
+            return "n/a (the platform returned no priced counts)"
         if isinstance(basis, bool) or not isinstance(basis, (int, float)):
             return "n/a"
-        return f"~{count * float(basis):,.2f} (estimate)"
+        return f"~{render_usd(count * float(basis))} (estimate)"
 
     @staticmethod
     def _render_vcs_login(login: Any, email: Any) -> str:
@@ -3263,6 +4017,23 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             )
             lines.append(
                 f"**Cutoff**: pull requests opened before {cutoff} are left out, open or closed{origin}."
+            )
+        # Rendered only when sent: an older platform has no countsSince, and a
+        # date computed here could disagree with the one the platform counted from.
+        counts_since = report.get("countsSince")
+        if counts_since:
+            if cutoff and counts_since == cutoff:
+                window_origin = " (the team's cutoff date)"
+            elif not cutoff:
+                window_origin = (
+                    " (the team has no cutoff date, so the platform counts from six months "
+                    "before today, UTC)"
+                )
+            else:
+                window_origin = ""
+            lines.append(
+                f"**Counts since**: {counts_since}. Pull requests opened before it are left out "
+                f"of every count{window_origin}."
             )
         excluded = report.get("excludedRepos")
         if isinstance(excluded, list):
@@ -3387,7 +4158,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         raw_totals = report.get("totals")
         totals: Dict[str, Any] = raw_totals if isinstance(raw_totals, dict) else {}
         lines = self._render_pr_health_heading("PR Health", report, source, start_date, end_date)
-        lines.extend(["", *self._render_pr_health_totals(totals)])
+        lines.extend(["", *self._render_pr_health_totals(totals, self._render_priced_since(report))])
         lines.extend(self._render_pr_health_causes(report.get("causes")))
         lines.extend([
             "",
@@ -3420,7 +4191,16 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         """The AI-assisted subset of one total, or nothing when the platform did not send it."""
         return f" ({self._render_count(totals[key])} AI-assisted)" if key in totals else ""
 
-    def _render_pr_health_totals(self, totals: Dict[str, Any]) -> List[str]:
+    @staticmethod
+    def _render_priced_since(report: Dict[str, Any]) -> str:
+        """The report's pricedSince, naming a cause only when the platform sent the key."""
+        if "pricedSince" not in report:
+            return "n/a (the platform did not return pricedSince)"
+        return report["pricedSince"] or "none (no coding-assistant spend to price yet)"
+
+    def _render_pr_health_totals(
+        self, totals: Dict[str, Any], priced_since: Optional[str] = None
+    ) -> List[str]:
         basis = totals.get("avgCostPerMergedPr")
         lines = [
             "**Totals**",
@@ -3446,8 +4226,9 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
                 f"{self._render_count(totals.get('automationPrs'))}"
             )
         lines += [
-            f"- avgCostPerMergedPr (the only cost figure the platform returns): "
-            f"{self._render_money(basis, None)}",
+            f"- avgCostPerMergedPr (the cost basis the estimates below multiply: the "
+            f"organization's coding-assistant cost divided by every pull request in the window): "
+            f"{render_usd(basis)}",
         ]
         last_synced = totals.get("lastSyncedAt")
         if last_synced:
@@ -3455,10 +4236,11 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         lines.extend([
             "",
             "**Cost estimates (computed here, not billed)**",
-            f"- At risk (rotting, AI-assisted): "
-            f"{self._render_pr_health_estimate(totals.get('rottingPrsAssisted'), basis)}",
-            f"- Wasted (closed unmerged, AI-assisted): "
-            f"{self._render_pr_health_estimate(totals.get('closedUnmergedAssisted'), basis)}",
+            f"- Priced since: {priced_since or self._render_priced_since({})}",
+            f"- At risk (rotting, AI-assisted, priced): "
+            f"{self._render_pr_health_estimate(totals.get('pricedRottingPrsAssisted'), basis)}",
+            f"- Wasted (closed unmerged, AI-assisted, priced): "
+            f"{self._render_pr_health_estimate(totals.get('pricedClosedUnmergedAssisted'), basis)}",
             self._PR_HEALTH_ESTIMATE_NOTE,
         ])
         return lines
@@ -3506,14 +4288,14 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             client = await self.get_client(ctx=ctx)
             report = await fetch(client)
             return [TextContent(type="text", text="\n".join(render(report)))]
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             raise
         except Exception as e:
             logger.error(f"Error in {action}: {e}")
             error_details = self._format_api_error_details(e)
             rule_lines = "\n".join(f"- {rule}" for rule in rules)
-            return [TextContent(type="text", text=f"""**{failure_title} Failed**
+            raise_refusal(f"""**{failure_title} Failed**
 
 {error_details}
 
@@ -3524,7 +4306,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
 
 **For Help:**
 - Use `get_capabilities()` to check current status
-""")]
+""", error_code=ErrorCodes.API_ERROR)
 
     async def _handle_get_pr_health(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -4159,7 +4941,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             "",
             f"**Rotting threshold**: {self._render_count(report.get('rottingDays'))}+ days inactive. At risk "
             "counts the open, non-draft, non-automation pull requests idle that long at each bucket's end.",
-            f"**Priced since**: {report.get('pricedSince') or 'none (no coding-assistant spend to price yet)'}",
+            f"**Priced since**: {self._render_priced_since(report)}",
             f"**Synced history starts**: {history_start}" if history_start
             else "**Synced history starts**: unknown, so every bucket is marked not covered",
             "",
@@ -4204,7 +4986,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         figures: Dict[str, Any] = at_risk if isinstance(at_risk, dict) else {}
         return (
             f"- {label}: {self._render_count(figures.get('prs'))} pull requests, "
-            f"{self._render_money(figures.get('estimatedDollars'), None)} estimated"
+            f"{render_usd(figures.get('estimatedDollars'))} estimated"
         )
 
     def _render_pr_health_follow_through(
@@ -4232,8 +5014,8 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
                 report.get("atRiskThen"),
             ),
             self._render_pr_health_at_risk("Now (today's rotting set)", report.get("atRiskNow")),
-            f"- Cost per merged pull request, last 90 days: {self._render_money(report.get('basisNow'), None)}; "
-            f"the 90 days ending on the first flag: {self._render_money(report.get('basisThen'), None)}",
+            f"- Cost per merged pull request, last 90 days: {render_usd(report.get('basisNow'))}; "
+            f"the 90 days ending on the first flag: {render_usd(report.get('basisThen'))}",
             "n/a means the basis window had no merged pull request outside automation or no recorded "
             "coding-assistant spend (or nothing was flagged yet), not a zero.",
         ])
@@ -4275,6 +5057,10 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
     _MERGED_PRS_PULL_REQUEST_ONLY_PARAMS: ClassVar[List[str]] = ["pr_limit", "pr_offset"]
     _MERGED_PRS_MAX_PR_LIMIT: ClassVar[int] = 200
     _MERGED_PRS_MAX_ROWS: ClassVar[int] = 200
+    # The cap on dated entries across the people shown. Base answers held 200
+    # one-line rows; 400 entries of about 35 characters stays under that, and a
+    # 21-person daily month needed 338.
+    _MERGED_PRS_MAX_DAY_ENTRIES: ClassVar[int] = 400
     _MERGED_PRS_WINDOW_RULE: ClassVar[str] = (
         "start_date must not be after end_date; granularity=day spans fewer than 35 days, "
         "week and month fewer than 400, window is unbounded"
@@ -4297,6 +5083,23 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             ],
             examples={"usage": self._VCS_ACTION_USAGE[action]},
         )
+
+    def _validate_merged_prs_people_offset(self, arguments: Dict[str, Any], group_by: Optional[str]) -> int:
+        """Pre-flight for people_offset: it pages the per-person list, which group_by replaces."""
+        action = "get_merged_prs"
+        if group_by is not None and arguments.get("people_offset") is not None:
+            raise create_structured_validation_error(
+                message="people_offset applies only without group_by",
+                field="people_offset",
+                value=arguments.get("people_offset"),
+                suggestions=[
+                    "Drop people_offset, or drop group_by for the per-person list",
+                    "Repositories come in the platform's order and are not paged here",
+                ],
+                examples={"usage": self._VCS_ACTION_USAGE[action]},
+            )
+        offset = self._validate_optional_int(arguments, "people_offset", 0)
+        return 0 if offset is None else offset
 
     def _validate_merged_prs_request(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Pre-flight for get_merged_prs; returns the keyword arguments for get_vcs_prs."""
@@ -4424,14 +5227,19 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             )
         return lines
 
-    def _render_capped_rows(self, entries: List[List[str]], empty_text: str) -> List[str]:
-        """Flatten per-object line groups, capping whole objects rather than lines."""
+    def _render_capped_rows(
+        self, entries: List[List[str]], empty_text: str, more: Callable[[int], str]
+    ) -> List[str]:
+        """Flatten per-object line groups, capping whole objects rather than lines.
+
+        ``more`` words the overflow line from the number of objects left out.
+        """
         if not entries:
             return [f"- {empty_text}"]
         cap = self._MERGED_PRS_MAX_ROWS
         hidden = len(entries) - cap
-        more = [f"… {hidden} more rows not shown; narrow the window or the grouping."] if hidden > 0 else []
-        return [line for entry in entries[:cap] for line in entry] + more
+        overflow = [more(hidden)] if hidden > 0 else []
+        return [line for entry in entries[:cap] for line in entry] + overflow
 
     def _render_merged_prs_repositories(self, report: Dict[str, Any], empty_text: str) -> List[str]:
         raw = report.get("repositories")
@@ -4445,7 +5253,14 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
                 login = self._render_vcs_login(member.get("platformLogin"), member.get("mappedEmail"))
                 entry.append(f"  - {login} | {self._render_merged_counts(member)}")
             entries.append(entry)
-        return ["**By repository**", *self._render_capped_rows(entries, empty_text)]
+        return [
+            "**By repository**",
+            *self._render_capped_rows(
+                entries,
+                empty_text,
+                lambda hidden: f"… {hidden} more repositories not shown, in the platform's order.",
+            ),
+        ]
 
     def _render_merged_pull_requests(self, pulls: Any) -> List[str]:
         if not isinstance(pulls, list):
@@ -4466,30 +5281,124 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         # truncation line's next pr_offset counts every pull request listed.
         return ["", "**Merged pull requests** (newest first)", *(lines or ["- None on this page."])]
 
-    def _render_merged_prs_people(self, report: Dict[str, Any], empty_text: str) -> List[str]:
+    @staticmethod
+    def _merged_count_or_none(value: Any) -> Optional[int]:
+        """The counter when it is a real integer, else None (rendered n/a, never a zero)."""
+        return None if isinstance(value, bool) or not isinstance(value, int) else value
+
+    @staticmethod
+    def _sum_counts_or_none(values: List[Optional[int]]) -> Optional[int]:
+        """The sum, or None when any value is missing: a partial sum would read as the total."""
+        return None if any(value is None for value in values) else sum(cast(List[int], values))
+
+    @staticmethod
+    def _merged_rank_key(merged: Optional[int], login: str) -> "tuple[bool, int, str]":
+        """Most merges first, ties by login, people without a merge count last."""
+        return (merged is None, -(merged or 0), login)
+
+    def _render_merged_prs_people(
+        self, report: Dict[str, Any], empty_text: str, people_offset: int = 0
+    ) -> List[str]:
+        """People busiest first: skip people_offset, cap at _MERGED_PRS_MAX_ROWS, then budget the days."""
         daily = report.get("dailyRows")
         if isinstance(daily, list):
-            rows = [
-                [
-                    f"- {row.get('date') or 'n/a'} | "
-                    f"{self._render_vcs_login(row.get('platformLogin'), row.get('mappedEmail'))} | "
-                    f"{self._render_merged_counts(row)}"
-                ]
-                for row in daily
-            ]
-            return [f"**By person, per {report.get('granularity') or 'bucket'}**", *self._render_capped_rows(rows, empty_text)]
-        raw = report.get("members")
-        members: List[Dict[str, Any]] = raw if isinstance(raw, list) else []
-        rows = [
-            [
-                f"- {self._render_vcs_login(member.get('platformLogin'), member.get('mappedEmail'))} | "
-                f"{self._render_merged_counts(member)}"
-            ]
+            heading = f"**By person, per {report.get('granularity') or 'bucket'}**"
+            everyone = self._merged_prs_daily_people(daily)
+        else:
+            heading = "**By person**"
+            raw = report.get("members")
+            everyone = self._merged_prs_member_people(raw if isinstance(raw, list) else [])
+        everyone.sort(key=lambda person: self._merged_rank_key(person.merged, person.sort_login))
+        people = everyone[people_offset:]
+        if everyone and not people:
+            return [heading, f"- No people at people_offset={people_offset}; there are {len(everyone)} in all."]
+        cap = self._MERGED_PRS_MAX_ROWS
+        budget = self._MERGED_PRS_MAX_DAY_ENTRIES
+        days_cut = False
+        totals_only = 0
+        # Page position of the first person who lost their days; their offset reaches them.
+        first_cut: Optional[int] = None
+        entries: List[List[str]] = []
+        for position, person in enumerate(people):
+            line = (
+                f"- {person.login} | merged={self._render_count(person.merged)} "
+                f"with-coding-tool={self._render_count(person.coding)}"
+            )
+            if person.days is not None and not person.days:
+                line += " | no merges in this window"
+            elif person.days:
+                days_cut = days_cut or len(person.days) > budget
+                if days_cut:
+                    # Days come whole or not at all, so this person and everyone ranked below get totals only.
+                    if position < cap:
+                        totals_only += 1
+                        first_cut = position if first_cut is None else first_cut
+                else:
+                    budget -= len(person.days)
+                    line += " | " + ", ".join(
+                        f"{day.get('date') or 'n/a'} {self._render_merged_counts(day)}" for day in person.days
+                    )
+            entries.append([line])
+        shown = len(entries[:cap])
+        lines = [
+            heading,
+            *self._render_capped_rows(
+                entries,
+                empty_text,
+                lambda hidden: (
+                    f"… {hidden} more people not shown, ranked below those listed. "
+                    f"Pass people_offset={people_offset + shown} for the next ones."
+                ),
+            ),
+        ]
+        if totals_only and first_cut is not None:
+            lines.append(
+                f"… {totals_only} people shown with totals only; pass "
+                f"people_offset={people_offset + first_cut} or a shorter window for their days."
+            )
+        return lines
+
+    def _merged_prs_member_people(self, members: List[Dict[str, Any]]) -> List[_MergedPerson]:
+        return [
+            _MergedPerson(
+                login=self._render_vcs_login(member.get("platformLogin"), member.get("mappedEmail")),
+                sort_login=str(member.get("platformLogin") or member.get("mappedEmail") or ""),
+                merged=self._merged_count_or_none(member.get("prsMerged")),
+                coding=self._merged_count_or_none(member.get("prsMergedWithCodingTool")),
+                days=None,
+            )
             for member in members
         ]
-        return ["**By person**", *self._render_capped_rows(rows, empty_text)]
 
-    def _render_merged_prs_report(self, report: Dict[str, Any], request: Dict[str, Any]) -> List[str]:
+    def _merged_prs_daily_people(self, daily: List[Dict[str, Any]]) -> List[_MergedPerson]:
+        """Group the per-day rows by person; totals cover every day, the day list leaves out empty ones."""
+        rows_by_person: Dict[Any, List[Dict[str, Any]]] = {}
+        for index, row in enumerate(daily):
+            # A row naming nobody stays its own person rather than merging under one "unknown".
+            key = row.get("platformLogin") or row.get("mappedEmail") or ("unnamed", index)
+            rows_by_person.setdefault(key, []).append(row)
+        people = []
+        for key, rows in rows_by_person.items():
+            days = sorted(
+                (row for row in rows if self._merged_count_or_none(row.get("prsMerged")) != 0),
+                key=lambda row: str(row.get("date") or ""),
+            )
+            people.append(
+                _MergedPerson(
+                    login=self._render_vcs_login(rows[0].get("platformLogin"), rows[0].get("mappedEmail")),
+                    sort_login=key if isinstance(key, str) else "",
+                    merged=self._sum_counts_or_none([self._merged_count_or_none(r.get("prsMerged")) for r in rows]),
+                    coding=self._sum_counts_or_none(
+                        [self._merged_count_or_none(r.get("prsMergedWithCodingTool")) for r in rows]
+                    ),
+                    days=days,
+                )
+            )
+        return people
+
+    def _render_merged_prs_report(
+        self, report: Dict[str, Any], request: Dict[str, Any], people_offset: int = 0
+    ) -> List[str]:
         source = report.get("source") or request["source"]
         group_by = report.get("groupBy") or request["group_by"]
         grouping = "per repository" if group_by == "repository" else "per person"
@@ -4512,7 +5421,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             lines.extend(self._render_merged_prs_repositories(report, empty_text))
             lines.extend(self._render_merged_pull_requests(report.get("pullRequests")))
         else:
-            lines.extend(self._render_merged_prs_people(report, empty_text))
+            lines.extend(self._render_merged_prs_people(report, empty_text, people_offset))
         return lines
 
     async def _handle_get_merged_prs(
@@ -4520,12 +5429,13 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get_merged_prs — merged pull-request counts per person or per repository."""
         request = self._validate_merged_prs_request(arguments)
+        people_offset = self._validate_merged_prs_people_offset(arguments, request["group_by"])
         return await self._run_vcs_read(
             "get_merged_prs",
             "Merged PRs",
             [self._VCS_WINDOW_REQUIRED_RULE, self._MERGED_PRS_WINDOW_RULE],
             lambda client: client.get_vcs_prs(**request),
-            lambda report: self._render_merged_prs_report(report, request),
+            lambda report: self._render_merged_prs_report(report, request, people_offset),
             ctx,
         )
 
@@ -4552,6 +5462,19 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             "numbers here mean unknown, not zero."
         ),
     }
+    # The platform's single-provider branch (hypercurrent CoverageRatioService)
+    # looks the provider name up literally among the organisation's credential
+    # providers, while the unfiltered report maps a vendor's other credential
+    # types onto its row. Until BACK-4187 lands, a filtered NO_INTEGRATION can
+    # sit beside a populated row in the unfiltered report; remove this note and
+    # its limitations line when it ships.
+    _COVERAGE_SINGLE_PROVIDER_NOTE: ClassVar[str] = (
+        "A request for one provider matches only a billing credential of exactly that "
+        "provider on the current platform, so a credential of the same vendor family is "
+        "not found: for Anthropic, a Claude Enterprise connection answers NO_INTEGRATION "
+        "here. Call get_coverage_ratio without provider; that report shows the vendor's "
+        "row, with the Claude Enterprise credential counted under Anthropic."
+    )
     # The coding-assistant field this release removed was a dollar figure; its
     # replacement is a boolean, and a false can also mean "the probe could not
     # confirm" — so it is never rendered as an amount and never as a certain no.
@@ -4562,13 +5485,22 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
     )
     _COVERAGE_CHECK_INCOMPLETE_LABEL: ClassVar[str] = "unknown (the check could not complete)"
 
-    # Each row's ratio is that provider's slice of the billed total — the rows sum
-    # toward 1.0 across providers. It answers "who did we spend it with", not
-    # "how much of it did we meter", which is the aggregate figure above.
-    _COVERAGE_ROW_SHARE_NOTE: ClassVar[str] = (
-        "Each row's share is that provider's portion of TOTAL billed spend, not its "
-        "coverage. Compare metered against billed within a row to see that provider's "
-        "gap. A row state of no-data means the provider reported nothing to compare."
+    # Backend contract (CoverageRatioResponse): a row's ratio is its own
+    # Revenium-metered spend divided by its billed spend, the same measure as the
+    # aggregate, and the aggregate counts only rows that have a billing credential.
+    _COVERAGE_ROW_RATIO_NOTE: ClassVar[str] = (
+        "Each row's ratio is that row's Revenium-metered spend divided by its billed "
+        "spend. A row state of no-data means the provider reported nothing to compare."
+    )
+    # Amounts arrive as cents-precision floats; a sub-cent gap between the row
+    # sums and the report totals is float noise, not a disagreement.
+    _COVERAGE_TOTALS_TOLERANCE: ClassVar[float] = 0.005
+    _COVERAGE_NOT_ZERO_LEAD: ClassVar[str] = (
+        "This n/a is NOT zero coverage — no ratio could be computed at all."
+    )
+    _COVERAGE_AGGREGATE_SCOPE_NOTE: ClassVar[str] = (
+        "- The ratio is Revenium-metered spend divided by billed spend. It counts only "
+        "providers with a billing credential."
     )
 
     # BACK-2957. The aggregate ratio and hiddenSpend are computed only over the
@@ -4585,7 +5517,8 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         "A row with billing credential connected: no reports metered spend whose invoice "
         "Revenium cannot see, so it carries no ratio and is excluded from the aggregate "
         "ratio and from hidden spend. Its dollars are real and are counted in the metered "
-        "spend outside the comparison."
+        "spend outside the comparison. To compare it with an invoice, connect that "
+        "provider's key in Revenium's Manage Connections."
     )
     # transform is a comma-separated list of what reshaped the metered row sums
     # before they were reported. Printing the bare tokens would hide a reshaped
@@ -4693,6 +5626,26 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         return f"{points:+.1f} pp"
 
     @staticmethod
+    def _coverage_row_name(row: Dict[str, Any]) -> str:
+        """A row's display name: its label, else its provider code, else 'unknown'.
+
+        An older platform sends no label, so the provider code stays the fallback.
+        """
+        for key in ("label", "provider"):
+            value = row.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return "unknown"
+
+    @staticmethod
+    def _coverage_credential_names(row: Dict[str, Any]) -> List[str]:
+        """The row's billing credential names, empty when absent or malformed."""
+        names = row.get("credentialNames")
+        if not isinstance(names, list):
+            return []
+        return [n.strip() for n in names if isinstance(n, str) and n.strip()]
+
+    @staticmethod
     def _render_coverage_amount(value: Any) -> str:
         """Render a coverage amount without rounding real sub-cent spend to 0.
 
@@ -4730,6 +5683,111 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             and isinstance(value, (int, float))
             and math.isfinite(value)
         )
+
+    @staticmethod
+    def _coverage_compared_rows(report: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The rows the platform compares: credential connected and not no-overlap."""
+        rows = report.get("byProvider")
+        if not isinstance(rows, list):
+            return []
+        return [
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and row.get("billingCredentialConnected") is True
+            and row.get("comparisonState") != "no-overlap"
+        ]
+
+    def _coverage_amount_or_zero(self, value: Any) -> float:
+        return float(value) if self._is_coverage_amount(value) else 0.0
+
+    def _coverage_row_totals(
+        self, compared_rows: List[Dict[str, Any]]
+    ) -> Optional[Tuple[float, float]]:
+        """Summed (metered, billed) over the compared rows, or None when unusable.
+
+        An absent billing counts as zero, as the platform counts it; an absent
+        metered leaves the sum incomplete, so no row-based figure is given.
+        """
+        if not all(self._is_coverage_amount(row.get("metered")) for row in compared_rows):
+            return None
+        metered = sum(self._coverage_amount_or_zero(row.get("metered")) for row in compared_rows)
+        billed = sum(self._coverage_amount_or_zero(row.get("billing")) for row in compared_rows)
+        return (metered, billed) if billed > 0 else None
+
+    def _coverage_published_totals(self, report: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+        """(metered, billed) implied by the report totals: billed = hidden + metered.
+
+        The platform clamps hiddenSpend at zero, so a zero hides how far metered
+        exceeds billed and billed cannot be recovered from it.
+        """
+        hidden = report.get("hiddenSpend")
+        metered = report.get("meteredTotalInComparison")
+        if not (self._is_coverage_amount(hidden) and self._is_coverage_amount(metered)):
+            return None
+        hidden_total = self._coverage_amount_or_zero(hidden)
+        if hidden_total <= 0:
+            return None
+        metered_total = self._coverage_amount_or_zero(metered)
+        return (metered_total, hidden_total + metered_total)
+
+    def _render_withheld_aggregate_lines(self, report: Dict[str, Any]) -> List[str]:
+        """Explain a null aggregate the state does not explain, from the rows.
+
+        hypercurrent CoverageRatioService publishes aggregateRatio only when every
+        compared provider billed something in the window (BACK-4619), while
+        hiddenSpend and meteredTotalInComparison are still published.
+        """
+        compared_rows = self._coverage_compared_rows(report)
+        unbilled_names = [
+            self._coverage_row_name(row)
+            for row in compared_rows
+            if self._coverage_amount_or_zero(row.get("billing")) == 0
+        ]
+        if unbilled_names:
+            why = (
+                "The platform publishes the aggregate ratio only when every compared "
+                "provider (billing credential connected and overlapping the window) "
+                "billed something in it, and these compared providers billed nothing "
+                f"in it: {', '.join(unbilled_names)}. Those rows withhold the aggregate."
+            )
+        else:
+            why = "The platform withheld the aggregate ratio for this window without saying why."
+        lines = [
+            "",
+            f"{self._COVERAGE_NOT_ZERO_LEAD} The aggregate ratio was not published. {why}",
+        ]
+        return lines + self._render_diagnostic_quotient_lines(report, compared_rows)
+
+    def _render_diagnostic_quotient_lines(
+        self, report: Dict[str, Any], compared_rows: List[Dict[str, Any]]
+    ) -> List[str]:
+        row_totals = self._coverage_row_totals(compared_rows)
+        published_totals = self._coverage_published_totals(report)
+        totals = row_totals or published_totals
+        if totals is None:
+            return []
+        metered, billed = totals
+        source = "the compared rows" if row_totals else "hidden spend plus metered spend"
+        lines = [
+            f"- Diagnostic only, not the coverage ratio: metered {self._render_coverage_amount(metered)} "
+            f"divided by billed {self._render_coverage_amount(billed)} across {source} is "
+            f"{self._render_ratio(metered / billed)}. It is a division of the published "
+            "totals, not a ratio the platform computed or published."
+        ]
+        if row_totals and published_totals and not all(
+            math.isclose(a, b, rel_tol=0.0, abs_tol=self._COVERAGE_TOTALS_TOLERANCE)
+            for a, b in zip(row_totals, published_totals)
+        ):
+            published_metered, published_billed = published_totals
+            lines.append(
+                "- The report totals (hidden spend plus metered spend inside the "
+                f"comparison) give metered {self._render_coverage_amount(published_metered)} "
+                f"over billed {self._render_coverage_amount(published_billed)} = "
+                f"{self._render_ratio(published_metered / published_billed)}; the row sums "
+                "above were used."
+            )
+        return lines
 
     def _render_metered_basis_lines(self, basis: Any) -> List[str]:
         """Render where and how the metered figures were read, when upstream says.
@@ -4778,27 +5836,59 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             lines[:0] = ["", "**Metered basis**"]
         return lines
 
+    _COVERAGE_DATE_FORMS: ClassVar[Tuple[str, ...]] = (
+        "Pass calendar dates, e.g. start_date='2026-09-01' and end_date='2026-09-30': "
+        "each covers the whole UTC day and both days are included",
+        "Or pass ISO-8601 instants with Z or an offset, e.g. "
+        "start_date='2026-09-01T00:00:00Z' and end_date='2026-09-30T23:59:59Z'",
+    )
+    _COVERAGE_CUSTOM_EXAMPLE: ClassVar[Dict[str, str]] = {
+        "action": "get_coverage_ratio",
+        "start_date": "2026-09-01",
+        "end_date": "2026-09-30",
+    }
+
+    @staticmethod
+    def _coverage_provider_refusal(message: str, provider: Any) -> ToolError:
+        return create_structured_validation_error(
+            message=message,
+            field="provider",
+            value=provider,
+            suggestions=[
+                "Omit provider to cover every connected provider",
+                "Use get_filter_options(dimension='providers') to discover valid names",
+            ],
+            examples={"correct_usage": {"action": "get_coverage_ratio", "provider": "ANTHROPIC"}},
+        )
+
     async def _handle_get_coverage_ratio(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get_coverage_ratio — metered vs. provider-billed spend and hidden spend."""
         provider = arguments.get("provider")
-        if isinstance(provider, str):
-            provider = provider.strip() or None
-        elif provider is not None:
-            raise create_structured_validation_error(
-                message=f"provider must be a provider name string: {provider!r}",
-                field="provider",
-                value=provider,
-                suggestions=[
-                    "Omit provider to cover every connected provider",
-                    "Use get_filter_options(dimension='providers') to discover valid names",
-                ],
-                examples={"correct_usage": {"action": "get_coverage_ratio", "provider": "ANTHROPIC"}},
+        if isinstance(provider, str) and provider.strip():
+            provider = provider.strip()
+        elif isinstance(provider, str):
+            raise self._coverage_provider_refusal(
+                "provider is blank: name one provider, or omit provider to cover every "
+                "connected provider. Nothing was read.",
+                provider,
             )
+        elif provider is not None:
+            raise self._coverage_provider_refusal(
+                f"provider must be a provider name string: {provider!r}", provider
+            )
+        # `is not None`, so an empty string still reaches the format refusal
+        # in utc_instant_bounds instead of reading as "no dates".
+        dates_given = (
+            arguments.get("start_date") is not None or arguments.get("end_date") is not None
+        )
+        period_sent = arguments.get("period") is not None
         period = arguments.get("period")
         if period is None:
-            period = self._COVERAGE_DEFAULT_PERIOD
+            # Dates alone select that range, as on the other cost reports; the
+            # platform reads them only for period custom.
+            period = "custom" if dates_given else self._COVERAGE_DEFAULT_PERIOD
         elif not isinstance(period, str) or not period.strip():
             raise create_structured_validation_error(
                 message=f"period must be a period name string: {period!r}",
@@ -4814,47 +5904,58 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             )
         else:
             period = period.strip()
-        start_date = arguments.get("start_date")
-        end_date = arguments.get("end_date")
-        for date_field, date_value in (("start_date", start_date), ("end_date", end_date)):
-            if date_value is not None and (
-                not isinstance(date_value, str) or not date_value.strip()
-            ):
-                raise create_structured_validation_error(
-                    message=f"{date_field} must be an ISO-8601 instant string: {date_value!r}",
-                    field=date_field,
-                    value=date_value,
-                    suggestions=[
-                        "Pass an ISO-8601 instant, e.g. '2026-08-01T00:00:00Z'",
-                        "start_date/end_date only apply when period='custom'",
-                    ],
-                    examples={
-                        "correct_usage": {
-                            "action": "get_coverage_ratio",
-                            "period": "custom",
-                            "start_date": "2026-08-01T00:00:00Z",
-                            "end_date": "2026-08-27T00:00:00Z",
-                        }
-                    },
-                )
+        if dates_given and period.lower() != "custom":
+            # The platform ignores the dates for a named period, so answering
+            # would report a window other than the one the dates name.
+            raise create_structured_validation_error(
+                message="Pass either period or start_date/end_date, not both",
+                field="period",
+                value=arguments.get("period"),
+                suggestions=[
+                    "Drop period to read the calendar range start_date to end_date",
+                    "Or drop start_date and end_date to read the rolling period",
+                ],
+                examples={"correct_usage": self._COVERAGE_CUSTOM_EXAMPLE},
+            )
+        try:
+            start_date, end_date = utc_instant_bounds(
+                arguments.get("start_date"), arguments.get("end_date")
+            )
+        except CalendarRangeError as error:
+            raise create_structured_validation_error(
+                message=str(error),
+                field=error.field,
+                value=arguments.get(error.field),
+                suggestions=[
+                    *self._COVERAGE_DATE_FORMS,
+                    "start_date must not be after end_date; start_date/end_date select "
+                    "that range, with period omitted or 'custom'",
+                ],
+                examples={"correct_usage": self._COVERAGE_CUSTOM_EXAMPLE},
+            ) from None
+        if period.lower() == "custom" and not period_sent and not (start_date and end_date):
+            missing = "start_date" if start_date is None else "end_date"
+            raise create_structured_validation_error(
+                message="start_date and end_date go together: pass both or neither",
+                field=missing,
+                value=None,
+                suggestions=[
+                    *self._COVERAGE_DATE_FORMS,
+                    "Or drop both to read the default rolling period "
+                    f"({self._COVERAGE_DEFAULT_PERIOD})",
+                ],
+                examples={"correct_usage": self._COVERAGE_CUSTOM_EXAMPLE},
+            )
         if period.lower() == "custom" and not (start_date and end_date):
             raise create_structured_validation_error(
                 message="period='custom' requires both start_date and end_date",
                 field="period",
                 value=period,
                 suggestions=[
-                    "Pass ISO-8601 instants, e.g. start_date='2026-08-01T00:00:00Z' "
-                    "and end_date='2026-08-27T00:00:00Z'",
+                    *self._COVERAGE_DATE_FORMS,
                     "Or use a named window: 24h, 7d, 30d, 90d",
                 ],
-                examples={
-                    "correct_usage": {
-                        "action": "get_coverage_ratio",
-                        "period": "custom",
-                        "start_date": "2026-08-01T00:00:00Z",
-                        "end_date": "2026-08-27T00:00:00Z",
-                    }
-                },
+                examples={"correct_usage": self._COVERAGE_CUSTOM_EXAMPLE},
             )
         try:
             logger.info("Processing get_coverage_ratio request")
@@ -4869,18 +5970,28 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             state = report.get("state")
             state_text = state if isinstance(state, str) and state.strip() else "unknown"
             scope = f" — {provider}" if provider else " — all providers"
+            if period.lower() == "custom" and start_date and end_date:
+                # The platform keeps the UTC calendar day of each bound, so the
+                # header names the days read rather than the word "custom".
+                window = (
+                    f"{start_date[:10]} to {end_date[:10]} (whole UTC days, both included)"
+                )
+            else:
+                window = period
 
             lines = [
                 f"**Provider Metering Coverage{scope}**",
                 "",
                 "How much of what the providers billed was actually metered by Revenium. "
-                f"Comparison window: {period}.",
+                f"Comparison window: {window}.",
                 "",
                 f"**State**: {state_text}",
             ]
             note = self._COVERAGE_STATE_NOTES.get(state_text)
             if note:
                 lines.append(f"- {note}")
+            if provider and state_text == "NO_INTEGRATION":
+                lines.append(f"- {self._COVERAGE_SINGLE_PROVIDER_NOTE}")
 
             aggregate_ratio = self._render_ratio(report.get("aggregateRatio"))
             lines.extend([
@@ -4894,6 +6005,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
                 f"{self._render_coverage_amount(report.get('hiddenSpend'))}",
                 f"- Trend vs. the previous window: {self._render_trend(report.get('trend'))}",
                 f"- Confidence: {report.get('confidence') or 'n/a'}",
+                self._COVERAGE_AGGREGATE_SCOPE_NOTE,
             ])
             # BACK-2957: the ratio and hidden spend above cover only the
             # providers with a billing credential. Naming both totals is what
@@ -4915,22 +6027,15 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             if aggregate_ratio == "n/a":
                 # Said only when it applies, so it reads as an explanation of this
                 # report rather than boilerplate the caller learns to skip.
-                # Live dev evidence: state can be VALID while the ratio is null
-                # (aggregateRatioAvailable=false, e.g. no provider billing in the
-                # window) — so only point at the state when it actually explains.
+                # Live dev evidence: state can be VALID while the ratio is null,
+                # so only point at the state when it actually explains.
                 if state_text in self._COVERAGE_STATE_NOTES:
-                    why = "The state above says why."
+                    lines.extend([
+                        "",
+                        f"{self._COVERAGE_NOT_ZERO_LEAD} The state above says why.",
+                    ])
                 else:
-                    why = (
-                        "The platform reports aggregateRatioAvailable="
-                        f"{report.get('aggregateRatioAvailable')} — it could not "
-                        "compute a ratio for this window (for example, no provider "
-                        "billing in the period)."
-                    )
-                lines.extend([
-                    "",
-                    f"This n/a is NOT zero coverage — no ratio could be computed at all. {why}",
-                ])
+                    lines.extend(self._render_withheld_aggregate_lines(report))
 
             lines.extend(self._render_metered_basis_lines(report.get("meteredBasis")))
 
@@ -4954,22 +6059,20 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
             uncredentialed_row_seen = False
             lines.extend(["", "**By provider**"])
             if not rows:
-                # The share note explains columns that are not about to be printed.
+                # The row ratio note explains columns that are not about to be printed.
                 lines.append("- No per-provider rows were returned for this report.")
             else:
-                lines.append(self._COVERAGE_ROW_SHARE_NOTE)
+                lines.append(self._COVERAGE_ROW_RATIO_NOTE)
             for row in rows[: self._COVERAGE_MAX_PROVIDER_ROWS]:
                 if not isinstance(row, dict):
                     continue
-                name = row.get("provider") or "unknown"
+                name = self._coverage_row_name(row)
                 row_state = row.get("state")
                 row_state_text = (
                     row_state if isinstance(row_state, str) and row_state.strip() else "unknown"
                 )
                 parts = [
-                    # ratio is this provider's share of TOTAL billed spend, not its
-                    # coverage — labelling it "coverage" would invert its meaning.
-                    f"- {name} [{row_state_text}] | share of billed spend="
+                    f"- {name} [{row_state_text}] | metered/billed ratio="
                     f"{self._render_ratio(row.get('ratio'))}",
                     f"metered={self._render_coverage_amount(row.get('metered'))}",
                     f"billed={self._render_coverage_amount(row.get('billing'))}",
@@ -4990,6 +6093,9 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
                     if connected is False:
                         uncredentialed_row_seen = True
                 lines.append(" ".join(parts))
+                credential_names = self._coverage_credential_names(row)
+                if credential_names:
+                    lines.append(f"  Billing credentials: {', '.join(credential_names)}")
                 revision_window = self._render_revision_window(row)
                 if revision_window is not None:
                     lines.append(revision_window)
@@ -5002,7 +6108,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
 
             return [TextContent(type="text", text="\n".join(lines))]
 
-        except AuthenticationError:
+        except (AuthenticationError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             raise
         except PermissionError:
@@ -5013,19 +6119,20 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
         except Exception as e:
             logger.error(f"Error in get_coverage_ratio: {e}")
             error_details = self._format_api_error_details(e)
-            return [TextContent(type="text", text=f"""**Provider Metering Coverage Failed**
+            raise_refusal(f"""**Provider Metering Coverage Failed**
 
 {error_details}
 
 **Troubleshooting:**
-- `period` is required upstream (24h, 7d, 30d, 90d, or custom with start_date/end_date); this action defaults it to 30d
+- `period` (24h, 7d, 30d, 90d) or start_date/end_date for a calendar range; with neither, this action reads 30d
+- start_date/end_date: the platform refuses an end after today and a range longer than it allows; its message is shown above
 - The team is resolved from your credentials — no team parameter is needed
 - Use `get_filter_options(dimension='providers')` to check the provider name you passed
 - A 403 usually means the coding-assistant-separation-active feature is not enabled for this environment — the whole report is gated on it; with the feature on, any member who can view the organization may read it
 
 **For Help:**
 - Use `get_capabilities()` to check current status
-""")]
+""", error_code=ErrorCodes.API_ERROR)
 
     async def _handle_get_model_costs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -5060,9 +6167,9 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
 - Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response)
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
             raise
@@ -5076,7 +6183,7 @@ No usage recorded for skill '{skill_id}' in the requested period ({requested}).
 If you're seeing this error, please report it as it indicates a reliability issue.
 
 **Troubleshooting:**
-- Verify your parameters: period (required), aggregation (optional, defaults to TOTAL)
+- Verify your parameters: period, or start_date and end_date (yyyy-MM-dd, both days included) in its place; aggregation (optional, defaults to TOTAL)
 - Check that you have data for the specified time period
 - Try a different time period if no data is available
 
@@ -5088,7 +6195,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to check current status
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     async def _handle_get_customer_costs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -5123,9 +6230,9 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response)
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
             raise
@@ -5139,7 +6246,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 If you're seeing this error, please report it as it indicates a reliability issue.
 
 **Troubleshooting:**
-- Verify your parameters: period (required), aggregation (optional, defaults to TOTAL)
+- Verify your parameters: period, or start_date and end_date (yyyy-MM-dd, both days included) in its place; aggregation (optional, defaults to TOTAL)
 - Check that you have data for the specified time period
 - Try a different time period if no data is available
 
@@ -5151,7 +6258,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to check current status
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     async def _handle_get_api_key_costs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -5186,9 +6293,9 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response)
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
             raise
@@ -5202,7 +6309,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 If you're seeing this error, please report it as it indicates a reliability issue.
 
 **Troubleshooting:**
-- Verify your parameters: period (required), aggregation (optional, defaults to TOTAL)
+- Verify your parameters: period, or start_date and end_date (yyyy-MM-dd, both days included) in its place; aggregation (optional, defaults to TOTAL)
 - Check that you have API key data for the specified time period
 - Try a different time period if no data is available
 
@@ -5214,7 +6321,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to check current status
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     async def _handle_get_agent_costs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -5249,9 +6356,9 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response)
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
             raise
@@ -5265,7 +6372,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 If you're seeing this error, please report it as it indicates a reliability issue.
 
 **Troubleshooting:**
-- Verify your parameters: period (required), aggregation (optional, defaults to TOTAL)
+- Verify your parameters: period, or start_date and end_date (yyyy-MM-dd, both days included) in its place; aggregation (optional, defaults to TOTAL)
 - Check that you have agent data for the specified time period
 - Try a different time period if no data is available
 
@@ -5278,7 +6385,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to check current status
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     # Decision (BACK-2765): GET /v2/api/billing/users is intentionally unwrapped.
     #
@@ -5351,20 +6458,21 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response)
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
             raise
         except NewApiRequiredError:
-            return [TextContent(type="text", text=(
+            raise_refusal(
                 "**get_user_costs** is not enabled on this MCP server deployment.\n\n"
                 "This is a server configuration gap, not something your tenant lacks: "
                 "the per-user cost report reads the analytics API, which this server is "
                 "not configured to call. The server operator can enable it by setting "
-                "`REVENIUM_USE_NEW_ANALYTICS_API=true`."
-            ))]
+                "`REVENIUM_USE_NEW_ANALYTICS_API=true`.",
+                error_code=ErrorCodes.TOOL_ERROR,
+            )
         except Exception as e:
             logger.error(f"Error in get_user_costs: {e}")
             error_details = self._format_api_error_details(e)
@@ -5373,14 +6481,15 @@ If you're seeing this error, please report it as it indicates a reliability issu
 {error_details}
 
 **Troubleshooting:**
-- Verify your parameters: period (required), aggregation (optional, defaults to TOTAL)
-- User cost data exists only for rows whose subscriber email is populated; coding-assistant usage
-  is real spend or an estimate under coding_assistant depending on whether the team pays for it at API rates
+- Verify your parameters: period, or start_date and end_date (yyyy-MM-dd, both days included) in its place; aggregation (optional, defaults to TOTAL)
+- User cost data exists only for rows whose subscriber email is populated; which coding-assistant
+  calls count, and under which cost source, is the coding-assistant scope note every cost answer carries
 
 **Supported Parameters:**
 - **period**: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - **aggregation**: TOTAL, MEAN, MAXIMUM, MINIMUM (optional, defaults to TOTAL)
 - **filters**: Optional dict with array keys `agents`, `providers`, `models`, `users`, `costSources`
+- **page** (zero-based) and **size** (1 to {ANALYTICS_MAX_PAGE_SIZE}, default {USER_COSTS_DEFAULT_PAGE_SIZE}): one page of users per call
 - **costSources**: Defaults to `["coding_assistant", "revenium_metered", "provider_billing"]`
   (every source); pass a subset to narrow the report to one classification
 
@@ -5388,7 +6497,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to check current status
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     # Decision (BACK-3979): GET /api/v2/analytics/cost-by-department is not wrapped.
     #
@@ -5421,12 +6530,15 @@ If you're seeing this error, please report it as it indicates a reliability issu
             text = DepartmentCostsFormatter().format(parse_department_costs(envelope), query)
             return [TextContent(type="text", text=text)]
         except ValidationError as e:
-            return [TextContent(type="text", text=self._department_costs_validation_error(e))]
-        except AuthenticationError:
+            raise_refusal(self._department_costs_validation_error(e))
+        except (AuthenticationError, PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in get_department_costs: {e}")
-            return [TextContent(type="text", text=self._department_costs_failure(e))]
+            raise_refusal(
+                self._department_costs_failure(e),
+                error_code=ErrorCodes.API_ERROR,
+            )
 
     @staticmethod
     def _department_costs_validation_error(error: ValidationError) -> str:
@@ -5438,7 +6550,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 **Suggestions:**
 {suggestions}
 **Parameters:**
-- **period** (required): {_values(COST_PERIOD_VALUES)}
+- **period** (required unless **start_date**/**end_date** replace it): {_values(COST_PERIOD_VALUES)}
 - **group** or **aggregation** (optional): {_values(AGGREGATION_VALUES)}, default TOTAL
 - **filters** (optional): arrays under agents, providers, models, users, costSources
 - **page** (optional, zero-based) and **size** (optional, 1 to 100, default 20)
@@ -5450,7 +6562,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 {self._format_api_error_details(error)}
 
 **Troubleshooting:**
-- Verify your parameters: period (required), group or aggregation (optional, default TOTAL)
+- Verify your parameters: period, or start_date and end_date (yyyy-MM-dd, both days included) in its place; group or aggregation (optional, default TOTAL)
 - size must be from 1 to 100
 - Filter values must be names the platform knows: use get_filter_options(dimension=...)
 """
@@ -5482,8 +6594,8 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
-            return [TextContent(type="text", text=error_response)]
-        except AuthenticationError:
+            raise_refusal(error_response)
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
             raise
@@ -5503,7 +6615,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to check current status
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     async def _handle_get_top_tools(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -5532,8 +6644,8 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
-            return [TextContent(type="text", text=error_response)]
-        except AuthenticationError:
+            raise_refusal(error_response)
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
             raise
@@ -5552,7 +6664,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to check current status
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     # ── Coding-assistant team medians (analytics plane) ────────────────────
     # Verified against dev: any other window answers 400
@@ -5689,7 +6801,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
             raise
         except ReveniumAPIError as e:
             logger.warning(f"get_ai_assistant_team_medians failed: {e}")
-            return [TextContent(type="text", text=self._render_team_medians_failure(e))]
+            raise_refusal(
+                self._render_team_medians_failure(e),
+                error_code=ErrorCodes.API_ERROR,
+            )
         return [TextContent(type="text", text="\n".join(self._render_team_medians(report)))]
 
     async def _handle_get_tool_costs_by_agent(
@@ -5719,8 +6834,8 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
-            return [TextContent(type="text", text=error_response)]
-        except AuthenticationError:
+            raise_refusal(error_response)
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
             raise
@@ -5740,7 +6855,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to check current status
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     async def _handle_get_tool_costs_by_provider(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -5769,8 +6884,8 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - Check supported aggregations: TOTAL, MEAN, MAXIMUM, MINIMUM
 """
-            return [TextContent(type="text", text=error_response)]
-        except AuthenticationError:
+            raise_refusal(error_response)
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
             raise
@@ -5790,7 +6905,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to check current status
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     @staticmethod
     def _md_cell(value: Any) -> str:
@@ -5834,6 +6949,12 @@ If you're seeing this error, please report it as it indicates a reliability issu
         ]
         if "time_groups_analyzed" in result:
             summary_bits.append(f"**Time groups analyzed:** {result['time_groups_analyzed']}")
+        elif "time_groups_by_dimension" in result:
+            per_dimension = ", ".join(
+                f"{dimension} {count}"
+                for dimension, count in result["time_groups_by_dimension"].items()
+            )
+            summary_bits.append(f"**Time groups analyzed:** {per_dimension}")
         lines.append(" · ".join(summary_bits))
         lines.append("")
 
@@ -5841,18 +6962,32 @@ If you're seeing this error, please report it as it indicates a reliability issu
             lines.append(f"> ⚠️ {result['period_conversion_notice']}")
             lines.append("")
 
+        not_read: Dict[str, str] = result.get("dimensions_not_read") or {}
+        if not_read:
+            unread = "; ".join(f"{dim} ({reason})" for dim, reason in not_read.items())
+            lines.append(f"> ⚠️ Not read, so not examined for anomalies: {unread}")
+            lines.append("")
+
+        incomplete: Dict[str, str] = result.get("dimensions_incomplete") or {}
+        if incomplete:
+            partly = "; ".join(f"{dim}: {note}" for dim, note in incomplete.items())
+            lines.append(f"> ⚠️ Partly read: {partly}")
+            lines.append("")
+
         entities_analyzed = result.get("entities_analyzed") or {}
-        if entities_analyzed:
+        if entities_analyzed or not_read:
             lines.append("## Entities Analyzed")
             for dim, count in entities_analyzed.items():
                 lines.append(f"- **{dim}**: {count}")
+            for dim, reason in not_read.items():
+                lines.append(f"- **{dim}**: not read ({reason})")
             lines.append("")
 
         lines.append("## Anomalies Detected")
         lines.append("")
         if anomalies:
             lines.append(
-                "| Entity | Type | Time | Value | Normal Range | % Above | z-score | Severity |"
+                "| Entity | Type | Time | Value | Normal Range | % vs Normal | z-score | Severity |"
             )
             lines.append("|---|---|---|---|---|---|---|---|")
             for a in anomalies:
@@ -5866,8 +7001,8 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 z = a.get("z_score", 0) or 0
                 sev = a.get("severity_score", 0) or 0
                 lines.append(
-                    f"| {entity} | {etype} | {label} | ${value:.2f} | "
-                    f"${nmin:.2f}–${nmax:.2f} | {pct:.1f}% | {z:.1f} | {sev:.1f} |"
+                    f"| {entity} | {etype} | {label} | {render_dollars(value)} | "
+                    f"{render_dollars(nmin)}–{render_dollars(nmax)} | {pct:.1f}% | {z:.1f} | {sev:.1f} |"
                 )
             lines.append("")
 
@@ -5895,29 +7030,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
             lines.append("")
             self._render_grouped_summary(es, lines)
 
-        if result.get("new_entities_detected"):
-            lines.append("## New Entities Detected")
-            lines.append("")
-            ne_summary = result.get("new_entity_summary")
-            if ne_summary:
-                lines.append(ne_summary)
-                lines.append("")
-            ne_by_type = result.get("new_entities_by_type") or {}
-            for entity_type, data in ne_by_type.items():
-                count = data.get("count", 0)
-                lines.append(f"### {entity_type.title()} ({count})")
-                lines.append("")
-                if data.get("summary"):
-                    lines.append(data["summary"])
-                    lines.append("")
-                for entity in data.get("entities", []):
-                    name = entity.get("entity_name", "—")
-                    cost = entity.get("total_cost_impact", 0) or 0
-                    periods = entity.get("periods_active", 0)
-                    lines.append(
-                        f"- **{name}** — ${cost:.2f} impact across {periods} period(s)"
-                    )
-                lines.append("")
+        self._render_new_entities(result, lines)
 
         recs = result.get("recommendations") or []
         if recs:
@@ -5928,6 +7041,126 @@ If you're seeing this error, please report it as it indicates a reliability issu
             lines.append("")
 
         return "\n".join(lines).rstrip() + "\n"
+
+    def _render_new_entities(self, result: Dict[str, Any], lines: List[str]) -> None:
+        detection: Dict[str, Any] = result.get("new_entity_detection") or {}
+        if not detection and not result.get("new_entities_detected"):
+            return
+        lines.append("## New Entities Detected")
+        lines.append("")
+        if detection:
+            self._render_detection_window(detection, lines)
+        if not result.get("new_entities_detected"):
+            return
+        ne_summary = result.get("new_entity_summary")
+        if ne_summary:
+            lines.append(ne_summary)
+            lines.append("")
+        ne_by_type = result.get("new_entities_by_type") or {}
+        for entity_type, data in ne_by_type.items():
+            entities = data.get("entities", [])
+            lines.append(f"### {entity_type.replace('_', ' ').title()} ({data.get('count', 0)})")
+            lines.append("")
+            if data.get("summary"):
+                lines.append(data["summary"])
+                lines.append("")
+            spans = spans_for_entity_type(detection, entity_type)
+            for entity in entities[:NEW_ENTITY_LIST_CAP]:
+                lines.append(self._new_entity_line(entity, spans))
+            if len(entities) > NEW_ENTITY_LIST_CAP:
+                lines.append(f"- and {len(entities) - NEW_ENTITY_LIST_CAP} more")
+            lines.append("")
+
+    @staticmethod
+    def _render_detection_window(detection: Dict[str, Any], lines: List[str]) -> None:
+        status = detection.get("status")
+        if status == "not_run":
+            lines.append(f"New-entity detection could not run: {detection.get('reason')}.")
+        else:
+            threshold = detection.get("min_new_entity_threshold") or 0
+            shown_threshold = BaseFormattingUtilities.format_currency(threshold)
+            sentences = []
+            for dimensions, spans in detection_span_groups(detection):
+                recent = describe_part(spans, "recent")
+                baseline = describe_part(spans, "baseline")
+                if status == "none":
+                    nouns = [_DETECTION_NOUNS.get(name, name) for name in dimensions]
+                    named = (
+                        nouns[0] if len(nouns) == 1
+                        else f"{', '.join(nouns[:-1])} or {nouns[-1]}"
+                    )
+                    nothing = (
+                        f"No new or activated {named} reached {shown_threshold}"
+                        if threshold > 0
+                        else f"No new {named} appeared"
+                    )
+                    sentences.append(
+                        f"{nothing} in the recent part, {recent}, "
+                        f"compared with the baseline, {baseline}."
+                    )
+                else:
+                    sentences.append(
+                        f"Examined {', '.join(dimensions)}: compared the recent part, "
+                        f"{recent}, with the baseline, {baseline}."
+                    )
+            if status != "none" and threshold > 0:
+                sentences.append(
+                    f"Only sources that reached {shown_threshold} in the recent part "
+                    "are listed."
+                )
+            sentences.append("Spans are the buckets the platform returned.")
+            lines.append(" ".join(sentences))
+        lines.append("")
+        not_read: Dict[str, str] = detection.get("dimensions_not_read") or {}
+        if not_read and detection.get("dimensions_examined"):
+            unread = "; ".join(f"{name} ({reason})" for name, reason in not_read.items())
+            lines.append(f"Not read for new-entity detection, so not examined: {unread}")
+            lines.append("")
+        not_compared: Dict[str, str] = detection.get("dimensions_not_compared") or {}
+        if not_compared and status != "not_run":
+            skipped = "; ".join(
+                f"{name} ({reason})" for name, reason in not_compared.items()
+            )
+            lines.append(f"Read for new-entity detection but not compared: {skipped}")
+            lines.append("")
+        capped: Dict[str, str] = detection.get("dimensions_capped") or {}
+        if capped and status != "not_run":
+            limits = "; ".join(f"{name} ({note})" for name, note in capped.items())
+            lines.append(f"Capped for new-entity detection: {limits}")
+            lines.append("")
+        incomplete: Dict[str, str] = detection.get("dimensions_incomplete") or {}
+        if incomplete:
+            partly = "; ".join(f"{name}: {note}" for name, note in incomplete.items())
+            lines.append(f"Partly read for new-entity detection: {partly}")
+            lines.append("")
+
+    @staticmethod
+    def _new_entity_line(entity: Dict[str, Any], spans: Dict[str, Any]) -> str:
+        name = entity.get("entity_name", "-")
+        cost = entity.get("total_cost_impact", 0) or 0
+        active = entity.get("periods_active", 0)
+        if not spans.get("baseline"):
+            return f"- **{name}**: {render_dollars(cost)} impact, active in {active} bucket(s)"
+        baseline = spans["baseline"]
+        with_time = not spans.get("buckets_start_at_midnight", True)
+        start = format_bucket_start(baseline["start"], with_time)
+        end = format_bucket_start(baseline["end"], with_time)
+        baseline_range = start if baseline["buckets"] == 1 else f"{start} to {end}"
+        if entity.get("introduction_type") == "activation":
+            kind = "activated"
+            without_cost = entity.get("baseline_buckets_without_cost")
+            quiet = (
+                f"no cost in {without_cost} of {baseline['buckets']} baseline buckets "
+                f"from {baseline_range}"
+            )
+        else:
+            kind = "new"
+            quiet = f"no cost from {baseline_range}"
+        return (
+            f"- **{name}** ({kind}): {render_dollars(cost)} in the recent part, active in {active} of "
+            f"{spans['recent']['buckets']} recent buckets, first active "
+            f"{entity.get('first_active_date')}; {quiet}"
+        )
 
     async def _handle_analyze_cost_anomalies(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -6078,9 +7311,9 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Check supported periods: HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - Check supported sensitivity levels: conservative, normal, aggressive
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response)
 
-        except AuthenticationError:
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # The outer handle_action wraps Exception as ToolError; this clause keeps that intact.
             raise
@@ -6101,9 +7334,14 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - Use `get_capabilities()` to check current status
 - Use `get_examples()` to see working examples
 """
-            return [TextContent(type="text", text=error_response)]
+            raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
     # Metadata Provider Implementation
+    async def _calendar_range_actions(self) -> List[str]:
+        """The CALENDAR_RANGE_ACTIONS this deployment advertises."""
+        supported = await self._get_supported_actions()
+        return [action for action in CALENDAR_RANGE_ACTIONS if action in supported]
+
     async def _get_supported_actions(self) -> List[str]:
         actions = [
             "get_capabilities",
@@ -6241,7 +7479,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 },
                 "detect_new_entities": {
                     "type": "boolean",
-                    "description": "Report cost sources present in the recent window but absent from the baseline on analyze_cost_anomalies (default false)",
+                    "description": "Report cost sources new in the recent part (no cost in the baseline) or activated (no cost in at least half of the baseline buckets) on analyze_cost_anomalies (default false)",
                 },
                 "min_new_entity_threshold": {
                     "type": "number",
@@ -6258,7 +7496,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 # Billing listings: list_invoices / list_refunds / list_period_charges
                 "start_date": {
                     "type": "string",
-                    "description": "Start of the window. yyyy-MM-dd for get_pr_health and the PR-health reads (optional, with end_date, on get_pr_health_trend and get_pr_health_follow_through), an ISO-8601 instant for get_coverage_ratio (required when period is custom), pass-through for the billing listings",
+                    "description": f"Start of the window. yyyy-MM-dd for the analytics cost reads (optional, with end_date, in place of period; both days included, at most {CALENDAR_RANGE_MAX_DAYS} days), for get_pr_health and the PR-health reads (optional, with end_date, on get_pr_health_trend and get_pr_health_follow_through), yyyy-MM-dd (the whole UTC day, both days included) or an ISO-8601 instant with Z or an offset for get_coverage_ratio (optional, with end_date, in place of period), pass-through for the billing listings",
                 },
                 "end_date": {
                     "type": "string",
@@ -6283,12 +7521,12 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "description": "Lifecycle-state filter on list_invoices. Validated by the platform",
                 },
                 "starting_amount": {
-                    "type": "number",
-                    "description": "Lower bound on invoice total amount for list_invoices",
+                    "type": "integer",
+                    "description": "Lower bound on invoice total amount for list_invoices, a whole number of 0 or more",
                 },
                 "ending_amount": {
-                    "type": "number",
-                    "description": "Upper bound on invoice total amount for list_invoices",
+                    "type": "integer",
+                    "description": "Upper bound on invoice total amount for list_invoices, a whole number of 0 or more",
                 },
                 "minimum": {
                     "type": "number",
@@ -6358,7 +7596,12 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 },
                 "sort_by": {
                     "type": "string",
-                    "description": "get_pr_health_engineers: authorLogin, openPrs, agingPrs, rottingPrs, closedUnmerged or oldestInactiveDays. get_pr_health_pull_requests: inactivity or age. get_pr_health_breakdown: rottingPrs, closedUnmerged, openPrs, name or share. get_pr_health_queue: inactivity, age, repo, author or review",
+                    "description": (
+                        f"get_pr_health_engineers: {_values(self._PR_HEALTH_ENGINEER_SORT_FIELDS)}. "
+                        f"get_pr_health_pull_requests: {_values(self._PR_HEALTH_PULL_REQUEST_SORT_FIELDS)}. "
+                        "get_pr_health_breakdown: rottingPrs, closedUnmerged, openPrs, name or share. "
+                        "get_pr_health_queue: inactivity, age, repo, author or review"
+                    ),
                 },
                 "sort_dir": {
                     "type": "string",
@@ -6407,6 +7650,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "type": "integer",
                     "description": "Offset into the get_merged_prs pull-request list (default 0). Needs include_pull_requests=true",
                 },
+                "people_offset": {
+                    "type": "integer",
+                    "description": "Offset into the ranked people of get_merged_prs per-person grouping (default 0). Not with group_by",
+                },
                 # Coding-assistant team medians
                 "window": {
                     "type": "string",
@@ -6428,13 +7675,16 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 # Advertised at the top level, repeated here for completeness
                 "filters": {
                     "type": "object",
-                    "description": "Per-action filter object, most commonly {\"costSources\": [...]}. The per-user and per-department cost reports take arrays under agents, providers, models, users and costSources",
+                    "description": "Per-action filter object, most commonly {\"costSources\": [...]}. The per-user and per-department cost reports take arrays under agents, providers, models, users and costSources; get_agent_costs takes costSources. get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_cost_summary, the tool cost reports and every other cost action take no filters and refuse them",
                 },
                 "page": {"type": "integer", "description": "Zero-based page index (default 0)"},
-                "size": {"type": "integer", "description": "Page size (default 20)"},
+                "size": {"type": "integer", "description": f"Page size (default 20; {USER_COSTS_DEFAULT_PAGE_SIZE} on get_user_costs)"},
                 "dry_run": {
                     "type": "boolean",
-                    "description": "Validate the request and report what would run, without querying",
+                    "description": (
+                        "Not supported by this tool: a request with dry_run=true "
+                        "is refused and nothing runs"
+                    ),
                 },
                 "example_type": {
                     "type": "string",
@@ -6461,6 +7711,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 },
                 examples=[
                     "get_provider_costs(period='THIRTY_DAYS', group='TOTAL')",
+                    _CALENDAR_MONTH_CALL,
                     "get_model_costs(period='SEVEN_DAYS', group='TOTAL')",
                     "get_customer_costs(period='THIRTY_DAYS', group='TOTAL')",
                     "get_cost_summary(period='THIRTY_DAYS', group='TOTAL')",
@@ -6597,27 +7848,27 @@ If you're seeing this error, please report it as it indicates a reliability issu
                         "page": "int",
                         "size": "int",
                         "invoice_number": "str",
-                        "start_date": "str",
-                        "end_date": "str",
+                        "start_date": "str (yyyy-MM-dd day or ISO-8601 instant with Z or an offset)",
+                        "end_date": "str (yyyy-MM-dd day or ISO-8601 instant with Z or an offset)",
                         "pay_states": "list",
                         "states": "list",
-                        "starting_amount": "float",
-                        "ending_amount": "float",
+                        "starting_amount": "int (whole number, 0 or more)",
+                        "ending_amount": "int (whole number, 0 or more)",
                     },
                     "list_refunds": {
                         "page": "int",
                         "size": "int",
                         "query": "str",
-                        "start_date": "str",
-                        "end_date": "str",
+                        "start_date": "str (yyyy-MM-dd day or ISO-8601 instant with Z or an offset)",
+                        "end_date": "str (yyyy-MM-dd day or ISO-8601 instant with Z or an offset)",
                         "minimum": "float",
                         "maximum": "float",
                     },
                     "list_period_charges": {
                         "size": "int",
                         "invoice_id": "str",
-                        "start_date": "str",
-                        "end_date": "str",
+                        "start_date": "str (yyyy-MM-dd day or ISO-8601 instant with Z or an offset)",
+                        "end_date": "str (yyyy-MM-dd day or ISO-8601 instant with Z or an offset)",
                         "cursor": "str",
                     },
                 },
@@ -6698,7 +7949,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "All three parameters are required; the window must span fewer than 366 days and start_date must not be after end_date",
                     "The aging/rotting thresholds, cutoff date, excluded repositories, automation patterns and assisted-only default are team-addressed and changed with manage_customers update_pr_health_settings",
                     "The report itself is flat and lists at most 50 engineers; get_pr_health_engineers pages every engineer and get_pr_health_pull_requests every PR",
-                    "Every dollar figure is an estimate (count x avgCostPerMergedPr, an org average), not a billed amount",
+                    "Every dollar figure is an estimate (priced count x avgCostPerMergedPr, an org average), not a billed amount",
                 ],
             ),
             ToolCapability(
@@ -6714,7 +7965,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                         "end_date": "str (required, yyyy-MM-dd)",
                         "page": "int (optional, zero-based)",
                         "size": "int (optional)",
-                        "sort_by": "str (optional, authorLogin|openPrs|agingPrs|rottingPrs|closedUnmerged|oldestInactiveDays)",
+                        "sort_by": f"str (optional, {'|'.join(self._PR_HEALTH_ENGINEER_SORT_FIELDS)})",
                         "sort_dir": "str (optional, asc|desc)",
                         "query": "str (optional, login or mapped email contains it, at most 100 characters)",
                         **self._PR_HEALTH_NARROWING_CAPABILITY_PARAMS,
@@ -6741,7 +7992,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                         "triaged": "str (optional, EXCLUDE (default, dismissed and snoozed left out)|ONLY)",
                         "page": "int (optional, zero-based)",
                         "size": "int (optional)",
-                        "sort_by": "str (optional, inactivity|age)",
+                        "sort_by": f"str (optional, {'|'.join(self._PR_HEALTH_PULL_REQUEST_SORT_FIELDS)})",
                         "sort_dir": "str (optional, asc|desc)",
                         **self._PR_HEALTH_NARROWING_CAPABILITY_PARAMS,
                     },
@@ -6843,6 +8094,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                         "include_pull_requests": "bool (optional, needs group_by=repository)",
                         "pr_limit": "int (optional, 1-200, needs include_pull_requests)",
                         "pr_offset": "int (optional, needs include_pull_requests)",
+                        "people_offset": "int (optional, per-person grouping only)",
                     },
                 },
                 examples=[
@@ -6864,8 +8116,12 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "amount, and a null coverage ratio is not zero coverage — state carries "
                     "NO_INTEGRATION / ZERO_SPEND_PERIOD / DATA_UNAVAILABLE separately. Trend is "
                     "a signed percentage-point delta against the previous window, and each "
-                    "per-provider row reports that provider's share of total billed spend "
-                    "alongside its metered and billed amounts. Where the platform sends "
+                    "per-provider row reports its metered-to-billed coverage: that provider's "
+                    "Revenium-metered spend divided by its own billed spend, alongside its "
+                    "metered and billed amounts. The aggregate ratio counts only providers "
+                    "with a billing credential. Metered figures are telemetry valued at API "
+                    "rates and billed figures are what the provider reported; neither is an "
+                    "invoice allocation or an additional charge. Where the platform sends "
                     "them, the report states two metered totals: the spend inside the "
                     "comparison, which the ratio and hidden spend were computed from, and "
                     "the spend outside it, metered for a provider with no billing "
@@ -6875,18 +8131,25 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 parameters={
                     "get_coverage_ratio": {
                         "provider": "str (optional, single provider filter)",
+                        "period": "str (optional, 24h|7d|30d|90d|custom, default 30d; omit it with start_date/end_date)",
+                        "start_date": "str (optional, with end_date, in place of period; yyyy-MM-dd or ISO-8601 instant)",
+                        "end_date": "str (optional, with start_date, in place of period; yyyy-MM-dd or ISO-8601 instant, day included)",
                     },
                 },
                 examples=[
                     "get_coverage_ratio()",
                     "get_coverage_ratio(provider='ANTHROPIC')",
+                    "get_coverage_ratio(start_date='2026-09-01', end_date='2026-09-30')",
                 ],
                 limitations=[
-                    "period picks the comparison window (24h/7d/30d/90d/custom, default 30d); custom needs start_date/end_date",
+                    "period picks a rolling window (24h/7d/30d/90d, default 30d); start_date/end_date pick a calendar range instead; both together are refused unless period is custom",
+                    "A date is a yyyy-MM-dd UTC day (both ends included) or an ISO-8601 instant with Z or an offset",
                     "The team is the one your credentials resolve to; you do not pass one",
                     "A null aggregateRatio is not zero coverage — read state before concluding anything",
+                    "With provider set only a credential of exactly that provider is matched: a Claude Enterprise connection answers NO_INTEGRATION for provider=ANTHROPIC, and the call without provider shows its row",
                     "trend is a percentage-point delta, not a percentage: 0.0 pp means unchanged, null means no prior period",
-                    "A per-provider ratio is a share of total billed spend, not that provider's coverage",
+                    "A per-provider ratio is that provider's Revenium-metered spend divided by its own billed spend (metered-to-billed coverage)",
+                    "The aggregate ratio counts only providers with a billing credential",
                     "meteredTotalOutsideComparison is metered spend with no billing credential to compare against, not hidden spend",
                     "A billingCredentialConnected: false row is metered-only and is excluded from the aggregate ratio and hiddenSpend",
                     "The two metered totals, the credential flag and meteredBasis are omitted by older platform builds; absent is not zero",
@@ -6903,7 +8166,11 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "get_capabilities": {},
                     "get_examples": {"example_type": "str"},
                     "get_agent_summary": {},
-                    "get_filter_options": {"dimension": "str", "period": "str"},
+                    "get_filter_options": {
+                        "dimension": "str",
+                        "period": "str",
+                        "filters": "dict (optional, users only: costSources)",
+                    },
                 },
                 examples=[
                     "get_capabilities()",

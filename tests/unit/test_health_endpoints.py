@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -21,10 +23,41 @@ def reset_health_cache():
     from src.revenium_mcp_server import health_endpoints
 
     health_endpoints._last_probe = None
+    health_endpoints._last_platform_probe = None
     health_endpoints._probe_lock = asyncio.Lock()
+    health_endpoints._refresh_task = None
     yield
+    _cancel_pending_refresh(health_endpoints)
     health_endpoints._last_probe = None
+    health_endpoints._last_platform_probe = None
     health_endpoints._probe_lock = asyncio.Lock()
+    health_endpoints._refresh_task = None
+
+
+def _cancel_pending_refresh(health_endpoints) -> None:
+    task = getattr(health_endpoints, "_refresh_task", None)
+    if task is None or task.done():
+        return
+    try:
+        task.cancel()
+    except RuntimeError:
+        # The test's event loop is already closed; the task died with it.
+        pass
+
+
+async def _drain_refresh() -> None:
+    """Cancel and await any background refresh a /health call started."""
+    from src.revenium_mcp_server import health_endpoints
+
+    task = getattr(health_endpoints, "_refresh_task", None)
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 def _build_mcp():
@@ -47,9 +80,17 @@ async def test_health_returns_200_with_status_healthy():
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
         resp = await client.get("/health")
+    await _drain_refresh()
 
     assert resp.status_code == 200
-    assert resp.json() == {"status": "healthy"}
+    body = resp.json()
+    assert body["status"] == "healthy"
+    assert set(body["platform"]) == {
+        "status_code",
+        "checked_at",
+        "age_seconds",
+        "error",
+    }
 
 
 # ── _probe_revenium ──────────────────────────────────────────────
@@ -329,9 +370,12 @@ async def test_create_enhanced_server_registers_health_endpoints(monkeypatch):
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
         resp = await client.get("/health")
+    await _drain_refresh()
 
     assert resp.status_code == 200
-    assert resp.json() == {"status": "healthy"}
+    body = resp.json()
+    assert body["status"] == "healthy"
+    assert "platform" in body
 
 
 # ── api_key mode: reachability probe, no validate_api_key ────────
@@ -402,3 +446,305 @@ async def test_clerk_mode_probe_does_not_call_validate_api_key(monkeypatch):
     result = await health_endpoints._probe_revenium()
     assert called["validate"] is False
     assert result.ok in (True, False)  # a reachability result, not an auth result
+
+
+# ── /health platform state ───────────────────────────────────────
+
+_HOSTED_MODES = ["api_key", "clerk"]
+_PLATFORM_NOT_CHECKED = {
+    "status_code": None,
+    "checked_at": None,
+    "age_seconds": None,
+    "error": None,
+}
+
+
+def _install_platform_stub(monkeypatch, head):
+    """Replace the shared httpx client the probe uses with a stub ``head``."""
+    stub = SimpleNamespace(head=head)
+    monkeypatch.setattr(
+        "src.revenium_mcp_server.client.get_shared_http_client",
+        lambda *a, **k: stub,
+    )
+    return stub
+
+
+def _install_platform_transport(monkeypatch, handler):
+    """Route the real client code through an ``httpx.MockTransport``."""
+    transport_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(
+        "src.revenium_mcp_server.client.get_shared_http_client",
+        lambda *a, **k: transport_client,
+    )
+    return transport_client
+
+
+def _hosted_mode(monkeypatch, auth_mode, base_url="https://platform.test"):
+    monkeypatch.setenv("AUTH_MODE", auth_mode)
+    monkeypatch.setenv("REVENIUM_BASE_URL", base_url)
+
+
+def _asgi_client(mcp):
+    return httpx.AsyncClient(
+        transport=ASGITransport(app=mcp.http_app()), base_url="http://test"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auth_mode", _HOSTED_MODES)
+@pytest.mark.parametrize("code", [502, 503])
+async def test_health_reports_platform_status_seen_by_last_readiness_probe(
+    monkeypatch, auth_mode, code
+):
+    _hosted_mode(monkeypatch, auth_mode)
+    _install_platform_stub(
+        monkeypatch, AsyncMock(return_value=httpx.Response(code))
+    )
+
+    async with _asgi_client(_build_mcp()) as client:
+        ready = await client.get("/ready")
+        health = await client.get("/health")
+
+    assert ready.status_code == 200
+    assert ready.json() == {"status": "ready"}
+    assert health.status_code == 200
+    body = health.json()
+    assert body["status"] == "healthy"
+    platform = body["platform"]
+    assert platform["status_code"] == code
+    checked_at = datetime.fromisoformat(platform["checked_at"])
+    assert checked_at.tzinfo is not None
+    assert 0 <= platform["age_seconds"] < 5
+    assert platform["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_health_before_any_readiness_probe_reports_platform_not_checked(
+    monkeypatch,
+):
+    from src.revenium_mcp_server import health_endpoints
+
+    _hosted_mode(monkeypatch, "api_key")
+    never = asyncio.Event()
+
+    async def head_that_never_answers(*args, **kwargs):
+        await never.wait()
+
+    _install_platform_stub(monkeypatch, head_that_never_answers)
+
+    async with _asgi_client(_build_mcp()) as client:
+        resp = await asyncio.wait_for(client.get("/health"), 1.0)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "healthy", "platform": _PLATFORM_NOT_CHECKED}
+    assert health_endpoints._refresh_task is not None
+    await _drain_refresh()
+
+
+@pytest.mark.asyncio
+async def test_health_reports_unanswered_platform_without_a_status_code(
+    monkeypatch,
+):
+    _hosted_mode(monkeypatch, "api_key")
+    _install_platform_stub(
+        monkeypatch, AsyncMock(side_effect=httpx.ConnectError("refused"))
+    )
+
+    async with _asgi_client(_build_mcp()) as client:
+        ready = await client.get("/ready")
+        health = await client.get("/health")
+
+    assert ready.status_code == 503
+    assert ready.json() == {
+        "status": "not_ready",
+        "reason": "revenium_api_unreachable",
+    }
+    assert health.status_code == 200
+    platform = health.json()["platform"]
+    assert platform["status_code"] is None
+    assert platform["error"] == "revenium_api_unreachable"
+    assert platform["checked_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_env_mode_ready_still_validates_the_key_on_a_platform_503(
+    monkeypatch,
+):
+    from src.revenium_mcp_server import health_endpoints
+
+    monkeypatch.delenv("AUTH_MODE", raising=False)
+    monkeypatch.setenv("REVENIUM_BASE_URL", "https://platform.test")
+    monkeypatch.setattr(health_endpoints, "PROBE_TIMEOUT_SECONDS", 0.2)
+    _install_platform_transport(monkeypatch, lambda request: httpx.Response(503))
+
+    async with _asgi_client(_build_mcp()) as client:
+        ready = await client.get("/ready")
+
+    assert ready.status_code == 503
+    assert ready.json()["status"] == "not_ready"
+    assert ready.json()["reason"] in ("timeout", "revenium_api_unreachable")
+    assert health_endpoints._last_platform_probe is None
+
+
+@pytest.mark.asyncio
+async def test_health_in_env_mode_refreshes_with_a_keyless_head_and_never_sends_the_key(
+    monkeypatch,
+):
+    from src.revenium_mcp_server import health_endpoints
+
+    monkeypatch.delenv("AUTH_MODE", raising=False)
+    monkeypatch.setenv("REVENIUM_BASE_URL", "https://platform.test")
+    monkeypatch.setenv("REVENIUM_API_KEY", "hak_must_not_leave")
+    seen = []
+
+    def platform(request):
+        seen.append(request)
+        return httpx.Response(503)
+
+    _install_platform_transport(monkeypatch, platform)
+    validate = AsyncMock(return_value={"valid": True, "status_code": 200})
+    monkeypatch.setattr(
+        "src.revenium_mcp_server.client.ReveniumClient.validate_api_key", validate
+    )
+
+    async with _asgi_client(_build_mcp()) as client:
+        cold = await client.get("/health")
+        await health_endpoints._refresh_task
+        warm = await client.get("/health")
+
+    assert cold.status_code == 200
+    assert warm.status_code == 200
+    platform_state = warm.json()["platform"]
+    assert platform_state["status_code"] == 503
+    assert platform_state["error"] is None
+    validate.assert_not_called()
+    assert [r.method for r in seen] == ["HEAD"]
+    assert "x-api-key" not in seen[0].headers
+    assert "authorization" not in seen[0].headers
+    assert "hak_must_not_leave" not in str(seen[0].headers)
+    assert health_endpoints._last_probe is None
+
+
+@pytest.mark.asyncio
+async def test_health_in_env_mode_without_a_base_url_makes_no_request(
+    monkeypatch,
+):
+    from src.revenium_mcp_server import health_endpoints
+
+    monkeypatch.delenv("AUTH_MODE", raising=False)
+    monkeypatch.delenv("REVENIUM_BASE_URL", raising=False)
+    shared_client = MagicMock()
+    monkeypatch.setattr(
+        "src.revenium_mcp_server.client.get_shared_http_client", shared_client
+    )
+
+    async with _asgi_client(_build_mcp()) as client:
+        await client.get("/health")
+        await health_endpoints._refresh_task
+        health = await client.get("/health")
+
+    shared_client.assert_not_called()
+    assert health.status_code == 200
+    platform = health.json()["platform"]
+    assert platform["status_code"] is None
+    assert platform["error"] == "revenium_api_unreachable"
+
+
+@pytest.mark.asyncio
+async def test_health_refreshes_a_stale_platform_state_in_the_background(
+    monkeypatch,
+):
+    from src.revenium_mcp_server import health_endpoints
+
+    _hosted_mode(monkeypatch, "api_key")
+    stub = _install_platform_stub(
+        monkeypatch, AsyncMock(return_value=httpx.Response(503))
+    )
+
+    async with _asgi_client(_build_mcp()) as client:
+        cold = await client.get("/health")
+        assert cold.json()["platform"] == _PLATFORM_NOT_CHECKED
+        await health_endpoints._refresh_task
+        warm = await client.get("/health")
+        await client.get("/health")
+        await client.get("/health")
+
+    assert warm.status_code == 200
+    assert warm.json()["platform"]["status_code"] == 503
+    assert stub.head.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_health_serves_an_expired_state_then_shows_the_refreshed_one(
+    monkeypatch,
+):
+    from src.revenium_mcp_server import health_endpoints
+
+    fake_now = [1000.0]
+    monkeypatch.setattr(health_endpoints.time, "monotonic", lambda: fake_now[0])
+    _hosted_mode(monkeypatch, "api_key")
+    stub = _install_platform_stub(
+        monkeypatch, AsyncMock(return_value=httpx.Response(200))
+    )
+
+    async with _asgi_client(_build_mcp()) as client:
+        await client.get("/health")
+        await health_endpoints._refresh_task
+        fake_now[0] += health_endpoints.PROBE_TTL_SECONDS + 1.0
+        stub.head.return_value = httpx.Response(503)
+        expired = await client.get("/health")
+        await health_endpoints._refresh_task
+        refreshed = await client.get("/health")
+
+    assert expired.status_code == 200
+    assert expired.json()["platform"]["status_code"] == 200
+    assert refreshed.json()["platform"]["status_code"] == 503
+    assert stub.head.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auth_mode", _HOSTED_MODES)
+@pytest.mark.parametrize("code", [301, 401, 404, 500, 502, 503])
+async def test_ready_stays_ready_on_any_platform_answer_in_hosted_modes(
+    monkeypatch, auth_mode, code
+):
+    _hosted_mode(monkeypatch, auth_mode)
+    _install_platform_stub(
+        monkeypatch, AsyncMock(return_value=httpx.Response(code))
+    )
+
+    async with _asgi_client(_build_mcp()) as client:
+        resp = await client.get("/ready")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ready"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auth_mode", ["api_key", "env"])
+async def test_health_body_exposes_no_platform_host(monkeypatch, auth_mode):
+    from src.revenium_mcp_server import health_endpoints
+
+    secret_host = "https://platform-secret.test"
+    monkeypatch.setenv("REVENIUM_BASE_URL", secret_host)
+    monkeypatch.setattr(health_endpoints, "PROBE_TIMEOUT_SECONDS", 0.2)
+
+    def refuse(request):
+        raise httpx.ConnectError(f"Cannot connect to {secret_host}")
+
+    if auth_mode == "env":
+        monkeypatch.delenv("AUTH_MODE", raising=False)
+        _install_platform_transport(monkeypatch, refuse)
+    else:
+        monkeypatch.setenv("AUTH_MODE", auth_mode)
+        _install_platform_stub(
+            monkeypatch, AsyncMock(side_effect=httpx.ConnectError(secret_host))
+        )
+
+    async with _asgi_client(_build_mcp()) as client:
+        await client.get("/ready")
+        resp = await client.get("/health")
+
+    assert resp.status_code == 200
+    assert "platform-secret" not in resp.text
+    assert "base_url" not in resp.text
