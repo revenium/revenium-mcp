@@ -6,6 +6,7 @@ across all alert and anomaly management operations.
 
 import functools
 import traceback
+from builtins import PermissionError as BuiltinPermissionError
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from loguru import logger
@@ -41,7 +42,7 @@ def handle_alert_tool_errors(
             *args: Any, **kwargs: Any
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
             from .client import ReveniumAPIError
-            from .common.error_handling import ToolError
+            from .common.error_handling import ErrorCodes, ToolError, raise_refusal
 
             try:
                 return await func(*args, **kwargs)
@@ -49,107 +50,92 @@ def handle_alert_tool_errors(
             except AlertToolsError as e:
                 # Handle our custom exceptions with rich formatting
                 logger.error(f"Alert tools error in {operation_name}: {e.to_dict()}")
-                return [TextContent(type="text", text=e.format_user_message())]
+                raise_refusal(e.format_user_message(), error_code=e.error_code)
 
-            except (ToolError, ReveniumAPIError):
+            except (ToolError, ReveniumAPIError, BuiltinPermissionError):
                 raise
 
             except ValidationError as e:
                 # Handle ValidationError using its built-in formatting to avoid duplication
                 logger.error(f"Validation error in {operation_name}: {e}")
-                return [
-                    TextContent(
-                        type="text",
-                        text=e.format_user_message(),
-                    )
-                ]
+                raise_refusal(e.format_user_message(), error_code=e.error_code)
 
             except PermissionError as e:
                 # Handle permission errors
                 logger.error(f"Permission error in {operation_name}: {e}")
-                return [
-                    TextContent(
-                        type="text",
-                        text=(
-                            "🔒 **Permission Denied**\n\n"
-                            "You don't have permission to perform this operation.\n\n"
-                            "**Suggestions:**\n"
-                            "• Check your API key and team permissions\n"
-                            "• Verify you're using the correct team ID\n"
-                            "• Contact your administrator for access"
-                        ),
-                    )
-                ]
+                raise_refusal(
+                    (
+                        "🔒 **Permission Denied**\n\n"
+                        "You don't have permission to perform this operation.\n\n"
+                        "**Suggestions:**\n"
+                        "• Check your API key and team permissions\n"
+                        "• Verify you're using the correct team ID\n"
+                        "• Contact your administrator for access"
+                    ),
+                    error_code=ErrorCodes.API_AUTHORIZATION,
+                )
 
             except ConnectionError as e:
                 # Handle network connection errors
                 logger.error(f"Connection error in {operation_name}: {e}")
-                return [
-                    TextContent(
-                        type="text",
-                        text=(
-                            "🌐 **Connection Error**\n\n"
-                            "Unable to connect to the API service.\n\n"
-                            "**Suggestions:**\n"
-                            "• Check your internet connection\n"
-                            "• Verify the API endpoint is accessible\n"
-                            "• Try again in a few moments\n"
-                            "• Check if there are any service outages"
-                        ),
-                    )
-                ]
+                raise_refusal(
+                    (
+                        "🌐 **Connection Error**\n\n"
+                        "Unable to connect to the API service.\n\n"
+                        "**Suggestions:**\n"
+                        "• Check your internet connection\n"
+                        "• Verify the API endpoint is accessible\n"
+                        "• Try again in a few moments\n"
+                        "• Check if there are any service outages"
+                    ),
+                    error_code=ErrorCodes.API_ERROR,
+                )
 
             except TimeoutError as e:
                 # Handle timeout errors
                 logger.error(f"Timeout error in {operation_name}: {e}")
-                return [
-                    TextContent(
-                        type="text",
-                        text=(
-                            "⏱️ **Operation Timeout**\n\n"
-                            "The operation took too long to complete.\n\n"
-                            "**Suggestions:**\n"
-                            "• Try the operation again\n"
-                            "• Check your network connection\n"
-                            "• Consider breaking large operations into smaller chunks\n"
-                            "• Contact support if the issue persists"
-                        ),
-                    )
-                ]
+                raise_refusal(
+                    (
+                        "⏱️ **Operation Timeout**\n\n"
+                        "The operation took too long to complete.\n\n"
+                        "**Suggestions:**\n"
+                        "• Try the operation again\n"
+                        "• Check your network connection\n"
+                        "• Consider breaking large operations into smaller chunks\n"
+                        "• Contact support if the issue persists"
+                    ),
+                    error_code=ErrorCodes.API_TIMEOUT,
+                )
 
             except ValueError as e:
                 # Handle value errors (invalid parameters, etc.)
                 logger.error(f"Value error in {operation_name}: {e}")
-                return [
-                    TextContent(
-                        type="text",
-                        text=(
-                            f"❌ **Invalid Value**\n\n"
-                            f"{str(e)}\n\n"
-                            f"**Suggestions:**\n"
-                            f"• Check the parameter values and types\n"
-                            f"• Ensure all values are within valid ranges\n"
-                            f"• Refer to the API documentation for valid formats"
-                        ),
-                    )
-                ]
+                raise_refusal(
+                    (
+                        f"❌ **Invalid Value**\n\n"
+                        f"{str(e)}\n\n"
+                        f"**Suggestions:**\n"
+                        f"• Check the parameter values and types\n"
+                        f"• Ensure all values are within valid ranges\n"
+                        f"• Refer to the API documentation for valid formats"
+                    ),
+                    error_code=ErrorCodes.VALIDATION_ERROR,
+                )
 
             except KeyError as e:
                 # Handle missing required keys
                 logger.error(f"Key error in {operation_name}: {e}")
-                return [
-                    TextContent(
-                        type="text",
-                        text=(
-                            f"❌ **Missing Required Field**\n\n"
-                            f"Required field {str(e)} is missing.\n\n"
-                            f"**Suggestions:**\n"
-                            f"• Check that all required parameters are provided\n"
-                            f"• Verify the parameter names are correct\n"
-                            f"• Refer to the API documentation for required fields"
-                        ),
-                    )
-                ]
+                raise_refusal(
+                    (
+                        f"❌ **Missing Required Field**\n\n"
+                        f"Required field {str(e)} is missing.\n\n"
+                        f"**Suggestions:**\n"
+                        f"• Check that all required parameters are provided\n"
+                        f"• Verify the parameter names are correct\n"
+                        f"• Refer to the API documentation for required fields"
+                    ),
+                    error_code=ErrorCodes.MISSING_PARAMETER,
+                )
 
             except Exception as e:
                 # Handle unexpected errors with full traceback logging
@@ -159,22 +145,20 @@ def handle_alert_tool_errors(
                     f"Traceback: {traceback.format_exc()}"
                 )
 
-                return [
-                    TextContent(
-                        type="text",
-                        text=(
-                            f"**Unexpected Error**\n\n"
-                            f"An unexpected error occurred during the operation.\n\n"
-                            f"**Error ID:** `{error_id}`\n"
-                            f"**Error:** {str(e)}\n\n"
-                            f"**Suggestions:**\n"
-                            f"• Try the operation again\n"
-                            f"• Check your input parameters\n"
-                            f"• Contact support with the Error ID if the issue persists\n"
-                            f"• Check the system logs for more details"
-                        ),
-                    )
-                ]
+                raise_refusal(
+                    (
+                        f"**Unexpected Error**\n\n"
+                        f"An unexpected error occurred during the operation.\n\n"
+                        f"**Error ID:** `{error_id}`\n"
+                        f"**Error:** {str(e)}\n\n"
+                        f"**Suggestions:**\n"
+                        f"• Try the operation again\n"
+                        f"• Check your input parameters\n"
+                        f"• Contact support with the Error ID if the issue persists\n"
+                        f"• Check the system logs for more details"
+                    ),
+                    error_code=ErrorCodes.API_ERROR,
+                )
 
         return wrapper
 
@@ -469,7 +453,7 @@ class UserFriendlyErrorTranslator:
         "periodDuration.*required": {
             "message": "Evaluation period is required",
             "help": "Specify how often to check for alert conditions",
-            "example": "periodDuration: 'FIVE_MINUTES'",
+            "example": "periodDuration: 'FIFTEEN_MINUTES'",
         },
         # Value validation errors
         "threshold.*negative": {
@@ -570,7 +554,7 @@ class UserFriendlyErrorTranslator:
         "periodDuration": {
             "description": "How often to evaluate the alert condition",
             "requirements": "Must be a valid time period",
-            "examples": ["FIVE_MINUTES", "FIFTEEN_MINUTES", "ONE_HOUR", "DAILY"],
+            "examples": ["FIFTEEN_MINUTES", "ONE_HOUR", "DAILY"],
         },
     }
 

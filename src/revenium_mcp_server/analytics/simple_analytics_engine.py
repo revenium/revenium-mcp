@@ -11,13 +11,48 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Union, cast
 
 from ..auth import AuthenticationError
-from ..endpoint_registry import NewApiRequiredError
+from ..common.error_handling import ErrorCodes, ToolError, raise_refusal
+from ..endpoint_registry import CalendarRangeNeedsNewApiError, NewApiRequiredError
 from .formatters.base_formatter import BaseFormattingUtilities
 from .response_formatter import ResponseFormatter
-from .simple_cost_analyzer import SimpleCostAnalyzer
+from .envelope_reads import with_unread_pages_notice
+from .report_reads import fails_whole_call, is_server_configuration_error, read_failure_reason
+from .simple_cost_analyzer import (
+    COST_SUMMARY_PARTS,
+    CostSummaryUnreadError,
+    RankedCosts,
+    SimpleCostAnalyzer,
+    TeamIdUnavailableError,
+    ToolRows,
+    UserCostsPage,
+    agent_costs_endpoint_key,
+)
 from .validation import AnalyticsValidator, ValidationError
 
 logger = logging.getLogger(__name__)
+
+COST_SUMMARY_RETRY_ADVICE = [
+    "The platform did not answer the cost reports in time, or refused them",
+    "Try a shorter period",
+    "Read the parts one at a time with "
+    + ", ".join(part.action for part in COST_SUMMARY_PARTS),
+]
+_COST_SUMMARY_CREDENTIAL_ADVICE = [
+    "The platform refused the credential, so no cost report was read",
+    "Check that the API key or signed-in session is current and can read this team",
+]
+_COST_SUMMARY_CONFIGURATION_ADVICE = [
+    "The server's configuration stopped the read before any cost report was sent",
+    "Ask the server's administrator to correct the setting the error names",
+]
+
+
+def _cost_summary_advice(error: Exception) -> List[str]:
+    if isinstance(error, TeamIdUnavailableError) or is_server_configuration_error(error):
+        return _COST_SUMMARY_CONFIGURATION_ADVICE
+    if fails_whole_call(error):
+        return _COST_SUMMARY_CREDENTIAL_ADVICE
+    return COST_SUMMARY_RETRY_ADVICE
 
 
 @dataclass
@@ -75,12 +110,16 @@ class AnalyticsProcessor(ABC):
 
         Returns:
             Formatted analytics response
+
+        Raises:
+            ToolError: When the request is refused or the analysis fails, carrying
+                the formatted refusal text so the MCP envelope sets isError=true
         """
         try:
             return await self._execute_analytics_workflow(params)
         except ValidationError as e:
-            return self._handle_validation_error_with_logging(e, params.operation_type)
-        except AuthenticationError:
+            raise_refusal(self._handle_validation_error_with_logging(e, params.operation_type))
+        except (AuthenticationError, PermissionError, ToolError):
             # Auth-config errors must escape so the MCP envelope sets isError=true.
             # Each tool handler that catches Exception below must also re-raise this.
             raise
@@ -88,8 +127,18 @@ class AnalyticsProcessor(ABC):
             # A deployment-configuration refusal, not an analysis failure: the tool
             # handler words it so a caller does not read it as a tenant limitation.
             raise
+        except CalendarRangeNeedsNewApiError as e:
+            raise_refusal(
+                self.formatter.format_error_response(
+                    str(e),
+                    ["Pass period (for example THIRTY_DAYS) in place of start_date/end_date"],
+                )
+            )
         except Exception as e:
-            return self._handle_general_error_with_logging(e, params.operation_type)
+            raise_refusal(
+                self._handle_general_error_with_logging(e, params.operation_type),
+                error_code=ErrorCodes.API_ERROR,
+            )
 
     async def _execute_analytics_workflow(self, params: AnalyticsParams) -> str:
         """Execute the core analytics workflow."""
@@ -120,16 +169,12 @@ class AnalyticsProcessor(ABC):
         pass
 
     @abstractmethod
-    async def fetch_data(
-        self, params: Dict[str, Any]
-    ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
+    async def fetch_data(self, params: Dict[str, Any]) -> Any:
         """Fetch data from analyzer."""
         pass
 
     @abstractmethod
-    def format_response(
-        self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]
-    ) -> str:
+    def format_response(self, data: Any, params: Dict[str, Any]) -> str:
         """Format response using formatter."""
         pass
 
@@ -143,23 +188,38 @@ class AnalyticsProcessor(ABC):
         pass
 
 
-class ProviderCostsProcessor(AnalyticsProcessor):
+class RankedCostsProcessor(AnalyticsProcessor):
+    """A ranked cost report: its rendering ends with a notice when the read left pages unread."""
+
+    @abstractmethod
+    async def fetch_data(self, params: Dict[str, Any]) -> RankedCosts:
+        """Fetch the ranked rows and the pages the read left unread."""
+
+    def format_response(self, data: RankedCosts, params: Dict[str, Any]) -> str:
+        return with_unread_pages_notice(self.format_ranked_rows(data, params), data.unread)
+
+    @abstractmethod
+    def format_ranked_rows(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+        """Render the ranked rows."""
+
+
+class ProviderCostsProcessor(RankedCostsProcessor):
     """Processor for provider costs analytics."""
 
     def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Validate provider costs parameters."""
         return self.validator.validate_provider_costs_params(kwargs)
 
-    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def fetch_data(self, params: Dict[str, Any]) -> RankedCosts:
         """Fetch provider costs data."""
         return await self.analyzer.get_provider_costs(
             period=params["period"], aggregation=params["aggregation"]
         )
 
-    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_ranked_rows(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format provider costs response."""
         return self.formatter.format_provider_costs_response(
-            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
+            data=data, period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -175,23 +235,23 @@ class ProviderCostsProcessor(AnalyticsProcessor):
         )
 
 
-class ModelCostsProcessor(AnalyticsProcessor):
+class ModelCostsProcessor(RankedCostsProcessor):
     """Processor for model costs analytics."""
 
     def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Validate model costs parameters."""
         return self.validator.validate_model_costs_params(kwargs)
 
-    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def fetch_data(self, params: Dict[str, Any]) -> RankedCosts:
         """Fetch model costs data."""
         return await self.analyzer.get_model_costs(
             period=params["period"], aggregation=params["aggregation"]
         )
 
-    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_ranked_rows(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format model costs response."""
         return self.formatter.format_model_costs_response(
-            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
+            data=data, period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -207,23 +267,23 @@ class ModelCostsProcessor(AnalyticsProcessor):
         )
 
 
-class CustomerCostsProcessor(AnalyticsProcessor):
+class CustomerCostsProcessor(RankedCostsProcessor):
     """Processor for customer costs analytics."""
 
     def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Validate customer costs parameters."""
         return self.validator.validate_customer_costs_params(kwargs)
 
-    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def fetch_data(self, params: Dict[str, Any]) -> RankedCosts:
         """Fetch customer costs data."""
         return await self.analyzer.get_customer_costs(
             period=params["period"], aggregation=params["aggregation"]
         )
 
-    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_ranked_rows(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format customer costs response."""
         return self.formatter.format_customer_costs_response(
-            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
+            data=data, period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -264,23 +324,23 @@ class CostSpikeProcessor(AnalyticsProcessor):
         raise
 
 
-class ApiKeyCostsProcessor(AnalyticsProcessor):
+class ApiKeyCostsProcessor(RankedCostsProcessor):
     """Processor for API key costs analytics."""
 
     def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Validate API key costs parameters."""
         return self.validator.validate_api_key_costs_params(kwargs)
 
-    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def fetch_data(self, params: Dict[str, Any]) -> RankedCosts:
         """Fetch API key costs data."""
         return await self.analyzer.get_api_key_costs(
             period=params["period"], aggregation=params["aggregation"]
         )
 
-    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_ranked_rows(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format API key costs response."""
         return self.formatter.format_api_key_costs_response(
-            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
+            data=data, period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -296,14 +356,14 @@ class ApiKeyCostsProcessor(AnalyticsProcessor):
         )
 
 
-class AgentCostsProcessor(AnalyticsProcessor):
+class AgentCostsProcessor(RankedCostsProcessor):
     """Processor for agent costs analytics."""
 
     def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Validate agent costs parameters."""
         return self.validator.validate_agent_costs_params(kwargs)
 
-    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def fetch_data(self, params: Dict[str, Any]) -> RankedCosts:
         """Fetch agent costs data."""
         return await self.analyzer.get_agent_costs(
             period=params["period"],
@@ -311,10 +371,13 @@ class AgentCostsProcessor(AnalyticsProcessor):
             filters=params.get("filters"),
         )
 
-    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_ranked_rows(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format agent costs response."""
         return self.formatter.format_agent_costs_response(
-            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
+            data=data,
+            period=params["period"],
+            aggregation=params["aggregation"],
+            endpoint_key=agent_costs_endpoint_key(params.get("filters")),
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -337,18 +400,24 @@ class UserCostsProcessor(AnalyticsProcessor):
         """Validate user costs parameters."""
         return self.validator.validate_user_costs_params(kwargs)
 
-    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Fetch user costs data."""
+    async def fetch_data(self, params: Dict[str, Any]) -> UserCostsPage:
+        """Fetch one page of user costs."""
         return await self.analyzer.get_user_costs(
             period=params["period"],
             aggregation=params["aggregation"],
             filters=params.get("filters"),
+            page=params["page"],
+            size=params["size"],
         )
 
-    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
-        """Format user costs response."""
+    def format_response(self, data: Any, params: Dict[str, Any]) -> str:
+        """Format one page of user costs."""
+        page = cast(UserCostsPage, data)
         return self.formatter.format_user_costs_response(
-            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
+            data=page.users,
+            period=params["period"],
+            aggregation=params["aggregation"],
+            paging=page.paging,
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -371,10 +440,21 @@ class CostSummaryProcessor(AnalyticsProcessor):
         return self.validator.validate_cost_summary_params(kwargs)
 
     async def fetch_data(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Fetch cost summary data."""
-        return await self.analyzer.get_cost_summary(
-            period=params["period"], aggregation=params["aggregation"]
-        )
+        """Fetch cost summary data.
+
+        A team-scope refusal or a server-configuration error stops every part
+        of the summary, so it is raised with the summary's advice added rather
+        than passed through bare.
+        """
+        try:
+            return await self.analyzer.get_cost_summary(
+                period=params["period"], aggregation=params["aggregation"]
+            )
+        except ToolError as error:
+            raise_refusal(
+                self._handle_general_error_with_logging(error, "cost summary"),
+                error_code=error.error_code or ErrorCodes.API_ERROR,
+            )
 
     def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
         """Format cost summary response."""
@@ -383,32 +463,47 @@ class CostSummaryProcessor(AnalyticsProcessor):
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
-        """Handle cost summary errors."""
+        """Handle cost summary errors.
+
+        The period and aggregation were validated before any read, so the
+        failure is the server's configuration or the platform's answer, never
+        the caller's period.
+        """
+        if isinstance(error, CostSummaryUnreadError):
+            return self.formatter.format_error_response(str(error), COST_SUMMARY_RETRY_ADVICE)
         return self.formatter.format_error_response(
-            f"Cost summary analysis failed: {str(error)}",
-            [
-                "Check that the time period is valid (HOUR, SEVEN_DAYS, THIRTY_DAYS, etc.)",
-                "Verify that aggregation is valid (TOTAL, MEAN, MAXIMUM, MINIMUM)",
-                "Ensure there is data available for the specified period",
-                "Try a different time period if no data is found",
-            ],
+            f"Cost summary analysis failed: {read_failure_reason(error)}",
+            _cost_summary_advice(error),
         )
 
 
-class ToolCostsProcessor(AnalyticsProcessor):
-    """Processor for tool costs analytics."""
+class ToolReportProcessor(AnalyticsProcessor):
+    """A tool report: its answer names the window the platform was asked for and any pages left unread."""
+
+    action: str
 
     def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        return self.validator.validate_tool_costs_params(kwargs)
+        return self.validator.validate_tool_costs_params(kwargs, self.action)
 
-    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    @abstractmethod
+    async def fetch_data(self, params: Dict[str, Any]) -> ToolRows:
+        """Read the tool report for the validated window."""
+
+    def format_response(self, data: ToolRows, params: Dict[str, Any]) -> str:
+        text = self.formatter.format_tool_costs_response(
+            data=list(data), period=str(data.window), aggregation=params["aggregation"]
+        )
+        return with_unread_pages_notice(text, data.unread)
+
+
+class ToolCostsProcessor(ToolReportProcessor):
+    """Processor for tool costs analytics."""
+
+    action = "get_tool_costs"
+
+    async def fetch_data(self, params: Dict[str, Any]) -> ToolRows:
         return await self.analyzer.get_tool_costs(
             period=params["period"], aggregation=params["aggregation"]
-        )
-
-    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
-        return self.formatter.format_tool_costs_response(
-            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -423,20 +518,14 @@ class ToolCostsProcessor(AnalyticsProcessor):
         )
 
 
-class TopToolsProcessor(AnalyticsProcessor):
+class TopToolsProcessor(ToolReportProcessor):
     """Processor for top tools by call count."""
 
-    def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        return self.validator.validate_tool_costs_params(kwargs)
+    action = "get_top_tools"
 
-    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def fetch_data(self, params: Dict[str, Any]) -> ToolRows:
         return await self.analyzer.get_top_tools(
             period=params["period"], aggregation=params["aggregation"]
-        )
-
-    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
-        return self.formatter.format_tool_costs_response(
-            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -449,20 +538,14 @@ class TopToolsProcessor(AnalyticsProcessor):
         )
 
 
-class ToolCostsByAgentProcessor(AnalyticsProcessor):
+class ToolCostsByAgentProcessor(ToolReportProcessor):
     """Processor for tool costs grouped by agent."""
 
-    def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        return self.validator.validate_tool_costs_params(kwargs)
+    action = "get_tool_costs_by_agent"
 
-    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def fetch_data(self, params: Dict[str, Any]) -> ToolRows:
         return await self.analyzer.get_tool_costs_by_agent(
             period=params["period"], aggregation=params["aggregation"]
-        )
-
-    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
-        return self.formatter.format_tool_costs_response(
-            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -475,20 +558,14 @@ class ToolCostsByAgentProcessor(AnalyticsProcessor):
         )
 
 
-class ToolCostsByProviderProcessor(AnalyticsProcessor):
+class ToolCostsByProviderProcessor(ToolReportProcessor):
     """Processor for tool costs grouped by provider."""
 
-    def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        return self.validator.validate_tool_costs_params(kwargs)
+    action = "get_tool_costs_by_provider"
 
-    async def fetch_data(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def fetch_data(self, params: Dict[str, Any]) -> ToolRows:
         return await self.analyzer.get_tool_costs_by_provider(
             period=params["period"], aggregation=params["aggregation"]
-        )
-
-    def format_response(self, data: Union[List[Dict[str, Any]], Dict[str, Any]], params: Dict[str, Any]) -> str:
-        return self.formatter.format_tool_costs_response(
-            data=cast(List[Dict[str, Any]], data), period=params["period"], aggregation=params["aggregation"]
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -575,7 +652,7 @@ class SimpleAnalyticsEngine:
         Returns:
             Formatted transaction volume response
         """
-        period = self.validator.validate_period(str(kwargs.get("period") or "SEVEN_DAYS"))
+        period = self.validator.validate_window(kwargs, default_period="SEVEN_DAYS")
 
         count = await self.analyzer.get_transaction_count(period)
 
@@ -616,8 +693,9 @@ analytics cost actions report.
     async def get_filter_options(self, **kwargs: Any) -> str:
         """Enumerate the valid filter values for an analytics dimension.
 
-        Lets callers discover the real names the cost endpoints' ``filters``
-        arguments expect, instead of guessing and getting empty results.
+        Lets callers discover the real names the filters of get_user_costs,
+        get_department_costs and the other filtering reports expect, instead of
+        guessing and getting empty results.
 
         Args:
             **kwargs: ``dimension`` (required) and ``period`` (optional,
@@ -637,14 +715,24 @@ analytics cost actions report.
         except (TypeError, ValueError):
             page = 0
 
-        values = await self.analyzer.get_analytics_filter_options(dimension, period)
+        cost_sources = self.validator.validate_filter_options_filters(
+            kwargs.get("filters")
+        )
+
+        values = await self.analyzer.get_analytics_filter_options(
+            dimension, period, cost_sources=cost_sources
+        )
 
         # Dimension-aware usage guidance: pointing every dimension at
         # filters.agents sends callers to the wrong argument.
         _GUIDANCE_BY_DIMENSION = {
             "agents": "filters.agents on get_user_costs, or the agents argument on get_task_completion",
             "models": "filters.models on get_user_costs",
-            "providers": "filters.providers on get_user_costs, or the providers argument on get_token_breakdown",
+            "providers": (
+                "filters.providers on get_user_costs, or the providers argument on "
+                "get_token_breakdown"
+            ),
+            "tool-providers": "the provider argument on manage_tools get_cost_by_provider",
             "users": "filters.users on get_user_costs",
         }
         specific = _GUIDANCE_BY_DIMENSION.get(dimension.replace("-", "_").replace("_", "-"))
@@ -653,7 +741,11 @@ analytics cost actions report.
         guidance = (
             f"Use these values in {specific}."
             if specific
-            else "Use these values in the corresponding filter arguments on the cost actions."
+            else (
+                f"No cost report filters by {dimension} in business_analytics_management. "
+                "Its cost filters are agents, providers, models, users and costSources on "
+                "get_user_costs and get_department_costs, and costSources on get_agent_costs."
+            )
         )
 
         if not values:

@@ -1,6 +1,8 @@
 """Unit tests for DateRangeParser — natural language date parsing."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from src.revenium_mcp_server.date_parser import DateRangeParser
 
@@ -8,9 +10,10 @@ from src.revenium_mcp_server.date_parser import DateRangeParser
 class TestDateRangeParser:
     """Test natural language date expression parsing."""
 
-    def setup_method(self):
+    @pytest.fixture(autouse=True)
+    def _parser_at_a_frozen_instant(self, frozen_utc_clock):
+        self.now = frozen_utc_clock.current
         self.parser = DateRangeParser()
-        self.now = self.parser.now
 
     # -----------------------------------------------------------------------
     # Named time ranges
@@ -116,18 +119,16 @@ class TestDateRangeParser:
     # -----------------------------------------------------------------------
 
     def test_since_yesterday(self):
-        """'since yesterday' matches the 'yesterday' keyword first (24-hour range)."""
+        """'since yesterday' starts at the first instant of yesterday and ends now."""
         result = self.parser.parse_natural_language_date_range("since yesterday")
         start = datetime.fromisoformat(result["start"].replace("Z", "+00:00"))
         end = datetime.fromisoformat(result["end"].replace("Z", "+00:00"))
-        # "since yesterday" matches "yesterday" → 24-hour range; start must be before end
         assert start < end
 
     def test_since_iso_date(self):
         result = self.parser.parse_natural_language_date_range("since 2024-06-01")
-        assert result["start"] is not None
-        assert "2024-06-01" in result["start"]
-        assert result["end"] is None  # open-ended
+        assert result["start"] == "2024-06-01T00:00:00.000Z"
+        assert result["end"] == "2026-10-15T15:30:45.123Z"  # the frozen now
 
     def test_after_iso_date(self):
         result = self.parser.parse_natural_language_date_range("after 2024-06-01")
@@ -216,3 +217,130 @@ class TestDateRangeParser:
         result = self.parser.parse_natural_language_date_range("last 7 days")
         assert "+00:00" not in result["start"]
         assert result["start"].endswith("Z") or "Z" in result["start"]
+
+
+_NOW = "2026-10-15T15:30:45.123Z"
+_THIRTY_DAYS_BEFORE_NOW = "2026-09-15T15:30:45.123Z"
+
+
+class TestAlertHistoryPhrasesNameTheirWindow:
+    """Each phrase gives the window it names, in the form the platform takes.
+
+    The fixture's clock is Thursday 2026-10-15 15:30:45.123456 UTC.
+    """
+
+    @pytest.mark.parametrize(
+        "phrase,start,end",
+        [
+            ("show alerts this week", "2026-10-12T00:00:00.000Z", _NOW),
+            ("show alerts today", "2026-10-15T00:00:00.000Z", _NOW),
+            ("show alerts this month", "2026-10-01T00:00:00.000Z", _NOW),
+            (
+                "show alerts from 2026-10-12 to 2026-10-14",
+                "2026-10-12T00:00:00.000Z",
+                "2026-10-14T23:59:59.999Z",
+            ),
+            (
+                "show alerts from Oct 12 to Oct 14",
+                "2026-10-12T00:00:00.000Z",
+                "2026-10-14T23:59:59.999Z",
+            ),
+            ("show alerts yesterday", "2026-10-14T00:00:00.000Z", "2026-10-14T23:59:59.999Z"),
+            ("show alerts from the last 3 days", "2026-10-12T15:30:45.123Z", _NOW),
+            ("alerts in the last 14 days", "2026-10-01T15:30:45.123Z", _NOW),
+            ("alerts from the last 48 hours", "2026-10-13T15:30:45.123Z", _NOW),
+            ("alerts in the last 30 minutes", "2026-10-15T15:00:45.123Z", _NOW),
+            ("show alerts from the last hour", "2026-10-15T14:30:45.123Z", _NOW),
+            ("since yesterday", "2026-10-14T00:00:00.000Z", _NOW),
+            ("since Oct 12", "2026-10-12T00:00:00.000Z", _NOW),
+            ("since Dec 30", "2025-12-30T00:00:00.000Z", _NOW),
+            (
+                "from 2026-10-12T08:00:00Z to 2026-10-14T12:00:00Z",
+                "2026-10-12T08:00:00.000Z",
+                "2026-10-14T12:00:00.000Z",
+            ),
+            ("show high cost alerts", _THIRTY_DAYS_BEFORE_NOW, _NOW),
+            ("alerts in the last 0 days", _THIRTY_DAYS_BEFORE_NOW, _NOW),
+            ("alerts in the last 99999999 days", _THIRTY_DAYS_BEFORE_NOW, _NOW),
+        ],
+    )
+    def test_phrase_gives_the_window_it_names_in_the_platform_format(
+        self, frozen_utc_clock, phrase, start, end
+    ):
+        assert DateRangeParser().parse_natural_language_date_range(phrase) == {
+            "start": start,
+            "end": end,
+        }
+
+    @pytest.mark.parametrize(
+        "phrase,start,end",
+        [
+            (
+                "show alerts that fired yesterday for rules with a 15 minute period",
+                "2026-10-14T00:00:00.000Z",
+                "2026-10-14T23:59:59.999Z",
+            ),
+            ("show alerts from the last 15 minutes", "2026-10-15T15:15:45.123Z", _NOW),
+        ],
+    )
+    def test_a_span_selects_the_window_only_with_a_window_word(
+        self, frozen_utc_clock, phrase, start, end
+    ):
+        assert DateRangeParser().parse_natural_language_date_range(phrase) == {
+            "start": start,
+            "end": end,
+        }
+
+    @pytest.mark.parametrize(
+        "now,phrase,start,end",
+        [
+            (
+                datetime(2027, 1, 1, 0, 30, 0, 250000, tzinfo=timezone.utc),
+                "yesterday",
+                "2026-12-31T00:00:00.000Z",
+                "2026-12-31T23:59:59.999Z",
+            ),
+            (
+                datetime(2027, 1, 1, 0, 30, 0, 250000, tzinfo=timezone.utc),
+                "this week",
+                "2026-12-28T00:00:00.000Z",
+                "2027-01-01T00:30:00.250Z",
+            ),
+            (
+                datetime(2027, 1, 1, 0, 30, 0, 250000, tzinfo=timezone.utc),
+                "this month",
+                "2027-01-01T00:00:00.000Z",
+                "2027-01-01T00:30:00.250Z",
+            ),
+            (
+                datetime(2027, 1, 1, 0, 30, 0, 250000, tzinfo=timezone.utc),
+                "today",
+                "2027-01-01T00:00:00.000Z",
+                "2027-01-01T00:30:00.250Z",
+            ),
+            (
+                datetime(2026, 10, 18, 23, 59, 59, 999000, tzinfo=timezone.utc),
+                "this week",
+                "2026-10-12T00:00:00.000Z",
+                "2026-10-18T23:59:59.999Z",
+            ),
+            (
+                datetime(2026, 10, 15, 15, 30, 45, 123456, tzinfo=timezone.utc),
+                "from Oct 12 to Oct 18",
+                "2026-10-12T00:00:00.000Z",
+                "2026-10-18T23:59:59.999Z",
+            ),
+            (
+                datetime(2026, 1, 5, 9, 0, 0, tzinfo=timezone.utc),
+                "from Dec 28 to Jan 3",
+                "2025-12-28T00:00:00.000Z",
+                "2026-01-03T23:59:59.999Z",
+            ),
+        ],
+    )
+    def test_calendar_edges(self, frozen_utc_clock, now, phrase, start, end):
+        frozen_utc_clock.current = now
+        assert DateRangeParser().parse_natural_language_date_range(phrase) == {
+            "start": start,
+            "end": end,
+        }

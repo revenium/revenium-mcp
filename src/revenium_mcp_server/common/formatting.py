@@ -8,8 +8,15 @@ from typing import Any, Dict, List, Optional
 
 from mcp.types import TextContent
 
+from .sample_coverage import platform_total
+
 # Re-export for common use
-__all__ = ["format_json_response", "format_list_response", "format_success_response"]
+__all__ = [
+    "format_json_response",
+    "format_list_response",
+    "format_page_count_heading",
+    "format_success_response",
+]
 
 
 def format_json_response(data: Any, title: str = "Response") -> List[TextContent]:
@@ -97,3 +104,45 @@ def format_success_response(
             text += f"  • {key.replace('_', ' ').title()}: {value}\n"
 
     return [TextContent(type="text", text=text)]
+
+
+def format_page_count_heading(
+    noun: str, rows_on_page: int, page_info: Dict[str, Any], page: Any
+) -> str:
+    """Heading for one page of a list, counted against the total the platform reported.
+
+    The rows on the page are never presented as the total: when the platform
+    reports no total, the heading says so instead.
+
+    Args:
+        noun: Plural name of the listed resource (e.g. "users")
+        rows_on_page: Number of rows returned on this page
+        page_info: Pagination block of the response (totalElements, totalPages)
+        page: Zero-based page that was read; anything but an int reads as 0
+
+    Returns:
+        One heading line
+    """
+    if not isinstance(page, int) or isinstance(page, bool):
+        page = 0
+    shown_page = page + 1
+    total = platform_total(page_info)
+    pages = page_info.get("totalPages")
+    if not isinstance(pages, int) or isinstance(pages, bool) or pages < 1:
+        pages = None
+
+    if total is None:
+        return (
+            f"Found {rows_on_page} {noun} on page {shown_page}; "
+            "the platform reported no total, so more may exist:"
+        )
+    if total == 0:
+        return f"Found 0 {noun}; the platform reports none."
+    if rows_on_page == 0:
+        page_count = f" ({pages} pages)" if pages is not None else ""
+        return (
+            f"Page {shown_page} is past the last page{page_count}; the platform reports "
+            f"{total} {noun} in total. Pass page=0 for the first page."
+        )
+    page_of = f"page {shown_page} of {pages}" if pages is not None else f"page {shown_page}"
+    return f"Found {rows_on_page} of {total} {noun} ({page_of}):"

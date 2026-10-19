@@ -29,11 +29,12 @@ registration closure folds the bag into the named arguments it built, with the
 named arguments winning.
 """
 
-from typing import Any, Dict, Mapping, Optional, Sequence, Set
+from typing import Any, Dict, FrozenSet, Mapping, Optional, Sequence, Set
 
 from loguru import logger
 
 from ..common.department_aliases import mark_deprecated_aliases
+from ..constants import USER_COSTS_DEFAULT_PAGE_SIZE
 
 #: Parameters advertised on a thin schema when the tool declares them. These
 #: are the argument names that are meaningful across most actions of a tool,
@@ -58,9 +59,51 @@ COMMON_PARAMETERS: Sequence[str] = ("page", "size", "filters", "dry_run")
 THIN_TOOL_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "manage_metering": {},
     "business_analytics_management": {"page": 0, "size": 20},
-    "manage_alerts": {"page": 0, "size": 20, "resource_type": "anomalies"},
+    "manage_alerts": {"page": 0, "size": 20},
     "manage_ai_insights": {},
     "manage_tools": {"page": 0, "size": 20},
+}
+
+#: Parameters a thin tool advertises without a default because its handler
+#: reads their absence. With no ``resource_type``, ``manage_alerts`` ``list``
+#: routes by the question (alert history for "which alerts fired", the rules
+#: otherwise) and ``query`` always reads alert history; ``get``, ``create`` and
+#: the other actions default to the rules in their handlers. A default filled
+#: in before the handler ran made both routes unreachable.
+THIN_TOOL_PARAMETERS_WITHOUT_DEFAULT: Dict[str, Sequence[str]] = {
+    "manage_alerts": ("resource_type",),
+}
+
+#: Per-action defaults that replace the tool's own default for one action.
+THIN_ACTION_DEFAULTS: Dict[str, Dict[str, Dict[str, Any]]] = {
+    "business_analytics_management": {
+        "get_user_costs": {"size": USER_COSTS_DEFAULT_PAGE_SIZE},
+    },
+}
+
+#: Options a closure declares but no handler reads. FastMCP refuses an
+#: undeclared name, so they stay on the signature for callers that already
+#: send them; they are left out of the advertised schema so an assistant is
+#: not told that setting one changes the answer.
+ACCEPTED_BUT_IGNORED_ARGUMENTS: Dict[str, FrozenSet[str]] = {
+    "system_diagnostics": frozenset(
+        {
+            "format_output",
+            "include_recommendations",
+            "include_sensitive",
+            "show_detailed_analysis",
+        }
+    ),
+    "system_setup": frozenset(
+        {
+            "include_recommendations",
+            "include_setup_guidance",
+            "show_environment",
+            "suggest_smart_defaults",
+            "validate_format",
+        }
+    ),
+    "slack_management": frozenset({"skip_prompts"}),
 }
 
 #: The tools whose advertised parameter list is replaced by the thin shape.
@@ -172,14 +215,18 @@ def slim_schema(schema: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def thin_schema(
-    schema: Mapping[str, Any], defaults: Optional[Mapping[str, Any]] = None
+    schema: Mapping[str, Any],
+    defaults: Optional[Mapping[str, Any]] = None,
+    advertised_without_default: Sequence[str] = (),
 ) -> Dict[str, Any]:
     """Advertise only ``action``, the common and defaulted parameters, and ``params``.
 
     ``defaults`` is the tool's entry from ``THIN_TOOL_DEFAULTS``: those names
     stay advertised and get their default written back onto the advertised
     property, because the closure applies it after the merge rather than in
-    its signature.
+    its signature. ``advertised_without_default`` is the tool's entry from
+    ``THIN_TOOL_PARAMETERS_WITHOUT_DEFAULT``: those names stay advertised as
+    they are, with no default.
 
     Expects an already-slimmed schema. Idempotent.
     """
@@ -195,7 +242,7 @@ def thin_schema(
     for name, prop in properties.items():
         if name in kept or name == PARAMS_PROPERTY:
             continue
-        if name in defaults or name in COMMON_PARAMETERS:
+        if name in defaults or name in COMMON_PARAMETERS or name in advertised_without_default:
             kept[name] = prop
     for name, default in defaults.items():
         if name in kept and isinstance(kept[name], Mapping):
@@ -223,11 +270,36 @@ def thin_schema(
     return thinned
 
 
+def drop_ignored_arguments(tool_name: str, schema: Mapping[str, Any]) -> Dict[str, Any]:
+    """Stop advertising the tool's ``ACCEPTED_BUT_IGNORED_ARGUMENTS``.
+
+    Like ``thin_schema``, the result allows additional properties, because the
+    closure still accepts the names it no longer advertises.
+    """
+    trimmed = dict(schema)
+    properties = trimmed.get("properties")
+    ignored = ACCEPTED_BUT_IGNORED_ARGUMENTS.get(tool_name, frozenset())
+    if not isinstance(properties, dict) or not ignored & set(properties):
+        return trimmed
+
+    trimmed["properties"] = {
+        name: prop for name, prop in properties.items() if name not in ignored
+    }
+    trimmed["additionalProperties"] = True
+    return trimmed
+
+
 def slim_tool_schema(tool_name: str, schema: Mapping[str, Any]) -> Dict[str, Any]:
     """Return the schema to advertise for ``tool_name``."""
-    slimmed = mark_deprecated_aliases(tool_name, slim_schema(schema))
+    slimmed = drop_ignored_arguments(
+        tool_name, mark_deprecated_aliases(tool_name, slim_schema(schema))
+    )
     if tool_name in THIN_SCHEMA_TOOLS:
-        return thin_schema(slimmed, THIN_TOOL_DEFAULTS[tool_name])
+        return thin_schema(
+            slimmed,
+            THIN_TOOL_DEFAULTS[tool_name],
+            THIN_TOOL_PARAMETERS_WITHOUT_DEFAULT.get(tool_name, ()),
+        )
     return slimmed
 
 
@@ -272,9 +344,12 @@ def apply_thin_tool_defaults(tool_name: str, arguments: Dict[str, Any]) -> Dict[
     """Apply a thin tool's defaults to whatever the caller and the bag left unset.
 
     Called after ``merge_params_argument`` so the bag can override a default
-    the closure signature used to hard-code.
+    the closure signature used to hard-code. An action's own default, from
+    ``THIN_ACTION_DEFAULTS``, replaces the tool's default for that action.
     """
-    for name, default in THIN_TOOL_DEFAULTS.get(tool_name, {}).items():
+    action_defaults = THIN_ACTION_DEFAULTS.get(tool_name, {}).get(str(arguments.get("action")), {})
+    defaults = {**THIN_TOOL_DEFAULTS.get(tool_name, {}), **action_defaults}
+    for name, default in defaults.items():
         if arguments.get(name) is None:
             arguments[name] = default
     return arguments

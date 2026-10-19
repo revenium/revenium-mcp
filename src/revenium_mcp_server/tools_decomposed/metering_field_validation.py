@@ -23,6 +23,7 @@ def _get_utc_timestamp() -> str:
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
+from ..auth.tenant_scope import tenant_scope
 from ..client import ReveniumClient
 from ..endpoint_registry import get_endpoint_path
 from ..common.error_handling import ErrorCodes, ToolError
@@ -1537,10 +1538,13 @@ class MeteringFieldValidationManagement(ToolBase):
         # Submit each transaction in the batch
         results = []
         client = await self.get_client(ctx=ctx)
+        scope = tenant_scope(ctx)
 
         for i, transaction in enumerate(test_data):
             try:
-                result = await self.transaction_manager.submit_transaction(client, transaction)
+                result = await self.transaction_manager.submit_transaction(
+                    client, transaction, scope, ctx=ctx
+                )
                 results.append(
                     {
                         "index": i,

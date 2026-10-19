@@ -6,7 +6,7 @@ tool with internal composition, following the proven alert/source management tem
 
 import json
 import unicodedata
-from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional, Tuple, Union, cast
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -26,9 +26,18 @@ from ..common.error_handling import (
     ToolError,
     create_structured_missing_parameter_error,
     create_structured_validation_error,
+    raise_refusal,
 )
 from ..common.department_aliases import deprecated_aliases_note
+from ..common.formatting import format_page_count_heading
 from ..common.partial_update_handler import PartialUpdateHandler
+from ..common.sample_coverage import (
+    describe_sample,
+    distinct_ids_in_lists,
+    platform_total,
+    reference_id,
+    share_of_sample,
+)
 from ..common.update_configs import UpdateConfigFactory
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..config_store import get_config_value
@@ -65,6 +74,25 @@ from .pr_health_settings_fields import (
     present_display_fields,
 )
 from .unified_tool_base import ToolBase
+
+
+CUSTOMER_DATA_ARGUMENTS = {
+    "organizations": "organization_data",
+    "users": "user_data",
+    "subscribers": "subscriber_data",
+    "teams": "team_data",
+}
+
+CUSTOMER_DATA_READERS = ("create", "update", "validate")
+
+
+def customer_data_for(resource_type: Optional[str], arguments: Dict[str, Any]) -> Any:
+    """The data argument resource_type names, else resource_data; never another type's."""
+    data_argument = CUSTOMER_DATA_ARGUMENTS.get(resource_type or "")
+    explicit_data = arguments.get(data_argument) if data_argument else None
+    if explicit_data is not None:
+        return explicit_data
+    return arguments.get("resource_data")
 
 
 # snake_case filter name -> camelCase query parameter, per customer resource
@@ -127,6 +155,76 @@ def _validate_lookup_email(email: Any, action: str) -> str:
         )
 
     return candidate
+
+
+def _refuse_user_without_last_name(resource_data: Any) -> None:
+    """Refuse a user create that has no lastName once auto-generation has run.
+
+    The upstream API needs a lastName for a user and the server will not invent one,
+    so a one-word email prefix with no explicit lastName is refused with the fix in
+    the message text.
+    """
+    if isinstance(resource_data, dict) and not str(
+        resource_data.get("lastName") or ""
+    ).strip():
+        raise_refusal(
+            "A lastName is required to create a user. Add it as "
+            'resource_data.lastName, for example {"lastName": "Doe"}. With '
+            "auto_generate on, the server fills it only when the part of the email "
+            "before @ has two or more words separated by . or _ (for example "
+            "john.doe@acme.com).",
+            field="lastName",
+        )
+
+
+def _refuse_incomplete_person_create(resource_type: str, resource_data: Any) -> None:
+    """Refuse a user or subscriber create that lacks what the server cannot supply.
+
+    The server never generates an email from a name and never picks an organization
+    for a subscriber, so both are refused here with the guidance in the message text
+    (only the message reaches the caller). Other resource types are left alone.
+    """
+    if resource_type not in ("users", "subscribers"):
+        return
+
+    if not isinstance(resource_data, dict):
+        raise_refusal(
+            "resource_data must be an object with the resource fields, for example "
+            '{"email": "john.doe@acme.com"}.',
+            field="resource_data",
+        )
+
+    groups: List[str] = []
+    field: Optional[str] = None
+
+    if not str(resource_data.get("email") or "").strip():
+        noun = "user" if resource_type == "users" else "subscriber"
+        groups.append(
+            f"An email is required to create a {noun}. Add it as "
+            'resource_data.email, for example {"email": "john.doe@acme.com"}. '
+            "The server does not generate an email from a name."
+        )
+        field = "email"
+
+    if resource_type == "subscribers":
+        organization_ids = resource_data.get("organizationIds")
+        if not (
+            isinstance(organization_ids, list)
+            and organization_ids
+            and all(isinstance(o, str) and o.strip() for o in organization_ids)
+        ):
+            groups.append(
+                "A subscriber must name the organization it belongs to. Add "
+                "resource_data.organizationIds with one or more organization ids, "
+                'for example {"organizationIds": ["<organization id>"]}. To find '
+                "the id, call manage_customers with action='list' and "
+                "resource_type='organizations'. The server does not pick an "
+                "organization for you."
+            )
+            field = field or "organizationIds"
+
+    if groups:
+        raise_refusal(" ".join(groups), field=field)
 
 
 # Marketplace-settings support -------------------------------------------------
@@ -1110,6 +1208,31 @@ def _department_feature_disabled_error(team_id: Optional[str], action: str) -> T
     )
 
 
+def _department_removal_forbidden_error(
+    error: ReveniumAPIError, team_id: Optional[str], action: str
+) -> ToolError:
+    """A removal 403 has two causes the answer alone cannot tell apart, so name both.
+
+    The guidance is in the message itself because only the message reaches the caller.
+    """
+    causes = (
+        "Two causes give this answer: department attribution is not enabled for this "
+        "organization, or this key is not allowed to change departments."
+    )
+    tell_apart = (
+        "Run list_departments(team_id=...) for the same team. If it lists departments, "
+        f"they are enabled and this key may not run {action}. If it also answers 403, "
+        "ask Revenium to enable department attribution."
+    )
+    return ToolError(
+        message=f"The platform refused this department change (403). {causes} {tell_apart}",
+        error_code=ErrorCodes.API_AUTHORIZATION,
+        field="team_id",
+        value=team_id or "(ambient team)",
+        suggestions=[str(error.message), causes, tell_apart],
+    )
+
+
 def _optional_team_id(arguments: Dict[str, Any]) -> Optional[str]:
     team_id = arguments.get("team_id")
     return team_id.strip() if isinstance(team_id, str) and team_id.strip() else None
@@ -1178,10 +1301,8 @@ def _raise_department_removal_error(
     error: ReveniumAPIError, action: str, team_id: Optional[str], target: Dict[str, Any]
 ) -> NoReturn:
     """Translate the removal routes' documented 4xx answers into caller guidance."""
-    # The department routes share list_departments' default-OFF feature flag, so a 403
-    # is a tenant-configuration state before it is a permissions problem.
     if error.status_code == 403:
-        raise _department_feature_disabled_error(team_id, action)
+        raise _department_removal_forbidden_error(error, team_id, action)
     field, value = (
         ("person_id", target["person_id"])
         if target.get("person_id") is not None
@@ -1349,6 +1470,8 @@ class UserManager(BaseManager):
             "resource_type": "users",
             "users": users,
             "pagination": page_info,
+            "page": page,
+            "total_records": platform_total(page_info),
             "total_found": len(users),
         }
 
@@ -1427,7 +1550,7 @@ class UserManager(BaseManager):
                     field="email",
                     value=email,
                     suggestions=[
-                        "Verify the email is correct and belongs to a user (platform admin)",
+                        "Verify the email is correct and belongs to a user (a person who signs in to Revenium)",
                         "Use list(resource_type='users') to browse existing users",
                         "If you meant an API consumer, try lookup_subscriber(email=...) instead",
                     ],
@@ -1440,30 +1563,10 @@ class UserManager(BaseManager):
         return user
 
     async def create_user(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Create new user with Context7 auto-generation support."""
+        """Create a new user."""
         user_data = arguments.get("user_data")
-        name = arguments.get("name")
 
-        # Context7 auto-generation: Handle case where user provides only name
-        if not user_data and name:
-            # Auto-generate user_data from minimal user input
-            # Parse name into firstName and lastName
-            name_parts = name.split(" ", 1)
-            first_name = name_parts[0]
-            last_name = name_parts[1] if len(name_parts) > 1 else ""
-
-            # Generate email from name (basic implementation)
-            email_name = name.lower().replace(" ", ".").replace("@", "").replace(".", "")
-            generated_email = f"{email_name}@example.com"
-
-            user_data = {
-                "email": generated_email,
-                "firstName": first_name,
-                "lastName": last_name,
-                "roles": ["ROLE_API_CONSUMER"],
-            }
-
-        elif not user_data:
+        if not user_data:
             raise create_structured_missing_parameter_error(
                 parameter_name="user_data",
                 action="create user",
@@ -1477,9 +1580,11 @@ class UserManager(BaseManager):
                         "roles": ["ROLE_API_CONSUMER"],
                     },
                     "billing_safety": "🔒 BILLING SAFETY: User creation establishes billing relationships and access permissions",
-                    "role_requirement": "roles field is required - ROLE_API_CONSUMER is the only valid role for subscribers/users",
+                    "role_requirement": "roles field is required - use ROLE_API_CONSUMER unless the customer explicitly asks for an administrator (ROLE_TENANT_ADMIN)",
                 },
             )
+
+        _refuse_incomplete_person_create("users", user_data)
 
         # Add required fields from client environment
         if "teamIds" not in user_data:
@@ -1587,6 +1692,8 @@ class SubscriberManager(BaseManager):
             "resource_type": "subscribers",
             "subscribers": enhanced_subscribers,
             "pagination": page_info,
+            "page": page,
+            "total_records": platform_total(page_info),
             "total_found": len(enhanced_subscribers),
         }
 
@@ -1669,7 +1776,7 @@ class SubscriberManager(BaseManager):
                     suggestions=[
                         "Verify the email is correct and belongs to a subscriber (API consumer)",
                         "Use list(resource_type='subscribers') to browse existing subscribers",
-                        "If you meant a platform admin, try lookup_user(email=...) instead",
+                        "If you meant a person who signs in to Revenium, try lookup_user(email=...) instead",
                     ],
                 )
             # 5xx and other API errors propagate unchanged
@@ -1723,39 +1830,7 @@ class SubscriberManager(BaseManager):
                     "REVENIUM_OWNER_ID not available from configuration store, API will use default owner"
                 )
 
-        # Add required organizationIds field - API requires this as an array
-        if "organizationIds" not in subscriber_data:
-            # Try to get a default organization or create a minimal one
-            try:
-                # Get first available organization for this team
-                orgs_response = await self.client.get_organizations(page=0, size=1)
-                organizations = self.client._extract_embedded_data(orgs_response)
-                if organizations:
-                    subscriber_data["organizationIds"] = [organizations[0]["id"]]
-                else:
-                    # No organizations found - this is a critical issue
-                    raise create_structured_missing_parameter_error(
-                        parameter_name="organizationIds",
-                        action="create subscriber",
-                        examples={
-                            "issue": "No organizations found in the system",
-                            "solution": "Create an organization first, or provide organizationIds explicitly",
-                            "usage": "create(resource_type='subscribers', subscriber_data={'email': '...', 'organizationIds': ['org_id_123']})",
-                            "helper": "First use list action with resource_type='organizations' to get valid organization ID, then replace 'org_id_123' with actual ID",
-                        },
-                    )
-            except Exception as e:
-                # If organization lookup fails, require explicit organizationIds
-                raise create_structured_missing_parameter_error(
-                    parameter_name="organizationIds",
-                    action="create subscriber",
-                    examples={
-                        "issue": f"Could not auto-resolve organizationIds: {e}",
-                        "solution": "Provide organizationIds explicitly in subscriber_data",
-                        "usage": "create(resource_type='subscribers', subscriber_data={'email': '...', 'organizationIds': ['org_id_123']})",
-                        "helper": "First use list action with resource_type='organizations' to get valid organization ID, then replace 'org_id_123' with actual ID",
-                    },
-                )
+        _refuse_incomplete_person_create("subscribers", subscriber_data)
 
         # MCP convenience: Add ROLE_API_CONSUMER if not provided (API requires this field)
         # Note: API requires roles field to be explicitly set, but MCP tool provides fallback for better UX
@@ -1831,7 +1906,7 @@ class SubscriberManager(BaseManager):
                 parameter_name="subscriber_id",
                 action="update subscriber",
                 examples={
-                    "usage": "update(resource_type='subscribers', subscriber_id='sub_123', subscriber_data={'name': 'Updated Name'})",
+                    "usage": "update(resource_type='subscribers', subscriber_id='sub_123', subscriber_data={'firstName': 'Jane'})",
                     "note": "Now supports partial updates - only provide fields you want to change",
                     "billing_safety": "🔒 BILLING SAFETY: Subscriber updates can affect billing identity and subscription relationships",
                 },
@@ -1842,7 +1917,7 @@ class SubscriberManager(BaseManager):
                 parameter_name="subscriber_data",
                 action="update subscriber",
                 examples={
-                    "usage": "update(resource_type='subscribers', subscriber_id='sub_123', subscriber_data={'name': 'Updated Name'})",
+                    "usage": "update(resource_type='subscribers', subscriber_id='sub_123', subscriber_data={'firstName': 'Jane'})",
                     "partial_update": "Only provide the fields you want to update",
                     "updatable_fields": [
                         "firstName",
@@ -1948,6 +2023,8 @@ class OrganizationManager(BaseManager):
             "resource_type": "organizations",
             "organizations": organizations,
             "pagination": page_info,
+            "page": page,
+            "total_records": platform_total(page_info),
             "total_found": len(organizations),
         }
 
@@ -2017,7 +2094,7 @@ class OrganizationManager(BaseManager):
                         "status": "active",
                     },
                     "billing_safety": "🔒 BILLING SAFETY: Organization creation establishes primary billing entity and customer hierarchy",
-                    "api_requirements": "API requires tenantId, parentId, and metadata fields - these are auto-populated from environment",
+                    "api_requirements": "API requires tenantId and metadata fields - these are auto-populated from environment. parentId is optional: omit it for a top-level organization, or set it to an existing organization id to nest one.",
                 },
             )
 
@@ -2027,10 +2104,6 @@ class OrganizationManager(BaseManager):
             organization_data["tenantId"] = (
                 self.client.auth_config.tenant_id or self.client.auth_config.team_id
             )
-
-        if "parentId" not in organization_data:
-            # Use the team_id as the parent organization ID (this is the standard pattern)
-            organization_data["parentId"] = self.client.team_id
 
         if "metadata" not in organization_data:
             # API requires metadata field, even if empty
@@ -2066,6 +2139,7 @@ class OrganizationManager(BaseManager):
                     "usage": "update(resource_type='organizations', organization_id='org_123', organization_data={'name': 'Updated Corp'})",
                     "partial_update": "Only provide the fields you want to update",
                     "updatable_fields": ["name", "domain", "type", "status"],
+                    "metadata": "Send metadata as a string of name=value pairs separated by commas, such as 'region=eu, tier=gold'; it replaces the organization's editable metadata keys. A comma always ends a value",
                     "billing_safety": "🔒 BILLING SAFETY: Partial updates preserve existing organization configuration while changing specific fields",
                 },
             )
@@ -2129,6 +2203,8 @@ class TeamManager(BaseManager):
             "resource_type": "teams",
             "teams": teams,
             "pagination": page_info,
+            "page": page,
+            "total_records": platform_total(page_info),
             "total_found": len(teams),
         }
 
@@ -3109,8 +3185,8 @@ class CustomerValidator:
             "organization_fields": {
                 "required": ["name"],
                 "optional": ["description", "status"],
-                "auto_populated": ["tenantId", "parentId", "metadata"],
-                "note": "✅ FIXED: API-required fields (tenantId, parentId, metadata) are automatically populated from environment",
+                "auto_populated": ["tenantId", "metadata"],
+                "note": "API-required fields (tenantId, metadata) are automatically populated from environment. parentId is optional: omit it for a top-level organization, or set it to an existing organization id to nest one.",
             },
             "team_fields": {
                 "required": ["name", "organizationId"],
@@ -3157,7 +3233,7 @@ class CustomerValidator:
                     "lastName": "Doe",
                     "roles": ["ROLE_API_CONSUMER"],
                 },
-                "note": "⚠️ CRITICAL: roles field is required - ROLE_API_CONSUMER is the only valid role for users/subscribers",
+                "note": "⚠️ CRITICAL: roles field is required - use ROLE_API_CONSUMER unless the customer explicitly asks for an administrator (ROLE_TENANT_ADMIN)",
             },
             "subscribers": {
                 "name": "Create Subscriber",
@@ -3174,13 +3250,13 @@ class CustomerValidator:
             },
             "organizations": {
                 "name": "Create Organization",
-                "description": "Create a new organization (tenantId, parentId, and metadata are auto-populated)",
+                "description": "Create a new organization (tenantId and metadata are auto-populated)",
                 "template": {
                     "name": "Acme Corporation",
                     "description": "Technology company",
                     "status": "active",
                 },
-                "note": "✅ FIXED: Required API fields (tenantId, parentId, metadata) are automatically added from environment",
+                "note": "Required API fields (tenantId, metadata) are automatically added from environment. parentId is optional: omit it for a top-level organization, or set it to an existing organization id to nest one.",
             },
             "teams": {
                 "name": "Create Team",
@@ -3273,20 +3349,20 @@ class CustomerValidator:
                 "users": {
                     "available_roles": [
                         {
+                            "name": "ROLE_API_CONSUMER",
+                            "description": "API consumer role for programmatic access",
+                            "permissions": ["API access", "Resource consumption"],
+                            "usage": "For users or services that consume APIs programmatically",
+                        },
+                        {
                             "name": "ROLE_TENANT_ADMIN",
-                            "description": "Tenant administrator with full access to tenant resources",
+                            "description": "Organization administrator: full access to the whole organization",
                             "permissions": [
                                 "Full tenant management",
                                 "User management",
                                 "Resource creation/modification",
                             ],
-                            "usage": "For administrative users who need full control over the tenant",
-                        },
-                        {
-                            "name": "ROLE_API_CONSUMER",
-                            "description": "API consumer role for programmatic access",
-                            "permissions": ["API access", "Resource consumption"],
-                            "usage": "For users or services that consume APIs programmatically",
+                            "usage": "Grant only when the customer explicitly asks for an administrator",
                         },
                     ],
                     "role_requirements": [
@@ -3312,20 +3388,10 @@ class CustomerValidator:
                 },
             },
             "examples": {
-                "admin_user": {
-                    "resource_type": "users",
-                    "roles": ["ROLE_TENANT_ADMIN"],
-                    "use_case": "Administrative user with full tenant access",
-                },
                 "api_user": {
                     "resource_type": "users",
                     "roles": ["ROLE_API_CONSUMER"],
                     "use_case": "Service account for API access",
-                },
-                "power_user": {
-                    "resource_type": "users",
-                    "roles": ["ROLE_TENANT_ADMIN", "ROLE_API_CONSUMER"],
-                    "use_case": "User with both administrative and API access",
                 },
                 "subscriber": {
                     "resource_type": "subscribers",
@@ -3338,14 +3404,22 @@ class CustomerValidator:
 
 
 class CustomerAnalytics:
-    """Internal processor for customer analytics and relationships."""
+    """Internal processor for customer analytics."""
 
     def __init__(self, client: ReveniumClient) -> None:
         """Initialize analytics processor."""
         self.client = client
 
+    def _page_records(self, response: Any) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+        resources = self.client._extract_embedded_data(response)
+        return resources, platform_total(self.client._extract_pagination_info(response))
+
+    @staticmethod
+    def _count_with_parent(resources: List[Dict[str, Any]]) -> int:
+        return sum(1 for r in resources if reference_id(r, "parent", "parentId"))
+
     async def analyze_customers(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Analyze customer data and relationships."""
+        """Analyze customer data."""
         resource_type = arguments.get("resource_type", "organizations")
         page = arguments.get("page", 0)
         size = arguments.get("size", 100)  # Get more for analysis
@@ -3362,98 +3436,48 @@ class CustomerAnalytics:
 
         if resource_type == "users":
             response = await self.client.get_users(page=page, size=size, **filters)
-            resources = self.client._extract_embedded_data(response)
-            page_info = self.client._extract_pagination_info(response)
-
-            total_resources = page_info.get("totalElements", len(resources))
-            active_resources = len([r for r in resources if r.get("status") == "active"])
-
+            resources, total_resources = self._page_records(response)
             analytics = {
                 "resource_type": resource_type,
                 "total_users": total_resources,
-                "active_users": active_resources,
-                "inactive_users": total_resources - active_resources,
-                "activity_rate": (
-                    (active_resources / total_resources * 100) if total_resources > 0 else 0
-                ),
-                "sample_size": len(resources),
-                "organizations_represented": len(
-                    set(r.get("organizationId") for r in resources if r.get("organizationId"))
-                ),
-                "teams_represented": len(
-                    set(r.get("teamId") for r in resources if r.get("teamId"))
-                ),
+                "sample": describe_sample(page, len(resources), total_resources),
+                "teams_represented": distinct_ids_in_lists(resources, "teamIds"),
             }
 
         elif resource_type == "subscribers":
             response = await self.client.get_subscribers(page=page, size=size, **filters)
-            resources = self.client._extract_embedded_data(response)
-            page_info = self.client._extract_pagination_info(response)
-
-            total_resources = page_info.get("totalElements", len(resources))
-            active_resources = len([r for r in resources if r.get("status") == "active"])
-            trial_resources = len([r for r in resources if r.get("status") == "trial"])
-
+            resources, total_resources = self._page_records(response)
             analytics = {
                 "resource_type": resource_type,
                 "total_subscribers": total_resources,
-                "active_subscribers": active_resources,
-                "trial_subscribers": trial_resources,
-                "inactive_subscribers": total_resources - active_resources - trial_resources,
-                "conversion_rate": (
-                    (active_resources / total_resources * 100) if total_resources > 0 else 0
-                ),
-                "trial_rate": (
-                    (trial_resources / total_resources * 100) if total_resources > 0 else 0
-                ),
-                "sample_size": len(resources),
-                "organizations_represented": len(
-                    set(r.get("organizationId") for r in resources if r.get("organizationId"))
+                "sample": describe_sample(page, len(resources), total_resources),
+                "organizations_represented": distinct_ids_in_lists(
+                    resources, "organizationIds"
                 ),
             }
 
         elif resource_type == "organizations":
             response = await self.client.get_organizations(page=page, size=size, **filters)
-            resources = self.client._extract_embedded_data(response)
-            page_info = self.client._extract_pagination_info(response)
-
-            total_resources = page_info.get("totalElements", len(resources))
-            active_resources = len([r for r in resources if r.get("status") == "active"])
-
+            resources, total_resources = self._page_records(response)
+            hierarchical = self._count_with_parent(resources)
             analytics = {
                 "resource_type": resource_type,
                 "total_organizations": total_resources,
-                "active_organizations": active_resources,
-                "inactive_organizations": total_resources - active_resources,
-                "activity_rate": (
-                    (active_resources / total_resources * 100) if total_resources > 0 else 0
-                ),
-                "sample_size": len(resources),
-                "hierarchical_organizations": len(
-                    [r for r in resources if r.get("parentOrganizationId")]
-                ),
+                "sample": describe_sample(page, len(resources), total_resources),
+                "hierarchical_organizations": hierarchical,
+                "hierarchical_rate_in_sample": share_of_sample(hierarchical, len(resources)),
             }
 
         elif resource_type == "teams":
             response = await self.client.get_teams(page=page, size=size, **filters)
-            resources = self.client._extract_embedded_data(response)
-            page_info = self.client._extract_pagination_info(response)
-
-            total_resources = page_info.get("totalElements", len(resources))
-            active_resources = len([r for r in resources if r.get("status") == "active"])
-
+            resources, total_resources = self._page_records(response)
+            hierarchical = self._count_with_parent(resources)
             analytics = {
                 "resource_type": resource_type,
                 "total_teams": total_resources,
-                "active_teams": active_resources,
-                "inactive_teams": total_resources - active_resources,
-                "activity_rate": (
-                    (active_resources / total_resources * 100) if total_resources > 0 else 0
-                ),
-                "sample_size": len(resources),
-                "organizations_represented": len(
-                    set(r.get("organizationId") for r in resources if r.get("organizationId"))
-                ),
+                "sample": describe_sample(page, len(resources), total_resources),
+                "hierarchical_teams": hierarchical,
+                "hierarchical_rate_in_sample": share_of_sample(hierarchical, len(resources)),
             }
 
         else:
@@ -3479,61 +3503,12 @@ class CustomerAnalytics:
 
         return analytics
 
-    async def get_relationships(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Get customer relationships and hierarchies."""
-        resource_type = arguments.get("resource_type")
-        resource_id = (
-            arguments.get("resource_id")
-            or arguments.get("user_id")
-            or arguments.get("subscriber_id")
-            or arguments.get("organization_id")
-            or arguments.get("team_id")
-        )
-
-        if not resource_type or not resource_id:
-            missing_params = []
-            if not resource_type:
-                missing_params.append("resource_type")
-            if not resource_id:
-                missing_params.append("resource_id")
-
-            raise create_structured_missing_parameter_error(
-                parameter_name=" and ".join(missing_params),
-                action="get_relationships",
-                examples={
-                    "usage": "get_relationships(resource_type='users', resource_id='user_123')",
-                    "valid_resource_types": ["users", "subscribers", "organizations", "teams"],
-                    "example_calls": [
-                        "get_relationships(resource_type='users', resource_id='user_123')",
-                        "get_relationships(resource_type='organizations', resource_id='org_456')",
-                    ],
-                },
-            )
-
-        relationships = {
-            "resource_type": resource_type,
-            "resource_id": resource_id,
-            "relationships": [],
-        }
-
-        # This is a placeholder implementation
-        # In a real implementation, this would query the API for related resources
-        relationships["relationships"].append(
-            {
-                "type": "placeholder",
-                "message": "Relationship mapping functionality is not yet implemented",
-                "suggestion": "Use list operations to explore related resources manually",
-            }
-        )
-
-        return relationships
-
 
 class CustomerManagement(ToolBase):
     """Consolidated customer management tool with internal composition."""
 
     tool_name = "manage_customers"
-    tool_description = "Customer lifecycle management: organizations (customers), subscribers (API consumers), users (platform admins), teams (groups). Key actions: list, get, create, update, delete. Use get_capabilities() for complete action list."
+    tool_description = "Customer lifecycle management: organizations (customers), subscribers (API consumers), users (people who sign in to Revenium), teams (groups). Key actions: list, get, create, update, delete. Use get_capabilities() for complete action list."
     business_category = "Core Business Management Tools"
     tool_type = ToolType.CRUD
     tool_version = "2.0.0"
@@ -3614,7 +3589,13 @@ class CustomerManagement(ToolBase):
                 return [
                     TextContent(
                         type="text",
-                        text=f"Found {result['total_found']} {resource_type} (page {arguments.get('page', 0) + 1}):\n\n"
+                        text=format_page_count_heading(
+                            resource_type,
+                            len(result[resource_type]),
+                            result["pagination"],
+                            result["page"],
+                        )
+                        + "\n\n"
                         + json.dumps(result, indent=2),
                     )
                 ]
@@ -3687,26 +3668,36 @@ class CustomerManagement(ToolBase):
                 ]
 
             elif action == "create":
-                # Handle unified resource_data container pattern
-                resource_data = arguments.get("resource_data", {})
+                resource_data = customer_data_for(resource_type, arguments)
                 auto_generate = arguments.get("auto_generate", True)
                 dry_run = arguments.get("dry_run", False)
 
-                # Legacy data fallback (deprecated)
                 if not resource_data:
-                    resource_data = (
-                        arguments.get("user_data")
-                        or arguments.get("subscriber_data")
-                        or arguments.get("organization_data")
-                        or arguments.get("team_data")
-                        or {}
+                    raise create_structured_missing_parameter_error(
+                        parameter_name="resource_data",
+                        action="create",
+                        examples={
+                            "usage": "create(resource_type='organizations', resource_data={'name': 'Acme Corp', 'domain': 'acme.com'})",
+                            "valid_resource_types": [
+                                "organizations",
+                                "subscribers",
+                                "users",
+                                "teams",
+                            ],
+                        },
                     )
+
+                # Refuse before auto-generation so dry run and live create agree
+                _refuse_incomplete_person_create(resource_type, resource_data)
 
                 # PROGRESSIVE COMPLEXITY: Auto-generate missing fields based on mode
                 if auto_generate and resource_data:
                     resource_data = self._apply_auto_generation(
                         resource_data, resource_type, arguments
                     )
+
+                if resource_type == "users":
+                    _refuse_user_without_last_name(resource_data)
 
                 # Handle dry_run mode for create operations
                 if dry_run:
@@ -3756,7 +3747,7 @@ class CustomerManagement(ToolBase):
                             "usage": '{"action": "create", "resource_type": "organizations", "resource_data": {"name": "Company"}}',
                             "example_calls": [
                                 '{"action": "create", "resource_type": "organizations", "resource_data": {"name": "Company"}}',
-                                '{"action": "create", "resource_type": "subscribers", "resource_data": {"email": "user@company.com"}}',
+                                '{"action": "create", "resource_type": "subscribers", "resource_data": {"email": "user@company.com", "organizationIds": ["<organization id>"]}}',
                             ],
                             "billing_safety": "🔒 BILLING SAFETY: Correct resource type ensures proper customer creation and billing setup",
                         },
@@ -3775,12 +3766,7 @@ class CustomerManagement(ToolBase):
                 # Handle dry_run mode for update operations
                 dry_run = arguments.get("dry_run", False)
                 if dry_run:
-                    resource_data = (
-                        arguments.get("user_data")
-                        or arguments.get("subscriber_data")
-                        or arguments.get("organization_data")
-                        or arguments.get("team_data")
-                    )
+                    resource_data = customer_data_for(resource_type, arguments)
                     identifier = (
                         arguments.get("user_id")
                         or arguments.get("subscriber_id")
@@ -4099,7 +4085,7 @@ class CustomerManagement(ToolBase):
                 result = await department_manager.clear_department_assignment(arguments)
                 return [TextContent(type="text", text=_format_department_removal_text(result))]
 
-            # Analytics and relationship operations
+            # Analytics operations
             elif action == "analyze":
                 result = await analytics_processor.analyze_customers(arguments)
                 return [
@@ -4110,14 +4096,6 @@ class CustomerManagement(ToolBase):
                     )
                 ]
 
-            elif action == "get_relationships":
-                result = await analytics_processor.get_relationships(arguments)
-                return [
-                    TextContent(
-                        type="text",
-                        text="**Customer Relationships**\n\n" + json.dumps(result, indent=2),
-                    )
-                ]
 
             # Validation and discovery operations
             elif action == "get_capabilities":
@@ -4130,12 +4108,7 @@ class CustomerManagement(ToolBase):
 
             elif action == "validate":
                 resource_type = arguments.get("resource_type", "organizations")
-                resource_data = (
-                    arguments.get("user_data")
-                    or arguments.get("subscriber_data")
-                    or arguments.get("organization_data")
-                    or arguments.get("team_data")
-                )
+                resource_data = customer_data_for(resource_type, arguments)
 
                 if not resource_data:
                     raise create_structured_missing_parameter_error(
@@ -4209,7 +4182,7 @@ class CustomerManagement(ToolBase):
                             "delete_department_person",
                             "clear_department_assignment",
                         ],
-                        "analysis_actions": ["analyze", "get_relationships"],
+                        "analysis_actions": ["analyze"],
                         "discovery_actions": [
                             "get_capabilities",
                             "get_examples",
@@ -4286,7 +4259,9 @@ class CustomerManagement(ToolBase):
             for role in capabilities.get("user_roles", []):
                 if role == "ROLE_TENANT_ADMIN":
                     result_text += (
-                        f"- `{role}` (returned by API, but not valid or available for customers)\n"
+                        f"- `{role}` (administrator with full access to the whole "
+                        "organization; grant only when the customer explicitly asks "
+                        "for an administrator)\n"
                     )
                 else:
                     result_text += f"- `{role}`\n"
@@ -4354,7 +4329,7 @@ class CustomerManagement(ToolBase):
 
         result_text += "## **Team PR-Health Settings**\n"
         result_text += "The team PR-health settings: the aging/rotting inactivity thresholds, the cutoff date and excluded repositories that narrow which pull requests the report counts, the automation patterns that put matching pull requests in the automation bucket, and the assisted-only default view for pricing and listing AI-assisted pull requests.\n\n"
-        result_text += "- `get_pr_health_settings(team_id='jR2kmLs')` - read the effective `agingDays` / `rottingDays` plus `assistedOnly`, `automationPatterns`, `builtInAutomationPatterns`, `cutoffDate`, `cutoffDateIsDefault`, `defaultCutoffDate` and `excludedRepos`\n"
+        result_text += "- `get_pr_health_settings(team_id='jR2kmLs')` - read the effective `agingDays` / `rottingDays` plus `assistedOnly`, `automationPatterns`, `builtInAutomationPatterns`, `cutoffDate`, `cutoffDateIsDefault`, `defaultCountsSince`, `defaultCutoffDate` and `excludedRepos`\n"
         result_text += "- `update_pr_health_settings(team_id='jR2kmLs', aging_days=14, rotting_days=30)` - name one threshold and the other is read-merged from the current settings\n"
         result_text += "- `update_pr_health_settings(team_id='jR2kmLs', excluded_repos=['acme/legacy-app'], cutoff_date='2025-03-01')` - also accepts `automation_patterns` and `assisted_only`\n"
         result_text += f"- **Omitted fields**: {PR_HEALTH_OMITTED_FIELDS_NOTE}\n"
@@ -4454,7 +4429,7 @@ class CustomerManagement(ToolBase):
                 examples={
                     "available_types": available_types,
                     "usage": "get_examples(example_type='basic')",
-                    "common_types": ["basic", "advanced", "validation", "relationships"],
+                    "common_types": ["basic", "advanced", "validation"],
                 },
             )
 
@@ -4606,7 +4581,7 @@ class CustomerManagement(ToolBase):
         result_text += '  "email": "user@example.com",\n'
         result_text += '  "firstName": "John",\n'
         result_text += '  "lastName": "Doe",\n'
-        result_text += '  "roles": ["ROLE_TENANT_ADMIN"]\n'
+        result_text += '  "roles": ["ROLE_API_CONSUMER"]\n'
         result_text += "}\n"
         result_text += "```\n\n"
 
@@ -4644,7 +4619,7 @@ class CustomerManagement(ToolBase):
         key_capabilities = [
             "Manage multiple customer resource types (users, subscribers, organizations, teams)",
             "Hierarchical customer structures with organizations containing teams and users",
-            "Customer analytics and relationship mapping",
+            "Customer analytics",
             "Cross-resource validation and business rule enforcement",
             "Bulk customer operations and data management",
             "Integration with subscriptions, products, and alerts",
@@ -4709,7 +4684,7 @@ class CustomerManagement(ToolBase):
             },
             {
                 "title": "Customer Analytics",
-                "description": "Analyze customer data and activity patterns",
+                "description": "Count one page of customers and the teams, organizations or parents they reference",
                 "example": "analyze(resource_type='users', filters={'query': 'acme'})",
             },
             {
@@ -4726,7 +4701,7 @@ class CustomerManagement(ToolBase):
             "Use get_examples(resource_type='...') to see working customer templates",
             "Validate configurations with validate(resource_type='...', ...data={...}, dry_run=True)",
             "Create customers with create(resource_type='...', ...data={...})",
-            "Analyze customer data with analyze(resource_type='...') and get_relationships(...)",
+            "Analyze customer data with analyze(resource_type='...')",
             "Manage hierarchies through organizations and teams",
         ]
 
@@ -4841,7 +4816,7 @@ class CustomerManagement(ToolBase):
                     "rottingDays thresholds (how many days of INACTIVITY, not age, make an "
                     "open pull request aging or rotting), the cutoffDate, the excludedRepos, "
                     "the custom automationPatterns and the assistedOnly default view for AI-assisted pull requests; reads also "
-                    "echo builtInAutomationPatterns, cutoffDateIsDefault and defaultCutoffDate. "
+                    "echo builtInAutomationPatterns, cutoffDateIsDefault, defaultCountsSince and defaultCutoffDate. "
                     "The thresholds, cutoffDate and excludedRepos reshape the PR-health report, which is read "
                     "with business_analytics_management get_pr_health."
                 ),
@@ -4866,7 +4841,7 @@ class CustomerManagement(ToolBase):
                     "At least one of aging_days, rotting_days, assisted_only, automation_patterns, cutoff_date or excluded_repos is required",
                     f"Both thresholds are bounded to {PR_HEALTH_MIN_THRESHOLD_DAYS}-{PR_HEALTH_MAX_THRESHOLD_DAYS} days and aging_days must be lower than rotting_days",
                     PR_HEALTH_OMITTED_FIELDS_NOTE,
-                    "builtInAutomationPatterns, cutoffDateIsDefault and defaultCutoffDate are read-only here; restoring the telemetry-default cutoff is not exposed",
+                    "builtInAutomationPatterns, cutoffDateIsDefault, defaultCountsSince and defaultCutoffDate are read-only here; clearing the team's cutoff date is not exposed (without one, counts start at defaultCountsSince)",
                     PR_HEALTH_FULL_REPLACEMENT_NOTE,
                     PR_HEALTH_CONCURRENCY_NOTE,
                     "When a stored threshold or optional setting comes back different from the value sent, the response carries divergence_warning naming the fields the interleaved write changed, with the sent and stored values in divergence_detail (excludedRepos is compared ignoring order and case, as the platform sorts and matches it case-insensitively)",
@@ -5034,14 +5009,12 @@ class CustomerManagement(ToolBase):
             ),
             ToolCapability(
                 name="Customer Analytics",
-                description="Analyze customer data and relationships",
+                description="Analyze customer data",
                 parameters={
                     "analyze": {"resource_type": "str", "filters": "dict"},
-                    "get_relationships": {"resource_type": "str", "resource_id": "str"},
                 },
                 examples=[
                     "analyze(resource_type='users', filters={'query': 'acme'})",
-                    "get_relationships(resource_type='organizations', resource_id='org_123')",
                 ],
             ),
             ToolCapability(
@@ -5096,7 +5069,8 @@ class CustomerManagement(ToolBase):
                     # Generate lastName from email prefix or domain
                     name_part = email_parts[0].replace(".", " ").replace("_", " ").title()
                     parts = name_part.split()
-                    result["lastName"] = parts[-1] if len(parts) > 1 else "Name"
+                    if len(parts) > 1:
+                        result["lastName"] = parts[-1]
             if not result.get("roles"):
                 result["roles"] = ["ROLE_API_CONSUMER"]
 
@@ -5110,7 +5084,8 @@ class CustomerManagement(ToolBase):
                 if len(email_parts) == 2 and not result.get("lastName"):
                     name_part = email_parts[0].replace(".", " ").replace("_", " ").title()
                     parts = name_part.split()
-                    result["lastName"] = parts[-1] if len(parts) > 1 else "Name"
+                    if len(parts) > 1:
+                        result["lastName"] = parts[-1]
             if not result.get("roles"):
                 result["roles"] = ["ROLE_API_CONSUMER"]
             if not result.get("organizationIds") and "email" in result:
@@ -5155,7 +5130,6 @@ class CustomerManagement(ToolBase):
             "get_roles",
             "validate",
             "get_agent_summary",
-            "get_relationships",
             "get_tool_metadata",
         ]
 
@@ -5176,10 +5150,15 @@ class CustomerManagement(ToolBase):
                 "resource_data": {
                     "type": "object",
                     "description": (
-                        "The resource fields for create/update. For creates, name is "
-                        "the key field — email/firstName/lastName are auto-generated "
-                        "from it when auto_generate is on. This matches the registered "
-                        "tool signature: there is no top-level name parameter."
+                        "The resource fields for create/update. Organizations and "
+                        "teams need name. Users and subscribers need email; with "
+                        "auto_generate on, firstName is taken from the part of the "
+                        "email before @, and lastName too when that part has two or "
+                        "more words separated by . or _ (for example "
+                        "john.doe@acme.com). Users always need a lastName, so give "
+                        "one when the email cannot supply it. Subscribers also need "
+                        "organizationIds (use list with resource_type='organizations' "
+                        "to find ids). There is no top-level name parameter."
                     ),
                 },
                 "team_id": {
@@ -5235,7 +5214,6 @@ class CustomerManagement(ToolBase):
                     ),
                 },
                 **digest_input_schema_properties(),
-                # Note: email, firstName, lastName auto-generated from name
                 # Note: ownerId, teamId system-managed for customer resources
                 # Note: resource_type determined from context
             },
@@ -5250,8 +5228,9 @@ class CustomerManagement(ToolBase):
             "allOf": [
                 # The create requirement is per resource type, matching the
                 # runtime exactly: organizations/teams key on name, while
-                # users/subscribers are email-keyed (auto-generation derives
-                # firstName from the email prefix). Requiring name globally
+                # users/subscribers key on email (auto-generation derives
+                # firstName from the email prefix) and the server never makes
+                # an email up from a name. Requiring name globally
                 # forced email-based creates to invent one; requiring only the
                 # container blessed empty payloads that failed at execution.
                 {
@@ -5307,14 +5286,42 @@ class CustomerManagement(ToolBase):
                         "properties": {
                             "resource_data": {
                                 "type": "object",
-                                "anyOf": [
-                                    {"required": ["email"]},
-                                    {"required": ["name"]},
-                                ],
+                                "required": ["email"],
                             }
                         }
                     },
-                }
+                },
+                # A subscriber is filed under the organizations it names; the
+                # server never picks one, so organizationIds is a real requirement.
+                {
+                    "if": {
+                        "properties": {
+                            "action": {"const": "create"},
+                            "resource_type": {"const": "subscribers"},
+                        },
+                        "required": ["action", "resource_type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "resource_data": {
+                                "type": "object",
+                                "required": ["organizationIds"],
+                                "properties": {
+                                    "organizationIds": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        # \S: the runtime refuses blank ids too
+                                        "items": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "pattern": "\\S",
+                                        },
+                                    }
+                                },
+                            }
+                        }
+                    },
+                },
             ],
         }
 
@@ -5394,11 +5401,11 @@ class CustomerManagement(ToolBase):
             ),
             UsagePattern(
                 pattern_name="Customer Analytics",
-                description="Analyze customer relationships and metrics",
+                description="Analyze customer metrics",
                 frequency=0.5,
-                typical_sequence=["analyze", "get_relationships"],
+                typical_sequence=["analyze"],
                 common_parameters={"filters": {"query": "acme"}},
-                success_indicators=["Analytics generated", "Relationships mapped"],
+                success_indicators=["Analytics generated"],
             ),
         ]
 
@@ -5406,12 +5413,12 @@ class CustomerManagement(ToolBase):
         """Get agent summary."""
         return """**Customer Management Tool**
 
-Comprehensive customer lifecycle management for the Revenium platform. Handle users, subscribers, organizations, and teams with hierarchical structures, relationship mapping, and analytics capabilities.
+Comprehensive customer lifecycle management for the Revenium platform. Handle users, subscribers, organizations, and teams with hierarchical structures and analytics capabilities.
 
 **Key Features:**
 • Multi-resource customer management (Users, Subscribers, Organizations, Teams)
 • Hierarchical organizational structures
-• Customer relationship mapping and analytics
+• Customer analytics
 • Integration with subscriptions, products, and alerts
 • Agent-friendly error handling and guidance"""
 
@@ -5422,7 +5429,7 @@ Comprehensive customer lifecycle management for the Revenium platform. Handle us
             "Use get_examples(resource_type='...') to see working customer templates",
             "List customers with list(resource_type='users') or other resource types",
             "Create customers with create(resource_type='...', ...data={...})",
-            "Analyze relationships with get_relationships() and analyze()",
+            "Analyze customer data with analyze()",
             "Manage hierarchies through organizations and teams",
         ]
 

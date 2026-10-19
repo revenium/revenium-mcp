@@ -35,7 +35,7 @@ class ProviderCostsFormatter(AnalyticsResponseFormatter):
                 "provider costs",
                 period,
                 f"aggregation: {aggregation}",
-                scope_note=self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY),
+                scope_note=self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY, period),
             )
 
         return self._format_provider_costs_content(
@@ -175,4 +175,4 @@ class ProviderCostsFormatter(AnalyticsResponseFormatter):
         footer = self.utilities.add_insights_footer(
             "provider costs", period, f"{aggregation} aggregation"
         )
-        return f"{footer}\n{self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY)}"
+        return f"{footer}\n{self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY, period)}"

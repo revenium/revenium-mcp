@@ -3,11 +3,9 @@
 Covers:
 - submit_transaction: full submission flow, validation, payload building, caching, errors
 - _process_batch_result: batch response parsing for exceptions, dicts, unexpected types
-- _handle_retry_attempt: single retry logic with success, failure, exception paths
-- _execute_with_retry: retry loop, max attempts, backoff delays
 - _process_session_results: session store result aggregation
 - _build_api_result_entry: result structure building for found/not-found
-- _process_api_results: API response transformation with retry integration
+- _process_api_results: round-based search of the ids the session store did not hold
 - lookup_transactions: end-to-end lookup entry point
 - _search_transaction_pages: pagination, page iteration, early termination, caching
 """
@@ -16,7 +14,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.revenium_mcp_server.auth.tenant_scope import LOCAL_TENANT_SCOPE
 from src.revenium_mcp_server.tools_decomposed.metering_management import (
+    _LOOKUP_DEFAULT_PAGE_SIZE,
+    _LOOKUP_MAX_PAGE_SIZE,
     MeteringTransactionManager,
 )
 from src.revenium_mcp_server.common.error_handling import ToolError
@@ -82,7 +83,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                result = await self.mgr.submit_transaction(client, VALID_ARGS.copy())
+                result = await self.mgr.submit_transaction(client, VALID_ARGS.copy(), LOCAL_TENANT_SCOPE)
 
         assert result["status"] == "submitted"
         assert result["model"] == "gpt-4"
@@ -101,7 +102,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, VALID_ARGS.copy())
+                await self.mgr.submit_transaction(client, VALID_ARGS.copy(), LOCAL_TENANT_SCOPE)
 
         posted_payload = client.post.call_args[1]["data"]
         assert posted_payload["inputTokenCount"] == 1500
@@ -119,7 +120,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, VALID_ARGS.copy())
+                await self.mgr.submit_transaction(client, VALID_ARGS.copy(), LOCAL_TENANT_SCOPE)
 
         posted_payload = client.post.call_args[1]["data"]
         # Auto-calculated as 10% of duration_ms (2500 -> 250)
@@ -137,7 +138,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, args)
+                await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         posted_payload = client.post.call_args[1]["data"]
         assert posted_payload["timeToFirstToken"] == 500
@@ -154,7 +155,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                result = await self.mgr.submit_transaction(client, args)
+                result = await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         assert result["transaction_id"] == "tx_a1b2c3d4e5f6"
 
@@ -170,7 +171,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                result = await self.mgr.submit_transaction(client, args)
+                result = await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         assert result["transaction_id"] == "550e8400-e29b-41d4-a716-446655440000"
 
@@ -187,7 +188,7 @@ class TestSubmitTransaction:
                 return_value={"valid": True, "message": "ok"},
             ):
                 with pytest.raises(ToolError) as excinfo:
-                    await self.mgr.submit_transaction(client, args)
+                    await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         err = excinfo.value
         assert getattr(err, "field", None) == "transaction_id"
@@ -207,7 +208,7 @@ class TestSubmitTransaction:
                 return_value={"valid": True, "message": "ok"},
             ):
                 with pytest.raises(ToolError) as excinfo:
-                    await self.mgr.submit_transaction(client, args)
+                    await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         err = excinfo.value
         assert getattr(err, "field", None) == "transaction_id"
@@ -224,12 +225,13 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                result = await self.mgr.submit_transaction(client, VALID_ARGS.copy())
+                result = await self.mgr.submit_transaction(client, VALID_ARGS.copy(), LOCAL_TENANT_SCOPE)
 
         tid = result["transaction_id"]
-        assert tid in self.mgr.transaction_store
-        assert self.mgr.transaction_store[tid]["submitted"] is True
-        assert self.mgr.transaction_store[tid]["verified"] is False
+        stored = self.mgr.transaction_store.get(LOCAL_TENANT_SCOPE, tid)
+        assert stored is not None
+        assert stored["submitted"] is True
+        assert stored["verified"] is False
 
     # --- Validation failure ---
 
@@ -243,7 +245,7 @@ class TestSubmitTransaction:
             return_value={"valid": False, "message": "Missing model field"},
         ):
             with pytest.raises(ToolError) as exc_info:
-                await self.mgr.submit_transaction(client, VALID_ARGS.copy())
+                await self.mgr.submit_transaction(client, VALID_ARGS.copy(), LOCAL_TENANT_SCOPE)
             assert "validation failed" in str(exc_info.value).lower()
 
     # --- time_to_first_token validation ---
@@ -259,7 +261,7 @@ class TestSubmitTransaction:
             return_value={"valid": True, "message": "ok"},
         ):
             with pytest.raises(ToolError):
-                await self.mgr.submit_transaction(client, args)
+                await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
     @pytest.mark.asyncio
     async def test_non_numeric_time_to_first_token_raises(self):
@@ -272,7 +274,7 @@ class TestSubmitTransaction:
             return_value={"valid": True, "message": "ok"},
         ):
             with pytest.raises(ToolError):
-                await self.mgr.submit_transaction(client, args)
+                await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
     # --- Optional fields ---
 
@@ -294,7 +296,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, args)
+                await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         posted_payload = client.post.call_args[1]["data"]
         assert posted_payload["organizationName"] == "org_123"
@@ -314,7 +316,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, args)
+                await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         posted_payload = client.post.call_args[1]["data"]
         assert "organizationName" not in posted_payload
@@ -336,7 +338,7 @@ class TestSubmitTransaction:
                 return_value={"valid": True, "message": "ok"},
             ):
                 with pytest.raises(ToolError) as excinfo:
-                    await self.mgr.submit_transaction(client, args)
+                    await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         err = excinfo.value
         assert getattr(err, "field", None) == "organization_id"
@@ -360,7 +362,7 @@ class TestSubmitTransaction:
                 return_value={"valid": True, "message": "ok"},
             ):
                 with pytest.raises(ToolError) as excinfo:
-                    await self.mgr.submit_transaction(client, args)
+                    await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         err = excinfo.value
         assert getattr(err, "field", None) == "product_id"
@@ -386,7 +388,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, args)
+                await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         posted_payload = client.post.call_args[1]["data"]
         assert posted_payload["subscriber"]["id"] == "sub_1"
@@ -410,7 +412,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, args)
+                await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         posted_payload = client.post.call_args[1]["data"]
         assert posted_payload["subscriber"]["credential"]["name"] == "api-key"
@@ -428,7 +430,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, args)
+                await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         posted_payload = client.post.call_args[1]["data"]
         assert "subscriber" not in posted_payload
@@ -445,7 +447,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, args)
+                await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         posted_payload = client.post.call_args[1]["data"]
         assert "subscriber" not in posted_payload
@@ -465,7 +467,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                result = await self.mgr.submit_transaction(client, VALID_ARGS.copy())
+                result = await self.mgr.submit_transaction(client, VALID_ARGS.copy(), LOCAL_TENANT_SCOPE)
 
         # When cached, client.post should NOT be called
         client.post.assert_not_called()
@@ -482,7 +484,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, VALID_ARGS.copy())
+                await self.mgr.submit_transaction(client, VALID_ARGS.copy(), LOCAL_TENANT_SCOPE)
 
         mock_cache.set_cached_response.assert_called_once()
 
@@ -501,7 +503,7 @@ class TestSubmitTransaction:
                 return_value={"valid": True, "message": "ok"},
             ):
                 with pytest.raises(Exception, match="Connection refused"):
-                    await self.mgr.submit_transaction(client, VALID_ARGS.copy())
+                    await self.mgr.submit_transaction(client, VALID_ARGS.copy(), LOCAL_TENANT_SCOPE)
 
     # --- Endpoint ---
 
@@ -516,7 +518,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, VALID_ARGS.copy())
+                await self.mgr.submit_transaction(client, VALID_ARGS.copy(), LOCAL_TENANT_SCOPE)
 
         assert client.post.call_args[0][0] == "/meter/v2/ai/completions"
 
@@ -533,7 +535,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, VALID_ARGS.copy())
+                await self.mgr.submit_transaction(client, VALID_ARGS.copy(), LOCAL_TENANT_SCOPE)
 
         posted_payload = client.post.call_args[1]["data"]
         assert posted_payload["stopReason"] == "END"
@@ -553,7 +555,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, args)
+                await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         posted_payload = client.post.call_args[1]["data"]
         assert posted_payload["stopReason"] == "MAX_TOKENS"
@@ -570,7 +572,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, args)
+                await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         posted_payload = client.post.call_args[1]["data"]
         assert posted_payload["isStreamed"] is True
@@ -593,7 +595,7 @@ class TestSubmitTransaction:
                     "src.revenium_mcp_server.tools_decomposed.metering_management.extract_trace_fields",
                     return_value={"traceId": "trace_abc123"},
                 ):
-                    await self.mgr.submit_transaction(client, args)
+                    await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         posted_payload = client.post.call_args[1]["data"]
         assert posted_payload["traceId"] == "trace_abc123"
@@ -617,7 +619,7 @@ class TestSubmitTransaction:
                 new_callable=AsyncMock,
                 return_value={"valid": True, "message": "ok"},
             ):
-                await self.mgr.submit_transaction(client, args)
+                await self.mgr.submit_transaction(client, args, LOCAL_TENANT_SCOPE)
 
         posted_payload = client.post.call_args[1]["data"]
         assert posted_payload["reasoningTokenCount"] == 100
@@ -671,206 +673,6 @@ class TestProcessBatchResult:
 
 
 # ===========================================================================
-# _handle_retry_attempt
-# ===========================================================================
-
-
-class TestHandleRetryAttempt:
-    """MeteringTransactionManager._handle_retry_attempt — single retry logic."""
-
-    def setup_method(self):
-        self.mgr = MeteringTransactionManager()
-
-    @pytest.mark.asyncio
-    async def test_successful_operation_returns_success(self):
-        async def op():
-            return {"data": "found"}, {"pages": 1}
-
-        success, result, metadata, error = await self.mgr._handle_retry_attempt(
-            op, "tx_001", 0, 3, "lookup"
-        )
-        assert success is True
-        assert result == {"data": "found"}
-        assert metadata == {"pages": 1}
-        assert error is None
-
-    @pytest.mark.asyncio
-    async def test_operation_returns_none_result(self):
-        async def op():
-            return None, {}
-
-        success, result, metadata, error = await self.mgr._handle_retry_attempt(
-            op, "tx_001", 0, 3, "lookup"
-        )
-        assert success is False
-        assert result is None
-        assert error is None
-
-    @pytest.mark.asyncio
-    async def test_operation_returns_empty_dict_result(self):
-        async def op():
-            return {}, {"pages": 1}
-
-        success, result, metadata, error = await self.mgr._handle_retry_attempt(
-            op, "tx_001", 0, 3, "lookup"
-        )
-        # Empty dict is falsy, so should return not-success
-        assert success is False
-
-    @pytest.mark.asyncio
-    async def test_operation_raises_exception(self):
-        async def op():
-            raise ConnectionError("API down")
-
-        success, result, metadata, error = await self.mgr._handle_retry_attempt(
-            op, "tx_001", 0, 3, "lookup"
-        )
-        assert success is False
-        assert result is None
-        assert isinstance(error, ConnectionError)
-
-    @pytest.mark.asyncio
-    async def test_falsy_result_with_metadata_returns_not_success(self):
-        """Empty list is falsy, should not be treated as success."""
-        async def op():
-            return [], {"pages": 1}
-
-        success, result, metadata, error = await self.mgr._handle_retry_attempt(
-            op, "tx_001", 0, 3, "lookup"
-        )
-        assert success is False
-        assert result is None
-
-
-# ===========================================================================
-# _execute_with_retry
-# ===========================================================================
-
-
-class TestExecuteWithRetry:
-    """MeteringTransactionManager._execute_with_retry — retry loop."""
-
-    def setup_method(self):
-        self.mgr = MeteringTransactionManager()
-
-    @pytest.mark.asyncio
-    async def test_succeeds_on_first_attempt(self):
-        call_count = 0
-
-        async def op():
-            nonlocal call_count
-            call_count += 1
-            return {"found": True}, {"pages": 1}
-
-        success, result, metadata, error = await self.mgr._execute_with_retry(
-            op, "tx_001", max_retries=3, retry_interval=0, operation_name="lookup"
-        )
-        assert success is True
-        assert call_count == 1
-
-    @pytest.mark.asyncio
-    async def test_succeeds_on_second_attempt(self):
-        attempts = []
-
-        async def op():
-            attempts.append(1)
-            if len(attempts) < 2:
-                return None, {}
-            return {"found": True}, {"pages": 2}
-
-        success, result, metadata, error = await self.mgr._execute_with_retry(
-            op, "tx_001", max_retries=3, retry_interval=0, operation_name="lookup"
-        )
-        assert success is True
-        assert len(attempts) == 2
-
-    @pytest.mark.asyncio
-    async def test_exhausts_all_retries_and_fails(self):
-        call_count = 0
-
-        async def op():
-            nonlocal call_count
-            call_count += 1
-            return None, {}
-
-        success, result, metadata, error = await self.mgr._execute_with_retry(
-            op, "tx_001", max_retries=3, retry_interval=0, operation_name="lookup"
-        )
-        assert success is False
-        assert call_count == 3
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_last_error_returned_on_failure(self):
-        attempts = []
-
-        async def op():
-            attempts.append(1)
-            raise RuntimeError(f"Attempt {len(attempts)} failed")
-
-        success, _, _, error = await self.mgr._execute_with_retry(
-            op, "tx_001", max_retries=2, retry_interval=0, operation_name="lookup"
-        )
-        assert success is False
-        assert isinstance(error, RuntimeError)
-        assert "Attempt 2" in str(error)
-
-    @pytest.mark.asyncio
-    async def test_retry_interval_causes_sleep(self):
-        async def op():
-            return None, {}
-
-        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            await self.mgr._execute_with_retry(
-                op, "tx_001", max_retries=2, retry_interval=5, operation_name="lookup"
-            )
-            # Should sleep once (between attempt 1 and 2, not after last)
-            mock_sleep.assert_called_once_with(5)
-
-    @pytest.mark.asyncio
-    async def test_no_sleep_after_last_attempt(self):
-        async def op():
-            return None, {}
-
-        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            await self.mgr._execute_with_retry(
-                op, "tx_001", max_retries=1, retry_interval=5, operation_name="lookup"
-            )
-            mock_sleep.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_single_retry_max(self):
-        call_count = 0
-
-        async def op():
-            nonlocal call_count
-            call_count += 1
-            return None, {}
-
-        await self.mgr._execute_with_retry(
-            op, "tx_001", max_retries=1, retry_interval=0, operation_name="lookup"
-        )
-        assert call_count == 1
-
-    @pytest.mark.asyncio
-    async def test_exception_then_success(self):
-        attempts = []
-
-        async def op():
-            attempts.append(1)
-            if len(attempts) == 1:
-                raise ConnectionError("Transient failure")
-            return {"found": True}, {}
-
-        success, result, _, error = await self.mgr._execute_with_retry(
-            op, "tx_001", max_retries=3, retry_interval=0, operation_name="lookup"
-        )
-        assert success is True
-        assert error is None
-        assert len(attempts) == 2
-
-
-# ===========================================================================
 # _process_session_results
 # ===========================================================================
 
@@ -883,12 +685,12 @@ class TestProcessSessionResults:
 
     @pytest.mark.asyncio
     async def test_found_in_session_returns_result_and_empty_remaining(self):
-        self.mgr.transaction_store["tx_s1"] = {
+        self.mgr.transaction_store.put(LOCAL_TENANT_SCOPE, "tx_s1", {
             "payload": {"model": "gpt-4"},
             "verified": False,
-        }
+        })
 
-        results, remaining = await self.mgr._process_session_results(["tx_s1"])
+        results, remaining = await self.mgr._process_session_results(["tx_s1"], LOCAL_TENANT_SCOPE)
         assert len(results) == 1
         assert results[0]["transaction_id"] == "tx_s1"
         assert results[0]["found"] is True
@@ -897,30 +699,30 @@ class TestProcessSessionResults:
 
     @pytest.mark.asyncio
     async def test_not_in_session_returns_empty_results_and_remaining(self):
-        results, remaining = await self.mgr._process_session_results(["tx_missing"])
+        results, remaining = await self.mgr._process_session_results(["tx_missing"], LOCAL_TENANT_SCOPE)
         assert len(results) == 0
         assert remaining == ["tx_missing"]
 
     @pytest.mark.asyncio
     async def test_mixed_session_and_remaining(self):
-        self.mgr.transaction_store["tx_s1"] = {
+        self.mgr.transaction_store.put(LOCAL_TENANT_SCOPE, "tx_s1", {
             "payload": {"model": "gpt-4"},
             "verified": False,
-        }
+        })
 
         results, remaining = await self.mgr._process_session_results(
-            ["tx_s1", "tx_missing"]
+            ["tx_s1", "tx_missing"], LOCAL_TENANT_SCOPE
         )
         assert len(results) == 1
         assert remaining == ["tx_missing"]
 
     @pytest.mark.asyncio
     async def test_multiple_session_hits(self):
-        self.mgr.transaction_store["tx_s1"] = {"payload": {}, "verified": False}
-        self.mgr.transaction_store["tx_s2"] = {"payload": {}, "verified": False}
+        self.mgr.transaction_store.put(LOCAL_TENANT_SCOPE, "tx_s1", {"payload": {}, "verified": False})
+        self.mgr.transaction_store.put(LOCAL_TENANT_SCOPE, "tx_s2", {"payload": {}, "verified": False})
 
         results, remaining = await self.mgr._process_session_results(
-            ["tx_s1", "tx_s2"]
+            ["tx_s1", "tx_s2"], LOCAL_TENANT_SCOPE
         )
         assert len(results) == 2
         assert remaining == []
@@ -1013,9 +815,9 @@ class TestProcessApiResults:
 
         with patch.object(
             self.mgr,
-            "_execute_with_retry",
+            "_search_transaction_pages",
             new_callable=AsyncMock,
-            return_value=(True, found_data, metadata, None),
+            return_value=(found_data, metadata),
         ):
             params = {
                 "max_retries": 3,
@@ -1039,9 +841,9 @@ class TestProcessApiResults:
 
         with patch.object(
             self.mgr,
-            "_execute_with_retry",
+            "_search_transaction_pages",
             new_callable=AsyncMock,
-            return_value=(False, None, metadata, None),
+            return_value=(None, metadata),
         ):
             params = {
                 "max_retries": 3,
@@ -1056,24 +858,22 @@ class TestProcessApiResults:
 
         assert len(results) == 1
         assert results[0]["found"] is False
+        assert "5,000 transactions across 5 pages" in results[0]["message"]
 
     @pytest.mark.asyncio
     async def test_multiple_ids_processed(self):
         client = _make_client()
 
-        call_count = 0
+        searched = []
 
-        seen_retry_on_empty = []
-
-        async def mock_retry(op, tid, max_retries, interval, name, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            seen_retry_on_empty.append(kwargs.get("retry_on_empty"))
+        async def mock_search(client, tid, *args, **kwargs):
+            searched.append(tid)
             if tid == "tx_found":
-                return True, {"transactionId": tid}, {"found": True, "pages_searched": 1, "transactions_examined": 100}, None
-            return False, None, {"found": False, "pages_searched": 5, "transactions_examined": 5000}, None
+                return {"transactionId": tid}, {"found": True, "pages_searched": 1, "transactions_examined": 100}
+            return None, {"found": False, "pages_searched": 5, "transactions_examined": 5000}
 
-        with patch.object(self.mgr, "_execute_with_retry", side_effect=mock_retry):
+        with patch.object(self.mgr, "_search_transaction_pages", side_effect=mock_search), \
+             patch("asyncio.sleep", new_callable=AsyncMock) as sleep:
             params = {
                 "max_retries": 3,
                 "retry_interval": 0,
@@ -1085,12 +885,13 @@ class TestProcessApiResults:
                 client, ["tx_found", "tx_missing"], params
             )
 
-        assert len(results) == 2
-        assert call_count == 2
+        assert [r["transaction_id"] for r in results] == ["tx_found", "tx_missing"]
+        assert [r["found"] for r in results] == [True, False]
         # params in this test omits retry_on_empty — the lookup-specific
-        # fallback must be the prompt-not-found default (False), not the
-        # legacy retry-on-empty behavior.
-        assert seen_retry_on_empty == [False, False]
+        # fallback must be the prompt-not-found default (one round, no pause),
+        # not the legacy retry-on-empty behavior.
+        assert sorted(searched) == ["tx_found", "tx_missing"]
+        sleep.assert_not_called()
 
 
 # ===========================================================================
@@ -1108,22 +909,22 @@ class TestLookupTransactions:
     async def test_empty_transaction_ids_raises(self):
         client = _make_client()
         with pytest.raises(ToolError):
-            await self.mgr.lookup_transactions(client, {"transaction_ids": []})
+            await self.mgr.lookup_transactions(client, {"transaction_ids": []}, LOCAL_TENANT_SCOPE)
 
     @pytest.mark.asyncio
     async def test_session_only_lookup(self):
         """Transaction found in session => no API call."""
         client = _make_client()
-        self.mgr.transaction_store["tx_s1"] = {
+        self.mgr.transaction_store.put(LOCAL_TENANT_SCOPE, "tx_s1", {
             "payload": {"model": "gpt-4"},
             "verified": False,
-        }
+        })
 
         with patch.object(
             self.mgr, "_process_api_results", new_callable=AsyncMock, return_value=[]
         ) as mock_api:
             result = await self.mgr.lookup_transactions(
-                client, {"transaction_ids": ["tx_s1"]}
+                client, {"transaction_ids": ["tx_s1"]}, LOCAL_TENANT_SCOPE
             )
 
         assert result["summary"]["found_count"] == 1
@@ -1149,7 +950,7 @@ class TestLookupTransactions:
             return_value=[api_result],
         ):
             result = await self.mgr.lookup_transactions(
-                client, {"transaction_ids": ["tx_api1"]}
+                client, {"transaction_ids": ["tx_api1"]}, LOCAL_TENANT_SCOPE
             )
 
         assert result["summary"]["found_count"] == 1
@@ -1158,10 +959,10 @@ class TestLookupTransactions:
     @pytest.mark.asyncio
     async def test_mixed_session_and_api_lookup(self):
         client = _make_client()
-        self.mgr.transaction_store["tx_s1"] = {
+        self.mgr.transaction_store.put(LOCAL_TENANT_SCOPE, "tx_s1", {
             "payload": {"model": "gpt-4"},
             "verified": False,
-        }
+        })
         api_result = {
             "transaction_id": "tx_api1",
             "found": True,
@@ -1175,7 +976,7 @@ class TestLookupTransactions:
             return_value=[api_result],
         ):
             result = await self.mgr.lookup_transactions(
-                client, {"transaction_ids": ["tx_s1", "tx_api1"]}
+                client, {"transaction_ids": ["tx_s1", "tx_api1"]}, LOCAL_TENANT_SCOPE
             )
 
         assert result["summary"]["total_requested"] == 2
@@ -1186,10 +987,10 @@ class TestLookupTransactions:
     @pytest.mark.asyncio
     async def test_configuration_included_in_response(self):
         client = _make_client()
-        self.mgr.transaction_store["tx_s1"] = {
+        self.mgr.transaction_store.put(LOCAL_TENANT_SCOPE, "tx_s1", {
             "payload": {},
             "verified": False,
-        }
+        })
 
         with patch.object(
             self.mgr, "_process_api_results", new_callable=AsyncMock, return_value=[]
@@ -1197,6 +998,7 @@ class TestLookupTransactions:
             result = await self.mgr.lookup_transactions(
                 client,
                 {"transaction_ids": ["tx_s1"], "max_retries": 5, "retry_interval": 10},
+                LOCAL_TENANT_SCOPE,
             )
 
         assert result["configuration"]["max_retries"] == 5
@@ -1218,7 +1020,7 @@ class TestLookupTransactions:
             return_value=[api_result],
         ):
             result = await self.mgr.lookup_transactions(
-                client, {"transaction_ids": ["tx_missing"]}
+                client, {"transaction_ids": ["tx_missing"]}, LOCAL_TENANT_SCOPE
             )
 
         assert result["summary"]["missing_count"] == 1
@@ -1358,22 +1160,30 @@ class TestSearchTransactionPages:
         assert client.get.call_count == 2  # Called twice but second had no data
 
     @pytest.mark.asyncio
-    async def test_api_error_stops_search(self):
+    async def test_api_error_raises_with_pages_searched(self):
+        """A page the platform did not answer is a failed search, not the end
+        of the data: it raises TransactionSearchFailed carrying how far the
+        search got, instead of returning "not found"."""
         client = _make_client()
         other_txn = {"transactionId": "tx_other", "model": "gpt-3.5"}
+        cause = Exception("500 Internal Server Error")
 
         page_responses = [
             self._make_page_response([other_txn], page=0, total_pages=5),
-            Exception("500 Internal Server Error"),
+            cause,
         ]
         client.get = AsyncMock(side_effect=page_responses)
 
-        result, metadata = await self.mgr._search_transaction_pages(
-            client, "tx_missing", search_page_range=5, page_size=100
-        )
+        with pytest.raises(Exception) as raised:
+            await self.mgr._search_transaction_pages(
+                client, "tx_missing", search_page_range=5, page_size=100
+            )
 
-        assert result is None
-        assert metadata["pages_searched"] == 1
+        assert type(raised.value).__name__ == "TransactionSearchFailed"
+        assert raised.value.transaction_id == "tx_missing"
+        assert raised.value.pages_searched == 1
+        assert raised.value.page == 1
+        assert raised.value.cause is cause
 
     @pytest.mark.asyncio
     async def test_content_response_format(self):
@@ -1541,10 +1351,11 @@ class TestExtractLookupParameters:
         assert params["wait_seconds"] == 30
         assert params["max_retries"] == 3
         assert params["retry_interval"] == 15
-        assert params["search_page_range"] == 50
-        assert params["page_size"] == 1000
+        assert params["search_page_range"] == 10
+        assert params["page_size"] == _LOOKUP_DEFAULT_PAGE_SIZE
         assert params["early_termination"] is True
         assert params["return_transaction_data"] == "no"
+        assert params["adjustments"] == []
 
     def test_custom_values_used(self):
         params = self.mgr._extract_lookup_parameters(
@@ -1552,16 +1363,16 @@ class TestExtractLookupParameters:
                 "transaction_ids": ["tx_001"],
                 "max_retries": 5,
                 "retry_interval": 10,
-                "search_page_range": 20,
-                "page_size": 500,
+                "search_page_range": 8,
+                "page_size": 50,
                 "early_termination": False,
                 "return_transaction_data": "full",
             }
         )
         assert params["max_retries"] == 5
         assert params["retry_interval"] == 10
-        assert params["search_page_range"] == 20
-        assert params["page_size"] == 500
+        assert params["search_page_range"] == 8
+        assert params["page_size"] == 50
         assert params["early_termination"] is False
         assert params["return_transaction_data"] == "full"
 
@@ -1586,12 +1397,13 @@ class TestBuildConfigurationObject:
             "wait_seconds": 30,
             "max_retries": 3,
             "retry_interval": 15,
-            "search_page_range": 50,
+            "search_page_range": 10,
             "page_size": 1000,
             "early_termination": True,
+            "adjustments": ["max_retries 50 is above the limit of 10; used 10"],
         }
-        config = self.mgr._build_configuration_object(params)
-        assert config == params
+        config = self.mgr._build_configuration_object({**params, "retry_on_empty": True})
+        assert config == {**params, "polling": True}
 
     def test_extra_fields_excluded(self):
         params = {
@@ -1611,47 +1423,13 @@ class TestBuildConfigurationObject:
 
 class TestLookupNotFoundFastPath:
     """A lookup for a nonexistent transaction must return promptly by default;
-    retry-on-empty is opt-in (explicit max_retries/retry_interval = the
-    post-submit polling flow), and transport errors keep retrying."""
+    retry-on-empty is opt-in (explicit max_retries, retry_interval or
+    wait_seconds = the post-submit polling flow). A platform or transport
+    failure ends polling and is reported as a lookup error, not retried (see
+    TestLookupPollsInRounds and TestLookupPlatformFailureIsAnError)."""
 
     def setup_method(self):
         self.mgr = MeteringTransactionManager()
-
-    @pytest.mark.asyncio
-    async def test_retry_on_empty_false_returns_after_single_attempt(self):
-        call_count = 0
-
-        async def op():
-            nonlocal call_count
-            call_count += 1
-            return None, {}
-
-        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            success, result, _, error = await self.mgr._execute_with_retry(
-                op, "tx_bogus", max_retries=3, retry_interval=15,
-                operation_name="lookup", retry_on_empty=False,
-            )
-        assert success is False
-        assert call_count == 1
-        mock_sleep.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_retry_on_empty_false_still_retries_exceptions(self):
-        call_count = 0
-
-        async def op():
-            nonlocal call_count
-            call_count += 1
-            raise RuntimeError("transient transport error")
-
-        with patch("asyncio.sleep", new_callable=AsyncMock):
-            success, _, _, error = await self.mgr._execute_with_retry(
-                op, "tx_bogus", max_retries=3, retry_interval=15,
-                operation_name="lookup", retry_on_empty=False,
-            )
-        assert success is False
-        assert call_count == 3
-        assert isinstance(error, RuntimeError)
 
     def test_extract_parameters_defaults_to_no_empty_retry(self):
         params = self.mgr._extract_lookup_parameters({"transaction_ids": ["tx_1"]})
@@ -1755,3 +1533,326 @@ class TestLookupNotFoundFastPath:
 
         assert results[0]["found"] is True
         assert results[0]["attempts"] == 2
+
+
+class TestLookupPollsInRounds:
+    """A batch lookup searches every pending id once per round and pauses once
+    between rounds, inside stated limits, so checking that 20 just-submitted
+    transactions landed waits seconds rather than ten minutes."""
+
+    def setup_method(self):
+        self.mgr = MeteringTransactionManager()
+        self.searched = []
+
+    def _search_recorder(self, visible_from=None):
+        """Fake `_search_transaction_pages`: records each id searched and finds
+        an id once it has been searched `visible_from[id]` times."""
+        visible_from = visible_from or {}
+        counts = {}
+
+        async def fake_search(client, tid, *args, **kwargs):
+            self.searched.append(tid)
+            counts[tid] = counts.get(tid, 0) + 1
+            if tid in visible_from and counts[tid] >= visible_from[tid]:
+                return {"transactionId": tid}, {"pages_searched": 1, "transactions_examined": 1}
+            return None, {"pages_searched": 1, "transactions_examined": 0}
+
+        return fake_search
+
+    async def _lookup(self, arguments, visible_from=None):
+        with patch.object(
+            self.mgr, "_search_transaction_pages", side_effect=self._search_recorder(visible_from)
+        ), patch("asyncio.sleep", new_callable=AsyncMock) as sleep:
+            result = await self.mgr.lookup_transactions(
+                MagicMock(), arguments, LOCAL_TENANT_SCOPE
+            )
+        return result, [c.args[0] for c in sleep.await_args_list]
+
+    @pytest.mark.asyncio
+    async def test_batch_polling_pauses_once_per_round_not_per_id(self):
+        ids = [f"tx_verify_{i:02d}" for i in range(20)]
+        result, sleeps = await self._lookup({"transaction_ids": ids, "max_retries": 3})
+
+        assert sleeps == [15, 15]
+        assert len(self.searched) == 60
+        assert set(self.searched[:20]) == set(ids)
+        assert [r["transaction_id"] for r in result["results"]] == ids
+        assert all(r["found"] is False and r["attempts"] == 3 for r in result["results"])
+
+    @pytest.mark.asyncio
+    async def test_retry_settings_are_clamped_and_said(self):
+        result, sleeps = await self._lookup(
+            {"transaction_ids": ["tx_a", "tx_b"], "max_retries": 1000, "retry_interval": 3600}
+        )
+
+        assert len(self.searched) <= 20
+        assert all(s <= 60 for s in sleeps)
+        assert sum(sleeps) <= 300
+        adjustments = " ".join(result["configuration"]["adjustments"])
+        assert "max_retries 1000 is above the limit of 10; used 10" in adjustments
+        assert "retry_interval 3600 is above the limit of 60; used 60" in adjustments
+
+    @pytest.mark.asyncio
+    async def test_page_settings_are_clamped_and_said(self):
+        params = self.mgr._extract_lookup_parameters(
+            {"transaction_ids": ["tx_a"], "search_page_range": [20, 50], "page_size": 5000}
+        )
+        assert params["search_page_range"] == [20, 29]
+        assert params["page_size"] == _LOOKUP_MAX_PAGE_SIZE
+        adjustments = " ".join(params["adjustments"])
+        assert "search_page_range" in adjustments
+        assert f"page_size 5000 is above the limit of {_LOOKUP_MAX_PAGE_SIZE}; used {_LOOKUP_MAX_PAGE_SIZE}" in adjustments
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("max_retries", 50),
+            ("max_retries", 0),
+            ("retry_interval", 600),
+            ("retry_interval", -1),
+            ("wait_seconds", 900),
+            ("wait_seconds", -1),
+            ("page_size", 5000),
+            ("page_size", 0),
+        ],
+    )
+    async def test_advertised_schema_bounds_match_the_lookup_clamps(self, field, value):
+        """BACK-4796: no request is checked against _get_input_schema(); callers
+        read it through tool_introspection get_tool_metadata. A bound there is
+        documentation, so it must name the limit the lookup applies. The old
+        page_size maximum of 1000 told callers the ceiling was ten times the 100
+        rows the lookup uses."""
+        from src.revenium_mcp_server.tools_decomposed import metering_management as mm_module
+
+        limits = {
+            "max_retries": (1, mm_module._LOOKUP_MAX_ROUNDS),
+            "retry_interval": (0, mm_module._LOOKUP_MAX_RETRY_INTERVAL),
+            "wait_seconds": (0, mm_module._LOOKUP_MAX_WAIT_SECONDS),
+            "page_size": (1, mm_module._LOOKUP_MAX_PAGE_SIZE),
+        }
+        low, high = limits[field]
+        assert not low <= value <= high, f"{field} {value} is inside [{low}, {high}]"
+
+        schema = (await mm_module.MeteringManagement()._get_input_schema())["properties"]
+        prop = schema[field]
+        assert prop.get("minimum") in (None, low), prop
+        assert prop.get("maximum") in (None, high), prop
+
+        params = self.mgr._extract_lookup_parameters({"transaction_ids": ["tx_a"], field: value})
+        limit, side = (high, "above the limit") if value > high else (low, "below the minimum")
+        assert f"{field} {value} is {side} of {limit}; used {limit}" in params["adjustments"]
+
+    def test_default_page_range_is_ten_pages_and_unmentioned(self):
+        params = self.mgr._extract_lookup_parameters({"transaction_ids": ["tx_a"]})
+        assert params["search_page_range"] == 10
+        assert params["adjustments"] == []
+
+    @pytest.mark.asyncio
+    async def test_more_than_fifty_ids_are_refused(self):
+        ids = [f"tx_{i:03d}" for i in range(51)]
+        with pytest.raises(ToolError) as raised:
+            await self._lookup({"transaction_ids": ids})
+        assert raised.value.field == "transaction_ids"
+        assert "50" in raised.value.message
+        assert self.searched == []
+
+    @pytest.mark.asyncio
+    async def test_duplicate_ids_are_searched_once(self):
+        result, _ = await self._lookup({"transaction_ids": ["tx_a", "tx_a", "tx_b"]})
+        assert sorted(self.searched) == ["tx_a", "tx_b"]
+        assert [r["transaction_id"] for r in result["results"]] == ["tx_a", "tx_b"]
+
+    @pytest.mark.asyncio
+    async def test_found_ids_leave_the_round(self):
+        result, sleeps = await self._lookup(
+            {"transaction_ids": ["tx_a", "tx_b"], "max_retries": 3},
+            visible_from={"tx_a": 2},
+        )
+        assert self.searched.count("tx_a") == 2
+        assert self.searched.count("tx_b") == 3
+        assert sleeps == [15, 15]
+        by_id = {r["transaction_id"]: r for r in result["results"]}
+        assert by_id["tx_a"]["found"] is True and by_id["tx_a"]["attempts"] == 2
+        assert by_id["tx_b"]["found"] is False and by_id["tx_b"]["attempts"] == 3
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("max_retries", True),
+            ("max_retries", "abc"),
+            ("retry_interval", 1.5),
+            ("page_size", "big"),
+            ("search_page_range", [5, 2]),
+            ("search_page_range", [1, 2, 3]),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_non_int_retry_settings_are_refused(self, field, value):
+        with pytest.raises(ToolError) as raised:
+            await self._lookup({"transaction_ids": ["tx_a"], field: value})
+        assert raised.value.field == field
+        assert self.searched == []
+
+    @pytest.mark.asyncio
+    async def test_wait_seconds_drives_the_polling_wait(self):
+        result, sleeps = await self._lookup({"transaction_ids": ["tx_late"], "wait_seconds": 90})
+
+        assert sleeps == [15] * 6
+        assert sum(sleeps) == 90
+        assert len(self.searched) == 7
+        assert result["configuration"]["wait_seconds"] == 90
+        assert self.mgr._extract_lookup_parameters(
+            {"transaction_ids": ["tx_late"], "wait_seconds": 90}
+        )["retry_on_empty"] is True
+
+    @pytest.mark.asyncio
+    async def test_wait_seconds_caps_the_total_wait(self):
+        result, sleeps = await self._lookup(
+            {
+                "transaction_ids": ["tx_late"],
+                "max_retries": 10,
+                "retry_interval": 60,
+                "wait_seconds": 90,
+            }
+        )
+
+        assert sleeps == [60]
+        assert len(self.searched) == 2
+        assert "stopped polling after 60s, the wait budget" in result["results"][0]["message"]
+
+    def test_wait_echo_is_the_wait_the_call_uses(self):
+        """Without wait_seconds the wait is the pauses max_retries rounds take,
+        and the configuration echo shows that wait, not a default of 30."""
+        params = self.mgr._extract_lookup_parameters(
+            {"transaction_ids": ["tx_late"], "max_retries": 5}
+        )
+        assert params["wait_seconds"] == 60
+        assert "wait_budget_seconds" not in params
+        defaults = self.mgr._extract_lookup_parameters({"transaction_ids": ["tx_late"]})
+        assert defaults["wait_seconds"] == 30
+
+    @pytest.mark.asyncio
+    async def test_plain_lookup_echo_says_it_did_not_poll(self):
+        """A lookup that sends no polling knob searches once without waiting;
+        the configuration echo says so instead of implying a 30 s poll."""
+        result, sleeps = await self._lookup({"transaction_ids": ["tx_late"]})
+        assert sleeps == []
+        assert self.searched == ["tx_late"]
+        assert result["configuration"]["polling"] is False
+        polled, _ = await self._lookup({"transaction_ids": ["tx_late"], "max_retries": 2})
+        assert polled["configuration"]["polling"] is True
+
+    @pytest.mark.asyncio
+    async def test_wait_seconds_above_the_limit_is_clamped_and_said(self):
+        result, sleeps = await self._lookup(
+            {"transaction_ids": ["tx_late"], "wait_seconds": 900, "retry_interval": 60}
+        )
+
+        assert sum(sleeps) <= 300
+        assert sleeps == [60] * 5
+        adjustments = " ".join(result["configuration"]["adjustments"])
+        assert "wait_seconds 900 is above the limit of 300; used 300" in adjustments
+
+    @pytest.mark.asyncio
+    async def test_no_lookup_example_starts_its_page_range_past_page_zero(self):
+        """BACK-4795: every lookup page carries transactionId, so the platform's
+        answer has one page; an example range like [20, 29] read only empty pages
+        and answered Not Found for a transaction that exists."""
+        import re
+
+        from src.revenium_mcp_server.tools_decomposed import metering_management as mm_module
+
+        mm = mm_module.MeteringManagement()
+        help_texts = [
+            await mm._build_lookup_capabilities_content(None),
+            (await mm._handle_get_examples({}))[0].text,
+        ]
+        for text in help_texts:
+            starts = re.findall(r'"search_page_range": \[(\d+),', text)
+            assert all(int(start) == 0 for start in starts), starts
+            assert "a range that starts past page 0" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_help_states_the_limits_the_lookup_applies(self):
+        """The markdown help blocks restate the lookup limits in prose (their
+        JSON examples keep them plain strings, not f-strings); this pins that
+        prose to the constants, so changing a limit fails here until the help
+        says the new value."""
+        from src.revenium_mcp_server.tools_decomposed import metering_management as mm_module
+
+        mm = mm_module.MeteringManagement()
+        lookup_help = await mm._build_lookup_capabilities_content(None)
+        field_help = await mm._build_field_documentation_content(None)
+        pages = mm_module._LOOKUP_MAX_PAGES
+
+        assert f"searches at most {pages} pages" in lookup_help
+        assert f"at most {mm_module._LOOKUP_MAX_IDS} ids per call" in lookup_help
+        assert (
+            f"Default: {mm_module._LOOKUP_DEFAULT_PAGES} pages, and at most {pages}: "
+            f"a larger value is lowered to {pages}"
+        ) in lookup_help
+        assert f"turns polling on (0-{mm_module._LOOKUP_MAX_WAIT_SECONDS})" in lookup_help
+        assert (
+            f"({mm_module._LOOKUP_DEFAULT_ROUNDS} - 1) × {mm_module._LOOKUP_DEFAULT_RETRY_INTERVAL} = "
+            f"{(mm_module._LOOKUP_DEFAULT_ROUNDS - 1) * mm_module._LOOKUP_DEFAULT_RETRY_INTERVAL} "
+            f"seconds by default, at most {mm_module._LOOKUP_MAX_WAIT_SECONDS}"
+        ) in lookup_help
+        assert f"(default: {mm_module._LOOKUP_DEFAULT_PAGES}, at most {pages})" in field_help
+
+        rounds = mm_module._LOOKUP_DEFAULT_ROUNDS
+        interval = mm_module._LOOKUP_DEFAULT_RETRY_INTERVAL
+        schema = (await mm._get_input_schema())["properties"]
+        assert f"(default: {rounds}, 1-{mm_module._LOOKUP_MAX_ROUNDS})" in schema["max_retries"]["description"]
+        assert (
+            f"(default: {interval}, 0-{mm_module._LOOKUP_MAX_RETRY_INTERVAL})"
+            in schema["retry_interval"]["description"]
+        )
+        assert (
+            f"(({rounds} - 1) x {interval} = {(rounds - 1) * interval} seconds by default"
+            in schema["wait_seconds"]["description"]
+        )
+
+
+class TestPageSizeFloor:
+    """No action that takes page_size can use a page below one row."""
+
+    @pytest.mark.asyncio
+    async def test_schema_advertises_a_page_size_floor_of_one(self):
+        """BACK-4796: the internal schema bound stays consistent with the clamp."""
+        from src.revenium_mcp_server.tools_decomposed import metering_management as mm_module
+
+        schema = (await mm_module.MeteringManagement()._get_input_schema())["properties"]
+        assert schema["page_size"].get("minimum") == 1
+
+    @pytest.mark.asyncio
+    async def test_capabilities_parameter_list_states_the_lookup_page_range(self):
+        """BACK-4796: callers read the range in the description get_capabilities lists."""
+        from src.revenium_mcp_server.tools_decomposed import metering_management as mm_module
+
+        reference = (await mm_module.MeteringManagement().parameter_reference_block())[0].text
+        page_size_line = next(
+            line for line in reference.splitlines() if line.startswith("- `page_size`")
+        )
+        assert f"For lookup_transactions: 1-{mm_module._LOOKUP_MAX_PAGE_SIZE}" in page_size_line
+        assert f"default {mm_module._LOOKUP_DEFAULT_PAGE_SIZE}" in page_size_line
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("page_size", [0, -3])
+    async def test_no_action_sends_a_page_below_one(self, page_size):
+        from src.revenium_mcp_server.tools_decomposed import metering_management as mm_module
+
+        params = MeteringTransactionManager()._extract_lookup_parameters(
+            {"transaction_ids": ["tx_a"], "page_size": page_size}
+        )
+        assert params["page_size"] == 1
+        assert f"page_size {page_size} is below the minimum of 1; used 1" in params[
+            "adjustments"
+        ]
+
+        mm = mm_module.MeteringManagement.__new__(mm_module.MeteringManagement)
+        client = _make_client()
+        with pytest.raises(ToolError) as raised:
+            await mm._handle_lookup_recent_transactions(client, {"page_size": page_size})
+        assert raised.value.field == "page_size"
+        client.get.assert_not_called()

@@ -67,6 +67,7 @@ from src.revenium_mcp_server.tools_decomposed.pr_health_settings_fields import (
 )
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
+from src.revenium_mcp_server.common.tool_execution import standardized_tool_execution
 from src.revenium_mcp_server.common.update_configs import UpdateConfigs
 from mcp.types import TextContent
 
@@ -447,18 +448,18 @@ class TestUserManagerCreate:
         assert create_call_data["ownerId"] == "owner_123"
 
     @pytest.mark.asyncio
-    async def test_create_user_auto_generates_from_name(self, user_manager, mock_client):
-        """When only name is provided, auto-generates user_data."""
+    async def test_create_user_with_only_a_top_level_name_is_refused(
+        self, user_manager, mock_client
+    ):
+        """A bare name never produces a user: no email is invented from it."""
         mock_client.create_user.return_value = {"id": "u_auto"}
         with patch(
             "src.revenium_mcp_server.tools_decomposed.customer_management.get_config_value",
             return_value=None,
         ):
-            result = await user_manager.create_user({"name": "John Doe"})
-        create_call_data = mock_client.create_user.call_args[0][0]
-        assert create_call_data["firstName"] == "John"
-        assert create_call_data["lastName"] == "Doe"
-        assert "ROLE_API_CONSUMER" in create_call_data["roles"]
+            with pytest.raises(ToolError):
+                await user_manager.create_user({"name": "John Doe"})
+        mock_client.create_user.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_create_user_missing_data_raises(self, user_manager):
@@ -657,6 +658,9 @@ class TestSubscriberManagerLookup:
             await subscriber_manager.lookup_subscriber({"email": "joao@acme.com"})
 
 
+_MISSING = object()
+
+
 class TestSubscriberManagerCreate:
 
     @pytest.mark.asyncio
@@ -684,31 +688,73 @@ class TestSubscriberManagerCreate:
         assert result["id"] == "s_new"
 
     @pytest.mark.asyncio
-    async def test_create_subscriber_auto_resolves_org_ids(self, subscriber_manager, mock_client):
-        """When organizationIds not provided, auto-resolves from first org."""
+    @pytest.mark.parametrize(
+        "organization_ids", [_MISSING, [], "org_acme", [""], [" "]]
+    )
+    @pytest.mark.parametrize(
+        "listed_organizations",
+        [
+            [{"id": "OQNb1o0", "name": "UNCLASSIFIED"}],
+            [
+                {"id": "OQNb1o0", "name": "UNCLASSIFIED"},
+                {"id": "org_acme", "name": "Acme"},
+            ],
+        ],
+    )
+    async def test_create_subscriber_without_organization_is_refused_not_guessed(
+        self, subscriber_manager, mock_client, listed_organizations, organization_ids
+    ):
         mock_client.get_organizations.return_value = {}
-        mock_client._extract_embedded_data.return_value = [{"id": "auto_org_1"}]
-        mock_client.create_subscriber.return_value = {"id": "s_auto", "subscriberId": "sub_auto"}
+        mock_client._extract_embedded_data.return_value = listed_organizations
+        mock_client.create_subscriber.return_value = {"id": "s1"}
+        subscriber_data = {"email": "a.b@example.com", "firstName": "A", "lastName": "B"}
+        if organization_ids is not _MISSING:
+            subscriber_data["organizationIds"] = organization_ids
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.customer_management.get_config_value",
+            return_value=None,
+        ):
+            with pytest.raises(ToolError) as exc_info:
+                await subscriber_manager.create_subscriber(
+                    {"subscriber_data": subscriber_data}
+                )
+        message = exc_info.value.message
+        assert exc_info.value.error_code == ErrorCodes.VALIDATION_ERROR
+        assert "organizationIds" in message
+        assert "resource_type='organizations'" in message
+        assert "OQNb1o0" not in message
+        assert "UNCLASSIFIED" not in message
+        mock_client.create_subscriber.assert_not_awaited()
+        mock_client.get_organizations.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_subscriber_with_explicit_organizations_sends_exactly_those(
+        self, subscriber_manager, mock_client
+    ):
+        mock_client._extract_embedded_data.return_value = [
+            {"id": "OQNb1o0", "name": "UNCLASSIFIED"}
+        ]
+        mock_client.create_subscriber.return_value = {"id": "s1"}
         with patch(
             "src.revenium_mcp_server.tools_decomposed.customer_management.get_config_value",
             return_value=None,
         ):
             await subscriber_manager.create_subscriber({
                 "subscriber_data": {
-                    "email": "sub@co.com",
-                    "firstName": "Sub",
-                    "lastName": "User",
+                    "email": "a.b@example.com",
+                    "firstName": "A",
+                    "lastName": "B",
+                    "organizationIds": ["org_acme"],
                 }
             })
-        create_data = mock_client.create_subscriber.call_args[0][0]
-        assert create_data["organizationIds"] == ["auto_org_1"]
-        assert create_data["roles"] == ["ROLE_API_CONSUMER"]
+        sent = mock_client.create_subscriber.await_args.args[0]
+        assert sent["organizationIds"] == ["org_acme"]
 
     @pytest.mark.asyncio
-    async def test_create_subscriber_no_orgs_raises(self, subscriber_manager, mock_client):
-        """When no organizations exist, raises error about missing organizationIds."""
-        mock_client.get_organizations.return_value = {}
-        mock_client._extract_embedded_data.return_value = []
+    async def test_create_subscriber_without_organizations_is_refused_at_the_manager(
+        self, subscriber_manager, mock_client
+    ):
+        """A subscriber with no organizationIds is refused by the manager itself."""
         with patch(
             "src.revenium_mcp_server.tools_decomposed.customer_management.get_config_value",
             return_value=None,
@@ -718,6 +764,8 @@ class TestSubscriberManagerCreate:
                     "subscriber_data": {"email": "sub@co.com", "firstName": "S", "lastName": "U"}
                 })
             assert "organizationids" in str(exc_info.value).lower()
+        mock_client.create_subscriber.assert_not_awaited()
+        mock_client.get_organizations.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_create_subscriber_400_invalid_org_id(self, subscriber_manager, mock_client):
@@ -922,14 +970,14 @@ class TestOrganizationManagerCreate:
 
     @pytest.mark.asyncio
     async def test_create_org_auto_populates_fields(self, org_manager, mock_client):
-        """Auto-populates tenantId, parentId, metadata."""
+        """Auto-populates tenantId and metadata; parentId is not auto-populated."""
         mock_client.create_organization.return_value = {"id": "o_new", "name": "New Org"}
         result = await org_manager.create_organization({
             "organization_data": {"name": "New Org"}
         })
         create_data = mock_client.create_organization.call_args[0][0]
         assert create_data["tenantId"] == "test_tenant_id"
-        assert create_data["parentId"] == "test_team_id_456"
+        assert "parentId" not in create_data
         assert create_data["metadata"] == ""
 
 
@@ -1535,6 +1583,23 @@ class TestTeamPrHealthSettingsRead:
     """TeamManager.get_pr_health_settings."""
 
     @pytest.mark.asyncio
+    async def test_renders_where_counts_start_without_a_team_cutoff(self, team_manager, mock_client):
+        mock_client.get_team_pr_health_settings.return_value = {
+            "agingDays": 14,
+            "rottingDays": 30,
+            "cutoffDate": None,
+            "cutoffDateIsDefault": True,
+            "defaultCutoffDate": "2025-01-20",
+            "defaultCountsSince": "2026-04-16",
+        }
+
+        result = await team_manager.get_pr_health_settings({"team_id": "jR2kmLs"})
+
+        assert result.get("defaultCountsSince") == "2026-04-16"
+        assert "null for no cutoff" not in result["field_semantics"]
+        assert "defaultCountsSince" in result["field_semantics"]
+
+    @pytest.mark.asyncio
     async def test_missing_team_id_raises_before_any_call(self, team_manager, mock_client):
         with pytest.raises(ToolError) as exc:
             await team_manager.get_pr_health_settings({})
@@ -1615,6 +1680,13 @@ class TestTeamPrHealthSettingsRead:
             assert result[camel] == FULL_PR_HEALTH_SETTINGS[camel]
         assert result["field_semantics"] == PR_HEALTH_FIELDS_NOTE
 
+    def test_note_says_dollar_estimates_price_the_priced_counts(self):
+        """pricedSince is the team cutoff, else defaultCutoffDate, and the estimates price those counts."""
+        assert "Without a team cutoff, defaultCutoffDate" in PR_HEALTH_FIELDS_NOTE
+        assert "pricedSince is cutoffDate, else defaultCutoffDate" in PR_HEALTH_FIELDS_NOTE
+        assert "dollar estimates multiply those priced counts" in PR_HEALTH_FIELDS_NOTE
+        assert "multiply the full counts" not in PR_HEALTH_FIELDS_NOTE
+
     @pytest.mark.asyncio
     async def test_absent_new_fields_are_not_rendered(self, team_manager, mock_client):
         """A platform that predates the fields must not read as an empty exclusion list."""
@@ -1658,6 +1730,7 @@ FULL_PR_HEALTH_SETTINGS = {
     "cutoffDate": "2026-04-07",
     "cutoffDateIsDefault": True,
     "defaultCutoffDate": "2026-04-07",
+    "defaultCountsSince": "2026-04-16",
     "excludedRepos": ["acme/legacy-app"],
     "automationPatterns": ["^release-bot$"],
     "builtInAutomationPatterns": ["^\\[Snyk\\]"],
@@ -1718,6 +1791,7 @@ class TestTeamPrHealthSettingsOptionalFields:
             "builtInAutomationPatterns": ["x"],
             "cutoffDateIsDefault": True,
             "defaultCutoffDate": "2024-01-01",
+            "defaultCountsSince": "2026-04-16",
         })
 
         assert self._sent_body(mock_client) == {
@@ -3757,6 +3831,14 @@ class TestCustomerValidator:
         assert "users" in roles["roles_by_resource_type"]
         assert "subscribers" in roles["roles_by_resource_type"]
 
+    def test_role_guide_never_offers_the_administrator_role(self):
+        roles = CustomerValidator().get_roles()
+        for example in roles["examples"].values():
+            assert "ROLE_TENANT_ADMIN" not in example["roles"]
+        user_roles = roles["roles_by_resource_type"]["users"]["available_roles"]
+        assert user_roles[0]["name"] == "ROLE_API_CONSUMER"
+        assert any(role["name"] == "ROLE_TENANT_ADMIN" for role in user_roles)
+
     @pytest.mark.asyncio
     async def test_validate_configuration_no_schema_raises(self):
         validator = CustomerValidator()
@@ -3778,6 +3860,103 @@ class TestCustomerValidator:
         )
 
 
+class TestListHeadingNamesThePlatformTotal:
+    """The list heading counts the page against the platform total, never the page as the total."""
+
+    @staticmethod
+    def _stub_list(mock_client, client_method, rows, page_info):
+        setattr(mock_client, client_method, AsyncMock(return_value={}))
+        mock_client._extract_embedded_data.return_value = rows
+        mock_client._extract_pagination_info.return_value = page_info
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "resource_type, client_method",
+        [
+            ("users", "get_users"),
+            ("subscribers", "get_subscribers"),
+            ("organizations", "get_organizations"),
+            ("teams", "get_teams"),
+        ],
+    )
+    async def test_heading_counts_the_page_against_the_platform_total(
+        self, customer_mgmt, resource_type, client_method
+    ):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            self._stub_list(
+                mock_client,
+                client_method,
+                [{"id": f"r{i}"} for i in range(20)],
+                {"size": 20, "number": 0, "totalPages": 25, "totalElements": 500},
+            )
+
+            result = await customer_mgmt.handle_action("list", {"resource_type": resource_type})
+
+        heading, body = result[0].text.split("\n\n", 1)
+        assert heading == f"Found 20 of 500 {resource_type} (page 1 of 25):"
+        assert json.loads(body)["total_records"] == 500
+
+    @pytest.mark.asyncio
+    async def test_heading_without_a_platform_total_never_calls_the_page_the_total(
+        self, customer_mgmt
+    ):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            self._stub_list(mock_client, "get_users", [{"id": f"r{i}"} for i in range(20)], {})
+
+            result = await customer_mgmt.handle_action("list", {"resource_type": "users"})
+
+        heading = result[0].text.split("\n", 1)[0]
+        assert heading == (
+            "Found 20 users on page 1; the platform reported no total, so more may exist:"
+        )
+        assert "of 20" not in heading
+
+    @pytest.mark.asyncio
+    async def test_page_given_as_text_is_read_as_a_number(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            self._stub_list(
+                mock_client,
+                "get_users",
+                [{"id": f"r{i}"} for i in range(20)],
+                {"size": 20, "number": 1, "totalPages": 25, "totalElements": 500},
+            )
+
+            result = await customer_mgmt.handle_action(
+                "list", {"resource_type": "users", "page": "1"}
+            )
+
+        assert "(page 2 of 25)" in result[0].text.split("\n", 1)[0]
+        mock_client.get_users.assert_awaited_once()
+        assert mock_client.get_users.await_args.kwargs["page"] == 1
+
+    @pytest.mark.asyncio
+    async def test_page_past_the_end_says_so(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_gc.return_value = mock_client
+            self._stub_list(
+                mock_client,
+                "get_users",
+                [],
+                {"size": 20, "number": 30, "totalPages": 25, "totalElements": 500},
+            )
+
+            result = await customer_mgmt.handle_action(
+                "list", {"resource_type": "users", "page": 30}
+            )
+
+        assert result[0].text.split("\n", 1)[0] == (
+            "Page 31 is past the last page (25 pages); the platform reports 500 users "
+            "in total. Pass page=0 for the first page."
+        )
+
+
 # ===========================================================================
 # CustomerAnalytics Tests
 # ===========================================================================
@@ -3786,86 +3965,11 @@ class TestCustomerValidator:
 class TestCustomerAnalytics:
 
     @pytest.mark.asyncio
-    async def test_analyze_users(self, mock_client):
-        mock_client._extract_embedded_data.return_value = [
-            {"id": "u1", "status": "active", "organizationId": "o1", "teamId": "t1"},
-            {"id": "u2", "status": "inactive", "organizationId": "o1", "teamId": "t2"},
-        ]
-        mock_client._extract_pagination_info.return_value = {"totalElements": 2}
-
-        analytics = CustomerAnalytics(mock_client)
-        result = await analytics.analyze_customers({"resource_type": "users"})
-
-        assert result["resource_type"] == "users"
-        assert result["total_users"] == 2
-        assert result["active_users"] == 1
-        assert result["activity_rate"] == 50.0
-
-    @pytest.mark.asyncio
-    async def test_analyze_subscribers(self, mock_client):
-        mock_client._extract_embedded_data.return_value = [
-            {"status": "active"},
-            {"status": "trial"},
-            {"status": "inactive"},
-        ]
-        mock_client._extract_pagination_info.return_value = {"totalElements": 3}
-
-        analytics = CustomerAnalytics(mock_client)
-        result = await analytics.analyze_customers({"resource_type": "subscribers"})
-
-        assert result["total_subscribers"] == 3
-        assert result["active_subscribers"] == 1
-        assert result["trial_subscribers"] == 1
-
-    @pytest.mark.asyncio
-    async def test_analyze_organizations(self, mock_client):
-        mock_client._extract_embedded_data.return_value = [
-            {"status": "active", "parentOrganizationId": "parent1"},
-            {"status": "active"},
-        ]
-        mock_client._extract_pagination_info.return_value = {"totalElements": 2}
-
-        analytics = CustomerAnalytics(mock_client)
-        result = await analytics.analyze_customers({"resource_type": "organizations"})
-
-        assert result["total_organizations"] == 2
-        assert result["active_organizations"] == 2
-        assert result["hierarchical_organizations"] == 1
-
-    @pytest.mark.asyncio
-    async def test_analyze_teams(self, mock_client):
-        mock_client._extract_embedded_data.return_value = [
-            {"status": "active", "organizationId": "o1"},
-        ]
-        mock_client._extract_pagination_info.return_value = {"totalElements": 1}
-
-        analytics = CustomerAnalytics(mock_client)
-        result = await analytics.analyze_customers({"resource_type": "teams"})
-
-        assert result["total_teams"] == 1
-        assert result["active_teams"] == 1
-
-    @pytest.mark.asyncio
     async def test_analyze_unknown_type_raises(self, mock_client):
         analytics = CustomerAnalytics(mock_client)
         with pytest.raises(ToolError):
             await analytics.analyze_customers({"resource_type": "widgets"})
 
-    @pytest.mark.asyncio
-    async def test_get_relationships_missing_params_raises(self, mock_client):
-        analytics = CustomerAnalytics(mock_client)
-        with pytest.raises(ToolError):
-            await analytics.get_relationships({})
-
-    @pytest.mark.asyncio
-    async def test_get_relationships_returns_placeholder(self, mock_client):
-        analytics = CustomerAnalytics(mock_client)
-        result = await analytics.get_relationships({
-            "resource_type": "users", "resource_id": "u1"
-        })
-        assert result["resource_type"] == "users"
-        assert result["resource_id"] == "u1"
-        assert len(result["relationships"]) == 1
 
 
 # ===========================================================================
@@ -3874,6 +3978,174 @@ class TestCustomerAnalytics:
 
 
 class TestCustomerManagementHandleAction:
+
+    @pytest.mark.asyncio
+    async def test_create_organization_without_parent_sends_no_parent_id(
+        self, customer_mgmt, mock_client
+    ):
+        mock_client.create_organization.return_value = {"id": "o1", "name": "Acme"}
+        with patch.object(
+            customer_mgmt, "get_client", new_callable=AsyncMock, return_value=mock_client
+        ):
+            result = await customer_mgmt.handle_action(
+                "create",
+                {"resource_type": "organizations", "resource_data": {"name": "Acme"}},
+            )
+        sent = mock_client.create_organization.await_args.args[0]
+        assert "parentId" not in sent
+        assert sent["tenantId"] == "test_tenant_id"
+        assert "created successfully" in result[0].text.lower()
+
+    @pytest.mark.asyncio
+    async def test_create_organization_with_explicit_parent_nests_it(
+        self, customer_mgmt, mock_client
+    ):
+        mock_client.create_organization.return_value = {"id": "o2", "name": "Acme"}
+        with patch.object(
+            customer_mgmt, "get_client", new_callable=AsyncMock, return_value=mock_client
+        ):
+            result = await customer_mgmt.handle_action(
+                "create",
+                {
+                    "resource_type": "organizations",
+                    "resource_data": {"name": "Acme", "parentId": "parent_org_9"},
+                },
+            )
+        sent = mock_client.create_organization.await_args.args[0]
+        assert sent["parentId"] == "parent_org_9"
+        assert sent["tenantId"] == "test_tenant_id"
+        assert "created successfully" in result[0].text.lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dry_run", [False, True])
+    @pytest.mark.parametrize(
+        "resource_data",
+        [{"name": "John Doe"}, {"email": None}, {"email": "   "}],
+    )
+    @pytest.mark.parametrize("resource_type", ["users", "subscribers"])
+    async def test_name_only_person_create_is_refused_asking_for_an_email(
+        self, customer_mgmt, mock_client, resource_type, resource_data, dry_run
+    ):
+        mock_client.create_user.return_value = {"id": "u1"}
+        mock_client.create_subscriber.return_value = {"id": "s1"}
+        arguments = {"resource_type": resource_type, "resource_data": resource_data}
+        if dry_run:
+            arguments["dry_run"] = True
+        with patch.object(
+            customer_mgmt, "get_client", new_callable=AsyncMock, return_value=mock_client
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.customer_management.get_config_value",
+            return_value=None,
+        ):
+            with pytest.raises(ToolError) as exc:
+                await customer_mgmt.handle_action("create", arguments)
+        assert exc.value.error_code == ErrorCodes.VALIDATION_ERROR
+        assert "email is required" in exc.value.message.lower()
+        assert "json" not in exc.value.message.lower()
+        if resource_type == "subscribers":
+            assert "organizationIds" in exc.value.message
+        mock_client.create_user.assert_not_awaited()
+        mock_client.create_subscriber.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refusal_text_reaches_the_caller_through_standardized_execution(
+        self, mock_client
+    ):
+        mock_client.create_user.return_value = {"id": "u1"}
+        with patch.object(
+            CustomerManagement,
+            "get_client",
+            new_callable=AsyncMock,
+            return_value=mock_client,
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.customer_management.get_config_value",
+            return_value=None,
+        ):
+            with pytest.raises(ToolError) as exc:
+                await standardized_tool_execution(
+                    "manage_customers",
+                    "create",
+                    {"resource_type": "users", "resource_data": {"name": "John Doe"}},
+                    CustomerManagement,
+                )
+        assert "email is required" in exc.value.message.lower()
+        assert "Tool execution failed" not in exc.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dry_run", [False, True])
+    async def test_user_create_without_a_derivable_last_name_is_refused(
+        self, customer_mgmt, mock_client, dry_run
+    ):
+        mock_client.create_user.return_value = {"id": "u1"}
+        arguments = {
+            "resource_type": "users",
+            "resource_data": {"email": "solo@example.com"},
+        }
+        if dry_run:
+            arguments["dry_run"] = True
+        with patch.object(
+            customer_mgmt, "get_client", new_callable=AsyncMock, return_value=mock_client
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.customer_management.get_config_value",
+            return_value=None,
+        ):
+            with pytest.raises(ToolError) as exc:
+                await customer_mgmt.handle_action("create", arguments)
+        assert "lastName is required" in exc.value.message
+        mock_client.create_user.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_subscriber_create_dry_run_without_organization_is_refused_like_the_real_create(
+        self, customer_mgmt, mock_client
+    ):
+        mock_client.create_subscriber.return_value = {"id": "s1"}
+        messages = []
+        for dry_run in (False, True):
+            arguments = {
+                "resource_type": "subscribers",
+                "resource_data": {"email": "solo@example.com"},
+            }
+            if dry_run:
+                arguments["dry_run"] = True
+            with patch.object(
+                customer_mgmt,
+                "get_client",
+                new_callable=AsyncMock,
+                return_value=mock_client,
+            ), patch(
+                "src.revenium_mcp_server.tools_decomposed.customer_management.get_config_value",
+                return_value=None,
+            ):
+                with pytest.raises(ToolError) as exc:
+                    await customer_mgmt.handle_action("create", arguments)
+            messages.append(exc.value.message)
+        assert messages[0] == messages[1]
+        assert "organizationIds" in messages[0]
+
+    @pytest.mark.asyncio
+    async def test_subscriber_create_dry_run_shows_the_organization_it_will_send(
+        self, customer_mgmt, mock_client
+    ):
+        with patch.object(
+            customer_mgmt, "get_client", new_callable=AsyncMock, return_value=mock_client
+        ):
+            result = await customer_mgmt.handle_action(
+                "create",
+                {
+                    "resource_type": "subscribers",
+                    "dry_run": True,
+                    "resource_data": {
+                        "email": "solo@example.com",
+                        "organizationIds": ["org_acme"],
+                    },
+                },
+            )
+        text = result[0].text
+        preview = text.split("**Resource Data:** ", 1)[1].split("\n\n", 1)[0]
+        data = json.loads(preview)
+        assert "lastName" not in data
+        assert data["organizationIds"] == ["org_acme"]
+        mock_client.create_subscriber.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unknown_action_raises_tool_error(self, customer_mgmt):
@@ -3994,16 +4266,38 @@ class TestCustomerManagementHandleAction:
             assert "role" in result[0].text.lower()
 
     @pytest.mark.asyncio
-    async def test_get_relationships_action(self, customer_mgmt):
+    async def test_get_roles_creation_example_uses_the_api_consumer_role(self, customer_mgmt):
         with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_gc.return_value = MagicMock()
 
-            result = await customer_mgmt.handle_action("get_relationships", {
-                "resource_type": "users", "resource_id": "u1"
-            })
+            result = await customer_mgmt.handle_action("get_roles", {})
 
-            assert isinstance(result[0], TextContent)
-            assert "relationship" in result[0].text.lower()
+        text = result[0].text
+        creation_example = text.split("### User Creation (with roles)", 1)[1]
+        assert '"roles": ["ROLE_API_CONSUMER"]' in creation_example
+        assert '"roles": ["ROLE_TENANT_ADMIN"]' not in text
+        assert "Admin User" not in text
+        assert "Power User" not in text
+
+    @pytest.mark.asyncio
+    async def test_get_relationships_is_not_offered(self, customer_mgmt):
+        with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = MagicMock()
+
+            with pytest.raises(ToolError) as exc_info:
+                await customer_mgmt.handle_action(
+                    "get_relationships", {"resource_type": "organizations", "resource_id": "abc1234"}
+                )
+            assert exc_info.value.error_code == ErrorCodes.ACTION_NOT_SUPPORTED
+
+            assert "get_relationships" not in await customer_mgmt._get_supported_actions()
+            schema = await customer_mgmt._get_input_schema()
+            assert "get_relationships" not in schema["properties"]["action"]["enum"]
+
+            metadata = await customer_mgmt.handle_action("get_tool_metadata", {})
+            assert "get_relationships" not in metadata[0].text
+            summary = await customer_mgmt.handle_action("get_agent_summary", {})
+            assert "get_relationships" not in summary[0].text
 
     @pytest.mark.asyncio
     async def test_analyze_action(self, customer_mgmt):
@@ -4294,7 +4588,8 @@ class TestIntrospectionSchemaRequired:
         assert create_rule["then"]["required"] == ["resource_data"]
         # The container alone is not enough (minProperties), and the key-field
         # requirement is per resource type, matching the runtime: name for
-        # organizations/teams, email-or-name for users/subscribers.
+        # organizations/teams, email for users/subscribers (plus
+        # organizationIds for subscribers).
         assert create_rule["then"]["properties"]["resource_data"]["minProperties"] == 1
         untyped_rule = next(
             c for c in schema["allOf"]
@@ -4312,11 +4607,49 @@ class TestIntrospectionSchemaRequired:
             c for c in schema["allOf"]
             if c["if"]["properties"].get("resource_type", {}).get("enum") == ["users", "subscribers"]
         )
-        any_of = person_rule["then"]["properties"]["resource_data"]["anyOf"]
-        assert {"required": ["email"]} in any_of and {"required": ["name"]} in any_of
+        person_data = person_rule["then"]["properties"]["resource_data"]
+        assert person_data["required"] == ["email"]
+        assert "anyOf" not in person_data
+        subscriber_rule = next(
+            c for c in schema["allOf"]
+            if c["if"]["properties"].get("resource_type") == {"const": "subscribers"}
+        )
+        subscriber_data = subscriber_rule["then"]["properties"]["resource_data"]
+        assert subscriber_data["required"] == ["organizationIds"]
         assert "name" not in schema["properties"]
         assert "resource_data" in schema["properties"]
         assert "resource_type" in schema["properties"]
+
+
+    @pytest.mark.asyncio
+    async def test_resource_data_description_matches_the_server(self, customer_mgmt):
+        schema = await customer_mgmt._get_input_schema()
+        description = schema["properties"]["resource_data"]["description"]
+        assert "lastName too when" in description
+        assert "organizationIds" in description
+        assert "auto-generated from it" not in description
+        assert "auto-generated from name" not in description
+
+    @pytest.mark.asyncio
+    async def test_subscriber_organization_ids_schema_rejects_blank_ids_like_the_runtime(
+        self, customer_mgmt
+    ):
+        # The runtime refuses a whitespace-only organization id, so the schema
+        # must not advertise one as valid.
+        import re
+
+        schema = await customer_mgmt._get_input_schema()
+        subscriber_rule = next(
+            c for c in schema["allOf"]
+            if c["if"]["properties"].get("resource_type") == {"const": "subscribers"}
+        )
+        items = subscriber_rule["then"]["properties"]["resource_data"]["properties"][
+            "organizationIds"
+        ]["items"]
+        pattern = items.get("pattern")
+        assert pattern is not None
+        assert re.search(pattern, " ") is None
+        assert re.search(pattern, "org_acme") is not None
 
 
 class TestDepartmentFeatureFlagGate:
@@ -4590,8 +4923,21 @@ class TestDepartmentRemovalIdentifierValidation:
 class TestDepartmentRemovalErrors:
     """Upstream 4xx answers become caller guidance; everything else propagates."""
 
+    @staticmethod
+    def _assert_names_both_causes(error, mock_client, action):
+        caller_text = str(error)
+        assert caller_text.startswith("The platform refused this department change (403).")
+        assert "department attribution is not enabled for this organization" in caller_text
+        assert "this key is not allowed to change departments" in caller_text
+        assert "list_departments" in caller_text
+        assert f"may not run {action}" in caller_text
+        assert "not a permissions problem" not in caller_text
+        assert "Departments are not enabled" not in caller_text
+        assert error.error_code == ErrorCodes.API_AUTHORIZATION
+        mock_client.get_departments.assert_not_awaited()
+
     @pytest.mark.asyncio
-    async def test_403_maps_to_the_feature_flag_explanation(self, department_manager, mock_client):
+    async def test_403_on_delete_names_both_causes(self, department_manager, mock_client):
         mock_client.delete_department_person.side_effect = ReveniumAPIError(
             "Forbidden", status_code=403
         )
@@ -4599,15 +4945,12 @@ class TestDepartmentRemovalErrors:
         with pytest.raises(ToolError) as excinfo:
             await department_manager.delete_department_person({"person_id": 97, "confirm": True})
 
-        assert excinfo.value.message == "Departments are not enabled for this tenant"
-        assert excinfo.value.error_code == ErrorCodes.API_AUTHORIZATION
-        assert any("org-unit-attribution-enabled" in s for s in excinfo.value.suggestions)
-        assert any("retry delete_department_person" in s for s in excinfo.value.suggestions)
+        self._assert_names_both_causes(excinfo.value, mock_client, "delete_department_person")
+        assert excinfo.value.field == "team_id"
+        assert excinfo.value.value == "(ambient team)"
 
     @pytest.mark.asyncio
-    async def test_403_on_clear_maps_to_the_feature_flag_explanation(
-        self, department_manager, mock_client
-    ):
+    async def test_403_on_clear_names_both_causes(self, department_manager, mock_client):
         mock_client.clear_department_assignment_by_email.side_effect = ReveniumAPIError(
             "Forbidden", status_code=403
         )
@@ -4617,7 +4960,7 @@ class TestDepartmentRemovalErrors:
                 {"email": "ash@acme.com", "confirm": True}
             )
 
-        assert excinfo.value.message == "Departments are not enabled for this tenant"
+        self._assert_names_both_causes(excinfo.value, mock_client, "clear_department_assignment")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -4815,6 +5158,15 @@ class TestCustomerManagementAutoGeneration:
         )
         assert result["firstName"] == "Jane"
         assert result["lastName"] == "Smith"
+
+
+    @pytest.mark.parametrize("resource_type", ["users", "subscribers"])
+    def test_one_word_email_invents_no_last_name(self, customer_mgmt, resource_type):
+        result = customer_mgmt._apply_auto_generation(
+            {"email": "solo@example.com"}, resource_type, {}
+        )
+        assert "lastName" not in result
+        assert result["firstName"] == "Solo"
 
 
 class TestCreateCustomersConfigDefaultFields:
@@ -5200,3 +5552,85 @@ class TestWarningFieldsCannotFabricateLines:
         ]
         assert text.count("Teams created successfully:") == 1
         assert text.startswith(callout_lines[0] + "\n\nTeams created successfully:\n\n")
+
+
+class TestCustomerHelpIsTrue:
+    """BACK-4815: the customers tool's own text leads only to calls it accepts."""
+
+    @pytest.mark.asyncio
+    async def test_no_capability_source_lists_a_relationships_resource_type(self):
+        from src.revenium_mcp_server.capability_manager.discovery import (
+            CapabilityDiscovery,
+        )
+        from src.revenium_mcp_server.json_schema_validator import JSONSchemaValidator
+        from src.revenium_mcp_server.schema_discovery import CustomerSchemaDiscovery
+
+        discovery = CapabilityDiscovery.__new__(CapabilityDiscovery)
+        discovered = await CapabilityDiscovery._discover_customer_capabilities(discovery)
+        schema_capabilities = CustomerSchemaDiscovery().get_customer_capabilities()
+        schema = JSONSchemaValidator()._build_customers_schema()
+
+        assert "relationships" not in discovered["resource_types"]
+        assert "relationships" not in schema_capabilities["resource_types"]
+        assert "relationships" not in (
+            schema["properties"]["resource_type"]["enum"]
+        )
+
+    def test_tool_description_does_not_call_users_platform_admins(self):
+        assert "platform admins" not in CustomerManagement.tool_description
+        assert "users" in CustomerManagement.tool_description
+
+    @pytest.mark.asyncio
+    async def test_capabilities_describe_the_administrator_role_the_way_get_roles_does(
+        self, customer_mgmt
+    ):
+        from src.revenium_mcp_server.capability_manager.discovery import (
+            CapabilityDiscovery,
+        )
+
+        discovery = CapabilityDiscovery.__new__(CapabilityDiscovery)
+        discovered = await CapabilityDiscovery._discover_customer_capabilities(discovery)
+        ucm_helper = MagicMock()
+        ucm_helper.ucm.get_capabilities = AsyncMock(return_value=discovered)
+        customer_mgmt.validator.ucm_helper = ucm_helper
+
+        with patch.object(
+            customer_mgmt, "get_client", new_callable=AsyncMock, return_value=MagicMock()
+        ):
+            result = await customer_mgmt.handle_action("get_capabilities", {})
+
+        text = result[0].text
+        admin_line = next(
+            line for line in text.splitlines() if line.startswith("- `ROLE_TENANT_ADMIN`")
+        )
+        assert "not valid or available" not in text
+        assert "administrator" in admin_line
+        assert "explicitly asks for an administrator" in admin_line
+        assert "`relationships`" not in text
+
+    @pytest.mark.asyncio
+    async def test_subscriber_update_examples_send_a_field_a_subscriber_has(
+        self, subscriber_manager
+    ):
+        usages = []
+        for arguments in ({"subscriber_data": {"firstName": "X"}}, {"subscriber_id": "s1"}):
+            with pytest.raises(ToolError) as exc_info:
+                await subscriber_manager.update_subscriber(arguments)
+            usages.append(exc_info.value.examples["usage"])
+
+        for usage in usages:
+            assert "'name'" not in usage
+            assert "'firstName'" in usage
+
+    @pytest.mark.asyncio
+    async def test_user_role_hints_do_not_say_users_may_hold_only_the_consumer_role(
+        self, user_manager, customer_mgmt
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await user_manager.create_user({})
+        role_requirement = exc_info.value.examples["role_requirement"]
+        customer_mgmt.validator.schema_discovery = None
+        user_example_note = customer_mgmt.validator.get_examples("users")
+
+        assert "subscribers/users" not in role_requirement
+        assert "users/subscribers" not in json.dumps(user_example_note)

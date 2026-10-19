@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 from mcp.types import TextContent
 
+from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.tools_decomposed.slack_management import SlackManagement
 
 
@@ -110,14 +111,16 @@ class TestSlackManagementUnknownAction:
 
     @pytest.mark.asyncio
     async def test_unknown_action_returns_error_with_valid_actions(self, slack_mgmt):
-        result = await slack_mgmt.handle_action("nonexistent_action", {})
-        text = result[0].text.lower()
+        with pytest.raises(ToolError) as exc_info:
+            await slack_mgmt.handle_action("nonexistent_action", {})
+        text = exc_info.value.message.lower()
         assert "unknown" in text or "nonexistent_action" in text
 
     @pytest.mark.asyncio
     async def test_unknown_action_suggests_categories(self, slack_mgmt):
-        result = await slack_mgmt.handle_action("bad_action", {})
-        text = result[0].text
+        with pytest.raises(ToolError) as exc_info:
+            await slack_mgmt.handle_action("bad_action", {})
+        text = exc_info.value.message
         # Should include references to valid action categories
         assert "configuration" in text.lower() or "oauth" in text.lower() or "setup" in text.lower()
 

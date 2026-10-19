@@ -10,8 +10,12 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from ..client import ReveniumClient
-from ..common.security_utils import obfuscate_credential_data, obfuscate_sensitive_string
+from ..client import ReveniumAPIError, ReveniumClient
+from ..common.security_utils import obfuscate_credential_data
+
+# ReveniumClient rewrites the platform's "Failed to decode hashed Id" message into
+# "Invalid <Resource> ID ... not valid or does not exist", so match either form.
+_MALFORMED_ID_MARKERS = ("decode", "not valid or does not exist")
 
 
 class ValidationSeverity(Enum):
@@ -56,6 +60,56 @@ class DryRunResult:
     preview_data: Dict[str, Any]
     confidence_score: float
     next_steps: List[str]
+
+
+def _is_unknown_subscriber(error: ReveniumAPIError) -> bool:
+    """A 404, or the 400 the platform gives for an ID it cannot decode.
+
+    Both mean the platform will refuse a credential for this subscriber; a 403
+    or an outage says nothing about whether the subscriber exists.
+    """
+    if error.status_code == 404:
+        return True
+    if error.status_code != 400:
+        return False
+    evidence = f"{error.message} {error.response_data}".lower()
+    return any(marker in evidence for marker in _MALFORMED_ID_MARKERS)
+
+
+def _unknown_subscriber_issue(subscriber_id: str) -> ValidationIssue:
+    return ValidationIssue(
+        severity=ValidationSeverity.ERROR,
+        field="subscriberId",
+        message=f"Subscriber '{subscriber_id}' not found",
+        suggestion=(
+            "Check the subscriber ID, or look it up by email with "
+            "resolve_subscriber_email_to_id"
+        ),
+        business_impact="The platform refuses a credential for an unknown subscriber",
+    )
+
+
+def _unverified_subscriber_issue(subscriber_id: str) -> ValidationIssue:
+    return ValidationIssue(
+        severity=ValidationSeverity.WARNING,
+        field="subscriberId",
+        message=f"The preview could not verify subscriber '{subscriber_id}'",
+        suggestion="Verify the subscriber ID is valid",
+        business_impact="Invalid subscriber may cause billing issues",
+    )
+
+
+def _unchecked_external_id_issue(business_impact: str) -> ValidationIssue:
+    return ValidationIssue(
+        severity=ValidationSeverity.WARNING,
+        field="externalId",
+        message=(
+            "The preview cannot check for an existing credential with this "
+            "external ID, because the platform masks external IDs"
+        ),
+        suggestion="Confirm the external ID is unique",
+        business_impact=business_impact,
+    )
 
 
 class CredentialDryRunValidator:
@@ -276,66 +330,26 @@ class CredentialDryRunValidator:
         self, credential_data: Dict[str, Any]
     ) -> List[ValidationIssue]:
         """Check for conflicts during credential creation."""
-        issues = []
-
-        # Check for duplicate external IDs
-        if "externalId" in credential_data:
-            try:
-                # Search for existing credentials with the same external ID
-                existing_credentials = await self.client.get_credentials(page=0, size=100)
-                credentials = self.client._extract_embedded_data(existing_credentials)
-
-                for cred in credentials:
-                    if cred.get("externalId") == credential_data["externalId"]:
-                        # SECURITY: Obfuscate sensitive data in error messages
-                        obfuscated_id = obfuscate_sensitive_string(credential_data["externalId"])
-                        issues.append(
-                            ValidationIssue(
-                                severity=ValidationSeverity.ERROR,
-                                field="externalId",
-                                message=f"External ID '{obfuscated_id}' already exists",
-                                suggestion="Use a unique external ID or update the existing credential",
-                                business_impact="Duplicate external IDs can cause authentication conflicts",
-                            )
-                        )
-                        break
-            except Exception as e:
-                logger.warning(f"Could not check for duplicate external IDs: {e}")
-
-        return issues
+        if "externalId" not in credential_data:
+            return []
+        return [
+            _unchecked_external_id_issue(
+                "A create with an existing external ID returns the existing "
+                "credential instead of creating a new one"
+            )
+        ]
 
     async def _check_update_conflicts(
         self, credential_id: str, credential_data: Dict[str, Any]
     ) -> List[ValidationIssue]:
         """Check for conflicts during credential updates."""
-        issues = []
-
-        # Similar to create conflicts but exclude the current credential
-        if "externalId" in credential_data:
-            try:
-                existing_credentials = await self.client.get_credentials(page=0, size=100)
-                credentials = self.client._extract_embedded_data(existing_credentials)
-
-                for cred in credentials:
-                    is_different_credential = cred.get("id") != credential_id
-                    has_same_external_id = cred.get("externalId") == credential_data["externalId"]
-                    if is_different_credential and has_same_external_id:
-                        # SECURITY: Obfuscate sensitive data in error messages
-                        obfuscated_id = obfuscate_sensitive_string(credential_data["externalId"])
-                        issues.append(
-                            ValidationIssue(
-                                severity=ValidationSeverity.ERROR,
-                                field="externalId",
-                                message=f"External ID '{obfuscated_id}' already exists on another credential",
-                                suggestion="Use a unique external ID",
-                                business_impact="Duplicate external IDs can cause authentication conflicts",
-                            )
-                        )
-                        break
-            except Exception as e:
-                logger.warning(f"Could not check for duplicate external IDs: {e}")
-
-        return issues
+        if "externalId" not in credential_data:
+            return []
+        return [
+            _unchecked_external_id_issue(
+                "Duplicate external IDs can cause authentication conflicts"
+            )
+        ]
 
     async def _check_immutable_fields(
         self, current_credential: Dict[str, Any], update_data: Dict[str, Any]
@@ -363,25 +377,24 @@ class CredentialDryRunValidator:
         self, credential_data: Dict[str, Any]
     ) -> List[ValidationIssue]:
         """Validate business relationships and dependencies."""
-        issues = []
+        subscriber_id = credential_data.get("subscriberId")
+        if not isinstance(subscriber_id, str) or not subscriber_id.strip():
+            return []
 
-        # Validate subscriber exists
-        if "subscriberId" in credential_data:
-            try:
-                # This would check if subscriber exists - simplified for now
-                pass
-            except Exception:
-                issues.append(
-                    ValidationIssue(
-                        severity=ValidationSeverity.WARNING,
-                        field="subscriberId",
-                        message="Could not verify subscriber existence",
-                        suggestion="Verify the subscriber ID is valid",
-                        business_impact="Invalid subscriber may cause billing issues",
-                    )
-                )
+        try:
+            subscriber = await self.client.get_subscriber_by_id(
+                ReveniumClient._quote_path_segment(subscriber_id)
+            )
+        except ReveniumAPIError as e:
+            if _is_unknown_subscriber(e):
+                return [_unknown_subscriber_issue(subscriber_id)]
+            return [_unverified_subscriber_issue(subscriber_id)]
+        except Exception:
+            return [_unverified_subscriber_issue(subscriber_id)]
 
-        return issues
+        if not isinstance(subscriber, dict) or subscriber.get("id") != subscriber_id:
+            return [_unverified_subscriber_issue(subscriber_id)]
+        return []
 
     async def _analyze_billing_impact(
         self,

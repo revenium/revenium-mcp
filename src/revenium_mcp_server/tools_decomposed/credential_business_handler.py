@@ -4,12 +4,27 @@ This module handles business guidance, onboarding checklists, troubleshooting gu
 and billing impact analysis for credential operations.
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ..business_context.credential_business_context import (
+    BusinessGuidance,
     BusinessScenario,
     CredentialBusinessContext,
 )
+
+
+def _guidance_as_dict(guidance: Optional[BusinessGuidance]) -> Dict[str, Any]:
+    """The guidance fields a caller reads, as plain data the tool result can carry."""
+    if not guidance:
+        return {}
+    return {
+        "description": guidance.description,
+        "key_considerations": guidance.key_considerations,
+        "step_by_step_process": guidance.step_by_step_process,
+        "common_pitfalls": guidance.common_pitfalls,
+        "success_metrics": guidance.success_metrics,
+        "troubleshooting_tips": guidance.troubleshooting_tips,
+    }
 
 
 class CredentialBusinessHandler:
@@ -35,22 +50,10 @@ class CredentialBusinessHandler:
 
         guidance = self.business_context.get_business_guidance(scenario)
 
-        # Convert guidance to dictionary if it exists
-        guidance_dict = {}
-        if guidance:
-            guidance_dict = {
-                "description": guidance.description,
-                "key_considerations": guidance.key_considerations,
-                "step_by_step_process": guidance.step_by_step_process,
-                "common_pitfalls": guidance.common_pitfalls,
-                "success_metrics": guidance.success_metrics,
-                "troubleshooting_tips": guidance.troubleshooting_tips,
-            }
-
         return {
             "action": "get_business_guidance",
             "scenario": scenario_name,
-            "guidance": guidance_dict,
+            "guidance": _guidance_as_dict(guidance),
             "related_actions": [
                 "get_onboarding_checklist - for new customer setup",
                 "get_troubleshooting_guide - for issue resolution",
@@ -91,6 +94,7 @@ class CredentialBusinessHandler:
             }
 
         guide = self.business_context.generate_troubleshooting_guide(issue_description)
+        guide["guidance"] = _guidance_as_dict(guide.get("guidance"))
 
         return {
             "action": "get_troubleshooting_guide",
@@ -128,7 +132,8 @@ class CredentialBusinessHandler:
             "impact_analysis": impact_analysis,
             "billing_relationships": relationships,
             "recommendations": [
-                "Use dry_run=true to preview changes before applying",
+                "Read the credential with get before applying changes; "
+                "only credential create previews with dry_run=true",
                 "Monitor billing automation for 24-48 hours after changes",
                 "Coordinate with customers for any credential secret updates",
                 "Maintain audit trail of all credential changes",

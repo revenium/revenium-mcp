@@ -1,4 +1,4 @@
-"""Unit tests for SmartDefaultsEngine — product/alert/customer/source defaults and merging."""
+"""Unit tests for SmartDefaultsEngine: alert/customer/source defaults and merging."""
 
 import pytest
 
@@ -10,32 +10,6 @@ class TestSmartDefaultsEngine:
 
     def setup_method(self):
         self.engine = SmartDefaultsEngine()
-
-    # -----------------------------------------------------------------------
-    # Product defaults
-    # -----------------------------------------------------------------------
-
-    def test_product_defaults_simple(self):
-        defaults = self.engine.get_product_defaults("simple")
-        assert defaults["version"] == "1.0.0"
-        assert defaults["published"] is True
-        assert defaults["plan"]["type"] == "CHARGE"
-
-    def test_product_defaults_subscription(self):
-        defaults = self.engine.get_product_defaults("subscription")
-        assert defaults["plan"]["type"] == "SUBSCRIPTION"
-        assert defaults["plan"]["period"] == "MONTH"
-
-    def test_product_defaults_usage_based(self):
-        defaults = self.engine.get_product_defaults("usage_based")
-        assert defaults["plan"]["type"] == "USAGE"
-        assert defaults["plan"]["graduated"] is True
-        assert len(defaults["plan"]["tiers"]) == 3
-
-    def test_product_defaults_unknown_type_returns_base(self):
-        defaults = self.engine.get_product_defaults("unknown_type")
-        assert "version" in defaults
-        assert "plan" not in defaults
 
     # -----------------------------------------------------------------------
     # Alert defaults
@@ -157,13 +131,6 @@ class TestSmartDefaultsEngine:
     # apply_smart_defaults
     # -----------------------------------------------------------------------
 
-    def test_apply_smart_defaults_product_create(self):
-        result = self.engine.apply_smart_defaults(
-            "manage_products", "create", {"name": "My Product"}
-        )
-        assert result["name"] == "My Product"
-        assert "version" in result
-
     def test_apply_smart_defaults_alert_create(self):
         result = self.engine.apply_smart_defaults(
             "manage_alerts", "create", {"alertType": "threshold"}
@@ -209,19 +176,6 @@ class TestSmartDefaultsEngine:
         assert result == {"x": 1}
 
     # -----------------------------------------------------------------------
-    # _detect_product_type
-    # -----------------------------------------------------------------------
-
-    def test_detect_product_type_subscription(self):
-        assert self.engine._detect_product_type({"plan": {"type": "SUBSCRIPTION"}}) == "subscription"
-
-    def test_detect_product_type_usage(self):
-        assert self.engine._detect_product_type({"plan": {"type": "USAGE"}}) == "usage_based"
-
-    def test_detect_product_type_simple_by_default(self):
-        assert self.engine._detect_product_type({}) == "simple"
-
-    # -----------------------------------------------------------------------
     # Onboarding integration
     # -----------------------------------------------------------------------
 
@@ -234,9 +188,9 @@ class TestSmartDefaultsEngine:
     def test_get_onboarding_enhanced_defaults_no_context(self):
         """Without onboarding context, falls back to standard defaults."""
         result = self.engine.get_onboarding_enhanced_defaults(
-            "manage_products", "create", {"name": "Test"}
+            "manage_alerts", "create", {"alertType": "threshold"}
         )
-        assert "version" in result
+        assert result["enabled"] is True
 
     def test_get_onboarding_enhanced_defaults_with_context(self):
         self.engine._onboarding_context = {

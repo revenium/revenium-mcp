@@ -11,7 +11,7 @@ Targets previously-uncovered branches across:
     create_with_subscription)
   - ProductManagement (handle_action routing, dry-run paths, formatting helpers,
     _format_create_with_subscription_response, _format_validation_response,
-    _generate_educational_feedback, _handle_get_agent_summary)
+    _handle_get_agent_summary)
 """
 
 import json
@@ -52,6 +52,12 @@ def _make_client():
         return_value={"totalPages": 1, "totalElements": 0}
     )
     return client
+
+
+def _previewed_body(preview_text: str) -> dict:
+    heading = "**Body the update would send:**"
+    assert heading in preview_text
+    return json.loads(preview_text.split(heading, 1)[1].split("**Dry Run:**", 1)[0])
 
 
 def _make_mgmt():
@@ -166,7 +172,7 @@ class TestProductManagerCreate:
         assert call_args["ownerId"] == "owner_123"
 
     @pytest.mark.asyncio
-    async def test_create_assigns_default_source_when_none_present(self):
+    async def test_create_attaches_no_source_when_none_named(self):
         client = _make_client()
         client._extract_embedded_data.return_value = [{"id": "src_default"}]
         manager = ProductManager(client)
@@ -187,7 +193,8 @@ class TestProductManagerCreate:
                 )
 
         call_args = client.create_product.call_args[0][0]
-        assert call_args["sourceIds"] == ["src_default"]
+        assert "sourceIds" not in call_args
+        assert client.get_sources.await_count == 0
 
     @pytest.mark.asyncio
     async def test_create_skips_source_on_exception(self):
@@ -668,7 +675,7 @@ class TestCreateSimple:
         assert "name" in exc_info.value.message.lower()
 
     @pytest.mark.asyncio
-    async def test_create_simple_subscription_pricing(self):
+    async def test_monthly_price_is_the_plans_flat_amount(self):
         client = _make_client()
         client._extract_embedded_data.return_value = [{"id": "src_1"}]
         client.create_product = AsyncMock(return_value={"id": "p_new", "name": "Monthly API"})
@@ -688,30 +695,111 @@ class TestCreateSimple:
 
         assert result["id"] == "p_new"
         call_args = client.create_product.call_args[0][0]
-        assert call_args["plan"]["tiers"][0]["unit_amount"] == "29.99"
+        tier = call_args["plan"]["tiers"][0]
+        assert tier["flat_amount"] == "29.99"
+        assert "unit_amount" not in tier
 
     @pytest.mark.asyncio
-    async def test_create_simple_usage_based_pricing(self):
+    async def test_usage_based_quick_create_is_refused_before_any_write(self):
+        """Quick create cannot choose a metering element, so a usage-based
+        quick create is refused with the lookup guidance before any call."""
         client = _make_client()
-        client._extract_embedded_data.return_value = [{"id": "src_1"}]
-        client.create_product = AsyncMock(return_value={"id": "p_usage", "name": "Usage API"})
+        processor = ProductEnhancementProcessor(client)
+
+        with pytest.raises(ToolError) as exc_info:
+            await processor.create_simple(
+                {"name": "Usage API", "pricing_model": "usage_based", "per_unit_price": 0.005}
+            )
+
+        error = exc_info.value
+        rendered = error.message + repr(error.suggestions) + repr(error.examples)
+        assert "manage_metering_elements(action='list')" in rendered
+        assert "0.005" in rendered
+        client.get_sources.assert_not_awaited()
+        client.create_product.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "extra,field",
+        [
+            ({"per_unit_price": 0.005}, "per_unit_price"),
+            ({"per_unit_price": 0}, "per_unit_price"),
+            ({"pricing_model": "subscription", "per_unit_price": 0.005}, "per_unit_price"),
+            ({"setup_fee_type": "per_customer"}, "setup_fee_type"),
+        ],
+        ids=["per_unit_default_model", "per_unit_zero", "per_unit_subscription", "fee_type_alone"],
+    )
+    @pytest.mark.asyncio
+    async def test_an_input_quick_create_would_drop_is_refused_before_any_write(self, extra, field):
+        client = _make_client()
+        processor = ProductEnhancementProcessor(client)
+
+        with pytest.raises(ToolError) as exc_info:
+            await processor.create_simple({"name": "Flat", **extra})
+
+        error = exc_info.value
+        assert error.field == field
+        assert "Nothing was created" in error.message
+        client.get_sources.assert_not_awaited()
+        client.create_product.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unknown_pricing_model_is_refused_before_any_write(self):
+        client = _make_client()
+        processor = ProductEnhancementProcessor(client)
+
+        with pytest.raises(ToolError) as exc_info:
+            await processor.create_simple({"name": "X", "pricing_model": "monthly"})
+
+        assert exc_info.value.field == "pricing_model"
+        client.get_sources.assert_not_awaited()
+        client.create_product.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_invalid_setup_fee_type_is_refused(self):
+        client = _make_client()
+        processor = ProductEnhancementProcessor(client)
+
+        with pytest.raises(ToolError) as exc_info:
+            await processor.create_simple(
+                {"name": "X", "setup_fee": 50, "setup_fee_type": "per_org"}
+            )
+
+        assert exc_info.value.field == "setup_fee_type"
+        client.create_product.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("monthly_price", float("nan")),
+            ("monthly_price", float("inf")),
+            ("setup_fee", float("nan")),
+            ("monthly_price", -1),
+            ("setup_fee", "fifty"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_non_finite_price_is_refused(self, field, value):
+        client = _make_client()
+        processor = ProductEnhancementProcessor(client)
+
+        with pytest.raises(ToolError) as exc_info:
+            await processor.create_simple({"name": "X", field: value})
+
+        assert exc_info.value.field == field
+        client.create_product.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_zero_price_is_accepted(self):
+        client = _make_client()
         processor = ProductEnhancementProcessor(client)
 
         with patch(
             "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
             return_value=None,
         ):
-            result = await processor.create_simple(
-                {
-                    "name": "Usage API",
-                    "pricing_model": "usage_based",
-                    "per_unit_price": 0.005,
-                }
-            )
+            await processor.create_simple({"name": "X", "monthly_price": 0, "setup_fee": 0})
 
-        assert result["id"] == "p_usage"
-        call_args = client.create_product.call_args[0][0]
-        assert call_args["plan"]["ratingAggregations"][0]["aggregationType"] == "SUM"
+        client.create_product.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_create_simple_with_setup_fee(self):
@@ -759,6 +847,24 @@ class TestCreateSimple:
         assert call_args["plan"]["setupFees"][0]["type"] == "ORGANIZATION"
 
     @pytest.mark.asyncio
+    async def test_create_simple_is_unpublished_with_no_source(self):
+        """BACK-4662: create_simple names no source, so it makes a draft product."""
+        client = _make_client()
+        client._extract_embedded_data.return_value = [{"id": "src_1"}]
+        processor = ProductEnhancementProcessor(client)
+
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
+            return_value=None,
+        ):
+            await processor.create_simple({"name": "Draft"})
+
+        call_args = client.create_product.call_args[0][0]
+        assert call_args["published"] is False
+        assert "sourceIds" not in call_args
+        assert client.get_sources.await_count == 0
+
+    @pytest.mark.asyncio
     async def test_create_simple_source_exception_does_not_raise(self):
         """Source lookup failure is swallowed — product creation proceeds."""
         client = _make_client()
@@ -773,31 +879,6 @@ class TestCreateSimple:
             result = await processor.create_simple({"name": "Test"})
 
         assert result["id"] == "p_new"
-
-    @pytest.mark.asyncio
-    async def test_create_simple_usage_based_api_error_reraises_as_api_error(self):
-        """ReveniumAPIError that doesn't match the elementDefinitionId condition is re-raised.
-        The production guard checks str(e) which only contains the status_code integer,
-        so the error always falls through to the re-raise branch."""
-        from src.revenium_mcp_server.client import ReveniumAPIError
-
-        original_error = ReveniumAPIError(400, "Bad Request", {})
-        client = _make_client()
-        client._extract_embedded_data.return_value = []
-        client.create_product = AsyncMock(side_effect=original_error)
-        processor = ProductEnhancementProcessor(client)
-
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
-            return_value=None,
-        ):
-            with pytest.raises(ReveniumAPIError) as exc_info:
-                await processor.create_simple(
-                    {"name": "Usage API", "pricing_model": "usage_based", "per_unit_price": 0.01}
-                )
-
-        # Confirm it is the exact same exception object — re-raised, not wrapped
-        assert exc_info.value is original_error
 
     @pytest.mark.asyncio
     async def test_create_simple_non_element_api_error_reraises(self):
@@ -817,7 +898,7 @@ class TestCreateSimple:
         ):
             with pytest.raises(ReveniumAPIError):
                 await processor.create_simple(
-                    {"name": "Test", "pricing_model": "usage_based", "per_unit_price": 0.01}
+                    {"name": "Test", "pricing_model": "subscription", "monthly_price": 10}
                 )
 
 
@@ -978,7 +1059,7 @@ class TestGetTemplates:
         mock_lib.get_template.return_value = {"name": "API Template"}
         processor.template_library = mock_lib
 
-        result = await processor.get_templates({"template": "simple_api_service"})
+        result = await processor.get_templates({"name": "simple_api_service"})
 
         assert result["template"]["name"] == "API Template"
 
@@ -1395,7 +1476,15 @@ class TestHandleActionDelete:
 class TestHandleActionUpdateDryRun:
     @pytest.mark.asyncio
     async def test_handle_action_update_dry_run(self):
-        mgmt, _ = _make_mgmt()
+        mgmt, client = _make_mgmt()
+        client.get_product_by_id.return_value = {
+            "id": "p1",
+            "name": "Product A",
+            "version": "1.0.0",
+            "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
+            "plan": {"type": "SUBSCRIPTION", "tiers": [{"name": "t1"}]},
+        }
+        client.prepare_product_update_body = lambda body: body
 
         result = await mgmt.handle_action(
             "update",
@@ -1405,6 +1494,12 @@ class TestHandleActionUpdateDryRun:
         text = result[0].text
         assert "DRY RUN" in text
         assert "p1" in text
+        body = _previewed_body(text)
+        assert body["name"] == "New Name"
+        assert body["version"] == "1.0.0"
+        assert body["paymentSource"] == "INVOICE_ONLY_NO_PAYMENT"
+        client.get_product_by_id.assert_awaited()
+        client.update_product.assert_not_awaited()
 
 
 # ===========================================================================
@@ -1505,6 +1600,28 @@ class TestHandleActionCreateSimple:
 
         text = result[0].text
         assert "created" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_is_refused_before_any_write(self):
+        mgmt, client = _make_mgmt()
+
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
+            return_value=None,
+        ), pytest.raises(ToolError) as exc_info:
+            await mgmt.handle_action(
+                "create_simple",
+                {"name": "Simple", "pricing_model": "subscription", "dry_run": True},
+            )
+
+        client.create_product.assert_not_awaited()
+        client.create_subscription.assert_not_awaited()
+        error = exc_info.value
+        assert error.error_code == ErrorCodes.INVALID_PARAMETER
+        assert error.field == "dry_run"
+        assert "create_simple has no preview" in error.message
+        assert "nothing was sent" in error.message
+        assert 'action="create"' in error.message
 
 
 # ===========================================================================
@@ -1662,60 +1779,6 @@ class TestHandleActionGetCapabilities:
 
 
 # ===========================================================================
-# ProductManagement._generate_educational_feedback
-# ===========================================================================
-
-
-class TestGenerateEducationalFeedback:
-    def test_subscription_setup_fee_feedback(self):
-        mgmt = ProductManagement()
-        feedback = mgmt._generate_educational_feedback(
-            {
-                "setupFees": [{"type": "SUBSCRIPTION", "flatAmount": 50.0}],
-                "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
-            }
-        )
-
-        assert "SUBSCRIPTION type" in feedback
-        assert "flatAmount" in feedback
-        assert "Manual invoice" in feedback
-
-    def test_organization_setup_fee_feedback(self):
-        mgmt = ProductManagement()
-        feedback = mgmt._generate_educational_feedback(
-            {
-                "setupFees": [{"type": "ORGANIZATION", "flatAmount": 200.0}],
-            }
-        )
-
-        assert "ORGANIZATION type" in feedback
-
-    def test_no_setup_fees_no_feedback(self):
-        mgmt = ProductManagement()
-        feedback = mgmt._generate_educational_feedback({"name": "Plain Product"})
-
-        assert feedback == ""
-
-    def test_external_payment_notification(self):
-        mgmt = ProductManagement()
-        feedback = mgmt._generate_educational_feedback(
-            {"paymentSource": "EXTERNAL_PAYMENT_NOTIFICATION"}
-        )
-
-        assert "Tracked invoice" in feedback
-
-    def test_setup_fee_without_flat_amount_shows_migration_note(self):
-        mgmt = ProductManagement()
-        feedback = mgmt._generate_educational_feedback(
-            {
-                "setupFees": [{"type": "SUBSCRIPTION", "amount": 50.0}],
-            }
-        )
-
-        assert "flatAmount" in feedback
-
-
-# ===========================================================================
 # ProductManagement._format_validation_response
 # ===========================================================================
 
@@ -1759,3 +1822,20 @@ class TestFormatValidationResponse:
         text = result[0].text
         assert "Validation Failed" in text
         assert "CHARGE is deprecated" in text
+
+
+class TestCreateWithSubscriptionExample:
+    """The copy-paste example matches what the real create requires."""
+
+    def test_example_requires_metering_and_carries_organization_id(self):
+        from src.revenium_mcp_server.tools_decomposed.product_management import ProductValidator
+
+        example = ProductValidator().get_examples("create_with_subscription")[
+            "coordinated_workflow_example"
+        ]
+
+        metering_step = example["prerequisites"]["step_2"]
+        assert metering_step["required"] is True
+        assert "optional" not in metering_step["purpose"].lower()
+        assert "refused" in metering_step["purpose"]
+        assert "organizationId" in example["template"]["subscription_data"]

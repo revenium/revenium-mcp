@@ -14,7 +14,7 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..common.error_handling import (
     create_structured_validation_error,
-    format_structured_error,
+    raise_structured_error,
 )
 from ..introspection.metadata import ToolCapability, ToolType
 from .email_verification import EmailVerification
@@ -384,7 +384,7 @@ All actions support the same parameters as their original tools for 100% compati
             },
         )
 
-        return [TextContent(type="text", text=format_structured_error(error))]
+        raise_structured_error(error)
 
     async def _get_supported_actions(self) -> List[str]:
         """Get all supported actions from consolidated tool."""
@@ -400,12 +400,11 @@ All actions support the same parameters as their original tools for 100% compati
                 name="Welcome and Onboarding",
                 description="Comprehensive system onboarding with welcome guidance and setup overview",
                 parameters={
-                    "show_welcome": {"include_setup_guidance": "bool", "show_environment": "bool"},
+                    "show_welcome": {},
                     "get_agent_summary": {},
                 },
                 examples=[
                     "show_welcome()",
-                    "show_welcome(include_setup_guidance=True)",
                     "get_agent_summary()",
                 ],
                 limitations=[
@@ -416,7 +415,7 @@ All actions support the same parameters as their original tools for 100% compati
                 name="Setup Validation and Checklist",
                 description="Comprehensive setup status checking and requirement verification",
                 parameters={
-                    "setup_checklist": {"suggest_smart_defaults": "bool", "test_configuration": "bool"},
+                    "setup_checklist": {"test_configuration": "bool"},
                     "environment_status": {},
                     "next_steps": {},
                     "complete_setup": {"confirm_completion": "bool"},
@@ -442,7 +441,7 @@ All actions support the same parameters as their original tools for 100% compati
                 description="Email setup validation and configuration guidance",
                 parameters={
                     "check_status": {},
-                    "update_email": {"email": "str", "validate_format": "bool"},
+                    "update_email": {"email": "str"},
                     "validate_email": {"email": "str"},
                     "setup_guidance": {},
                     "test_configuration": {},

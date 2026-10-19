@@ -43,6 +43,14 @@ def mock_revenium_api() -> Iterator[HTTPServer]:
     server.expect_request("/profitstream/v2/api/organizations").respond_with_json(ORGANIZATIONS_LIST)
     server.expect_request("/profitstream/v2/api/sources/ai/anomaly").respond_with_json(ANOMALIES_LIST)
     server.expect_request("/profitstream/v2/api/sources/ai/models").respond_with_json(AI_MODELS_LIST)
+    # system_health reads these two as the caller; without them the client's
+    # 5xx retry backoff adds seconds to the call.
+    server.expect_request(
+        "/profitstream/v2/api/sources/metrics/ai/data-connected/sources"
+    ).respond_with_json({"sdkMetering": {"connected": True, "lastReceived": None}})
+    server.expect_request("/profitstream/v2/api/configurations/slack").respond_with_json(
+        {"_embedded": {"slackConfigurationResourceList": []}, "page": {"totalElements": 0}}
+    )
 
     try:
         yield server

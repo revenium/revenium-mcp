@@ -118,7 +118,14 @@ async def test_env_http_serves_health_endpoint(env_http_server):
         )
 
     assert resp.status_code == 200
-    assert resp.json() == {"status": "healthy"}
+    body = resp.json()
+    assert body["status"] == "healthy"
+    assert set(body["platform"]) == {
+        "status_code",
+        "checked_at",
+        "age_seconds",
+        "error",
+    }
 
 
 @pytest.mark.asyncio

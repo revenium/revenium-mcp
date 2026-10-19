@@ -27,6 +27,7 @@ from src.revenium_mcp_server.alerts.anomaly_manager import (
     format_filter_row,
     validate_filter_rows,
 )
+from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.exceptions import ValidationError
 from src.revenium_mcp_server.json_schema_validator import JSONSchemaValidator
 
@@ -213,20 +214,21 @@ class TestCreateForwardsTheInRow:
         client.team_id = "team-1"
         client.create_anomaly = AsyncMock(return_value={"id": "anom-1"})
 
-        result = await manager.create_anomaly(
-            client,
-            {
-                "name": "Frontier",
-                "alertType": "THRESHOLD",
-                "metricType": "TOTAL_COST",
-                "operatorType": "GREATER_THAN",
-                "threshold": 500,
-                "filters": [{"dimension": "MODEL", "operator": "IN"}],
-            },
-        )
+        with pytest.raises(ToolError) as exc_info:
+            await manager.create_anomaly(
+                client,
+                {
+                    "name": "Frontier",
+                    "alertType": "THRESHOLD",
+                    "metricType": "TOTAL_COST",
+                    "operatorType": "GREATER_THAN",
+                    "threshold": 500,
+                    "filters": [{"dimension": "MODEL", "operator": "IN"}],
+                },
+            )
 
         client.create_anomaly.assert_not_called()
-        assert "values" in result[0].text
+        assert "values" in exc_info.value.message
 
 
 class TestUpdateKeepsTheValuesList:
@@ -237,7 +239,7 @@ class TestUpdateKeepsTheValuesList:
         current = {"id": "anom-1", "name": "Frontier", "enabled": True}
         client = MagicMock()
         client.get_anomaly_by_id = AsyncMock(return_value=current)
-        client.update_anomaly = AsyncMock(return_value=current)
+        client.update_anomaly = AsyncMock(side_effect=lambda _anomaly_id, body: dict(body))
 
         await manager.update_anomaly(
             client,
@@ -261,12 +263,13 @@ class TestUpdateKeepsTheValuesList:
         client.get_anomaly_by_id = AsyncMock(return_value=current)
         client.update_anomaly = AsyncMock(return_value=current)
 
-        result = await manager.update_anomaly(
-            client, "anom-1", {"filters": [{"dimension": "MODEL", "operator": "IN"}]}
-        )
+        with pytest.raises(ToolError) as exc_info:
+            await manager.update_anomaly(
+                client, "anom-1", {"filters": [{"dimension": "MODEL", "operator": "IN"}]}
+            )
 
         client.update_anomaly.assert_not_called()
-        assert "values" in result[0].text
+        assert "values" in exc_info.value.message
 
 
 class TestRenderingAnInRow:

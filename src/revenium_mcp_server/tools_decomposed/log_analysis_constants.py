@@ -41,7 +41,7 @@ CAPABILITIES_TEXT = """
 4. **search_logs** - ✅ **AVAILABLE**
    - Advanced filtering with operation and status types
    - Client-side search of details field
-   - Supports comprehensive search across all pages
+   - Supports a page-by-page search that reports how much it covered
 
 5. **analyze_operations** - ✅ **AVAILABLE**
    - Operation pattern analysis and frequency reporting
@@ -101,7 +101,7 @@ CAPABILITIES_TEXT = """
   "operation_filter": "AI_METRIC_PROCESSING",  // Filter by operation type
   "status_filter": "SUCCESS",   // Filter by status: SUCCESS|FAILURE|INFO|WARNING
   "search_term": "keyword",     // Search in details field
-  "search_all_pages": true      // Search across all pages (default: false)
+  "search_all_pages": true      // Search page by page up to the page limit (default: false)
 }
 ```
 
@@ -272,7 +272,7 @@ EXAMPLES_TEXT = """
   "search_all_pages": true
 }
 ```
-**Purpose**: Search for specific terms across entire historical dataset.
+**Purpose**: Search for specific terms page by page, newest first, up to the search's page limit; the answer says how many pages and entries it searched.
 
 ### analyze_operations
 ```json

@@ -3,7 +3,7 @@
 This module provides shared validation functions used across the MCP server.
 """
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from ..validators import InputValidator
 from ..exceptions import ValidationError
 
@@ -22,6 +22,7 @@ __all__ = [
     "validate_pagination_params",
     "validate_string_params",
     "apply_filter_allowlist",
+    "refuse_arguments_the_action_ignores",
     "SAFE_INT_MAX",
 ]
 
@@ -221,15 +222,26 @@ def validate_pagination_params(arguments: Dict[str, Any], action: str) -> Dict[s
                 if max_value is None
                 else f"an integer in [{min_value}, {max_value}]"
             )
+            if coerced is None:
+                suggestions = [
+                    f"When calling '{action}', pass {name} as an integer (e.g. {name}={min_value if name == 'page' else 20})",
+                    f"When calling '{action}' over string transports, send a digit-only string for {name} (e.g. {name}=\"{min_value if name == 'page' else 20}\")",
+                ]
+            else:
+                # The value is a well-formed integer; only its range is wrong,
+                # so advice about its type would send the caller the wrong way.
+                suggestions = [f"When calling '{action}', pass {name} between {min_value} and {max_value}"]
+                if name == "size" and coerced > max_value:
+                    suggestions.append(
+                        f"When calling '{action}', a page holds at most {max_value} rows; "
+                        "request the next page with page=<n + 1> for more"
+                    )
             raise ToolError(
                 message=f"{name} must be {range_hint}, got {raw!r}",
                 error_code=ErrorCodes.VALIDATION_ERROR,
                 field=name,
                 value=raw,
-                suggestions=[
-                    f"When calling '{action}', pass {name} as an integer (e.g. {name}={min_value if name == 'page' else 20})",
-                    f"When calling '{action}' over string transports, send a digit-only string for {name} (e.g. {name}=\"{min_value if name == 'page' else 20}\")",
-                ],
+                suggestions=suggestions,
             )
 
         out[name] = coerced
@@ -474,3 +486,40 @@ def apply_filter_allowlist(
             )
 
     return mapped
+
+
+def refuse_arguments_the_action_ignores(
+    action: str,
+    arguments: Mapping[str, Any],
+    names: Iterable[str],
+    *,
+    honoured_by: Collection[str],
+    known_actions: Collection[str],
+) -> None:
+    """Refuse a call that sends an argument ``action`` never reads.
+
+    Only a known action is checked, so a mistyped one still gets the tool's
+    unknown-action answer. The refusal names the arguments and never quotes
+    their values, which carry emails, names and free-form data.
+
+    Raises:
+        ToolError: when ``action`` is known, is not in ``honoured_by`` and
+            one of ``names`` was sent.
+    """
+    if action not in known_actions or action in honoured_by:
+        return
+    sent = [name for name in names if arguments.get(name) is not None]
+    if not sent:
+        return
+
+    # Local import to avoid a circular dependency at module import time.
+    from .error_handling import create_structured_validation_error
+
+    refused = ", ".join(sent)
+    readers = ", ".join(sorted(honoured_by))
+    raise create_structured_validation_error(
+        message=f"{action} does not read {refused}; it is read only by {readers}.",
+        field=sent[0],
+        value=None,
+        suggestions=[f"Drop {refused} from this {action} call."],
+    )

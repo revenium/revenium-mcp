@@ -6,7 +6,7 @@ validation infrastructure to ensure consistency with the system.
 
 import os
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -19,10 +19,23 @@ from ..common.error_handling import (
     create_structured_validation_error,
     format_structured_error,
 )
+from ..config_store import get_environment_value
 from ..endpoint_registry import _resolved_app_base_url, _use_new_api, get_endpoint_path
-from ..onboarding.env_validation import API_AUTH_REJECTED_MESSAGE, read_forbidden_detail
+from ..onboarding.env_validation import (
+    API_AUTH_REJECTED_MESSAGE,
+    read_forbidden_detail,
+    request_settings,
+)
+from ..onboarding.platform_read import probe_platform_read
 from ..introspection.metadata import ToolType
 from .unified_tool_base import ToolBase
+
+
+_HOSTED_READ_LABELS = {
+    "success": "SUCCESS",
+    "permission_denied": "FORBIDDEN",
+    "not_attempted": "SKIPPED",
+}
 
 
 class DebugAutoDiscovery(ToolBase):
@@ -96,6 +109,9 @@ class DebugAutoDiscovery(ToolBase):
         self, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle debug action - run auto-discovery diagnostics."""
+        caller_settings = request_settings()
+        if caller_settings is not None:
+            return await self._hosted_debug_report(caller_settings)
         try:
             import httpx
 
@@ -111,7 +127,7 @@ class DebugAutoDiscovery(ToolBase):
             ]
 
             for var in revenium_vars:
-                value = os.getenv(var)
+                value = get_environment_value(var)
                 if "API_KEY" in var and value:
                     env_vars[var] = "SET (hidden)"
                 elif value:
@@ -243,6 +259,38 @@ class DebugAutoDiscovery(ToolBase):
             logger.error(f"Error in debug auto-discovery: {e}")
             error_text = f"**Diagnostic Error**: {str(e)}\n\nPlease check system configuration and try again."
             return [TextContent(type="text", text=error_text)]
+
+    async def _hosted_debug_report(
+        self, caller_settings: Dict[str, Tuple[bool, str]]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Diagnose a hosted caller from its request and one read made with it.
+
+        The server's own variables and probe describe the server, not this caller.
+        """
+        read = await probe_platform_read(await self.get_client())
+        accessible = read.get("status") == "success"
+        label = _HOSTED_READ_LABELS.get(read.get("status", ""), "FAILED")
+        result = label if accessible else f"{label} ({read.get('error', 'no data was read')})"
+
+        report = "# **Auto-Discovery Diagnostic Report**\n\n## **Your Request**\n"
+        for var_name, (present, shown) in caller_settings.items():
+            report += f"- {'✅' if present else '❌'} **{var_name}**: {shown}\n"
+        report += (
+            "\n## **API Connectivity Test**\n"
+            f"- **Result**: {result}\n"
+            "- **Test**: Read this organization's data-connected sources\n"
+            "\n## **Summary**\n"
+            f"- **API Accessible**: {'Yes' if accessible else 'No'}\n"
+            "\n## **Recommendations**\n"
+        )
+        if accessible:
+            report += (
+                "✅ **Core functionality operational!** Your credentials can read "
+                "this organization's data\n"
+            )
+        else:
+            report += f"[CRITICAL] {read.get('error', 'No data could be read')}\n"
+        return [TextContent(type="text", text=report)]
 
     async def _handle_get_capabilities(
         self,

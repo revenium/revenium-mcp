@@ -1,9 +1,21 @@
 """Unit tests for ToolIntrospectionService — action dispatching and formatting."""
 
+import json
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from mcp.types import TextContent
+
+from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.introspection.engine import ToolIntrospectionEngine
+from src.revenium_mcp_server.introspection.metadata import (
+    PerformanceMetrics,
+    ToolMetadata,
+    ToolType,
+)
 from src.revenium_mcp_server.introspection.service import ToolIntrospectionService
+from src.revenium_mcp_server.tools_decomposed.unified_tool_base import ToolBase
 
 
 class TestHandleIntrospectionAction:
@@ -60,17 +72,19 @@ class TestHandleGetToolMetadata:
 
     @pytest.mark.asyncio
     async def test_missing_tool_name(self):
-        result = await self.service._handle_get_tool_metadata({})
-        assert "Error" in result[0].text
-        assert "tool_name" in result[0].text
+        with pytest.raises(ToolError) as exc_info:
+            await self.service._handle_get_tool_metadata({})
+        assert "Error" in exc_info.value.message
+        assert "tool_name" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_tool_not_found(self):
         self.service.engine.get_tool_metadata = AsyncMock(return_value=None)
         self.service.engine.list_tools = AsyncMock(return_value=["tool_a"])
-        result = await self.service._handle_get_tool_metadata({"tool_name": "nonexistent"})
-        assert "not found" in result[0].text
-        assert "tool_a" in result[0].text
+        with pytest.raises(ToolError) as exc_info:
+            await self.service._handle_get_tool_metadata({"tool_name": "nonexistent"})
+        assert "not found" in exc_info.value.message
+        assert "tool_a" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_formats_metadata(self):
@@ -316,3 +330,131 @@ class TestFormatToolsInCategory:
             )
         assert "manage_products" in result
         assert "Product management" in result
+
+
+class _CountedTool(ToolBase):
+    """Minimal registered tool whose counters the engine updates."""
+
+    tool_name = "counted_tool"
+    tool_description = "A tool whose calls are counted"
+    business_category = "Test Tools"
+
+    async def handle_action(self, action, arguments, ctx=None):
+        return [TextContent(type="text", text=f"handled: {action}")]
+
+
+HOSTED_NOTE_SUBSTRING = "not shown on the hosted server"
+SHARED_COUNT_FRAGMENTS = (
+    "Executions",
+    "Success Rate",
+    "Avg Response Time",
+    "50.0%",
+    "3.2ms",
+)
+SINGLE_KEY_MODES = [(None, None), ("env", None), ("env", "http")]
+
+
+def _set_modes(monkeypatch, auth_mode, transport_mode=None):
+    for name, value in (("AUTH_MODE", auth_mode), ("TRANSPORT_MODE", transport_mode)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+
+def _metadata_with_two_calls():
+    return ToolMetadata(
+        name="manage_products",
+        description="Manage products",
+        version="1.0.0",
+        tool_type=ToolType.CRUD,
+        performance_metrics=PerformanceMetrics(
+            total_executions=2,
+            error_count=1,
+            success_rate=0.5,
+            avg_response_time_ms=3.2,
+        ),
+    )
+
+
+class TestPerformanceMetricsOnTheHostedServer:
+    """One hosted process answers many organizations, so its counts are not shown."""
+
+    def setup_method(self):
+        self.service = ToolIntrospectionService()
+        self.service.engine = MagicMock()
+        self.service.engine.get_tool_metadata = AsyncMock(
+            return_value=_metadata_with_two_calls()
+        )
+
+    async def _render(self):
+        result = await self.service._handle_get_tool_metadata(
+            {"tool_name": "manage_products"}
+        )
+        return result[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_mode", ["api_key", "clerk"])
+    async def test_hosted_get_tool_metadata_hides_the_shared_counts(
+        self, monkeypatch, auth_mode
+    ):
+        _set_modes(monkeypatch, auth_mode)
+        text = await self._render()
+        assert HOSTED_NOTE_SUBSTRING in text
+        for fragment in SHARED_COUNT_FRAGMENTS:
+            assert fragment not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_mode,transport_mode", SINGLE_KEY_MODES)
+    async def test_single_key_get_tool_metadata_still_shows_the_counts(
+        self, monkeypatch, auth_mode, transport_mode
+    ):
+        _set_modes(monkeypatch, auth_mode, transport_mode)
+        text = await self._render()
+        assert "• Executions: 2" in text
+        assert "• Success Rate: 50.0%" in text
+        assert "• Avg Response Time: 3.2ms" in text
+        assert HOSTED_NOTE_SUBSTRING not in text
+
+    def test_hosted_tool_metadata_json_leaves_the_counts_out(self, monkeypatch):
+        _set_modes(monkeypatch, "api_key")
+        d = _metadata_with_two_calls().to_dict()
+        assert d["performance_metrics"] is None
+        assert HOSTED_NOTE_SUBSTRING in d["performance_metrics_note"]
+        dumped = json.dumps(d)
+        assert "total_executions" not in dumped
+        assert "error_count" not in dumped
+
+    @pytest.mark.parametrize("auth_mode,transport_mode", SINGLE_KEY_MODES)
+    def test_single_key_tool_metadata_json_keeps_the_counts(
+        self, monkeypatch, auth_mode, transport_mode
+    ):
+        _set_modes(monkeypatch, auth_mode, transport_mode)
+        d = _metadata_with_two_calls().to_dict()
+        assert d["performance_metrics"]["total_executions"] == 2
+        assert d["performance_metrics"]["error_count"] == 1
+        assert "performance_metrics_note" not in d
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_mode,shows_counts", [(None, True), ("api_key", False)])
+    async def test_registered_tool_counts_follow_the_auth_mode(
+        self, monkeypatch, auth_mode, shows_counts
+    ):
+        _set_modes(monkeypatch, auth_mode)
+        engine = ToolIntrospectionEngine()
+        await engine.register_tool(_CountedTool.tool_name, _CountedTool())
+        await engine.update_tool_performance(_CountedTool.tool_name, 3.2, True)
+        await engine.update_tool_performance(_CountedTool.tool_name, 3.2, True)
+        self.service.engine = engine
+
+        result = await self.service._handle_get_tool_metadata(
+            {"tool_name": _CountedTool.tool_name}
+        )
+        text = result[0].text
+
+        if shows_counts:
+            assert "• Executions: 2" in text
+            assert HOSTED_NOTE_SUBSTRING not in text
+        else:
+            assert HOSTED_NOTE_SUBSTRING in text
+            assert "Executions" not in text

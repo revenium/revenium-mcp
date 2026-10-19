@@ -154,8 +154,7 @@ async def test_customer_delete_team_tolerates_empty_ack():
 @pytest.mark.asyncio
 async def test_subscription_delete_tolerates_empty_ack():
     tool, client = _tool(SubscriptionManagement)
-    # delete_subscription routes through the DELETE-based cancel endpoint.
-    client.cancel_subscription = AsyncMock(return_value=RELAXED_ACK)
+    client.delete_subscription = AsyncMock(return_value=RELAXED_ACK)
 
     result = await tool.handle_action("delete", {"subscription_id": "sub_123"})
 

@@ -176,7 +176,7 @@ class TestGetModelCosts:
                 ],
             },
         ]
-        result = await analyzer.get_model_costs("LAST_7_DAYS", "DAILY")
+        result = await analyzer.get_model_costs("LAST_7_DAYS", "TOTAL")
         # gpt-4 accumulates 250 across two entries
         gpt4 = next(r for r in result if r["model"] == "gpt-4")
         assert gpt4["cost"] == pytest.approx(250.0)
@@ -220,8 +220,8 @@ class TestGetModelCosts:
         with pytest.raises(ValueError, match="bad request"):
             await analyzer.get_model_costs("LAST_30_DAYS", "TOTAL")
 
-    async def test_zero_cost_items_excluded_from_dict_groups(self):
-        """Items with zero metricResult are not added to processed_data."""
+    async def test_zero_cost_items_kept_from_dict_groups(self):
+        """A model the platform reports at $0 is listed after the paid ones (BACK-4690)."""
         analyzer = _make_analyzer()
         analyzer.client.get.return_value = {
             "groups": [
@@ -230,8 +230,8 @@ class TestGetModelCosts:
             ]
         }
         result = await analyzer.get_model_costs("LAST_30_DAYS", "TOTAL")
-        assert len(result) == 1
-        assert result[0]["model"] == "claude-3"
+        assert [row["model"] for row in result] == ["claude-3", "gpt-4"]
+        assert result[1]["cost"] == 0.0
 
     async def test_sorted_by_cost_descending(self):
         """Results are sorted highest cost first."""
@@ -315,7 +315,7 @@ class TestGetCustomerCosts:
                 ],
             },
         ]
-        result = await analyzer.get_customer_costs("LAST_7_DAYS", "DAILY")
+        result = await analyzer.get_customer_costs("LAST_7_DAYS", "TOTAL")
         assert len(result) == 1
         assert result[0]["customer"] == "Corp X"
         assert result[0]["cost"] == pytest.approx(800.0)
@@ -353,15 +353,14 @@ class TestGetCustomerCosts:
         result = await analyzer.get_customer_costs("LAST_30_DAYS", "TOTAL")
         assert any(r["customer"] == "fallback-customer" for r in result)
 
-    async def test_percentage_zero_when_total_cost_zero(self):
-        """Percentage is 0 when all costs are zero (no items added)."""
+    async def test_no_share_when_total_cost_zero(self):
+        """A $0 customer is listed with no share when nothing was spent (BACK-4690)."""
         analyzer = _make_analyzer()
         analyzer.client.get.return_value = [
             {"customer": "ghost", "cost": 0.0},
         ]
         result = await analyzer.get_customer_costs("LAST_30_DAYS", "TOTAL")
-        # Zero-cost items are not added
-        assert result == []
+        assert result == [{"customer": "ghost", "cost": 0.0}]
 
 
 # ---------------------------------------------------------------------------
@@ -637,12 +636,147 @@ class TestGetCostSummary:
         assert result["period"] == "LAST_7_DAYS"
         assert result["aggregation"] == "WEEKLY"
 
-    async def test_re_raises_when_sub_method_fails(self):
-        """Exception from any sub-method is re-raised."""
+    @staticmethod
+    def _patch_parts(analyzer, **overrides):
+        """Patch the five part reads; each returns one row unless overridden."""
+        rows = {
+            "get_provider_costs": [{"provider": "OpenAI", "cost": 500.0}],
+            "get_model_costs": [{"model": "gpt-4", "cost": 400.0}],
+            "get_customer_costs": [{"customer": "Acme", "cost": 300.0}],
+            "get_api_key_costs": [{"api_key": "key-1", "cost": 200.0}],
+            "get_agent_costs": [{"agent": "bot-1", "cost": 100.0}],
+        }
+        mocks = {
+            name: overrides.get(name) or AsyncMock(return_value=value)
+            for name, value in rows.items()
+        }
+        for name, mock in mocks.items():
+            setattr(analyzer, name, mock)
+        return mocks
+
+    async def test_one_failed_part_leaves_the_other_four(self):
+        """A part that fails is named; the four that answered are kept (BACK-4690)."""
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
         analyzer = _make_analyzer()
-        with patch.object(analyzer, "get_provider_costs", new=AsyncMock(side_effect=RuntimeError("provider fail"))):
-            with pytest.raises(RuntimeError, match="provider fail"):
-                await analyzer.get_cost_summary("LAST_30_DAYS", "TOTAL")
+        timeout = ReveniumAPIError("Endpoint request timed out", status_code=504)
+        self._patch_parts(analyzer, get_model_costs=AsyncMock(side_effect=timeout))
+
+        result = None
+        try:
+            result = await analyzer.get_cost_summary("TWELVE_MONTHS", "TOTAL")
+        except ReveniumAPIError:
+            pass
+
+        assert result is not None, "one failed part threw away the four that answered"
+        assert result["not_read"] == {"model_costs": "HTTP 504: Endpoint request timed out"}
+        assert result["cost_breakdown"]["model_costs"] is None
+        assert result["top_models"] == []
+        assert result["top_providers"] == [{"provider": "OpenAI", "cost": 500.0}]
+        assert result["top_customers"] == [{"customer": "Acme", "cost": 300.0}]
+        assert result["top_api_keys"] == [{"api_key": "key-1", "cost": 200.0}]
+        assert result["top_agents"] == [{"agent": "bot-1", "cost": 100.0}]
+        assert result["total_cost"] == pytest.approx(500.0)
+
+    async def test_parts_are_read_concurrently(self):
+        """Every part is asked before any answers, so the wait is not the sum."""
+        import asyncio
+
+        analyzer = _make_analyzer()
+        all_started = asyncio.Event()
+        started = []
+
+        def part(name):
+            async def read(*_args, **_kwargs):
+                started.append(name)
+                if len(started) == 5:
+                    all_started.set()
+                await all_started.wait()
+                return []
+
+            return AsyncMock(side_effect=read)
+
+        self._patch_parts(
+            analyzer,
+            **{
+                name: part(name)
+                for name in (
+                    "get_provider_costs",
+                    "get_model_costs",
+                    "get_customer_costs",
+                    "get_api_key_costs",
+                    "get_agent_costs",
+                )
+            },
+        )
+
+        try:
+            await asyncio.wait_for(analyzer.get_cost_summary("TWELVE_MONTHS", "TOTAL"), 1)
+        except asyncio.TimeoutError:
+            pass
+
+        assert len(started) == 5, f"parts started before the first answered: {started}"
+
+    async def test_provider_failure_reports_the_total_as_not_read(self):
+        """The total is the provider sum; a failed provider read is not a $0 total."""
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        analyzer = _make_analyzer()
+        failure = ReveniumAPIError("Endpoint request timed out", status_code=504)
+        self._patch_parts(analyzer, get_provider_costs=AsyncMock(side_effect=failure))
+
+        result = None
+        try:
+            result = await analyzer.get_cost_summary("TWELVE_MONTHS", "TOTAL")
+        except ReveniumAPIError:
+            pass
+
+        assert result is not None, "a failed provider part threw the summary away"
+        assert result["total_cost"] is None
+        assert result["cost_breakdown"]["provider_costs"] is None
+        assert set(result["not_read"]) == {"provider_costs"}
+        assert result["cost_breakdown"]["model_costs"] == pytest.approx(400.0)
+
+    async def test_every_part_failing_raises_one_error_naming_each_part(self):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        analyzer = _make_analyzer()
+        names = (
+            "get_provider_costs",
+            "get_model_costs",
+            "get_customer_costs",
+            "get_api_key_costs",
+            "get_agent_costs",
+        )
+        self._patch_parts(
+            analyzer,
+            **{
+                name: AsyncMock(
+                    side_effect=ReveniumAPIError(f"{name} timed out", status_code=504)
+                )
+                for name in names
+            },
+        )
+
+        with pytest.raises(Exception) as exc_info:
+            await analyzer.get_cost_summary("TWELVE_MONTHS", "TOTAL")
+
+        message = str(exc_info.value)
+        for name in names:
+            assert name in message
+
+    async def test_authentication_error_is_not_turned_into_a_missing_part(self):
+        """Guard: a credentials problem fails the whole call, never one part."""
+        from src.revenium_mcp_server.auth import AuthenticationError
+
+        analyzer = _make_analyzer()
+        self._patch_parts(
+            analyzer,
+            get_model_costs=AsyncMock(side_effect=AuthenticationError("no API key")),
+        )
+
+        with pytest.raises(AuthenticationError):
+            await analyzer.get_cost_summary("TWELVE_MONTHS", "TOTAL")
 
     async def test_cost_breakdown_has_all_keys(self):
         analyzer = _make_analyzer()
@@ -821,14 +955,14 @@ class TestProcessProviderDataEdgeCases:
             "not-a-dict",
             {"groupName": "OpenAI", "metrics": [{"metricResult": 100.0}]},
         ]
-        result = self.analyzer._process_provider_data(data)
+        result = self.analyzer._process_provider_data(data, "TOTAL")
         assert len(result) == 1
         assert result[0]["provider"] == "OpenAI"
 
     def test_groups_key_with_non_list_value_skipped(self):
         """If groups value is not a list, that response entry is skipped."""
         data = [{"groups": "not-a-list"}]
-        result = self.analyzer._process_provider_data(data)
+        result = self.analyzer._process_provider_data(data, "TOTAL")
         assert result == []
 
     def test_group_item_with_non_list_metrics_skipped(self):
@@ -840,7 +974,7 @@ class TestProcessProviderDataEdgeCases:
                 ]
             }
         ]
-        result = self.analyzer._process_provider_data(data)
+        result = self.analyzer._process_provider_data(data, "TOTAL")
         assert result == []
 
     def test_metric_non_dict_skipped(self):
@@ -855,7 +989,7 @@ class TestProcessProviderDataEdgeCases:
                 ]
             }
         ]
-        result = self.analyzer._process_provider_data(data)
+        result = self.analyzer._process_provider_data(data, "TOTAL")
         # Only valid metric contributes
         assert result[0]["cost"] == pytest.approx(200.0)
 
@@ -874,13 +1008,13 @@ class TestProcessProviderDataEdgeCases:
                 ]
             }
         ]
-        result = self.analyzer._process_provider_data(data)
+        result = self.analyzer._process_provider_data(data, "TOTAL")
         assert result[0]["cost"] == pytest.approx(150.0)
 
     def test_direct_format_non_list_metrics_skipped(self):
         """Direct format item with non-list metrics is skipped."""
         data = [{"groupName": "Anthropic", "metrics": "bad-format"}]
-        result = self.analyzer._process_provider_data(data)
+        result = self.analyzer._process_provider_data(data, "TOTAL")
         assert result == []
 
     def test_multiple_groups_responses_aggregated(self):
@@ -889,7 +1023,7 @@ class TestProcessProviderDataEdgeCases:
             {"groupName": "OpenAI", "metrics": [{"metricResult": 300.0}]},
             {"groupName": "OpenAI", "metrics": [{"metricResult": 200.0}]},
         ]
-        result = self.analyzer._process_provider_data(data)
+        result = self.analyzer._process_provider_data(data, "TOTAL")
         # Both direct-format items for OpenAI should be aggregated
         assert len(result) == 1
         assert result[0]["cost"] == pytest.approx(500.0)
@@ -908,23 +1042,23 @@ class TestProcessApiKeyDataEdgeCases:
 
     def test_non_dict_items_skipped(self):
         data = ["not-a-dict", {"groupName": "key-1", "metrics": [{"metricResult": 100.0}]}]
-        result = self.analyzer._process_api_key_data(data)
+        result = self.analyzer._process_api_key_data(data, "TOTAL")
         assert len(result) == 1
         assert result[0]["api_key"] == "key-1"
 
     def test_groups_non_list_skipped(self):
         data = [{"groups": "not-a-list"}]
-        result = self.analyzer._process_api_key_data(data)
+        result = self.analyzer._process_api_key_data(data, "TOTAL")
         assert result == []
 
     def test_group_item_non_dict_skipped(self):
         data = [{"groups": ["not-a-dict"]}]
-        result = self.analyzer._process_api_key_data(data)
+        result = self.analyzer._process_api_key_data(data, "TOTAL")
         assert result == []
 
     def test_group_item_with_non_list_metrics_skipped(self):
         data = [{"groups": [{"groupName": "k1", "metrics": "bad"}]}]
-        result = self.analyzer._process_api_key_data(data)
+        result = self.analyzer._process_api_key_data(data, "TOTAL")
         assert result == []
 
     def test_metric_non_dict_skipped_in_groups(self):
@@ -935,7 +1069,7 @@ class TestProcessApiKeyDataEdgeCases:
                 ]
             }
         ]
-        result = self.analyzer._process_api_key_data(data)
+        result = self.analyzer._process_api_key_data(data, "TOTAL")
         assert result[0]["cost"] == pytest.approx(50.0)
 
     def test_non_numeric_metric_result_ignored_in_groups(self):
@@ -946,32 +1080,32 @@ class TestProcessApiKeyDataEdgeCases:
                 ]
             }
         ]
-        result = self.analyzer._process_api_key_data(data)
+        result = self.analyzer._process_api_key_data(data, "TOTAL")
         assert result[0]["cost"] == pytest.approx(75.0)
 
     def test_direct_format_non_list_metrics_skipped(self):
         data = [{"groupName": "k-direct", "metrics": "bad"}]
-        result = self.analyzer._process_api_key_data(data)
+        result = self.analyzer._process_api_key_data(data, "TOTAL")
         assert result == []
 
     def test_metric_non_dict_in_direct_format_skipped(self):
         data = [{"groupName": "k-direct", "metrics": ["bad", {"metricResult": 200.0}]}]
-        result = self.analyzer._process_api_key_data(data)
+        result = self.analyzer._process_api_key_data(data, "TOTAL")
         assert result[0]["cost"] == pytest.approx(200.0)
 
     def test_non_numeric_metric_in_direct_format_ignored(self):
         data = [{"groupName": "k-direct", "metrics": [{"metricResult": "bad"}, {"metricResult": 100.0}]}]
-        result = self.analyzer._process_api_key_data(data)
+        result = self.analyzer._process_api_key_data(data, "TOTAL")
         assert result[0]["cost"] == pytest.approx(100.0)
 
-    def test_zero_cost_not_added(self):
+    def test_zero_cost_kept_without_a_share(self):
         data = [{"groupName": "zero-key", "metrics": [{"metricResult": 0.0}]}]
-        result = self.analyzer._process_api_key_data(data)
-        assert result == []
+        result = self.analyzer._process_api_key_data(data, "TOTAL")
+        assert result == [{"api_key": "zero-key", "cost": 0.0}]
 
     def test_percentage_zero_when_only_one_key(self):
         data = [{"groupName": "solo-key", "metrics": [{"metricResult": 500.0}]}]
-        result = self.analyzer._process_api_key_data(data)
+        result = self.analyzer._process_api_key_data(data, "TOTAL")
         assert result[0]["percentage"] == pytest.approx(100.0)
 
 
@@ -988,28 +1122,28 @@ class TestProcessAgentDataEdgeCases:
 
     def test_non_dict_items_skipped(self):
         data = ["not-a-dict", {"groupName": "agent-1", "metrics": [{"metricResult": 100.0}]}]
-        result = self.analyzer._process_agent_data(data)
+        result = self.analyzer._process_agent_data(data, "TOTAL")
         assert len(result) == 1
         assert result[0]["agent"] == "agent-1"
 
     def test_groups_non_list_skipped(self):
         data = [{"groups": "bad-format"}]
-        result = self.analyzer._process_agent_data(data)
+        result = self.analyzer._process_agent_data(data, "TOTAL")
         assert result == []
 
     def test_group_item_non_dict_skipped(self):
         data = [{"groups": ["not-a-dict"]}]
-        result = self.analyzer._process_agent_data(data)
+        result = self.analyzer._process_agent_data(data, "TOTAL")
         assert result == []
 
     def test_group_item_non_list_metrics_skipped(self):
         data = [{"groups": [{"groupName": "a1", "metrics": "bad"}]}]
-        result = self.analyzer._process_agent_data(data)
+        result = self.analyzer._process_agent_data(data, "TOTAL")
         assert result == []
 
     def test_metric_non_dict_skipped_in_groups(self):
         data = [{"groups": [{"groupName": "a1", "metrics": ["bad", {"metricResult": 80.0}]}]}]
-        result = self.analyzer._process_agent_data(data)
+        result = self.analyzer._process_agent_data(data, "TOTAL")
         assert result[0]["cost"] == pytest.approx(80.0)
 
     def test_non_numeric_metric_ignored_in_groups(self):
@@ -1020,32 +1154,32 @@ class TestProcessAgentDataEdgeCases:
                 ]
             }
         ]
-        result = self.analyzer._process_agent_data(data)
+        result = self.analyzer._process_agent_data(data, "TOTAL")
         assert result[0]["cost"] == pytest.approx(60.0)
 
     def test_direct_format_non_list_metrics_skipped(self):
         data = [{"groupName": "a-direct", "metrics": "bad"}]
-        result = self.analyzer._process_agent_data(data)
+        result = self.analyzer._process_agent_data(data, "TOTAL")
         assert result == []
 
     def test_metric_non_dict_in_direct_format_skipped(self):
         data = [{"groupName": "a-direct", "metrics": ["bad", {"metricResult": 300.0}]}]
-        result = self.analyzer._process_agent_data(data)
+        result = self.analyzer._process_agent_data(data, "TOTAL")
         assert result[0]["cost"] == pytest.approx(300.0)
 
     def test_non_numeric_metric_in_direct_format_ignored(self):
         data = [{"groupName": "a-direct", "metrics": [{"metricResult": "bad"}, {"metricResult": 150.0}]}]
-        result = self.analyzer._process_agent_data(data)
+        result = self.analyzer._process_agent_data(data, "TOTAL")
         assert result[0]["cost"] == pytest.approx(150.0)
 
-    def test_zero_cost_not_added(self):
+    def test_zero_cost_kept_without_a_share(self):
         data = [{"groupName": "zero-agent", "metrics": [{"metricResult": 0.0}]}]
-        result = self.analyzer._process_agent_data(data)
-        assert result == []
+        result = self.analyzer._process_agent_data(data, "TOTAL")
+        assert result == [{"agent": "zero-agent", "cost": 0.0}]
 
     def test_percentage_100_for_single_agent(self):
         data = [{"groupName": "solo-agent", "metrics": [{"metricResult": 700.0}]}]
-        result = self.analyzer._process_agent_data(data)
+        result = self.analyzer._process_agent_data(data, "TOTAL")
         assert result[0]["percentage"] == pytest.approx(100.0)
 
 
@@ -1082,15 +1216,58 @@ class TestGetAgentCostsCostSourceFilter:
         _, kwargs = analyzer.client.get.call_args
         assert "costSource" not in kwargs["params"]
 
-    async def test_filter_on_legacy_api_raises_validation_error(self, monkeypatch):
-        """The legacy profitstream endpoint has no costSource param; failing
-        loudly beats silently returning unfiltered data labeled as filtered."""
-        from src.revenium_mcp_server.analytics.validation import ValidationError
-
-        monkeypatch.setenv("REVENIUM_USE_NEW_ANALYTICS_API", "false")
+    async def test_filter_routes_to_the_analytics_api_without_the_flag(self, monkeypatch):
+        """The legacy route takes no cost source, so a filtered named-period
+        read goes to the analytics route even on a deployment without the
+        new-API setting, which hosted deployments never set (BACK-4690)."""
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+        monkeypatch.setenv("REVENIUM_APP_BASE_URL", "https://app.dev.example")
         analyzer = _make_analyzer()
-        with pytest.raises(ValidationError, match="new analytics API"):
-            await analyzer.get_agent_costs(
-                "SEVEN_DAYS", "TOTAL", filters={"costSources": ["provider_billing"]}
-            )
-        analyzer.client.get.assert_not_called()
+        analyzer.client.get.return_value = []
+        await analyzer.get_agent_costs(
+            "THIRTY_DAYS", "TOTAL", filters={"costSources": ["provider_billing"]}
+        )
+        analyzer.client.get.assert_awaited_once()
+        args, kwargs = analyzer.client.get.call_args
+        assert args[0] == "/api/v2/analytics/cost-by-agent"
+        assert kwargs.get("use_bearer") is True
+        assert kwargs["params"]["costSource"] == ["provider_billing"]
+
+    async def test_unfiltered_named_period_keeps_the_legacy_route_without_the_flag(
+        self, monkeypatch
+    ):
+        """Only a cost-source filter moves the read; named-period routing is
+        otherwise unchanged."""
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+        analyzer = _make_analyzer()
+        analyzer.client.get.return_value = []
+        await analyzer.get_agent_costs("THIRTY_DAYS", "TOTAL")
+        analyzer.client.get.assert_awaited_once()
+        args, kwargs = analyzer.client.get.call_args
+        assert args[0] == (
+            "/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-agents-over-time"
+        )
+        assert "costSource" not in kwargs["params"]
+
+    @pytest.mark.parametrize(
+        "aggregation, metric_type",
+        [("MEAN", "avg"), ("MAXIMUM", "max"), ("MINIMUM", "min")],
+    )
+    async def test_filter_with_mean_or_maximum_asks_the_analytics_route_for_that_aggregation(
+        self, monkeypatch, aggregation, metric_type
+    ):
+        """The analytics route takes the aggregation beside the cost source, so
+        a MEAN, MAXIMUM or MINIMUM agent read with costSources is answered
+        rather than refused (BACK-4809)."""
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+        monkeypatch.setenv("REVENIUM_APP_BASE_URL", "https://app.dev.example")
+        analyzer = _make_analyzer()
+        analyzer.client.get.return_value = []
+        await analyzer.get_agent_costs(
+            "THIRTY_DAYS", aggregation, filters={"costSources": ["provider_billing"]}
+        )
+        analyzer.client.get.assert_awaited_once()
+        args, kwargs = analyzer.client.get.call_args
+        assert args[0] == "/api/v2/analytics/cost-by-agent"
+        assert kwargs["params"]["metricType"] == metric_type
+        assert kwargs["params"]["costSource"] == ["provider_billing"]

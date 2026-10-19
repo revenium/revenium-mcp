@@ -4,12 +4,48 @@ This module contains all response formatting logic extracted from the main
 tool class to comply with the 300-line module limit requirement.
 """
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Union
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
+from ..analytics.paging import PageInfo, counted
 from ..common.error_handling import ErrorCodes, ToolError
+from .log_filters import CONTENT_FILTER_KEYS
+
+
+class PageCoverage(NamedTuple):
+    """How much of the platform's paged log list a walk read, and why it stopped."""
+
+    pages_read: int
+    entries_read: int
+    platform: PageInfo
+    failed_page: Optional[int] = None  # 0-based
+    failure: Optional[str] = None
+    page_limit: Optional[int] = None
+
+    @property
+    def pages_left(self) -> Optional[int]:
+        if self.platform.total_pages is None:
+            return None
+        return max(self.platform.total_pages - self.pages_read, 0)
+
+    @property
+    def complete(self) -> bool:
+        """True only when every page up to the platform's last was read; never on an unknown total."""
+        return self.failed_page is None and self.pages_left == 0
+
+    def failure_note(self) -> Optional[str]:
+        if self.failed_page is None:
+            return None
+        return (
+            f"page {self.failed_page + 1} (page={self.failed_page}) failed ({self.failure}); "
+            f"results cover {counted(self.pages_read, 'page', 'pages')}"
+        )
+
+
+def _of_total(read: str, total: Optional[int], spec: str = "") -> str:
+    return f"{read} of {'an unknown number' if total is None else format(total, spec)}"
 
 
 class LogResponseFormatter:
@@ -54,10 +90,19 @@ class LogResponseFormatter:
             operation_counts = self._count_operations(log_entries)
             status_counts = self._count_statuses(log_entries)
 
-            # Generate diagnostic insights with pagination info
-            insights = self._generate_diagnostic_insights(
-                log_entries, operation_counts, status_counts, total_elements, total_pages
-            )
+            # A client-side filter narrows the fetched page only; the platform's
+            # totals still count every entry, so they are never the filter's totals.
+            filtered = any((applied_filters or {}).get(key) for key in CONTENT_FILTER_KEYS)
+            if filtered:
+                platform = PageInfo.from_envelope(api_response)
+                total_elements, total_pages = platform.total_elements, platform.total_pages
+                insights = self._generate_diagnostic_insights(
+                    log_entries, operation_counts, status_counts
+                )
+            else:
+                insights = self._generate_diagnostic_insights(
+                    log_entries, operation_counts, status_counts, total_elements, total_pages
+                )
 
             # Build response text
             response_text = self._build_response_header(
@@ -67,6 +112,7 @@ class LogResponseFormatter:
                 total_pages,
                 len(log_entries),
                 applied_filters,
+                filtered=filtered,
             )
 
             response_text += self._build_operation_summary(operation_counts)
@@ -112,14 +158,20 @@ class LogResponseFormatter:
     def _build_response_header(
         self,
         log_type: str,
-        total_elements: int,
+        total_elements: Optional[int],
         current_page: int,
-        total_pages: int,
+        total_pages: Optional[int],
         entries_this_page: int,
         applied_filters: Optional[Dict[str, Any]] = None,
+        filtered: bool = False,
     ) -> str:
         """Build the response header section."""
-        header = f"""
+        if filtered:
+            header = self._build_filtered_summary(
+                log_type, total_elements, current_page, total_pages, entries_this_page
+            )
+        else:
+            header = f"""
 # {log_type.title()} Log Analysis
 
 ## Summary
@@ -136,6 +188,32 @@ class LogResponseFormatter:
                     header += f"- **{filter_name}**: {filter_value}\n"
 
         return header
+
+    def _build_filtered_summary(
+        self,
+        log_type: str,
+        total_elements: Optional[int],
+        current_page: int,
+        total_pages: Optional[int],
+        entries_this_page: int,
+    ) -> str:
+        """Summary of a filtered page: its matches, and the platform totals labelled unfiltered."""
+        summary = f"""
+# {log_type.title()} Log Analysis
+
+## Summary
+- **Matches On This Page**: {entries_this_page}
+"""
+        if total_elements is not None and total_pages is not None:
+            summary += (
+                f"- **Platform Total (unfiltered)**: {total_elements:,} entries across "
+                f"{counted(total_pages, 'page', 'pages')}\n"
+            )
+        if total_pages is not None:
+            summary += f"- **Current Page**: {current_page + 1} of {total_pages} (unfiltered pages)\n"
+        summary += "- **Filter Scope**: the filter was applied to the entries on this page only\n"
+        summary += f"- **Log Type**: {log_type}\n"
+        return summary
 
     def _build_operation_summary(self, operation_counts: Dict[str, int]) -> str:
         """Build the operation summary section."""
@@ -232,6 +310,7 @@ class LogResponseFormatter:
         log_type: str,
         pages_retrieved: int,
         applied_filters: Optional[Dict[str, Any]] = None,
+        stop_note: Optional[str] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Format multi-page analysis response."""
         try:
@@ -248,6 +327,8 @@ class LogResponseFormatter:
                 pages_retrieved,
             )
 
+            stopped = f"- **Stopped Early**: {stop_note}\n" if stop_note else ""
+
             # Build multi-page response
             response_text = f"""
 # Multi-Page {log_type.title()} Log Analysis
@@ -255,7 +336,7 @@ class LogResponseFormatter:
 ## Summary
 - **Total Entries Analyzed**: {len(all_entries):,}
 - **Pages Retrieved**: {pages_retrieved}
-- **Log Type**: {log_type}
+{stopped}- **Log Type**: {log_type}
 """
 
             if applied_filters:
@@ -295,10 +376,10 @@ class LogResponseFormatter:
         self,
         all_matches: List[Dict[str, Any]],
         log_type: str,
-        pages_searched: int,
+        coverage: PageCoverage,
         applied_filters: Optional[Dict[str, Any]] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Format comprehensive search results across all pages."""
+        """Format a page-by-page search with the pages and entries it covered."""
         try:
             # Generate operation and status summaries
             operation_counts = {}
@@ -311,6 +392,12 @@ class LogResponseFormatter:
                 operation_counts[operation] = operation_counts.get(operation, 0) + 1
                 status_counts[status] = status_counts.get(status, 0) + 1
 
+            platform = coverage.platform
+            pages_searched = _of_total(str(coverage.pages_read), platform.total_pages)
+            entries_searched = _of_total(
+                f"{coverage.entries_read:,}", platform.total_elements, ","
+            )
+
             # Format response
             response_text = f"""
 # Comprehensive Search Results ({log_type.title()} Logs)
@@ -318,7 +405,8 @@ class LogResponseFormatter:
 ## Search Summary
 - **Total Matches Found**: {len(all_matches):,}
 - **Pages Searched**: {pages_searched}
-- **Search Scope**: Complete historical dataset
+- **Entries Searched**: {entries_searched}
+- **Search Scope**: {self._search_scope(coverage)}
 - **Log Type**: {log_type}
 """
 
@@ -359,10 +447,16 @@ class LogResponseFormatter:
 - **Details**: {details}
 """
             else:
+                not_found = (
+                    "The search terms were not found in the "
+                    f"{counted(coverage.pages_read, 'page', 'pages')} searched."
+                )
+                if not coverage.complete:
+                    not_found += "\nMatches may still exist in the pages that were not searched."
                 response_text += f"""
 ## No Matches Found
 
-The search terms were not found in any of the {pages_searched} pages searched.
+{not_found}
 
 ## Recommendations
 - Verify the search term spelling
@@ -385,6 +479,27 @@ The search terms were not found in any of the {pages_searched} pages searched.
                     "Try with simpler search criteria",
                 ],
             )
+
+    @staticmethod
+    def _search_scope(coverage: PageCoverage) -> str:
+        """Complete only when every page was read; otherwise say why the search stopped."""
+        if coverage.failed_page is not None:
+            page = coverage.failed_page
+            return (
+                f"Incomplete: page {page + 1} (page={page}) failed ({coverage.failure}), "
+                "so it and every later page went unsearched"
+            )
+        if coverage.complete:
+            return "Complete: every page the platform reported was searched"
+        if coverage.pages_left is None:
+            return "Unknown: the platform did not report how many pages exist"
+        not_searched = counted(coverage.pages_left, "page", "pages")
+        if coverage.pages_read == coverage.page_limit:
+            return f"Incomplete: stopped at the search's page limit with {not_searched} not searched"
+        return (
+            "Incomplete: the platform returned an empty page before its last page; "
+            f"{not_searched} not searched"
+        )
 
     def _build_temporal_analysis(self, all_entries: List[Dict[str, Any]]) -> str:
         """Build temporal analysis section for multi-page data."""

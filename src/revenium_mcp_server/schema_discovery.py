@@ -34,6 +34,14 @@ from .alert_operators import (
 )
 from .product_validators import ProductValidationEngine
 
+#: The subscription template names, in template order; get_examples takes one.
+SUBSCRIPTION_EXAMPLE_TYPES = (
+    "monthly_billing",
+    "trial_period",
+    "annual_billing",
+    "enterprise_custom",
+)
+
 
 class SchemaDiscoveryEngine:
     """Provides comprehensive schema discovery and capabilities for agents."""
@@ -209,11 +217,11 @@ class SchemaDiscoveryEngine:
                 "Alert when cost per transaction exceeds $0.50",
                 "Notify when error rate is above 5% for 10 minutes",
                 "Alert when total daily cost reaches $1000",
-                "Notify when tokens per second drops below 100",
+                "Notify when tokens per minute drops below 100",
                 "Alert when OpenAI model costs exceed $50 per hour",
                 "Alert when monthly spending exceeds $5000",
                 "Notify when weekly token usage reaches 1 million",
-                "Alert when daily API calls exceed 10,000",
+                "Alert when daily token usage exceeds 1,000,000",
                 "Notify when quarterly costs approach $25,000",
                 "Alert when cumulative usage in period exceeds threshold",
                 "Monitor weekly spending for customer Acme",
@@ -1231,8 +1239,15 @@ class SubscriptionSchemaDiscovery(SchemaDiscoveryEngine):
         return cast(Dict[str, Any], self.capabilities["subscriptions"])
 
     def get_subscription_examples(self, example_type: Optional[str] = None) -> Dict[str, Any]:
-        """Get subscription creation examples and templates."""
-        return self.get_examples("subscriptions", example_type)
+        """Get subscription creation examples, only the named template when one is given.
+
+        Subscription templates carry their name under ``example_type``, not the
+        ``type`` key the shared ``get_examples`` filter reads.
+        """
+        examples = self.examples["subscriptions"]
+        if example_type:
+            examples = [ex for ex in examples if ex.get("example_type") == example_type]
+        return {"examples": examples}
 
     def validate_subscription_configuration(
         self, config_data: Dict[str, Any], dry_run: bool = True, client: Any = None
@@ -1687,7 +1702,7 @@ class CustomerSchemaDiscovery(SchemaDiscoveryEngine):
     def _build_customer_capabilities(self) -> Dict[str, Any]:
         """Build comprehensive customer capabilities schema."""
         return {
-            "resource_types": ["users", "subscribers", "organizations", "teams", "relationships"],
+            "resource_types": ["users", "subscribers", "organizations", "teams"],
             "user_roles": [
                 role.value for role in UserRole
             ],  # CONFIRMED: ROLE_TENANT_ADMIN, ROLE_API_CONSUMER exist
@@ -1781,7 +1796,7 @@ class CustomerSchemaDiscovery(SchemaDiscoveryEngine):
                         "contact_info": "object",
                         "billing_info": "object",
                         "tags": "array of strings",
-                        "metadata": "object",
+                        "metadata": "string of name=value pairs separated by commas",
                     },
                 },
                 "teams": {
@@ -1810,7 +1825,7 @@ class CustomerSchemaDiscovery(SchemaDiscoveryEngine):
                         "permissions": "array of strings",
                         "settings": "object",
                         "tags": "array of strings",
-                        "metadata": "object",
+                        "metadata": "string of name=value pairs separated by commas",
                     },
                 },
             },

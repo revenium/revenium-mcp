@@ -316,12 +316,43 @@ def test_validate_env_http_warns_about_no_auth(monkeypatch):
     from src.revenium_mcp_server import transport_mode
     from src.revenium_mcp_server.transport_mode import validate_mode_combination
 
+    monkeypatch.setenv("AUTH_MODE", "env")
     warnings: list[str] = []
     monkeypatch.setattr(
         transport_mode.logger, "warning", lambda msg: warnings.append(msg)
     )
     validate_mode_combination("env", "http")
     assert any("without authentication" in m.lower() for m in warnings)
+
+
+def test_validate_env_http_refuses_when_auth_mode_unset(monkeypatch):
+    """An HTTP server with no AUTH_MODE refuses to start (BACK-4687)."""
+    from src.revenium_mcp_server.transport_mode import validate_mode_combination
+
+    monkeypatch.delenv("AUTH_MODE", raising=False)
+    with pytest.raises(ValueError, match="requires AUTH_MODE to be set") as excinfo:
+        validate_mode_combination("env", "http")
+    message = str(excinfo.value)
+    assert "api_key" in message
+    assert "clerk" in message
+    assert "AUTH_MODE=env" in message
+
+
+def test_validate_env_http_with_explicit_env_warns_and_names_the_opt_in(monkeypatch):
+    """AUTH_MODE=env set on purpose over HTTP starts, and the log names the opt-in."""
+    from src.revenium_mcp_server import transport_mode
+    from src.revenium_mcp_server.transport_mode import validate_mode_combination
+
+    monkeypatch.setenv("AUTH_MODE", "env")
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        transport_mode.logger, "warning", lambda msg: warnings.append(msg)
+    )
+    validate_mode_combination("env", "http")
+    assert len(warnings) == 1
+    assert "without authentication" in warnings[0]
+    assert "set explicitly" in warnings[0]
+    assert "check that this was deliberate" in warnings[0]
 
 
 def test_validate_clerk_stdio_raises(monkeypatch):

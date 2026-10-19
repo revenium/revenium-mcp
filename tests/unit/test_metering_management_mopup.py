@@ -399,6 +399,32 @@ class TestHandleLookupRecentTransactions:
                 client, {"recent_page_size": 101}
             )
 
+    async def test_invalid_page_size_error_names_the_declared_parameter(self):
+        """The error must send the caller to page_size, the name the tool accepts."""
+        client = make_client()
+        with pytest.raises(ToolError) as exc_info:
+            await self.mm._handle_lookup_recent_transactions(client, {"page_size": 0})
+
+        error = exc_info.value
+        guidance = " ".join(
+            [error.message, *error.suggestions, *map(str, error.examples.values())]
+        )
+        assert error.field == "page_size"
+        assert "page_size" in error.message
+        assert "recent_page_size" not in guidance
+
+    async def test_invalid_recent_page_size_error_names_the_key_it_came_from(self):
+        """BACK-4674: a bad recent_page_size is reported under that name."""
+        client = make_client()
+        with pytest.raises(ToolError) as exc_info:
+            await self.mm._handle_lookup_recent_transactions(
+                client, {"recent_page_size": 0, "page_size": 20}
+            )
+
+        error = exc_info.value
+        assert error.field == "recent_page_size"
+        assert "Invalid recent_page_size parameter: 0" in error.message
+
     async def test_successful_response_with_embedded(self):
         """Lines 2697-2728: successful lookup with _embedded response."""
         client = make_client()
@@ -751,21 +777,21 @@ class TestAIModelHandlers:
         assert "No AI models found" in result[0].text
 
     async def test_list_ai_models_exception(self):
-        """Line 4107-4111: exception handling."""
+        """An unexpected failure propagates so the caller sees the error flag."""
         mock_client = MagicMock()
         mock_client.get_ai_models = AsyncMock(side_effect=RuntimeError("fail"))
         self._install_mock_client(mock_client)
-        result = await self.mm._handle_list_ai_models({})
-        assert len(result) > 0  # Returns error response
+        with pytest.raises(RuntimeError, match="fail"):
+            await self.mm._handle_list_ai_models({})
 
     async def test_search_ai_models_no_query_returns_error(self):
-        """Line 4119: missing query parameter returns error response."""
+        """Line 4119: missing query parameter raises an error."""
         mock_client = MagicMock()
         self._install_mock_client(mock_client)
-        result = await self.mm._handle_search_ai_models({})
-        assert len(result) > 0
-        # The ToolError is caught by except and formatted as error response
-        assert any("query" in c.text.lower() or "missing" in c.text.lower() or "error" in c.text.lower() for c in result)
+        with pytest.raises(ToolError) as exc_info:
+            await self.mm._handle_search_ai_models({})
+        text = exc_info.value.message.lower()
+        assert "query" in text or "missing" in text or "error" in text
 
     async def test_search_ai_models_success(self):
         """Server-side search returns matching models."""
@@ -831,11 +857,11 @@ class TestAIModelHandlers:
         assert "No providers found" in result[0].text
 
     async def test_validate_model_provider_missing_params(self):
-        """Lines 4313-4337: missing model/provider returns error."""
+        """Lines 4313-4337: missing model/provider raises an error."""
         mock_client = MagicMock()
         self._install_mock_client(mock_client)
-        result = await self.mm._handle_validate_model_provider({"model": "gpt-4"})
-        assert len(result) > 0
+        with pytest.raises(ToolError, match="provider"):
+            await self.mm._handle_validate_model_provider({"model": "gpt-4"})
 
     async def test_validate_model_provider_exact_match(self):
         """Lines 4361-4371: exact match found."""
@@ -909,20 +935,20 @@ class TestAIModelHandlers:
         assert "Unable to retrieve models from API" in result[0].text
 
     async def test_estimate_cost_missing_params(self):
-        """Lines 4419-4434: missing model/provider returns error."""
+        """Lines 4419-4434: missing model/provider raises an error."""
         mock_client = MagicMock()
         self._install_mock_client(mock_client)
-        result = await self.mm._handle_estimate_transaction_cost({"input_tokens": 100})
-        assert len(result) > 0
+        with pytest.raises(ToolError, match="model, provider"):
+            await self.mm._handle_estimate_transaction_cost({"input_tokens": 100})
 
     async def test_estimate_cost_invalid_tokens(self):
-        """Lines 4439-4457: non-integer tokens returns error."""
+        """Lines 4439-4457: non-integer tokens raises an error."""
         mock_client = MagicMock()
         self._install_mock_client(mock_client)
-        result = await self.mm._handle_estimate_transaction_cost(
-            {"model": "gpt-4o", "provider": "openai", "input_tokens": "abc"}
-        )
-        assert len(result) > 0
+        with pytest.raises(ToolError, match="Token counts must be valid integers"):
+            await self.mm._handle_estimate_transaction_cost(
+                {"model": "gpt-4o", "provider": "openai", "input_tokens": "abc"}
+            )
 
     async def test_estimate_cost_success(self):
         """Lines 4477-4507: successful cost estimation."""

@@ -13,7 +13,7 @@ from loguru import logger
 
 from ..client import ReveniumClient
 from .entity_lookup_service import EntityLookupService
-from .navigation_service import HierarchyNavigationService
+from .navigation_service import HierarchyNavigationService, NavigationResult
 
 
 class ValidationSeverity(Enum):
@@ -87,6 +87,13 @@ class ImpactAnalysis:
     recommendations: List[str]
     safe_to_proceed: bool
     metadata: Dict[str, Any]
+
+
+def _unchecked_dependents_message(nav_result: NavigationResult) -> str:
+    return (
+        "Cannot confirm the product has no dependent subscriptions because a "
+        f"subscriptions page failed to load: {nav_result.error_message}"
+    )
 
 
 class CrossTierValidator:
@@ -455,7 +462,11 @@ class CrossTierValidator:
             if entity_type == "products":
                 # Check for dependent subscriptions
                 nav_result = await self.navigation_service.get_subscriptions_for_product(entity_id)
-                if nav_result.success and nav_result.related_entities:
+                if nav_result.incomplete is True:
+                    impact_severity = ValidationSeverity.ERROR
+                    safe_to_proceed = False
+                    recommendations.append(_unchecked_dependents_message(nav_result))
+                elif nav_result.success and nav_result.related_entities:
                     affected_entities["subscriptions"] = nav_result.related_entities
                     impact_severity = ValidationSeverity.ERROR
                     safe_to_proceed = False
@@ -669,7 +680,20 @@ class CrossTierValidator:
         for dependent_type in deletion_checks:
             if entity_type == "products" and dependent_type == "subscriptions":
                 nav_result = await self.navigation_service.get_subscriptions_for_product(entity_id)
-                if nav_result.success and nav_result.related_entities:
+                if nav_result.incomplete is True:
+                    issues.append(
+                        ValidationIssue(
+                            severity=ValidationSeverity.ERROR,
+                            code="DEPENDENTS_UNVERIFIED",
+                            message=_unchecked_dependents_message(nav_result),
+                            entity_type=entity_type,
+                            entity_id=entity_id,
+                            field=None,
+                            suggested_action="Retry the validation",
+                            metadata={"dependent_type": dependent_type},
+                        )
+                    )
+                elif nav_result.success and nav_result.related_entities:
                     issues.append(
                         ValidationIssue(
                             severity=ValidationSeverity.ERROR,

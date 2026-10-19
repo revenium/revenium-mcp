@@ -7,17 +7,23 @@ including per-tool, aggregated, agent, provider, and filter options.
 """
 
 import pathlib
+from datetime import datetime, timedelta
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from src.revenium_mcp_server.analytics.envelope_reads import ENVELOPE_MAX_PAGES
+from src.revenium_mcp_server.analytics_window import CALENDAR_RANGE_MAX_DAYS
 
 from src.revenium_mcp_server.tools_decomposed.tool_management import (
     ToolManager,
     ToolManagement,
 )
-from src.revenium_mcp_server.client import ReveniumAPIError
+from src.revenium_mcp_server.auth import AuthConfig
+from src.revenium_mcp_server.client import ReveniumAPIError, ReveniumClient
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from mcp.types import TextContent
+from tests.unit._helpers_list_heading import LIST_HEADING_CASES, heading_and_body, rows
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +71,32 @@ def tool_manager(mock_client):
 def tool_mgmt():
     """Create ToolManagement instance (top-level tool)."""
     return ToolManagement()
+
+
+# The tool record as the Tool Registry GET returns it (BACK-4696). The real
+# GET never carries teamId, and this tool is disabled so an update that let
+# the platform default enabled back to true would show.
+STORED_TOOL = {
+    "id": "l39KLb",
+    "name": "tool-registry-tool-x",
+    "toolId": "tool-registry-tool-x",
+    "toolType": "MCP_SERVER",
+    "description": "Tool: tool-registry-tool-x",
+    "enabled": False,
+    "toolProvider": "",
+    "label": "tool-registry-tool-x",
+    "resourceType": "tool",
+    "configSource": "DATABASE",
+    "created": "2026-10-15T00:00:00Z",
+    "updated": "2026-10-15T00:00:00Z",
+    "_links": {"self": {"href": "x"}},
+    "team": {"id": "test_team_id_456", "label": "t"},
+    "pricing": {
+        "currency": "USD",
+        "elements": [{"name": "requests", "unitPrice": "0.005", "aggregationType": "COUNT", "tiers": None}],
+    },
+}
+_STORED_IDENTITY = {k: STORED_TOOL[k] for k in ("name", "toolId", "toolType", "enabled")}
 
 
 # ===========================================================================
@@ -256,15 +288,17 @@ class TestToolManagerUpdate:
 
     @pytest.mark.asyncio
     async def test_update_tool_sends_patch(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
         mock_client.update_tool.return_value = {"id": "t1", "name": "Updated"}
         result = await tool_manager.update_tool({"tool_id": "t1", "tool_data": {"name": "Updated"}})
         assert result["name"] == "Updated"
         mock_client.update_tool.assert_called_once_with(
-            "t1", {"name": "Updated", "teamId": "test_team_id_456"},
+            "t1", {**_STORED_IDENTITY, "name": "Updated", "teamId": "test_team_id_456"},
         )
 
     @pytest.mark.asyncio
     async def test_update_tool_preserves_explicit_team_id(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
         mock_client.update_tool.return_value = {"id": "t1"}
         await tool_manager.update_tool({
             "tool_id": "t1",
@@ -284,17 +318,112 @@ class TestToolManagerUpdate:
         with pytest.raises(ToolError):
             await tool_manager.update_tool({"tool_id": "t1"})
 
+    # BACK-4696: the platform PUT requires name, toolId and toolType, and
+    # defaults a missing enabled to true. An update reads the stored tool and
+    # sends those four back under the caller's change, and nothing else.
+
+    @pytest.mark.asyncio
+    async def test_a_rename_sends_the_stored_tool_with_the_new_name(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
+
+        await tool_manager.update_tool({"tool_id": "l39KLb", "tool_data": {"name": "renamed"}})
+
+        mock_client.get_tool.assert_awaited_once_with("l39KLb")
+        mock_client.update_tool.assert_awaited_once_with(
+            "l39KLb", {**_STORED_IDENTITY, "name": "renamed", "teamId": "test_team_id_456"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_description_change_alone_keeps_the_stored_name(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
+
+        await tool_manager.update_tool({"tool_id": "l39KLb", "tool_data": {"description": "new text"}})
+
+        body = mock_client.update_tool.await_args.args[1]
+        assert body == {**_STORED_IDENTITY, "description": "new text", "teamId": "test_team_id_456"}
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_tool_stays_disabled_after_a_rename(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
+
+        await tool_manager.update_tool({"tool_id": "l39KLb", "tool_data": {"name": "renamed"}})
+
+        body = mock_client.update_tool.await_args.args[1]
+        assert body["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_pricing_is_sent_only_when_the_caller_sends_it(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
+
+        await tool_manager.update_tool({"tool_id": "l39KLb", "tool_data": {"name": "renamed"}})
+
+        body = mock_client.update_tool.await_args.args[1]
+        assert not {"pricing", "description", "toolProvider"} & set(body)
+
+        pricing = {
+            "currency": "USD",
+            "elements": [{"name": "requests", "unitPrice": 0.01, "aggregationType": "COUNT"}],
+        }
+        await tool_manager.update_tool({"tool_id": "l39KLb", "tool_data": {"pricing": pricing}})
+
+        body = mock_client.update_tool.await_args.args[1]
+        assert body["pricing"] == pricing
+
+    @pytest.mark.asyncio
+    async def test_the_callers_value_wins_over_the_stored_one(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
+        tool_data = {"toolType": "REST_API", "enabled": True}
+
+        await tool_manager.update_tool({"tool_id": "l39KLb", "tool_data": tool_data})
+
+        body = mock_client.update_tool.await_args.args[1]
+        assert body["toolType"] == "REST_API"
+        assert body["enabled"] is True
+        assert tool_data == {"toolType": "REST_API", "enabled": True}
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_tool_is_not_found_and_nothing_is_sent(self, tool_manager, mock_client):
+        mock_client.get_tool.side_effect = ReveniumAPIError("missing", status_code=404)
+
+        with pytest.raises(ToolError) as exc:
+            await tool_manager.update_tool({"tool_id": "l39KLb", "tool_data": {"name": "renamed"}})
+
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        mock_client.update_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_empty_stored_record_sends_nothing(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = {}
+
+        with pytest.raises(ToolError):
+            await tool_manager.update_tool({"tool_id": "l39KLb", "tool_data": {"name": "renamed"}})
+
+        mock_client.update_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_invalid_input_is_refused_before_the_tool_is_read(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
+
+        with pytest.raises(ToolError):
+            await tool_manager.update_tool({
+                "tool_id": "l39KLb",
+                "tool_data": {"name": "X", "pricing": {"elements": [{"unitPrice": -1}]}},
+            })
+
+        mock_client.get_tool.assert_not_awaited()
+
 
 class TestToolManagerReplace:
     """replace is an alias for update_tool (BACK-1316/F.2)."""
 
     @pytest.mark.asyncio
     async def test_replace_routes_through_update_tool(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
         mock_client.update_tool.return_value = {"id": "t1", "name": "Replaced"}
         result = await tool_manager.update_tool({"tool_id": "t1", "tool_data": {"name": "Replaced"}})
         assert result["name"] == "Replaced"
         mock_client.update_tool.assert_called_once_with(
-            "t1", {"name": "Replaced", "teamId": "test_team_id_456"},
+            "t1", {**_STORED_IDENTITY, "name": "Replaced", "teamId": "test_team_id_456"},
         )
 
     @pytest.mark.asyncio
@@ -502,103 +631,249 @@ class TestToolManagerGetEvents:
 # ===========================================================================
 
 
-class TestToolManagerCostBreakdown:
-    """Test ToolManager.get_cost_breakdown behavior."""
+SEPTEMBER_START = "2026-09-01T00:00:00.000Z"
+SEPTEMBER_END = "2026-09-30T23:59:59.999Z"
+SEPTEMBER = {"start_date": SEPTEMBER_START, "end_date": SEPTEMBER_END}
+
+# action -> (client method, the filters it takes, as caller name -> platform name)
+TOOL_REPORT_ACTIONS = {
+    "get_cost_breakdown": ("get_cost_by_tool", {"tool_id": "toolIds"}),
+    "get_top_tools": ("get_top_tools_by_call_count", {}),
+    "get_success_rate": ("get_tool_success_rate", {}),
+    "get_latency": ("get_tool_latency", {}),
+    "get_cost_aggregated": ("get_cost_by_tool_aggregated", {}),
+    "get_cost_by_agent": ("get_cost_by_tool_agent", {}),
+    "get_agent_breakdown": ("get_agent_tool_breakdown", {}),
+    "get_cost_by_provider": ("get_cost_by_tool_provider", {"provider": "providers"}),
+    "get_cost_by_provider_aggregated": ("get_cost_by_tool_provider_aggregated", {}),
+}
+
+ONE_PAGE = {"_embedded": {"items": []}, "page": {"number": 0, "size": 100, "totalPages": 1}}
+
+
+def _bucket(hour):
+    return {
+        "startTimestamp": f"2026-09-30T{hour:02d}:00:00.000Z",
+        "endTimestamp": f"2026-09-30T{hour:02d}:59:59.999Z",
+        "groups": [{"groupName": "isotope", "metrics": [{"metricResult": 0.2}]}],
+    }
+
+
+def _pages(hours_per_page):
+    total = len(hours_per_page)
+    return {
+        number: {
+            "period": {"start": SEPTEMBER_START, "end": SEPTEMBER_END},
+            "_embedded": {"items": [_bucket(hour) for hour in hours]},
+            "page": {"number": number, "size": 100, "totalPages": total, "totalElements": 24},
+        }
+        for number, hours in enumerate(hours_per_page)
+    }
+
+
+def _answer_by_page(pages):
+    async def answer(**params):
+        return pages[params.get("page", 0)]
+
+    return answer
+
+
+class TestToolReportsSendThePlatformNames:
+    """BACK-4625: every tool analytics action sends the names the isotope operation declares."""
 
     @pytest.mark.asyncio
-    async def test_get_cost_breakdown(self, tool_manager, mock_client):
-        mock_client.get_cost_by_tool.return_value = {"data": []}
-        result = await tool_manager.get_cost_breakdown({"action": "get_cost_breakdown"})
-        assert "data" in result
-        mock_client.get_cost_by_tool.assert_called_once()
+    @pytest.mark.parametrize("action", sorted(TOOL_REPORT_ACTIONS))
+    async def test_outgoing_parameter_names(self, tool_manager, mock_client, action):
+        method, filters = TOOL_REPORT_ACTIONS[action]
+        getattr(mock_client, method).return_value = ONE_PAGE
+        arguments = {**SEPTEMBER, **dict.fromkeys(filters, "x")}
 
+        await getattr(tool_manager, action)(arguments)
 
-class TestToolManagerTopTools:
-    """Test ToolManager.get_top_tools behavior."""
-
-    @pytest.mark.asyncio
-    async def test_get_top_tools(self, tool_manager, mock_client):
-        mock_client.get_top_tools_by_call_count.return_value = {"tools": []}
-        result = await tool_manager.get_top_tools({"action": "get_top_tools"})
-        assert "tools" in result
-        mock_client.get_top_tools_by_call_count.assert_called_once()
-
-
-class TestToolManagerSuccessRate:
-    """Test ToolManager.get_success_rate behavior."""
+        sent = getattr(mock_client, method).await_args.kwargs
+        assert set(sent) == {"startDate", "endDate", "size", *filters.values()}
+        assert (sent["startDate"], sent["endDate"]) == (SEPTEMBER_START, SEPTEMBER_END)
+        for platform_name in filters.values():
+            assert sent[platform_name] == ["x"]
 
     @pytest.mark.asyncio
-    async def test_get_success_rate(self, tool_manager, mock_client):
-        mock_client.get_tool_success_rate.return_value = {"rates": []}
-        result = await tool_manager.get_success_rate({"action": "get_success_rate"})
-        assert "rates" in result
-        mock_client.get_tool_success_rate.assert_called_once()
+    async def test_filter_options_send_no_window_or_filter(self, tool_manager, mock_client):
+        mock_client.get_tool_filter_options.return_value = {"tools": []}
 
+        await tool_manager.get_filter_options({"action": "get_filter_options"})
 
-class TestToolManagerLatency:
-    """Test ToolManager.get_latency behavior."""
+        mock_client.get_tool_filter_options.assert_awaited_once_with()
 
     @pytest.mark.asyncio
-    async def test_get_latency(self, tool_manager, mock_client):
-        mock_client.get_tool_latency.return_value = {"latencies": []}
-        result = await tool_manager.get_latency({"action": "get_latency"})
-        assert "latencies" in result
-        mock_client.get_tool_latency.assert_called_once()
+    async def test_filter_options_refuse_a_window(self, tool_manager, mock_client):
+        with pytest.raises(ToolError, match="start_date is not accepted by get_filter_options"):
+            await tool_manager.get_filter_options(dict(SEPTEMBER))
 
-
-class TestToolManagerCostAggregated:
-    """Test ToolManager.get_cost_aggregated behavior."""
+        mock_client.get_tool_filter_options.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_get_cost_aggregated(self, tool_manager, mock_client):
-        mock_client.get_cost_by_tool_aggregated.return_value = {"data": []}
-        result = await tool_manager.get_cost_aggregated({"action": "get_cost_aggregated"})
-        assert "data" in result
-        mock_client.get_cost_by_tool_aggregated.assert_called_once()
+    async def test_a_calendar_day_covers_the_whole_utc_day(self, tool_manager, mock_client):
+        mock_client.get_cost_by_tool_aggregated.return_value = ONE_PAGE
 
+        await tool_manager.get_cost_aggregated({"start_date": "2026-09-01", "end_date": "2026-09-30"})
 
-class TestToolManagerCostByAgent:
-    """Test ToolManager.get_cost_by_agent behavior."""
+        sent = mock_client.get_cost_by_tool_aggregated.await_args.kwargs
+        assert (sent["startDate"], sent["endDate"]) == (SEPTEMBER_START, SEPTEMBER_END)
 
     @pytest.mark.asyncio
-    async def test_get_cost_by_agent(self, tool_manager, mock_client):
-        mock_client.get_cost_by_tool_agent.return_value = {"data": []}
-        result = await tool_manager.get_cost_by_agent({"agent": "my-agent", "start_date": "2025-01-01"})
-        assert "data" in result
-        mock_client.get_cost_by_tool_agent.assert_called_once_with(agent="my-agent", start_date="2025-01-01")
+    async def test_a_period_becomes_the_dates_it_covers(self, tool_manager, mock_client):
+        mock_client.get_top_tools_by_call_count.return_value = ONE_PAGE
 
+        await tool_manager.get_top_tools({"period": "SEVEN_DAYS"})
 
-class TestToolManagerAgentBreakdown:
-    """Test ToolManager.get_agent_breakdown behavior."""
-
-    @pytest.mark.asyncio
-    async def test_get_agent_breakdown(self, tool_manager, mock_client):
-        mock_client.get_agent_tool_breakdown.return_value = {"data": []}
-        result = await tool_manager.get_agent_breakdown({"action": "get_agent_breakdown"})
-        assert "data" in result
-        mock_client.get_agent_tool_breakdown.assert_called_once()
-
-
-class TestToolManagerCostByProvider:
-    """Test ToolManager.get_cost_by_provider behavior."""
+        sent = mock_client.get_top_tools_by_call_count.await_args.kwargs
+        assert "period" not in sent
+        start = datetime.fromisoformat(sent["startDate"].replace("Z", "+00:00"))
+        end = datetime.fromisoformat(sent["endDate"].replace("Z", "+00:00"))
+        assert end - start == timedelta(days=7)
 
     @pytest.mark.asyncio
-    async def test_get_cost_by_provider(self, tool_manager, mock_client):
-        mock_client.get_cost_by_tool_provider.return_value = {"data": []}
-        result = await tool_manager.get_cost_by_provider({"provider": "anthropic", "start_date": "2025-01-01"})
-        assert "data" in result
-        mock_client.get_cost_by_tool_provider.assert_called_once_with(provider="anthropic", start_date="2025-01-01")
+    async def test_without_a_window_the_platform_default_is_sent(self, tool_manager, mock_client):
+        mock_client.get_cost_by_tool_agent.return_value = ONE_PAGE
 
+        read = await tool_manager.get_cost_by_agent({})
 
-class TestToolManagerCostByProviderAggregated:
-    """Test ToolManager.get_cost_by_provider_aggregated behavior."""
+        sent = mock_client.get_cost_by_tool_agent.await_args.kwargs
+        assert set(sent) == {"startDate", "endDate", "size"}
+        assert (sent["startDate"], sent["endDate"]) == (read.window.start, read.window.end)
+        start = datetime.fromisoformat(sent["startDate"].replace("Z", "+00:00"))
+        end = datetime.fromisoformat(sent["endDate"].replace("Z", "+00:00"))
+        assert end - start == timedelta(hours=24)
 
     @pytest.mark.asyncio
-    async def test_get_cost_by_provider_aggregated(self, tool_manager, mock_client):
-        mock_client.get_cost_by_tool_provider_aggregated.return_value = {"data": []}
-        result = await tool_manager.get_cost_by_provider_aggregated({"action": "get_cost_by_provider_aggregated"})
-        assert "data" in result
-        mock_client.get_cost_by_tool_provider_aggregated.assert_called_once()
+    @pytest.mark.parametrize(
+        "action,arguments,refused",
+        [
+            ("get_cost_aggregated", {"group": "TOTAL"}, "group"),
+            ("get_cost_breakdown", {"granularity": "day"}, "granularity"),
+            ("get_cost_by_agent", {"agent": "claude-code"}, "agent"),
+            ("get_cost_aggregated", {"tool_name": "search"}, "tool_name"),
+            ("get_cost_aggregated", {"tool_id": "t1"}, "tool_id"),
+            ("get_cost_breakdown", {"provider": "anthropic"}, "provider"),
+        ],
+    )
+    async def test_a_filter_the_report_does_not_take_is_refused(
+        self, tool_manager, mock_client, action, arguments, refused
+    ):
+        method, _ = TOOL_REPORT_ACTIONS[action]
+
+        with pytest.raises(ToolError, match=f"{refused} is not accepted by {action}"):
+            await getattr(tool_manager, action)(arguments)
+
+        getattr(mock_client, method).assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "arguments,message",
+        [
+            ({"period": "SEVEN_DAYS", **SEPTEMBER}, "Pass either period or start_date/end_date"),
+            ({"start_date": SEPTEMBER_START}, "start_date and end_date go together"),
+            ({"period": "FORTNIGHT"}, "Unsupported period"),
+            ({"start_date": "2026-09-30", "end_date": "2026-09-01"}, "is after end_date"),
+            (
+                {"start_date": "2025-09-01", "end_date": "2026-09-02"},
+                f"covers 367 days; at most {CALENDAR_RANGE_MAX_DAYS} are allowed",
+            ),
+            (
+                {"start_date": "2025-09-01T00:00:00Z", "end_date": "2026-09-02T00:00:01Z"},
+                f"covers 367 days; at most {CALENDAR_RANGE_MAX_DAYS} are allowed",
+            ),
+        ],
+    )
+    async def test_an_unusable_window_is_refused(self, tool_manager, mock_client, arguments, message):
+        with pytest.raises(ToolError, match=message):
+            await tool_manager.get_cost_aggregated(arguments)
+
+        mock_client.get_cost_by_tool_aggregated.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_answer_names_the_window_asked_for(self, tool_mgmt, mock_client):
+        mock_client.get_cost_by_tool_aggregated.return_value = ONE_PAGE
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await tool_mgmt.handle_action("get_cost_aggregated", dict(SEPTEMBER))
+
+        assert f"Aggregated cost per tool ({SEPTEMBER_START} to {SEPTEMBER_END}):" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_the_longest_calendar_range_is_read(self, tool_manager, mock_client):
+        mock_client.get_cost_by_tool_aggregated.return_value = ONE_PAGE
+
+        await tool_manager.get_cost_aggregated({"start_date": "2025-09-01", "end_date": "2026-09-01"})
+
+        sent = mock_client.get_cost_by_tool_aggregated.await_args.kwargs
+        assert (sent["startDate"], sent["endDate"]) == (
+            "2025-09-01T00:00:00.000Z",
+            "2026-09-01T23:59:59.999Z",
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_answer_names_the_period_asked_for(self, tool_mgmt, mock_client):
+        mock_client.get_top_tools_by_call_count.return_value = ONE_PAGE
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await tool_mgmt.handle_action("get_top_tools", {"period": "SEVEN_DAYS"})
+
+        sent = mock_client.get_top_tools_by_call_count.await_args.kwargs
+        assert f"Top tools (SEVEN_DAYS: {sent['startDate']} to {sent['endDate']}):" in result[0].text
+
+
+class TestToolReportsReadEveryPage:
+    """BACK-4640: a tool report's time buckets are read to the last page."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["get_cost_by_provider", "get_cost_breakdown"])
+    async def test_three_pages_become_one_complete_series(self, tool_manager, mock_client, action):
+        method, _ = TOOL_REPORT_ACTIONS[action]
+        getattr(mock_client, method).side_effect = _answer_by_page(
+            _pages([range(0, 10), range(10, 20), range(20, 24)])
+        )
+
+        read = await getattr(tool_manager, action)(dict(SEPTEMBER))
+
+        calls = getattr(mock_client, method).await_args_list
+        assert [call.kwargs.get("page") for call in calls] == [None, 1, 2]
+        assert len(read.items) == 24
+        assert read.items[-1]["endTimestamp"] == SEPTEMBER_END
+        assert read.unread is None
+        assert "page" not in read.envelope
+
+    @pytest.mark.asyncio
+    async def test_without_a_window_every_page_reads_the_same_default_window(self, tool_mgmt, mock_client):
+        mock_client.get_cost_by_tool_provider.side_effect = _answer_by_page(
+            _pages([range(0, 10), range(10, 20), range(20, 24)])
+        )
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await tool_mgmt.handle_action("get_cost_by_provider", {})
+
+        calls = mock_client.get_cost_by_tool_provider.await_args_list
+        windows = {(call.kwargs["startDate"], call.kwargs["endDate"]) for call in calls}
+        assert len(calls) == 3
+        assert len(windows) == 1
+        (start, end), = windows
+        assert (
+            f"Cost by provider (TWENTY_FOUR_HOURS, the platform default: {start} to {end}):"
+            in result[0].text
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_read_that_stops_at_the_page_cap_says_so(self, tool_mgmt, mock_client):
+        total_pages = ENVELOPE_MAX_PAGES + 1
+        mock_client.get_cost_by_tool_provider.side_effect = _answer_by_page(
+            _pages([[0]] * total_pages)
+        )
+        tool_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await tool_mgmt.handle_action("get_cost_by_provider", dict(SEPTEMBER))
+
+        assert mock_client.get_cost_by_tool_provider.await_count == ENVELOPE_MAX_PAGES
+        assert f"the platform holds {total_pages} pages" in result[0].text
 
 
 class TestToolManagerFilterOptions:
@@ -610,50 +885,6 @@ class TestToolManagerFilterOptions:
         result = await tool_manager.get_filter_options({})
         assert result["tools"] == ["t1", "t2"]
         mock_client.get_tool_filter_options.assert_called_once()
-
-
-class TestToolManagerAnalyticsFilterForwarding:
-    """Test _extract_analytics_filters forwards agent and provider params."""
-
-    @pytest.mark.asyncio
-    async def test_agent_param_forwarded(self, tool_manager, mock_client):
-        mock_client.get_cost_by_tool_agent.return_value = {}
-        await tool_manager.get_cost_by_agent({"agent": "a1", "start_date": "2025-01-01", "irrelevant_key": "ignored"})
-        mock_client.get_cost_by_tool_agent.assert_called_once_with(agent="a1", start_date="2025-01-01")
-
-    @pytest.mark.asyncio
-    async def test_provider_param_forwarded(self, tool_manager, mock_client):
-        mock_client.get_cost_by_tool_provider.return_value = {}
-        await tool_manager.get_cost_by_provider({"provider": "openai", "end_date": "2025-12-31", "extra": "dropped"})
-        mock_client.get_cost_by_tool_provider.assert_called_once_with(provider="openai", end_date="2025-12-31")
-
-    def test_extract_analytics_filters_includes_new_params(self, tool_manager):
-        filters = tool_manager._extract_analytics_filters({
-            "agent": "a1", "provider": "p1", "start_date": "2025-01-01",
-            "tool_id": "t1", "unknown_param": "dropped",
-        })
-        assert filters == {"agent": "a1", "provider": "p1", "start_date": "2025-01-01", "tool_id": "t1"}
-
-    @pytest.mark.asyncio
-    async def test_period_param_forwarded(self, tool_manager, mock_client):
-        """period reaches the analytics client method (BACK-1096)."""
-        mock_client.get_top_tools_by_call_count.return_value = {}
-        await tool_manager.get_top_tools({"period": "SEVEN_DAYS", "junk": "dropped"})
-        mock_client.get_top_tools_by_call_count.assert_called_once_with(period="SEVEN_DAYS")
-
-    @pytest.mark.asyncio
-    async def test_group_param_forwarded(self, tool_manager, mock_client):
-        """group reaches the analytics client method (BACK-1096)."""
-        mock_client.get_cost_by_tool.return_value = {}
-        await tool_manager.get_cost_breakdown({"group": "TOTAL", "period": "THIRTY_DAYS"})
-        mock_client.get_cost_by_tool.assert_called_once_with(group="TOTAL", period="THIRTY_DAYS")
-
-    def test_extract_analytics_filters_includes_period_and_group(self, tool_manager):
-        """period and group are recognised analytics params (BACK-1096)."""
-        filters = tool_manager._extract_analytics_filters({
-            "period": "SEVEN_DAYS", "group": "TOTAL", "tool_id": "t1",
-        })
-        assert filters == {"period": "SEVEN_DAYS", "group": "TOTAL", "tool_id": "t1"}
 
 
 # ===========================================================================
@@ -977,6 +1208,7 @@ class TestToolManagerPricingValidation:
         self, tool_manager, mock_client
     ):
         """update_tool with a string unitPrice (GET round-trip) succeeds without TypeError (BACK-2396)."""
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
         mock_client.update_tool = AsyncMock(return_value={"id": "t1", "name": "x"})
         tool_manager.client = mock_client
 
@@ -1039,6 +1271,25 @@ class TestToolManagementHandleAction:
         assert "pricing_structure" in result[0].text
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("page_info, row_count, page, heading, total", LIST_HEADING_CASES)
+    async def test_list_heading_counts_the_page_against_the_platform_total(
+        self, tool_mgmt, mock_client, page_info, row_count, page, heading, total
+    ):
+        """The heading counts the page against the platform total, not the rows alone."""
+        mock_client._extract_embedded_data.return_value = rows(row_count)
+        mock_client._extract_pagination_info.return_value = page_info
+        mock_client.list_tools.return_value = {}
+        tool_mgmt.client = mock_client
+
+        result = await tool_mgmt.handle_action("list", {"page": page, "size": 20})
+
+        shown_heading, body = heading_and_body(result[0].text)
+        assert shown_heading == heading.format(noun="tools")
+        assert body["total_records"] == total
+        assert body["page"] == page
+        assert body["total_found"] == row_count
+
+    @pytest.mark.asyncio
     async def test_list_dispatch_with_digit_string_page_no_typeerror(self, tool_mgmt, mock_client):
         """Digit-string page flows end-to-end to display text without TypeError (BACK-1097).
 
@@ -1055,11 +1306,12 @@ class TestToolManagementHandleAction:
         assert len(result) == 1
         assert isinstance(result[0], TextContent)
         assert "page 3" in result[0].text
-        assert "Found 1 tools" in result[0].text
+        assert result[0].text.startswith("Found 1 of 21 tools (page 3 of 3):\n\n")
         mock_client.list_tools.assert_called_once_with(page=2, size=10)
 
     @pytest.mark.asyncio
     async def test_replace_dispatches_to_update_tool(self, tool_mgmt, mock_client):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
         mock_client.update_tool.return_value = {"id": "t1", "name": "replaced"}
         tool_mgmt.client = mock_client
 
@@ -1073,7 +1325,12 @@ class TestToolManagementHandleAction:
         assert "Tool updated" in result[0].text
         mock_client.update_tool.assert_called_once()
         call_data = mock_client.update_tool.call_args[0][1]
-        assert "teamId" in call_data
+        assert call_data == {
+            **_STORED_IDENTITY,
+            "name": "replaced",
+            "toolType": "MCP_SERVER",
+            "teamId": "test_team_id_456",
+        }
 
     @pytest.mark.asyncio
     async def test_auth_failure_reraises_api_error(self, tool_mgmt, mock_client):
@@ -1677,3 +1934,70 @@ class TestToolVersionIsRefusedNotDiscarded:
         await tool_manager.create_tool({"tool_data": {"name": "T", "toolType": "HUMAN"}})
         mock_client.create_tool.assert_called_once()
         assert "version" not in mock_client.create_tool.call_args[0][0]
+
+
+class TestAgentBreakdownOverTheWire:
+    """BACK-4696: the agent-tool breakdown answer carries the rows the analytics service sends.
+
+    The service answers this report with its rows under ``data`` and no
+    ``_embedded``, so a client that unwraps HAL ``_embedded`` turns it into an
+    empty list. Runs a real ReveniumClient against a mocked HTTP response.
+    """
+
+    BODY = {
+        "id": "x",
+        "resourceType": "agent-tool-breakdown",
+        "label": "x",
+        "period": {"start": "2026-09-15T00:00:00.000Z", "end": "2026-10-15T00:00:00.000Z"},
+        "data": [
+            {
+                "agentName": "revvie",
+                "toolName": "engineering-time",
+                "toolType": "HUMAN",
+                "totalCost": 1143.75,
+                "totalCalls": 16,
+            }
+        ],
+        "_links": {"self": {"href": "x"}},
+    }
+
+    @pytest.mark.asyncio
+    async def test_rows_under_data_reach_the_answer_for_the_dates_asked(self):
+        client = ReveniumClient(
+            auth_config=AuthConfig(
+                api_key="test-key-xyz",
+                team_id="team_abc",
+                base_url="https://api.test.revenium.ai",
+                timeout=5.0,
+                max_retries=0,
+            )
+        )
+        response = MagicMock()
+        response.status_code = 200
+        response.headers = {}
+        response.content = b"non-empty"
+        response.json.return_value = self.BODY
+
+        def config_value(name, default=None):
+            return "https://ai.test.example" if name == "REVENIUM_APP_BASE_URL" else default
+
+        tool_mgmt = ToolManagement()
+        tool_mgmt.get_client = AsyncMock(return_value=client)
+        with patch("src.revenium_mcp_server.client.get_config_value", side_effect=config_value), \
+                patch.object(client.client, "request", new_callable=AsyncMock, return_value=response) as request:
+            result = await tool_mgmt.handle_action(
+                "get_agent_breakdown",
+                {"start_date": "2026-09-15T00:00:00Z", "end_date": "2026-10-15T00:00:00Z"},
+            )
+
+        text = result[0].text
+        assert '"agentName": "revvie"' in text
+        assert '"toolName": "engineering-time"' in text
+        assert '"totalCalls": 16' in text
+        request.assert_awaited_once()
+        sent = request.await_args.kwargs
+        params = sent["params"]
+        assert params["startDate"] == "2026-09-15T00:00:00.000Z"
+        assert params["endDate"] == "2026-10-15T00:00:00.000Z"
+        assert "start_date" not in params and "end_date" not in params
+        assert sent["url"] == "https://ai.test.example/api/v2/analytics/agent-tool-breakdown"

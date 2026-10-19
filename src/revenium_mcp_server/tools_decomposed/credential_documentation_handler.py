@@ -33,7 +33,7 @@ class CredentialDocumentationHandler:
         result_text += "- `action` - What operation to perform (default: get_capabilities)\n"
         result_text += "- `credential_id` - For get/update/delete operations\n"
         result_text += "- `organizationId` - For the list_by_organization action\n"
-        result_text += "- `dry_run` - Preview without creating (optional)\n"
+        result_text += "- `dry_run` - Preview create and validate without writing (other actions refuse it)\n"
         result_text += "- `page`, `size` - For list operations\n"
         result_text += ("- `filters` - Narrows a listing. `list` accepts query, sort, type; "
                         "`list_by_organization` accepts query, sort\n\n")
@@ -90,7 +90,7 @@ class CredentialDocumentationHandler:
         result_text += "## **Validation and Testing**\n"
         result_text += "- `validate` - Validate credential data structure\n"
         result_text += "- `get_examples` - Get comprehensive usage examples\n"
-        result_text += "- Dry-run support for all operations\n\n"
+        result_text += "- `dry_run` previews only create and validate; other actions refuse it\n\n"
 
         # Business Rules
         result_text += "## **Business Rules**\n"
@@ -285,7 +285,7 @@ class CredentialDocumentationHandler:
                 action="validate credential data",
                 examples={
                     "usage": "validate(credential_data={...})",
-                    "usage_update": "validate(credential_data={...}, operation_type='update')",
+                    "usage_update": "validate(credential_id='cred_123', credential_data={...})",
                     "example_data": {
                         "label": "API Key",
                         "subscriberId": "sub_123",

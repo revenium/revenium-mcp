@@ -8,6 +8,7 @@ import importlib.util
 import json
 import re
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -94,10 +95,11 @@ class TestHandleActionRouting:
         assert "Quick Start" in text
 
     @pytest.mark.asyncio
-    async def test_unsupported_action_returns_available_actions(self, analytics_tool):
+    async def test_unsupported_action_raises_with_available_actions(self, analytics_tool):
         """An unsupported action returns a message listing available actions."""
-        result = await analytics_tool.handle_action("totally_fake_action", {})
-        text = result[0].text
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("totally_fake_action", {})
+        text = exc.value.message
         assert "Not Supported" in text
         assert "totally_fake_action" in text
         assert "get_capabilities" in text
@@ -105,8 +107,9 @@ class TestHandleActionRouting:
     @pytest.mark.asyncio
     async def test_deprecated_actions_treated_as_unsupported(self, analytics_tool):
         """Known deprecated actions like cost_spike_analysis route to unsupported handler."""
-        result = await analytics_tool.handle_action("cost_spike_analysis", {})
-        text = result[0].text
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("cost_spike_analysis", {})
+        text = exc.value.message
         assert "Not Supported" in text
         assert "cost_spike_analysis" in text
 
@@ -515,10 +518,11 @@ class TestSeatUtilizationRendering:
             side_effect=ReveniumAPIError("boom", status_code=404)
         )
         analytics_tool.get_client = AsyncMock(return_value=client)
-        result = await analytics_tool.handle_action(
-            "get_seat_utilization", {"from_date": "2026-08-01", "to_date": "2026-08-22"}
-        )
-        text = result[0].text
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action(
+                "get_seat_utilization", {"from_date": "2026-08-01", "to_date": "2026-08-22"}
+            )
+        text = exc.value.message
         assert "Seat Utilization Failed" in text
         assert "366" in text
 
@@ -600,6 +604,122 @@ class TestSeatUtilizationRendering:
         line = next(line for line in text.splitlines() if "Census freshness" in line)
         assert "PARTIAL" in line
         assert "does not recognise" in line
+
+    @staticmethod
+    def _census(*dates):
+        return {"days": [{"date": d, "seatsPaid": 4, "seatsUsed": 1} for d in dates]}
+
+    @staticmethod
+    async def _run_on(analytics_tool, arguments, payload=None, today=date(2027, 1, 1)):
+        with patch.object(BusinessAnalyticsManagement, "_today_utc", return_value=today):
+            return await _run_seat_action(analytics_tool, arguments, payload)
+
+    @pytest.mark.asyncio
+    async def test_requested_days_missing_from_the_census_are_named(self, analytics_tool):
+        _, text = await self._run_on(
+            analytics_tool,
+            {"from_date": "2026-10-01", "to_date": "2026-10-04"},
+            self._census("2026-10-01", "2026-10-03"),
+        )
+        assert (
+            "the platform returned no census for 2 of the 4 requested days: "
+            "2026-10-02, 2026-10-04."
+        ) in text
+        assert "not days with zero seats" in text
+
+    @pytest.mark.asyncio
+    async def test_consecutive_missing_days_collapse_into_one_range(self, analytics_tool):
+        _, text = await self._run_on(
+            analytics_tool,
+            {"from_date": "2026-10-01", "to_date": "2026-10-14"},
+            self._census(*(f"2026-10-{day:02d}" for day in range(1, 11))),
+        )
+        assert "no census for 4 of the 14 requested days: 2026-10-11 through 2026-10-14." in text
+
+    @pytest.mark.asyncio
+    async def test_missing_day_runs_are_capped_with_a_count(self, analytics_tool):
+        _, text = await self._run_on(
+            analytics_tool,
+            {"from_date": "2026-01-01", "to_date": "2026-01-30"},
+            self._census(*(f"2026-01-{day:02d}" for day in range(1, 30, 2))),
+        )
+        line = next(
+            line for line in text.splitlines() if line.startswith("**Days with no census**")
+        )
+        assert "no census for 15 of the 30 requested days" in line
+        assert "2026-01-20, and 5 more days through 2026-01-30." in line
+        assert "2026-01-22" not in line
+
+    @pytest.mark.asyncio
+    async def test_a_complete_census_reports_no_missing_days(self, analytics_tool):
+        _, text = await self._run_on(
+            analytics_tool, {"from_date": "2026-08-01", "to_date": "2026-08-02"}
+        )
+        assert "Days with no census" not in text
+
+    @pytest.mark.asyncio
+    async def test_days_from_today_on_are_not_called_gaps(self, analytics_tool):
+        _, text = await self._run_on(
+            analytics_tool,
+            {"from_date": "2026-10-01", "to_date": "2026-10-05"},
+            self._census("2026-10-01"),
+            today=date(2026, 10, 3),
+        )
+        gap_line = next(line for line in text.splitlines() if "no census for" in line)
+        assert "no census for 1 of the 5 requested days: 2026-10-02." in gap_line
+        assert "2026-10-04" not in gap_line
+        assert (
+            "3 requested days from 2026-10-03 are today or later, so no census has been "
+            "taken for them yet."
+        ) in text
+
+    @pytest.mark.asyncio
+    async def test_days_from_the_census_check_day_on_are_not_called_gaps(self, analytics_tool):
+        arguments = {"from_date": "2026-10-10", "to_date": "2026-10-17"}
+        synced = {"censusState": "READ", "censusCheckedAt": "2026-10-17T01:00:12Z"}
+        today = date(2026, 10, 17)
+        hedge = (
+            "1 requested day from 2026-10-16 ended too recently for the latest census "
+            "sync (2026-10-17T01:00:12Z) to include it; the vendor may not have "
+            "published it yet."
+        )
+        today_line = (
+            "1 requested day from 2026-10-17 is today or later, so no census has been "
+            "taken for it yet."
+        )
+
+        through_15 = self._census(*(f"2026-10-{day}" for day in range(10, 16)))
+        _, text = await self._run_on(analytics_tool, arguments, {**through_15, **synced}, today)
+        assert "no census for" not in text
+        assert hedge in text
+        assert today_line in text
+
+        without_14 = self._census(*(f"2026-10-{day}" for day in (10, 11, 12, 13, 15)))
+        _, text = await self._run_on(analytics_tool, arguments, {**without_14, **synced}, today)
+        assert "no census for 1 of the 8 requested days: 2026-10-14." in text
+        assert hedge in text
+        assert today_line in text
+
+        later = {"from_date": "2026-10-10", "to_date": "2026-10-19"}
+        _, text = await self._run_on(analytics_tool, later, {**through_15, **synced}, today)
+        assert "no census for" not in text
+        assert hedge in text
+        assert "3 requested days from 2026-10-17 are today or later" in text
+        assert text.count("ended too recently") == 1
+
+        for unusable in (
+            {"censusState": "READ", "censusCheckedAt": None},
+            {"censusState": "READ", "censusCheckedAt": "not a time"},
+            {"censusState": "READ", "censusCheckedAt": "2026-10-17T01:00:12"},
+            {"censusState": "UNREAD", "censusCheckedAt": "2026-10-17T01:00:12Z"},
+        ):
+            _, text = await self._run_on(analytics_tool, arguments, {**through_15, **unusable}, today)
+            assert "no census for 1 of the 8 requested days: 2026-10-16." in text
+            assert (
+                "1 requested day from 2026-10-17 is today or later, so no census has been "
+                "taken for it yet."
+            ) in text
+            assert "ended too recently" not in text
 
     @pytest.mark.asyncio
     async def test_census_line_shows_when_days_is_empty(self, analytics_tool):
@@ -835,6 +955,18 @@ class TestPrHealthRendering:
         return result[0].text
 
     @pytest.mark.asyncio
+    async def test_priced_since_names_a_cause_only_when_the_platform_sent_the_key(
+        self, analytics_tool
+    ):
+        """BACK-4812: an absent pricedSince is not 'no spend to price yet'."""
+        absent = {k: v for k, v in PR_HEALTH_PAYLOAD.items() if k != "pricedSince"}
+        text = await self._render(analytics_tool, absent)
+        assert "- Priced since: n/a (the platform did not return pricedSince)" in text
+        null = {**PR_HEALTH_PAYLOAD, "pricedSince": None}
+        text = await self._render(analytics_tool, null)
+        assert "- Priced since: none (no coding-assistant spend to price yet)" in text
+
+    @pytest.mark.asyncio
     async def test_action_is_supported_and_routed(self, analytics_tool):
         assert "get_pr_health" in await analytics_tool._get_supported_actions()
         analytics_tool._handle_get_pr_health = AsyncMock(return_value=[])
@@ -874,6 +1006,39 @@ class TestPrHealthRendering:
         assert "At risk" in text
         assert "Wasted" in text
         assert "never add" in text.lower() or "not add" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_dollar_estimates_multiply_the_priced_counts(self, analytics_tool):
+        counts = {
+            "rottingPrs": 9,
+            "pricedRottingPrs": 7,
+            "rottingPrsAssisted": 5,
+            "pricedRottingPrsAssisted": 3,
+            "closedUnmerged": 17,
+            "pricedClosedUnmerged": 13,
+            "closedUnmergedAssisted": 11,
+            "pricedClosedUnmergedAssisted": 4,
+        }
+        totals = {**PR_HEALTH_PAYLOAD["totals"], **counts, "avgCostPerMergedPr": 12.5}
+        payload = {**PR_HEALTH_PAYLOAD, "totals": totals, "pricedSince": "2026-05-01"}
+        unpriced = ("~112.50", "~87.50", "~62.50", "~212.50", "~162.50", "~137.50")
+
+        text = await self._render(analytics_tool, payload)
+        estimates = text.split("**Cost estimates", 1)[1]
+        assert "~37.50 USD (estimate)" in estimates
+        assert "~50.00 USD (estimate)" in estimates
+        assert "- Priced since: 2026-05-01" in estimates
+        for product in unpriced:
+            assert product not in text
+
+        full_only = {
+            name: value for name, value in totals.items()
+            if name not in ("pricedRottingPrsAssisted", "pricedClosedUnmergedAssisted")
+        }
+        text = await self._render(analytics_tool, {**payload, "totals": full_only})
+        assert text.count("n/a (the platform returned no priced counts)") == 2
+        for product in unpriced:
+            assert product not in text
 
     @pytest.mark.asyncio
     async def test_dollar_figures_are_labelled_as_estimates(self, analytics_tool):
@@ -938,15 +1103,16 @@ class TestPrHealthRendering:
             side_effect=ReveniumAPIError("Bad request", status_code=400)
         )
         with patch.object(analytics_tool, "get_client", AsyncMock(return_value=client)):
-            result = await analytics_tool.handle_action(
-                "get_pr_health",
-                {
-                    "source": "github",
-                    "start_date": "2026-05-17",
-                    "end_date": "2026-08-17",
-                },
-            )
-        text = result[0].text
+            with pytest.raises(ToolError) as exc:
+                await analytics_tool.handle_action(
+                    "get_pr_health",
+                    {
+                        "source": "github",
+                        "start_date": "2026-05-17",
+                        "end_date": "2026-08-17",
+                    },
+                )
+        text = exc.value.message
         assert "Failed" in text
         assert "366" in text
 
@@ -1062,6 +1228,8 @@ Comparison window: 30d.
 - Hidden spend (billed but not metered): 1234.5
 - Trend vs. the previous window: +2.5 pp
 - Confidence: HIGH
+- The ratio is Revenium-metered spend divided by billed spend. It counts only \
+providers with a billing credential.
 
 **Coding-assistant usage**
 - Present: yes
@@ -1070,12 +1238,11 @@ not prove there was no coding-assistant usage — a probe that cannot complete \
 also reports no.
 
 **By provider**
-Each row's share is that provider's portion of TOTAL billed spend, not its \
-coverage. Compare metered against billed within a row to see that provider's \
-gap. A row state of no-data means the provider reported nothing to compare.
-- ANTHROPIC [active] | share of billed spend=91.0% metered=910 billed=1000 \
+Each row's ratio is that row's Revenium-metered spend divided by its billed \
+spend. A row state of no-data means the provider reported nothing to compare.
+- ANTHROPIC [active] | metered/billed ratio=91.0% metered=910 billed=1000 \
 coding-assistant usage: yes
-- OPENAI [no-data] | share of billed spend=n/a metered=0 billed=0 \
+- OPENAI [no-data] | metered/billed ratio=n/a metered=0 billed=0 \
 coding-assistant usage: no"""
 
 
@@ -1131,15 +1298,131 @@ class TestCoverageRatio:
         assert "n/a" not in anthropic
 
     @pytest.mark.asyncio
-    async def test_row_ratio_is_labelled_a_share_not_a_coverage(self, analytics_tool):
-        """A row's ratio is that provider's portion of TOTAL billed spend. Calling
-        it coverage would invert its meaning against the aggregate figure."""
+    async def test_row_ratio_is_labelled_metered_over_billed(self, analytics_tool):
+        """The backend computes a row's ratio as metered divided by billed, so a
+        'share of billed spend' label would state the opposite of what it is."""
         text = await self._render(analytics_tool)
         anthropic = next(
             line for line in text.split("\n") if line.startswith("- ANTHROPIC")
         )
-        assert "share of billed spend=91.0%" in anthropic
-        assert "coverage=" not in anthropic
+        assert "metered/billed ratio=91.0%" in anthropic
+        assert "share of" not in text
+
+    @pytest.mark.asyncio
+    async def test_capability_metadata_describes_the_row_ratio_as_metered_over_billed(
+        self, analytics_tool
+    ):
+        """FRONT-3514: the capability text still called the row ratio a share of
+        total billed spend after the rendered report stopped saying so."""
+        coverage = next(
+            c for c in await analytics_tool._get_tool_capabilities()
+            if "get_coverage_ratio" in c.parameters
+        )
+        metadata = " ".join([coverage.description, *coverage.limitations])
+        assert "share of" not in metadata
+        assert "Revenium-metered spend divided by its own billed spend" in metadata
+        assert "counts only providers with a billing credential" in metadata
+
+    @pytest.mark.asyncio
+    async def test_coverage_discovery_text_says_dates_alone_select_a_range(
+        self, analytics_tool
+    ):
+        """BACK-4693: dates alone select the range, so no discovery surface may
+        still say they only apply, or are only required, with period custom."""
+        capabilities = (await analytics_tool.handle_action("get_capabilities", {}))[0].text
+        examples = (await analytics_tool.handle_action("get_examples", {}))[0].text
+        coverage = next(
+            c for c in await analytics_tool._get_tool_capabilities()
+            if "get_coverage_ratio" in c.parameters
+        )
+        metadata = json.dumps({
+            "description": coverage.description,
+            "parameters": coverage.parameters,
+            "examples": coverage.examples,
+            "limitations": coverage.limitations,
+        })
+        schema = json.dumps(await analytics_tool._get_input_schema())
+        for text in (capabilities, examples, metadata, schema):
+            assert "required when period is custom" not in text
+            assert "only apply when period='custom'" not in text
+        assert "get_coverage_ratio(start_date='2026-09-01', end_date='2026-09-30')" in metadata
+
+    @pytest.mark.asyncio
+    async def test_aggregate_scope_names_the_ratio_and_keyed_rows_only(
+        self, analytics_tool
+    ):
+        text = await self._render(analytics_tool)
+        assert "Revenium-metered spend divided by billed spend" in text
+        assert "counts only providers with a billing credential" in text
+
+    @pytest.mark.asyncio
+    async def test_rows_print_their_label_in_place_of_the_provider_code(
+        self, analytics_tool
+    ):
+        payload = dict(COVERAGE_PAYLOAD, byProvider=[
+            {**COVERAGE_PAYLOAD["byProvider"][0], "provider": "anthropic",
+             "label": "Anthropic Console"},
+            {**COVERAGE_PAYLOAD["byProvider"][0], "provider": "anthropic_enterprise",
+             "label": "Claude Enterprise"},
+        ])
+        text = await self._render(analytics_tool, payload)
+        assert "- Anthropic Console [active]" in text
+        assert "- Claude Enterprise [active]" in text
+        assert "anthropic_enterprise" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("label", [None, "", "   ", 7])
+    async def test_a_missing_or_blank_label_falls_back_to_the_provider(
+        self, analytics_tool, label
+    ):
+        row = {**COVERAGE_PAYLOAD["byProvider"][0], "provider": "anthropic"}
+        if label is not None:
+            row["label"] = label
+        text = await self._render(analytics_tool, dict(COVERAGE_PAYLOAD, byProvider=[row]))
+        assert "- anthropic [active]" in text
+
+    @pytest.mark.asyncio
+    async def test_credential_names_are_listed_when_present_only(self, analytics_tool):
+        with_names = {**COVERAGE_PAYLOAD["byProvider"][0],
+                      "credentialNames": ["Eng Enterprise", "Platform"]}
+        text = await self._render(
+            analytics_tool, dict(COVERAGE_PAYLOAD, byProvider=[with_names])
+        )
+        assert "  Billing credentials: Eng Enterprise, Platform" in text
+        empty = {**COVERAGE_PAYLOAD["byProvider"][0], "credentialNames": []}
+        text = await self._render(
+            analytics_tool, dict(COVERAGE_PAYLOAD, byProvider=[empty])
+        )
+        assert "Billing credentials" not in text
+
+    @pytest.mark.asyncio
+    async def test_no_billing_key_row_reads_as_such_and_points_to_manage_connections(
+        self, analytics_tool
+    ):
+        row = {
+            "provider": "anthropic",
+            "label": "Anthropic API usage, no Console key",
+            "state": "active", "ratio": None, "metered": 88.0, "billing": None,
+            "billingCredentialConnected": False, "credentialNames": [],
+        }
+        text = await self._render(analytics_tool, dict(COVERAGE_PAYLOAD, byProvider=[row]))
+        assert "- Anthropic API usage, no Console key [active]" in text
+        assert "billing credential connected: no" in text
+        assert "Manage Connections" in text
+
+    @pytest.mark.asyncio
+    async def test_two_anthropic_rows_render_as_two_named_lines(self, analytics_tool):
+        base = COVERAGE_PAYLOAD["byProvider"][0]
+        rows = [
+            {**base, "provider": "anthropic", "label": "Anthropic Console"},
+            {**base, "provider": "anthropic_enterprise", "label": "Claude Enterprise",
+             "credentialNames": ["Engineering Enterprise"]},
+        ]
+        text = await self._render(
+            analytics_tool, dict(COVERAGE_PAYLOAD, byProvider=rows), {"provider": "anthropic"}
+        )
+        names = [l for l in text.split("\n") if l.startswith("- Anthropic Console") or l.startswith("- Claude Enterprise")]
+        assert len(names) == 2
 
     @pytest.mark.asyncio
     async def test_row_state_is_rendered(self, analytics_tool):
@@ -1152,7 +1435,7 @@ class TestCoverageRatio:
         """A no-data row has a null ratio but real zero amounts; 0 is not n/a."""
         text = await self._render(analytics_tool)
         openai = next(line for line in text.split("\n") if line.startswith("- OPENAI"))
-        assert "share of billed spend=n/a" in openai
+        assert "metered/billed ratio=n/a" in openai
         assert "metered=0" in openai
         assert "billed=0" in openai
 
@@ -1310,8 +1593,8 @@ class TestCoverageRatio:
             )
         kwargs = client.get_provider_coverage.await_args[1]
         assert kwargs["period"] == "custom"
-        assert kwargs["start_date"] == "2026-08-01T00:00:00Z"
-        assert kwargs["end_date"] == "2026-08-27T00:00:00Z"
+        assert kwargs["start_date"] == "2026-08-01T00:00:00.000Z"
+        assert kwargs["end_date"] == "2026-08-27T00:00:00.000Z"
 
     @pytest.mark.asyncio
     async def test_sub_cent_amounts_are_not_rendered_as_zero(self, analytics_tool):
@@ -1373,12 +1656,229 @@ class TestCoverageRatio:
         assert "NOT zero coverage" in text
 
     @pytest.mark.asyncio
+    async def test_single_provider_no_integration_points_at_the_unfiltered_report(
+        self, analytics_tool
+    ):
+        """FRONT-3434: provider=ANTHROPIC answers NO_INTEGRATION for a tenant whose only
+        Anthropic credential is Claude Enterprise; the unfiltered report has the row."""
+        text = await self._render(
+            analytics_tool,
+            {"state": "NO_INTEGRATION", "aggregateRatio": None, "byProvider": []},
+            {"provider": "ANTHROPIC"},
+        )
+        assert "a Claude Enterprise connection answers NO_INTEGRATION" in text
+        assert "Call get_coverage_ratio without provider" in text
+
+    @pytest.mark.asyncio
+    async def test_unfiltered_no_integration_carries_no_family_note(self, analytics_tool):
+        text = await self._render(
+            analytics_tool, {"state": "NO_INTEGRATION", "aggregateRatio": None, "byProvider": []}
+        )
+        assert "Claude Enterprise connection" not in text
+
+    @pytest.mark.asyncio
+    async def test_capabilities_explain_the_single_provider_match(self, analytics_tool):
+        result = await analytics_tool.handle_action("get_capabilities", {})
+        assert "provider=ANTHROPIC answers NO_INTEGRATION" in result[0].text
+
+    @pytest.mark.asyncio
     async def test_null_ratio_caveat_is_absent_when_a_ratio_was_computed(
         self, analytics_tool
     ):
         """The caveat explains a specific n/a; printed unconditionally it is noise."""
         text = await self._render(analytics_tool)
         assert "NOT zero coverage" not in text
+
+    @staticmethod
+    def _withheld_report(rows, **totals):
+        return {
+            "state": "VALID",
+            "aggregateRatio": None,
+            "aggregateRatioAvailable": False,
+            "confidence": "HIGH",
+            "byProvider": rows,
+            **totals,
+        }
+
+    _ENTERPRISE_ROW = {
+        "provider": "ANTHROPIC", "label": "Claude Enterprise", "state": "active",
+        "ratio": 0.769, "metered": 7300.0, "billing": 9492.0,
+        "billingCredentialConnected": True, "comparisonState": "full-window",
+    }
+    _UNBILLED_ROW = {
+        "provider": "OPENAI", "label": "OpenAI Platform", "state": "active",
+        "ratio": None, "metered": 12.0, "billing": 0,
+        "billingCredentialConnected": True, "comparisonState": "partial-window",
+    }
+
+    @pytest.mark.asyncio
+    async def test_withheld_aggregate_names_the_connected_row_that_billed_nothing(
+        self, analytics_tool
+    ):
+        """FRONT-3514: VALID, HIGH, thousands billed and metered, yet n/a; the
+        platform withholds the aggregate while any compared row billed 0."""
+        text = await self._render(
+            analytics_tool,
+            self._withheld_report([self._ENTERPRISE_ROW, self._UNBILLED_ROW]),
+        )
+        assert "- Coverage ratio: n/a\n" in text
+        assert (
+            "This n/a is NOT zero coverage — no ratio could be computed at all. "
+            "The aggregate ratio was not published." in text
+        )
+        assert (
+            "only when every compared provider (billing credential connected and "
+            "overlapping the window) billed something in it" in text
+        )
+        assert "billed nothing in it: OpenAI Platform. Those rows withhold" in text
+        assert "Claude Enterprise. Those rows" not in text
+        assert "for example, no provider billing" not in text
+        assert (
+            "- Diagnostic only, not the coverage ratio: metered 7312 divided by billed "
+            "9492 across the compared rows is 77.0%." in text
+        )
+
+    @pytest.mark.asyncio
+    async def test_published_aggregate_renders_neither_reason_nor_quotient(
+        self, analytics_tool
+    ):
+        payload = self._withheld_report([self._ENTERPRISE_ROW])
+        payload.update(aggregateRatio=0.769, aggregateRatioAvailable=True)
+        text = await self._render(analytics_tool, payload)
+        assert "Coverage ratio: 76.9%" in text
+        assert "withhold" not in text
+        assert "Diagnostic only" not in text
+        assert "NOT zero coverage" not in text
+
+    @pytest.mark.asyncio
+    async def test_no_overlap_or_unconnected_zero_rows_are_not_named_as_the_cause(
+        self, analytics_tool
+    ):
+        no_overlap = {**self._UNBILLED_ROW, "comparisonState": "no-overlap"}
+        unconnected = {
+            **self._UNBILLED_ROW, "label": "Gemini", "billingCredentialConnected": False,
+        }
+        text = await self._render(
+            analytics_tool,
+            self._withheld_report([self._ENTERPRISE_ROW, no_overlap, unconnected]),
+        )
+        assert "OpenAI Platform. Those rows" not in text
+        assert "Gemini. Those rows" not in text
+        assert (
+            "The platform withheld the aggregate ratio for this window without saying why."
+            in text
+        )
+        assert "metered 7300 divided by billed 9492" in text
+
+    @pytest.mark.asyncio
+    async def test_quotient_prefers_row_sums_and_flags_disagreeing_report_totals(
+        self, analytics_tool
+    ):
+        rows = [self._ENTERPRISE_ROW, self._UNBILLED_ROW]
+        agreeing = await self._render(
+            analytics_tool,
+            self._withheld_report(rows, hiddenSpend=2180.0, meteredTotalInComparison=7312.0),
+        )
+        assert "across the compared rows is 77.0%" in agreeing
+        assert "The report totals" not in agreeing
+
+        disagreeing = await self._render(
+            analytics_tool,
+            self._withheld_report(rows, hiddenSpend=2192.0, meteredTotalInComparison=7300.0),
+        )
+        assert "across the compared rows is 77.0%" in disagreeing
+        assert (
+            "The report totals (hidden spend plus metered spend inside the comparison) "
+            "give metered 7300 over billed 9492 = 76.9%; the row sums above were used."
+            in disagreeing
+        )
+
+    @pytest.mark.asyncio
+    async def test_quotient_falls_back_to_report_totals_without_comparable_rows(
+        self, analytics_tool
+    ):
+        text = await self._render(
+            analytics_tool,
+            self._withheld_report([], hiddenSpend=2192.0, meteredTotalInComparison=7300.0),
+        )
+        assert "without saying why" in text
+        assert (
+            "metered 7300 divided by billed 9492 across hidden spend plus metered spend "
+            "is 76.9%" in text
+        )
+
+    @pytest.mark.asyncio
+    async def test_withheld_aggregate_without_totals_prints_no_quotient(
+        self, analytics_tool
+    ):
+        text = await self._render(analytics_tool, self._withheld_report([]))
+        assert "without saying why" in text
+        assert "Diagnostic only" not in text
+
+    _OVER_METERED_ROW = {
+        "provider": "ANTHROPIC", "label": "Claude Enterprise", "state": "active",
+        "ratio": 1.5, "metered": 150.0, "billing": 100.0,
+        "billingCredentialConnected": True, "comparisonState": "full-window",
+    }
+
+    @pytest.mark.asyncio
+    async def test_zero_hidden_spend_does_not_reconstruct_billed_from_metered(
+        self, analytics_tool
+    ):
+        """The platform clamps hiddenSpend at 0, so metered 150 over billed 100
+        reports hiddenSpend 0; reading billed as 0 + 150 would invent 100%."""
+        unbilled = {**self._UNBILLED_ROW, "metered": 0.0}
+        totals = {"hiddenSpend": 0.0, "meteredTotalInComparison": 150.0}
+        text = await self._render(
+            analytics_tool,
+            self._withheld_report([self._OVER_METERED_ROW, unbilled], **totals),
+        )
+        assert "metered 150 divided by billed 100 across the compared rows is 150.0%" in text
+        assert "The report totals" not in text
+        assert "100.0%" not in text
+
+        without_rows = await self._render(analytics_tool, self._withheld_report([], **totals))
+        assert "Diagnostic only" not in without_rows
+
+    @pytest.mark.asyncio
+    async def test_compared_row_without_metered_gives_no_row_based_quotient(
+        self, analytics_tool
+    ):
+        unmetered = {k: v for k, v in self._ENTERPRISE_ROW.items() if k != "metered"}
+        text = await self._render(
+            analytics_tool, self._withheld_report([unmetered, self._UNBILLED_ROW])
+        )
+        assert "billed nothing in it: OpenAI Platform" in text
+        assert "Diagnostic only" not in text
+
+        with_totals = await self._render(
+            analytics_tool,
+            self._withheld_report(
+                [unmetered, self._UNBILLED_ROW],
+                hiddenSpend=2192.0, meteredTotalInComparison=7300.0,
+            ),
+        )
+        assert "across the compared rows" not in with_totals
+        assert (
+            "metered 7300 divided by billed 9492 across hidden spend plus metered spend "
+            "is 76.9%" in with_totals
+        )
+
+    @pytest.mark.asyncio
+    async def test_report_totals_four_cents_apart_disagree_at_any_magnitude(
+        self, analytics_tool
+    ):
+        big_row = {**self._ENTERPRISE_ROW, "metered": 40_000_000.0, "billing": 50_000_000.0}
+        unbilled = {**self._UNBILLED_ROW, "metered": 0.0}
+        text = await self._render(
+            analytics_tool,
+            self._withheld_report(
+                [big_row, unbilled],
+                hiddenSpend=10_000_000.04, meteredTotalInComparison=40_000_000.0,
+            ),
+        )
+        assert "across the compared rows is 80.0%" in text
+        assert "The report totals" in text
 
     @pytest.mark.asyncio
     async def test_zero_spend_and_data_unavailable_each_get_their_own_note(
@@ -1455,8 +1955,9 @@ class TestCoverageRatio:
             side_effect=ReveniumAPIError("Bad request", status_code=400)
         )
         with patch.object(analytics_tool, "get_client", AsyncMock(return_value=client)):
-            result = await analytics_tool.handle_action("get_coverage_ratio", {})
-        text = result[0].text
+            with pytest.raises(ToolError) as exc:
+                await analytics_tool.handle_action("get_coverage_ratio", {})
+        text = exc.value.message
         assert "Failed" in text
         assert "period" in text
         assert "coding-assistant-separation-active" in text
@@ -1710,6 +2211,168 @@ class TestCoverageRatio:
         assert '"provider": provider' in source
 
 
+class TestCoverageCustomDates:
+    """FRONT-3513: the platform parses each custom bound with Instant.parse, so
+    a calendar day must reach it as an instant covering that whole UTC day."""
+
+    @staticmethod
+    async def _forwarded_dates(tool, start_date, end_date):
+        client = _coverage_client()
+        with patch.object(tool, "get_client", AsyncMock(return_value=client)):
+            await tool.handle_action(
+                "get_coverage_ratio",
+                {"period": "custom", "start_date": start_date, "end_date": end_date},
+            )
+        kwargs = client.get_provider_coverage.await_args[1]
+        return kwargs["start_date"], kwargs["end_date"]
+
+    @staticmethod
+    async def _refusal(tool, start_date, end_date):
+        client = _coverage_client()
+        with patch.object(tool, "get_client", AsyncMock(return_value=client)):
+            with pytest.raises(ToolError) as exc:
+                await tool.handle_action(
+                    "get_coverage_ratio",
+                    {"period": "custom", "start_date": start_date, "end_date": end_date},
+                )
+        client.get_provider_coverage.assert_not_awaited()
+        return exc.value
+
+    @pytest.mark.asyncio
+    async def test_calendar_dates_cover_both_whole_utc_days(self, analytics_tool):
+        assert await self._forwarded_dates(analytics_tool, "2026-09-01", "2026-09-30") == (
+            "2026-09-01T00:00:00.000Z",
+            "2026-09-30T23:59:59.999Z",
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_instant_with_an_offset_is_sent_in_utc(self, analytics_tool):
+        assert await self._forwarded_dates(
+            analytics_tool, "2026-09-01T02:00:00+02:00", "2026-09-30T18:30:00.25-05:00"
+        ) == ("2026-09-01T00:00:00.000Z", "2026-09-30T23:30:00.250Z")
+
+    @pytest.mark.asyncio
+    async def test_an_instant_with_z_passes(self, analytics_tool):
+        assert await self._forwarded_dates(
+            analytics_tool, "2026-09-01T00:00:00Z", "2026-09-30T12:00:00.123Z"
+        ) == ("2026-09-01T00:00:00.000Z", "2026-09-30T12:00:00.123Z")
+
+    @pytest.mark.asyncio
+    async def test_a_date_and_an_instant_can_be_mixed(self, analytics_tool):
+        assert await self._forwarded_dates(
+            analytics_tool, "2026-09-01", "2026-09-15T10:00:00Z"
+        ) == ("2026-09-01T00:00:00.000Z", "2026-09-15T10:00:00.000Z")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_end", ["30/09/2026", "2026-09-30T12:00:00", "", "September", "2026-02-30"]
+    )
+    async def test_a_value_in_neither_form_is_refused_naming_both(
+        self, analytics_tool, bad_end
+    ):
+        error = await self._refusal(analytics_tool, "2026-09-01", bad_end)
+        assert error.field == "end_date"
+        assert "yyyy-MM-dd" in str(error)
+        assert "ISO-8601 instant" in str(error)
+
+    @pytest.mark.asyncio
+    async def test_a_start_after_the_end_is_refused(self, analytics_tool):
+        error = await self._refusal(analytics_tool, "2026-09-30", "2026-09-01")
+        assert error.field == "start_date"
+        assert "after end_date" in str(error)
+
+    @pytest.mark.asyncio
+    async def test_the_same_day_at_both_ends_is_one_whole_day(self, analytics_tool):
+        assert await self._forwarded_dates(analytics_tool, "2026-09-01", "2026-09-01") == (
+            "2026-09-01T00:00:00.000Z",
+            "2026-09-01T23:59:59.999Z",
+        )
+
+    @pytest.mark.asyncio
+    async def test_dates_without_a_period_read_that_range(self, analytics_tool):
+        client = _coverage_client()
+        with patch.object(analytics_tool, "get_client", AsyncMock(return_value=client)):
+            result = await analytics_tool.handle_action(
+                "get_coverage_ratio",
+                {"start_date": "2026-09-01", "end_date": "2026-09-30"},
+            )
+        client.get_provider_coverage.assert_awaited_once_with(
+            period="custom",
+            provider=None,
+            start_date="2026-09-01T00:00:00.000Z",
+            end_date="2026-09-30T23:59:59.999Z",
+        )
+        text = result[0].text
+        assert (
+            "Comparison window: 2026-09-01 to 2026-09-30 (whole UTC days, both included)."
+            in text
+        )
+        assert "Comparison window: 30d" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("period", ["24h", "7d", "30d", "90d"])
+    async def test_dates_with_a_named_period_are_refused(self, analytics_tool, period):
+        client = _coverage_client()
+        with patch.object(analytics_tool, "get_client", AsyncMock(return_value=client)):
+            with pytest.raises(ToolError) as exc:
+                await analytics_tool.handle_action(
+                    "get_coverage_ratio",
+                    {"period": period, "start_date": "2026-09-01", "end_date": "2026-09-30"},
+                )
+        assert exc.value.message == "Pass either period or start_date/end_date, not both"
+        assert exc.value.field == "period"
+        client.get_provider_coverage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_one_date_without_a_period_is_refused_naming_the_other(
+        self, analytics_tool
+    ):
+        client = _coverage_client()
+        with patch.object(analytics_tool, "get_client", AsyncMock(return_value=client)):
+            with pytest.raises(ToolError) as exc:
+                await analytics_tool.handle_action(
+                    "get_coverage_ratio", {"start_date": "2026-09-01"}
+                )
+        assert exc.value.field == "end_date"
+        assert "pass both or neither" in exc.value.message
+        assert "period='custom'" not in exc.value.message
+        client.get_provider_coverage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_custom_period_header_names_the_dates(self, analytics_tool):
+        client = _coverage_client()
+        with patch.object(analytics_tool, "get_client", AsyncMock(return_value=client)):
+            result = await analytics_tool.handle_action(
+                "get_coverage_ratio",
+                {"period": "custom", "start_date": "2026-09-01", "end_date": "2026-09-30"},
+            )
+        text = result[0].text
+        assert (
+            "Comparison window: 2026-09-01 to 2026-09-30 (whole UTC days, both included)."
+            in text
+        )
+        assert "Comparison window: custom." not in text
+
+    @pytest.mark.asyncio
+    async def test_offset_dates_without_a_period_name_the_utc_days(self, analytics_tool):
+        client = _coverage_client()
+        with patch.object(analytics_tool, "get_client", AsyncMock(return_value=client)):
+            result = await analytics_tool.handle_action(
+                "get_coverage_ratio",
+                {"start_date": "2026-09-01T01:00:00+02:00", "end_date": "2026-09-15T10:00:00Z"},
+            )
+        client.get_provider_coverage.assert_awaited_once_with(
+            period="custom",
+            provider=None,
+            start_date="2026-08-31T23:00:00.000Z",
+            end_date="2026-09-15T10:00:00.000Z",
+        )
+        assert (
+            "Comparison window: 2026-08-31 to 2026-09-15 (whole UTC days, both included)."
+            in result[0].text
+        )
+
+
 class TestFormatApiErrorDetails:
     """Test _format_api_error_details with different error types."""
 
@@ -1728,16 +2391,22 @@ class TestFormatApiErrorDetails:
         assert "auth failed" in result
 
     def test_revenium_api_error_with_response_data(self, analytics_tool):
-        """ReveniumAPIError with response_data dict includes error_data."""
+        """The status and cleaned-up message stay; the platform's raw body does not."""
         from src.revenium_mcp_server.client import ReveniumAPIError
 
         err = ReveniumAPIError(
             "server error",
             status_code=500,
-            response_data={"error_data": "rate limit exceeded"},
+            response_data={
+                "error_data": {"timestamp": "2026-10-16T03:15:54Z", "path": "/profitstream/v2/api/x"}
+            },
         )
         result = analytics_tool._format_api_error_details(err)
-        assert "rate limit exceeded" in result
+        assert "**API Error**: server error" in result
+        assert "**HTTP Status**: 500" in result
+        assert "API Response" not in result
+        assert "'timestamp'" not in result
+        assert "'path'" not in result
 
 
 class TestChartGeneration:
@@ -2088,6 +2757,14 @@ async def _call(tool, action, args, client):
         return (await tool.handle_action(action, args))[0].text
 
 
+async def _refusal(tool, action, args, client):
+    """The text of the error a failed read raises."""
+    with patch.object(tool, "get_client", AsyncMock(return_value=client)):
+        with pytest.raises(ToolError) as exc:
+            await tool.handle_action(action, args)
+    return exc.value.message
+
+
 class TestPrHealthOldestRowFields:
     @pytest.mark.asyncio
     async def test_bucket_draft_and_ai_assisted_are_rendered(self, analytics_tool):
@@ -2169,6 +2846,27 @@ class TestPrHealthEngineers:
         assert exc.value.field == "sort_by"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "given,sent",
+        [("MERGEDPRS", "mergedPrs"), ("aishare", "aiShare"), ("rotRate", "rotRate"), ("departmentlabel", "departmentLabel")],
+    )
+    async def test_every_platform_sort_order_is_sent_in_its_exact_spelling(self, analytics_tool, given, sent):
+        client = _vcs_client(get_vcs_pr_health_engineers=ENGINEERS_PAGE)
+        await _call(analytics_tool, "get_pr_health_engineers", {**WINDOW, "sort_by": given}, client)
+        assert client.get_vcs_pr_health_engineers.await_args.kwargs["sort_by"] == sent
+
+    @pytest.mark.asyncio
+    async def test_unknown_sort_by_names_every_supported_value(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("get_pr_health_engineers", {**WINDOW, "sort_by": "zzBogus"})
+        assert exc.value.field == "sort_by"
+        assert str(exc.value) == (
+            "Unsupported sort_by for get_pr_health_engineers: 'zzBogus'. Use one of: authorLogin, "
+            "openPrs, agingPrs, rottingPrs, closedUnmerged, mergedPrs, aiShare, rotRate, "
+            "departmentLabel, oldestInactiveDays"
+        )
+
+    @pytest.mark.asyncio
     async def test_reuses_the_pr_health_window_rule(self, analytics_tool):
         with pytest.raises(ToolError) as exc:
             await analytics_tool.handle_action(
@@ -2237,13 +2935,106 @@ class TestPrHealthPullRequests:
         assert exc.value.field == "bucket"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("given,sent", [("REPO", "repo"), ("author", "author"), ("Review", "review")])
+    async def test_every_platform_sort_order_is_sent_in_its_exact_spelling(self, analytics_tool, given, sent):
+        client = _vcs_client(get_vcs_pr_health_pull_requests=PULL_REQUESTS_PAGE)
+        await _call(analytics_tool, "get_pr_health_pull_requests", {**WINDOW, "sort_by": given}, client)
+        assert client.get_vcs_pr_health_pull_requests.await_args.kwargs["sort_by"] == sent
+
+    @pytest.mark.asyncio
+    async def test_unknown_sort_by_names_every_supported_value(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("get_pr_health_pull_requests", {**WINDOW, "sort_by": "zzBogus"})
+        assert exc.value.field == "sort_by"
+        assert str(exc.value) == (
+            "Unsupported sort_by for get_pr_health_pull_requests: 'zzBogus'. "
+            "Use one of: inactivity, age, repo, author, review"
+        )
+
+    @pytest.mark.asyncio
     async def test_api_failure_renders_guidance_not_a_crash(self, analytics_tool):
         client = MagicMock()
         client.get_vcs_pr_health_pull_requests = AsyncMock(
             side_effect=ReveniumAPIError("Bad request", status_code=400)
         )
-        text = await _call(analytics_tool, "get_pr_health_pull_requests", WINDOW, client)
+        text = await _refusal(analytics_tool, "get_pr_health_pull_requests", WINDOW, client)
         assert "Failed" in text and "366" in text
+
+
+# ── BACK-4698: the sort orders the platform documents, written out here so
+# a change to the server's lists cannot also rewrite what is expected ──────
+
+PLATFORM_ENGINEER_SORTS = [
+    "authorLogin",
+    "openPrs",
+    "agingPrs",
+    "rottingPrs",
+    "closedUnmerged",
+    "mergedPrs",
+    "aiShare",
+    "rotRate",
+    "departmentLabel",
+    "oldestInactiveDays",
+]
+PLATFORM_PULL_REQUEST_SORTS = ["inactivity", "age", "repo", "author", "review"]
+COUNTS_SINCE_SENTENCE = (
+    "Every count starts at the report's countsSince (get_pr_health shows it): the team's "
+    "cutoff date, else six months before today (UTC)."
+)
+
+
+class TestPrHealthSortOrdersAreDocumented:
+    @pytest.mark.asyncio
+    async def test_help_text_lists_exactly_the_accepted_orders(self, analytics_tool):
+        assert analytics_tool._PR_HEALTH_ENGINEER_SORT_FIELDS == PLATFORM_ENGINEER_SORTS
+        assert analytics_tool._PR_HEALTH_PULL_REQUEST_SORT_FIELDS == PLATFORM_PULL_REQUEST_SORTS
+
+        capabilities = (await analytics_tool.handle_action("get_capabilities", {}))[0].text
+        examples = (await analytics_tool.handle_action("get_examples", {}))[0].text
+        # Anchored to each action's own line: the queue already lists the same
+        # pull-request orders, so a bare match would pass on the queue's text.
+        assert f"sort_by {'|'.join(PLATFORM_ENGINEER_SORTS)}, sort_dir" in capabilities
+        assert f"triaged (EXCLUDE|ONLY), sort_by {'|'.join(PLATFORM_PULL_REQUEST_SORTS)}\n" in capabilities
+        assert f"`size`, `sort_by` ({', '.join(PLATFORM_ENGINEER_SORTS)}), `sort_dir`" in examples
+        assert f"`size`, `sort_by` ({', '.join(PLATFORM_PULL_REQUEST_SORTS)}) and `sort_dir`" in examples
+        assert COUNTS_SINCE_SENTENCE in capabilities
+        assert COUNTS_SINCE_SENTENCE in examples
+
+        schema = await analytics_tool._get_input_schema()
+        description = schema["properties"]["sort_by"]["description"]
+        for value in PLATFORM_ENGINEER_SORTS + PLATFORM_PULL_REQUEST_SORTS:
+            assert value in description
+
+        drill_down = next(
+            capability for capability in await analytics_tool._get_tool_capabilities()
+            if capability.name == "Developer PR Health Drill-down"
+        )
+        assert "|".join(PLATFORM_ENGINEER_SORTS) in drill_down.parameters["get_pr_health_engineers"]["sort_by"]
+        assert "|".join(PLATFORM_PULL_REQUEST_SORTS) in drill_down.parameters["get_pr_health_pull_requests"]["sort_by"]
+
+
+    @pytest.mark.asyncio
+    async def test_every_drill_down_says_where_its_counts_start(self, analytics_tool):
+        capabilities = (await analytics_tool.handle_action("get_capabilities", {}))[0].text
+        examples = (await analytics_tool.handle_action("get_examples", {}))[0].text
+
+        drill_downs = capabilities.split("6e1b. ", 1)[1].split("\n6e2. ", 1)[0]
+        assert (
+            "The breakdown, the queue and the trend count from the report's countsSince"
+        ) in drill_downs
+        assert (
+            "The follow-through counts only pull requests opened on or after the "
+            "report's pricedSince"
+        ) in drill_downs
+
+        def example(action):
+            return examples.split(f"### {action}\n", 1)[1].split("\n### ", 1)[0]
+
+        for action in ("get_pr_health_breakdown", "get_pr_health_queue", "get_pr_health_trend"):
+            assert "countsSince" in example(action), action
+        follow_through = example("get_pr_health_follow_through")
+        assert "pricedSince" in follow_through
+        assert "countsSince" not in follow_through
 
 
 # ── BACK-3952: pull-request list filters, engineer search, causes ───────────
@@ -2741,7 +3532,165 @@ class TestMergedPrsRendering:
             {**MERGED_WINDOW, "end_date": "2026-08-20", "granularity": "day"},
             _vcs_client(get_vcs_prs=report),
         )
-        assert "2026-08-02 | bob | merged=1" in text
+        assert "bob | merged=1" in text
+        assert "2026-08-02 merged=1" in text
+
+    @staticmethod
+    def _day_row(date, login, merged, coding=0):
+        return {"date": date, "platformLogin": login, "prsMerged": merged, "prsMergedWithCodingTool": coding}
+
+    @staticmethod
+    def _daily_report(rows):
+        return {**PER_PERSON_REPORT, "granularity": "day", "members": None, "dailyRows": rows}
+
+    @staticmethod
+    def _person_lines(text):
+        return [line for line in text.split("\n") if re.match(r"- \S+ \| merged=", line)]
+
+    @pytest.mark.asyncio
+    async def test_every_person_of_a_daily_month_is_listed_busiest_first(self, analytics_tool):
+        rows = []
+        for person in [f"dev{i:02d}" for i in range(20)] + ["myrison"]:
+            for day in range(1, 21):
+                merged = 0 if day % 2 else (5 if person == "myrison" else 1)
+                rows.append(self._day_row(f"2026-08-{day:02d}", person, merged))
+        text = await _call(
+            analytics_tool,
+            "get_merged_prs",
+            {**MERGED_WINDOW, "end_date": "2026-08-20", "granularity": "day"},
+            _vcs_client(get_vcs_prs=self._daily_report(rows)),
+        )
+        person_lines = self._person_lines(text)
+        assert len(person_lines) == 21
+        assert person_lines[0].startswith("- myrison | merged=")
+        assert "more people not shown" not in text
+
+    @pytest.mark.asyncio
+    async def test_daily_rows_leave_out_empty_days(self, analytics_tool):
+        rows = [
+            self._day_row("2026-08-02", "alice", 3),
+            self._day_row("2026-08-03", "alice", 0),
+            self._day_row("2026-08-02", "bob", 0),
+            self._day_row("2026-08-03", "bob", 0),
+        ]
+        text = await _call(
+            analytics_tool,
+            "get_merged_prs",
+            {**MERGED_WINDOW, "end_date": "2026-08-20", "granularity": "day"},
+            _vcs_client(get_vcs_prs=self._daily_report(rows)),
+        )
+        person_lines = self._person_lines(text)
+        assert "2026-08-03" not in text
+        assert "2026-08-02 merged=3" in person_lines[0]
+        assert person_lines[0].startswith("- alice | merged=3")
+        assert person_lines[1].startswith("- bob | merged=0")
+        assert person_lines[1].endswith("no merges in this window")
+
+    @staticmethod
+    def _many_people_report():
+        rows = [
+            {"date": "2026-08-02", "platformLogin": f"u{i:03d}", "prsMerged": 1000 - i, "prsMergedWithCodingTool": 0}
+            for i in range(205)
+        ]
+        return {**PER_PERSON_REPORT, "granularity": "day", "members": None, "dailyRows": rows}
+
+    @pytest.mark.asyncio
+    async def test_people_past_the_cap_are_counted_with_a_page_that_reaches_them(self, analytics_tool):
+        text = await _call(
+            analytics_tool,
+            "get_merged_prs",
+            {**MERGED_WINDOW, "end_date": "2026-08-20", "granularity": "day"},
+            _vcs_client(get_vcs_prs=self._many_people_report()),
+        )
+        assert len(self._person_lines(text)) == 200
+        assert "5 more people not shown" in text
+        assert "people_offset=200" in text
+        assert "narrow the window or the grouping" not in text
+
+    @pytest.mark.asyncio
+    async def test_people_offset_returns_the_next_ranked_people(self, analytics_tool):
+        text = await _call(
+            analytics_tool,
+            "get_merged_prs",
+            {**MERGED_WINDOW, "end_date": "2026-08-20", "granularity": "day", "people_offset": 200},
+            _vcs_client(get_vcs_prs=self._many_people_report()),
+        )
+        person_lines = self._person_lines(text)
+        assert [line.split(" ")[1] for line in person_lines] == [f"u{i:03d}" for i in range(200, 205)]
+        assert "more people not shown" not in text
+
+    @pytest.mark.asyncio
+    async def test_people_offset_is_refused_with_repository_grouping(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await _call(
+                analytics_tool,
+                "get_merged_prs",
+                {**MERGED_WINDOW, "group_by": "repository", "people_offset": 5},
+                _vcs_client(get_vcs_prs=CONNECTED_REPOSITORY_REPORT),
+            )
+        assert exc.value.field == "people_offset"
+
+    @pytest.mark.asyncio
+    async def test_day_entries_are_budgeted_and_the_rest_show_totals(self, analytics_tool):
+        rows = [
+            self._day_row(f"2026-08-{day:02d}", f"p{i:03d}", 1 + i % 3)
+            for i in range(200)
+            for day in range(1, 31)
+        ]
+        text = await _call(
+            analytics_tool,
+            "get_merged_prs",
+            {**MERGED_WINDOW, "end_date": "2026-08-30", "granularity": "day"},
+            _vcs_client(get_vcs_prs=self._daily_report(rows)),
+        )
+        dated = re.findall(r"\d{4}-\d{2}-\d{2} merged=", text)
+        assert 0 < len(dated) <= 400
+        person_lines = self._person_lines(text)
+        assert len(person_lines) == 200
+        assert "people shown with totals only" in text
+        # The notice names the offset of the first person who lost their days, and it reaches them.
+        first_cut = next(i for i, line in enumerate(person_lines) if "2026-08-" not in line)
+        login = person_lines[first_cut].split(" | ")[0]
+        assert f"pass people_offset={first_cut} or a shorter window" in text
+        next_text = await _call(
+            analytics_tool,
+            "get_merged_prs",
+            {**MERGED_WINDOW, "end_date": "2026-08-30", "granularity": "day", "people_offset": first_cut},
+            _vcs_client(get_vcs_prs=self._daily_report(rows)),
+        )
+        next_first = self._person_lines(next_text)[0]
+        assert next_first.startswith(f"{login} |")
+        assert "2026-08-01 merged=" in next_first
+
+    @pytest.mark.asyncio
+    async def test_window_members_are_ranked_by_merges(self, analytics_tool):
+        report = {
+            **PER_PERSON_REPORT,
+            "members": [
+                {"platformLogin": "bob", "prsMerged": 5, "prsMergedWithCodingTool": 2},
+                {"platformLogin": "amy", "prsMerged": 50, "prsMergedWithCodingTool": 9},
+            ],
+        }
+        text = await _call(analytics_tool, "get_merged_prs", MERGED_WINDOW, _vcs_client(get_vcs_prs=report))
+        person_lines = self._person_lines(text)
+        assert person_lines[0].startswith("- amy | merged=50")
+        assert person_lines[1].startswith("- bob | merged=5")
+
+    @pytest.mark.asyncio
+    async def test_repository_overflow_states_count_only(self, analytics_tool):
+        repositories = [
+            {"repository": f"acme/r{i:03d}", "repositoryDisplay": f"acme/r{i:03d}", "prsMerged": 1, "prsMergedWithCodingTool": 0}
+            for i in range(205)
+        ]
+        report = {**CONNECTED_REPOSITORY_REPORT, "repositories": repositories}
+        text = await _call(
+            analytics_tool,
+            "get_merged_prs",
+            {**MERGED_WINDOW, "group_by": "repository"},
+            _vcs_client(get_vcs_prs=report),
+        )
+        assert "5 more repositories not shown, in the platform's order" in text
+        assert "narrow" not in text.lower()
 
 
 class TestVcsActionsAreDiscoverable:
@@ -2774,7 +3723,7 @@ class TestVcsActionsAreDiscoverable:
         )
         for name in [
             "author", "bucket", "sort_by", "sort_dir", "granularity", "email",
-            "include_members", "include_pull_requests", "pr_limit", "pr_offset",
+            "include_members", "include_pull_requests", "pr_limit", "pr_offset", "people_offset",
             "department_id", "include_descendants", "assisted_only",
         ]:
             assert f'"{name}": {name}' in source
@@ -2855,7 +3804,7 @@ class TestMergedPrsFullPage:
         for i in range(200):
             assert f"acme/api#{1000 + i} by alice" in text
             assert f"Change {i} " in text
-        assert "more rows not shown" not in text
+        assert "not shown" not in text
         assert "showing 201-400 of 450" in text
         assert "pr_offset=400" in text
 
@@ -3000,7 +3949,7 @@ class TestPrHealthDepartmentScope:
     async def test_api_failure_names_the_department_rule(self, analytics_tool):
         client = MagicMock()
         client.get_vcs_pr_health = AsyncMock(side_effect=ReveniumAPIError("Department 9 not found", status_code=404))
-        text = await _call(analytics_tool, "get_pr_health", {**WINDOW, "department_id": 9}, client)
+        text = await _refusal(analytics_tool, "get_pr_health", {**WINDOW, "department_id": 9}, client)
         assert "Failed" in text
         assert "department_id must be a department of your own organization" in text
 
@@ -3041,10 +3990,40 @@ class TestPrHealthAppliedSettingsRendering:
         assert "**Excluded repositories**: none" in text
 
     @pytest.mark.asyncio
-    async def test_header_is_unchanged_without_the_new_fields(self, analytics_tool):
-        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=PR_HEALTH_PAYLOAD))
-        for absent in ("**Department**", "**Cutoff**", "**Excluded repositories**", "**AI-assisted only**"):
+    @pytest.mark.parametrize("payload", [PR_HEALTH_PAYLOAD, {**PR_HEALTH_PAYLOAD, "countsSince": None}])
+    async def test_header_is_unchanged_without_the_new_fields(self, analytics_tool, payload):
+        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=payload))
+        for absent in (
+            "**Department**", "**Cutoff**", "**Excluded repositories**", "**AI-assisted only**", "**Counts since**",
+        ):
             assert absent not in text
+
+    @pytest.mark.asyncio
+    async def test_header_states_where_counts_start_without_a_team_cutoff(self, analytics_tool):
+        payload = {
+            **PR_HEALTH_PAYLOAD,
+            "cutoffDate": None,
+            "cutoffDateIsDefault": True,
+            "countsSince": "2026-04-16",
+            "pricedSince": "2025-01-20",
+            "excludedRepos": [],
+        }
+        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=payload))
+        assert "**Counts since**: 2026-04-16." in text
+        assert "the team has no cutoff date" in text
+        assert "**Cutoff**" not in text
+        header, estimates = text.split("**Cost estimates", 1)
+        assert "2025-01-20" not in header
+        assert "- Priced since: 2025-01-20" in estimates
+
+    @pytest.mark.asyncio
+    async def test_header_with_a_team_cutoff_names_it_as_the_counting_start(self, analytics_tool):
+        cutoff = SCOPED_REPORT["cutoffDate"]
+        payload = {**SCOPED_REPORT, "cutoffDateIsDefault": False, "countsSince": cutoff}
+        text = await _call(analytics_tool, "get_pr_health", WINDOW, _vcs_client(get_vcs_pr_health=payload))
+        assert f"**Counts since**: {cutoff}." in text
+        assert "(the team's cutoff date)" in text
+        assert "the team has no cutoff date" not in text
 
     @pytest.mark.asyncio
     async def test_unscoped_echo_renders_no_department_line(self, analytics_tool):
@@ -3139,7 +4118,7 @@ class TestPrHealthRepositories:
         client.get_vcs_pr_health_repositories = AsyncMock(
             side_effect=ReveniumAPIError("Bad request", status_code=400)
         )
-        text = await _call(analytics_tool, "get_pr_health_repositories", {"source": "github"}, client)
+        text = await _refusal(analytics_tool, "get_pr_health_repositories", {"source": "github"}, client)
         assert "PR Health Repositories Failed" in text
         assert "this read takes no window" in text
 
@@ -3231,7 +4210,7 @@ class TestAiAssistantTeamMedians:
                 },
             )
         )
-        text = await _call(analytics_tool, "get_ai_assistant_team_medians", {}, client)
+        text = await _refusal(analytics_tool, "get_ai_assistant_team_medians", {}, client)
         assert "- Invalid enum value. Expected 'claude-code'" in text
         assert "always sends assistants=claude-code" in text
         assert "a 400 naming assistants means the platform changed that list" in text
@@ -3243,7 +4222,7 @@ class TestAiAssistantTeamMedians:
         client.get_ai_assistant_team_medians = AsyncMock(
             side_effect=ReveniumAPIError("Too many requests", status_code=status)
         )
-        text = await _call(analytics_tool, "get_ai_assistant_team_medians", {}, client)
+        text = await _refusal(analytics_tool, "get_ai_assistant_team_medians", {}, client)
         assert "No figures right now" in text
         assert "not a zero and not a small team" in text
 
@@ -3567,7 +4546,7 @@ class TestPrHealthFollowThrough:
         assert "  - merged after the flag: 4" in text
         assert "  - closed without merging after the flag: 3" in text
         assert "  - still open, not dismissed or snoozed: 2" in text
-        assert "flagged in the first 7 days from the first flag): 6 pull requests, 120.5 estimated" in text
+        assert "flagged in the first 7 days from the first flag): 6 pull requests, 120.50 USD estimated" in text
         assert "- Now (today's rotting set): 2 pull requests, n/a estimated" in text
         assert "last 90 days: n/a; the 90 days ending on the first flag: 20.08" in text
 
@@ -3648,3 +4627,26 @@ class TestPrHealthTrendsAreDiscoverable:
             registry_module.ToolConfigurationRegistry._register_business_analytics_management
         )
         assert '"per_cause": per_cause' in source
+
+
+class TestFilterHelpNamesOnlyReportsThatApplyFilters:
+    """The help never invites a filter a report would drop (BACK-4694)."""
+
+    @pytest.mark.asyncio
+    async def test_filter_help_names_only_reports_that_apply_filters(self, analytics_tool):
+        examples = (await analytics_tool._handle_get_examples({}))[0].text
+        capabilities = (await analytics_tool._handle_get_capabilities())[0].text
+        schema = (await analytics_tool._get_input_schema())["properties"]["filters"]
+
+        for text in (examples, capabilities):
+            assert "cost endpoints' `filters`" not in text
+            assert "to any cost action" not in text
+        filter_options_example = examples.split("### get_filter_options", 1)[1].split("###", 1)[0]
+        assert "get_user_costs" in filter_options_example
+        capabilities_entry = capabilities.split("**get_filter_options**", 1)[1].split("\n\n", 1)[0]
+        assert "get_department_costs" in capabilities_entry
+        assert "refuse" in capabilities_entry
+        for entry in (filter_options_example, capabilities_entry):
+            assert "get_agent_costs filters only by costSources" in entry
+        assert "refuse" in schema["description"]
+        assert "get_provider_costs" in schema["description"]

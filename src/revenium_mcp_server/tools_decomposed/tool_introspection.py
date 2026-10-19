@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
-from ..common.error_handling import ErrorCodes, ToolError, format_structured_error
+from ..common.error_handling import ErrorCodes, ToolError, raise_structured_error
 from ..introspection.metadata import ToolCapability, ToolType
 from ..introspection.service import ToolIntrospectionService
 from .unified_tool_base import ToolBase
@@ -109,9 +109,7 @@ class ToolIntrospection(ToolBase):
 
         except ToolError as e:
             logger.error(f"Tool error in tool introspection: {e}")
-            # Format ToolError with detailed guidance for agents following architecture patterns
-            formatted_error_text = format_structured_error(e, include_debug_info=False)
-            return [TextContent(type="text", text=formatted_error_text)]
+            raise_structured_error(e)
         except Exception as e:
             logger.error(f"Error in tool introspection: {e}")
             # Re-raise Exception to be handled by standardized_tool_execution

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "revenium-mcp"
-version = "0.8.0"
+version = "0.8.1"
 description = "Model Context Protocol (MCP) server for Revenium API monitoring, analytics, and AI spending management"
 readme = "README.md"
 license = "MIT"
@@ -44,7 +44,15 @@ dependencies = [
     # pip recovery note in the CI workflow. 4.x depends on mcp 2.x, so the
     # server speaks the 2026-07-28 protocol revision; fastmcp negotiates the
     # best mutual era per connection, so legacy clients keep working.
-    "fastmcp==4.0.0",
+    # Pinned at 4.0.10 (BACK-4637): 4.0.4 stopped logging the rejected value of
+    # an argument that fails tool validation (before it, a misplaced
+    # credential secret reached the server log) and made OAuthProxy refuse an
+    # ID-JAG token when identity assertion is not configured; 4.0.8 revokes
+    # the upstream refresh token instead of sending the proxy's own upstream.
+    # 4.0.10 is the newest 4.x release at least two weeks old on 2026-10-16;
+    # its dependency set (pydantic, mcp 2.x, py-key-value-aio <0.5) matches
+    # 4.0.0's.
+    "fastmcp==4.0.10",
     "httpx>=0.25.0",
     # Floor tracks the pinned fastmcp: fastmcp-slim 4.x requires pydantic
     # >=2.12, and the MCP SDK v2 snake_case field bridge needs it.

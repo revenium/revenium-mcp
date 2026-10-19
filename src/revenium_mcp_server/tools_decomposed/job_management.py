@@ -170,6 +170,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    NamedTuple,
     Optional,
     Tuple,
     Union,
@@ -181,6 +182,7 @@ if TYPE_CHECKING:
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
+from ..analytics_window import CalendarRangeError, utc_instant_bounds
 from ..client import ReveniumAPIError, ReveniumClient
 from ..common.error_handling import ErrorCodes, ToolError, raise_unknown_action_error
 from ..common.validation import apply_filter_allowlist
@@ -205,11 +207,14 @@ from .unified_tool_base import ToolBase
 _MAX_JOBS_PAGE = 1_000_000
 
 # BACK-1140: upper bound on the size parameter. Matches
-# PaginationPerformanceManager.MAXIMUM_LIMIT (50), the Revenium API
-# absolute maximum. Without this, size=2147483647 (32-bit MAX_INT)
+# PaginationPerformanceManager.MAXIMUM_LIMIT, the platform's page
+# maximum. Without this, size=2147483647 (32-bit MAX_INT)
 # passed the `size <= 0` guard and was forwarded to the backend, which
 # returned the same generic HTTP 500 this PR closed for page.
-_MAX_JOBS_SIZE = 50
+_MAX_JOBS_SIZE = 100
+
+_DEFAULT_JOBS_PAGE = 0
+_DEFAULT_JOBS_SIZE = 20
 
 # snake_case filter name -> camelCase query parameter, bounded to what the
 # endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
@@ -249,6 +254,59 @@ _JOB_FILTER_VALUE_ENUMS: Dict[str, Tuple[str, ...]] = {
     "executionStatus": _JOB_EXECUTION_STATUSES,
     "outcomeType": _JOB_OUTCOME_TYPES,
 }
+
+# BACK-4716: the date filters list_jobs, get_conversion_funnel and
+# get_roi_summary take. The platform parses the list and funnel bounds as
+# instants, so a calendar day was refused there, and reads the ROI summary's
+# calendar end day as its midnight, so the last day was dropped. Every bound is
+# therefore converted to a UTC instant here, one rule for all three actions.
+_DATE_FILTER_FORMS = (
+    "startDate and endDate each take a yyyy-MM-dd day, which covers that whole "
+    "UTC day, or an ISO 8601 time with Z or an offset, such as 2026-10-14T18:00:00Z"
+)
+_DATE_FILTER_CAPABILITY = (
+    "startDate, endDate (yyyy-MM-dd for a whole UTC day, or ISO 8601 with Z or an offset)"
+)
+# utc_instant_bounds names the bounds in snake_case; these are the wire names
+# the filters are reported under.
+_WIRE_DATE_FIELDS: Dict[str, str] = {"start_date": "startDate", "end_date": "endDate"}
+
+
+def _whole_day_date_filters(filters: Dict[str, Any], action: str) -> Dict[str, Any]:
+    """The filters with startDate/endDate as the UTC instants the platform parses.
+
+    A blank bound counts as not given. An unreadable bound, a zone-less time or
+    a start after the end is refused before any request is sent.
+    """
+    bounds = []
+    for wire_name in ("startDate", "endDate"):
+        value = filters.get(wire_name)
+        bounds.append(None if isinstance(value, str) and not value.strip() else value)
+    try:
+        start, end = utc_instant_bounds(bounds[0], bounds[1])
+    except CalendarRangeError as error:
+        field = _WIRE_DATE_FIELDS[error.field]
+        message = str(error)
+        for snake_name, wire_name in _WIRE_DATE_FIELDS.items():
+            message = message.replace(snake_name, wire_name)
+        raise ToolError(
+            message=f"{message} ({action} action)",
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field=field,
+            value=filters.get(field),
+            suggestions=[
+                _DATE_FILTER_FORMS,
+                "startDate must not be after endDate",
+                "start_date and end_date are the same filters",
+            ],
+        ) from None
+    converted = {
+        name: value for name, value in filters.items() if name not in ("startDate", "endDate")
+    }
+    for wire_name, bound in (("startDate", start), ("endDate", end)):
+        if bound is not None:
+            converted[wire_name] = bound
+    return converted
 
 # BACK-3091: the outcome POST and the outcome PATCH both accept this array, and
 # neither this tool nor ReveniumClient filters it — it simply was not named
@@ -732,9 +790,9 @@ def _normalize_wire_keys(
     return normalized
 
 
-# The two path segments URL resolution removes rather than sends. A job type of
-# exactly one of these is refused; a dot INSIDE a longer name is not a
-# dot-segment and is left alone ('x..y' resolves to itself).
+# The two path segments URL resolution removes rather than sends. A job type or
+# a job id of exactly one of these is refused; a dot INSIDE a longer name is not
+# a dot-segment and is left alone ('x..y' resolves to itself).
 _PATH_DOT_SEGMENTS = frozenset({".", ".."})
 
 
@@ -784,6 +842,107 @@ def _require_job_type(job_type: Any, action: str) -> str:
             ],
         )
     return job_type
+
+
+# The two ids whose bare /v2/api/jobs/{agenticJobId} path is another endpoint:
+# GET .../jobs/types and GET .../jobs/conversion-funnel. Only a path that ends
+# at the id collides; .../jobs/types/outcome is still that job's outcome.
+_RESERVED_JOB_IDS = frozenset({"types", "conversion-funnel"})
+
+
+class _PathIdKind(NamedTuple):
+    """How one kind of caller-supplied id is named when it is refused."""
+
+    field: str
+    owner: str
+    slash_rule: str
+    suggestions: Tuple[str, ...]
+
+
+_JOB_ID = _PathIdKind(
+    field="job_id",
+    owner="job",
+    slash_rule=(
+        "job ids use only letters, digits, '.', '_' and '-', so no job has this id."
+    ),
+    suggestions=("Use list_jobs to find valid job IDs",),
+)
+
+_SESSION_ID = _PathIdKind(
+    field="session_id",
+    owner="session",
+    slash_rule=(
+        "the platform carries the session id as one path segment, so no session "
+        "can have this id."
+    ),
+    suggestions=(
+        "Pass the coding-assistant session identifier, for Claude Code the "
+        "session UUID",
+    ),
+)
+
+
+def _refuse_id_off_its_path(value: Any, action: str, kind: _PathIdKind) -> None:
+    """Refuse an id that cannot be the one path segment its endpoint expects.
+
+    The client percent-encodes the id into one path segment, but a dot-segment
+    is still resolved out of the URL, and the platform refuses an encoded slash
+    with a bare 400 that names no reason. The dot-segment rule is exact, as in
+    ``ReveniumClient._quote_path_segment``: ``' .. '`` is sent as one ordinary
+    segment.
+    """
+    if not isinstance(value, str):
+        return
+    if value in _PATH_DOT_SEGMENTS:
+        raise ToolError(
+            message=(
+                f"{kind.field} must not be '{value}' for {action} action: a "
+                "dot-segment is normalised out of the URL path, so the request "
+                f"would be sent to a different endpoint than this {kind.owner}'s."
+            ),
+            error_code=ErrorCodes.INVALID_PARAMETER,
+            field=kind.field,
+            value=value,
+            suggestions=list(kind.suggestions),
+        )
+    if "/" in value:
+        raise ToolError(
+            message=(
+                f"{kind.field} must not contain '/' for {action} action: "
+                f"{kind.slash_rule}"
+            ),
+            error_code=ErrorCodes.INVALID_PARAMETER,
+            field=kind.field,
+            value=value,
+            suggestions=list(kind.suggestions),
+        )
+
+
+def _refuse_job_id_off_its_path(
+    job_id: Any, action: str, *, path_ends_at_id: bool = False
+) -> None:
+    """Refuse a job id that would send the request to another endpoint (BACK-4716).
+
+    Beyond the checks every path id gets, where the action's path ends at the
+    id the platform answers ``types`` and ``conversion-funnel`` from endpoints
+    of their own, so the request would not reach that job. The caller is told
+    instead.
+    """
+    if not isinstance(job_id, str):
+        return
+    _refuse_id_off_its_path(job_id, action, _JOB_ID)
+    if path_ends_at_id and job_id in _RESERVED_JOB_IDS:
+        raise ToolError(
+            message=(
+                f"job_id must not be '{job_id}' for {action} action: the platform "
+                "reserves that path for another endpoint, so the request would not "
+                "reach a job."
+            ),
+            error_code=ErrorCodes.INVALID_PARAMETER,
+            field="job_id",
+            value=job_id,
+            suggestions=list(_JOB_ID.suggestions),
+        )
 
 
 def _require_entry_list(
@@ -1665,6 +1824,74 @@ def _tool_cost_attribution_notes(rows: List[Dict[str, Any]]) -> List[str]:
     ]
 
 
+def _roi_summary_heading(result: Dict[str, Any]) -> List[str]:
+    """The ROI summary's heading: the window the platform answered for.
+
+    BACK-4716: with no dates the platform answers its own default window, and
+    the window it used was shown only in the ``period`` block below the JSON,
+    so a heading that said only "across all job types" read as the whole
+    history. The window is named from the response rather than assumed.
+    """
+    period = result.get("period")
+    if (
+        isinstance(period, dict)
+        and isinstance(period.get("start"), str)
+        and isinstance(period.get("end"), str)
+    ):
+        lines = [f"ROI summary across all job types from {period['start']} to {period['end']}:"]
+    else:
+        lines = ["ROI summary across all job types (the response did not say which window it covers):"]
+
+    applied = result.get("filters_applied") or {}
+    if not applied:
+        lines.append(
+            "No startDate or endDate was given, so this is the platform's default "
+            "window; pass startDate and endDate for another one."
+        )
+    elif "startDate" not in applied:
+        lines.append("No startDate was given, so the platform chose the start.")
+    elif "endDate" not in applied:
+        lines.append("No endDate was given, so the platform chose the end.")
+    return lines
+
+
+def _date_window_phrase(filters_applied: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The window the dates sent cover, or None when no date was sent."""
+    applied = filters_applied or {}
+    start, end = applied.get("startDate"), applied.get("endDate")
+    if start and end:
+        return f"from {start} to {end}"
+    if start:
+        return f"from {start} onward"
+    if end:
+        return f"up to {end}"
+    return None
+
+
+def _conversion_funnel_heading(filters_applied: Optional[Dict[str, Any]]) -> str:
+    """The funnel's heading: the dates sent, or that none were.
+
+    BACK-4716: the funnel sends no window unless one is given, and the platform
+    then answers without one, so the heading says which case this is.
+    """
+    window = _date_window_phrase(filters_applied)
+    if window:
+        return f"Conversion funnel analytics {window}:"
+    return "Conversion funnel analytics with no date window (no startDate or endDate was given):"
+
+
+def _jobs_list_heading(page: int, filters_applied: Optional[Dict[str, Any]]) -> str:
+    """The jobs list heading: the creation dates sent, or that none were.
+
+    The platform applies no default window to this list, so with no dates it
+    is every job, and the heading says so.
+    """
+    window = _date_window_phrase(filters_applied)
+    if window:
+        return f"Jobs created {window} (page {page + 1}):"
+    return f"Jobs (page {page + 1}), all creation dates (no startDate or endDate was given):"
+
+
 def _render_roi_summary(result: Dict[str, Any]) -> str:
     """Render the ROI summary with its qualifiers next to the numbers.
 
@@ -1674,7 +1901,7 @@ def _render_roi_summary(result: Dict[str, Any]) -> str:
     missing rather than zero. Putting them above the payload keeps them in
     front of a reader who never expands the JSON.
     """
-    lines = ["ROI summary across all job types:"]
+    lines = _roi_summary_heading(result)
 
     notes = result.get("cost_attribution", {}).get("notes") or []
     if notes:
@@ -1701,6 +1928,69 @@ def _render_roi_summary(result: Dict[str, Any]) -> str:
 
     lines.extend(["", json.dumps(result, indent=2)])
     return "\n".join(lines)
+
+
+def _parse_job_transactions(job_id: str, response: Any) -> Tuple[List[Any], int]:
+    """Read the platform's ``{"transactions": [...], "totalCount": N}`` body.
+
+    Anything else raises, for the reason ``_require_roi_summary_envelope``
+    raises: coercing an unexpected body to ``[]`` would report a contract
+    failure as "this job made no calls". Only a genuine ``transactions: []``
+    is an empty result.
+
+    Raises:
+        ToolError: when the body is not an object or carries no
+            ``transactions`` array; the message names what arrived.
+    """
+    transactions = response.get("transactions") if isinstance(response, dict) else None
+    if not isinstance(transactions, list):
+        raise _job_transactions_contract_error(job_id, response)
+    total_count = response.get("totalCount")
+    if not isinstance(total_count, int) or isinstance(total_count, bool):
+        total_count = len(transactions)
+    return transactions, total_count
+
+
+def _job_transactions_contract_error(job_id: str, response: Any) -> ToolError:
+    if isinstance(response, dict):
+        observed = f"the body is an object with top-level keys {sorted(response.keys())}"
+    else:
+        observed = f"the body is a {type(response).__name__}, not an object"
+    return ToolError(
+        message=(
+            f"The job transactions endpoint answered for job '{job_id}' with "
+            f"something other than the published object carrying a transactions "
+            f"array; {observed}. No transactions were returned, and this is NOT "
+            "the same as the job having none."
+        ),
+        error_code=ErrorCodes.API_ERROR,
+        field="job_id",
+        value=job_id,
+        context={"job_id": job_id, "observed_type": type(response).__name__},
+        suggestions=[
+            "Retry the request; a truncated or proxied response can produce this",
+            "If it persists, the endpoint's response contract has changed and the MCP needs updating",
+        ],
+    )
+
+
+def _refuse_job_transactions_paging(arguments: Dict[str, Any]) -> None:
+    for label, default in (("page", _DEFAULT_JOBS_PAGE), ("size", _DEFAULT_JOBS_SIZE)):
+        value = arguments.get(label, default)
+        if value != default:
+            raise ToolError(
+                message=(
+                    f"get_job_transactions is not paged: it returns every transaction "
+                    f"of the job in one answer, so {label}={value!r} cannot be honoured."
+                ),
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=label,
+                value=value,
+                suggestions=[
+                    f"Call get_job_transactions without {label}; the answer already "
+                    "holds every transaction and the platform's total_count",
+                ],
+            )
 
 
 def _validate_jobs_pagination(page: Any, size: Any) -> None:
@@ -1751,7 +2041,7 @@ def _validate_jobs_pagination(page: Any, size: Any) -> None:
             error_code=ErrorCodes.VALIDATION_ERROR,
             field="size",
             value=size,
-            suggestions=["Use size between 1 and 50 (default 20)"],
+            suggestions=[f"Use size between 1 and {_MAX_JOBS_SIZE} (default 20)"],
         )
     if size > _MAX_JOBS_SIZE:
         raise ToolError(
@@ -1776,20 +2066,22 @@ class JobManager:
 
     async def list_jobs(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """List jobs with pagination."""
-        page = arguments.get("page", 0)
-        size = arguments.get("size", 20)
+        page = arguments.get("page", _DEFAULT_JOBS_PAGE)
+        size = arguments.get("size", _DEFAULT_JOBS_SIZE)
         filters = apply_filter_allowlist(
             arguments.get("filters"),
             _JOB_FILTER_MAP,
             action="list_jobs",
             value_enums=_JOB_FILTER_VALUE_ENUMS,
         )
+        filters = _whole_day_date_filters(filters, "list_jobs")
         _validate_jobs_pagination(page, size)
         response = await self.client.get_jobs(page=page, size=size, **filters)
         jobs = self.client._extract_embedded_data(response)
         page_info = self.client._extract_pagination_info(response)
         return {
             "action": "list_jobs",
+            "filters_applied": filters or None,
             "data": _strip_links(jobs),
             "pagination": {
                 "page": page,
@@ -1812,6 +2104,7 @@ class JobManager:
                 field="job_id",
                 suggestions=["Use list_jobs to find valid job IDs"],
             )
+        _refuse_job_id_off_its_path(job_id, "get_job", path_ends_at_id=True)
         result = await self.client.get_job_by_id(job_id)
         return {"action": "get_job", "job_id": job_id, "data": _strip_links(result)}
 
@@ -1825,24 +2118,15 @@ class JobManager:
                 field="job_id",
                 suggestions=["Use list_jobs to find valid job IDs"],
             )
-        page = arguments.get("page", 0)
-        size = arguments.get("size", 20)
-        _validate_jobs_pagination(page, size)
-        response = await self.client.get_job_transactions(job_id, page=page, size=size)
-        transactions = self.client._extract_embedded_data(response)
-        page_info = self.client._extract_pagination_info(response)
+        _refuse_job_id_off_its_path(job_id, "get_job_transactions")
+        _refuse_job_transactions_paging(arguments)
+        response = await self.client.get_job_transactions(job_id)
+        transactions, total_count = _parse_job_transactions(job_id, response)
         return {
             "action": "get_job_transactions",
             "job_id": job_id,
             "data": _strip_links(transactions),
-            "pagination": {
-                "page": page,
-                "size": size,
-                "total_pages": page_info.get("totalPages", 1),
-                "total_items": page_info.get("totalElements", len(transactions)),
-                "has_next": page < page_info.get("totalPages", 1) - 1,
-                "has_previous": page > 0,
-            },
+            "total_count": total_count,
         }
 
     async def get_job_roi(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -1855,6 +2139,7 @@ class JobManager:
                 field="job_id",
                 suggestions=["Use list_jobs to find valid job IDs"],
             )
+        _refuse_job_id_off_its_path(job_id, "get_job_roi")
         result = await self.client.get_job_roi(job_id)
         return {"action": "get_job_roi", "job_id": job_id, "data": _strip_links(result)}
 
@@ -1875,8 +2160,13 @@ class JobManager:
             action="get_conversion_funnel",
             paginated=False,
         )
+        filters = _whole_day_date_filters(filters, "get_conversion_funnel")
         result = await self.client.get_job_conversion_funnel(**filters)
-        return {"action": "get_conversion_funnel", "data": _strip_links(result)}
+        return {
+            "action": "get_conversion_funnel",
+            "data": _strip_links(result),
+            "filters_applied": filters or None,
+        }
 
     async def get_roi_summary(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get the published ROI summary by job type (BACK-2915).
@@ -1901,6 +2191,7 @@ class JobManager:
             action="get_roi_summary",
             paginated=False,
         )
+        filters = _whole_day_date_filters(filters, "get_roi_summary")
         forwarded = {
             name: value
             for name, value in filters.items()
@@ -1916,7 +2207,8 @@ class JobManager:
             raise ToolError(
                 message=(
                     "The job type ROI summary request failed "
-                    f"(status={getattr(exc, 'status_code', 'unknown')}); no summary was returned."
+                    f"(status={getattr(exc, 'status_code', 'unknown')}); no summary was returned. "
+                    f"The platform said: {exc.message}"
                 ),
                 error_code=ErrorCodes.API_ERROR,
                 suggestions=[
@@ -1967,7 +2259,7 @@ class JobManager:
         ``_session_attribution_intervals`` rather than rendered as empty.
         """
         session_id = arguments.get("session_id")
-        if not session_id:
+        if not session_id or not str(session_id).strip():
             raise ToolError(
                 message="session_id is required for list_session_attributions action",
                 error_code=ErrorCodes.VALIDATION_ERROR,
@@ -1979,12 +2271,12 @@ class JobManager:
                     }
                 },
                 suggestions=[
-                    "Pass the coding-assistant session identifier — for Claude Code, "
-                    "the session UUID",
+                    *_SESSION_ID.suggestions,
                     "There is no session listing endpoint: the id comes from the "
                     "assistant that ran the session, not from this tool",
                 ],
             )
+        _refuse_id_off_its_path(session_id, "list_session_attributions", _SESSION_ID)
         response = await self.client.get_session_attributions(session_id)
         intervals = _session_attribution_intervals(session_id, response)
         result: Dict[str, Any] = {
@@ -2010,6 +2302,7 @@ class JobManager:
                 field="job_id",
                 suggestions=["Use list_jobs to find valid job IDs"],
             )
+        _refuse_job_id_off_its_path(job_id, "report_outcome")
         outcome_data = arguments.get("outcome_data")
         if outcome_data is None:
             raise ToolError(
@@ -2094,6 +2387,7 @@ class JobManager:
                 field="job_id",
                 suggestions=["Use list_jobs to find valid job IDs"],
             )
+        _refuse_job_id_off_its_path(job_id, "amend_outcome")
         outcome_data = arguments.get("outcome_data")
         # The lock token is a control field, not outcome content, so it is
         # separated from the body before the body is judged empty: an
@@ -2425,6 +2719,7 @@ class JobManager:
                     "hang off; report_outcome first if it does not",
                 ],
             )
+        _refuse_job_id_off_its_path(job_id, "append_outcome_metrics")
         metrics = _require_entry_list(
             arguments.get("metrics"),
             action="append_outcome_metrics",
@@ -2595,7 +2890,7 @@ class JobManagement(ToolBase):
                                 f"executionStatus ({'|'.join(_JOB_EXECUTION_STATUSES)}), "
                                 f"outcomeType ({'|'.join(_JOB_OUTCOME_TYPES)}), "
                                 "outcomeValueMin, outcomeValueMax, environment, "
-                                "startDate (ISO 8601), endDate (ISO 8601), sort. "
+                                f"{_DATE_FILTER_CAPABILITY}, sort. "
                                 "Any other key, and any executionStatus or outcomeType "
                                 "value outside the lists above, is rejected here rather "
                                 "than sent upstream"
@@ -2615,22 +2910,21 @@ class JobManagement(ToolBase):
                         },
                         "get_job_transactions": {
                             "job_id": "str (required)",
-                            "page": "int (default 0)",
-                            "size": "int (default 20)",
+                            "returns": "every transaction of the job and the platform's total_count; not paged",
                         },
                         "get_job_roi": {"job_id": "str (required)"},
                         "get_job_types": {},
                         "get_conversion_funnel": {
                             "filters": (
                                 "dict (optional) — supported keys: "
-                                "jobType (case-insensitive), startDate (ISO 8601), "
-                                "endDate (ISO 8601), environment"
+                                "jobType (case-insensitive), "
+                                f"{_DATE_FILTER_CAPABILITY}, environment"
                             ),
                         },
                         "get_roi_summary": {
                             "filters": (
                                 "dict (optional) — supported keys: "
-                                "startDate (ISO 8601), endDate (ISO 8601), environment. "
+                                f"{_DATE_FILTER_CAPABILITY}, environment. "
                                 "The published endpoint declares four query parameters "
                                 "(startDate, endDate, metricType, jobType); this action "
                                 "forwards startDate and endDate. jobType is not accepted "
@@ -2882,8 +3176,6 @@ class JobManagement(ToolBase):
                         "example": {
                             "action": "get_job_transactions",
                             "job_id": "job_123",
-                            "page": 0,
-                            "size": 20,
                         },
                     },
                     "get_job_roi": {
@@ -3226,7 +3518,10 @@ class JobManagement(ToolBase):
                 return [
                     TextContent(
                         type="text",
-                        text=f"Jobs (page {arguments.get('page', 0) + 1}):\n\n"
+                        text=_jobs_list_heading(
+                            result["pagination"]["page"], result["filters_applied"]
+                        )
+                        + "\n\n"
                         + json.dumps(result, indent=2),
                     )
                 ]
@@ -3275,7 +3570,8 @@ class JobManagement(ToolBase):
                 return [
                     TextContent(
                         type="text",
-                        text="Conversion funnel analytics:\n\n"
+                        text=_conversion_funnel_heading(result.get("filters_applied"))
+                        + "\n\n"
                         + json.dumps(result, indent=2),
                     )
                 ]
@@ -3450,7 +3746,7 @@ class JobManagement(ToolBase):
                     "attribution qualifier"
                 ),
                 parameters={
-                    "get_job_transactions": {"job_id": "str", "page": "int", "size": "int"},
+                    "get_job_transactions": {"job_id": "str"},
                     "get_job_roi": {"job_id": "str"},
                     "get_conversion_funnel": {"filters": "dict (optional)"},
                     "get_roi_summary": {

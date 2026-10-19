@@ -3,9 +3,9 @@
 Targets lines missed in the first pass:
   - SourceManager.create_source (connection_string, config already set, owner absent)
   - SourceValidator (UCM paths, schema_discovery branch, validate_configuration)
-  - SourceEnhancementProcessor (create_source stream/ai/unknown types, create_from_text)
+  - SourceEnhancementProcessor (create_source stream/ai/unknown types)
   - SourceManagement.handle_action (create non-auto-generate, validation fail, update/delete
-    non-dry-run, create_from_text, get_capabilities, validate action, debug_ucm, get_agent_summary)
+    non-dry-run, get_capabilities, validate action, debug_ucm, get_agent_summary)
   - _format_capabilities_response, _format_examples_response, _format_validation_response
   - ToolBase introspection helpers (_get_tool_capabilities, _get_tool_dependencies, etc.)
 """
@@ -543,67 +543,6 @@ class TestSourceEnhancementProcessorCreateSource:
         assert data["name"] == "Nested Name"
 
 
-class TestSourceEnhancementProcessorCreateFromText:
-    """Test create_from_text."""
-
-    @pytest.mark.asyncio
-    async def test_create_from_text_success(self, enhancement_processor, mock_client):
-        mock_client.create_source.return_value = {"id": "txt1"}
-
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value",
-            return_value=None,
-        ):
-            result = await enhancement_processor.create_from_text(
-                {"text": "Create API source for customer data from https://api.customer.com"}
-            )
-
-        assert result["id"] == "txt1"
-        data = mock_client.create_source.call_args[0][0]
-        assert "Source from text:" in data["name"]
-        assert data["type"] == "API"
-
-    @pytest.mark.asyncio
-    async def test_create_from_text_missing_text_raises_error(self, enhancement_processor):
-        with pytest.raises(ToolError) as exc_info:
-            await enhancement_processor.create_from_text({})
-
-        assert "text" in str(exc_info.value).lower()
-
-    @pytest.mark.asyncio
-    async def test_create_from_text_empty_text_raises_error(self, enhancement_processor):
-        with pytest.raises(ToolError) as exc_info:
-            await enhancement_processor.create_from_text({"text": ""})
-
-        assert "text" in str(exc_info.value).lower()
-
-    @pytest.mark.asyncio
-    async def test_create_from_text_adds_owner_id(self, enhancement_processor, mock_client):
-        mock_client.create_source.return_value = {"id": "txt2"}
-
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value",
-            return_value="owner_from_text",
-        ):
-            await enhancement_processor.create_from_text({"text": "Some source description"})
-
-        data = mock_client.create_source.call_args[0][0]
-        assert data["ownerId"] == "owner_from_text"
-
-    @pytest.mark.asyncio
-    async def test_create_from_text_sets_team_id(self, enhancement_processor, mock_client):
-        mock_client.create_source.return_value = {"id": "txt3"}
-
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value",
-            return_value=None,
-        ):
-            await enhancement_processor.create_from_text({"text": "Another source"})
-
-        data = mock_client.create_source.call_args[0][0]
-        assert data["teamId"] == "team_xyz"
-
-
 # ===========================================================================
 # SourceManagement.handle_action – untested action branches
 # ===========================================================================
@@ -833,30 +772,6 @@ class TestSourceManagementHandleActionExtended:
         assert len(result) >= 1
         assert "s_del" in result[0].text
         assert "deleted successfully" in result[0].text.lower()
-
-    # -----------------------------------------------------------------------
-    # create_from_text action
-    # -----------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_create_from_text_action(self, source_mgmt):
-        """create_from_text action creates a source from natural language."""
-        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
-            mock_client = _make_client()
-            mock_client.create_source = AsyncMock(return_value={"id": "txt_s1"})
-            mock_gc.return_value = mock_client
-
-            with patch(
-                "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value",
-                return_value=None,
-            ):
-                result = await source_mgmt.handle_action(
-                    "create_from_text",
-                    {"text": "Create a REST API source for customer data"},
-                )
-
-        assert len(result) >= 1
-        assert "successfully" in result[0].text.lower()
 
     # -----------------------------------------------------------------------
     # get_capabilities action

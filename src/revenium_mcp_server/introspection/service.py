@@ -9,8 +9,10 @@ from typing import Any, Dict, List, Union
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
-from ..common.error_handling import ToolError
+from ..auth.auth_mode import credentials_are_per_request
+from ..common.error_handling import ErrorCodes, ToolError, raise_refusal
 from .engine import introspection_engine
+from .metadata import HOSTED_PERFORMANCE_METRICS_NOTE
 
 
 class ToolIntrospectionService:
@@ -309,23 +311,22 @@ To get more detailed information about any specific tool, you can ask me about i
         """Handle getting metadata for a specific tool."""
         tool_name = arguments.get("tool_name")
         if not tool_name:
-            return [
-                TextContent(
-                    type="text",
-                    text="❌ **Error**: tool_name parameter is required for get_tool_metadata action",
-                )
-            ]
+            raise_refusal(
+                "❌ **Error**: tool_name parameter is required for get_tool_metadata action",
+                error_code=ErrorCodes.MISSING_PARAMETER,
+                field="tool_name",
+            )
 
         metadata = await self.engine.get_tool_metadata(tool_name)
         if not metadata:
             available_tools = await self.engine.list_tools()
-            return [
-                TextContent(
-                    type="text",
-                    text=f"❌ **Error**: Tool '{tool_name}' not found or no metadata available\n\n"
-                    f"**Available tools**: {', '.join(available_tools) if available_tools else 'None'}",
-                )
-            ]
+            raise_refusal(
+                f"❌ **Error**: Tool '{tool_name}' not found or no metadata available\n\n"
+                f"**Available tools**: {', '.join(available_tools) if available_tools else 'None'}",
+                error_code=ErrorCodes.TOOL_NOT_FOUND,
+                field="tool_name",
+                value=tool_name,
+            )
 
         # Format metadata as readable text
         text = f"**Tool Metadata: {metadata.name}**\n\n"
@@ -358,7 +359,9 @@ To get more detailed information about any specific tool, you can ask me about i
                 text += f"• **{rel.resource_type}** ({rel.relationship_type}): {rel.description}\n"
             text += "\n"
 
-        if metadata.performance_metrics:
+        if credentials_are_per_request():
+            text += f"**Performance Metrics**: {HOSTED_PERFORMANCE_METRICS_NOTE}\n\n"
+        elif metadata.performance_metrics:
             pm = metadata.performance_metrics
             text += "**Performance Metrics**:\n"
             text += f"• Executions: {pm.total_executions}\n"

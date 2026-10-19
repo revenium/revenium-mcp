@@ -15,6 +15,25 @@ from src.revenium_mcp_server.onboarding.env_validation import API_AUTH_REJECTED_
 from src.revenium_mcp_server.tools_decomposed.welcome_setup import WelcomeSetup
 
 
+@pytest.fixture(autouse=True)
+def _platform_read_succeeds():
+    """Renderer tests here mock the validator; the platform read itself is fixed."""
+    from src.revenium_mcp_server.onboarding.platform_read import PlatformFacts
+
+    facts = PlatformFacts(read={"status": "success", "status_code": 200, "payload": {}})
+    with patch(
+        "src.revenium_mcp_server.tools_decomposed.welcome_setup.read_platform_facts",
+        new=AsyncMock(return_value=facts),
+    ), patch(
+        "src.revenium_mcp_server.onboarding.platform_read.probe_platform_read",
+        new=AsyncMock(return_value=facts.read),
+    ), patch(
+        "src.revenium_mcp_server.tools_decomposed.welcome_setup.probe_platform_read",
+        new=AsyncMock(return_value=facts.read),
+    ):
+        yield
+
+
 @pytest.fixture
 def welcome_tool():
     return WelcomeSetup()
@@ -295,7 +314,7 @@ class TestSetupChecklist:
         }
         with patch(
             "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_onboarding_state",
-            return_value=_mock_onboarding_state(),
+            return_value=_mock_onboarding_state(api_key=False, team_id=False),
         ), patch(
             "src.revenium_mcp_server.tools_decomposed.welcome_setup.validate_environment_variables",
             return_value=validation,
@@ -415,69 +434,43 @@ class TestCompleteSetup:
 
     @pytest.mark.asyncio
     async def test_successful_completion(self, welcome_tool):
-        mock_config_store = MagicMock()
-        mock_config_store.get_configuration = AsyncMock()
-        mock_config_store._discovery_attempted = True
-        mock_config_store._discovered_config = MagicMock()
-        mock_config_store._discovered_config.has_required_fields.return_value = True
-
-        mock_detection_service = MagicMock()
-        mock_detection_service.mark_onboarding_completed = AsyncMock(return_value=True)
-
+        """A successful read confirms setup, and nothing is written (BACK-4677)."""
+        read = {"status": "success", "status_code": 200, "payload": {}}
         with patch(
-            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_config_value",
-            side_effect=lambda key, *args: {
-                "REVENIUM_API_KEY": "key",
-                "REVENIUM_TEAM_ID": "team",
-                "REVENIUM_TENANT_ID": "tenant",
-                "REVENIUM_OWNER_ID": "owner",
-            }.get(key),
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.probe_platform_read",
+            new=AsyncMock(return_value=read),
         ), patch(
-            "src.revenium_mcp_server.config_store.get_config_store",
-            return_value=mock_config_store,
-        ), patch(
-            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_config_value",
-            side_effect=lambda key, *args: {
-                "REVENIUM_API_KEY": "key",
-                "REVENIUM_TEAM_ID": "team",
-                "REVENIUM_TENANT_ID": "tenant",
-                "REVENIUM_OWNER_ID": "owner",
-            }.get(key),
-        ), patch(
-            "src.revenium_mcp_server.onboarding.detection_service.get_detection_service",
-            return_value=mock_detection_service,
-        ):
+            "src.revenium_mcp_server.config_cache.ConfigurationCache.save_config",
+            new=AsyncMock(),
+        ) as save_config:
             result = await welcome_tool.handle_action(
                 "complete_setup", {"confirm_completion": True}
             )
         text = result[0].text
-        assert "Complete" in text or "complete" in text
+        assert "Setup Complete!" in text
+        assert "your API key can read this organization's data" in text
+        assert "sign-in" not in text
+        assert "Debug Information" not in text
+        save_config.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_missing_required_fields_shows_incomplete(self, welcome_tool):
-        mock_config_store = MagicMock()
-        mock_config_store.get_configuration = AsyncMock()
-        mock_config_store._discovery_attempted = True
-        mock_config_store._discovered_config = MagicMock()
-        mock_config_store._discovered_config.has_required_fields.return_value = False
+    async def test_failed_read_raises_tool_error_with_next_step(self, welcome_tool):
+        """A failed read is an error answer, never a success page (BACK-4677)."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
+        read = {"status": "error", "error": "The platform could not be reached, so nothing was verified."}
         with patch(
-            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_config_value",
-            side_effect=lambda key, *args: {
-                "REVENIUM_API_KEY": "key",
-                "REVENIUM_TEAM_ID": None,
-                "REVENIUM_TENANT_ID": None,
-                "REVENIUM_OWNER_ID": None,
-            }.get(key),
-        ), patch(
-            "src.revenium_mcp_server.config_store.get_config_store",
-            return_value=mock_config_store,
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.probe_platform_read",
+            new=AsyncMock(return_value=read),
         ):
-            result = await welcome_tool.handle_action(
-                "complete_setup", {"confirm_completion": True}
-            )
-        text = result[0].text
-        assert "Incomplete" in text or "missing" in text.lower()
+            with pytest.raises(ToolError) as raised:
+                await welcome_tool.handle_action(
+                    "complete_setup", {"confirm_completion": True}
+                )
+        message = raised.value.message
+        assert "Setup could not be completed" in message
+        assert "could not be reached" in message
+        assert "system_diagnostics(action='system_health')" in message
 
 
 class TestBuildNextSteps:
@@ -487,18 +480,35 @@ class TestBuildNextSteps:
         state = _mock_onboarding_state(
             api_key=True, team_id=True, email=True, slack=True, auto_discovery=True
         )
-        result = welcome_tool._build_next_steps(state)
+        result = welcome_tool._build_next_steps(state, _mock_validation_result())
         assert "Complete" in result or "Ready" in result
+        assert "mark onboarding as complete" not in result
+        assert "confirm that your credentials can read your organization's data" in result
 
     def test_missing_items_prioritized(self, welcome_tool):
         state = _mock_onboarding_state(
             api_key=False, team_id=True, email=False, slack=False, auto_discovery=False
         )
-        result = welcome_tool._build_next_steps(state)
+        result = welcome_tool._build_next_steps(state, _mock_validation_result())
         # API key should appear before email in output (higher priority)
         api_pos = result.find("API Key")
         email_pos = result.find("Email")
         assert api_pos < email_pos
+
+
+    @pytest.mark.parametrize(
+        "slack, completion_claim",
+        [(True, "Setup Complete!"), (None, "Your setup is complete")],
+    )
+    def test_failed_read_never_claims_completion(self, welcome_tool, slack, completion_claim):
+        """A configured local server whose data read failed is not told setup is done."""
+        state = _mock_onboarding_state(
+            api_key=True, team_id=True, email=True, slack=slack, auto_discovery=True
+        )
+        result = welcome_tool._build_next_steps(state, _mock_validation_result("error"))
+        assert completion_claim not in result
+        assert "The platform could not be read" in result
+        assert "system_diagnostics(action='system_health')" in result
 
 
 class TestBuildWelcomeMessage:

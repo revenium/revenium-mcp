@@ -317,6 +317,13 @@ class TestThinSchema:
         once = thin_schema(_wide_slim_schema(), _WIDE_DEFAULTS)
         assert thin_schema(once, _WIDE_DEFAULTS) == once
 
+    def test_a_parameter_advertised_without_default_keeps_no_default(self):
+        properties = thin_schema(
+            _wide_slim_schema(), {"page": 0}, advertised_without_default=("resource_type",)
+        )["properties"]
+        assert properties["resource_type"] == {"type": "string"}
+        assert properties["page"] == {"type": "integer", "default": 0}
+
 
 class TestSlimToolSchema:
     def test_heavy_tools_get_the_thin_shape(self):
@@ -327,7 +334,8 @@ class TestSlimToolSchema:
 
     def test_each_thin_tool_carries_its_own_defaults(self):
         properties = slim_tool_schema("manage_alerts", _wide_slim_schema())["properties"]
-        assert properties["resource_type"]["default"] == "anomalies"
+        assert "resource_type" in properties
+        assert "default" not in properties["resource_type"]
         assert properties["page"]["default"] == 0
 
     def test_other_tools_keep_every_parameter(self):
@@ -547,12 +555,14 @@ class TestDefaultedParametersFromTheBag:
         for method, expected in (
             ("_register_business_analytics_management", {"page": 0, "size": 20}),
             ("_register_manage_tools", {"page": 0, "size": 20}),
-            ("_register_manage_alerts", {"page": 0, "size": 20, "resource_type": "anomalies"}),
+            ("_register_manage_alerts", {"page": 0, "size": 20}),
         ):
             closure = await _closure_for(method)
             arguments = await _arguments_from(closure, action="list")
             for name, value in expected.items():
                 assert arguments[name] == value, (method, name)
+            # Routing tells an absent resource_type from a chosen one.
+            assert "resource_type" not in arguments, method
 
     async def test_business_analytics_paging_can_come_from_the_bag(self):
         closure = await _closure_for("_register_business_analytics_management")
@@ -608,14 +618,17 @@ class TestDefaultedParametersFromTheBag:
 # ---------------------------------------------------------------------------
 
 
-async def _text_from(closure, **kwargs):
-    """Call a closure that is expected to refuse, and return its message."""
+async def _refusal_from(closure, **kwargs):
+    """Call a closure that is expected to refuse, and return the error it raised."""
+    from src.revenium_mcp_server.common.error_handling import ToolError
+
     with patch(
         "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
         new=AsyncMock(return_value=[]),
     ):
-        result = await closure(**kwargs)
-    return result[0].text if result else ""
+        with pytest.raises(ToolError) as raised:
+            await closure(**kwargs)
+    return raised.value
 
 
 @pytest.mark.asyncio
@@ -641,18 +654,22 @@ class TestBaggedJsonStringsAreDecoded:
     async def test_malformed_bagged_anomaly_data_is_still_refused(self):
         closure = await _closure_for("_register_manage_alerts")
 
-        text = await _text_from(closure, action="create", params={"anomaly_data": "{not json"})
+        refusal = await _refusal_from(
+            closure, action="create", params={"anomaly_data": "{not json"}
+        )
 
-        assert "Invalid JSON String for anomaly_data" in text
+        assert refusal.field == "anomaly_data"
+        assert refusal.message.startswith("Invalid JSON for anomaly_data:")
 
     async def test_a_bagged_anomaly_ids_scalar_is_still_refused(self):
         closure = await _closure_for("_register_manage_alerts")
 
-        text = await _text_from(
+        refusal = await _refusal_from(
             closure, action="get_budget_progress", params={"anomaly_ids": '"a1"'}
         )
 
-        assert "Invalid anomaly_ids" in text
+        assert refusal.field == "anomaly_ids"
+        assert "anomaly_ids must be a JSON array" in refusal.message
 
     async def test_manage_tools_decodes_filters_from_the_bag(self):
         closure = await _closure_for("_register_manage_tools")
@@ -667,14 +684,18 @@ class TestBaggedJsonStringsAreDecoded:
         """`filters or {}` used to swallow this before the decode could refuse it."""
         closure = await _closure_for("_register_manage_tools")
 
-        assert "Invalid JSON for filters" in await _text_from(closure, action="list", filters="")
+        refusal = await _refusal_from(closure, action="list", filters="")
+
+        assert refusal.field == "filters"
+        assert refusal.message.startswith("Invalid JSON for filters:")
 
     async def test_manage_tools_refuses_an_empty_filters_string_from_the_bag(self):
         closure = await _closure_for("_register_manage_tools")
 
-        text = await _text_from(closure, action="list", params={"filters": ""})
+        refusal = await _refusal_from(closure, action="list", params={"filters": ""})
 
-        assert "Invalid JSON for filters" in text
+        assert refusal.field == "filters"
+        assert refusal.message.startswith("Invalid JSON for filters:")
 
     async def test_manage_tools_decodes_tool_data_from_the_bag(self):
         closure = await _closure_for("_register_manage_tools")
@@ -697,13 +718,113 @@ class TestBaggedJsonStringsAreDecoded:
     async def test_malformed_bagged_tool_data_is_still_refused(self):
         closure = await _closure_for("_register_manage_tools")
 
-        text = await _text_from(closure, action="create", params={"tool_data": "{not json"})
+        refusal = await _refusal_from(
+            closure, action="create", params={"tool_data": "{not json"}
+        )
 
-        assert "Invalid JSON for tool_data" in text
+        assert refusal.field == "tool_data"
+        assert refusal.message.startswith("Invalid JSON for tool_data:")
 
     async def test_malformed_bagged_event_data_is_still_refused(self):
         closure = await _closure_for("_register_manage_tools")
 
-        text = await _text_from(closure, action="meter_event", params={"event_data": ""})
+        refusal = await _refusal_from(
+            closure, action="meter_event", params={"event_data": ""}
+        )
 
-        assert "Invalid JSON for event_data" in text
+        assert refusal.field == "event_data"
+        assert refusal.message.startswith("Invalid JSON for event_data:")
+
+
+# ---------------------------------------------------------------------------
+# manage_alerts routes by the question when no resource_type is sent
+# ---------------------------------------------------------------------------
+
+
+_FIRED_ALERT = {
+    "id": "l3moXN",
+    "resolved": True,
+    "triggeredValue": 1023.48633754,
+    "anomaly": {
+        "name": "Total Anthropic Spend",
+        "operatorType": "GREATER_THAN",
+        "threshold": 1000.0,
+        "metricType": "TOTAL_COST",
+    },
+}
+
+
+async def _call_registered_manage_alerts(**kwargs):
+    """Call manage_alerts through its registered closure against a stubbed platform.
+
+    The closure applies THIN_TOOL_DEFAULTS before AlertManagement sees the
+    call, which is where an absent resource_type used to become "anomalies".
+    """
+    from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
+
+    closure = await _closure_for("_register_manage_alerts")
+    client = MagicMock()
+    client.get_alerts = AsyncMock(return_value={})
+    client.get_anomalies = AsyncMock(return_value={})
+    client._extract_embedded_data = MagicMock(return_value=[_FIRED_ALERT])
+    client._extract_pagination_info = MagicMock(
+        return_value={"totalPages": 1, "totalElements": 1}
+    )
+    tool = AlertManagement()
+    tool.get_client = AsyncMock(return_value=client)
+
+    async def execute(*, tool_name, action, arguments, tool_class):
+        return await tool.handle_action(action, arguments)
+
+    with patch(
+        "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+        new=execute,
+    ):
+        result = await closure(**kwargs)
+    return client, result[0].text
+
+
+class TestManageAlertsRoutesWithoutAResourceType:
+    async def test_a_question_about_fired_alerts_reaches_alert_history_and_is_echoed(self):
+        client, text = await _call_registered_manage_alerts(
+            action="query", query="show alerts that fired recently"
+        )
+
+        assert client.get_alerts.await_count == 1
+        assert client.get_anomalies.await_count == 0
+        assert '**Query:** "show alerts that fired recently"' in text
+        assert "**AI Alerts**" in text
+
+    async def test_a_list_about_fired_alerts_uses_intent_detection(self):
+        client, _ = await _call_registered_manage_alerts(
+            action="list", query="which alerts fired yesterday"
+        )
+
+        assert client.get_alerts.await_count == 1
+        assert client.get_anomalies.await_count == 0
+
+    async def test_query_reads_the_page_and_size_it_was_given(self):
+        client, _ = await _call_registered_manage_alerts(
+            action="query",
+            query="show alerts that fired recently",
+            resource_type="alerts",
+            page=1,
+            size=3,
+        )
+
+        sent = client.get_alerts.await_args.kwargs
+        assert (sent["page"], sent["size"]) == (1, 3)
+
+    async def test_a_plain_list_still_lists_the_alert_rules(self):
+        client, _ = await _call_registered_manage_alerts(action="list")
+
+        assert client.get_anomalies.await_count == 1
+        assert client.get_alerts.await_count == 0
+
+    async def test_a_rules_question_still_lists_the_alert_rules(self):
+        client, _ = await _call_registered_manage_alerts(
+            action="list", query="list monitoring rules"
+        )
+
+        assert client.get_anomalies.await_count == 1
+        assert client.get_alerts.await_count == 0

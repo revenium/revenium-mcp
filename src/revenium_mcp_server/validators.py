@@ -8,13 +8,90 @@ import html
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, NoReturn, Optional, Union
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
 from .alert_operators import CHANGE_OPERATORS, FILTER_LIST_OPERATOR, validate_filter_rows
 from .exceptions import InvalidInputError, ValidationError
+
+TIME_WINDOW_FORMAT = re.compile(r"^\d+[smhd]$")
+SUB_FIFTEEN_MINUTE_PERIODS = ("ONE_MINUTE", "FIVE_MINUTES", "TEN_MINUTES")
+
+PER_SECOND_METRIC_REPLACEMENTS = {
+    "tokens_per_second": "tokens_per_minute",
+    "requests_per_second": "requests_per_minute",
+}
+
+
+def refuse_sub_fifteen_minute_period(alert_type: Any, period_duration: Any) -> None:
+    """Refuse a tracking period shorter than FIFTEEN_MINUTES on a non-cumulative alert.
+
+    The platform rejects these periods, but its 400 carries a generic message, so
+    the rule is applied locally with the actionable wording.
+    """
+    if alert_type == "CUMULATIVE_USAGE" or period_duration not in SUB_FIFTEEN_MINUTE_PERIODS:
+        return
+    # Imported here: common.error_handling imports modules that import this one.
+    from .common.error_handling import create_structured_validation_error
+
+    raise create_structured_validation_error(
+        message=(
+            f"periodDuration {period_duration} is not "
+            "supported by the platform; use FIFTEEN_MINUTES or longer"
+        ),
+        field="periodDuration",
+        value=period_duration,
+        suggestions=[
+            "Use FIFTEEN_MINUTES, THIRTY_MINUTES, ONE_HOUR, TWELVE_HOURS, DAILY, WEEKLY, MONTHLY, QUARTERLY, or THIRTY_DAYS",
+        ],
+        examples={
+            "valid_period_durations": [
+                "FIFTEEN_MINUTES",
+                "THIRTY_MINUTES",
+                "ONE_HOUR",
+                "TWELVE_HOURS",
+                "DAILY",
+                "WEEKLY",
+                "MONTHLY",
+                "QUARTERLY",
+                "THIRTY_DAYS",
+            ],
+        },
+    )
+
+
+def _refuse_per_second_metric(metric: str) -> NoReturn:
+    from .common.error_handling import create_structured_validation_error
+
+    per_minute = PER_SECOND_METRIC_REPLACEMENTS[metric]
+    raise create_structured_validation_error(
+        message=(
+            f"metric '{metric}' is not one the platform measures; it measures "
+            f"throughput per minute, so use '{per_minute}' with a per-minute threshold"
+        ),
+        field="metric",
+        value=metric,
+        suggestions=[f"Use metric '{per_minute}' and express the threshold per minute"],
+        examples={"detection_rule": {"metric": per_minute, "operator": ">", "time_window": "15m"}},
+    )
+
+
+def _refuse_unknown_window(window: Any, accepted: List[str]) -> NoReturn:
+    from .common.error_handling import create_structured_validation_error
+
+    raise create_structured_validation_error(
+        message=(
+            f"time_window {window} has no tracking period on the platform: "
+            f"'{window}' is not a window the platform accepts; "
+            f"accepted: {', '.join(accepted)}"
+        ),
+        field="time_window",
+        value=window,
+        suggestions=[f"Use one of: {', '.join(accepted)}"],
+        examples={"accepted_time_windows": accepted},
+    )
 
 
 class InputValidator:
@@ -547,12 +624,12 @@ class InputValidator:
                         )
                 else:
                     # For other alert types, use time-based format
-                    if not re.match(r"^\d+[smhd]$", time_window):
+                    if not TIME_WINDOW_FORMAT.match(time_window):
                         raise ValidationError(
                             message="Invalid time window format",
                             field="time_window",
                             value=time_window,
-                            expected="Format like '5m', '1h', '2d' (number + s/m/h/d)",
+                            expected="Format like '15m', '1h', '1d' (number + s/m/h/d)",
                         )
             validated_rule["time_window"] = time_window
 
@@ -684,7 +761,7 @@ class InputValidator:
 
             field = filter_data.get("field", "").lower()
             operator = filter_data.get("operator", "").lower()
-            value = filter_data.get("value", "")
+            value = filter_data.get("value")
 
             # Convert field to dimension
             dimension = dimension_mapping.get(field, field.upper())
@@ -706,7 +783,11 @@ class InputValidator:
                     "values": raw_values if isinstance(raw_values, list) else [],
                 }
             else:
-                api_filter = {"dimension": dimension, "operator": api_operator, "value": str(value)}
+                api_filter = {
+                    "dimension": dimension,
+                    "operator": api_operator,
+                    "value": None if value is None else str(value),
+                }
 
             api_filters.append(api_filter)
 
@@ -743,8 +824,8 @@ class InputValidator:
             # Complete list of valid metrics from MetricType enum
             "total_cost": "TOTAL_COST",
             "cost_per_transaction": "COST_PER_TRANSACTION",
-            "tokens_per_second": "TOKENS_PER_SECOND",
-            "requests_per_second": "REQUESTS_PER_SECOND",
+            "tokens_per_minute": "TOKENS_PER_MINUTE",
+            "requests_per_minute": "REQUESTS_PER_MINUTE",
             "token_count": "TOKEN_COUNT",
             "input_token_count": "INPUT_TOKEN_COUNT",
             "output_token_count": "OUTPUT_TOKEN_COUNT",
@@ -754,18 +835,21 @@ class InputValidator:
         }
 
         period_mapping = {
-            # Time-based periods (for THRESHOLD alerts)
+            # Time-based periods (for THRESHOLD alerts). The sub-15-minute
+            # windows stay mapped so refuse_sub_fifteen_minute_period names the rule.
             "1m": "ONE_MINUTE",
             "5m": "FIVE_MINUTES",
             "10m": "TEN_MINUTES",
             "15m": "FIFTEEN_MINUTES",
             "30m": "THIRTY_MINUTES",
             "1h": "ONE_HOUR",
-            "2h": "TWO_HOURS",
-            "4h": "FOUR_HOURS",
-            "8h": "EIGHT_HOURS",
             "12h": "TWELVE_HOURS",
-            "1d": "ONE_DAY",
+            # The platform refuses TWENTY_FOUR_HOURS and SEVEN_DAYS although its
+            # contract lists them; DAILY and WEEKLY are the same rolling windows.
+            "24h": "DAILY",
+            "1d": "DAILY",
+            "7d": "WEEKLY",
+            "30d": "THIRTY_DAYS",
             # Calendar periods (for CUMULATIVE_USAGE alerts)
             "daily": "DAILY",
             "weekly": "WEEKLY",
@@ -797,7 +881,11 @@ class InputValidator:
                 or user_data.get("notification_addresses")
                 or []
             ),
-            "slackConfigurations": user_data.get("slack_configurations", []),
+            "slackConfigurations": (
+                user_data.get("slackConfigurations")
+                or user_data.get("slack_configurations")
+                or []
+            ),
             "webhookConfigurations": user_data.get(
                 "webhook_configurations", []
             ),  # Correct field name
@@ -828,6 +916,8 @@ class InputValidator:
 
         # Convert metric - strict validation, no guessing
         metric = rule.get("metric", "").lower()
+        if metric in PER_SECOND_METRIC_REPLACEMENTS:
+            _refuse_per_second_metric(metric)
         if metric in metric_mapping:
             api_data["metricType"] = metric_mapping[metric]
         else:
@@ -840,9 +930,9 @@ class InputValidator:
             elif "error" in metric:
                 suggestions = ["error_rate", "error_count"]
             elif "time" in metric or "speed" in metric:
-                suggestions = ["tokens_per_second", "requests_per_second"]
+                suggestions = ["tokens_per_minute", "requests_per_minute"]
             else:
-                suggestions = ["total_cost", "token_count", "error_rate", "tokens_per_second"]
+                suggestions = ["total_cost", "token_count", "error_rate", "tokens_per_minute"]
 
             raise ValidationError(
                 message=f"Invalid metric type: '{metric}'",
@@ -865,10 +955,11 @@ class InputValidator:
         # Convert period duration - handle CUMULATIVE_USAGE and RELATIVE_CHANGE differently
         # Use appropriate defaults based on alert type
         _calendar_alert_types = ("CUMULATIVE_USAGE", "RELATIVE_CHANGE")
+        raw_window = (rule.get("time_window") or "").strip()
         if alert_type in _calendar_alert_types:
-            period = rule.get("time_window", "daily")  # Default to daily for calendar-period alerts
+            period = raw_window or "daily"
         else:
-            period = rule.get("time_window", "5m")  # Default to 5m for THRESHOLD alerts
+            period = raw_window or "15m"
 
         # Debug logging for period conversion
         logger.debug(
@@ -877,7 +968,7 @@ class InputValidator:
 
         if alert_type in _calendar_alert_types:
             # For CUMULATIVE_USAGE, if time_window is missing, check user_data for period
-            if "time_window" not in rule:
+            if not raw_window:
                 logger.info(
                     "CUMULATIVE_USAGE alert missing time_window, checking user_data for period"
                 )
@@ -922,13 +1013,35 @@ class InputValidator:
                     f"CUMULATIVE_USAGE: Unrecognized period '{period}', defaulting to DAILY"
                 )
         else:
-            # For THRESHOLD alerts, use time-based periods
-            if period in period_mapping:
-                api_data["periodDuration"] = period_mapping[period]
-            else:
-                api_data["periodDuration"] = "FIVE_MINUTES"  # Default for THRESHOLD
+            if period not in period_mapping:
+                raise InputValidator._time_window_refusal(
+                    period, period_mapping, alert_type, user_data.get("dataSource")
+                )
+            api_data["periodDuration"] = period_mapping[period]
+            refuse_sub_fifteen_minute_period(api_data["alertType"], api_data["periodDuration"])
 
         return api_data
+
+
+    @staticmethod
+    def _time_window_refusal(
+        time_window: Any,
+        period_mapping: Dict[str, str],
+        alert_type: str,
+        data_source: Any,
+    ) -> NoReturn:
+        # Imported here: update_fidelity imports this module while it loads.
+        from .alerts.update_fidelity import platform_periods_for
+
+        allowed = platform_periods_for(alert_type, data_source)
+        accepted = [
+            window
+            for window, period in period_mapping.items()
+            if period in allowed
+            and TIME_WINDOW_FORMAT.match(window)
+            and period not in SUB_FIFTEEN_MINUTE_PERIODS
+        ]
+        _refuse_unknown_window(time_window, accepted)
 
 
 class AdvancedConfigurationBuilder:

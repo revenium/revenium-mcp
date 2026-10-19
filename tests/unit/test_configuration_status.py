@@ -15,6 +15,22 @@ from src.revenium_mcp_server.tools_decomposed.configuration_status import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _platform_read_succeeds():
+    """Renderer tests here mock the validator; the platform read itself is fixed."""
+    from src.revenium_mcp_server.onboarding.platform_read import PlatformFacts
+
+    facts = PlatformFacts(read={"status": "success", "status_code": 200, "payload": {}})
+    with patch(
+        "src.revenium_mcp_server.tools_decomposed.configuration_status.read_platform_facts",
+        new=AsyncMock(return_value=facts),
+    ), patch(
+        "src.revenium_mcp_server.onboarding.platform_read.probe_platform_read",
+        new=AsyncMock(return_value=facts.read),
+    ):
+        yield
+
+
 @pytest.fixture
 def config_tool():
     """Create a ConfigurationStatus instance."""
@@ -277,13 +293,14 @@ class TestBuildOnboardingStatusAnalysis:
         state.recommendations = ["Do this", "Do that"]
         return state
 
-    def _make_validation_result(self, overall=True):
+    def _make_validation_result(self, overall=True, read_status="success"):
         result = MagicMock()
         result.summary = {
             "overall_status": overall,
             "direct_api_works": overall,
             "auto_discovery_works": overall,
         }
+        result.api_connectivity = {"status": read_status}
         return result
 
     def test_first_time_user_identified(self, config_tool):
@@ -332,6 +349,42 @@ class TestBuildOnboardingStatusAnalysis:
         validation = self._make_validation_result()
         text = config_tool._build_onboarding_status_analysis(state, validation)
         assert "EXCELLENT" in text
+
+    def test_hosted_caller_is_not_scored_on_server_auto_discovery(self, config_tool):
+        """Auto-discovery reads server settings, so it never scores a hosted caller."""
+        state = self._make_onboarding_state(
+            completion={
+                "api_key_configured": True,
+                "team_id_configured": True,
+                "email_configured": True,
+                "slack_configured": True,
+                "auto_discovery_working": False,
+            }
+        )
+        validation = self._make_validation_result()
+        validation.summary["auto_discovery_works"] = False
+        validation.summary["credential_source"] = "request"
+        text = config_tool._build_onboarding_status_analysis(state, validation)
+        assert "Auto-Discovery" not in text
+        assert "**Overall Completion**: 4/4" in text
+
+    @pytest.mark.parametrize("slack_configured", [True, False])
+    def test_slack_step_is_suggested_only_without_slack(self, config_tool, slack_configured):
+        state = self._make_onboarding_state(
+            completion={
+                "api_key_configured": True,
+                "team_id_configured": True,
+                "email_configured": True,
+                "slack_configured": slack_configured,
+                "cache_valid": False,
+                "auto_discovery_working": False,
+            }
+        )
+        text = config_tool._build_onboarding_status_analysis(
+            state, self._make_validation_result()
+        )
+        assert "**Recommended Actions**" in text
+        assert ("Configure optional features like Slack" in text) is not slack_configured
 
 
 class TestBuildSystemHealthSummary:
@@ -394,39 +447,43 @@ class TestBuildSystemHealthSummary:
         assert "Critical:" in text
         assert "Optional:" in text
 
-    def _make_clerk_validation(self, clerk_configured=True):
-        """Clerk/OAuth-mode validation summary: no static API key by design."""
+    def _make_clerk_validation(self, read_succeeded=True):
+        """Clerk/OAuth-mode summary for a signed-in caller: the verdict is the read."""
         result = MagicMock()
         result.summary = {
             "auth_mode": "clerk",
-            "clerk_configured": clerk_configured,
-            "overall_status": clerk_configured,
-            "api_key_available": False,
-            "direct_api_works": False,
+            "credential_source": "request",
+            "clerk_configured": True,
+            "overall_status": read_succeeded,
+            "api_key_available": True,
+            "direct_api_works": read_succeeded,
+            "api_unreachable": not read_succeeded,
             "auth_config_works": True,
             "auto_discovery_works": True,
         }
         return result
 
-    def test_clerk_mode_with_config_is_healthy(self, config_tool):
-        """Clerk mode with valid OAuth config is HEALTHY despite no static API key."""
+    def test_clerk_mode_with_successful_read_is_healthy(self, config_tool):
+        """Clerk mode is HEALTHY when the caller's own read succeeded."""
         state = self._make_state()
-        validation = self._make_clerk_validation(clerk_configured=True)
+        validation = self._make_clerk_validation(read_succeeded=True)
         text = config_tool._build_system_health_summary(validation, state)
         assert "NEEDS ATTENTION" not in text
         assert "system cannot function" not in text
         assert "NOT READY" not in text
-        # Critical component is labelled for the OAuth model, not the API-key model
-        assert "Clerk OAuth Configuration" in text
+        # Critical component is labelled for the sign-in model, not the API-key model
+        assert "**Sign-in**: Operational" in text
         assert "API Key Configuration" not in text
+        assert "Cache System" not in text
 
-    def test_clerk_mode_without_config_is_unhealthy(self, config_tool):
-        """Clerk mode with the OAuth config missing is genuinely unhealthy."""
+    def test_clerk_mode_without_successful_read_is_unhealthy(self, config_tool):
+        """Clerk mode with OAuth configured but no successful read is not healthy."""
         state = self._make_state()
-        validation = self._make_clerk_validation(clerk_configured=False)
+        validation = self._make_clerk_validation(read_succeeded=False)
         text = config_tool._build_system_health_summary(validation, state)
         assert "NEEDS ATTENTION" in text
-        assert "Clerk OAuth" in text
+        assert "[NOT READY]" in text
+        assert "could not be reached" in text
 
     def _make_forbidden_validation(self, detail=None):
         """API-key mode where the key authenticates but every read is forbidden."""

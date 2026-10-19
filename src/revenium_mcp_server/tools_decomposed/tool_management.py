@@ -5,17 +5,21 @@ Registry API, covering 26 actions: 9 CRUD, 4 event-metering, 10 analytics, 3 int
 """
 
 import json
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, get_args
 
 if TYPE_CHECKING:
+    from ..analytics.tool_reports import ToolReportRead
     from ..auth.tenant_context import TenantContext
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
+from ..analytics_parameters import TimePeriod
+from ..analytics_window import CALENDAR_RANGE_MAX_DAYS, CalendarRangeError, capped_utc_instant_bounds
 from ..client import ReveniumAPIError, ReveniumClient
 from ..common.error_handling import (
     ErrorCodes,
@@ -24,10 +28,25 @@ from ..common.error_handling import (
     create_structured_validation_error,
     raise_unknown_action_error,
 )
+from ..common.formatting import format_page_count_heading
+from ..common.sample_coverage import platform_total
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..introspection.metadata import (
     ToolCapability,
     ToolType,
+)
+from ..tool_analytics_reports import (
+    AGENT_TOOL_BREAKDOWN,
+    COST_BY_TOOL,
+    COST_BY_TOOL_AGENT,
+    COST_BY_TOOL_AGGREGATED,
+    COST_BY_TOOL_PROVIDER,
+    COST_BY_TOOL_PROVIDER_AGGREGATED,
+    TOOL_LATENCY,
+    TOOL_SUCCESS_RATE,
+    TOP_TOOLS_BY_CALL_COUNT,
+    ToolReport,
+    ToolReportWindow,
 )
 from .unified_tool_base import ToolBase
 
@@ -64,6 +83,126 @@ _TOOL_EVENT_FILTER_MAP: Dict[str, str] = {
     "charge_min": "chargeMin",
     "charge_max": "chargeMax",
 }
+
+
+@dataclass(frozen=True)
+class _ToolReportAction:
+    """The report behind a manage_tools analytics action, the title its answer carries, and whether it holds cost."""
+
+    report: ToolReport
+    title: str
+    has_cost: bool = True
+
+
+_TOOL_REPORT_ACTIONS: Dict[str, _ToolReportAction] = {
+    "get_cost_breakdown": _ToolReportAction(COST_BY_TOOL, "Cost breakdown"),
+    "get_top_tools": _ToolReportAction(TOP_TOOLS_BY_CALL_COUNT, "Top tools", has_cost=False),
+    "get_success_rate": _ToolReportAction(TOOL_SUCCESS_RATE, "Success rate", has_cost=False),
+    "get_latency": _ToolReportAction(TOOL_LATENCY, "Tool latency", has_cost=False),
+    "get_cost_aggregated": _ToolReportAction(COST_BY_TOOL_AGGREGATED, "Aggregated cost per tool"),
+    "get_cost_by_agent": _ToolReportAction(COST_BY_TOOL_AGENT, "Cost by agent"),
+    "get_agent_breakdown": _ToolReportAction(AGENT_TOOL_BREAKDOWN, "Agent-tool breakdown"),
+    "get_cost_by_provider": _ToolReportAction(COST_BY_TOOL_PROVIDER, "Cost by provider"),
+    "get_cost_by_provider_aggregated": _ToolReportAction(
+        COST_BY_TOOL_PROVIDER_AGGREGATED, "Aggregated cost by provider"
+    ),
+}
+
+_TOOL_REPORT_WINDOW_ARGUMENTS = ("start_date", "end_date", "period")
+_TOOL_REPORT_FILTER_ARGUMENTS = ("tool_id", "provider", "agent", "tool_name", "granularity", "group")
+_TOOL_PERIODS = tuple(member.value for member in TimePeriod)
+
+
+def _refuse_tool_report_argument(action: str, name: str, value: Any, accepted: List[str]) -> ToolError:
+    return create_structured_validation_error(
+        message=(
+            f"{name} is not accepted by {action}: the platform's report for this action has no "
+            "such filter, so the value would be dropped and the answer would cover every row."
+        ),
+        field=name,
+        value=value,
+        suggestions=[
+            f"{action} accepts: {', '.join(accepted) or 'no window or filter'}",
+            "Remove the argument and retry",
+        ],
+    )
+
+
+def _as_list(value: Any) -> List[Any]:
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def _tool_report_filters(action: str, report: ToolReport, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """The caller's filters under the names ``report`` declares; any other filter is refused."""
+    accepted = [*_TOOL_REPORT_WINDOW_ARGUMENTS, *report.filters]
+    filters: Dict[str, Any] = {}
+    for name in _TOOL_REPORT_FILTER_ARGUMENTS:
+        value = arguments.get(name)
+        if value is None:
+            continue
+        if name not in report.filters:
+            raise _refuse_tool_report_argument(action, name, value, accepted)
+        filters[report.filters[name]] = _as_list(value)
+    return filters
+
+
+def _tool_report_window(arguments: Dict[str, Any]) -> Optional[ToolReportWindow]:
+    """start_date/end_date (a yyyy-MM-dd day or an ISO-8601 instant, at most CALENDAR_RANGE_MAX_DAYS apart), or a period name, or the platform default."""
+    start, end, period = (arguments.get(name) for name in _TOOL_REPORT_WINDOW_ARGUMENTS)
+    if period is not None and (start is not None or end is not None):
+        raise create_structured_validation_error(
+            message="Pass either period or start_date/end_date, not both",
+            field="period",
+            value=period,
+            suggestions=["Drop period to read start_date to end_date", "Or drop the dates to read the period"],
+        )
+    if period is not None:
+        period = str(period).upper()
+        if period not in _TOOL_PERIODS:
+            raise create_structured_validation_error(
+                message=f"Unsupported period: {period}",
+                field="period",
+                value=period,
+                suggestions=[f"Pass one of: {', '.join(_TOOL_PERIODS)}"],
+            )
+        return ToolReportWindow.of(period)
+    if start is None and end is None:
+        return None
+    if start is None or end is None:
+        missing = "start_date" if start is None else "end_date"
+        raise create_structured_validation_error(
+            message="start_date and end_date go together: pass both or neither",
+            field=missing,
+            value=None,
+            suggestions=["Pass both, for example start_date='2026-09-01' and end_date='2026-09-30'"],
+        )
+    try:
+        start_date, end_date = capped_utc_instant_bounds(start, end)
+    except CalendarRangeError as error:
+        raise create_structured_validation_error(
+            message=str(error),
+            field=error.field,
+            value=arguments.get(error.field),
+            suggestions=[
+                "Pass yyyy-MM-dd days (both included) or ISO-8601 instants with Z or an offset",
+                f"Keep the range to at most {CALENDAR_RANGE_MAX_DAYS} days",
+            ],
+        ) from None
+    return ToolReportWindow(start=start_date, end=end_date)
+
+
+def _render_tool_report(action: str, read: "ToolReportRead") -> str:
+    # Deferred import: module-level import would trigger a circular
+    # import chain through analytics/__init__.py.
+    from ..analytics.cost_enrichment import enrich_cost_response  # noqa: PLC0415
+    from ..analytics.envelope_reads import with_unread_pages_notice  # noqa: PLC0415
+
+    report_action = _TOOL_REPORT_ACTIONS[action]
+    body: Any = read.envelope
+    if report_action.has_cost:
+        body = enrich_cost_response(body)
+    text = f"{report_action.title} ({read.window}):\n{json.dumps(body, indent=2)}"
+    return with_unread_pages_notice(text, read.unread)
 
 
 @lru_cache(maxsize=1)
@@ -107,6 +246,18 @@ _UNSUPPORTED_TOOL_FIELDS: Dict[str, str] = {
 }
 
 
+# BACK-4696: the platform PUT requires name, toolId and toolType, keeps the
+# stored value of any other field left out, and defaults a missing enabled to
+# true. An update sends these four from the stored tool under the caller's
+# change. Stored pricing is not resent: a non-null pricing rebuilds the plan.
+_TOOL_PUT_FIELDS: Tuple[str, ...] = ("name", "toolId", "toolType", "enabled")
+_PARTIAL_UPDATE_NOTE = (
+    "replace is an alias for update; both are partial updates: the stored tool's "
+    f"{', '.join(_TOOL_PUT_FIELDS[:-1])} and {_TOOL_PUT_FIELDS[-1]} are sent back with only "
+    "the fields in tool_data changed"
+)
+
+
 def _reject_unsupported_tool_fields(tool_data: Dict[str, Any]) -> None:
     """Refuse fields the Tool Registry does not store, instead of dropping them."""
     for field, reason in _UNSUPPORTED_TOOL_FIELDS.items():
@@ -146,6 +297,7 @@ class ToolManager:
             "tools": tools,
             "pagination": page_info,
             "total_found": len(tools),
+            "total_records": platform_total(page_info),
             "page": page,
         }
 
@@ -270,9 +422,19 @@ class ToolManager:
                         "Use get_pricing_help action for pricing structure reference",
                     ],
                 )
-        if "teamId" not in tool_data:
-            tool_data["teamId"] = self.client.team_id
-        return await self.client.update_tool(tool_id, tool_data)
+        stored = await self.get_tool({"tool_id": tool_id})
+        if not isinstance(stored, dict) or not stored.get("toolId") or not stored.get("toolType"):
+            raise ToolError(
+                message=f"Could not read tool {tool_id} to update it",
+                error_code=ErrorCodes.API_ERROR,
+                field="tool_id",
+                value=tool_id,
+                suggestions=["Check the id with get or list"],
+            )
+        body = {field: stored[field] for field in _TOOL_PUT_FIELDS if stored.get(field) is not None}
+        body.update(tool_data)
+        body.setdefault("teamId", self.client.team_id)
+        return await self.client.update_tool(tool_id, body)
 
     async def delete_tool(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Delete a tool by ID."""
@@ -374,45 +536,31 @@ class ToolManager:
         )
         return await self.client.list_tool_events(page=page, size=size, **filters)
 
-    # Analytics-relevant params — only these are forwarded to analytics client methods.
-    # `period` and `group` mirror the analytics contract used by business_analytics_management
-    # (see BACK-1096): without them in this set the MCP layer silently dropped the params
-    # before they reached the server.
-    _ANALYTICS_PARAMS = {
-        "start_date",
-        "end_date",
-        "granularity",
-        "tool_id",
-        "tool_name",
-        "agent",
-        "provider",
-        "period",
-        "group",
-    }
+    async def read_tool_report(self, action: str, arguments: Dict[str, Any]) -> "ToolReportRead":
+        """Read every page of the report behind a tool analytics action, under the platform's names."""
+        # Deferred import: module-level import would trigger a circular
+        # import chain through analytics/__init__.py.
+        from ..analytics.tool_reports import read_tool_report  # noqa: PLC0415
 
-    def _extract_analytics_filters(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract only analytics-relevant params from arguments."""
-        return {k: v for k, v in arguments.items() if k in self._ANALYTICS_PARAMS and v is not None}
+        report = _TOOL_REPORT_ACTIONS[action].report
+        filters = _tool_report_filters(action, report, arguments)
+        return await read_tool_report(self.client, report, _tool_report_window(arguments), filters)
 
-    async def get_cost_breakdown(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def get_cost_breakdown(self, arguments: Dict[str, Any]) -> "ToolReportRead":
         """Get cost breakdown by tool over time."""
-        filters = self._extract_analytics_filters(arguments)
-        return await self.client.get_cost_by_tool(**filters)
+        return await self.read_tool_report("get_cost_breakdown", arguments)
 
-    async def get_top_tools(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Get top 20 tools by call count."""
-        filters = self._extract_analytics_filters(arguments)
-        return await self.client.get_top_tools_by_call_count(**filters)
+    async def get_top_tools(self, arguments: Dict[str, Any]) -> "ToolReportRead":
+        """Get tools ranked by call count."""
+        return await self.read_tool_report("get_top_tools", arguments)
 
-    async def get_success_rate(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def get_success_rate(self, arguments: Dict[str, Any]) -> "ToolReportRead":
         """Get success rate per tool."""
-        filters = self._extract_analytics_filters(arguments)
-        return await self.client.get_tool_success_rate(**filters)
+        return await self.read_tool_report("get_success_rate", arguments)
 
-    async def get_latency(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def get_latency(self, arguments: Dict[str, Any]) -> "ToolReportRead":
         """Get average execution duration per tool."""
-        filters = self._extract_analytics_filters(arguments)
-        return await self.client.get_tool_latency(**filters)
+        return await self.read_tool_report("get_latency", arguments)
 
     async def record_event(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Record an event for a specific tool via per-tool endpoint."""
@@ -448,33 +596,31 @@ class ToolManager:
         size = arguments.get("size", 20)
         return await self.client.get_tool_events(tool_id, page=page, size=size)
 
-    async def get_cost_aggregated(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def get_cost_aggregated(self, arguments: Dict[str, Any]) -> "ToolReportRead":
         """Get aggregated cost per tool."""
-        filters = self._extract_analytics_filters(arguments)
-        return await self.client.get_cost_by_tool_aggregated(**filters)
+        return await self.read_tool_report("get_cost_aggregated", arguments)
 
-    async def get_cost_by_agent(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def get_cost_by_agent(self, arguments: Dict[str, Any]) -> "ToolReportRead":
         """Get tool cost grouped by agent."""
-        filters = self._extract_analytics_filters(arguments)
-        return await self.client.get_cost_by_tool_agent(**filters)
+        return await self.read_tool_report("get_cost_by_agent", arguments)
 
-    async def get_agent_breakdown(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def get_agent_breakdown(self, arguments: Dict[str, Any]) -> "ToolReportRead":
         """Get cost per (agent, tool) pair."""
-        filters = self._extract_analytics_filters(arguments)
-        return await self.client.get_agent_tool_breakdown(**filters)
+        return await self.read_tool_report("get_agent_breakdown", arguments)
 
-    async def get_cost_by_provider(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def get_cost_by_provider(self, arguments: Dict[str, Any]) -> "ToolReportRead":
         """Get cost by tool provider over time."""
-        filters = self._extract_analytics_filters(arguments)
-        return await self.client.get_cost_by_tool_provider(**filters)
+        return await self.read_tool_report("get_cost_by_provider", arguments)
 
-    async def get_cost_by_provider_aggregated(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def get_cost_by_provider_aggregated(self, arguments: Dict[str, Any]) -> "ToolReportRead":
         """Get aggregated cost by provider."""
-        filters = self._extract_analytics_filters(arguments)
-        return await self.client.get_cost_by_tool_provider_aggregated(**filters)
+        return await self.read_tool_report("get_cost_by_provider_aggregated", arguments)
 
     async def get_filter_options(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Get available tool IDs for filter dropdowns."""
+        """Get available tool IDs for filter dropdowns; the read takes no window or filter."""
+        for name in (*_TOOL_REPORT_WINDOW_ARGUMENTS, *_TOOL_REPORT_FILTER_ARGUMENTS):
+            if arguments.get(name) is not None:
+                raise _refuse_tool_report_argument("get_filter_options", name, arguments[name], [])
         return await self.client.get_tool_filter_options()
 
     async def create_simple(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -772,7 +918,10 @@ class ToolManagement(ToolBase):
                 },
                 "tool_id": {
                     "type": "string",
-                    "description": "Tool identifier for CRUD, event, and analytics operations",
+                    "description": (
+                        "Tool identifier for CRUD and event operations; among the analytics "
+                        "actions only get_cost_breakdown takes it (sent as toolIds)"
+                    ),
                 },
                 "tool_name": {
                     "type": "string",
@@ -943,39 +1092,45 @@ class ToolManagement(ToolBase):
                 },
                 "start_date": {
                     "type": "string",
-                    "description": "Start date for analytics queries (ISO 8601)",
+                    "description": (
+                        "Start of the window for the tool analytics actions: a yyyy-MM-dd day "
+                        "(from its first millisecond, UTC) or an ISO-8601 instant with Z or an "
+                        "offset. Goes with end_date; replaces period."
+                    ),
                 },
                 "end_date": {
                     "type": "string",
-                    "description": "End date for analytics queries (ISO 8601)",
+                    "description": (
+                        "End of the window for the tool analytics actions: a yyyy-MM-dd day "
+                        "(to its last millisecond, UTC) or an ISO-8601 instant. Goes with start_date."
+                    ),
                 },
                 "granularity": {
                     "type": "string",
-                    "description": "Time granularity for analytics (day, week, month)",
-                },
-                "agent": {
-                    "type": "string",
-                    "description": "Agent identifier for agent-scoped analytics (get_cost_by_agent, get_agent_breakdown)",
+                    "description": (
+                        "Not accepted by the tool analytics actions: the platform picks the time "
+                        "bucket from the window's length, and a value sent here is refused."
+                    ),
                 },
                 "provider": {
                     "type": "string",
-                    "description": "Provider identifier for provider-scoped analytics (get_cost_by_provider, get_cost_by_provider_aggregated)",
+                    "description": "Tool provider to keep, sent as providers; only get_cost_by_provider takes it",
                 },
                 "period": {
                     "type": "string",
-                    "enum": [
-                        "HOUR",
-                        "EIGHT_HOURS",
-                        "TWENTY_FOUR_HOURS",
-                        "SEVEN_DAYS",
-                        "THIRTY_DAYS",
-                        "TWELVE_MONTHS",
-                    ],
-                    "description": "Time window for analytics actions (e.g. SEVEN_DAYS). Mirrors the period parameter used by business_analytics_management.",
+                    "enum": list(_TOOL_PERIODS),
+                    "description": (
+                        "Rolling window for the tool analytics actions (e.g. SEVEN_DAYS), sent as "
+                        "the startDate and endDate it covers. Without period or start_date/end_date "
+                        "the platform answers for the last 24 hours."
+                    ),
                 },
                 "group": {
                     "type": "string",
-                    "description": "Grouping/aggregation key for analytics actions (e.g. TOTAL, MEAN, MAXIMUM, MINIMUM, or a dimension name like 'cost'). Forwarded as-is to the server.",
+                    "description": (
+                        "Not accepted by the tool analytics actions: none of their reports takes a "
+                        "grouping, and a value sent here is refused."
+                    ),
                 },
             },
             "required": ["action"],
@@ -1049,9 +1204,10 @@ class ToolManagement(ToolBase):
                 limitations=[
                     "Requires valid API authentication",
                     "Tool names must be unique within the organization",
-                    "Some fields (toolType, id) are immutable after creation",
+                    "id is fixed after creation; toolId and toolType can be changed with update "
+                    "(a toolId already used in the organization is refused)",
                     "get uses system UUID; get_by_tool_id uses team-scoped toolId",
-                    "replace is an alias for update; both perform partial updates via the upstream PUT endpoint",
+                    _PARTIAL_UPDATE_NOTE,
                     "delete is permanent — the Tool Registry API has no restore endpoint, so a "
                     "deleted tool has to be created again from scratch",
                 ],
@@ -1151,20 +1307,34 @@ class ToolManagement(ToolBase):
                 name="Tool Analytics",
                 description="Cost, performance, and usage analytics across registered tools",
                 parameters={
-                    "get_cost_breakdown": {"tool_id": "str", "start_date": "str (optional, ISO 8601)", "end_date": "str (optional, ISO 8601)", "granularity": "str (optional: day|week|month)"},
-                    "get_top_tools": {"tool_id": "str (optional)", "start_date": "str (optional, ISO 8601)", "end_date": "str (optional, ISO 8601)"},
-                    "get_success_rate": {"tool_id": "str", "start_date": "str (optional, ISO 8601)", "end_date": "str (optional, ISO 8601)"},
-                    "get_latency": {"tool_id": "str", "start_date": "str (optional, ISO 8601)", "end_date": "str (optional, ISO 8601)"},
+                    "get_cost_breakdown": {
+                        "tool_id": "str (optional, sent as toolIds)",
+                        "start_date": "str (optional, yyyy-MM-dd or ISO 8601, with end_date)",
+                        "end_date": "str (optional, yyyy-MM-dd or ISO 8601, with start_date)",
+                        "period": "str (optional, in place of start_date/end_date)",
+                    },
+                    "get_cost_by_provider": {
+                        "provider": "str (optional, sent as providers)",
+                        "start_date": "str (optional)",
+                        "end_date": "str (optional)",
+                        "period": "str (optional)",
+                    },
+                    "get_top_tools": {"start_date": "str (optional)", "end_date": "str (optional)", "period": "str (optional)"},
+                    "get_success_rate": {"start_date": "str (optional)", "end_date": "str (optional)", "period": "str (optional)"},
+                    "get_latency": {"start_date": "str (optional)", "end_date": "str (optional)", "period": "str (optional)"},
                 },
                 examples=[
-                    "get_cost_breakdown(tool_id='tool_123', start_date='2025-03-01', end_date='2025-03-31', granularity='day')",
-                    "get_top_tools(start_date='2025-04-01', end_date='2025-04-07')",
-                    "get_success_rate(tool_id='tool_123')",
-                    "get_latency(tool_id='tool_123')",
+                    "get_cost_breakdown(tool_id='tool_123', start_date='2026-09-01', end_date='2026-09-30')",
+                    "get_cost_aggregated(period='SEVEN_DAYS')",
+                    "get_cost_by_provider(provider='anthropic', period='TWENTY_FOUR_HOURS')",
+                    "get_top_tools(start_date='2026-04-01', end_date='2026-04-07')",
                 ],
                 limitations=[
                     "Analytics data availability depends on metered events",
-                    "Granularity options: day, week, month",
+                    "Every action takes start_date/end_date or period; without them the platform answers for the last 24 hours",
+                    "tool_id is taken only by get_cost_breakdown and provider only by get_cost_by_provider; "
+                    "agent, tool_name, granularity and group are refused because no report takes them",
+                    "Every page of the report is read; an answer that stops early says so",
                 ],
             ),
             ToolCapability(
@@ -1240,7 +1410,7 @@ class ToolManagement(ToolBase):
             "The usage event log is read-only: list_events / get_events read it, meter_event / "
             "record_event add to it, and no action edits or removes a logged event",
             "Ensure tool_data includes 'name' and 'toolType' when using create",
-            "replace is an alias for update; both perform partial updates via the upstream PUT endpoint",
+            _PARTIAL_UPDATE_NOTE,
         ]
 
     async def handle_action(
@@ -1252,9 +1422,6 @@ class ToolManagement(ToolBase):
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle tool registry management actions."""
         try:
-            # Deferred import: module-level import would trigger a circular
-            # import chain through analytics/__init__.py.
-            from ..analytics.cost_enrichment import enrich_cost_response  # noqa: PLC0415
             if action == "get_tool_metadata":
                 metadata = await self.get_tool_metadata()
                 return [TextContent(type="text", text=json.dumps(metadata.to_dict(), indent=2))]
@@ -1371,7 +1538,13 @@ class ToolManagement(ToolBase):
                 return [
                     TextContent(
                         type="text",
-                        text=f"Found {result['total_found']} tools (page {result.get('page', 0) + 1}):\n\n"
+                        text=format_page_count_heading(
+                            "tools",
+                            len(result["tools"]),
+                            result["pagination"],
+                            result["page"],
+                        )
+                        + "\n\n"
                         + json.dumps(result, indent=2),
                     )
                 ]
@@ -1434,47 +1607,9 @@ class ToolManagement(ToolBase):
                 result = await manager.get_events(arguments)
                 return [TextContent(type="text", text=f"Tool events:\n{json.dumps(result, indent=2)}")]
 
-            elif action == "get_cost_breakdown":
-                result = await manager.get_cost_breakdown(arguments)
-                result = enrich_cost_response(result)
-                return [TextContent(type="text", text=f"Cost breakdown:\n{json.dumps(result, indent=2)}")]
-
-            elif action == "get_top_tools":
-                result = await manager.get_top_tools(arguments)
-                return [TextContent(type="text", text=f"Top tools:\n{json.dumps(result, indent=2)}")]
-
-            elif action == "get_success_rate":
-                result = await manager.get_success_rate(arguments)
-                return [TextContent(type="text", text=f"Success rate:\n{json.dumps(result, indent=2)}")]
-
-            elif action == "get_latency":
-                result = await manager.get_latency(arguments)
-                return [TextContent(type="text", text=f"Tool latency:\n{json.dumps(result, indent=2)}")]
-
-            elif action == "get_cost_aggregated":
-                result = await manager.get_cost_aggregated(arguments)
-                result = enrich_cost_response(result)
-                return [TextContent(type="text", text=f"Aggregated cost per tool:\n{json.dumps(result, indent=2)}")]
-
-            elif action == "get_cost_by_agent":
-                result = await manager.get_cost_by_agent(arguments)
-                result = enrich_cost_response(result)
-                return [TextContent(type="text", text=f"Cost by agent:\n{json.dumps(result, indent=2)}")]
-
-            elif action == "get_agent_breakdown":
-                result = await manager.get_agent_breakdown(arguments)
-                result = enrich_cost_response(result)
-                return [TextContent(type="text", text=f"Agent-tool breakdown:\n{json.dumps(result, indent=2)}")]
-
-            elif action == "get_cost_by_provider":
-                result = await manager.get_cost_by_provider(arguments)
-                result = enrich_cost_response(result)
-                return [TextContent(type="text", text=f"Cost by provider:\n{json.dumps(result, indent=2)}")]
-
-            elif action == "get_cost_by_provider_aggregated":
-                result = await manager.get_cost_by_provider_aggregated(arguments)
-                result = enrich_cost_response(result)
-                return [TextContent(type="text", text=f"Aggregated cost by provider:\n{json.dumps(result, indent=2)}")]
+            elif action in _TOOL_REPORT_ACTIONS:
+                read = await manager.read_tool_report(action, arguments)
+                return [TextContent(type="text", text=_render_tool_report(action, read))]
 
             elif action == "get_filter_options":
                 result = await manager.get_filter_options(arguments)

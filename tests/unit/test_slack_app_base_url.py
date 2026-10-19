@@ -103,8 +103,8 @@ class TestSetupStatusBaseUrl:
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=None)
         with patch.object(tool, "get_client", AsyncMock(return_value=client)), patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
-            side_effect=lambda key, *args: args[0] if args else None,
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_default_slack_config_id",
+            return_value=None,
         ), patch(RESOLVER_CONFIG, side_effect=_config_reader(env)):
             result = await tool.handle_action("setup_status", {})
         text = result[0].text

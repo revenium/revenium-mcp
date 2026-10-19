@@ -4,6 +4,7 @@ import json
 import re
 from mcp.types import TextContent
 
+from src.revenium_mcp_server.common import formatting
 from src.revenium_mcp_server.common.formatting import (
     format_json_response,
     format_list_response,
@@ -157,3 +158,69 @@ class TestFormatSuccessResponse:
         assert len(result) == 1
         assert isinstance(result[0], TextContent)
         assert result[0].type == "text"
+
+
+def format_page_count_heading(*args):
+    assert hasattr(formatting, "format_page_count_heading"), "format_page_count_heading is missing"
+    return formatting.format_page_count_heading(*args)
+
+
+class TestFormatPageCountHeading:
+    def test_total_and_pages_known(self):
+        heading = format_page_count_heading(
+            "users", 20, {"totalElements": 500, "totalPages": 25}, 0
+        )
+        assert heading == "Found 20 of 500 users (page 1 of 25):"
+
+    def test_total_without_pages(self):
+        heading = format_page_count_heading("users", 20, {"totalElements": 500}, 2)
+        assert heading == "Found 20 of 500 users (page 3):"
+
+    def test_total_missing(self):
+        heading = format_page_count_heading("users", 20, {}, 0)
+        assert heading == (
+            "Found 20 users on page 1; the platform reported no total, so more may exist:"
+        )
+
+    def test_total_given_as_text_is_treated_as_missing(self):
+        heading = format_page_count_heading(
+            "users", 20, {"totalElements": "500", "totalPages": 25}, 0
+        )
+        assert heading == (
+            "Found 20 users on page 1; the platform reported no total, so more may exist:"
+        )
+
+    def test_zero_total(self):
+        heading = format_page_count_heading(
+            "users", 0, {"totalElements": 0, "totalPages": 0}, 0
+        )
+        assert heading == "Found 0 users; the platform reports none."
+
+    def test_page_past_the_end(self):
+        heading = format_page_count_heading(
+            "users", 0, {"totalElements": 500, "totalPages": 25}, 30
+        )
+        assert heading == (
+            "Page 31 is past the last page (25 pages); the platform reports 500 users "
+            "in total. Pass page=0 for the first page."
+        )
+
+    def test_page_past_the_end_without_pages(self):
+        heading = format_page_count_heading("users", 0, {"totalElements": 500}, 30)
+        assert heading == (
+            "Page 31 is past the last page; the platform reports 500 users "
+            "in total. Pass page=0 for the first page."
+        )
+
+    def test_one_row(self):
+        heading = format_page_count_heading(
+            "users", 1, {"totalElements": 1, "totalPages": 1}, 0
+        )
+        assert heading == "Found 1 of 1 users (page 1 of 1):"
+
+    def test_page_that_is_not_an_int_reads_as_the_first_page(self):
+        for page in ("1", True, None):
+            heading = format_page_count_heading(
+                "users", 20, {"totalElements": 500, "totalPages": 25}, page
+            )
+            assert heading == "Found 20 of 500 users (page 1 of 25):"

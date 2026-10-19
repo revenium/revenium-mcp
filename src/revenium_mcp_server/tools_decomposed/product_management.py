@@ -9,9 +9,24 @@ the dual-layer delegation pattern.
 """
 
 import json
+import math
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, NoReturn, Optional, Tuple, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    NoReturn,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -20,6 +35,7 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
+from ..api_field_mapper import APIFieldMapper
 from ..client import ReveniumAPIError, ReveniumClient
 from ..common.error_handling import (
     ErrorCodes,
@@ -29,7 +45,7 @@ from ..common.error_handling import (
 )
 from ..common.pagination_performance import validate_pagination_with_performance
 from ..common.partial_update_handler import PartialUpdateHandler
-from ..common.validation import SAFE_INT_MAX
+from ..common.validation import SAFE_INT_MAX, preprocess_boolean_parameters
 from ..common.ucm_config import log_ucm_status
 from ..common.update_configs import UpdateConfigFactory
 from ..config_store import get_config_value
@@ -232,6 +248,368 @@ def _validate_products_pagination(page: Any, size: Any) -> None:
 _ID_SCAN_PAGE_SIZE = 20
 _ID_SCAN_MAX_PAGES = 5
 
+_SUBSCRIBER_NEXT_STEP = (
+    'Create subscribers using manage_customers(action="create", '
+    'resource_type="subscribers", resource_data={"email": "...", '
+    '"firstName": "...", "lastName": "...", '
+    '"organizationIds": ["<organization id>"]}) '
+    "to set up users who will access this product"
+)
+_SUBSCRIPTION_NEXT_STEP = (
+    'Create subscriptions using manage_subscriptions(action="create", '
+    "subscription_data={...}) to subscribe those users to this product"
+)
+_ORGANIZATION_NOT_FOUND_STATUSES = (400, 404)
+
+
+def _usage_based_quick_create_error(name: str, per_unit_price: Any) -> ToolError:
+    """Explain why quick create cannot build a usage-priced product."""
+    return create_structured_validation_error(
+        message=(
+            "create_simple cannot build a usage-based product: usage billing needs "
+            "a metering element chosen from your organization. Nothing was created."
+        ),
+        field="pricing_model",
+        value="usage_based",
+        suggestions=[
+            "Follow the 4-step usage-based billing workflow below",
+            "Use manage_metering_elements(action='list') to see existing AI billing elements",
+            "Copy the elementDefinitionId from existing elements (totalCost, inputTokenCount, etc.)",
+            "Create the product using the full create() action with proper ratingAggregations",
+            "Only create new metering elements if existing ones don't match your requirements",
+        ],
+        examples={
+            "step_1": {
+                "action": "Check existing metering elements",
+                "tool_call": "manage_metering_elements(action='list')",
+                "purpose": "See available AI billing elements (totalCost, inputTokenCount, outputTokenCount, etc.)",
+            },
+            "step_2": {
+                "action": "Choose appropriate existing element",
+                "guidance": "Use existing AI elements when possible to avoid duplicates",
+                "available_elements": "totalCost, inputTokenCost, outputTokenCost, inputTokenCount, outputTokenCount, totalTokenCount",
+            },
+            "step_3": {
+                "action": "Copy the elementDefinitionId",
+                "instruction": "COPY_FROM_STEP_1 - Copy the actual elementDefinitionId from the list results",
+                "warning": "IDs are unique per account and cannot be reused across accounts",
+            },
+            "step_4": {
+                "action": "Create usage-based product with full create() action",
+                "example": {
+                    "name": name,
+                    "sourceIds": ["<source id from manage_sources(action='list')>"],
+                    "plan": {
+                        "type": "SUBSCRIPTION",
+                        "ratingAggregations": [
+                            {
+                                "elementDefinitionId": "COPY_FROM_STEP_1",
+                                "aggregationType": "SUM",
+                                "tiers": [
+                                    {"up_to": None, "unit_amount": str(per_unit_price)}
+                                ],
+                            }
+                        ],
+                    },
+                },
+            },
+            "workflow_guidance": {
+                "step_1": "Use manage_metering_elements(action='list') to see existing AI billing elements",
+                "step_2": "Choose appropriate existing element (totalCost, inputTokenCount, outputTokenCount, etc.)",
+                "step_3": "Copy the elementDefinitionId from the list results - IDs are unique per account",
+                "step_4": "Use the copied elementDefinitionId in ratingAggregations",
+                "step_5": "Only create new metering elements if existing ones don't match your needs",
+                "available_element_names": "totalCost, inputTokenCost, outputTokenCost, inputTokenCount, outputTokenCount, totalTokenCount, reasoningTokenCount, cacheCreationTokenCount, cacheReadTokenCount",
+                "warning": "NEVER hardcode element IDs - they are unique per account and must be looked up",
+            },
+            "product_lifecycle": "PRODUCT LIFECYCLE: Usage-based billing requires metering elements to track and bill for actual usage",
+        },
+    )
+
+
+def _dropped_quick_create_input_error(field: str, reason: str, suggestions: List[str]) -> ToolError:
+    """Refuse a create_simple input the product would silently lose."""
+    return create_structured_validation_error(
+        message=f"{reason}. Nothing was created.",
+        field=field,
+        value=None,
+        suggestions=suggestions,
+    )
+
+
+_INPUTS_ONLY_ONE_ACTION_READS = {
+    "pricing_model": "create_simple",
+    "monthly_price": "create_simple",
+    "per_unit_price": "create_simple",
+    "setup_fee": "create_simple",
+    "setup_fee_type": "create_simple",
+    "subscription_data": "create_with_subscription",
+    "text": "clarify_pricing",
+    "requirements": "suggest_template",
+}
+
+
+def _refuse_inputs_the_action_ignores(action: str, arguments: Dict[str, Any]) -> None:
+    """Refuse an input another action reads, so it is never silently dropped."""
+    for name, reader in _INPUTS_ONLY_ONE_ACTION_READS.items():
+        if arguments.get(name) is not None and action != reader:
+            raise create_structured_validation_error(
+                message=(
+                    f"{name} is read only by the {reader} action, not by {action}; "
+                    "nothing was sent."
+                ),
+                field=name,
+                value=action,
+                suggestions=[
+                    f"Use manage_products(action=\"{reader}\", ...) to use {name}",
+                    f"Or drop {name} from this {action} call",
+                ],
+            )
+
+
+_QUICK_CREATES_WITHOUT_PREVIEW = frozenset({"create_simple", "create_with_subscription"})
+
+
+def _refuse_dry_run_on_quick_creates(action: str, arguments: Dict[str, Any]) -> None:
+    """Refuse dry_run on a quick create, whose handler would write anyway.
+
+    An unrecognised string counts as a request, so a value the boolean
+    preprocessing does not know fails closed instead of letting the write run.
+    """
+    if action not in _QUICK_CREATES_WITHOUT_PREVIEW:
+        return
+    requested = arguments.get("dry_run")
+    if not preprocess_boolean_parameters({"dry_run": requested}, ["dry_run"])["dry_run"]:
+        return
+    raise ToolError(
+        message=(
+            f"{action} has no preview, so the dry_run request was refused and "
+            "nothing was sent or changed. To preview a product, run "
+            'manage_products(action="create", product_data={...}, dry_run=True), '
+            'or manage_products(action="get_templates") to see ready-made product shapes. '
+            f"Run {action} without dry_run only after the customer confirms."
+        ),
+        error_code=ErrorCodes.INVALID_PARAMETER,
+        field="dry_run",
+        value=requested,
+        suggestions=[
+            'Preview with manage_products(action="create", product_data={...}, dry_run=True)',
+            'See product shapes with manage_products(action="get_templates")',
+            f"Run {action} without dry_run once the customer confirms",
+        ],
+    )
+
+
+def _create_input_mode(arguments: Dict[str, Any]) -> str:
+    """Name the create input mode a preview was built from."""
+    has_data = bool(arguments.get("product_data") or arguments.get("resource_data"))
+    if arguments.get("description"):
+        return "hybrid (description plus product_data)" if has_data else "natural language"
+    if has_data:
+        return "structured"
+    return "name only (auto-generated)"
+
+
+def _subscription_organization(subscription: Dict[str, Any]) -> str:
+    """Name the organization a subscription bills, from the embedded object or the id."""
+    organization = subscription.get("organization")
+    if isinstance(organization, dict) and organization.get("id"):
+        label = organization.get("label") or organization.get("name")
+        return f"{label} ({organization['id']})" if label else str(organization["id"])
+    return str(subscription.get("organizationId") or "N/A")
+
+
+@dataclass(frozen=True)
+class CreatePayload:
+    """The body a products create sends, and what the answer must tell the caller about it."""
+
+    body: Dict[str, Any]
+    notes: Tuple[str, ...] = ()
+
+
+_RATING_AGGREGATION_KEYS = ("rating_aggregations", "ratingAggregations")
+
+
+def _drop_aggregations_without_an_element(parsed_data: Dict[str, Any]) -> Optional[str]:
+    """Remove description-derived usage aggregations the platform refuses.
+
+    The description parser turns phrases such as "per call" into rating
+    aggregations with no elementDefinitionId, and the platform refuses those
+    with "Invalid JSON format - plan.ratingAggregations[0].elementDefinitionId".
+    Returns the note the answer carries when any were removed.
+    """
+    plan = parsed_data.get("plan")
+    if not isinstance(plan, dict):
+        return None
+    dropped: List[str] = []
+    for key in _RATING_AGGREGATION_KEYS:
+        aggregations = plan.get(key)
+        if not isinstance(aggregations, list):
+            continue
+        kept = [a for a in aggregations if isinstance(a, dict) and a.get("elementDefinitionId")]
+        dropped += [
+            str(a.get("name", "usage")) if isinstance(a, dict) else "usage"
+            for a in aggregations
+            if a not in kept
+        ]
+        plan[key] = kept
+    if not dropped:
+        return None
+    return (
+        f"Usage billing was not set up: the description asks for per-use billing "
+        f"({', '.join(dropped)}) but names no metering element, so the product bills "
+        f"only its plan tiers. To bill per use, add plan.ratingAggregations entries that "
+        f'each carry an elementDefinitionId from manage_metering_elements(action="list"), '
+        f'using manage_products(action="update").'
+    )
+
+
+_PRICING_MODELS =("subscription", "usage_based")
+_SETUP_FEE_TYPES = ("per_subscription", "per_customer")
+
+
+def _quick_create_price(
+    arguments: Dict[str, Any], field: str, default: Optional[float]
+) -> Optional[float]:
+    """Read one create_simple price; a provided price must be a finite number >= 0."""
+    value = arguments.get(field)
+    if value is None:
+        return default
+    number: Optional[float] = None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = value
+    elif isinstance(value, str):
+        try:
+            number = float(value)
+        except ValueError:
+            number = None
+    if number is None or not math.isfinite(number) or number < 0:
+        raise create_structured_validation_error(
+            message=f"{field} must be a finite number of zero or more, got {value!r}",
+            field=field,
+            value=value,
+            suggestions=[f"Send {field} as a number in USD, for example {field}=29.99"],
+        )
+    return number
+
+
+@dataclass(frozen=True)
+class _QuickCreatePricing:
+    """create_simple's pricing inputs, checked before anything is read or sent."""
+
+    monthly_price: float
+    setup_fee: Optional[float]
+    setup_fee_type: str
+
+    @classmethod
+    def from_arguments(cls, name: str, arguments: Dict[str, Any]) -> "_QuickCreatePricing":
+        pricing_model = arguments.get("pricing_model", "subscription")
+        if pricing_model not in _PRICING_MODELS:
+            raise create_structured_validation_error(
+                message=f"Unknown pricing_model {pricing_model!r}",
+                field="pricing_model",
+                value=pricing_model,
+                suggestions=[f"Use one of: {', '.join(_PRICING_MODELS)}"],
+            )
+        setup_fee_type = arguments.get("setup_fee_type", "per_subscription")
+        if setup_fee_type not in _SETUP_FEE_TYPES:
+            raise create_structured_validation_error(
+                message=f"Unknown setup_fee_type {setup_fee_type!r}",
+                field="setup_fee_type",
+                value=setup_fee_type,
+                suggestions=[f"Use one of: {', '.join(_SETUP_FEE_TYPES)}"],
+            )
+        monthly_price = _quick_create_price(arguments, "monthly_price", 0.0)
+        per_unit_price = _quick_create_price(arguments, "per_unit_price", 0.01)
+        setup_fee = _quick_create_price(arguments, "setup_fee", None)
+        if pricing_model == "usage_based":
+            raise _usage_based_quick_create_error(name, per_unit_price)
+        if arguments.get("per_unit_price") is not None:
+            raise _dropped_quick_create_input_error(
+                "per_unit_price",
+                "per_unit_price is only for usage-based pricing, which create_simple "
+                "cannot build",
+                [
+                    "Use monthly_price for a flat monthly fee",
+                    "Use the full create action with plan.ratingAggregations for per-unit pricing",
+                ],
+            )
+        if arguments.get("setup_fee_type") is not None and setup_fee is None:
+            raise _dropped_quick_create_input_error(
+                "setup_fee_type",
+                "setup_fee_type has no effect without a setup_fee",
+                ["Add setup_fee with the amount, or drop setup_fee_type"],
+            )
+        return cls(
+            monthly_price=cast(float, monthly_price),
+            setup_fee=None if setup_fee is None else float(setup_fee),
+            setup_fee_type=setup_fee_type,
+        )
+
+
+def _fold_source_id_spellings(product_data: Dict[str, Any]) -> None:
+    """Keep one source list in place: a given ``sourceIds`` wins, even when empty."""
+    if product_data.get("sourceIds") is not None:
+        product_data.pop("source_ids", None)
+    elif product_data.get("source_ids") is not None:
+        product_data["sourceIds"] = product_data.pop("source_ids")
+
+
+def _apply_draft_defaults(product_data: Dict[str, Any]) -> None:
+    """A plain create makes a draft: unpublished, and only the sources the caller named."""
+    _fold_source_id_spellings(product_data)
+    if product_data.get("published") is None:
+        product_data["published"] = False
+
+
+def _describe_source(source: Dict[str, Any]) -> str:
+    source_id = source.get("id") or "id not returned"
+    label = source.get("label")
+    return f"{source_id} ({label})" if label else str(source_id)
+
+
+def _publication_and_source_claims(product: Dict[str, Any]) -> List[str]:
+    """Sentences stating what the platform says was stored; silent on what it omits."""
+    claims = []
+    if product.get("published") is True:
+        claims.append("It is published.")
+    elif product.get("published") is False:
+        claims.append("It is not published.")
+    sources = product.get("sources")
+    if isinstance(sources, list):
+        if sources:
+            attached = ", ".join(_describe_source(source) for source in sources)
+            claims.append(f"Data sources attached: {attached}.")
+        else:
+            claims.append("No data source is attached.")
+    return claims
+
+
+def _can_take_subscriptions(product: Dict[str, Any]) -> bool:
+    sources = product.get("sources")
+    return product.get("published") is True and isinstance(sources, list) and bool(sources)
+
+
+def _missing_subscription_requirements_step(product: Dict[str, Any], product_id: Any) -> str:
+    """Next step naming only what the product still lacks to take subscriptions."""
+    sources = product.get("sources")
+    has_source = isinstance(sources, list) and bool(sources)
+    fields = []
+    needs = []
+    if product.get("published") is not True:
+        fields.append("'published': True")
+        needs.append("publish it")
+    if not has_source:
+        fields.append("'sourceIds': ['<source id>']")
+        needs.append("attach a data source")
+    step = (
+        f"Before it can take subscriptions, {' and '.join(needs)}: "
+        f"update(product_id='{product_id}', product_data={{{', '.join(fields)}}})"
+    )
+    if not has_source:
+        step += ", with a source id from manage_sources(action='list')"
+    return step
+
 
 async def _first_id_bearing_entry_id(
     fetch_page: Callable[..., Awaitable[Any]],
@@ -422,11 +800,32 @@ class ProductManager:
         self, arguments: Dict[str, Any], enhancement_processor: Any = None
     ) -> Dict[str, Any]:
         """Enhanced create with unified progressive complexity + NLP support."""
+        payload = await self.prepare_create_payload(arguments, enhancement_processor)
+
+        # Create product using validated data
+        logger.info(f"Creating product via API: {payload.body.get('name')}")
+        result = await self.client.create_product(payload.body)
+        logger.info(f"Product created successfully with ID: {result.get('id', 'unknown')}")
+
+        return {
+            "action": "create",
+            "data": result,
+            "notes": list(payload.notes),
+            "metadata": {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+
+    async def prepare_create_payload(
+        self, arguments: Dict[str, Any], enhancement_processor: Any = None
+    ) -> CreatePayload:
+        """Build and validate the body create would send; reads, never writes."""
         # Handle both field names for backward compatibility
-        product_data = arguments.get("product_data") or arguments.get("resource_data") or {}
+        product_data = dict(arguments.get("product_data") or arguments.get("resource_data") or {})
         description = arguments.get("description")
         name = arguments.get("name")
         auto_generate = arguments.get("auto_generate", True)
+        notes: List[str] = []
 
         # UNIFIED PROGRESSIVE COMPLEXITY: Handle multiple input modes
         if description:
@@ -487,6 +886,10 @@ class ProductManager:
                 not parsed_data["plan"].get("name") or parsed_data["plan"]["name"].strip() == ""
             ):
                 parsed_data["plan"]["name"] = f"{parsed_data['name']} Plan"
+
+            usage_note = _drop_aggregations_without_an_element(parsed_data)
+            if usage_note and "plan" not in product_data:
+                notes.append(usage_note)
 
             # Mode 3: Hybrid - Merge with any provided resource_data (user override)
             product_data = {**parsed_data, **product_data}
@@ -577,6 +980,8 @@ class ProductManager:
                 },
             )
 
+        _apply_draft_defaults(product_data)
+
         # Add system-managed fields
         if "teamId" not in product_data:
             product_data["teamId"] = self.client.team_id
@@ -584,29 +989,6 @@ class ProductManager:
             owner_id = get_config_value("REVENIUM_OWNER_ID")
             if owner_id:
                 product_data["ownerId"] = owner_id
-
-        # Assign default source to make product subscription-ready
-        # This is required for subscription creation to work - products without sources cause "List is empty" errors
-        if "sourceIds" not in product_data or not product_data["sourceIds"]:
-            try:
-                default_source_id, source_scan_truncated = await _first_id_bearing_entry_id(
-                    self.client.get_sources, self.client._extract_embedded_data
-                )
-                if default_source_id:
-                    product_data["sourceIds"] = [default_source_id]
-                    logger.info(
-                        f"Assigned default source {default_source_id} to make product subscription-ready"
-                    )
-                elif source_scan_truncated:
-                    logger.warning(
-                        "No id-bearing source in the first "
-                        f"{_ID_SCAN_PAGE_SIZE * _ID_SCAN_MAX_PAGES} entries scanned; "
-                        "more sources exist - pass sourceIds explicitly"
-                    )
-                else:
-                    logger.warning("No sources available - product may not be subscription-ready")
-            except Exception as e:
-                logger.warning(f"Failed to assign default source: {e}")
 
         # Validate product data before API call
         from ..product_validation_engine import ProductValidationEngine
@@ -635,22 +1017,11 @@ class ProductManager:
             )
 
         logger.info("Product data validation successful - ready for API call")
+        return CreatePayload(body=product_data, notes=tuple(notes))
 
-        # Create product using validated data
-        logger.info(f"Creating product via API: {product_data.get('name')}")
-        result = await self.client.create_product(product_data)
-        logger.info(f"Product created successfully with ID: {result.get('id', 'unknown')}")
-
-        return {
-            "action": "create",
-            "data": result,
-            "metadata": {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            },
-        }
-
-    async def update_product(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Update existing product using PartialUpdateHandler."""
+    @staticmethod
+    def _require_update_arguments(arguments: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """Return (product_id, product_data), refusing an update that lacks either."""
         product_id = arguments.get("product_id")
         product_data = arguments.get("product_data")
 
@@ -673,9 +1044,12 @@ class ProductManager:
                 examples={
                     "usage": "update(product_id='prod_123', product_data={'description': 'Updated description'})",
                     "partial_update": (
-                        "Partial update — provide only the fields you want to change. "
-                        "Other fields (including the plan's tier configuration) are "
-                        "preserved from the current state."
+                        "Partial update: provide only the fields you want to change. "
+                        "Other fields are kept from the current state. A partial 'plan' "
+                        "is merged field by field into the stored plan, so tiers, period, "
+                        "elements and setup fees you leave out are kept; a list you send, "
+                        "such as 'tiers', replaces the stored one. An update that would "
+                        "leave the plan with no tiers is refused."
                     ),
                     "updatable_fields": [
                         "name",
@@ -688,6 +1062,27 @@ class ProductManager:
                     "product_lifecycle": "PRODUCT LIFECYCLE: Partial updates preserve existing configuration while changing specific fields",
                 },
             )
+
+        return product_id, product_data
+
+    async def preview_update(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Read the product and return the body update_product would send, sending nothing."""
+        product_id, product_data = self._require_update_arguments(arguments)
+        payload = await self.update_handler.build_update_payload(
+            resource_id=product_id,
+            partial_data=product_data,
+            config=self.update_config_factory.get_config("products"),
+            action_context="update product",
+        )
+        return {
+            "product_id": product_id,
+            "changes": product_data,
+            "body": self.client.prepare_product_update_body(payload),
+        }
+
+    async def update_product(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Update existing product using PartialUpdateHandler."""
+        product_id, product_data = self._require_update_arguments(arguments)
 
         # Note: Validation now happens AFTER merge in PartialUpdateHandler to support partial updates
         logger.info(f"Preparing partial update for product: {product_id}")
@@ -839,8 +1234,14 @@ class ProductValidator:
                         "step_2": {
                             "action": "Check available metering elements",
                             "tool_call": "manage_metering_elements(action='list')",
-                            "purpose": "Verify metering elements exist for usage billing (optional but recommended)",
-                            "required": False,
+                            "purpose": "The organization must have a metering element; without one the call is refused before anything is written",
+                            "required": True,
+                        },
+                        "step_3": {
+                            "action": "Pick the organization to bill",
+                            "tool_call": "manage_customers(action='list', resource_type='organizations')",
+                            "purpose": "Copy its id into subscription_data.organizationId",
+                            "required": True,
                         },
                     },
                     "template": {
@@ -868,12 +1269,14 @@ class ProductValidator:
                             "name": "Customer AI Analytics Subscription",
                             "description": "Active subscription for AI analytics platform",
                             "clientEmailAddress": "customer@company.com",
+                            "organizationId": "<organization id from manage_customers list>",
                         },
                     },
                     "automatic_enhancements": {
                         "sources": "Automatically assigns first available source from your account",
-                        "metering": "Adds usage billing with totalCost metering element",
-                        "system_fields": "Auto-populates ownerId, teamId, organizationId",
+                        "published": "Publishes the product (unless product_data sets published to false) so it can take the subscription",
+                        "metering": "Adds a free usage tier on the first metering element found in your organization (refuses if there is none)",
+                        "system_fields": "Auto-populates ownerId and teamId; organizationId is required in subscription_data",
                         "tier_structure": "Ensures proper tier configuration (single unlimited tier)",
                         "required_fields": "Adds all 15+ required subscription fields with defaults",
                     },
@@ -897,8 +1300,12 @@ class ProductValidator:
                         "list_is_empty": {
                             "error": "HTTP 400: Invalid request - {'error': 'List is empty.'}",
                             "cause": "Product missing sources - required for subscription creation",
-                            "solution": "FIXED: Sources are now automatically assigned during product creation",
-                            "note": "This error should no longer occur with current implementation",
+                            "solution": (
+                                "create attaches no data source unless product_data sets sourceIds; "
+                                "create_with_subscription attaches one; update with sourceIds "
+                                "attaches one to an existing product"
+                            ),
+                            "note": "Pick a source id with manage_sources(action='list')",
                         },
                         "validation_failed": {
                             "error": "Product validation failed - tier structure issues",
@@ -1052,7 +1459,6 @@ class ProductEnhancementProcessor:
     async def create_simple(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Create product with smart defaults."""
         name = arguments.get("name")
-        _ = arguments.get("type", "api")  # For future use in template selection
 
         if not name:
             raise create_structured_missing_parameter_error(
@@ -1065,6 +1471,8 @@ class ProductEnhancementProcessor:
                     "product_lifecycle": "PRODUCT LIFECYCLE: Product name identifies the offering for customers and billing",
                 },
             )
+
+        pricing = _QuickCreatePricing.from_arguments(name, arguments)
 
         # Build basic product configuration
         product_config = {
@@ -1084,67 +1492,33 @@ class ProductEnhancementProcessor:
                 "setupFees": [],
                 "ratingAggregations": [],
             },
-            "published": True,
+            "published": False,
             "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
             "comingSoon": False,
             "notifyClientTrialAboutToExpire": False,
         }
 
-        # Process pricing model parameters
-        pricing_model = arguments.get("pricing_model", "subscription")
-        if pricing_model == "usage_based":
-            # Add usage-based billing configuration
-            per_unit_price = arguments.get("per_unit_price", 0.01)
-            product_config["plan"]["ratingAggregations"] = [
-                {
-                    "name": f"{name} Usage Aggregation",
-                    "aggregationType": "SUM",
-                    "description": f"Tracks usage for {name} billing purposes",
-                    "_usage_based_billing": True,
-                    "_metering_element_required": True,
-                    "_workflow_guidance": {
-                        "step_1": "Use manage_metering_elements(action='list') to see existing AI billing elements",
-                        "step_2": "Choose appropriate existing element (totalCost, inputTokenCount, outputTokenCount, etc.)",
-                        "step_3": "Copy the elementDefinitionId from the list results - IDs are unique per account",
-                        "step_4": "Use the copied elementDefinitionId in ratingAggregations",
-                        "step_5": "Only create new metering elements if existing ones don't match your needs",
-                        "available_element_names": "totalCost, inputTokenCost, outputTokenCost, inputTokenCount, outputTokenCount, totalTokenCount, reasoningTokenCount, cacheCreationTokenCount, cacheReadTokenCount",
-                        "warning": "NEVER hardcode element IDs - they are unique per account and must be looked up",
-                    },
-                }
-            ]
-            # Add tier with per-unit pricing
-            product_config["plan"]["tiers"] = [
-                {"name": "Usage Tier", "up_to": None, "unit_amount": str(per_unit_price)}
-            ]
-        elif pricing_model == "subscription":
-            # Add subscription pricing
-            monthly_price = arguments.get("monthly_price", 0.00)
-            product_config["plan"]["tiers"] = [
-                {
-                    "name": "Monthly Subscription",
-                    "up_to": None,  # Unlimited usage
-                    "unit_amount": str(monthly_price),  # Monthly subscription fee
-                }
-            ]
-
-        # Process setup fee parameters
-        setup_fee = arguments.get("setup_fee")
-        setup_fee_type = arguments.get("setup_fee_type", "per_subscription")
-
-        if setup_fee is not None:
-            # Map setup fee type to API format
-            api_setup_fee_type = (
-                "SUBSCRIPTION" if setup_fee_type == "per_subscription" else "ORGANIZATION"
-            )
-
-            setup_fee_config = {
-                "name": f"{name} Setup Fee",
-                "type": api_setup_fee_type,
-                "flatAmount": float(setup_fee),
-                "description": f"Setup fee for {name} ({'per subscription' if setup_fee_type == 'per_subscription' else 'per customer'})",
+        product_config["plan"]["tiers"] = [
+            {
+                "name": "Monthly Subscription",
+                "up_to": None,  # Unlimited usage
+                "flat_amount": str(pricing.monthly_price),
             }
-            product_config["plan"]["setupFees"] = [setup_fee_config]
+        ]
+
+        if pricing.setup_fee is not None:
+            per_subscription = pricing.setup_fee_type == "per_subscription"
+            product_config["plan"]["setupFees"] = [
+                {
+                    "name": f"{name} Setup Fee",
+                    "type": "SUBSCRIPTION" if per_subscription else "ORGANIZATION",
+                    "flatAmount": pricing.setup_fee,
+                    "description": (
+                        f"Setup fee for {name} "
+                        f"({'per subscription' if per_subscription else 'per customer'})"
+                    ),
+                }
+            ]
 
         # Add required fields from client environment
         product_config["teamId"] = self.client.team_id
@@ -1152,98 +1526,7 @@ class ProductEnhancementProcessor:
         if owner_id:
             product_config["ownerId"] = owner_id
 
-        # CRITICAL FIX: Assign default source to make product subscription-ready
-        try:
-            default_source_id, source_scan_truncated = await _first_id_bearing_entry_id(
-                self.client.get_sources, self.client._extract_embedded_data
-            )
-            if default_source_id:
-                product_config["sourceIds"] = [default_source_id]
-                logger.info(f"Assigned default source {default_source_id} to product")
-            elif source_scan_truncated:
-                logger.warning(
-                    "No id-bearing source in the first "
-                    f"{_ID_SCAN_PAGE_SIZE * _ID_SCAN_MAX_PAGES} entries scanned; "
-                    "more sources exist - pass sourceIds explicitly"
-                )
-            else:
-                logger.warning("No sources available - product may not be subscription-ready")
-        except Exception as e:
-            logger.warning(f"Failed to assign default source: {e}")
-
-        # Create the product with enhanced error handling for usage-based billing
-        try:
-            result = await self.client.create_product(product_config)
-            return result
-        except ReveniumAPIError as e:
-            # Check if this is a usage-based billing error due to missing elementDefinitionId
-            if (
-                pricing_model == "usage_based"
-                and "elementDefinitionId" in str(e)
-                and "Missing required parameter" in str(e)
-            ):
-
-                # Provide comprehensive workflow guidance for usage-based billing
-                raise create_structured_validation_error(
-                    message="Usage-based billing requires metering elements to be set up first",
-                    field="elementDefinitionId",
-                    value="missing",
-                    suggestions=[
-                        "Follow the 4-step usage-based billing workflow below",
-                        "Use manage_metering_elements(action='list') to see existing AI billing elements",
-                        "Copy the elementDefinitionId from existing elements (totalCost, inputTokenCount, etc.)",
-                        "Create the product using the full create() action with proper ratingAggregations",
-                        "Only create new metering elements if existing ones don't match your requirements",
-                    ],
-                    examples={
-                        "step_1": {
-                            "action": "Check existing metering elements",
-                            "tool_call": "manage_metering_elements(action='list')",
-                            "purpose": "See available AI billing elements (totalCost, inputTokenCount, outputTokenCount, etc.)",
-                        },
-                        "step_2": {
-                            "action": "Choose appropriate existing element",
-                            "guidance": "Use existing AI elements when possible to avoid duplicates",
-                            "available_elements": "totalCost, inputTokenCost, outputTokenCost, inputTokenCount, outputTokenCount, totalTokenCount",
-                        },
-                        "step_3": {
-                            "action": "Copy the elementDefinitionId",
-                            "instruction": "COPY_FROM_STEP_1 - Copy the actual elementDefinitionId from the list results",
-                            "warning": "IDs are unique per account and cannot be reused across accounts",
-                        },
-                        "step_4": {
-                            "action": "Create usage-based product with full create() action",
-                            "example": {
-                                "name": name,
-                                "plan": {
-                                    "type": "SUBSCRIPTION",
-                                    "ratingAggregations": [
-                                        {
-                                            "elementDefinitionId": "COPY_FROM_STEP_1",
-                                            "aggregationType": "SUM",
-                                            "tiers": [
-                                                {"up_to": None, "unit_amount": str(per_unit_price)}
-                                            ],
-                                        }
-                                    ],
-                                },
-                            },
-                        },
-                        "workflow_guidance": {
-                            "step_1": "Use manage_metering_elements(action='list') to see existing AI billing elements",
-                            "step_2": "Choose appropriate existing element (totalCost, inputTokenCount, outputTokenCount, etc.)",
-                            "step_3": "Copy the elementDefinitionId from the list results - IDs are unique per account",
-                            "step_4": "Use the copied elementDefinitionId in ratingAggregations",
-                            "step_5": "Only create new metering elements if existing ones don't match your needs",
-                            "available_element_names": "totalCost, inputTokenCost, outputTokenCost, inputTokenCount, outputTokenCount, totalTokenCount, reasoningTokenCount, cacheCreationTokenCount, cacheReadTokenCount",
-                            "warning": "NEVER hardcode element IDs - they are unique per account and must be looked up",
-                        },
-                        "product_lifecycle": "PRODUCT LIFECYCLE: Usage-based billing requires metering elements to track and bill for actual usage",
-                    },
-                )
-            else:
-                # Re-raise other API errors without modification
-                raise
+        return await self.client.create_product(product_config)
 
     async def create_from_description(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Create product from natural language description with enhanced setup fee validation."""
@@ -1362,27 +1645,7 @@ class ProductEnhancementProcessor:
         owner_id = get_config_value("REVENIUM_OWNER_ID")
         if owner_id:
             product_data["ownerId"] = owner_id
-
-        # CRITICAL FIX: Assign default source to make product subscription-ready
-        try:
-            default_source_id, source_scan_truncated = await _first_id_bearing_entry_id(
-                self.client.get_sources, self.client._extract_embedded_data
-            )
-            if default_source_id:
-                product_data["sourceIds"] = [default_source_id]
-                logger.info(
-                    f"Assigned default source {default_source_id} to product from create_from_description"
-                )
-            elif source_scan_truncated:
-                logger.warning(
-                    "No id-bearing source in the first "
-                    f"{_ID_SCAN_PAGE_SIZE * _ID_SCAN_MAX_PAGES} entries scanned; "
-                    "more sources exist - pass sourceIds explicitly"
-                )
-            else:
-                logger.warning("No sources available - product may not be subscription-ready")
-        except Exception as e:
-            logger.warning(f"Failed to assign default source: {e}")
+        _apply_draft_defaults(product_data)
 
         # Create the product
         result = await self.client.create_product(product_data)
@@ -1412,7 +1675,7 @@ class ProductEnhancementProcessor:
                 }
             }
 
-        template_name = arguments.get("template") or arguments.get("name")
+        template_name = arguments.get("name")
         if template_name:
             return {"template": self.template_library.get_template(template_name)}
         else:
@@ -1855,6 +2118,25 @@ class ProductEnhancementProcessor:
         }
 
 
+_INCOMPLETE_WALK_SUGGESTIONS = [
+    "Retry the request; one page of subscriptions failed to load",
+    "If it keeps failing, check that the Revenium API is reachable",
+]
+
+
+def _raise_if_walk_incomplete(
+    navigation_result: Any, message: str, field: str, value: str
+) -> None:
+    if navigation_result.incomplete is True:
+        raise ToolError(
+            message=message,
+            error_code=ErrorCodes.API_ERROR,
+            field=field,
+            value=value,
+            suggestions=list(_INCOMPLETE_WALK_SUGGESTIONS),
+        )
+
+
 class ProductHierarchyManager:
     """Manager for product hierarchy operations using the hierarchy services."""
 
@@ -1885,8 +2167,10 @@ class ProductHierarchyManager:
         navigation_result = await self.navigation_service.get_subscriptions_for_product(product_id)
 
         if not navigation_result.success:
+            message = f"Failed to get subscriptions for product {product_id}: {navigation_result.error_message}"
+            _raise_if_walk_incomplete(navigation_result, message, "product_id", product_id)
             raise ToolError(
-                message=f"Failed to get subscriptions for product {product_id}: {navigation_result.error_message}",
+                message=message,
                 error_code=ErrorCodes.RESOURCE_NOT_FOUND,
                 field="product_id",
                 value=product_id,
@@ -1928,8 +2212,10 @@ class ProductHierarchyManager:
         navigation_result = await self.navigation_service.get_full_hierarchy("products", product_id)
 
         if not navigation_result.success:
+            message = f"Failed to get hierarchy for product {product_id}: {navigation_result.error_message}"
+            _raise_if_walk_incomplete(navigation_result, message, "product_id", product_id)
             raise ToolError(
-                message=f"Failed to get hierarchy for product {product_id}: {navigation_result.error_message}",
+                message=message,
                 error_code=ErrorCodes.RESOURCE_NOT_FOUND,
                 field="product_id",
                 value=product_id,
@@ -2052,10 +2338,103 @@ class ProductHierarchyManager:
                         "complete_example": {
                             "name": "Customer Subscription",
                             "clientEmailAddress": "customer@company.com",
+                            "organizationId": "<organization id>",
                         },
                         "field_context": f"The '{field}' field is required for subscription creation",
                     },
                 )
+
+    async def _organization_metering_element_id(self) -> str:
+        """The first metering element of this organization, or a refusal before any write."""
+        suggestions = [
+            "List this organization's elements with manage_metering_elements(action='list')",
+            "Or pass plan.ratingAggregations with an elementDefinitionId in product_data",
+        ]
+        try:
+            element_id, scan_truncated = await _first_id_bearing_entry_id(
+                self.client.get_metering_element_definitions,
+                self.client._extract_embedded_data,
+            )
+        except Exception as e:
+            logger.error(f"Failed to look up metering elements: {e}")
+            raise ToolError(
+                message="Could not look up metering elements; nothing was created.",
+                error_code=ErrorCodes.API_ERROR,
+                field="metering_elements",
+                value="lookup_failed",
+                suggestions=suggestions,
+            ) from e
+        if element_id:
+            logger.info(f"Found default metering element: {element_id}")
+            return element_id
+        if scan_truncated:
+            raise ToolError(
+                message=(
+                    "No id-bearing metering element in the first "
+                    f"{_ID_SCAN_PAGE_SIZE * _ID_SCAN_MAX_PAGES} entries scanned; "
+                    "nothing was created."
+                ),
+                error_code=ErrorCodes.API_ERROR,
+                field="metering_elements",
+                value="scan_truncated",
+                suggestions=suggestions,
+            )
+        raise ToolError(
+            message="This organization has no metering element; nothing was created.",
+            error_code=ErrorCodes.API_ERROR,
+            field="metering_elements",
+            value="none_available",
+            suggestions=suggestions,
+        )
+
+    @staticmethod
+    def _require_organization_id(subscription_data: Dict[str, Any]) -> None:
+        """The subscription bills an organization the caller names, never a guessed one."""
+        if subscription_data.get("organizationId"):
+            return
+        raise ToolError(
+            message=(
+                "subscription_data.organizationId is required: name the organization "
+                "this subscription bills. Nothing was created."
+            ),
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="subscription_data.organizationId",
+            value=None,
+            suggestions=[
+                'Find the id with manage_customers(action="list", resource_type="organizations")',
+                'Then pass subscription_data={"organizationId": "<organization id>", ...}',
+            ],
+        )
+
+    async def _require_existing_organization(self, organization_id: str) -> None:
+        """Refuse an organization id the platform does not know before anything is written.
+
+        Only a not-found (404) or an undecodable id (400) is a wrong id. Any other
+        failure, such as a key without organization read rights, proceeds and leaves
+        the platform's own refusal as the backstop.
+        """
+        try:
+            await self.client.get_organization_by_id(organization_id)
+        except ReveniumAPIError as e:
+            if e.status_code not in _ORGANIZATION_NOT_FOUND_STATUSES:
+                logger.warning(
+                    f"Could not confirm organization {organization_id} before creating "
+                    f"the product (status {e.status_code}); proceeding"
+                )
+                return
+            raise ToolError(
+                message=(
+                    f"Organization {organization_id} was not found (or is not a valid "
+                    "organization id). Nothing was created."
+                ),
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field="subscription_data.organizationId",
+                value=organization_id,
+                suggestions=[
+                    'Find the id with manage_customers(action="list", resource_type="organizations")',
+                    'Then pass subscription_data={"organizationId": "<organization id>", ...}',
+                ],
+            ) from e
 
     async def create_with_subscription(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Create a product and subscription together in a coordinated workflow."""
@@ -2099,10 +2478,14 @@ class ProductHierarchyManager:
                         "complete_example": {
                             "name": "Customer Subscription",
                             "clientEmailAddress": "customer@company.com",
+                            "organizationId": "<organization id>",
                         },
                         "field_context": f"The '{field}' field is required for subscription creation",
                     },
                 )
+
+        self._require_organization_id(subscription_data)
+        await self._require_existing_organization(subscription_data["organizationId"])
 
         # Validate the operation using cross-tier validator
         validation_result = await self.validator.validate_hierarchy_operation(
@@ -2138,6 +2521,8 @@ class ProductHierarchyManager:
         logger.info(
             f"Enhancing product data for subscription compatibility: {product_data.get('name')}"
         )
+
+        _fold_source_id_spellings(product_data)
 
         # Get available sources dynamically (account-specific)
         try:
@@ -2193,36 +2578,15 @@ class ProductHierarchyManager:
         if "sourceIds" not in product_data or not product_data["sourceIds"]:
             product_data["sourceIds"] = [default_source_id]
             logger.info(f"Added sourceIds for subscription compatibility: {default_source_id}")
+        if product_data.get("published") is None:
+            product_data["published"] = True
 
         # Add rating aggregation if not present (required for subscription billing)
         if "plan" in product_data and (
             "ratingAggregations" not in product_data["plan"]
             or not product_data["plan"]["ratingAggregations"]
         ):
-            # Get available metering elements dynamically
-            try:
-                default_element_id, element_scan_truncated = await _first_id_bearing_entry_id(
-                    self.client.get_metering_element_definitions,
-                    self.client._extract_embedded_data,
-                )
-                if default_element_id:
-                    logger.info(f"Found default metering element: {default_element_id}")
-                else:
-                    # Fallback to known totalCost element if available
-                    default_element_id = "jM73gVB"
-                    if element_scan_truncated:
-                        logger.warning(
-                            "No id-bearing metering element in the scanned pages "
-                            "(more exist); using the fallback element ID"
-                        )
-                    else:
-                        logger.warning(
-                            "Using fallback metering element ID - may not work in all accounts"
-                        )
-            except Exception:
-                # Fallback to known totalCost element
-                default_element_id = "jM73gVB"
-                logger.warning("Using fallback metering element ID - may not work in all accounts")
+            default_element_id = await self._organization_metering_element_id()
 
             # Remove unlimited tier from plan.tiers to avoid conflict
             if "plan" in product_data and "tiers" in product_data["plan"]:
@@ -2288,46 +2652,6 @@ class ProductHierarchyManager:
                     "REVENIUM_OWNER_ID not available from configuration store, API will use default owner"
                 )
 
-        # Add ALL required fields that were missing (based on successful API call analysis)
-        # These fields are required by the API but were missing from our implementation
-
-        # Organization ID - critical for subscription creation
-        if "organizationId" not in subscription_data:
-            # Try to get default organization (same pattern as subscriber creation)
-            try:
-                orgs_response = await self.client.get_organizations(page=0, size=1)
-                organizations = self.client._extract_embedded_data(orgs_response)
-                if organizations:
-                    subscription_data["organizationId"] = organizations[0]["id"]
-                else:
-                    # No organizations found - this is a critical issue
-                    logger.error("No organizations found in the system for subscription creation")
-                    raise create_structured_missing_parameter_error(
-                        parameter_name="organizationId",
-                        action="create subscription",
-                        examples={
-                            "issue": "No organizations found in the system",
-                            "solution": "Create an organization first, or provide organizationId explicitly",
-                            "usage": "create(resource_type='subscriptions', subscription_data={'productId': '...', 'organizationId': 'org_id_123'})",
-                            "helper": "Use manage_customers tool to create an organization first",
-                        },
-                    )
-            except Exception as e:
-                # If organization lookup fails, require explicit organizationId
-                logger.error(
-                    f"Failed to auto-resolve organizationId for subscription creation: {e}"
-                )
-                raise create_structured_missing_parameter_error(
-                    parameter_name="organizationId",
-                    action="create subscription",
-                    examples={
-                        "issue": f"Could not auto-resolve organizationId: {e}",
-                        "solution": "Provide organizationId explicitly in subscription_data",
-                        "usage": "create(resource_type='subscriptions', subscription_data={'productId': '...', 'organizationId': 'org_id_123'})",
-                        "helper": "Use manage_customers tool to list organizations and get valid IDs",
-                    },
-                )
-
         # Required array fields (must be present as empty arrays, not omitted)
         if "credentialIds" not in subscription_data:
             subscription_data["credentialIds"] = []
@@ -2362,7 +2686,23 @@ class ProductHierarchyManager:
 
         # Create subscription
         logger.info(f"Creating subscription for product {product_id}")
-        subscription_result = await self.client.create_subscription(subscription_data)
+        try:
+            subscription_result = await self.client.create_subscription(subscription_data)
+        except ReveniumAPIError as e:
+            raise ToolError(
+                message=(
+                    f"Product {product_id} was created, but its subscription was not: {e}"
+                ),
+                error_code=ErrorCodes.API_ERROR,
+                field="subscription_creation",
+                value={"product_id": product_id},
+                suggestions=[
+                    "Retry the subscription with manage_subscriptions(action=\"create\", "
+                    f'subscription_data={{"productId": "{product_id}", ...}})',
+                    "Or remove the product with "
+                    f'manage_products(action="delete", product_id="{product_id}")',
+                ],
+            ) from e
 
         return {
             "action": "create_with_subscription",
@@ -2492,18 +2832,16 @@ class ProductManagement(ToolBase):
         dry_run = arguments.get("dry_run", False)
 
         if action == "create":
-            if dry_run:
-                return await self._handle_create_dry_run(arguments)
             # Only pass enhancement processor if description is provided
-            if arguments.get("description"):
-                result = await product_manager.create_product(arguments, enhancement_processor)
-            else:
-                result = await product_manager.create_product(arguments)
+            processor = enhancement_processor if arguments.get("description") else None
+            if dry_run:
+                return await self._handle_create_dry_run(arguments, product_manager, processor)
+            result = await product_manager.create_product(arguments, processor)
             return self._format_create_success_response(result)
 
         elif action == "update":
             if dry_run:
-                return await self._handle_update_dry_run(arguments)
+                return await self._handle_update_dry_run(arguments, product_manager)
             result = await product_manager.update_product(arguments)
             return self._format_update_success_response(result)
 
@@ -2517,54 +2855,56 @@ class ProductManagement(ToolBase):
         return [TextContent(type="text", text=json.dumps({"error": f"Unhandled CRUD action: {action}"}, indent=2))]
 
     async def _handle_create_dry_run(
-        self, arguments: Dict[str, Any]
+        self,
+        arguments: Dict[str, Any],
+        product_manager: ProductManager,
+        enhancement_processor: Optional[ProductEnhancementProcessor],
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Handle dry run for create operations."""
-        # Support both product_data and resource_data parameters for backward compatibility
-        product_data = arguments.get("product_data") or arguments.get("resource_data") or {}
-        validation_result = self.validator.validate_configuration(product_data, dry_run=True)
-
-        if validation_result["valid"]:
-            return [
-                TextContent(
-                    type="text",
-                    text=f"DRY RUN MODE - Product Creation\n\n"
-                    f"Validation Successful: Product data is valid and ready for creation\n\n"
-                    f"**Would Create:**\n"
-                    f"- **Name:** {product_data.get('name', 'N/A')}\n"
-                    f"- **Version:** {product_data.get('version', 'N/A')}\n"
-                    f"- **Plan Type:** {product_data.get('plan', {}).get('type', 'N/A')}\n\n"
-                    f"**Dry Run:** True (no actual creation performed)",
-                )
-            ]
-        else:
-            errors_text = "\n".join(
-                [
-                    f"• {error.get('error', 'Unknown error')}"
-                    for error in validation_result.get("errors", [])
-                ]
+        """Preview a create with the real builder; a refusal raises like the real create."""
+        payload = await product_manager.prepare_create_payload(arguments, enhancement_processor)
+        product_data = payload.body
+        notes_text = "".join(f"**Note:** {note}\n\n" for note in payload.notes)
+        configuration = APIFieldMapper.map_product_fields(
+            {k: v for k, v in product_data.items() if not k.startswith("_")}
+        )
+        team_id = getattr(product_manager.client, "team_id", None)
+        if team_id:
+            configuration["teamId"] = team_id
+        source_ids = product_data.get("sourceIds") or []
+        if not isinstance(source_ids, list):
+            source_ids = [source_ids]
+        return [
+            TextContent(
+                type="text",
+                text=f"DRY RUN MODE - Product Creation\n\n"
+                f"Validation Successful: Product data is valid and ready for creation\n\n"
+                f"**Would Create:**\n"
+                f"- **Name:** {product_data.get('name', 'N/A')}\n"
+                f"- **Version:** {product_data.get('version', 'N/A')}\n"
+                f"- **Plan Type:** {product_data.get('plan', {}).get('type', 'N/A')}\n"
+                f"- **Published:** {product_data.get('published')}\n"
+                f"- **Data sources:** {', '.join(str(i) for i in source_ids) or 'none'}\n"
+                f"- **Input Mode:** {_create_input_mode(arguments)}\n\n"
+                f"{notes_text}"
+                f"**Configuration:**\n```json\n{json.dumps(configuration, indent=2)}\n```\n\n"
+                f"**Dry Run:** True (no actual creation performed)",
             )
-            return [
-                TextContent(
-                    type="text",
-                    text=f"DRY RUN MODE - Validation Failed\n\n"
-                    f"Errors Found:\n{errors_text}\n\n"
-                    f"**Dry Run:** True (fix errors before actual creation)",
-                )
-            ]
+        ]
 
     async def _handle_update_dry_run(
-        self, arguments: Dict[str, Any]
+        self, arguments: Dict[str, Any], product_manager: ProductManager
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle dry run for update operations."""
-        product_id = arguments.get("product_id")
-        product_data = arguments.get("product_data", {})
+        preview = await product_manager.preview_update(arguments)
+        body = preview["body"]
         return [
             TextContent(
                 type="text",
                 text=f"DRY RUN MODE - Product Update\n\n"
-                f"Would update product: {product_id}\n"
-                f"**Changes:** {json.dumps(product_data, indent=2)}\n\n"
+                f"Would update product: {preview['product_id']} ({body.get('name', 'unnamed')})\n"
+                f"**Changes:** {json.dumps(preview['changes'], indent=2, default=str)}\n\n"
+                f"**Body the update would send:**\n"
+                f"{json.dumps(body, indent=2, default=str)}\n\n"
                 f"**Dry Run:** True (no actual update performed)",
             )
         ]
@@ -2588,17 +2928,42 @@ class ProductManagement(ToolBase):
         self, result: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Format successful create response."""
+        product = result["data"]
+        return self._format_product_created(
+            f"Product '{product.get('name', 'N/A')}' created successfully",
+            product,
+            "create",
+            notes=result.get("notes", ()),
+        )
+
+    def _format_product_created(
+        self,
+        message: str,
+        product: Dict[str, Any],
+        action: str,
+        notes: Sequence[str] = (),
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Answer a create with what was stored and a next step that can work."""
+        product_id = product.get("id")
+        claims = _publication_and_source_claims(product)
+        if claims:
+            message = f"{message}. {' '.join(claims)}"
+        if _can_take_subscriptions(product):
+            subscribe_step = _SUBSCRIPTION_NEXT_STEP
+        else:
+            subscribe_step = _missing_subscription_requirements_step(product, product_id)
         return self.formatter.format_success_response(
-            message=f"Product '{result['data'].get('name', 'N/A')}' created successfully",
-            data=result["data"],
+            message=message,
+            data=product,
             next_steps=[
-                'Create subscribers using manage_customers(action="create", subscriber_data={...}) to set up users who will access this product',
-                'Create subscriptions using manage_subscriptions(action="create", subscription_data={...}) to subscribe those users to this product',
-                f"Use 'get' action with product_id='{result['data'].get('id')}' to view details",
+                *notes,
+                _SUBSCRIBER_NEXT_STEP,
+                subscribe_step,
+                f"Use 'get' action with product_id='{product_id}' to view details",
                 "Use 'update' action to modify the product",
                 "Use 'list' action to see all products",
             ],
-            action="create",
+            action=action,
         )
 
     def _format_update_success_response(
@@ -2651,169 +3016,6 @@ class ProductManagement(ToolBase):
 
         # Return error for unhandled validation actions
         return [TextContent(type="text", text=json.dumps({"error": "No validation action specified"}, indent=2))]
-
-    async def _handle_enhanced_features(
-        self,
-        action: str,
-        arguments: Dict[str, Any],
-        enhancement_processor: ProductEnhancementProcessor,
-    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Handle enhanced feature actions."""
-        if action == "create_simple":
-            result = await enhancement_processor.create_simple(arguments)
-            return self.formatter.format_success_response(
-                message=f"Simple product '{result.get('name', 'N/A')}' created successfully",
-                data=result,
-                next_steps=[
-                    'Create subscribers using manage_customers(action="create", subscriber_data={...}) to set up users who will access this product',
-                    'Create subscriptions using manage_subscriptions(action="create", subscription_data={...}) to subscribe those users to this product',
-                    f"Use 'get' action with product_id='{result.get('id')}' to view details",
-                    "Use 'update' action to modify the product",
-                    "Use 'list' action to see all products",
-                ],
-                action="create_simple",
-            )
-
-        elif action == "get_templates":
-            templates = await enhancement_processor.get_templates(arguments)
-            return [TextContent(type="text", text=json.dumps(templates, indent=2))]
-
-        elif action == "suggest_template":
-            suggestion = await enhancement_processor.suggest_template(arguments)
-            return [TextContent(type="text", text=json.dumps(suggestion, indent=2))]
-
-        elif action == "clarify_pricing":
-            clarification = await enhancement_processor.clarify_pricing(arguments)
-            return [TextContent(type="text", text=json.dumps(clarification, indent=2))]
-
-        # Return error for unhandled enhanced features
-        return [TextContent(type="text", text=json.dumps({"error": "No enhanced feature action specified"}, indent=2))]
-
-    async def _handle_create_from_description(
-        self, arguments: Dict[str, Any], enhancement_processor: ProductEnhancementProcessor
-    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Handle create_from_description with dry run support."""
-        dry_run = arguments.get("dry_run", False)
-
-        if dry_run:
-            return await self._handle_create_from_description_dry_run(
-                arguments, enhancement_processor
-            )
-
-        result = await enhancement_processor.create_from_description(arguments)
-        return self.formatter.format_success_response(
-            message=f"Product created from description: '{result.get('name', 'N/A')}'",
-            data=result,
-            next_steps=[
-                'Create subscribers using manage_customers(action="create", subscriber_data={...}) to set up users who will access this product',
-                'Create subscriptions using manage_subscriptions(action="create", subscription_data={...}) to subscribe those users to this product',
-                f"Use 'get' action with product_id='{result.get('id')}' to view details",
-                "Use 'update' action to modify the product",
-                "Use 'list' action to see all products",
-            ],
-            action="create_from_description",
-        )
-
-    async def _handle_create_from_description_dry_run(
-        self, arguments: Dict[str, Any], enhancement_processor: ProductEnhancementProcessor
-    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Handle dry run for create_from_description."""
-        description = arguments.get("description") or arguments.get("text", "")
-        if not description:
-            return [
-                TextContent(
-                    type="text",
-                    text="DRY RUN MODE - Create from Description\n\n"
-                    "Error: Description is required\n\n"
-                    "**Dry Run:** True (no actual creation performed)",
-                )
-            ]
-
-        # Use NLP processor to parse the description
-        if enhancement_processor.nlp_processor:
-            try:
-                parsed_result = enhancement_processor.nlp_processor.parse_product_request(
-                    description
-                )
-                educational_feedback = self._generate_educational_feedback(parsed_result)
-
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"DRY RUN MODE - Create from Description\n\n"
-                        f"Description Parsed Successfully\n\n"
-                        f"**Original Description:** {description}\n\n"
-                        f"**Would Create:**\n"
-                        f"- **Name:** {parsed_result.get('name', 'N/A')}\n"
-                        f"- **Version:** {parsed_result.get('version', 'N/A')}\n"
-                        f"- **Plan Type:** {parsed_result.get('plan', {}).get('type', 'N/A')}\n"
-                        f"- **Currency:** {parsed_result.get('plan', {}).get('currency', 'N/A')}\n"
-                        f"- **Payment Source:** {parsed_result.get('paymentSource', 'N/A')}\n"
-                        f"- **Setup Fees:** {len(parsed_result.get('setupFees', []))} configured\n\n"
-                        f"**Parsed Configuration:**\n```json\n{json.dumps(parsed_result, indent=2)}\n```\n"
-                        f"{educational_feedback}\n\n"
-                        f"**Dry Run:** True (no actual creation performed)",
-                    )
-                ]
-            except Exception as e:
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"DRY RUN MODE - Create from Description\n\n"
-                        f"Parsing Error: {str(e)}\n\n"
-                        f"**Original Description:** {description}\n\n"
-                        f"**Dry Run:** True (fix parsing errors before actual creation)",
-                    )
-                ]
-        else:
-            return [
-                TextContent(
-                    type="text",
-                    text=f"DRY RUN MODE - Create from Description\n\n"
-                    f"NLP Processor Unavailable: Would use fallback creation\n\n"
-                    f"**Original Description:** {description}\n\n"
-                    f"**Dry Run:** True (no actual creation performed)",
-                )
-            ]
-
-    def _generate_educational_feedback(self, parsed_result: Dict[str, Any]) -> str:
-        """Generate educational feedback for parsed product results."""
-        educational_notes = []
-
-        if "setupFees" in parsed_result and parsed_result["setupFees"]:
-            setup_fee = parsed_result["setupFees"][0]
-            if setup_fee.get("type") == "SUBSCRIPTION":
-                educational_notes.append(
-                    "Setup Fee Structure: Using new SUBSCRIPTION type (charged per subscription)"
-                )
-            elif setup_fee.get("type") == "ORGANIZATION":
-                educational_notes.append(
-                    "Setup Fee Structure: Using new ORGANIZATION type (charged per customer)"
-                )
-
-            if "flatAmount" in setup_fee:
-                educational_notes.append(
-                    "Setup Fee Format: Using new 'flatAmount' field structure"
-                )
-            else:
-                educational_notes.append(
-                    "Setup Fee Migration: Consider using 'flatAmount' instead of 'amount'"
-                )
-
-        if "paymentSource" in parsed_result:
-            payment_source = parsed_result["paymentSource"]
-            if payment_source == "INVOICE_ONLY_NO_PAYMENT":
-                educational_notes.append(
-                    "Payment Source: Manual invoice payment (customers pay outside system)"
-                )
-            elif payment_source == "EXTERNAL_PAYMENT_NOTIFICATION":
-                educational_notes.append(
-                    "Payment Source: Tracked invoice payment (external system confirms payment)"
-                )
-
-        if educational_notes:
-            return "\n\nEducational Feedback:\n" + "\n".join(educational_notes)
-        return ""
 
     async def _handle_hierarchy_actions(
         self, action: str, arguments: Dict[str, Any], hierarchy_manager: ProductHierarchyManager
@@ -2879,6 +3081,10 @@ class ProductManagement(ToolBase):
             source_id = product["sources"][0].get("id")
             if source_id:
                 auto_configured.append(f"Source assignment: {source_id} (dynamically resolved)")
+        if product.get("published") is True:
+            auto_configured.append("Publication: published, so the product can take the subscription")
+        elif product.get("published") is False:
+            auto_configured.append("Publication: not published")
 
         if (
             "plan" in product
@@ -2891,14 +3097,19 @@ class ProductManagement(ToolBase):
                 f"Usage billing: {element_id} metering element (dynamically resolved)"
             )
 
-        if "organizationId" in subscription:
-            org_id = subscription["organizationId"]
-            auto_configured.append(f"Organization assignment: {org_id} (auto-populated)")
-
         auto_config_text = ""
         if auto_configured:
             auto_config_text = "\n\nAuto-Configured:\n" + "\n".join(
                 [f"• {config}" for config in auto_configured]
+            )
+
+        client_email = subscription.get("clientEmailAddress")
+        subscriber_lines = ""
+        if client_email:
+            subscriber_lines = (
+                f"**Subscriber:** {client_email}\n"
+                f"**Client user:** the platform created a user for {client_email} "
+                "with this subscription, unless one already existed\n"
             )
 
         return [
@@ -2908,12 +3119,12 @@ class ProductManagement(ToolBase):
                 + f"**Product ID:** {product_id}\n"
                 + f"**Subscription ID:** {subscription_id}\n"
                 + f"**Product Name:** {product.get('name', 'N/A')}\n"
-                + f"**Subscriber:** {subscription.get('organizationId', 'N/A')}\n"
+                + f"**Organization:** {_subscription_organization(subscription)}\n"
+                + subscriber_lines
                 + f"{auto_config_text}\n\n"
                 + "**Next Steps:**\n"
                 + "• Use manage_subscriber_credentials to add API keys for the subscription\n"
-                + "• Use 'get_subscriptions' to see all subscriptions for this product\n"
-                + "• Use manage_subscriber_credentials to add credentials to the subscription",
+                + "• Use 'get_subscriptions' to see all subscriptions for this product",
             )
         ]
 
@@ -2971,6 +3182,9 @@ class ProductManagement(ToolBase):
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle product management actions using focused handler methods."""
         try:
+            _refuse_inputs_the_action_ignores(action, arguments)
+            _refuse_dry_run_on_quick_creates(action, arguments)
+
             # Setup managers
             product_manager, enhancement_processor, hierarchy_manager = await self._setup_managers(ctx=ctx)
 
@@ -2983,245 +3197,6 @@ class ProductManagement(ToolBase):
             result = await self._handle_standard_crud_actions(action, arguments, product_manager, ctx=ctx)
             if result is not None:
                 return result
-            elif action == "create":
-                # Handle dry_run mode for create operations
-                dry_run = arguments.get("dry_run", False)
-                if dry_run:
-                    product_data = (
-                        arguments.get("product_data") or arguments.get("resource_data") or {}
-                    )
-                    description = arguments.get("description")
-
-                    # UNIFIED PROGRESSIVE COMPLEXITY: Handle description in dry run
-                    if description:
-                        try:
-                            if enhancement_processor.nlp_processor:
-                                parsed_result = (
-                                    enhancement_processor.nlp_processor.parse_product_request(
-                                        description
-                                    )
-                                )
-                            else:
-                                # Fallback: simple parsing without NLP processor
-                                import re
-
-                                description_lower = description.lower()
-                                if "api" in description_lower:
-                                    name = "API Service"
-                                elif (
-                                    "subscription" in description_lower
-                                    or "plan" in description_lower
-                                ):
-                                    name = "Subscription Plan"
-                                else:
-                                    words = re.findall(r"\b[A-Za-z][A-Za-z]+\b", description)
-                                    if len(words) >= 2:
-                                        name = " ".join(words[:3]).title()
-                                    else:
-                                        name = "Custom Product"
-
-                                parsed_result = {
-                                    "name": name,
-                                    "description": f"Product for {name}",
-                                    "version": "1.0.0",
-                                    "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
-                                    "plan": {
-                                        "type": "SUBSCRIPTION",
-                                        "name": f"{name} Plan",
-                                        "currency": "USD",
-                                        "period": "MONTH",
-                                        "tiers": [
-                                            {
-                                                "name": "Base Tier",
-                                                "up_to": None,
-                                                "unit_amount": "0.00",
-                                            }
-                                        ],
-                                    },
-                                }
-
-                            # Handle empty name from NLP processor
-                            name = parsed_result.get("name")
-                            if not name or name.strip() == "":
-                                import re
-
-                                description_lower = description.lower()
-                                if "api" in description_lower:
-                                    parsed_result["name"] = "API Service"
-                                elif (
-                                    "subscription" in description_lower
-                                    or "plan" in description_lower
-                                ):
-                                    parsed_result["name"] = "Subscription Plan"
-                                else:
-                                    words = re.findall(r"\b[A-Za-z][A-Za-z]+\b", description)
-                                    if len(words) >= 2:
-                                        parsed_result["name"] = " ".join(words[:3]).title()
-                                    else:
-                                        parsed_result["name"] = "Custom Product"
-
-                            # Merge with resource_data for hybrid mode
-                            merged_data = {**parsed_result, **product_data}
-
-                            # Educational feedback for setup fees
-                            educational_notes = []
-                            if "setupFees" in merged_data and merged_data["setupFees"]:
-                                setup_fee = merged_data["setupFees"][0]
-                                if setup_fee.get("type") == "SUBSCRIPTION":
-                                    educational_notes.append(
-                                        "Setup Fee Structure: Using SUBSCRIPTION type (charged per subscription)"
-                                    )
-                                elif setup_fee.get("type") == "ORGANIZATION":
-                                    educational_notes.append(
-                                        "Setup Fee Structure: Using ORGANIZATION type (charged per customer)"
-                                    )
-                                if "flatAmount" in setup_fee:
-                                    educational_notes.append(
-                                        "Setup Fee Format: Using new 'flatAmount' field structure"
-                                    )
-
-                            educational_feedback = ""
-                            if educational_notes:
-                                educational_feedback = (
-                                    "\n\nEducational Feedback:\n"
-                                    + "\n".join(educational_notes)
-                                )
-
-                            return [
-                                TextContent(
-                                    type="text",
-                                    text=f"DRY RUN MODE - Unified Product Creation\n\n"
-                                    f"Description Parsed Successfully\n\n"
-                                    f"**Input Mode:** {'Hybrid (description + resource_data)' if product_data else 'Natural Language'}\n\n"
-                                    f"**Original Description:** {description}\n\n"
-                                    f"**Would Create:**\n"
-                                    f"- **Name:** {merged_data.get('name', 'N/A')}\n"
-                                    f"- **Version:** {merged_data.get('version', 'N/A')}\n"
-                                    f"- **Plan Type:** {merged_data.get('plan', {}).get('type', 'N/A')}\n"
-                                    f"- **Currency:** {merged_data.get('plan', {}).get('currency', 'N/A')}\n"
-                                    f"- **Payment Source:** {merged_data.get('paymentSource', 'N/A')}\n"
-                                    f"- **Setup Fees:** {len(merged_data.get('setupFees', []))} configured\n\n"
-                                    f"**Parsed Configuration:**\n```json\n{json.dumps(merged_data, indent=2)}\n```\n"
-                                    f"{educational_feedback}\n\n"
-                                    f"**Dry Run:** True (no actual creation performed)",
-                                )
-                            ]
-                        except Exception as e:
-                            return [
-                                TextContent(
-                                    type="text",
-                                    text=f"DRY RUN MODE - NLP Parsing Error\n\n"
-                                    f"Parsing Error: {str(e)}\n\n"
-                                    f"**Original Description:** {description}\n\n"
-                                    f"**Dry Run:** True (fix parsing errors before actual creation)",
-                                )
-                            ]
-                    else:
-                        # Standard structured validation
-                        validation_result = self.validator.validate_configuration(
-                            product_data, dry_run=True
-                        )
-                        if validation_result["valid"]:
-                            return [
-                                TextContent(
-                                    type="text",
-                                    text=f"DRY RUN MODE - Product Creation\n\n"
-                                    f"Validation Successful: Product data is valid and ready for creation\n\n"
-                                    f"**Input Mode:** Structured\n\n"
-                                    f"**Would Create:**\n"
-                                    f"- **Name:** {product_data.get('name', 'N/A')}\n"
-                                    f"- **Version:** {product_data.get('version', 'N/A')}\n"
-                                    f"- **Plan Type:** {product_data.get('plan', {}).get('type', 'N/A')}\n\n"
-                                    f"**Dry Run:** True (no actual creation performed)",
-                                )
-                            ]
-                        else:
-                            errors_text = "\n".join(
-                                [
-                                    f"• {error.get('error', 'Unknown error')}"
-                                    for error in validation_result.get("errors", [])
-                                ]
-                            )
-                            return [
-                                TextContent(
-                                    type="text",
-                                    text=f"DRY RUN MODE - Validation Failed\n\n"
-                                    f"Errors Found:\n{errors_text}\n\n"
-                                    f"**Dry Run:** True (fix errors before actual creation)",
-                                )
-                            ]
-
-                # Only pass enhancement processor if description is provided
-                if arguments.get("description"):
-                    result = await product_manager.create_product(arguments, enhancement_processor)
-                else:
-                    result = await product_manager.create_product(arguments)
-                return self.formatter.format_success_response(
-                    message=f"Product '{result['data'].get('name', 'N/A')}' created successfully",
-                    data=result["data"],
-                    next_steps=[
-                        'Create subscribers using manage_customers(action="create", subscriber_data={...}) to set up users who will access this product',
-                        'Create subscriptions using manage_subscriptions(action="create", subscription_data={...}) to subscribe those users to this product',
-                        f"Use 'get' action with product_id='{result['data'].get('id')}' to view details",
-                        "Use 'update' action to modify the product",
-                        "Use 'list' action to see all products",
-                    ],
-                    action="create",
-                )
-            elif action == "update":
-                # Handle dry_run mode for update operations
-                dry_run = arguments.get("dry_run", False)
-                if dry_run:
-                    product_id = arguments.get("product_id")
-                    product_data = arguments.get("product_data", {})
-                    return [
-                        TextContent(
-                            type="text",
-                            text=f"DRY RUN MODE - Product Update\n\n"
-                            f"Would update product: {product_id}\n"
-                            f"**Changes:** {json.dumps(product_data, indent=2)}\n\n"
-                            f"**Dry Run:** True (no actual update performed)",
-                        )
-                    ]
-
-                result = await product_manager.update_product(arguments)
-                return self.formatter.format_success_response(
-                    message=f"Product '{result['product_id']}' updated successfully",
-                    data=result["data"],
-                    next_steps=[
-                        f"Use 'get' action with product_id='{result['product_id']}' to view updated details",
-                        "Use 'list' action to see all products",
-                        "Use 'delete' action to remove this product if needed",
-                    ],
-                    action="update",
-                )
-            elif action == "delete":
-                # Handle dry_run mode for delete operations
-                dry_run = arguments.get("dry_run", False)
-                if dry_run:
-                    product_id = arguments.get("product_id")
-                    return [
-                        TextContent(
-                            type="text",
-                            text=f"DRY RUN MODE - Product Deletion\n\n"
-                            f"Would delete product: {product_id}\n\n"
-                            f"**Dry Run:** True (no actual deletion performed)\n\n"
-                            f"**Warning:** This action cannot be undone in real mode",
-                        )
-                    ]
-
-                result = await product_manager.delete_product(arguments)
-                return self.formatter.format_success_response(
-                    message=f"Product '{result['product_id']}' deleted successfully",
-                    data=result["data"],
-                    next_steps=[
-                        "Use 'list' action to see remaining products",
-                        "Use 'create' action to create a new product",
-                        "Use 'get_examples' to see product templates",
-                    ],
-                    action="delete",
-                )
-
             # Handle discovery and validation actions
             elif action == "get_capabilities":
                 return await self._handle_get_capabilities()
@@ -3240,17 +3215,10 @@ class ProductManagement(ToolBase):
             # Handle enhanced features
             elif action == "create_simple":
                 result = await enhancement_processor.create_simple(arguments)
-                return self.formatter.format_success_response(
-                    message=f"Simple product '{result.get('name', 'N/A')}' created successfully",
-                    data=result,
-                    next_steps=[
-                        'Create subscribers using manage_customers(action="create", subscriber_data={...}) to set up users who will access this product',
-                        'Create subscriptions using manage_subscriptions(action="create", subscription_data={...}) to subscribe those users to this product',
-                        f"Use 'get' action with product_id='{result.get('id')}' to view details",
-                        "Use 'update' action to modify the product",
-                        "Use 'list' action to see all products",
-                    ],
-                    action="create_simple",
+                return self._format_product_created(
+                    f"Simple product '{result.get('name', 'N/A')}' created successfully",
+                    result,
+                    "create_simple",
                 )
             elif action == "get_templates":
                 templates = await enhancement_processor.get_templates(arguments)
@@ -3283,88 +3251,7 @@ class ProductManagement(ToolBase):
                 ]
             elif action == "create_with_subscription":
                 result = await hierarchy_manager.create_with_subscription(arguments)
-
-                # Extract key information for enhanced output
-                product = result["result"]["product"]
-                subscription = result["result"]["subscription"]
-                product_id = product.get("id")
-                subscription_id = subscription.get("id")
-                if not product_id or not subscription_id:
-                    self._raise_missing_creation_id(product_id, subscription_id)
-
-                # Analyze what was automatically configured
-                auto_configured = []
-                if "sources" in product and product["sources"]:
-                    source_id = product["sources"][0].get("id")
-                    if source_id:
-                        auto_configured.append(f"Source assignment: {source_id} (dynamically resolved)")
-
-                if (
-                    "plan" in product
-                    and "ratingAggregations" in product["plan"]
-                    and product["plan"]["ratingAggregations"]
-                ):
-                    rating_agg = product["plan"]["ratingAggregations"][0]
-                    element_id = rating_agg.get("elementDefinitionId", "unknown")
-                    auto_configured.append(
-                        f"Usage billing: {element_id} metering element (dynamically resolved)"
-                    )
-
-                if "organizationId" in subscription:
-                    org_id = subscription["organizationId"]
-                    auto_configured.append(f"Organization assignment: {org_id} (auto-populated)")
-
-                auto_configured.append(
-                    "System fields: ownerId, teamId (auto-populated from authenticated context)"
-                )
-                auto_configured.append(
-                    "Required subscription fields: 15+ fields with proper defaults"
-                )
-
-                # Build enhanced success message
-                enhanced_message = (
-                    "Product and subscription created successfully with hierarchy linking\n\n"
-                )
-                enhanced_message += "Created Entities:\n"
-                enhanced_message += f"• **Product**: {product['name']} (ID: {product_id})\n"
-                enhanced_message += (
-                    f"• **Subscription**: {subscription['name']} (ID: {subscription_id})\n"
-                )
-                enhanced_message += (
-                    f"• **Client**: {subscription['client']['label']} (auto-created)\n\n"
-                )
-
-                enhanced_message += "Automatic Enhancements Applied:\n"
-                for config in auto_configured:
-                    enhanced_message += f"• {config}\n"
-                enhanced_message += "\n"
-
-                enhanced_message += "Product Structure:\n"
-                enhanced_message += (
-                    "• **Subscription-ready**: Product has sources and rating aggregations\n"
-                )
-                enhanced_message += f"• **Billing period**: {product['plan']['period']}\n"
-                enhanced_message += f"• **Currency**: {product['plan']['currency']}\n"
-                enhanced_message += "• **Tier structure**: Optimized (single unlimited tier)\n\n"
-
-                enhanced_message += "**Account-Agnostic Design:**\n"
-                enhanced_message += "• All resource IDs dynamically resolved from your account\n"
-                enhanced_message += (
-                    "• No hardcoded values - works across different Revenium accounts\n"
-                )
-                enhanced_message += "• Automatic prerequisite validation and error handling\n"
-
-                return [
-                    TextContent(
-                        type="text",
-                        text=enhanced_message
-                        + "\n**Next Steps:**\n"
-                        + f"• Use 'get' action with product_id='{product_id}' to view product details\n"
-                        + f"• Use manage_subscriptions get action with subscription_id='{subscription_id}' to view subscription\n"
-                        + "• Use 'get_subscriptions' to see all subscriptions for this product\n"
-                        + "• Use manage_subscriber_credentials to add credentials to the subscription",
-                    )
-                ]
+                return await self._format_create_with_subscription_response(result)
 
             # Handle agent summary
             elif action == "get_agent_summary":
@@ -3513,6 +3400,7 @@ manage_metering_elements(action="list")       # See available elements: totalCos
 # Step 3: Create usage-based product with elementDefinitionId
 create(product_data={
   "name": "AI Usage Product",
+  "sourceIds": ["<source id from manage_sources(action='list')>"],
   "plan": {
     "ratingAggregations": [{
       "elementDefinitionId": "COPY_FROM_STEP_1",  # Use actual ID from manage_metering_elements list
@@ -3540,7 +3428,8 @@ create_with_subscription(product_data={...}, subscription_data={...})  # Create 
 ```bash
 # PREREQUISITE: Verify account readiness (REQUIRED)
 manage_sources(action="list")                      # Ensure sources exist (required)
-manage_metering_elements(action="list")            # Check metering elements (optional)
+manage_customers(action="list", resource_type="organizations")  # Pick organizationId (required)
+manage_metering_elements(action="list")            # Ensure a metering element exists (required)
 
 # Complete workflow in single operation
 create_with_subscription(
@@ -3560,14 +3449,15 @@ create_with_subscription(
   subscription_data={
     "name": "Customer Subscription",
     "description": "Active subscription for AI analytics platform",
-    "clientEmailAddress": "customer@company.com"
+    "clientEmailAddress": "customer@company.com",
+    "organizationId": "<organization id>"
   }
 )
 
 # AUTOMATIC ENHANCEMENTS (no user action required):
 # Sources: Assigns first available source from your account
-# Metering: Adds usage billing with totalCost element
-# System fields: Auto-populates ownerId, teamId, organizationId
+# Metering: Adds a free usage tier on the first metering element found in your organization
+# System fields: Auto-populates ownerId and teamId (organizationId is required)
 # Tier structure: Ensures proper configuration (single unlimited tier)
 # Required fields: Adds all 15+ subscription fields with defaults
 ```"""

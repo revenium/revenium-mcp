@@ -4,10 +4,15 @@ Tests the EmailVerification class: action routing, email validation,
 email update flow, status checking, and error handling.
 """
 
+import json
+import time
+
 import pytest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 
+from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
+from src.revenium_mcp_server.config_cache import ConfigCacheError, _default_cache
 from src.revenium_mcp_server.tools_decomposed.email_verification import EmailVerification
 
 
@@ -96,9 +101,9 @@ class TestUpdateEmail:
 
     @pytest.mark.asyncio
     async def test_missing_email_returns_error(self, email_tool):
-        result = await email_tool.handle_action("update_email", {})
-        text = result[0].text.lower()
-        assert "email" in text
+        with pytest.raises(ToolError) as exc_info:
+            await email_tool.handle_action("update_email", {})
+        assert "email" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
     async def test_successful_update(self, email_tool):
@@ -117,21 +122,100 @@ class TestUpdateEmail:
         with patch.object(
             email_tool, "_update_email_configuration", return_value=False
         ):
-            result = await email_tool.handle_action(
-                "update_email", {"email": "admin@company.com"}
-            )
-        text = result[0].text
-        assert "Failed" in text
-        assert "Troubleshooting" in text
+            with pytest.raises(ToolError) as exc_info:
+                await email_tool.handle_action(
+                    "update_email", {"email": "admin@company.com"}
+                )
+        assert "was not saved" in exc_info.value.message
+        assert exc_info.value.suggestions
 
     @pytest.mark.asyncio
     async def test_invalid_email_update_shows_error(self, email_tool):
         """Updating with an invalid email format should show error."""
-        result = await email_tool.handle_action(
-            "update_email", {"email": "invalid"}
+        with pytest.raises(ToolError) as exc_info:
+            await email_tool.handle_action("update_email", {"email": "invalid"})
+        assert "was not saved" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_update_without_a_saved_configuration_says_not_saved(
+        self, email_tool, monkeypatch
+    ):
+        """BACK-4679: with no valid .revenium_cache nothing is stored, so the
+        reply must not claim the email was configured."""
+        monkeypatch.delenv("AUTH_MODE", raising=False)
+        with pytest.raises(ToolError) as exc_info:
+            await email_tool.handle_action(
+                "update_email", {"email": "admin@company.com"}
+            )
+        assert "was not saved" in exc_info.value.message
+        assert "admin@company.com" in exc_info.value.message
+        assert not _default_cache.cache_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_update_when_the_cache_cannot_be_written_says_not_saved(
+        self, email_tool, monkeypatch
+    ):
+        monkeypatch.delenv("AUTH_MODE", raising=False)
+        with patch.object(
+            _default_cache,
+            "update_config_field",
+            AsyncMock(side_effect=ConfigCacheError("disk full")),
+        ):
+            with pytest.raises(ToolError) as exc_info:
+                await email_tool.handle_action(
+                    "update_email", {"email": "admin@company.com"}
+                )
+        assert "was not saved" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_update_with_a_saved_configuration_writes_it_and_says_so(
+        self, email_tool, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("AUTH_MODE", raising=False)
+        monkeypatch.delenv("REVENIUM_DEFAULT_EMAIL", raising=False)
+        path = tmp_path / "cache.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "timestamp": time.time(),
+                    "config": {
+                        "REVENIUM_API_KEY": "fake-key-for-tests",
+                        "REVENIUM_TEAM_ID": "team_test",
+                        "REVENIUM_TENANT_ID": "tenant_test",
+                        "REVENIUM_OWNER_ID": "owner_test",
+                    },
+                    "version": "1.0",
+                }
+            )
         )
-        text = result[0].text.lower()
-        assert "error" in text or "failed" in text
+        monkeypatch.setattr(_default_cache, "cache_file", path)
+
+        result = await email_tool.handle_action(
+            "update_email", {"email": "admin@company.com"}
+        )
+        assert "Successfully configured" in result[0].text
+        saved = json.loads(path.read_text())
+        assert saved["config"]["REVENIUM_DEFAULT_EMAIL"] == "admin@company.com"
+
+        status = await EmailVerification().handle_action("check_status", {})
+        assert "admin@company.com" in status[0].text
+        assert "Email Not Configured" not in status[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_mode", ["api_key", "clerk"])
+    async def test_hosted_server_refuses_to_set_the_email(
+        self, email_tool, monkeypatch, auth_mode
+    ):
+        monkeypatch.setenv("AUTH_MODE", auth_mode)
+        update = AsyncMock(return_value=True)
+        with patch.object(_default_cache, "update_config_field", update):
+            with pytest.raises(ToolError) as exc_info:
+                await email_tool.handle_action(
+                    "update_email", {"email": "admin@company.com"}
+                )
+        assert "not available on the hosted server" in exc_info.value.message
+        assert exc_info.value.error_code == ErrorCodes.ACTION_NOT_SUPPORTED
+        update.assert_not_called()
 
 
 class TestSetupGuidance:
@@ -183,6 +267,50 @@ class TestTestConfiguration:
             result = await email_tool.handle_action("test_configuration", {})
         text = result[0].text
         assert "No Email Configuration Found" in text
+
+
+    @pytest.mark.asyncio
+    async def test_invalid_configured_address_is_not_reported_ready(self, email_tool):
+        """BACK-4679: a malformed address is never summarized as ready."""
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.email_verification.get_config_value",
+            return_value="bob@",
+        ):
+            result = await email_tool.handle_action("test_configuration", {})
+        text = result[0].text
+        assert "- **Format Valid**: ❌ No\n" in text
+        assert "- **Ready for Notifications**: ❌ No\n" in text
+        assert "✅ Yes (if validation passed)" not in text
+        assert "Your email configuration is ready!" not in text
+        assert "Ready for Notifications**: ✅" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_mode", ["api_key", "clerk"])
+    async def test_invalid_address_on_the_hosted_server_is_not_told_to_use_update_email(
+        self, email_tool, monkeypatch, auth_mode
+    ):
+        """update_email is refused on the hosted server, so the fix steps point
+        to the email argument of manage_alerts instead."""
+        monkeypatch.setenv("AUTH_MODE", auth_mode)
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.email_verification.get_config_value",
+            return_value="bob@",
+        ):
+            result = await email_tool.handle_action("test_configuration", {})
+        text = result[0].text
+        assert "action='update_email'" not in text
+        assert "manage_alerts(action='create_simple', threshold=100, email='your@email.com')" in text
+
+    @pytest.mark.asyncio
+    async def test_valid_configured_address_is_reported_ready(self, email_tool):
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.email_verification.get_config_value",
+            return_value="admin@company.com",
+        ):
+            result = await email_tool.handle_action("test_configuration", {})
+        text = result[0].text
+        assert "- **Format Valid**: ✅ Yes\n" in text
+        assert "- **Ready for Notifications**: ✅ Yes\n" in text
 
 
 class TestBuildEmailStatus:

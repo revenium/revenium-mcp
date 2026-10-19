@@ -8,6 +8,7 @@ checks, and handle_action routing — all high-value behavioral paths.
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from src.revenium_mcp_server.auth.tenant_scope import LOCAL_TENANT_SCOPE
 from src.revenium_mcp_server.tools_decomposed.metering_management import (
     MeteringTransactionManager,
     MeteringManagement,
@@ -307,12 +308,12 @@ class TestGetTransactionStatus:
     @pytest.mark.asyncio
     async def test_missing_transaction_id_raises(self):
         with pytest.raises(Exception) as exc_info:
-            await self.mgr.get_transaction_status({})
+            await self.mgr.get_transaction_status({}, LOCAL_TENANT_SCOPE)
         assert "transaction_id" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
     async def test_unknown_transaction_id_returns_not_found(self):
-        result = await self.mgr.get_transaction_status({"transaction_id": "tx_nonexistent"})
+        result = await self.mgr.get_transaction_status({"transaction_id": "tx_nonexistent"}, LOCAL_TENANT_SCOPE)
         assert result["found"] is False
         assert result["transaction_id"] == "tx_nonexistent"
 
@@ -320,14 +321,14 @@ class TestGetTransactionStatus:
     async def test_known_transaction_id_returns_found(self):
         from datetime import datetime, timezone
 
-        self.mgr.transaction_store["tx_known123"] = {
+        self.mgr.transaction_store.put(LOCAL_TENANT_SCOPE, "tx_known123", {
             "payload": {"model": "gpt-4", "provider": "OPENAI"},
             "timestamp": datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
             "verified": False,
             "submitted": True,
-        }
+        })
 
-        result = await self.mgr.get_transaction_status({"transaction_id": "tx_known123"})
+        result = await self.mgr.get_transaction_status({"transaction_id": "tx_known123"}, LOCAL_TENANT_SCOPE)
         assert result["found"] is True
         assert result["transaction_id"] == "tx_known123"
         assert result["model"] == "gpt-4"
@@ -496,25 +497,25 @@ class TestCheckSessionStore:
 
     def setup_method(self):
         self.mgr = MeteringTransactionManager()
-        self.mgr.transaction_store["tx_known"] = {"payload": {}, "verified": False}
+        self.mgr.transaction_store.put(LOCAL_TENANT_SCOPE, "tx_known", {"payload": {}, "verified": False})
 
     def test_known_id_found_in_session(self):
-        found, remaining = self.mgr._check_session_store(["tx_known"])
+        found, remaining = self.mgr._check_session_store(["tx_known"], LOCAL_TENANT_SCOPE)
         assert "tx_known" in found
         assert remaining == []
 
     def test_unknown_id_not_found_in_session(self):
-        found, remaining = self.mgr._check_session_store(["tx_unknown"])
+        found, remaining = self.mgr._check_session_store(["tx_unknown"], LOCAL_TENANT_SCOPE)
         assert found == {}
         assert "tx_unknown" in remaining
 
     def test_mixed_ids_splits_correctly(self):
-        found, remaining = self.mgr._check_session_store(["tx_known", "tx_unknown"])
+        found, remaining = self.mgr._check_session_store(["tx_known", "tx_unknown"], LOCAL_TENANT_SCOPE)
         assert "tx_known" in found
         assert "tx_unknown" in remaining
 
     def test_none_transaction_ids_returns_unverified_from_store(self):
-        found, remaining = self.mgr._check_session_store(None)
+        found, remaining = self.mgr._check_session_store(None, LOCAL_TENANT_SCOPE)
         assert "tx_known" in found
         assert remaining == []
 

@@ -24,6 +24,7 @@ from src.revenium_mcp_server.analytics.formatters.api_key_costs_formatter import
     ApiKeyCostsFormatter,
 )
 from src.revenium_mcp_server.analytics.formatters.base_formatter import (
+    COST_SOURCE_RULE,
     BaseFormattingUtilities,
 )
 from src.revenium_mcp_server.analytics.formatters.customer_costs_formatter import (
@@ -130,8 +131,12 @@ class TestScopeNoteFollowsThePlane:
         note = BaseFormattingUtilities.coding_assistant_scope_note(
             "cost_metric_by_provider_over_time"
         )
-        assert "is reported only under the `coding_assistant` cost source" in note
-        assert "revenium_metered" in note
+        assert "is counted only when the team pays API rates for that assistant" in note
+        assert "decides whether coding-assistant calls are counted, not which cost source" in note
+        assert "otherwise `coding_assistant` for a call that carries a coding-assistant" in note
+        assert "otherwise `revenium_metered`" in note
+        assert "legitimately returns nothing" in note
+        assert "is real spend under `revenium_metered` or `provider_billing`" not in note
         assert "get_transaction_count" in note
 
     def test_legacy_plane_states_the_tenant_policy_rule(self, monkeypatch):
@@ -220,6 +225,18 @@ class TestCapabilityTextIsConsistent:
         assert "Data from coding assistant traces" not in text
 
     @pytest.mark.asyncio
+    async def test_capabilities_state_where_a_call_is_counted(self):
+        """FRONT-3434: the API-rate setting decides whether a coding-assistant call counts,
+        not its cost source, so a metered-and-billing-only request can be empty."""
+        tool = _analytics_tool()
+        text = (await tool._handle_get_capabilities())[0].text
+        assert "source is where its row came from" in text
+        assert "The legacy analytics endpoints take no costSources" in text
+        assert "legitimately returns nothing" in text
+        assert COST_SOURCE_RULE in text
+        assert "real spend under revenium_metered or\n     provider_billing" not in text
+
+    @pytest.mark.asyncio
     async def test_capabilities_name_the_per_employee_boundary(self, monkeypatch):
         monkeypatch.setenv("REVENIUM_USE_NEW_ANALYTICS_API", "true")
         tool = _analytics_tool()
@@ -279,4 +296,16 @@ class TestCostSummaryCarriesTheScopeNote:
 
         monkeypatch.setenv("REVENIUM_USE_NEW_ANALYTICS_API", "true")
         result = CostSummaryFormatter().format(self._summary_data(), PARAMS)
-        assert "is reported only under the `coding_assistant` cost source" in result
+        assert "decides whether coding-assistant calls are counted, not which cost source" in result
+
+
+def test_billing_note_scopes_the_api_rate_rule_to_the_analytics_api():
+    """FRONT-3434: the legacy endpoints follow the tenant's filter policy, so the
+    API-rate rule must not read as true on every plane."""
+    from src.revenium_mcp_server.tools_decomposed.coding_assistant_billing_fields import (
+        CODING_ASSISTANT_BILLING_SEMANTICS_NOTE as note,
+    )
+
+    assert "On the analytics API their usage counts as spend" in note
+    assert "the analytics API leaves it out of its cost reads" in note
+    assert "legacy analytics endpoints follow the tenant's coding-assistant filter policy" in note

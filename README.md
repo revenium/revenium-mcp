@@ -137,10 +137,15 @@ Defaults baked into the image:
 - `TRANSPORT_MODE=http` (stdio doesn't make sense in a container)
 - `MCP_HOST=0.0.0.0` (binds all interfaces inside the container)
 - `MCP_PORT=8000`
+- No `AUTH_MODE`: the server refuses to start until you set one (`api_key` for
+  hosting, `clerk` for OAuth sign-in, `env` only on a trusted network, as a
+  deliberate choice to accept every caller with no sign-in). Under compose,
+  `docker compose logs mcp-server` shows the `AUTH_MODE` message and the
+  container restarts until it is set.
 
 The container runs as a non-root user (`mcp`, UID 1000). Health probes:
-- `GET /health` — liveness, always returns 200 (no external calls)
-- `GET /ready` — readiness, returns 200 when the Revenium API is reachable with the configured key (503 otherwise)
+- `GET /health`: liveness, always returns 200 and never waits on an external call. The body also reports the platform's state under `platform`, in every auth mode: `status_code` (the platform root's answer to an unauthenticated HEAD, for example 503 during an outage), `checked_at` (UTC time of that check), `age_seconds` and `error` (`timeout` or `revenium_api_unreachable` when there was no answer, including when `REVENIUM_BASE_URL` is unset, in which case no request is made). 2xx to 4xx mean the platform is up and 5xx means its gateway is not serving. All four are null until the first check; a `/health` call that finds the state missing or older than the readiness cache starts one HEAD in the background and returns at once. That check never sends an API key.
+- `GET /ready`: readiness of the server itself. With `AUTH_MODE=env` it returns 200 when the configured key is accepted by the Revenium API (503 otherwise). With `AUTH_MODE=api_key` or `clerk` there is no server-wide key: it returns 200 whenever the Revenium API host answers at all, including 401, 404 and 5xx, and 503 only when `REVENIUM_BASE_URL` is unset or the host does not answer. Watch `/health` for platform outages.
 
 ### For Full HTTPS Stack via docker compose
 
@@ -380,13 +385,13 @@ pip install revenium-mcp
 # Add to Claude Code using venv python (starter profile - default)
 claude mcp add revenium \
   -e REVENIUM_API_KEY=hak_your_api_key_here \
-  -- ./revenium-mcp-env/bin/python -m revenium_mcp
+  -- ./revenium-mcp-env/bin/python -m revenium_mcp_server
 
 # For business profile, add the environment variable:
 claude mcp add revenium \
   -e REVENIUM_API_KEY=hak_your_api_key_here \
   -e TOOL_PROFILE=business \
-  -- ./revenium-mcp-env/bin/python -m revenium_mcp
+  -- ./revenium-mcp-env/bin/python -m revenium_mcp_server
 ```
 
 #### Claude Code Slash Commands

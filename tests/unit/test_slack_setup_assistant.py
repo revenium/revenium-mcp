@@ -12,6 +12,10 @@ from unittest.mock import AsyncMock, patch
 
 
 from src.revenium_mcp_server.auth.tenant_context import TenantContext
+from src.revenium_mcp_server.client import ReveniumAPIError
+from src.revenium_mcp_server.tools_decomposed.slack_config_formatters import (
+    format_single_config_summary,
+)
 from src.revenium_mcp_server.tools_decomposed.slack_setup_assistant import SlackSetupAssistant
 
 
@@ -80,7 +84,7 @@ class TestGuidedSetup:
         with patch.object(
             setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_default_slack_config_id",
             return_value="cfg-1",
         ):
             result = await setup_tool.handle_action("guided_setup", {})
@@ -98,7 +102,7 @@ class TestGuidedSetup:
         with patch.object(
             setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_default_slack_config_id",
             return_value=None,
         ):
             result = await setup_tool.handle_action("guided_setup", {})
@@ -162,8 +166,8 @@ class TestSelectDefaultConfiguration:
 
     @pytest.mark.asyncio
     async def test_select_default_skips_env_write_when_ctx_set(self, setup_tool):
-        """Multi-tenant mode (ctx non-None) must NOT write the process-global
-        REVENIUM_DEFAULT_SLACK_CONFIG_ID env var — that would leak Tenant A's
+        """A hosted organization's choice must NOT write the process-global
+        REVENIUM_DEFAULT_SLACK_CONFIG_ID env var; that would leak Tenant A's
         selection into Tenant B's subsequent requests."""
         ctx = TenantContext(team_id="team-1", api_key="abcdef1234567890")
         configs = [{"id": "cfg-tenant", "name": "Tenant Cfg", "teamName": "WS", "channelName": "ch"}]
@@ -182,13 +186,30 @@ class TestSelectDefaultConfiguration:
                 )
             # Env var must NOT have been written.
             assert "REVENIUM_DEFAULT_SLACK_CONFIG_ID" not in os.environ
-            # Response should make clear the selection is not persisted globally.
             text = result[0].text
-            assert "Session" in text or "session" in text
+            assert "your organization on this server" in text
+            assert ".env" not in text
             assert "cfg-tenant" in text
         finally:
             if original is not None:
                 os.environ["REVENIUM_DEFAULT_SLACK_CONFIG_ID"] = original
+
+
+    @pytest.mark.asyncio
+    async def test_select_default_with_an_unknown_id_says_not_found(self, setup_tool):
+        mock_client = AsyncMock()
+        mock_client.get_slack_configuration_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("HTTP 403: Access Denied", status_code=403)
+        )
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
+        ), patch.dict("os.environ", {}, clear=False):
+            result = await setup_tool.handle_action(
+                "select_default_configuration", {"config_id": "RdKdRMz"}
+            )
+        text = result[0].text
+        assert "not found or is not in your organization" in text
+        assert "Access Denied" not in text
 
 
 class TestSetupStatus:
@@ -203,11 +224,8 @@ class TestSetupStatus:
         with patch.object(
             setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
-            side_effect=lambda key, *args: {
-                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": "cfg-1",
-                "REVENIUM_APP_BASE_URL": "https://ai.revenium.io",
-            }.get(key, args[0] if args else None),
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_default_slack_config_id",
+            return_value="cfg-1",
         ):
             result = await setup_tool.handle_action("setup_status", {})
         assert "COMPLETE" in result[0].text
@@ -221,11 +239,8 @@ class TestSetupStatus:
         with patch.object(
             setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
-            side_effect=lambda key, *args: {
-                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": None,
-                "REVENIUM_APP_BASE_URL": "https://ai.revenium.io",
-            }.get(key, args[0] if args else None),
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_default_slack_config_id",
+            return_value=None,
         ):
             result = await setup_tool.handle_action("setup_status", {})
         assert "PARTIAL" in result[0].text
@@ -237,11 +252,8 @@ class TestSetupStatus:
         with patch.object(
             setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
-            side_effect=lambda key, *args: {
-                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": None,
-                "REVENIUM_APP_BASE_URL": "https://ai.revenium.io",
-            }.get(key, args[0] if args else None),
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_default_slack_config_id",
+            return_value=None,
         ):
             result = await setup_tool.handle_action("setup_status", {})
         assert "NOT CONFIGURED" in result[0].text
@@ -284,7 +296,7 @@ class TestWorkspaceAndChannelFieldExtraction:
         with patch.object(
             setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_default_slack_config_id",
             return_value="cfg-1",
         ):
             result = await setup_tool.handle_action("guided_setup", {})
@@ -299,7 +311,7 @@ class TestWorkspaceAndChannelFieldExtraction:
         with patch.object(
             setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_default_slack_config_id",
             return_value="cfg-1",
         ):
             result = await setup_tool.handle_action("guided_setup", {})
@@ -317,7 +329,7 @@ class TestWorkspaceAndChannelFieldExtraction:
         with patch.object(
             setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_default_slack_config_id",
             return_value=None,
         ):
             result = await setup_tool.handle_action("detect_and_recommend", {})
@@ -337,7 +349,7 @@ class TestWorkspaceAndChannelFieldExtraction:
         with patch.object(
             setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ), patch(
-            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value",
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_default_slack_config_id",
             return_value=None,
         ):
             result = await setup_tool.handle_action("detect_and_recommend", {})
@@ -359,3 +371,90 @@ class TestWorkspaceAndChannelFieldExtraction:
         assert "WS1" in text
         assert "Unknown Workspace" not in text
         assert "general" in text
+
+
+class TestChannelAndCreatedMatchTheConfigurationList:
+    """BACK-4679: detect_and_recommend and select_default_configuration print the
+    channel name and creation date the way list_configurations does."""
+
+    @pytest.mark.asyncio
+    async def test_detect_and_recommend_prints_channel_and_created_like_list_configurations(
+        self, setup_tool
+    ):
+        configs = [
+            {
+                "id": "cfg-1",
+                "name": "Clerk Dev",
+                "teamName": "WS",
+                "channelName": "#clerk-dev",
+                "created": "2026-02-18T04:16:23.476Z",
+            },
+            {
+                "id": "cfg-2",
+                "name": "Gabriel DM",
+                "teamName": "WS",
+                "channelName": "@gabriel.sabadin",
+                "created": "2026-03-01T10:00:00.000Z",
+            },
+            {
+                "id": "cfg-3",
+                "name": "AI Prod",
+                "teamName": "WS",
+                "channelName": "ai-prod-cost-alerts",
+                "created": "2026-04-02T11:30:00.000Z",
+            },
+        ]
+        mock_client = _mock_client_with_configs(configs)
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_default_slack_config_id",
+            return_value="cfg-1",
+        ):
+            result = await setup_tool.handle_action("detect_and_recommend", {})
+        text = result[0].text
+
+        assert "##clerk-dev" not in text
+        assert "#@gabriel.sabadin" not in text
+        assert "Created:** Unknown" not in text
+        assert "- Channel: #clerk-dev\n" in text
+        for i, c in enumerate(configs, 1):
+            for line in format_single_config_summary(c, i).splitlines():
+                if line.startswith("- **Channel:**") or line.startswith("- **Created:**"):
+                    assert line + "\n" in text
+
+    @pytest.mark.asyncio
+    async def test_detect_and_recommend_prints_a_missing_channel_and_date_as_unknown(
+        self, setup_tool
+    ):
+        configs = [{"id": "cfg-1", "name": "Bare", "teamName": "WS"}]
+        mock_client = _mock_client_with_configs(configs)
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_default_slack_config_id",
+            return_value=None,
+        ):
+            result = await setup_tool.handle_action("detect_and_recommend", {})
+        text = result[0].text
+
+        assert "- **Channel:** N/A\n" in text
+        assert "#N/A" not in text
+        assert "- **Created:** Unknown\n" in text
+
+    @pytest.mark.asyncio
+    async def test_select_default_configuration_prints_the_channel_name_as_sent(
+        self, setup_tool
+    ):
+        configs = [{"id": "cfg-1", "name": "Ops", "teamName": "WS", "channelName": "#ops"}]
+        mock_client = _mock_client_with_configs(configs)
+        with patch.object(
+            setup_tool, "get_client", AsyncMock(return_value=mock_client)
+        ), patch.dict("os.environ", {}, clear=False):
+            result = await setup_tool.handle_action(
+                "select_default_configuration", {"config_id": "cfg-1"}
+            )
+        text = result[0].text
+
+        assert "- **Channel:** #ops\n" in text
+        assert "##ops" not in text

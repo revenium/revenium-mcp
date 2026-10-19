@@ -10,11 +10,16 @@ Covers:
   _handle_get_agent_summary, metadata provider methods
 """
 
+import inspect
+import re
+
 import pytest
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from src.revenium_mcp_server.client import ReveniumAPIError, ReveniumClient
+from src.revenium_mcp_server.tools_decomposed import subscription_management
 from src.revenium_mcp_server.tools_decomposed.subscription_management import (
     SubscriptionAnalytics,
     SubscriptionHierarchyManager,
@@ -22,8 +27,9 @@ from src.revenium_mcp_server.tools_decomposed.subscription_management import (
     SubscriptionManager,
     SubscriptionValidator,
 )
-from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from mcp.types import TextContent
+from tests.unit._helpers_recording_client import recording_client
 
 
 # ---------------------------------------------------------------------------
@@ -79,12 +85,11 @@ def mock_client():
     client.get_subscriptions = AsyncMock()
     client.get_subscription_by_id = AsyncMock()
     client.create_subscription = AsyncMock()
-    client.cancel_subscription = AsyncMock()
+    client.delete_subscription = AsyncMock()
     client.get_organizations = AsyncMock()
     client.get_subscribers = AsyncMock()
     client.get_credentials = AsyncMock()
     client.create_credential = AsyncMock()
-    client.get_paginated = AsyncMock()
     client._extract_embedded_data = MagicMock()
     client._extract_pagination_info = MagicMock(return_value={"totalElements": 5, "page": 0, "size": 20})
     return client
@@ -254,12 +259,14 @@ class TestCRUDOperations:
             await sub_manager.create_subscription({})
 
     @patch("src.revenium_mcp_server.tools_decomposed.subscription_management.get_config_value", return_value="owner_1")
-    async def test_create_subscription_with_name_auto_generate(self, mock_config, sub_manager, mock_client):
+    async def test_create_subscription_with_only_a_name_is_refused(self, mock_config, sub_manager, mock_client):
         mock_client.get_products.return_value = {}
         mock_client._extract_embedded_data.return_value = [{"id": "p1"}]
-        mock_client.create_subscription.return_value = {"id": "s_new"}
-        result = await sub_manager.create_subscription({"name": "My Sub"})
-        assert result["id"] == "s_new"
+        with pytest.raises(ToolError) as exc:
+            await sub_manager.create_subscription({"name": "My Sub"})
+        assert exc.value.field == "subscription_data"
+        mock_client.get_products.assert_not_awaited()
+        mock_client.create_subscription.assert_not_awaited()
 
     @patch("src.revenium_mcp_server.tools_decomposed.subscription_management.get_config_value", return_value="owner_1")
     async def test_create_subscription_with_data(self, mock_config, sub_manager, mock_client):
@@ -327,21 +334,12 @@ class TestCRUDOperations:
         })
         assert result["updated"] is True
 
-    async def test_cancel_subscription_missing_id(self, sub_manager):
-        with pytest.raises(ToolError):
-            await sub_manager.cancel_subscription({})
-
-    async def test_cancel_subscription_success(self, sub_manager, mock_client):
-        mock_client.cancel_subscription.return_value = {"cancelled": True}
-        result = await sub_manager.cancel_subscription({"subscription_id": "s1"})
-        assert result["cancelled"] is True
-
     async def test_delete_subscription_missing_id(self, sub_manager):
         with pytest.raises(ToolError):
             await sub_manager.delete_subscription({})
 
     async def test_delete_subscription_success(self, sub_manager, mock_client):
-        mock_client.cancel_subscription.return_value = {"deleted": True}
+        mock_client.delete_subscription.return_value = {"deleted": True}
         result = await sub_manager.delete_subscription({"subscription_id": "s1"})
         assert result["deleted"] is True
 
@@ -431,49 +429,67 @@ class TestGetSupportingData:
 
 
 class TestSearchSubscriptions:
+    """BACK-4709: one term goes to the platform as `query`; rows are platform-shaped."""
+
     async def test_search_no_filters(self, sub_manager, mock_client):
         mock_client.get_subscriptions.return_value = {}
         mock_client._extract_embedded_data.return_value = [
-            {"id": "s1", "name": "Sub A", "customer": "Acme", "product": "Pro", "subscriber": "a@b.com", "description": ""},
+            {"id": "s1", "name": "Sub A", "subscriberEmail": "a@b.com", "product": None},
         ]
         result = await sub_manager.search_subscriptions({})
-        assert result["total_found"] == 1
+        mock_client.get_subscriptions.assert_awaited_once_with(page=0, size=50)
+        assert result["total_found"] == 5
+        assert result["returned"] == 1
 
     async def test_search_with_query(self, sub_manager, mock_client):
         mock_client.get_subscriptions.return_value = {}
         mock_client._extract_embedded_data.return_value = [
-            {"id": "s1", "name": "Acme Sub", "customer": "", "product": "", "subscriber": "", "description": ""},
-            {"id": "s2", "name": "Globex Sub", "customer": "", "product": "", "subscriber": "", "description": ""},
+            {"id": "s1", "name": "Acme Sub", "subscriberEmail": "a@b.com"},
         ]
         result = await sub_manager.search_subscriptions({"search_query": "acme"})
-        assert result["total_found"] == 1
+        mock_client.get_subscriptions.assert_awaited_once_with(page=0, size=50, query="acme")
+        assert result["subscriptions"][0]["matched_on"] == ["name"]
+        assert result["exact_field_matches_on_page"] == 1
+
+    async def test_search_query_row_matching_no_known_field_is_not_counted(self, sub_manager, mock_client):
+        # The platform also matches the client username and treats _ and % as
+        # wildcards, so it can return a row none of the checked fields contain.
+        mock_client.get_subscriptions.return_value = {}
+        mock_client._extract_embedded_data.return_value = [
+            {"id": "s1", "name": "Acme Sub"},
+            {"id": "s2", "name": "Other", "subscriberEmail": "x@y.com"},
+        ]
+        result = await sub_manager.search_subscriptions({"search_query": "acme"})
+        assert result["subscriptions"][1]["matched_on"] == []
+        assert result["exact_field_matches_on_page"] == 1
 
     async def test_search_by_customer_name(self, sub_manager, mock_client):
         mock_client.get_subscriptions.return_value = {}
         mock_client._extract_embedded_data.return_value = [
-            {"id": "s1", "name": "S1", "customer": "Acme Corp", "product": "", "subscriber": "", "description": ""},
-            {"id": "s2", "name": "S2", "customer": "Globex", "product": "", "subscriber": "", "description": ""},
+            {"id": "s1", "name": "S1", "organization": {"id": "o1", "label": "Acme Corp"}},
         ]
         result = await sub_manager.search_subscriptions({"customer_name": "acme"})
-        assert result["total_found"] == 1
+        mock_client.get_subscriptions.assert_awaited_once_with(page=0, size=50, query="acme")
+        assert result["exact_field_matches_on_page"] == 1
 
     async def test_search_by_product_name(self, sub_manager, mock_client):
         mock_client.get_subscriptions.return_value = {}
         mock_client._extract_embedded_data.return_value = [
-            {"id": "s1", "name": "S1", "customer": "", "product": "Premium Plan", "subscriber": "", "description": ""},
-            {"id": "s2", "name": "S2", "customer": "", "product": "Basic Plan", "subscriber": "", "description": ""},
+            {"id": "s1", "name": "S1", "product": {"id": "p1", "name": "Premium Plan"}},
         ]
         result = await sub_manager.search_subscriptions({"product_name": "premium"})
-        assert result["total_found"] == 1
+        mock_client.get_subscriptions.assert_awaited_once_with(page=0, size=50, query="premium")
+        assert result["subscriptions"][0]["matched_on"] == ["product.name"]
 
     async def test_search_by_subscriber_email(self, sub_manager, mock_client):
         mock_client.get_subscriptions.return_value = {}
         mock_client._extract_embedded_data.return_value = [
-            {"id": "s1", "name": "S1", "customer": "", "product": "", "subscriber": "alice@test.com", "description": ""},
-            {"id": "s2", "name": "S2", "customer": "", "product": "", "subscriber": "bob@test.com", "description": ""},
+            {"id": "s1", "name": "S1", "subscriberEmail": "alice@test.com", "clientEmailAddress": "alice@test.com"},
         ]
         result = await sub_manager.search_subscriptions({"subscriber_email": "alice"})
-        assert result["total_found"] == 1
+        mock_client.get_subscriptions.assert_awaited_once_with(page=0, size=50, query="alice")
+        assert result["subscriptions"][0]["matched_on"] == ["subscriberEmail", "clientEmailAddress"]
+        assert result["exact_field_matches_on_page"] == 1
 
 
 # ===========================================================================
@@ -497,6 +513,104 @@ class TestSubscriptionNLP:
         mock_client._extract_embedded_data.return_value = []
         result = await sub_manager.subscription_nlp({"query": "find subscriptions for acme"})
         assert result["action"] == "search_subscriptions"
+        # BACK-4709: the extractor yields a customer name and a general term;
+        # only the more specific one is sent as the platform query.
+        mock_client.get_subscriptions.assert_awaited_once_with(page=0, size=20, query="acme")
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "find popcorn subscriptions",
+            "search subscriptions with popcorn",
+            "search subscriptions with popcorn?",
+            "find subscriptions for popcorn",
+        ],
+    )
+    async def test_nlp_search_sends_the_bare_term(self, sub_manager, mock_client, query):
+        mock_client.get_subscriptions.return_value = {}
+        mock_client._extract_embedded_data.return_value = []
+
+        await sub_manager.subscription_nlp({"query": query})
+
+        mock_client.get_subscriptions.assert_awaited_once_with(page=0, size=20, query="popcorn")
+
+    @pytest.mark.parametrize(
+        "verb", ["list", "show", "display", "view", "get", "see"]
+    )
+    async def test_nlp_every_list_phrase_lists_without_a_search_query(
+        self, sub_manager, mock_client, verb
+    ):
+        mock_client.get_subscriptions.return_value = {}
+        mock_client._extract_embedded_data.return_value = [{"id": "s1"}]
+
+        result = await sub_manager.subscription_nlp({"query": f"{verb} all subscriptions"})
+
+        assert result["action"] == "list"
+        assert "query" not in mock_client.get_subscriptions.await_args.kwargs
+
+    @pytest.mark.parametrize("query", ["list all active subscriptions", "show me subs"])
+    async def test_nlp_list_phrase_with_leftover_words_still_lists(
+        self, sub_manager, mock_client, query
+    ):
+        mock_client.get_subscriptions.return_value = {}
+        mock_client._extract_embedded_data.return_value = [{"id": "s1"}]
+
+        result = await sub_manager.subscription_nlp({"query": query})
+
+        assert result["action"] == "list"
+        assert "query" not in mock_client.get_subscriptions.await_args.kwargs
+
+    @pytest.mark.parametrize(
+        "query, term",
+        [
+            ("show me all subscriptions for globaltech", "globaltech"),
+            ("list subscriptions for popcorn", "popcorn"),
+            ("show subscriptions for popcorn", "popcorn"),
+        ],
+    )
+    async def test_nlp_list_phrasing_with_a_customer_searches_for_it(
+        self, sub_manager, mock_client, query, term
+    ):
+        """A list of every subscription is not an answer to a question about one customer."""
+        mock_client.get_subscriptions.return_value = {}
+        mock_client._extract_embedded_data.return_value = []
+
+        result = await sub_manager.subscription_nlp({"query": query})
+
+        assert result["action"] == "search_subscriptions"
+        mock_client.get_subscriptions.assert_awaited_once_with(page=0, size=20, query=term)
+
+    @pytest.mark.parametrize(
+        "query, term_key, term",
+        [
+            ("list subscriptions for product popcorn", "product_name", "popcorn"),
+            ("find subscriptions for product popcorn", "product_name", "popcorn"),
+            ("find subscriptions for products popcorn", "product_name", "popcorn"),
+            ("find subscriptions for customer acme", "customer_name", "acme"),
+            ("find subscriptions for customers acme", "customer_name", "acme"),
+            ("list subscriptions for organization acme", "customer_name", "acme"),
+            ("list subscriptions for organizations acme", "customer_name", "acme"),
+        ],
+    )
+    async def test_nlp_for_a_kind_word_searches_the_name_after_it(
+        self, sub_manager, mock_client, query, term_key, term
+    ):
+        """'for product popcorn' names the product popcorn, not a customer called product."""
+        mock_client.get_subscriptions.return_value = {}
+        mock_client._extract_embedded_data.return_value = []
+
+        result = await sub_manager.subscription_nlp({"query": query})
+
+        assert result["action"] == "search_subscriptions"
+        assert result["search_criteria"][term_key] == term
+        mock_client.get_subscriptions.assert_awaited_once_with(page=0, size=20, query=term)
+
+    async def test_nlp_email_search_sends_the_email(self, sub_manager, mock_client):
+        mock_client.get_subscriptions.return_value = {}
+        mock_client._extract_embedded_data.return_value = []
+        result = await sub_manager.subscription_nlp({"query": "find subscriptions for bob@x.com"})
+        assert result["search_criteria"]["subscriber_email"] == "bob@x.com"
+        mock_client.get_subscriptions.assert_awaited_once_with(page=0, size=20, query="bob@x.com")
 
     async def test_nlp_get_intent_with_id(self, sub_manager, mock_client):
         mock_client.get_subscription_by_id.return_value = {"id": "abc123"}
@@ -655,6 +769,12 @@ class TestCreateSimple:
         mock_client.get_product_by_id.return_value = {"id": "p1", "name": "Draft", "published": False}
         with pytest.raises(ToolError):
             await sub_manager._validate_simple_product("p1")
+
+    async def test_unpublished_refusal_tells_how_to_attach_a_source(self, sub_manager, mock_client):
+        mock_client.get_product_by_id.return_value = {"id": "p1", "name": "Draft", "published": False}
+        with pytest.raises(ToolError) as exc_info:
+            await sub_manager._validate_simple_product("p1")
+        assert "sourceIds" in exc_info.value.examples["publish_command"]
 
     async def test_validate_simple_product_api_error(self, sub_manager, mock_client):
         from src.revenium_mcp_server.client import ReveniumAPIError
@@ -817,33 +937,14 @@ class TestCreateFromText:
 
 
 class TestSubscriptionAnalytics:
-    async def test_get_metrics_basic(self, analytics, mock_client):
-        mock_client.get_subscriptions.return_value = {}
-        mock_client._extract_embedded_data.return_value = [
-            {"id": "s1", "status": "active", "billing_period": "monthly", "product_id": "p1"},
-            {"id": "s2", "status": "active", "billing_period": "yearly", "product_id": "p1"},
-            {"id": "s3", "status": "trial", "billing_period": "monthly", "product_id": "p2"},
-            {"id": "s4", "status": "cancelled", "billing_period": "monthly", "product_id": "p1"},
-        ]
-        mock_client._extract_pagination_info.return_value = {"totalElements": 4}
-        result = await analytics.get_metrics({})
-        assert result["total_subscriptions"] == 4
-        assert result["active_subscriptions"] == 2
-        assert result["trial_subscriptions"] == 1
-        assert result["cancelled_subscriptions"] == 1
-        assert result["billing_distribution"]["monthly"] == 3
-        assert result["billing_distribution"]["yearly"] == 1
-        assert result["products_represented"] == 2
-        assert result["conversion_rate"] == 50.0
-
     async def test_get_metrics_empty(self, analytics, mock_client):
         mock_client.get_subscriptions.return_value = {}
         mock_client._extract_embedded_data.return_value = []
         mock_client._extract_pagination_info.return_value = {"totalElements": 0}
         result = await analytics.get_metrics({})
         assert result["total_subscriptions"] == 0
-        assert result["conversion_rate"] == 0
-        assert result["churn_rate"] == 0
+        assert result["active_subscriptions"] == 0
+        assert result["active_rate_in_sample"] is None
 
 
 # ===========================================================================
@@ -889,18 +990,39 @@ class TestHandleAction:
         assert "updated" in result[0].text
 
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
-    async def test_handle_action_cancel(self, mock_get_client, sub_management, mock_client):
+    async def test_handle_action_cancel_refuses_and_sends_no_delete(
+        self, mock_get_client, sub_management, mock_client
+    ):
         mock_get_client.return_value = mock_client
-        mock_client.cancel_subscription.return_value = {"cancelled": True}
-        result = await sub_management.handle_action("cancel", {"subscription_id": "s1"})
-        assert "cancelled" in result[0].text
+        with pytest.raises(ToolError) as refusal:
+            await sub_management.handle_action("cancel", {"subscription_id": "s1"})
+
+        message = refusal.value.message
+        assert "no cancel operation" in message
+        assert "delete(subscription_id=" in message
+        assert "nothing was changed" in message
+        assert (
+            "The only non-destructive route the API exposes is "
+            "`update(subscription_id=..., subscription_data={'expiration': ...})`" in message
+        )
+        assert "cannot confirm that it stops billing on the platform" in message
+        assert not [c for c in mock_client.mock_calls if "delete" in c[0]]
 
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
-    async def test_handle_action_delete(self, mock_get_client, sub_management, mock_client):
+    async def test_handle_action_delete_says_the_record_was_deleted(
+        self, mock_get_client, sub_management, mock_client
+    ):
         mock_get_client.return_value = mock_client
-        mock_client.cancel_subscription.return_value = {"deleted": True}
+        mock_client.delete_subscription.return_value = {"deleted": True}
         result = await sub_management.handle_action("delete", {"subscription_id": "s1"})
-        assert "deleted" in result[0].text
+        assert "Subscription s1 deleted successfully" in result[0].text
+        assert "permanently removed" in result[0].text
+        mock_client.delete_subscription.assert_awaited_once_with("s1")
+
+    async def test_cancel_is_not_advertised_as_an_operation(self, sub_management):
+        assert "cancel" not in await sub_management._get_supported_actions()
+        capabilities = await sub_management._build_enhanced_capabilities_text(None)
+        assert "cancel(" not in capabilities
 
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
     async def test_handle_action_discover_products(self, mock_get_client, sub_management, mock_client):
@@ -1013,31 +1135,156 @@ class TestHandleCrudCreate:
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
     async def test_create_auto_gen_no_products_available(self, mock_get_client, sub_management, mock_client):
         mock_get_client.return_value = mock_client
-        mock_client.get_paginated.return_value = []
-        result = await sub_management.handle_action("create", {
-            "subscription_data": {"name": "Test Sub"}
-        })
-        assert "Auto-Generation Failed" in result[0].text
+        mock_client.get_products.return_value = {}
+        mock_client._extract_embedded_data.return_value = []
+        # BACK-4709: the refusal raises so the envelope carries isError.
+        with pytest.raises(ToolError) as exc_info:
+            await sub_management.handle_action("create", {
+                "subscription_data": {"name": "Test Sub"}
+            })
+        assert "No products available" in exc_info.value.message
+        mock_client.create_subscription.assert_not_awaited()
 
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
-    async def test_create_auto_gen_paginated_exception(self, mock_get_client, sub_management, mock_client):
+    async def test_create_auto_gen_product_lookup_error_propagates(self, mock_get_client, sub_management, mock_client):
         mock_get_client.return_value = mock_client
-        mock_client.get_paginated.side_effect = Exception("API fail")
-        result = await sub_management.handle_action("create", {
-            "subscription_data": {"name": "Test Sub"}
-        })
-        assert "Auto-Generation Error" in result[0].text
+        mock_client.get_products.side_effect = ReveniumAPIError("API fail", status_code=503)
+        # BACK-4709: a failed product lookup is raised, never answered as plain text.
+        with pytest.raises(ReveniumAPIError):
+            await sub_management.handle_action("create", {
+                "subscription_data": {"name": "Test Sub"}
+            })
+        mock_client.create_subscription.assert_not_awaited()
 
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
     async def test_create_auto_gen_dry_run(self, mock_get_client, sub_management, mock_client):
         mock_get_client.return_value = mock_client
-        mock_client.get_paginated.return_value = [{"id": "p1"}]
         result = await sub_management.handle_action("create", {
-            "subscription_data": {"name": "Test Sub"},
+            "subscription_data": {
+                "name": "Test Sub",
+                "product_id": "p1",
+                "clientEmailAddress": "a@b.com",
+            },
             "dry_run": True,
         })
-        assert "Dry Run Preview" in result[0].text
-        assert "AUTO-GENERATION" in result[0].text
+        text = result[0].text
+        assert "Dry Run Preview" in text
+        assert "AUTO-GENERATION" in text
+        # Nothing was filled in: the caller sent the address, and the platform
+        # does not store a description, so none is generated.
+        assert "**Auto-Generated Fields:** none" in text
+        assert '"description"' not in text
+
+    @pytest.mark.parametrize("default_email", [None, "   ", "dummy@email.com"])
+    @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
+    async def test_create_without_an_invoice_address_is_refused_not_invented(
+        self, mock_get_client, default_email, sub_management, mock_client, monkeypatch
+    ):
+        if default_email is None:
+            monkeypatch.delenv("REVENIUM_DEFAULT_EMAIL", raising=False)
+        else:
+            monkeypatch.setenv("REVENIUM_DEFAULT_EMAIL", default_email)
+        mock_get_client.return_value = mock_client
+        mock_client.create_subscription.return_value = {"id": "s_new"}
+
+        with pytest.raises(ToolError) as exc:
+            await sub_management.handle_action("create", {
+                "subscription_data": {"name": "Sub", "product_id": "p1"},
+            })
+
+        assert exc.value.error_code == ErrorCodes.MISSING_PARAMETER
+        assert exc.value.field == "clientEmailAddress"
+        assert "example.com" not in exc.value.message
+        assert "invoices" in exc.value.message
+        assert '"name":"Sub","product_id":"p1"' in exc.value.message
+        mock_client.create_subscription.assert_not_awaited()
+
+    @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
+    async def test_preview_without_an_invoice_address_is_refused(
+        self, mock_get_client, sub_management, mock_client, monkeypatch
+    ):
+        monkeypatch.delenv("REVENIUM_DEFAULT_EMAIL", raising=False)
+        mock_get_client.return_value = mock_client
+
+        with pytest.raises(ToolError) as exc:
+            await sub_management.handle_action("create", {
+                "subscription_data": {"name": "Sub", "product_id": "p1"},
+                "dry_run": True,
+            })
+
+        assert exc.value.field == "clientEmailAddress"
+        assert "example.com" not in exc.value.message
+        mock_client.create_subscription.assert_not_awaited()
+
+    @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
+    async def test_caller_blank_address_stays_refused_and_is_not_filled_from_the_default(
+        self, mock_get_client, sub_management, mock_client, monkeypatch
+    ):
+        """Guard: a blank address the caller sent is a bad address, not a missing one."""
+        monkeypatch.setenv("REVENIUM_DEFAULT_EMAIL", "default@test.com")
+        mock_get_client.return_value = mock_client
+
+        with pytest.raises(ToolError) as exc:
+            await sub_management.handle_action("create", {
+                "subscription_data": {
+                    "name": "Sub",
+                    "product_id": "p1",
+                    "clientEmailAddress": "   ",
+                },
+            })
+
+        assert exc.value.field == "clientEmailAddress"
+        assert exc.value.error_code == ErrorCodes.VALIDATION_ERROR
+        mock_client.create_subscription.assert_not_awaited()
+
+    @pytest.mark.parametrize("dry_run", [True, False])
+    @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
+    @patch(
+        "src.revenium_mcp_server.tools_decomposed.subscription_management.get_config_value",
+        return_value="o1",
+    )
+    async def test_an_address_filled_from_the_default_says_where_it_came_from(
+        self, mock_config, mock_get_client, dry_run, sub_management, mock_client, monkeypatch
+    ):
+        monkeypatch.setenv("REVENIUM_DEFAULT_EMAIL", "default@test.com")
+        mock_get_client.return_value = mock_client
+        mock_client.create_subscription.return_value = {"id": "s_new"}
+
+        result = await sub_management.handle_action("create", {
+            "subscription_data": {"name": "Sub", "product_id": "p1"},
+            "dry_run": dry_run,
+        })
+
+        text = result[0].text
+        assert (
+            "Invoice address default@test.com came from REVENIUM_DEFAULT_EMAIL; "
+            "pass clientEmailAddress to invoice someone else."
+        ) in text
+
+    @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
+    @patch(
+        "src.revenium_mcp_server.tools_decomposed.subscription_management.get_config_value",
+        return_value="o1",
+    )
+    @pytest.mark.parametrize("unstored", ["description", "quotaNotificationThreshold"])
+    async def test_create_says_which_fields_the_platform_does_not_store(
+        self, mock_config, mock_get_client, sub_management, mock_client, unstored
+    ):
+        mock_get_client.return_value = mock_client
+        mock_client.create_subscription.return_value = {"id": "s_new"}
+
+        result = await sub_management.handle_action("create", {
+            "subscription_data": {
+                "name": "Sub",
+                "product_id": "p1",
+                "clientEmailAddress": "a@b.com",
+                unstored: "kept nowhere",
+            },
+        })
+
+        text = result[0].text
+        assert "Created Successfully" in text
+        assert f"Not stored by the platform: {unstored}." in text
 
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
     @patch("src.revenium_mcp_server.tools_decomposed.subscription_management.get_config_value", return_value="o1")
@@ -1058,32 +1305,49 @@ class TestHandleCrudCreate:
     @patch.dict("os.environ", {"REVENIUM_DEFAULT_EMAIL": "default@test.com"})
     async def test_create_auto_gen_email_from_env(self, mock_config, mock_get_client, sub_management, mock_client):
         mock_get_client.return_value = mock_client
-        mock_client.get_paginated.return_value = [{"id": "p1"}]
         mock_client.create_subscription.return_value = {"id": "s_new"}
         result = await sub_management.handle_action("create", {
-            "subscription_data": {"name": "Test Sub"},
+            "subscription_data": {"name": "Test Sub", "product_id": "p1"},
         })
         assert "Created Successfully" in result[0].text
 
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
-    async def test_create_expert_mode_missing_product(self, mock_get_client, sub_management, mock_client):
+    async def test_expert_mode_missing_product_is_refused_with_the_error_flag(
+        self, mock_get_client, sub_management, mock_client
+    ):
         mock_get_client.return_value = mock_client
-        result = await sub_management.handle_action("create", {
-            "subscription_data": {"name": "Sub"},
-            "auto_generate": False,
-        })
-        assert "Missing Required Field" in result[0].text
-        assert "product_id" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await sub_management.handle_action("create", {
+                "subscription_data": {"name": "Sub"},
+                "auto_generate": False,
+            })
+        assert exc.value.field == "product_id"
+        assert exc.value.error_code == ErrorCodes.MISSING_PARAMETER
+        assert "Missing Required Field" in exc.value.message
+        # Quick create asks which product to use; it no longer picks one.
+        assert "auto_generate=true" not in exc.value.message
+        assert "smart defaults" not in exc.value.message
+        assert "asks which product to use" in exc.value.message
+        assert "manage_products(action='list')" in exc.value.message
+        mock_client.create_subscription.assert_not_awaited()
 
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
-    async def test_create_expert_mode_missing_email(self, mock_get_client, sub_management, mock_client):
+    async def test_expert_mode_missing_invoice_address_is_refused_with_the_error_flag(
+        self, mock_get_client, sub_management, mock_client
+    ):
         mock_get_client.return_value = mock_client
-        result = await sub_management.handle_action("create", {
-            "subscription_data": {"name": "Sub", "product_id": "p1"},
-            "auto_generate": False,
-        })
-        assert "Missing Required Field" in result[0].text
-        assert "clientEmailAddress" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await sub_management.handle_action("create", {
+                "subscription_data": {"name": "Sub", "product_id": "p1"},
+                "auto_generate": False,
+            })
+        assert exc.value.field == "clientEmailAddress"
+        assert exc.value.error_code == ErrorCodes.MISSING_PARAMETER
+        assert "Missing Required Field" in exc.value.message
+        # Quick create refuses a missing address too, so it is no way around it.
+        assert "auto_generate=true" not in exc.value.message
+        assert "REVENIUM_DEFAULT_EMAIL" in exc.value.message
+        mock_client.create_subscription.assert_not_awaited()
 
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
     async def test_create_expert_mode_dry_run(self, mock_get_client, sub_management, mock_client):
@@ -1138,23 +1402,17 @@ class TestHandleHierarchyActions:
         assert "Credentials" in result[0].text
 
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
-    async def test_handle_create_with_credentials(self, mock_get_client, sub_management, mock_client):
+    async def test_handle_create_with_credentials_is_refused(
+        self, mock_get_client, sub_management, mock_client
+    ):
         mock_get_client.return_value = mock_client
-        mock_client.create_subscription.return_value = {"id": "s_new"}
-        mock_client.create_credential.return_value = {"id": "c_new"}
-        val_result = FakeValidationResult(valid=True)
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.subscription_management.get_cross_tier_validator"
-        ) as mock_val, patch(
-            "src.revenium_mcp_server.tools_decomposed.subscription_management.get_config_value",
-            return_value="o1",
-        ):
-            mock_val.return_value.validate_hierarchy_operation = AsyncMock(return_value=val_result)
-            result = await sub_management.handle_action("create_with_credentials", {
+        with pytest.raises(ToolError) as exc:
+            await sub_management.handle_action("create_with_credentials", {
                 "subscription_data": {"name": "S", "productId": "p1", "clientEmailAddress": "a@b.com"},
                 "credentials_data": {"name": "Key", "type": "api_key"},
             })
-        assert "Created Successfully" in result[0].text
+        assert exc.value.error_code == ErrorCodes.ACTION_NOT_SUPPORTED
+        mock_client.create_subscription.assert_not_awaited()
 
 
 # ===========================================================================
@@ -1332,19 +1590,83 @@ class TestMetadataProvider:
     async def test_get_tool_capabilities(self, sub_management):
         caps = await sub_management._get_tool_capabilities()
         # The read-only "Subscription Billing Reads" capability is included.
-        assert len(caps) == 4
+        assert len(caps) == 3
+        # The create shortcuts are not routed, so they are not advertised (BACK-4709).
+        assert not any(c.name == "Enhanced Creation" for c in caps)
         assert caps[0].name == "Subscription CRUD Operations"
         assert any(c.name == "Subscription Billing Reads" for c in caps)
 
     async def test_get_supported_actions(self, sub_management):
         actions = await sub_management._get_supported_actions()
         assert "list" in actions
-        assert "create_with_credentials" in actions
+        assert "create_with_credentials" not in actions
 
     async def test_get_input_schema(self, sub_management):
         schema = await sub_management._get_input_schema()
         assert schema["type"] == "object"
         assert "action" in schema["properties"]
+
+    @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
+    async def test_create_with_credentials_is_no_longer_advertised(
+        self, mock_get_client, sub_management, mock_client
+    ):
+        """It wrote a subscription and then a credential with no preview and no
+        rollback; the two-step route through manage_subscriber_credentials
+        replaces it."""
+        mock_get_client.return_value = mock_client
+        actions = await sub_management._get_supported_actions()
+        schema = await sub_management._get_input_schema()
+        capabilities = (await sub_management._handle_get_capabilities())[0].text
+
+        assert "create_with_credentials" not in actions
+        assert "create_with_credentials" not in schema["properties"]["action"]["enum"]
+        assert "create_with_credentials" not in capabilities
+        with pytest.raises(ToolError) as exc:
+            await sub_management.handle_action(
+                "create_with_credentials",
+                {
+                    "subscription_data": {"name": "S", "productId": "p1"},
+                    "credentials_data": {"name": "Key"},
+                },
+            )
+        assert exc.value.error_code == ErrorCodes.ACTION_NOT_SUPPORTED
+        mock_client.create_subscription.assert_not_awaited()
+        mock_client.create_credential.assert_not_awaited()
+
+    async def test_get_capabilities_names_every_top_level_input_it_describes(
+        self, sub_management
+    ):
+        """Every top-level input the help lists is one the registered tool accepts,
+        and the help lists the inputs the search, data, question and template
+        actions read."""
+        import inspect
+        import re
+
+        from src.revenium_mcp_server.tool_configuration.config import ToolConfig
+        from src.revenium_mcp_server.tool_configuration.registry import (
+            ToolConfigurationRegistry,
+        )
+
+        mcp = MagicMock()
+        registry = ToolConfigurationRegistry(
+            tool_config=ToolConfig.create_for_testing(profile="business")
+        )
+        await registry._register_manage_subscriptions(mcp)
+        closure = mcp.tool.return_value.call_args[0][0]
+        declared = set(inspect.signature(closure).parameters)
+
+        text = (await sub_management._handle_get_capabilities())[0].text
+        block = text.split("**Top-level parameters**", 1)[1].split("\n\n", 1)[0]
+        listed = {
+            name
+            for line in block.splitlines()
+            if line.startswith("- ")
+            for name in re.findall(r"`([A-Za-z_]+)`", line.split(" - ", 1)[0])
+        }
+
+        assert sorted(listed - declared) == []
+        for name in ("search_query", "product_name", "data_type", "query", "example_type"):
+            assert name in listed, name
 
     async def test_get_tool_dependencies(self, sub_management):
         deps = await sub_management._get_tool_dependencies()
@@ -1396,3 +1718,129 @@ class TestHandleActionExceptions:
         ))
         result = await sub_management.handle_action("get_tool_metadata", {})
         assert "manage_subscriptions" in result[0].text
+
+
+# ===========================================================================
+# Name-only create asks which product (BACK-4709)
+# ===========================================================================
+
+
+def _products_answer(products, total=None):
+    """Answer the product list with `products`; fail any other request."""
+
+    def answer(method, url, params):
+        if method == "GET" and url.endswith("/profitstream/v2/api/products"):
+            return {
+                "_embedded": {"productResourceList": products},
+                "page": {
+                    "size": 5,
+                    "totalElements": len(products) if total is None else total,
+                    "totalPages": 1,
+                    "number": 0,
+                },
+            }
+        raise AssertionError(f"unexpected {method} {url}")
+
+    return answer
+
+
+class TestQuickCreateAsksWhichProduct:
+    """A create with only a name asks for the product through the real client."""
+
+    async def test_name_only_create_asks_which_product_with_the_error_flag(self, monkeypatch):
+        client, requests = recording_client(
+            monkeypatch,
+            _products_answer(
+                [
+                    {"id": "p1", "name": "Gold", "published": True},
+                    {"id": "p2", "name": "Silver", "published": True},
+                ]
+            ),
+        )
+        tool = SubscriptionManagement()
+
+        with patch.object(tool, "get_client", new_callable=AsyncMock, return_value=client):
+            with pytest.raises(ToolError) as exc:
+                await tool.handle_action("create", {"subscription_data": {"name": "Monthly"}})
+
+        assert exc.value.field == "product_id"
+        assert exc.value.error_code == ErrorCodes.MISSING_PARAMETER
+        assert "Gold (p1)" in exc.value.message
+        assert "Silver (p2)" in exc.value.message
+        assert "clientEmailAddress" in exc.value.message
+        assert [(r["method"], r["url"].endswith("/profitstream/v2/api/products")) for r in requests] == [
+            ("GET", True)
+        ]
+
+    async def test_retry_example_keeps_the_fields_the_caller_sent(self, monkeypatch):
+        client, _ = recording_client(
+            monkeypatch,
+            _products_answer([{"id": "p1", "name": "Gold", "published": True}]),
+        )
+        tool = SubscriptionManagement()
+
+        with patch.object(tool, "get_client", new_callable=AsyncMock, return_value=client):
+            with pytest.raises(ToolError) as exc:
+                await tool.handle_action(
+                    "create",
+                    {
+                        "subscription_data": {
+                            "name": "Monthly",
+                            "clientEmailAddress": "jane@acme.com",
+                            "expiration": "2027-01-01",
+                        }
+                    },
+                )
+
+        message = exc.value.message
+        assert exc.value.field == "product_id"
+        assert '"clientEmailAddress":"jane@acme.com"' in message
+        assert '"expiration":"2027-01-01"' in message
+        assert '"product_id":"<id>"' in message
+        assert "<invoice address>" not in message
+        assert "Also supply" not in message
+
+    async def test_name_only_create_with_no_products_refuses_with_the_error_flag(self, monkeypatch):
+        client, requests = recording_client(monkeypatch, _products_answer([]))
+        tool = SubscriptionManagement()
+
+        with patch.object(tool, "get_client", new_callable=AsyncMock, return_value=client):
+            with pytest.raises(ToolError) as exc:
+                await tool.handle_action("create", {"subscription_data": {"name": "Monthly"}})
+
+        assert exc.value.field == "product_id"
+        assert exc.value.error_code == ErrorCodes.MISSING_PARAMETER
+        assert "No products available" in exc.value.message
+        assert "this organization has none" in exc.value.message
+        assert all(r["method"] == "GET" for r in requests)
+
+    async def test_more_products_than_shown_says_how_many_and_where_to_see_the_rest(
+        self, monkeypatch
+    ):
+        client, _ = recording_client(
+            monkeypatch,
+            _products_answer(
+                [
+                    {"id": "p1", "name": "Gold", "published": True},
+                    {"id": "p2", "name": "Draft", "published": False},
+                ],
+                total=12,
+            ),
+        )
+        tool = SubscriptionManagement()
+
+        with patch.object(tool, "get_client", new_callable=AsyncMock, return_value=client):
+            with pytest.raises(ToolError) as exc:
+                await tool.handle_action("create", {"subscription_data": {"name": "Monthly"}})
+
+        assert "Draft (p2, unpublished)" in exc.value.message
+        assert "showing 2 of 12" in exc.value.message
+        assert "discover_products" in exc.value.message
+
+    def test_every_client_method_the_subscription_tool_calls_exists(self):
+        source = inspect.getsource(subscription_management)
+        called = set(re.findall(r"client\.([A-Za-z_]\w*)\(", source))
+
+        missing = sorted(name for name in called if not hasattr(ReveniumClient, name))
+
+        assert missing == []

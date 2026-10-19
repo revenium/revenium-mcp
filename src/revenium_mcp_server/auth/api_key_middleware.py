@@ -16,12 +16,17 @@ from fastmcp.server.auth.auth import AccessToken, TokenVerifier
 from fastmcp.server.dependencies import get_access_token, get_http_headers
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from loguru import logger
+from starlette.authentication import AuthenticationError
+from starlette.middleware.authentication import AuthenticationMiddleware
+from starlette.requests import HTTPConnection
+from starlette.responses import JSONResponse, Response
 
 from ..config_store import get_config_value
 from ..constants import DEFAULT_BASE_URL
 from .api_key_validator import (
     ApiKeyValidationError,
     ApiKeyValidator,
+    PlatformLockoutValidationError,
     _fingerprint,
     _strip_bearer,
 )
@@ -30,17 +35,48 @@ from .claims_middleware import _current_tenant
 from .tenant_context import TenantContext
 
 
+class PlatformLockoutAuthError(AuthenticationError):
+    """Stops the request at the HTTP auth layer with the platform's wait."""
+
+    def __init__(self, lockout: PlatformLockoutValidationError) -> None:
+        super().__init__(str(lockout))
+        self.wait_seconds = lockout.wait_seconds
+
+
+def _auth_error_response(conn: HTTPConnection, exc: AuthenticationError) -> Response:
+    if isinstance(exc, PlatformLockoutAuthError):
+        return JSONResponse(
+            {"error": "rate_limited", "error_description": str(exc)},
+            status_code=429,
+            headers={"Retry-After": str(exc.wait_seconds)},
+        )
+    return AuthenticationMiddleware.default_on_error(conn, exc)
+
+
 class ApiKeyTokenVerifier(TokenVerifier):
     """Validates a Revenium bearer token per request via ApiKeyValidator.
 
-    Returns an AccessToken (carrying tenant claims) on success, or None on any
-    validation failure. Phase 1: every failure collapses to HTTP 401 — the
-    typed distinction is preserved in logs only.
+    Returns an AccessToken (carrying tenant claims) on success, or None on a
+    validation failure, which FastMCP turns into HTTP 401 (the typed
+    distinction is preserved in logs only). A platform lockout is the one
+    exception: it raises PlatformLockoutAuthError, which the error handler in
+    get_middleware turns into HTTP 429 with a Retry-After header.
     """
 
     def __init__(self, *, validator: ApiKeyValidator, base_url: str) -> None:
         super().__init__(base_url=base_url)
         self._validator = validator
+
+    def get_middleware(self) -> list:
+        """FastMCP's auth middleware, answering a platform lockout with 429 and its wait.
+
+        Every other validation failure keeps FastMCP's 401.
+        """
+        middleware = super().get_middleware()
+        for entry in middleware:
+            if entry.cls is AuthenticationMiddleware:
+                entry.kwargs["on_error"] = _auth_error_response
+        return middleware
 
     async def verify_token(self, token: str) -> AccessToken | None:
         fingerprint = _fingerprint(_strip_bearer(token))
@@ -58,6 +94,8 @@ class ApiKeyTokenVerifier(TokenVerifier):
                 key_fingerprint=fingerprint,
                 reason=type(exc).__name__,
             )
+            if isinstance(exc, PlatformLockoutValidationError):
+                raise PlatformLockoutAuthError(exc) from exc
             return None
 
         emit_auth_event(
@@ -76,6 +114,7 @@ class ApiKeyTokenVerifier(TokenVerifier):
                 "team_id": identity.team_id,
                 "team_ids": list(identity.team_ids),
                 "user_id": identity.user_id,
+                "email": identity.email,
                 "scope_from_prefix": identity.scope_from_prefix,
             },
         )
@@ -134,6 +173,8 @@ class ApiKeyAuthMiddleware(Middleware):
             team_id=team_id,
             tenant_id=claims["tenant_id"],
             user_id=claims["user_id"],
+            owner_id=claims["user_id"],
+            email=claims.get("email") or None,
             api_key=token,
             base_url=base_url,
         )

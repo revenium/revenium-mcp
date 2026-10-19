@@ -15,11 +15,13 @@ Key areas covered here:
   _get_quick_start_guide, _get_common_use_cases, _get_input_schema
 """
 
+import re
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from mcp.types import TextContent
 
+from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
 from src.revenium_mcp_server.tools_decomposed.slack_setup_assistant import SlackSetupAssistant
 from src.revenium_mcp_server.common.error_handling import ToolError, ErrorCodes
 
@@ -49,7 +51,7 @@ def _make_client(configs, total=None):
     return client
 
 
-_PATCH_CFG = "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_config_value"
+_PATCH_CFG = "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_default_slack_config_id"
 _PATCH_ONBOARDING = (
     "src.revenium_mcp_server.tools_decomposed.slack_setup_assistant.get_onboarding_state"
 )
@@ -224,10 +226,7 @@ class TestSetupStatusDefaultConfigFetchFailure:
             patch.object(tool, "get_client", AsyncMock(return_value=config_fetcher)),
             patch(
                 _PATCH_CFG,
-                side_effect=lambda k, *a: {
-                    "REVENIUM_DEFAULT_SLACK_CONFIG_ID": "cfg-broken",
-                    "REVENIUM_APP_BASE_URL": "https://ai.revenium.io",
-                }.get(k, a[0] if a else None),
+                return_value="cfg-broken",
             ),
         ):
             result = await tool.handle_action("setup_status", {})
@@ -242,10 +241,9 @@ class TestSetupStatusDefaultConfigFetchFailure:
 
 class TestQuickSetupToolErrorReraise:
     @pytest.mark.asyncio
-    async def test_tool_error_in_quick_setup_is_caught_by_outer_handler(self, tool):
-        """When _handle_quick_setup raises ToolError (because it re-raises it),
-        handle_action's outer except catches it and returns a formatted error TextContent.
-        We verify that a ToolError raised during quick_setup does NOT propagate out of handle_action."""
+    async def test_tool_error_in_quick_setup_reaches_the_caller(self, tool):
+        """A ToolError raised under handle_action propagates, so the caller's
+        answer carries the error flag instead of a success envelope (BACK-4677)."""
         async def reraise_tool_error(args):
             raise ToolError(
                 message="Injected ToolError",
@@ -254,18 +252,13 @@ class TestQuickSetupToolErrorReraise:
                 value="x",
             )
 
-        # Bypass _handle_quick_setup entirely to inject ToolError at the handle_action level
         original = tool._handle_quick_setup
         tool._handle_quick_setup = reraise_tool_error
         try:
-            result = await tool.handle_action("quick_setup", {})
+            with pytest.raises(ToolError, match="Injected ToolError"):
+                await tool.handle_action("quick_setup", {})
         finally:
             tool._handle_quick_setup = original
-
-        # handle_action outer except catches ToolError and returns formatted error
-        assert isinstance(result[0], TextContent)
-        text = result[0].text
-        assert "TOOL_ERROR" in text or "failed" in text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -526,3 +519,89 @@ class TestMetadataHelpers:
         """_get_input_schema includes config_id for select_default_configuration."""
         schema = await tool._get_input_schema()
         assert "config_id" in schema["properties"]
+
+
+# ---------------------------------------------------------------------------
+# BACK-4679: printed examples name actions that are actually routed
+# ---------------------------------------------------------------------------
+
+_MANAGE_ALERTS_ACTION = re.compile(r"manage_alerts\(\s*action='([a-z_]+)'")
+
+
+async def _routed_alert_actions():
+    return await AlertManagement()._get_supported_actions()
+
+
+async def _run_with_state(tool, action, configs, default_id, is_first_time):
+    client = _make_client(configs, total=len(configs))
+    with (
+        patch.object(tool, "get_client", AsyncMock(return_value=client)),
+        patch(_PATCH_CFG, return_value=default_id),
+        patch(_PATCH_ONBOARDING, _onboarding_state(is_first_time)),
+    ):
+        result = await tool.handle_action(action, {})
+    return result[0].text
+
+
+_ONE_CONFIG = [{"id": "c1", "name": "Config A", "teamName": "WS", "channelName": "#ops"}]
+
+
+class TestPrintedExamplesNameRealActions:
+    @pytest.mark.asyncio
+    async def test_select_default_next_step_names_a_routed_alert_action(self, tool):
+        client = _make_client(_ONE_CONFIG)
+        with (
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
+            patch.dict("os.environ", {}, clear=False),
+        ):
+            result = await tool.handle_action(
+                "select_default_configuration", {"config_id": "c1"}
+            )
+        text = result[0].text
+
+        assert "action='create_cumulative_usage_alert'," in text
+        assert "action='create_cumulative_usage'," not in text
+        found = _MANAGE_ALERTS_ACTION.findall(text)
+        routes = await _routed_alert_actions()
+        assert found
+        assert all(a in routes for a in found), found
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action,is_first_time",
+        [
+            ("setup_status", False),
+            ("onboarding_setup", True),
+            ("onboarding_setup", False),
+            ("first_time_guidance", False),
+        ],
+    )
+    async def test_setup_complete_examples_name_routed_alert_actions(
+        self, tool, action, is_first_time
+    ):
+        text = await _run_with_state(tool, action, _ONE_CONFIG, "c1", is_first_time)
+
+        assert "create_simple_alert" not in text
+        found = _MANAGE_ALERTS_ACTION.findall(text)
+        routes = await _routed_alert_actions()
+        assert found
+        assert all(a in routes for a in found), found
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action,configs,default_id",
+        [
+            ("onboarding_setup", [], None),
+            ("onboarding_setup", _ONE_CONFIG, None),
+            ("onboarding_setup", _ONE_CONFIG, "c1"),
+            ("first_time_guidance", _ONE_CONFIG, "c1"),
+        ],
+    )
+    async def test_setup_checklist_is_offered_as_a_system_setup_action(
+        self, tool, action, configs, default_id
+    ):
+        text = await _run_with_state(tool, action, configs, default_id, True)
+
+        assert "`setup_checklist()`" not in text
+        assert "\nsetup_checklist()\n" not in text
+        assert "system_setup(action='setup_checklist')" in text

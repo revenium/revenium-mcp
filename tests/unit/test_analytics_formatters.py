@@ -23,7 +23,10 @@ from src.revenium_mcp_server.analytics.formatters.cost_summary_formatter import 
 from src.revenium_mcp_server.analytics.formatters.customer_costs_formatter import CustomerCostsFormatter
 from src.revenium_mcp_server.analytics.formatters.model_costs_formatter import ModelCostsFormatter
 from src.revenium_mcp_server.analytics.formatters.agent_costs_formatter import AgentCostsFormatter
-from src.revenium_mcp_server.analytics.formatters.api_key_costs_formatter import ApiKeyCostsFormatter
+from src.revenium_mcp_server.analytics.formatters.api_key_costs_formatter import (
+    ApiKeyCostsFormatter,
+    mask_api_key_name,
+)
 from src.revenium_mcp_server.analytics.formatters.provider_costs_formatter import ProviderCostsFormatter
 from src.revenium_mcp_server.analytics.formatters.cost_spike_formatter import CostSpikeFormatter
 from src.revenium_mcp_server.analytics.response_formatter import ResponseFormatter
@@ -51,6 +54,15 @@ class TestBaseFormattingUtilities:
         """Zero renders as $0.00."""
         result = BaseFormattingUtilities.format_currency(0)
         assert result == "$0.00"
+
+    def test_format_currency_negative_zero(self):
+        """A float negative zero renders as $0.00, not $-0.00."""
+        result = BaseFormattingUtilities.format_currency(-0.0)
+        assert result == "$0.00"
+
+    def test_format_currency_keeps_sub_cent_digits(self):
+        """A fraction of a cent keeps two significant digits instead of $0.00."""
+        assert BaseFormattingUtilities.format_currency(0.0042) == "$0.0042"
 
     def test_format_currency_non_numeric_returned_as_str(self):
         """Non-numeric cost is returned as its string representation."""
@@ -479,8 +491,7 @@ class TestApiKeyCostsFormatter:
 
     def test_mask_empty_key_returns_as_is(self, formatter):
         """Empty string key is returned without masking."""
-        result = formatter._mask_api_key_name("")
-        assert result == ""
+        assert mask_api_key_name("") == ""
 
     def test_debug_metrics_visible_in_debug_mode(self, debug_formatter):
         """debug_metrics_count appears in debug mode for API key entries."""
@@ -489,49 +500,29 @@ class TestApiKeyCostsFormatter:
         assert "15 metrics" in result
 
     # ─────────────────────────────────────────────────────────────────────
-    # BACK-1270 / item #8 — masked-label collision aggregation
+    # BACK-4623: one row per distinct key, never merged by masked label
     # ─────────────────────────────────────────────────────────────────────
 
-    def test_anonymous_rows_with_same_masked_label_aggregate_into_one(self, formatter):
-        """Two rows whose masked labels collide are merged into a single row.
-
-        BACK-1270 / item #8: business_analytics get_api_key_costs previously
-        returned multiple indistinguishable rows with the same masked label
-        (e.g. two ANON****MOUS rows). Group by masked label, sum cost + share.
-        """
+    def test_keys_sharing_first_and_last_four_characters_stay_two_rows(self, formatter):
         data = [
-            {"api_key": "ANONYMOUS", "cost": 10.0, "percentage": 40.0},
-            {"api_key": "ANONYMOUS", "cost": 5.0, "percentage": 20.0},
-            {"api_key": "real-key-abcdefgh", "cost": 7.5, "percentage": 40.0},
+            {"api_key": "Application Autodiscovery (ann@revenium.io)", "cost": 30.0, "percentage": 60.0},
+            {"api_key": "Application Autodiscovery (bob@revenium.io)", "cost": 20.0, "percentage": 40.0},
         ]
         result = formatter.format(data, {"period": "SEVEN_DAYS", "aggregation": "TOTAL"})
-        # Exactly one ANONYMOUS-derived row should appear — rendered verbatim
-        # (sentinel labels are placeholders, not secrets to mask).
-        assert result.count("**1. ANONYMOUS**") + result.count("**2. ANONYMOUS**") == 1
-        # Cost was summed: 10 + 5 = 15.
-        assert "$15.00" in result
-        # Share was summed: 40 + 20 = 60.
-        assert "60.0%" in result
-        # And only ONE entry total survives the collapse for ANONYMOUS plus
-        # the unrelated row, so "API Keys Found: 2" appears in the header.
+        assert "**1. Appl****.io)**\n   - Cost: $30.00" in result
+        assert "**2. Appl****.io)**\n   - Cost: $20.00" in result
         assert "API Keys Found**: 2" in result
 
-    def test_aggregation_emits_note_when_multiple_sources_collapse(self, formatter):
-        """Aggregated rows get a 'note' line documenting the source count."""
+    def test_no_row_carries_a_sources_note(self, formatter):
         data = [
-            {"api_key": "ANONYMOUS", "cost": 10.0, "percentage": 40.0},
-            {"api_key": "ANONYMOUS", "cost": 5.0, "percentage": 20.0},
+            {"api_key": "Application Autodiscovery (cy@revenium.io)", "cost": 10.0, "percentage": 50.0},
+            {"api_key": "Application Autodiscovery (dee@revenium.io)", "cost": 10.0, "percentage": 50.0},
         ]
         result = formatter.format(data, {"period": "SEVEN_DAYS", "aggregation": "TOTAL"})
-        assert "aggregated 2" in result.lower()
-
-    def test_unique_masked_label_passes_through_without_note(self, formatter):
-        """A row with a unique masked label has no aggregation note."""
-        data = [
-            {"api_key": "sk-abcdefgh1234", "cost": 25.0, "percentage": 100.0},
-        ]
-        result = formatter.format(data, {"period": "SEVEN_DAYS", "aggregation": "TOTAL"})
-        assert "aggregated" not in result.lower()
+        assert result.count("Appl****.io)") == 2
+        assert "API Keys Found**: 2" in result
+        assert "sources" not in result.lower()
+        assert "Note:" not in result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -777,6 +768,12 @@ class TestResponseFormatter:
         result = formatter.format_error_response("Bad param", ["Use SEVEN_DAYS", "Use TOTAL"])
         assert "Use SEVEN_DAYS" in result
         assert "Use TOTAL" in result
+
+    def test_error_footer_points_only_at_real_help(self, formatter):
+        """The help footer names only actions the tool provides (BACK-4699)."""
+        result = formatter.format_error_response("x")
+        assert "rebuild status" not in result
+        assert "get_capabilities()" in result
 
     def test_legacy_format_no_data_response(self, formatter):
         """Legacy _format_no_data_response still works for backward compatibility."""

@@ -154,62 +154,6 @@ class TestValidateThreshold:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AnalyticsValidator.validate_filters
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestValidateFilters:
-    """Tests for AnalyticsValidator.validate_filters."""
-
-    @pytest.fixture
-    def validator(self):
-        return AnalyticsValidator()
-
-    def test_valid_provider_filter_accepted(self, validator):
-        """provider filter key is accepted."""
-        result = validator.validate_filters({"provider": "openai"})
-        assert result == {"provider": "openai"}
-
-    def test_valid_model_filter_accepted(self, validator):
-        """model filter key is accepted."""
-        result = validator.validate_filters({"model": "gpt-4"})
-        assert result == {"model": "gpt-4"}
-
-    def test_valid_customer_filter_accepted(self, validator):
-        """customer filter key is accepted."""
-        result = validator.validate_filters({"customer": "Acme Corp"})
-        assert result == {"customer": "Acme Corp"}
-
-    def test_valid_team_id_filter_accepted(self, validator):
-        """team_id filter key is accepted."""
-        result = validator.validate_filters({"team_id": "team-123"})
-        assert result == {"team_id": "team-123"}
-
-    def test_empty_filters_accepted(self, validator):
-        """Empty dict is valid and returns empty dict."""
-        result = validator.validate_filters({})
-        assert result == {}
-
-    def test_invalid_filter_key_raises_validation_error(self, validator):
-        """Unknown filter key raises ValidationError."""
-        with pytest.raises(ValidationError) as exc_info:
-            validator.validate_filters({"unknown_key": "value"})
-        assert exc_info.value.field == "filters"
-        assert "unknown_key" in exc_info.value.message
-
-    def test_non_dict_filters_raises_validation_error(self, validator):
-        """Non-dict filters raises ValidationError."""
-        with pytest.raises(ValidationError) as exc_info:
-            validator.validate_filters("not-a-dict")
-        assert exc_info.value.field == "filters"
-
-    def test_filter_values_coerced_to_str(self, validator):
-        """Filter values are coerced to strings."""
-        result = validator.validate_filters({"team_id": 42})
-        assert result["team_id"] == "42"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # AnalyticsValidator.validate_date_range
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -288,12 +232,30 @@ class TestValidateAnalyticsParams:
         )
         assert params.threshold == 100.0
 
-    def test_filters_included_when_provided(self, validator):
-        """Valid filters are included in AnalyticsParams."""
+    def test_filters_refused_when_provided(self, validator):
+        """A filter on a report whose endpoint takes none is refused, not stored and dropped."""
+        with pytest.raises(ValidationError) as exc_info:
+            validator.validate_analytics_params(
+                {"period": "SEVEN_DAYS", "aggregation": "TOTAL", "filters": {"provider": "openai"}}
+            )
+        assert exc_info.value.field == "filters"
+        assert "does not apply filters" in exc_info.value.message
+
+    @pytest.mark.parametrize("filters", [None, {}])
+    def test_no_filters_when_none_or_empty(self, validator, filters):
+        """A null or empty filters object means no filters."""
         params = validator.validate_analytics_params(
-            {"period": "SEVEN_DAYS", "aggregation": "TOTAL", "filters": {"provider": "openai"}}
+            {"period": "SEVEN_DAYS", "aggregation": "TOTAL", "filters": filters}
         )
-        assert params.filters == {"provider": "openai"}
+        assert params.period == "SEVEN_DAYS"
+
+    def test_filters_refused_before_a_window_error(self, validator):
+        """The filter refusal comes first, so a caller fixes both in one retry at most."""
+        with pytest.raises(ValidationError) as exc_info:
+            validator.validate_analytics_params(
+                {"period": "BAD_PERIOD", "filters": {"provider": "openai"}}
+            )
+        assert exc_info.value.field == "filters"
 
     def test_invalid_period_raises_validation_error(self, validator):
         """Invalid period propagates as ValidationError."""
@@ -346,6 +308,37 @@ class TestDomainValidators:
         )
         assert result["threshold"] == 100.0
         assert result["period"] == "SEVEN_DAYS"
+
+    @pytest.mark.parametrize("method, report", [
+        ("validate_provider_costs_params", "get_provider_costs"),
+        ("validate_model_costs_params", "get_model_costs"),
+        ("validate_customer_costs_params", "get_customer_costs"),
+        ("validate_api_key_costs_params", "get_api_key_costs"),
+        ("validate_cost_summary_params", "get_cost_summary"),
+        ("validate_cost_spike_params", "investigate_cost_spike"),
+        ("validate_tool_costs_params", "get_tool_costs"),
+    ])
+    def test_cost_report_validators_refuse_filters(self, validator, method, report):
+        """The report validators whose endpoints take no filter refuse one by name."""
+        with pytest.raises(ValidationError) as exc_info:
+            getattr(validator, method)(
+                {"period": "SEVEN_DAYS", "threshold": 100.0, "filters": {"provider": "openai"}}
+            )
+        error = exc_info.value
+        assert error.field == "filters"
+        assert f"{report} does not apply filters" in error.message
+        assert not any("'provider'" in s or "Allowed keys" in s for s in error.suggestions)
+
+    def test_plural_filter_key_is_not_steered_to_a_dropped_key(self, validator):
+        """The per-user report's plural key is not answered with a singular key that is dropped."""
+        with pytest.raises(ValidationError) as exc_info:
+            validator.validate_provider_costs_params(
+                {"period": "SEVEN_DAYS", "filters": {"providers": ["openai"]}}
+            )
+        suggestions = " ".join(exc_info.value.suggestions)
+        assert "Allowed keys: " not in suggestions
+        assert "team_id" not in suggestions
+        assert "without filters" in suggestions
 
     @pytest.mark.parametrize("method", [
         "validate_provider_costs_params",
@@ -465,4 +458,62 @@ class TestFilterValidationHardening:
             validator.validate_user_costs_params(
                 {"period": "SEVEN_DAYS", "filters": ["revenium_metered"]}
             )
+        assert exc_info.value.field == "filters"
+
+    @pytest.mark.parametrize("method", [
+        "validate_user_costs_params",
+        "validate_department_costs_params",
+    ])
+    @pytest.mark.parametrize("filters, key", [
+        ({"users": ""}, "users"),
+        ({"users": [""]}, "users"),
+        ({"providers": ""}, "providers"),
+        ({"users": ["  "]}, "users"),
+        ({"models": ["gpt-4o", ""]}, "models"),
+        ({"users": None}, "users"),
+        ({"users": [None]}, "users"),
+        ({"users": ["a", None]}, "users"),
+    ])
+    def test_blank_filter_value_rejected(self, validator, method, filters, key):
+        """A blank value is ignored by the platform, which would answer unfiltered."""
+        with pytest.raises(ValidationError) as exc_info:
+            getattr(validator, method)({"period": "SEVEN_DAYS", "filters": filters})
+        assert exc_info.value.field == f"filters.{key}"
+        assert "blank" in exc_info.value.message
+
+    @pytest.mark.parametrize("filters", [{"users": [5]}, {"providers": 0}])
+    def test_non_string_filter_value_rejected(self, validator, filters):
+        """A number is not a name; it is refused rather than sent as its digits."""
+        with pytest.raises(ValidationError) as exc_info:
+            validator.validate_user_costs_params({"period": "SEVEN_DAYS", "filters": filters})
+        assert exc_info.value.field == f"filters.{next(iter(filters))}"
+
+    def test_non_blank_value_goes_upstream_as_typed(self, validator):
+        """Only blank values are refused; a real value keeps its spacing."""
+        result = validator.validate_user_costs_params(
+            {"period": "SEVEN_DAYS", "filters": {"providers": [" openai"]}}
+        )
+        assert result["filters"]["providers"] == [" openai"]
+
+    def test_blank_cost_source_rejected_as_blank_for_agent_costs(self, validator):
+        """A blank costSources reads as blank, not as an empty list of invalid values."""
+        with pytest.raises(ValidationError) as exc_info:
+            validator.validate_agent_costs_params(
+                {"period": "SEVEN_DAYS", "filters": {"costSources": ""}}
+            )
+        assert exc_info.value.field == "filters.costSources"
+        assert "blank" in exc_info.value.message
+        assert "provider_billing" in " ".join(exc_info.value.suggestions)
+        assert "get_filter_options" not in " ".join(exc_info.value.suggestions)
+
+    @pytest.mark.parametrize("method", [
+        "validate_agent_costs_params",
+        "validate_user_costs_params",
+        "validate_department_costs_params",
+    ])
+    @pytest.mark.parametrize("filters", ["", []])
+    def test_blank_filters_object_rejected(self, validator, method, filters):
+        """Only a null or empty object means no filters; a blank string or list is refused."""
+        with pytest.raises(ValidationError) as exc_info:
+            getattr(validator, method)({"period": "SEVEN_DAYS", "filters": filters})
         assert exc_info.value.field == "filters"

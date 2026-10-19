@@ -45,3 +45,10 @@ MCP_CACHE_HINT_TTL_SECONDS = 900  # tools/list freshness window advertised to cl
 MCP_CACHE_HINT_SCOPE: Literal["public", "private"] = (
     "public"  # listing is process-global, shareable across auth contexts
 )
+
+# The analytics endpoints refuse a larger page.
+ANALYTICS_MAX_PAGE_SIZE = 100
+
+# get_user_costs is read as a complete per-person report, so its page holds the
+# platform's maximum page size unless the caller asks for a smaller one.
+USER_COSTS_DEFAULT_PAGE_SIZE = ANALYTICS_MAX_PAGE_SIZE

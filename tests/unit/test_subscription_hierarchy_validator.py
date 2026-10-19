@@ -217,13 +217,30 @@ class TestSubscriptionValidatorGetExamples:
         assert len(result["examples"]) == 1
         assert result["examples"][0]["name"] == "Trial Subscription"
 
-    def test_get_examples_fallback_unknown_type_returns_all(self, validator_no_ucm):
-        """Unknown example_type falls back to returning all examples."""
+    def test_get_examples_fallback_unknown_type_is_refused(self, validator_no_ucm):
+        """Unknown example_type is refused rather than answered with every template."""
         validator_no_ucm.schema_discovery = None
 
         result = validator_no_ucm.get_examples(example_type="nonexistent")
 
-        assert len(result["examples"]) == 2
+        assert "error" in result
+        assert "examples" not in result
+
+    def test_fallback_examples_filter_on_the_advertised_template_name(self, validator_no_ucm):
+        validator_no_ucm.schema_discovery = None
+
+        result = validator_no_ucm.get_examples("trial_period")
+
+        assert [ex["name"] for ex in result["examples"]] == ["Trial Subscription"]
+
+    def test_fallback_examples_refuse_an_unknown_template(self, validator_no_ucm):
+        validator_no_ucm.schema_discovery = None
+
+        result = validator_no_ucm.get_examples("nope")
+
+        assert "trial_period" in result["error"]
+        assert "trial_period" in result["available_types"]
+        assert "examples" not in result
 
     def test_get_examples_schema_discovery_success(self, validator_with_ucm):
         """Schema discovery returns meaningful examples — used directly."""
@@ -869,38 +886,6 @@ class TestHandleCreationActions:
         assert len(result) == 1
         assert isinstance(result[0], TextContent)
         assert "Validation" in result[0].text
-
-    @pytest.mark.asyncio
-    async def test_create_simple_action(self, sub_mgmt):
-        """create_simple action returns TextContent."""
-        mock_manager = MagicMock()
-        mock_manager.create_simple = AsyncMock(
-            return_value={"id": "sub_1", "name": "Simple Sub"}
-        )
-
-        result = await sub_mgmt._handle_creation_actions(
-            "create_simple", {}, mock_manager
-        )
-
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        assert "created successfully" in result[0].text.lower()
-
-    @pytest.mark.asyncio
-    async def test_create_from_text_action(self, sub_mgmt):
-        """create_from_text action returns TextContent."""
-        mock_manager = MagicMock()
-        mock_manager.create_from_text = AsyncMock(
-            return_value={"id": "sub_2"}
-        )
-
-        result = await sub_mgmt._handle_creation_actions(
-            "create_from_text", {"text": "create a sub"}, mock_manager
-        )
-
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        assert "Safe Subscription Created" in result[0].text
 
 
 # ===========================================================================

@@ -7,6 +7,7 @@ validation, and email configuration into a single onboarding tool.
 import pytest
 from unittest.mock import AsyncMock
 
+from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from src.revenium_mcp_server.tools_decomposed.system_setup import SystemSetup
 from mcp.types import TextContent
 
@@ -81,10 +82,12 @@ class TestSystemSetupRouting:
 
     @pytest.mark.asyncio
     async def test_unknown_action_returns_error(self, setup_tool):
-        """Unknown action returns structured error with valid actions."""
-        result = await setup_tool.handle_action("bogus_action", {})
-        text = result[0].text
+        """Unknown action raises a structured error with valid actions."""
+        with pytest.raises(ToolError) as exc_info:
+            await setup_tool.handle_action("bogus_action", {})
+        text = exc_info.value.message
         assert "bogus_action" in text or "Unknown" in text
+        assert "valid_actions" in text
 
     @pytest.mark.asyncio
     async def test_exception_from_sub_tool_propagates(self, setup_tool):
@@ -108,3 +111,43 @@ class TestSupportedActions:
         assert "validate_email" in actions
         assert "get_capabilities" in actions
         assert "get_agent_summary" in actions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["help", "get_actions"])
+async def test_help_and_get_actions_name_only_registered_tools(action):
+    """Every tool the setup help tells the assistant to call is a registered tool.
+
+    BACK-4677 section B: the help text named ``welcome_and_setup``, which no
+    profile registers, so an assistant following it called a missing tool.
+    """
+    import re
+
+    from src.revenium_mcp_server.tool_configuration.profiles import (
+        PROFILE_DEFINITIONS,
+    )
+
+    result = await SystemSetup().handle_action(action, {})
+    text = result[0].text
+
+    callees = set(re.findall(r"`(\w+)\(", text))
+    assert callees, "help text names no callable tool at all"
+    assert callees <= PROFILE_DEFINITIONS["business"], (
+        f"help names unregistered tools: {sorted(callees - PROFILE_DEFINITIONS['business'])}"
+    )
+    assert "welcome_and_setup" not in text
+
+
+@pytest.mark.asyncio
+async def test_update_email_on_the_hosted_server_is_refused_through_system_setup(
+    monkeypatch,
+):
+    """BACK-4679: the hosted server cannot store a notification email, so
+    system_setup update_email raises instead of claiming success."""
+    monkeypatch.setenv("AUTH_MODE", "api_key")
+    with pytest.raises(ToolError) as exc_info:
+        await SystemSetup().handle_action(
+            "update_email", {"email": "admin@company.com"}
+        )
+    assert exc_info.value.error_code == ErrorCodes.ACTION_NOT_SUPPORTED
+    assert "not available on the hosted server" in exc_info.value.message

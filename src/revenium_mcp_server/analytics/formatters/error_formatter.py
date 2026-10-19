@@ -68,5 +68,4 @@ class ErrorFormatter(AnalyticsResponseFormatter):
         return """**For Help:**
 - Use `get_capabilities()` to see supported parameters
 - Use `get_examples()` to see working examples
-- Check the rebuild status for implementation timeline
 """

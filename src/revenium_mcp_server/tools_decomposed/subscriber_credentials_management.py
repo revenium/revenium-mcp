@@ -17,7 +17,7 @@ too would split one resource's read surface across two tools.
 
 import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, ClassVar, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -27,7 +27,8 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
 from ..business_context.credential_business_context import CredentialBusinessContext
-from ..client import ReveniumClient, ReveniumAPIError
+from ..auth import AuthenticationError
+from ..client import OrganizationNameUnresolvedError, ReveniumClient, ReveniumAPIError
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
@@ -43,6 +44,7 @@ from ..hierarchy import (
     get_hierarchy_navigation_service,
 )
 from ..introspection.metadata import ToolCapability, ToolType
+from ..log_context import redact_secret_fields
 from ..nlp.credential_nlp_processor import CredentialIntent, CredentialNLPProcessor
 from ..common.security_utils import obfuscate_credentials_list, obfuscate_credential_data
 from .credential_business_handler import CredentialBusinessHandler
@@ -70,6 +72,25 @@ _CREDENTIAL_BY_ORGANIZATION_FILTER_MAP: Dict[str, str] = {
     "query": "query",
     "sort": "sort",
 }
+
+
+_INCOMPLETE_WALK_SUGGESTIONS = [
+    "Retry the request; one page of subscriptions failed to load",
+    "If it keeps failing, check that the Revenium API is reachable",
+]
+
+
+def _raise_if_walk_incomplete(
+    navigation_result: Any, message: str, field: str, value: str
+) -> None:
+    if navigation_result.incomplete is True:
+        raise ToolError(
+            message=message,
+            error_code=ErrorCodes.API_ERROR,
+            field=field,
+            value=value,
+            suggestions=list(_INCOMPLETE_WALK_SUGGESTIONS),
+        )
 
 
 class CredentialsHierarchyManager:
@@ -106,8 +127,10 @@ class CredentialsHierarchyManager:
         )
 
         if not navigation_result.success:
+            message = f"Failed to get subscription for credential {credential_id}: {navigation_result.error_message}"
+            _raise_if_walk_incomplete(navigation_result, message, "credential_id", credential_id)
             raise ToolError(
-                message=f"Failed to get subscription for credential {credential_id}: {navigation_result.error_message}",
+                message=message,
                 error_code=ErrorCodes.RESOURCE_NOT_FOUND,
                 field="credential_id",
                 value=credential_id,
@@ -158,8 +181,10 @@ class CredentialsHierarchyManager:
         )
 
         if not navigation_result.success:
+            message = f"Failed to get hierarchy for credential {credential_id}: {navigation_result.error_message}"
+            _raise_if_walk_incomplete(navigation_result, message, "credential_id", credential_id)
             raise ToolError(
-                message=f"Failed to get hierarchy for credential {credential_id}: {navigation_result.error_message}",
+                message=message,
                 error_code=ErrorCodes.RESOURCE_NOT_FOUND,
                 field="credential_id",
                 value=credential_id,
@@ -392,6 +417,8 @@ class SubscriberCredentialsManagement(ToolBase):
                 from mcp.types import TextContent
                 try:
                     subscriber_id = await client.resolve_subscriber_email_to_id(email)
+                except (ToolError, AuthenticationError):
+                    raise
                 except Exception as e:
                     raise ToolError(
                         message=f"Failed to resolve subscriber email: {e}",
@@ -400,10 +427,18 @@ class SubscriberCredentialsManagement(ToolBase):
                         value=email,
                         suggestions=["Check your API connection and try again"],
                     )
-                if subscriber_id:
-                    return [TextContent(type="text", text=f"**Resolved Subscriber**\n\n- **Email:** {email}\n- **Subscriber ID:** {subscriber_id}")]
-                else:
-                    return [TextContent(type="text", text=f"**Subscriber Not Found**\n\nNo subscriber found with email: {email}")]
+                if not subscriber_id:
+                    raise ToolError(
+                        message=f"No subscriber found with email: {email}",
+                        error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+                        field="email",
+                        value=email,
+                        suggestions=[
+                            "Check the spelling of the email address",
+                            "List subscribers with manage_customers list(resource_type='subscribers')",
+                        ],
+                    )
+                return [TextContent(type="text", text=f"**Resolved Subscriber**\n\n- **Email:** {email}\n- **Subscriber ID:** {subscriber_id}")]
             elif action == "resolve_organization_name_to_id":
                 org_name = arguments.get("name")
                 if not org_name:
@@ -417,6 +452,16 @@ class SubscriberCredentialsManagement(ToolBase):
                 from mcp.types import TextContent
                 try:
                     org_id = await client.resolve_organization_name_to_id(org_name)
+                except (ToolError, AuthenticationError):
+                    raise
+                except OrganizationNameUnresolvedError as e:
+                    raise ToolError(
+                        message=e.message,
+                        error_code=ErrorCodes.INVALID_PARAMETER,
+                        field="name",
+                        value=org_name,
+                        suggestions=["Pass organizationId instead of the name"],
+                    )
                 except Exception as e:
                     raise ToolError(
                         message=f"Failed to resolve organization name: {e}",
@@ -425,10 +470,18 @@ class SubscriberCredentialsManagement(ToolBase):
                         value=org_name,
                         suggestions=["Check your API connection and try again"],
                     )
-                if org_id:
-                    return [TextContent(type="text", text=f"**Resolved Organization**\n\n- **Name:** {org_name}\n- **Organization ID:** {org_id}")]
-                else:
-                    return [TextContent(type="text", text=f"**Organization Not Found**\n\nNo organization found with name: {org_name}")]
+                if not org_id:
+                    raise ToolError(
+                        message=f"No organization found with name: {org_name}",
+                        error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+                        field="name",
+                        value=org_name,
+                        suggestions=[
+                            "Check the spelling; the name must match exactly",
+                            "List organizations with manage_customers list(resource_type='organizations')",
+                        ],
+                    )
+                return [TextContent(type="text", text=f"**Resolved Organization**\n\n- **Name:** {org_name}\n- **Organization ID:** {org_id}")]
             else:
                 raise ToolError(
                     message=f"Unknown action '{action}' is not supported",
@@ -477,7 +530,7 @@ class SubscriberCredentialsManagement(ToolBase):
                 return self.formatter.format_list_response(
                     items=result.get("credentials", []),
                     action=action,
-                    page=result.get("pagination", {}).get("page", 0),
+                    page=result.get("pagination", {}).get("number", 0),
                     size=result.get("pagination", {}).get("size", 20),
                     total_pages=result.get("pagination", {}).get("totalPages", 1),
                     total_items=result.get("pagination", {}).get("totalElements"),
@@ -694,6 +747,69 @@ class SubscriberCredentialsManagement(ToolBase):
 
         return obfuscated_credential
 
+    @staticmethod
+    async def _resolve_for_create(
+        raw_value: Any,
+        *,
+        field: str,
+        record: str,
+        key: str,
+        resolver: Callable[[str], Awaitable[Optional[str]]],
+    ) -> str:
+        """Turn a create's subscriber_email or organization_name into an id, or refuse.
+
+        Every outcome other than a found id stops the create before the dry
+        run or the POST: a credential attached to the wrong subscriber or
+        organization bills the wrong customer.
+        """
+        value = raw_value.strip() if isinstance(raw_value, str) else ""
+        if not value:
+            raise ToolError(
+                message=f"{field} is empty; give the {record} {key} or pass its id",
+                error_code=ErrorCodes.MISSING_PARAMETER,
+                field=field,
+                value=raw_value,
+                suggestions=[f"Provide a non-empty {field}, or pass the {record} id instead"],
+            )
+        try:
+            resolved_id = await resolver(value)
+        except (PermissionError, ToolError, AuthenticationError):
+            raise
+        except OrganizationNameUnresolvedError as e:
+            raise ToolError(
+                message=f"{e.message}; no credential was created",
+                error_code=ErrorCodes.INVALID_PARAMETER,
+                field=field,
+                value=value,
+                suggestions=["Pass organizationId instead of organization_name"],
+            )
+        except Exception as e:
+            reason = getattr(e, "message", None) or str(e)
+            raise ToolError(
+                message=(
+                    f"The {record} lookup for {key} '{value}' failed, "
+                    f"so no credential was created: {reason}"
+                ),
+                error_code=ErrorCodes.API_ERROR,
+                field=field,
+                value=value,
+                suggestions=[
+                    f"Retry, or pass the {record} id directly instead of {field}",
+                ],
+            )
+        if not resolved_id:
+            raise ToolError(
+                message=f"No {record} found with {key}: {value}; the credential was not created",
+                error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+                field=field,
+                value=value,
+                suggestions=[
+                    f"Check the spelling of the {record} {key}",
+                    f"List {record}s with manage_customers list(resource_type='{record}s')",
+                ],
+            )
+        return resolved_id
+
     async def _create_credential(self, arguments: Dict[str, Any], *, client: ReveniumClient, dry_run_validator: CredentialDryRunValidator) -> Dict[str, Any]:
         """Create new subscriber credential with enhanced NLP and dry run support."""
         # Check for natural language input first
@@ -786,26 +902,26 @@ class SubscriberCredentialsManagement(ToolBase):
                 },
             )
 
-        # Resolve email and organization names if provided
+        # The execution path may run a failed call again with these same arguments.
+        credential_data = dict(credential_data)
+
         if "subscriber_email" in credential_data:
-            try:
-                subscriber_id = await client.resolve_subscriber_email_to_id(
-                    credential_data["subscriber_email"]
-                )
-                credential_data["subscriberId"] = subscriber_id
-                del credential_data["subscriber_email"]
-            except Exception as e:
-                logger.warning(f"Could not resolve subscriber email: {e}")
+            credential_data["subscriberId"] = await self._resolve_for_create(
+                credential_data.pop("subscriber_email"),
+                field="subscriber_email",
+                record="subscriber",
+                key="email",
+                resolver=client.resolve_subscriber_email_to_id,
+            )
 
         if "organization_name" in credential_data:
-            try:
-                org_id = await client.resolve_organization_name_to_id(
-                    credential_data["organization_name"]
-                )
-                credential_data["organizationId"] = org_id
-                del credential_data["organization_name"]
-            except Exception as e:
-                logger.warning(f"Could not resolve organization name: {e}")
+            credential_data["organizationId"] = await self._resolve_for_create(
+                credential_data.pop("organization_name"),
+                field="organization_name",
+                record="organization",
+                key="name",
+                resolver=client.resolve_organization_name_to_id,
+            )
 
         # Perform dry run validation if requested
         if dry_run:
@@ -1076,7 +1192,7 @@ class SubscriberCredentialsManagement(ToolBase):
             logger.info(
                 f"Updating credential {credential_id} with merged payload keys: {list(final_payload.keys())}"
             )
-            logger.debug(f"Full payload: {final_payload}")
+            logger.debug("Full payload: {}", redact_secret_fields(final_payload))
             updated_credential = await client.update_credential(credential_id, final_payload)
 
             logger.info(f"Successfully updated credential: {credential_id}")
@@ -1216,9 +1332,8 @@ class SubscriberCredentialsManagement(ToolBase):
                     "update": {
                         "credential_id": "str",
                         "credential_data": "dict",
-                        "dry_run": "bool",
                     },
-                    "delete": {"credential_id": "str", "dry_run": "bool"},
+                    "delete": {"credential_id": "str"},
                 },
                 examples=[
                     "list(page=0, size=20)",
@@ -1232,7 +1347,7 @@ class SubscriberCredentialsManagement(ToolBase):
                 name="Enhanced NLP Support",
                 description="Natural language processing for credential operations",
                 parameters={
-                    "parse_natural_language": {"text": "str", "dry_run": "bool"},
+                    "parse_natural_language": {"text": "str"},
                     "get_agent_summary": {},
                 },
                 examples=[

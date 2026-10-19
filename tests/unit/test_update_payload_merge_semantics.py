@@ -189,6 +189,7 @@ class TestSourceUpdatePayload:
                 "description": "keep-description",
                 "version": "1.0.0",
                 "type": "API",
+                "owner": {"id": "owner_1"},
                 "created": "2020-01-01",
             }
         )

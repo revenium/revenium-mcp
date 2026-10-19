@@ -5,9 +5,167 @@ using user-friendly terms that map to Revenium API parameters.
 """
 
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from loguru import logger
+
+from ..common.error_handling import create_structured_validation_error
+from ..config_store import default_notification_email
+
+_ORDINAL_BRIDGE_WORDS = (
+    r"(?:tokens?|requests?|rate|cost|spend|spending|error|usage"
+    r"|daily|weekly|monthly|hourly|new|separate)"
+)
+_ALERT_NOUNS = r"(?:alerts?|rules?|budgets?|thresholds?|notifications?|monitors?|one)"
+# "a second" is an ordinal only when an alert noun follows, after at most two bridge words.
+PER_SECOND_UNIT = re.compile(
+    r"\b(?:per|each|every)\s+sec(?:ond)?s?\b"
+    rf"|\ba\s+sec(?:ond)?\b(?!(?:\s+{_ORDINAL_BRIDGE_WORDS}){{0,2}}\s+{_ALERT_NOUNS}\b)"
+    r"|(?<=\w)/\s?s(?:ec(?:ond)?)?\b",
+    re.IGNORECASE,
+)
+PER_SECOND_COUNTERPARTS = {
+    "TOKENS_PER_MINUTE": "TOKENS_PER_SECOND",
+    "REQUESTS_PER_MINUTE": "REQUESTS_PER_SECOND",
+}
+
+
+_NUMBER = r"(?<![\w.,-])(\d+(?:,\d{3})*(?:\.\d+)?)(?!\d|[.,]\d)"
+_AMOUNT = r"(?<![\w.,-])(\d+(?:,\d{3})*(?:\.\d+)?|\.\d+)(?!\d|[.,]\d)"
+_NOT_A_WINDOW = (
+    r"(?![\s-]*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|h|days?|d|weeks?|wks?|months?)\b)"
+)
+_NOT_A_WINDOW_OR_MINUTES = rf"{_NOT_A_WINDOW}(?!m\b)"
+_COUNTED = r"(?:tokens?|calls?|requests?|transactions?)"
+_MULTIPLIER_VALUES = {
+    "thousand": 1_000,
+    "k": 1_000,
+    "million": 1_000_000,
+    "mil": 1_000_000,
+    "billion": 1_000_000_000,
+    "bil": 1_000_000_000,
+}
+_MULTIPLIER_WORDS = "|".join(sorted(_MULTIPLIER_VALUES, key=len, reverse=True))
+_MULTIPLIER = re.compile(rf"\s*({_MULTIPLIER_WORDS})\b", re.IGNORECASE)
+_PERCENT_SUFFIX = r"\s*(?:%|(?:percent|pct)\b)"
+_PERCENT_AFTER_NUMBER = re.compile(_PERCENT_SUFFIX, re.IGNORECASE)
+
+
+_STANDS_APART = r"(?!\w|-(?!dollar))"
+# Must stay the last deciding pattern so money, percent, comparison and count words keep priority.
+_NAMED_THRESHOLD = r"(?:\b(?:budgets?|limits?|caps?)(?:\s+(?:of|is|at))?|\bcapped\s+at)"
+
+
+def _deciding_patterns(not_a_window: str) -> Tuple[re.Pattern[str], ...]:
+    return tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            rf"\${_AMOUNT}",
+            rf"{_NUMBER}{_PERCENT_SUFFIX}",
+            rf"{_NUMBER}(?:\s*|-)(?:dollars?|usd)",
+            rf"(?:over|above|exceeds?|exceed|greater than|more than|reaches?|reach)\s+{_NUMBER}{not_a_window}",
+            rf"(?:under|below|less than)\s+{_NUMBER}{not_a_window}",
+            rf"(?:at least|minimum|min)\s+{_NUMBER}{not_a_window}",
+            rf"(?:at most|maximum|max)\s+{_NUMBER}{not_a_window}",
+            rf"(?:for|of)\s+{_NUMBER}\s+{_COUNTED}",
+            rf"{_NUMBER}\s+{_COUNTED}",
+            rf"{_NUMBER}{not_a_window}\s*(?:{_MULTIPLIER_WORDS})\b",
+            rf"(?:increases?\s+by|decreases?\s+by)\s+{_NUMBER}",
+            rf"{_NAMED_THRESHOLD}\s+{_NUMBER}{_STANDS_APART}{not_a_window}",
+        )
+    )
+
+
+class _ThresholdPass(NamedTuple):
+    deciding: Tuple[re.Pattern[str], ...]
+    standalone: re.Pattern[str]
+
+
+def _threshold_pass(not_a_window: str) -> _ThresholdPass:
+    return _ThresholdPass(
+        _deciding_patterns(not_a_window),
+        re.compile(rf"{_NUMBER}{_STANDS_APART}{not_a_window}", re.IGNORECASE),
+    )
+
+
+# "15m" is read as a minute window first; only a sentence with no other number keeps it.
+_THRESHOLD_PASSES = (
+    _threshold_pass(_NOT_A_WINDOW_OR_MINUTES),
+    _threshold_pass(_NOT_A_WINDOW),
+)
+
+
+class NumberInText(NamedTuple):
+    value: float
+    end: int
+    ambiguous_between: Tuple[float, ...] = ()
+    is_percentage: bool = False
+
+
+def _number_at(text: str, match: re.Match[str]) -> NumberInText:
+    value = float(match.group(1).replace(",", ""))
+    multiplier = _MULTIPLIER.match(text, match.end(1))
+    if multiplier:
+        value *= _MULTIPLIER_VALUES[multiplier.group(1).lower()]
+    is_percentage = _PERCENT_AFTER_NUMBER.match(text, match.end(1)) is not None
+    return NumberInText(value, match.end(1), is_percentage=is_percentage)
+
+
+def _first_standalone_number(text: str, standalone: re.Pattern[str]) -> Optional[NumberInText]:
+    numbers = [_number_at(text, match) for match in standalone.finditer(text)]
+    if not numbers:
+        return None
+    distinct = tuple(dict.fromkeys(number.value for number in numbers))
+    return numbers[0]._replace(ambiguous_between=distinct if len(distinct) > 1 else ())
+
+
+def threshold_in_text(text: str) -> Optional[NumberInText]:
+    """The number a sentence sets its threshold to, and where its digits end.
+
+    Numbers next to a money, percent, comparison or count word come first, then the
+    number after a ``_NAMED_THRESHOLD`` word, then the first number standing on its own. A
+    number inside a name (gpt-4, team-3, budget 2026-Q1) or one that measures a window
+    ("over 24 hours") is never the threshold. When no word decides and several numbers
+    stand on their own, ``ambiguous_between`` lists them so the caller can ask instead
+    of guessing.
+    """
+    for reading in _THRESHOLD_PASSES:
+        for pattern in reading.deciding:
+            match = pattern.search(text)
+            if match:
+                return _number_at(text, match)
+        found = _first_standalone_number(text, reading.standalone)
+        if found:
+            return found
+    return None
+
+
+def _plain_number(value: float) -> str:
+    return str(int(value)) if value.is_integer() else str(value)
+
+
+def refuse_an_undecided_threshold(text: str) -> None:
+    """Refuse a sentence whose threshold could be any of several numbers, naming them."""
+    found = threshold_in_text(text)
+    if found is None or not found.ambiguous_between:
+        return
+    candidates = [_plain_number(value) for value in found.ambiguous_between]
+    named = ", ".join(candidates[:-1]) + f" or {candidates[-1]}"
+    raise create_structured_validation_error(
+        message=(
+            f"The text has more than one number that could be the threshold ({named}) "
+            "and no word that says which; nothing was created. Which one is the threshold?"
+        ),
+        field="text",
+        value=text,
+        suggestions=[
+            "Put 'over' or '$' right before the number you mean "
+            "and call create_from_text again",
+            "Writing 'budget of <number>' instead creates a cumulative budget alert; "
+            "write its period (daily, weekly or monthly) in the text as well",
+            "Or use create_threshold_alert or create_cumulative_usage_alert with threshold=<number>",
+        ],
+    )
 
 
 class AlertSemanticProcessor:
@@ -30,6 +188,8 @@ class AlertSemanticProcessor:
             "cost per transaction": "COST_PER_TRANSACTION",
             "tokens per second": "TOKENS_PER_SECOND",
             "requests per second": "REQUESTS_PER_SECOND",
+            "tokens per minute": "TOKENS_PER_MINUTE",
+            "requests per minute": "REQUESTS_PER_MINUTE",
             "error rate": "ERROR_RATE",
             "error count": "ERROR_COUNT",
             "token count": "TOKEN_COUNT",
@@ -46,11 +206,11 @@ class AlertSemanticProcessor:
             "cost per request": "COST_PER_TRANSACTION",
             "cost per task": "COST_PER_TRANSACTION",
             "average cost": "COST_PER_TRANSACTION",
-            "token rate": "TOKENS_PER_SECOND",
-            "token generation rate": "TOKENS_PER_SECOND",
+            "token rate": "TOKENS_PER_MINUTE",
+            "token generation rate": "TOKENS_PER_MINUTE",
             "api calls per second": "REQUESTS_PER_SECOND",
-            "requests rate": "REQUESTS_PER_SECOND",
-            "request rate": "REQUESTS_PER_SECOND",
+            "requests rate": "REQUESTS_PER_MINUTE",
+            "request rate": "REQUESTS_PER_MINUTE",
             "error percentage": "ERROR_RATE",
             "error rate (%)": "ERROR_RATE",
             "number of errors": "ERROR_COUNT",
@@ -322,20 +482,15 @@ class AlertSemanticProcessor:
         # Add conceptual guidance for ambiguous language
         conceptual_guidance = self._analyze_conceptual_intent(text.lower())
 
-        # Resolve notification email using environment variable
-        import os
-
-        env_email = os.getenv("REVENIUM_DEFAULT_EMAIL")
-        notification_email = (
-            env_email if env_email and env_email != "dummy@email.com" else "admin@example.com"
-        )
+        notification_email = default_notification_email()
+        recipients = [notification_email] if notification_email else []
 
         result = {
             "name": "",
             "description": text,
             "detection_rules": [],
             "filters": [],
-            "notification_addresses": [notification_email],  # Use resolved email
+            "notification_addresses": recipients,
             "enabled": True,
             "is_percentage": False,
             "_conceptual_guidance": conceptual_guidance,  # Internal guidance for agents
@@ -380,7 +535,7 @@ class AlertSemanticProcessor:
                 # Clamp to valid calendar period; ignore time intervals like "5m" or "1h"
                 time_window = time_period if time_period in calendar_periods else "daily"
             else:
-                time_window = time_period or "5m"  # Use time intervals like "5m", "1h"
+                time_window = time_period or "15m"
 
             detection_rule = {
                 "rule_type": alert_type or "THRESHOLD",
@@ -403,6 +558,8 @@ class AlertSemanticProcessor:
         for phrase, metric in sorted_metrics:
             if phrase in text_lower:
                 logger.debug(f"Found metric: {phrase} -> {metric}")
+                if PER_SECOND_UNIT.search(text_lower):
+                    return PER_SECOND_COUNTERPARTS.get(metric, metric)
                 return metric
 
         return None
@@ -415,51 +572,11 @@ class AlertSemanticProcessor:
         """
         text_lower = text.lower()
 
-        # Look for percentage indicators
-        is_percentage = "%" in text or "percent" in text_lower or "percentage" in text_lower
-
-        # Extract numeric value with optional currency/percentage
-        # Look for numbers in threshold contexts (avoid model names like gpt-4o)
-        number_patterns = [
-            r"\$(\d+(?:,\d{3})*(?:\.\d+)?)",  # $123,456.78
-            r"(\d+(?:,\d{3})*(?:\.\d+)?)%",  # 123,456.78%
-            r"(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:dollars?|usd)",  # 123,456.78 dollars
-            r"(?:over|above|exceeds?|exceed|greater than|more than|reaches?|reach)\s+(\d+(?:,\d{3})*(?:\.\d+)?)",  # over 40000
-            r"(?:under|below|less than)\s+(\d+(?:,\d{3})*(?:\.\d+)?)",  # under 100
-            r"(?:at least|minimum|min)\s+(\d+(?:,\d{3})*(?:\.\d+)?)",  # at least 50
-            r"(?:at most|maximum|max)\s+(\d+(?:,\d{3})*(?:\.\d+)?)",  # at most 200
-            r"(?:for|of)\s+(\d+(?:,\d{3})*(?:\.\d+)?)\s+(?:tokens?|calls?|requests?|transactions?)",  # for 50,000 tokens
-            r"(\d+(?:,\d{3})*(?:\.\d+)?)\s+(?:tokens?|calls?|requests?|transactions?)",  # 50,000 tokens
-            # Handle word-based numbers with multipliers
-            r"(\d+(?:\.\d+)?)\s*(?:million|mil|m)",  # 1 million, 1.5 million
-            r"(\d+(?:\.\d+)?)\s*(?:thousand|k)",  # 10 thousand, 10k
-            r"(\d+(?:\.\d+)?)\s*(?:billion|bil|b)",  # 1 billion
-            # Relative change operators followed by a bare number (no %)
-            r"(?:increases?\s+by|decreases?\s+by)\s+(\d+(?:,\d{3})*(?:\.\d+)?)",  # increases by 20
-        ]
-
-        threshold_value = None
-        for pattern in number_patterns:
-            match = re.search(pattern, text_lower)
-            if match:
-                # Remove commas and convert to float
-                number_str = match.group(1).replace(",", "")
-                base_value = float(number_str)
-
-                # Apply multipliers for word-based numbers
-                matched_text = match.group(0).lower()
-                if "million" in matched_text or " mil" in matched_text:
-                    threshold_value = base_value * 1_000_000
-                elif "thousand" in matched_text or " k" in matched_text:
-                    threshold_value = base_value * 1_000
-                elif "billion" in matched_text or " bil" in matched_text:
-                    threshold_value = base_value * 1_000_000_000
-                else:
-                    threshold_value = base_value
-                break
-
-        if threshold_value is None:
+        found = threshold_in_text(text)
+        if found is None:
             return None, None, False
+        threshold_value = found.value
+        is_percentage = found.is_percentage
 
         # Extract operator (look for operator words near the number)
         operator = None

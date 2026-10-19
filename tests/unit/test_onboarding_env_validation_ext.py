@@ -186,7 +186,8 @@ class TestClerkModeHealth:
         )
 
     @pytest.mark.asyncio
-    async def test_clerk_mode_healthy_from_oauth_config(self, monkeypatch):
+    async def test_clerk_mode_oauth_config_alone_is_not_healthy(self, monkeypatch):
+        """BACK-4677: OAuth settings being present proves nothing about a caller's read."""
         monkeypatch.setenv("AUTH_MODE", "clerk")
         monkeypatch.setenv("CLERK_DOMAIN", "clerk.example.com")
         monkeypatch.setenv("CLERK_OAUTH_CLIENT_ID", "client_abc")
@@ -199,8 +200,30 @@ class TestClerkModeHealth:
             result = await validator.validate_all_debug_auto_discovery_format()
         assert result.summary["auth_mode"] == "clerk"
         assert result.summary["clerk_configured"] is True
-        # Healthy despite no static API key and a failed direct API call.
-        assert result.summary["overall_status"] is True
+        assert result.summary["overall_status"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_mode", ["env", "clerk", "api_key"])
+    @pytest.mark.parametrize(
+        "read_status, healthy",
+        [("success", True), ("permission_denied", False), ("error", False)],
+    )
+    async def test_verdict_is_the_callers_read_in_every_mode(
+        self, monkeypatch, auth_mode, read_status, healthy
+    ):
+        """BACK-4677: the verdict is the result of the read made with the caller's client."""
+        monkeypatch.setenv("AUTH_MODE", auth_mode)
+        validator = EnvironmentVariableValidator()
+        _, p2, p3 = self._offline(validator)
+        probe = AsyncMock(return_value={"status": read_status})
+        with p2, p3, patch(
+            "src.revenium_mcp_server.onboarding.platform_read.probe_platform_read", new=probe
+        ):
+            client = object()
+            result = await validator.validate_all_debug_auto_discovery_format(client=client)
+        probe.assert_awaited_once_with(client)
+        assert result.summary["overall_status"] is healthy
+        assert result.summary["direct_api_works"] is healthy
 
     @pytest.mark.asyncio
     async def test_clerk_mode_unhealthy_when_oauth_config_missing(self, monkeypatch):

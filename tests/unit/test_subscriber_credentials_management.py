@@ -63,7 +63,7 @@ class TestHandleActionRouting:
         cred_tool._list_credentials = AsyncMock(
             return_value={
                 "credentials": [],
-                "pagination": {"page": 0, "size": 20, "totalPages": 1},
+                "pagination": {"number": 0, "size": 20, "totalPages": 1},
             }
         )
         result = await cred_tool.handle_action("list", {})
@@ -343,7 +343,7 @@ class TestListCredentialsByOrganization:
         cred_tool._list_credentials_by_organization = AsyncMock(
             return_value={
                 "credentials": [],
-                "pagination": {"page": 0, "size": 20, "totalPages": 1},
+                "pagination": {"number": 0, "size": 20, "totalPages": 1},
             }
         )
         result = await cred_tool.handle_action(
@@ -352,3 +352,119 @@ class TestListCredentialsByOrganization:
         assert cred_tool._list_credentials_by_organization.await_count == 1
         assert len(result) >= 1
         assert "list_by_organization" in await cred_tool._get_supported_actions()
+
+
+class TestListPagingText:
+    """Credentials listings render the page that was returned, with sized hints."""
+
+    @pytest.mark.asyncio
+    async def test_list_renders_the_requested_page_and_size(self, cred_tool):
+        cred_tool._list_credentials = AsyncMock(
+            return_value={
+                "credentials": [{"id": "c1"}],
+                "pagination": {
+                    "number": 2,
+                    "size": 5,
+                    "totalPages": 7,
+                    "totalElements": 31,
+                },
+            }
+        )
+        text = (await cred_tool.handle_action("list", {"page": 2, "size": 5}))[0].text
+        assert "(page 3 of 7)" in text, text
+        assert "• Next page: page=3, size=5" in text, text
+
+    @pytest.mark.asyncio
+    async def test_list_by_organization_renders_the_requested_page_and_size(
+        self, cred_tool
+    ):
+        cred_tool._list_credentials_by_organization = AsyncMock(
+            return_value={
+                "credentials": [{"id": "c1"}],
+                "pagination": {
+                    "number": 2,
+                    "size": 5,
+                    "totalPages": 7,
+                    "totalElements": 31,
+                },
+            }
+        )
+        text = (
+            await cred_tool.handle_action(
+                "list_by_organization",
+                {"organization_id": "OQNBA6J", "page": 2, "size": 5},
+            )
+        )[0].text
+        assert "(page 3 of 7)" in text, text
+        assert "• Next page: page=3, size=5" in text, text
+
+    @pytest.mark.asyncio
+    async def test_list_past_last_page_names_the_pages_that_exist(self, cred_tool):
+        cred_tool._list_credentials = AsyncMock(
+            return_value={
+                "credentials": [],
+                "pagination": {
+                    "number": 500,
+                    "size": 20,
+                    "totalPages": 2,
+                    "totalElements": 31,
+                },
+            }
+        )
+        text = (await cred_tool.handle_action("list", {"page": 500}))[0].text
+        assert "The page requested (page=500) is past the last." in text, text
+        assert "permissions" not in text, text
+
+class TestCredentialsHierarchyIncompleteWalk:
+    """A failed subscriptions page is a retryable API error, not a missing credential."""
+
+    @staticmethod
+    def _manager_whose_walk_failed(method_name):
+        from src.revenium_mcp_server.hierarchy.navigation_service import NavigationResult
+        from src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management import (
+            CredentialsHierarchyManager,
+        )
+
+        failed = NavigationResult(
+            success=False,
+            entity_type="credentials",
+            entity_id="cred_abc",
+            related_entities=[],
+            navigation_path=[],
+            metadata={"failed_page": 1},
+            error_message=(
+                "Could not read subscriptions page 1 (timeout). The subscription "
+                "list is incomplete, so no answer was built from the pages read "
+                "before it. Retry the request."
+            ),
+        )
+        failed.incomplete = True
+        manager = CredentialsHierarchyManager(client=MagicMock())
+        mock_nav = MagicMock()
+        setattr(mock_nav, method_name, AsyncMock(return_value=failed))
+        manager.navigation_service = mock_nav
+        return manager
+
+    @staticmethod
+    def _assert_retryable_walk_failure(error):
+        from src.revenium_mcp_server.common.error_handling import ErrorCodes
+
+        assert error.error_code == ErrorCodes.API_ERROR
+        assert "subscriptions page 1" in error.message
+        assert "incomplete" in error.message
+        assert any("Retry" in s for s in error.suggestions)
+        assert not any("Verify the credential ID exists" in s for s in error.suggestions)
+
+    @pytest.mark.asyncio
+    async def test_get_subscription_details_incomplete_walk_raises_api_error(self):
+        manager = self._manager_whose_walk_failed("get_subscription_for_credential")
+        with pytest.raises(ToolError) as exc_info:
+            await manager.get_subscription_details({"credential_id": "cred_abc"})
+        self._assert_retryable_walk_failure(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_get_product_details_incomplete_walk_raises_api_error(self):
+        manager = self._manager_whose_walk_failed("get_full_hierarchy")
+        with pytest.raises(ToolError) as exc_info:
+            await manager.get_product_details({"credential_id": "cred_abc"})
+        self._assert_retryable_walk_failure(exc_info.value)

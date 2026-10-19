@@ -173,11 +173,10 @@ class OnboardingManager:
             return {"status": "not_initialized", "message": "Onboarding system not initialized"}
 
         try:
-            # REUSE: Get onboarding state using existing infrastructure
-            onboarding_state = await get_onboarding_state()
-
-            # REUSE: Get environment validation using existing infrastructure
             validation_result = await validate_environment_variables()
+            onboarding_state = await get_onboarding_state(
+                validation_result=validation_result
+            )
 
             # Get tool registration status
             # DEBUGGING: Skip conditional registry status check
@@ -291,7 +290,7 @@ class OnboardingManager:
             return onboarding_state.recommendations
         except Exception as e:
             logger.error(f"Error getting personalized recommendations: {e}")
-            return ["Use welcome_and_setup() to get started with configuration"]
+            return ['Use system_setup(action="show_welcome") to get started with configuration']
 
     async def check_setup_completion(self) -> Dict[str, Any]:
         """Check overall setup completion status.
@@ -300,8 +299,10 @@ class OnboardingManager:
             Dictionary with setup completion information
         """
         try:
-            onboarding_state = await get_onboarding_state()
             validation_result = await validate_environment_variables()
+            onboarding_state = await get_onboarding_state(
+                validation_result=validation_result
+            )
 
             setup_completion = onboarding_state.setup_completion
             total_items = len(setup_completion) if setup_completion else 0
@@ -311,17 +312,20 @@ class OnboardingManager:
                 else 0
             )
             completion_percentage = (completed_items / total_items * 100) if total_items > 0 else 0
+            system_ready = bool(validation_result.summary.get("overall_status", False))
+            # Completion needs a platform read that succeeded, not only settings.
+            is_complete = completion_percentage >= 80 and system_ready
 
             return {
                 "completion_percentage": completion_percentage,
                 "completed_items": completed_items,
                 "total_items": total_items,
-                "is_complete": completion_percentage >= 80,  # 80% threshold for "complete"
-                "overall_system_ready": validation_result.summary.get("overall_status", False),
+                "is_complete": is_complete,
+                "overall_system_ready": system_ready,
                 "setup_items": setup_completion,
                 "next_steps": (
                     onboarding_state.recommendations[:3]
-                    if completion_percentage < 80
+                    if not is_complete
                     else [
                         "Setup is complete! Start using the system.",
                         "Create your first alert with manage_alerts()",

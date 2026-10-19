@@ -104,6 +104,47 @@ def _no_saved_configuration(monkeypatch, tmp_path_factory):
         forget_saved_configuration(monkeypatch, empty_cache_file)
 
 
+LOCKOUT_GATE_MODULES = (
+    "src.revenium_mcp_server.platform_lockout",
+    "revenium_mcp_server.platform_lockout",
+)
+
+
+def _loaded_lockout_modules():
+    return [sys.modules[name] for name in LOCKOUT_GATE_MODULES if name in sys.modules]
+
+
+@pytest.fixture(autouse=True)
+def _forget_platform_lockouts():
+    """The lockout gate is process-wide: a wait one test records must not hold the next."""
+    for module in _loaded_lockout_modules():
+        module.platform_lockouts.clear()
+    yield
+    for module in _loaded_lockout_modules():
+        module.platform_lockouts.clear()
+
+
+class LockoutClock:
+    """A monotonic clock the tests move by hand."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def lockout_clock(monkeypatch):
+    clock = LockoutClock()
+    for module in _loaded_lockout_modules():
+        monkeypatch.setattr(module, "_now", clock)
+    return clock
+
+
 @pytest.fixture
 def mock_env_vars(monkeypatch):
     """Mock environment variables for testing."""

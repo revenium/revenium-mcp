@@ -9,7 +9,15 @@ import os
 import pytest
 from unittest.mock import patch
 
-from src.revenium_mcp_server.alerts.semantic_processor import AlertSemanticProcessor
+from src.revenium_mcp_server.alerts.semantic_processor import (
+    AlertSemanticProcessor,
+    threshold_in_text,
+)
+from tests.unit.test_hosted_alert_notification_email import (
+    StubbedAlerts,
+    _text,
+    no_server_identity,  # noqa: F401
+)
 
 
 @pytest.fixture
@@ -54,6 +62,53 @@ class TestExtractMetric:
         """'cost per transaction' should match before 'cost'."""
         result = processor._extract_metric("cost per transaction exceeds 50")
         assert result == "COST_PER_TRANSACTION"
+
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("Add a second alert when token rate exceeds 900000", "TOKENS_PER_MINUTE"),
+            ("Create a second alert when request rate exceeds 50", "REQUESTS_PER_MINUTE"),
+            ("when token rate exceeds 900000 add a second alert", "TOKENS_PER_MINUTE"),
+            (
+                "set up a second token rate alert at 5000 tokens per minute",
+                "TOKENS_PER_MINUTE",
+            ),
+        ],
+    )
+    def test_an_ordinal_a_second_is_not_a_per_second_unit(self, processor, text, expected):
+        """BACK-4800: "a second alert" counts alerts; it is not a rate unit."""
+        assert processor._extract_metric(text) == expected
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("Alert when tokens per second exceed 50", "TOKENS_PER_SECOND"),
+            ("token rate exceeds 50 per second", "TOKENS_PER_SECOND"),
+            ("token rate exceeds 50 each second", "TOKENS_PER_SECOND"),
+            ("token rate exceeds 50 every second", "TOKENS_PER_SECOND"),
+            ("token rate exceeds 50/s", "TOKENS_PER_SECOND"),
+            ("token rate exceeds 1000 tokens a second", "TOKENS_PER_SECOND"),
+            ("token rate exceeds 1k tokens a second", "TOKENS_PER_SECOND"),
+            ("token rate exceeds 1,000 tokens in a second", "TOKENS_PER_SECOND"),
+            ("token rate exceeds 2.5 thousand tokens a second", "TOKENS_PER_SECOND"),
+            ("token rate over 500 a second for 10 minutes", "TOKENS_PER_SECOND"),
+            ("request rate exceeds 50 requests/second", "REQUESTS_PER_SECOND"),
+            ("request rate above 20 per sec", "REQUESTS_PER_SECOND"),
+            ("Alert when token rate exceeds 100 a second continuously", "TOKENS_PER_SECOND"),
+            ("token rate exceeds 1000 tokens a second at peak", "TOKENS_PER_SECOND"),
+            ("request rate exceeds 50 requests a second from any key", "REQUESTS_PER_SECOND"),
+            ("token rate exceeds 1000 tokens a second to the API", "TOKENS_PER_SECOND"),
+            ("token rate exceeds 1000 tokens a second per model", "TOKENS_PER_SECOND"),
+            ("token rate exceeds 100 a second for an alert", "TOKENS_PER_SECOND"),
+            ("token rate exceeds 800 a second please alert me", "TOKENS_PER_SECOND"),
+            ("token rate exceeds 800 a second triggers alert", "TOKENS_PER_SECOND"),
+            ("token rate exceeds 800 a second overall rate limit", "TOKENS_PER_SECOND"),
+        ],
+    )
+    def test_real_per_second_phrasing_still_reads_per_second(self, processor, text, expected):
+        """BACK-4800: a rate stated per second stays per second, so it is refused, not sent 60x low."""
+        assert processor._extract_metric(text) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +167,215 @@ class TestExtractThreshold:
     def test_percent_keyword(self, processor):
         _, _, is_pct = processor._extract_threshold("above 5 percent error rate")
         assert is_pct is True
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("alert when gpt-4 monthly total cost goes past 500", 500.0),
+            ("alert when total cost for gpt-4 exceeds 500", 500.0),
+            ("alert when claude-3.5 total cost exceeds 200", 200.0),
+            ("team-3 alert when total cost exceeds $50 per hour", 50.0),
+        ],
+    )
+    def test_a_number_inside_a_name_is_not_the_threshold(self, processor, text, expected):
+        """BACK-4800: the 4 of gpt-4 or the 3 of team-3 is part of a name, not the threshold."""
+        _, value, _ = processor._extract_threshold(text)
+        assert value == expected
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("Alert when total cost budget 500 over 24 hours", 500.0),
+            ("daily budget 500 over 24 hours", 500.0),
+            ("weekly spending budget 2000 over 7 days", 2000.0),
+            ("Alert when total cost budget 500 over 15m", 500.0),
+            ("daily budget 500 over 30m", 500.0),
+        ],
+    )
+    def test_a_window_is_not_the_threshold(self, processor, text, expected):
+        """BACK-4800: the 24 of "over 24 hours" is the window, not the money."""
+        _, value, _ = processor._extract_threshold(text)
+        assert value == expected
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("alert when total cost exceeds 10k", 10_000.0),
+            ("alert when total cost exceeds 1.5 million", 1_500_000.0),
+            ("alert when total cost exceeds 2 thousand", 2_000.0),
+        ],
+    )
+    def test_a_multiplier_after_the_number_is_applied(self, processor, text, expected):
+        """BACK-4800: "exceeds 10k" is ten thousand, not ten."""
+        _, value, _ = processor._extract_threshold(text)
+        assert value == expected
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("alert when total cost exceeds 5m", 5.0),
+            ("alert when total cost exceeds 5 kb", 5.0),
+            ("monthly budget 2000 for 5 models", 2000.0),
+            ("daily budget 300 across 5 models", 300.0),
+            ("budget 2000 across 3 keys", 2000.0),
+            ("budget 2000 for 4 bots", 2000.0),
+        ],
+    )
+    def test_a_unit_suffix_is_not_a_multiplier(self, processor, text, expected):
+        """BACK-4800: a bare m or kb, or a word like models or bots, after a number is not a multiplier."""
+        _, value, _ = processor._extract_threshold(text)
+        assert value == expected
+
+
+# ---------------------------------------------------------------------------
+# threshold_in_text: a budget, limit or cap word decides; otherwise ask
+# ---------------------------------------------------------------------------
+
+UNDECIDED_TEXT = "alert when project 7 spend hits 300"
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("alert me when the phase 2 budget of 500 is hit", 500.0),
+        ("team 3 budget 500", 500.0),
+        ("phase 2 limit 250", 250.0),
+        ("project 4 cap of 75", 75.0),
+        ("spend for phase 2 capped at 40", 40.0),
+        ("the phase 2 limit is 90", 90.0),
+        ("phase 2 budget of 10k", 10_000.0),
+        ("team 3 limit of 1.5 million", 1_500_000.0),
+    ],
+)
+def test_a_budget_limit_or_cap_word_decides_the_threshold(text, expected):
+    """BACK-4839: the number after budget, limit or cap wins over a number in a name."""
+    found = threshold_in_text(text)
+    assert found is not None
+    assert found.value == expected
+    assert found.ambiguous_between == ()
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("phase 2 budget of $500", 500.0),
+        ("team 3 alert when error rate is 5%", 5.0),
+        ("team 3 alert when total cost exceeds 500", 500.0),
+        ("team 3 alert at 10k tokens", 10_000.0),
+        ("alert when total cost is 500", 500.0),
+        ("alert when error rate hits 5 percent for team 2", 5.0),
+        ("error rate 5 pct for team 2", 5.0),
+        ("alert when error rate hits 5 % for team 2", 5.0),
+    ],
+)
+def test_a_money_percent_comparison_count_or_single_number_still_decides(text, expected):
+    """BACK-4839: sentences that a money, percent, comparison or count word settles are unchanged."""
+    found = threshold_in_text(text)
+    assert found is not None
+    assert found.value == expected
+    assert found.ambiguous_between == ()
+
+
+@pytest.mark.parametrize(
+    "text, is_percentage",
+    [
+        ("alert when error rate hits 5 percent for team 2", True),
+        ("error rate 5 pct for team 2", True),
+        ("team 3 alert when error rate is 5%", True),
+        ("alert when error rate hits 5 % for team 2", True),
+        ("phase 2 budget of 500", False),
+        ("phase 2 budget of $500", False),
+    ],
+)
+def test_the_percent_meaning_travels_with_the_number(text, is_percentage):
+    """BACK-4839: a percent sign or word after the digits marks the threshold as a percentage."""
+    found = threshold_in_text(text)
+    assert found is not None
+    assert found.is_percentage is is_percentage
+
+
+def test_the_semantic_parser_reads_pct_as_a_percentage(processor):
+    """BACK-4839: the semantic parser agrees with threshold_in_text on "5 pct"."""
+    _, value, is_percentage = processor._extract_threshold("error rate 5 pct for team 2")
+    assert value == 5.0
+    assert is_percentage is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "alert when the 95th percentile latency exceeds 500",
+        "alert when the percentile cost exceeds 500",
+    ],
+)
+def test_a_percent_away_from_the_threshold_does_not_make_it_a_percentage(processor, text):
+    """BACK-4839: only a percent sign or word next to the threshold makes it a percentage."""
+    found = threshold_in_text(text)
+    _, value, is_percentage = processor._extract_threshold(text)
+    assert found is not None
+    assert value == found.value
+    assert is_percentage is found.is_percentage is False
+
+
+def test_a_number_inside_a_name_after_budget_is_not_the_threshold():
+    """BACK-4839: "budget 2026-Q1" names a budget, so the standing 500 is the threshold."""
+    found = threshold_in_text("alert when total cost hits 500 for budget 2026-Q1")
+    assert found is not None
+    assert found.value == 500.0
+    assert found.ambiguous_between == ()
+
+
+@pytest.mark.parametrize(
+    "text, candidates",
+    [
+        (UNDECIDED_TEXT, (7.0, 300.0)),
+        ("alert when spend hits 500 for any of 3 projects", (500.0, 3.0)),
+        ("alert when monthly spend hits 1000 by the end of 2026", (1000.0, 2026.0)),
+    ],
+)
+def test_two_numbers_and_no_deciding_word_are_named_as_ambiguous(text, candidates):
+    """BACK-4839: with no word to decide, "of" included, every standing number is a candidate."""
+    found = threshold_in_text(text)
+    assert found is not None
+    assert found.ambiguous_between == candidates
+
+
+@pytest.fixture
+def alerts(monkeypatch):
+    return StubbedAlerts(monkeypatch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text", ["alert me when the phase 2 budget of 500 is hit", "team 3 budget 500"]
+)
+async def test_create_from_text_sends_the_budget_number_as_the_threshold(alerts, text):
+    """BACK-4839: the alert the customer asked for is created at 500, not at the name's digit."""
+    result = await alerts.call_with(
+        {"action": "create_from_text", "text": text, "email": "owner@example.test"}
+    )
+
+    assert result.is_error is False, _text(result)
+    assert alerts.sent()["threshold"] == 500.0
+
+
+@pytest.mark.asyncio
+async def test_create_from_text_asks_which_number_is_the_threshold(alerts):
+    """BACK-4839: two equally plausible numbers are refused, named, and nothing is created."""
+    result = await alerts.call_with(
+        {"action": "create_from_text", "text": UNDECIDED_TEXT, "email": "owner@example.test"}
+    )
+    text = _text(result)
+
+    assert result.is_error is True, text
+    assert "7 or 300" in text
+    assert "Which one is the threshold?" in text
+    assert "nothing was created" in text
+    assert "Put 'over' or '$' right before the number you mean" in text
+    assert "'budget of <number>' instead creates a cumulative budget alert" in text
+    assert "write its period (daily, weekly or monthly) in the text" in text
+    assert "monthly cumulative" not in text
+    alerts.platform.create_anomaly.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -396,9 +660,13 @@ class TestParseAlertRequest:
         assert "team@company.com" in result["notification_addresses"]
 
     @patch.dict(os.environ, {"REVENIUM_DEFAULT_EMAIL": "dummy@email.com"})
-    def test_dummy_email_uses_fallback(self, processor):
-        result = processor.parse_alert_request("alert when spending exceeds $100")
-        assert "admin@example.com" in result["notification_addresses"]
+    def test_dummy_email_never_becomes_a_placeholder_recipient(self, processor):
+        with patch(
+            "src.revenium_mcp_server.config_store.get_discovered_value",
+            return_value=None,
+        ):
+            result = processor.parse_alert_request("alert when spending exceeds $100")
+        assert result["notification_addresses"] == []
 
 
 # ---------------------------------------------------------------------------

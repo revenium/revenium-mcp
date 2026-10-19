@@ -5,16 +5,18 @@ using the existing validation infrastructure to ensure consistency with the
 debug_auto_discovery tool.
 """
 
-import asyncio
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
+    from ..onboarding.detection_service import OnboardingState
+    from ..onboarding.env_validation import ValidationResult
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
+from ..auth.auth_mode import credentials_are_per_request
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
@@ -27,6 +29,11 @@ from ..onboarding.detection_service import get_onboarding_state
 from ..onboarding.env_validation import (
     API_AUTH_REJECTED_MESSAGE,
     validate_environment_variables,
+)
+from ..onboarding.platform_read import (
+    probe_platform_read,
+    read_platform_facts,
+    reads_with_sign_in,
 )
 from .unified_tool_base import ToolBase
 
@@ -100,7 +107,6 @@ class WelcomeSetup(ToolBase):
         Returns:
             Tool response
         """
-        # ctx accepted for interface compliance; no upstream API calls in this tool.
         try:
             # Context7 default action pattern: If no action provided, default to show_welcome
             if not action:
@@ -150,6 +156,8 @@ class WelcomeSetup(ToolBase):
                 )
                 return [TextContent(type="text", text=format_structured_error(error))]
 
+        except (PermissionError, ToolError):
+            raise
         except Exception as e:
             logger.error(f"Error in welcome_and_setup action {action}: {e}")
             error = ToolError(
@@ -169,11 +177,7 @@ class WelcomeSetup(ToolBase):
         """Handle show_welcome action - main welcome message and overview."""
         logger.debug("Showing welcome message and setup overview")
 
-        # Get onboarding state using existing infrastructure
-        onboarding_state = await get_onboarding_state()
-
-        # Get environment validation using existing infrastructure
-        validation_result = await validate_environment_variables()
+        onboarding_state, validation_result = await self._read_caller_setup()
 
         # Build welcome message
         welcome_text = self._build_welcome_message(onboarding_state, validation_result)
@@ -184,11 +188,7 @@ class WelcomeSetup(ToolBase):
         """Handle setup_checklist action - detailed setup status."""
         logger.debug(" Showing detailed setup checklist")
 
-        # Get onboarding state
-        onboarding_state = await get_onboarding_state()
-
-        # Get environment validation
-        validation_result = await validate_environment_variables()
+        onboarding_state, validation_result = await self._read_caller_setup()
 
         # Build checklist
         checklist_text = self._build_setup_checklist(onboarding_state, validation_result)
@@ -199,8 +199,7 @@ class WelcomeSetup(ToolBase):
         """Handle environment_status action - complete environment variable display."""
         logger.debug(" Showing complete environment variable status")
 
-        # Get validation result using existing infrastructure
-        validation_result = await validate_environment_variables()
+        validation_result = await validate_environment_variables(await self.get_client())
 
         # Build environment status display
         env_status_text = self._build_environment_status(validation_result)
@@ -211,19 +210,26 @@ class WelcomeSetup(ToolBase):
         """Handle next_steps action - personalized recommendations."""
         logger.debug(" Generating personalized next steps")
 
-        # Get onboarding state
-        onboarding_state = await get_onboarding_state()
+        onboarding_state, validation_result = await self._read_caller_setup()
 
         # Build next steps
-        next_steps_text = self._build_next_steps(onboarding_state)
+        next_steps_text = self._build_next_steps(onboarding_state, validation_result)
 
         return [TextContent(type="text", text=next_steps_text)]
 
-    async def _handle_complete_setup(self, arguments: Dict[str, Any]) -> List[TextContent]:
-        """Handle complete_setup action - mark onboarding as complete."""
-        logger.debug("[OK] Marking onboarding as complete")
+    async def _read_caller_setup(self) -> Tuple["OnboardingState", "ValidationResult"]:
+        """Read the platform once as the caller, then judge setup from that read."""
+        facts = await read_platform_facts(await self.get_client())
+        validation_result = await validate_environment_variables(api_connectivity=facts.read)
+        onboarding_state = await get_onboarding_state(facts, validation_result)
+        return onboarding_state, validation_result
 
-        # CRITICAL: Validate setup completion parameters
+    async def _handle_complete_setup(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        """Confirm setup by checking the caller can read their organization's data.
+
+        Nothing is recorded: the confirmation is the read itself, so the answer
+        is the same on a local and a hosted server and leaves no file behind.
+        """
         confirmation = arguments.get("confirm_completion")
         if confirmation != True:
             error = create_structured_validation_error(
@@ -238,126 +244,28 @@ class WelcomeSetup(ToolBase):
             )
             return [TextContent(type="text", text=format_structured_error(error))]
 
-        debug_info = []
-        debug_info.append(" **DEBUG: Starting complete_setup process**")
+        client = await self.get_client()
+        read = await probe_platform_read(client)
+        if read.get("status") != "success":
+            reason = read.get("error") or "The platform read did not succeed."
+            raise ToolError(
+                message=(
+                    f"Setup could not be completed: {reason} Run "
+                    "system_diagnostics(action='system_health') to see what is not working."
+                ),
+                error_code=ErrorCodes.TOOL_ERROR,
+                field="confirm_completion",
+                value=True,
+            )
 
-        try:
-            # ROBUST APPROACH: Ensure auto-discovery completes with retry logic
-            from ..config_store import get_config_store, get_config_value
+        credential = "your sign-in" if reads_with_sign_in(client) else "your API key"
+        getting_started = self._getting_started_commands()
+        return [
+            TextContent(
+                type="text",
+                text=f"""# **Setup Complete!**
 
-            config_store = get_config_store()
-            debug_info.append(f"[OK] ConfigurationStore instance: {id(config_store)}")
-
-            # Force auto-discovery completion with retry
-            max_retries = 3
-            debug_info.append(f" Starting auto-discovery with {max_retries} retries")
-
-            for attempt in range(max_retries):
-                debug_info.append(f" Attempt {attempt + 1}/{max_retries}")
-                await config_store.get_configuration()
-
-                debug_info.append(f"   - Discovery attempted: {config_store._discovery_attempted}")
-                debug_info.append(
-                    f"   - Discovered config exists: {config_store._discovered_config is not None}"
-                )
-
-                # Verify auto-discovery actually completed by checking discovered config
-                if (
-                    config_store._discovered_config
-                    and config_store._discovered_config.has_required_fields()
-                ):
-                    debug_info.append(
-                        f"[OK] Auto-discovery completed successfully on attempt {attempt + 1}"
-                    )
-                    logger.info(
-                        f"[OK] Auto-discovery completed successfully on attempt {attempt + 1}"
-                    )
-                    break
-
-                if attempt < max_retries - 1:
-                    debug_info.append(
-                        f"⚠️ Auto-discovery incomplete on attempt {attempt + 1}, retrying..."
-                    )
-                    logger.warning(
-                        f"⚠️ Auto-discovery incomplete on attempt {attempt + 1}, retrying..."
-                    )
-                    await asyncio.sleep(0.5)  # Brief delay before retry
-                else:
-                    debug_info.append("❌ Auto-discovery failed after all retries")
-                    logger.error("❌ Auto-discovery failed after all retries")
-
-            # First check if we have the required configuration
-            required_fields = [
-                "REVENIUM_API_KEY",
-                "REVENIUM_TEAM_ID",
-                "REVENIUM_TENANT_ID",
-                "REVENIUM_OWNER_ID",
-            ]
-            missing_fields = []
-
-            debug_info.append(" Checking required configuration fields:")
-            for field in required_fields:
-                value = get_config_value(field)
-                if not value:
-                    missing_fields.append(field)
-                    debug_info.append(f"   - ❌ {field}: MISSING")
-                else:
-                    debug_info.append(
-                        f"   - [OK] {field}: {'SET (hidden)' if field == 'REVENIUM_API_KEY' else value}"
-                    )
-                logger.debug(
-                    f"Field {field}: {'SET (hidden)' if field == 'REVENIUM_API_KEY' and value else value or 'NONE'}"
-                )
-
-            if missing_fields:
-                debug_output = "\n".join(debug_info)
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"""# ⚠️ **Setup Incomplete**
-
-Cannot complete setup because the following required configuration values are missing:
-
-{chr(10).join(f'- **{field}**' for field in missing_fields)}
-
-##  **How to Fix**
-
-1. **Check Auto-Discovery**: Use `configuration_status(action='auto_discovery')` to verify auto-discovery is working
-2. **Check API Connectivity**: Use `configuration_status(action='api_connectivity')` to test your API connection
-3. **Manual Configuration**: Set missing environment variables if auto-discovery isn't working
-
-**Auto-discovery should provide these values automatically.** If it's not working, there may be an issue with your API key or network connectivity.
-
-**Try Again**: Once the missing values are available, run `complete_setup()` again.
-
----
-##  **Debug Information**
-
-{debug_output}
-""",
-                    )
-                ]
-
-            debug_info.append("[OK] All required fields available, proceeding with cache creation")
-
-            from ..onboarding.detection_service import get_detection_service
-
-            detection_service = get_detection_service()
-            debug_info.append(f"[OK] Detection service instance: {id(detection_service)}")
-
-            debug_info.append("Calling mark_onboarding_completed()...")
-            success = await detection_service.mark_onboarding_completed()
-            debug_info.append(f"Cache creation result: {success}")
-
-            debug_output = "\n".join(debug_info)
-
-            if success:
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"""# **Setup Complete!**
-
-[OK] **Congratulations!** Your Revenium MCP server setup is now complete.
+[OK] **Verified**: {credential} can read this organization's data, so your Revenium MCP server setup is complete.
 
 ## **What's Next?**
 
@@ -372,98 +280,66 @@ You can now use all the powerful features of the Revenium MCP server:
 ## **Getting Started**
 
 Try these commands to explore your capabilities:
-- `manage_alerts(action='create')` - Set up AI spending alerts to avoid surprise costs
-- `verify_email_setup(action='update_email')` - Configure default email address to receive AI spending alerts
-- `slack_management(action='setup_status')` - Configure default Slack channel to receive AI spending alerts
+{getting_started}
 
 **Welcome to Revenium!**
-
----
-##  **Debug Information**
-
-{debug_output}
 """,
-                    )
-                ]
-            else:
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"""# ⚠️ **Setup Completion Issue**
+            )
+        ]
 
-There was an issue marking your setup as complete. This might be due to:
-
-- Missing required configuration values
-- Cache write permissions
-- Network connectivity issues
-
-**Recommendation**: Use `setup_checklist()` to verify all required components are configured properly.
-
----
-##  **Debug Information**
-
-{debug_output}
-""",
-                    )
-                ]
-
-        except Exception as e:
-            logger.error(f"Error completing setup: {e}")
-            debug_info.append(f"❌ Exception occurred: {str(e)}")
-            debug_output = "\n".join(debug_info)
-            return [
-                TextContent(
-                    type="text",
-                    text=f"""# **Setup Completion Error**
-
-**Error**: {str(e)}
-
-**Recommendation**: Try running `setup_checklist()` to diagnose any remaining configuration issues.
-
----
-## **Debug Information**
-
-{debug_output}
-""",
-                )
-            ]
+    @staticmethod
+    def _getting_started_commands() -> str:
+        """First commands to try; the hosted server refuses update_email (BACK-4679)."""
+        first_commands = [
+            "- `manage_alerts(action='create')` - Set up AI spending alerts to avoid surprise costs",
+        ]
+        if not credentials_are_per_request():
+            first_commands.append(
+                "- `system_setup(action='update_email')` - Configure default email address "
+                "to receive AI spending alerts"
+            )
+        first_commands.append(
+            "- `slack_management(action='setup_status')` - Configure default Slack channel "
+            "to receive AI spending alerts"
+        )
+        return "\n".join(first_commands)
 
     async def _handle_help(self, arguments: Dict[str, Any]) -> List[TextContent]:
         """Handle help action - show available actions and usage examples."""
         logger.debug("Showing welcome setup help and available actions")
 
-        help_text = """# Welcome and Setup Tool Help
+        help_text = """# System Setup Help
 
 ## Available Actions
 
 **show_welcome**
 - Display welcome message and setup overview
-- Usage: `welcome_and_setup(action="show_welcome")`
+- Usage: `system_setup(action="show_welcome")`
 - Best for: First-time users or getting an overview
 
 **setup_checklist**
 - Show detailed setup completion status
-- Usage: `welcome_and_setup(action="setup_checklist")`
+- Usage: `system_setup(action="setup_checklist")`
 - Best for: Checking what configuration items are completed
 
 **environment_status**
 - Display all environment variables with status
-- Usage: `welcome_and_setup(action="environment_status")`
+- Usage: `system_setup(action="environment_status")`
 - Best for: Troubleshooting configuration issues
 
 **next_steps**
 - Get personalized recommendations based on current setup
-- Usage: `welcome_and_setup(action="next_steps")`
+- Usage: `system_setup(action="next_steps")`
 - Best for: Finding out what to do next
 
 **complete_setup**
-- Mark onboarding as complete (requires confirmation)
-- Usage: `welcome_and_setup(action="complete_setup", confirm_completion=True)`
+- Confirm setup: checks your organization's data can be read (requires confirmation)
+- Usage: `system_setup(action="complete_setup", confirm_completion=True)`
 - Best for: Finishing the setup process
 
 **help**
 - Show this help message
-- Usage: `welcome_and_setup(action="help")`
+- Usage: `system_setup(action="help")`
 - Best for: Learning about available actions
 
 ## Getting Started
@@ -472,11 +348,6 @@ There was an issue marking your setup as complete. This might be due to:
 2. Use `setup_checklist` to see what needs configuration
 3. Use `next_steps` for personalized guidance
 4. Use `complete_setup` when ready to finish
-
-## Optional Parameters
-
-- `show_environment`: Whether to show environment details (true/false)
-- `include_recommendations`: Whether to include recommendations (true/false)
 """
 
         return [TextContent(type="text", text=help_text)]
@@ -494,7 +365,7 @@ There was an issue marking your setup as complete. This might be due to:
             and setup_completion.get("auto_discovery_working", False)
         )
 
-        slack_configured = setup_completion.get("slack_configured", False)
+        slack_configured = setup_completion.get("slack_configured")
 
         if is_first_time:
             welcome_header = "# **Welcome to Revenium MCP Server!**\n\n"
@@ -563,6 +434,11 @@ Auto-discovery found all your required configuration:
 Let's get you set up!
 
 """
+        elif is_first_time is None:
+            welcome_header = "#**Revenium MCP Server Setup**\n\n"
+            welcome_intro = """We could not check your organization's data on the platform, so this shows your configuration only.
+
+"""
         else:
             welcome_header = "#**Revenium MCP Server Setup**\n\n"
             welcome_intro = """**Welcome back!** Let's check your current setup status.
@@ -591,11 +467,14 @@ Some configuration items need your attention to ensure optimal functionality.
             ("API Key", setup_completion.get("api_key_configured", False)),
             ("Team ID", setup_completion.get("team_id_configured", False)),
             ("Email", setup_completion.get("email_configured", False)),
-            ("Slack", setup_completion.get("slack_configured", False)),
+            ("Slack", slack_configured),
         ]
 
         setup_summary = "##  **Quick Setup Summary**\n\n"
         for item, configured in required_items:
+            if configured is None:
+                setup_summary += f"- ⚠️ **{item}**: Could not check on the platform\n"
+                continue
             status_icon = "[OK]" if configured else "⚠️"
             setup_summary += (
                 f"- {status_icon} **{item}**: {'Configured' if configured else 'Needs Setup'}\n"
@@ -611,13 +490,17 @@ Some configuration items need your attention to ensure optimal functionality.
         recommendations_section += "\n"
 
         # Next steps
-        next_steps_section = """## **Quick Actions**
+        slack_action = (
+            "- `slack_management(action='quick_setup')` - Set up Slack notifications\n"
+            if slack_configured is False
+            else ""
+        )
+        next_steps_section = f"""## **Quick Actions**
 
 - `tool_introspection()` - Discover all available tools and capabilities
 - `setup_checklist()` - See detailed setup status
 - `environment_status()` - View all environment variables
-- `slack_management(action='quick_setup')` - Set up Slack notifications
-- `next_steps()` - Get personalized recommendations
+{slack_action}- `next_steps()` - Get personalized recommendations
 
 **Ready to get started?** Use any of the commands above!
 """
@@ -638,8 +521,8 @@ Some configuration items need your attention to ensure optimal functionality.
         # Core requirements
         checklist += "##**Core Requirements**\n\n"
 
-        api_key_set = bool(get_config_value("REVENIUM_API_KEY"))
-        team_id_set = bool(get_config_value("REVENIUM_TEAM_ID"))
+        api_key_set = bool(onboarding_state.setup_completion.get("api_key_configured"))
+        team_id_set = bool(onboarding_state.setup_completion.get("team_id_configured"))
 
         checklist += f"{'[OK]' if api_key_set else '❌'} **API Key**: {'Configured' if api_key_set else 'Required - Set REVENIUM_API_KEY'}\n"
         checklist += f"{'[OK]' if team_id_set else '❌'} **Team ID**: {'Configured' if team_id_set else 'Required - Set REVENIUM_TEAM_ID or use auto-discovery'}\n\n"
@@ -648,11 +531,16 @@ Some configuration items need your attention to ensure optimal functionality.
         checklist += "## [ ] **Recommended Setup**\n\n"
 
         email_set = bool(get_config_value("REVENIUM_DEFAULT_EMAIL"))
-        slack_set = bool(get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID"))
+        slack_set = onboarding_state.setup_completion.get("slack_configured")
 
         checklist += f"{'[OK]' if email_set else '[ ]'} **Email Notifications**: {'Configured' if email_set else 'Use verify_email_setup() to configure'}\n"
-        slack_action = 'slack_management(action="quick_setup") to configure'
-        checklist += f"{'[OK]' if slack_set else '[ ]'} **Slack Integration**: {'Configured' if slack_set else f'Use {slack_action}'}\n\n"
+        if slack_set is None:
+            checklist += "[?] **Slack Integration**: Could not check Slack on the platform\n\n"
+        elif slack_set:
+            checklist += "[OK] **Slack Integration**: Configured on the platform\n\n"
+        else:
+            slack_action = 'slack_management(action="quick_setup") to configure'
+            checklist += f"[ ] **Slack Integration**: Use {slack_action}\n\n"
 
         # System status
         checklist += "##  **System Status**\n\n"
@@ -684,7 +572,9 @@ Some configuration items need your attention to ensure optimal functionality.
         else:
             api_connectivity_text = "Check API key and network"
         checklist += f"{'[OK]' if api_works else '❌'} **API Connectivity**: {api_connectivity_text}\n"
-        checklist += f"{'[OK]' if auto_discovery_works else '⚠️'} **Auto-Discovery**: {'Working' if auto_discovery_works else 'Manual configuration required'}\n\n"
+        if validation_result.summary.get("credential_source") != "request":
+            checklist += f"{'[OK]' if auto_discovery_works else '⚠️'} **Auto-Discovery**: {'Working' if auto_discovery_works else 'Manual configuration required'}\n"
+        checklist += "\n"
 
         # Next steps. A failed read gates readiness too: without it, "Ready to
         # Go!" would render directly under a Forbidden connectivity line.
@@ -702,23 +592,24 @@ Some configuration items need your attention to ensure optimal functionality.
             checklist += "2. Use `environment_status()` to see all variables\n"
             checklist += "3. Run `setup_checklist()` again to verify\n"
         elif not api_works:
-            # Everything looks configured but the probe never ran - the key can
-            # live in the config cache while missing from the environment the
-            # probe reads. Readiness cannot be claimed without a read.
+            # Readiness cannot be claimed without a completed read.
             checklist += "##**Next Steps**\n\n"
-            checklist += (
-                "1. API connectivity was not verified - the probe found no "
-                "REVENIUM_API_KEY in the process environment\n"
-            )
-            checklist += "2. Export REVENIUM_API_KEY, then run `setup_checklist()` again\n"
-        elif not email_set or not slack_set:
+            checklist += "1. API connectivity was not verified\n"
+            checklist += "2. Run `system_diagnostics(action='system_health')` to see why\n"
+        elif not email_set or slack_set is not True:
             checklist += "##**Next Steps**\n\n"
             step_num = 1
             if not email_set:
                 checklist += f"{step_num}. Set up email notifications for alerts\n"
                 step_num += 1
-            if not slack_set:
+            if slack_set is False:
                 checklist += f"{step_num}. Configure Slack integration for real-time updates\n"
+                step_num += 1
+            elif slack_set is None:
+                checklist += (
+                    f"{step_num}. Slack could not be checked on the platform; "
+                    "run `setup_checklist()` again to check it\n"
+                )
                 step_num += 1
             checklist += f"{step_num}. Use `complete_setup()` when ready\n"
         else:
@@ -759,39 +650,46 @@ Some configuration items need your attention to ensure optimal functionality.
         env_status += "##  **Summary**\n\n"
         summary = validation_result.summary
 
+        hosted_caller = summary.get("credential_source") == "request"
+
         env_status += f"- **API Key Available**: {'[OK] YES' if summary.get('api_key_available') else '❌ NO'}\n"
-        env_status += f"- **Auto-Discovery Works**: {'[OK] YES' if summary.get('auto_discovery_works') else '❌ NO'}\n"
-        env_status += f"- **Required Fields Discovered**: {'[OK] YES' if summary.get('required_fields_discovered') else '❌ NO'}\n"
-        env_status += (
-            f"- **Email Discovered**: {'[OK] YES' if summary.get('email_discovered') else '❌ NO'}\n"
-        )
+        if not hosted_caller:
+            env_status += f"- **Auto-Discovery Works**: {'[OK] YES' if summary.get('auto_discovery_works') else '❌ NO'}\n"
+            env_status += f"- **Required Fields Discovered**: {'[OK] YES' if summary.get('required_fields_discovered') else '❌ NO'}\n"
+            env_status += f"- **Email Discovered**: {'[OK] YES' if summary.get('email_discovered') else '❌ NO'}\n"
         env_status += (
             f"- **Direct API Works**: {'[OK] YES' if summary.get('direct_api_works') else '❌ NO'}\n"
         )
-        env_status += f"- **Auth Config Works**: {'[OK] YES' if summary.get('auth_config_works') else '❌ NO'}\n"
+        if not hosted_caller:
+            env_status += f"- **Auth Config Works**: {'[OK] YES' if summary.get('auth_config_works') else '❌ NO'}\n"
         env_status += f"- **Overall Status**: {'[OK] WORKING' if summary.get('overall_status') else '❌ NEEDS ATTENTION'}\n\n"
 
-        env_status += (
-            f"**Configuration Method**: {summary.get('configuration_method', 'Unknown')}\n"
-        )
+        if hosted_caller:
+            env_status += "**Configuration Method**: Your key or sign-in on each request\n"
+        else:
+            env_status += (
+                f"**Configuration Method**: {summary.get('configuration_method', 'Unknown')}\n"
+            )
 
         return env_status
 
-    def _build_next_steps(self, onboarding_state) -> str:
+    def _build_next_steps(self, onboarding_state, validation_result) -> str:
         """Build personalized next steps recommendations with streamlined experience."""
         setup_completion = onboarding_state.setup_completion
+        platform_read = validation_result.api_connectivity.get("status") == "success"
 
         # Check if auto-discovery has configured all required items
         auto_discovery_complete = (
-            setup_completion.get("api_key_configured", False)
+            platform_read
+            and setup_completion.get("api_key_configured", False)
             and setup_completion.get("team_id_configured", False)
             and setup_completion.get("email_configured", False)
             and setup_completion.get("auto_discovery_working", False)
         )
 
-        slack_configured = setup_completion.get("slack_configured", False)
+        slack_configured = setup_completion.get("slack_configured")
 
-        if auto_discovery_complete:
+        if auto_discovery_complete and slack_configured is not None:
             # STREAMLINED EXPERIENCE: Auto-discovery worked
             if slack_configured:
                 return """# **Setup Complete!**
@@ -809,7 +707,7 @@ Your Revenium MCP server is fully configured. Start using these powerful feature
 
 ##**Finish Onboarding**
 
-Ready to complete setup? Use `complete_setup()` to mark onboarding as complete!
+Ready to finish? Use `complete_setup()` to confirm that your credentials can read your organization's data.
 """
             else:
                 return """#**Almost Done!**
@@ -850,6 +748,23 @@ Slack notifications provide instant alerts when:
         # Prioritized recommendations
         steps = []
 
+        if not platform_read:
+            steps.append(
+                {
+                    "priority": 1,
+                    "title": "Restore Platform Access",
+                    "description": (
+                        "The platform could not be read, so setup could not be "
+                        "confirmed"
+                    ),
+                    "action": (
+                        "Run system_diagnostics(action='system_health') to see what is "
+                        "not working"
+                    ),
+                    "urgency": " Critical",
+                }
+            )
+
         if not setup_completion.get("api_key_configured", False):
             steps.append(
                 {
@@ -883,13 +798,25 @@ Slack notifications provide instant alerts when:
                 }
             )
 
-        if not setup_completion.get("slack_configured", False):
+        if setup_completion.get("slack_configured") is False:
             steps.append(
                 {
                     "priority": 2,
                     "title": "Configure Slack Integration",
                     "description": "Set up Slack for real-time notifications",
                     "action": "Use slack_management(action='quick_setup')",
+                    "urgency": " Recommended",
+                }
+            )
+        elif platform_read and setup_completion.get("slack_configured") is None:
+            steps.append(
+                {
+                    "priority": 2,
+                    "title": "Check Slack Integration",
+                    "description": (
+                        "Slack could not be checked on the platform, so its state is unknown"
+                    ),
+                    "action": "Run next_steps() again to check it",
                     "urgency": " Recommended",
                 }
             )

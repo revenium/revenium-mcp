@@ -126,14 +126,13 @@ class ReveniumTools:
         This tool provides comprehensive alert and anomaly management capabilities including:
         - AI Anomalies: Create, read, update, delete anomaly definitions (the rules that trigger alerts)
         - AI Alerts: List and investigate triggered alerts (the events that happened)
-        - Metrics: Retrieve metrics from anomaly builders
         - Analytics: Anomaly patterns and alert frequency analysis
 
         Args:
             arguments: Dictionary containing:
-                - action: The action to perform (list, get, create, update, delete, clear_all, get_metrics)
+                - action: The action to perform (list, get, create, update, delete, clear_all)
                 - resource_type: Type of resource (anomalies, alerts)
-                - anomaly_id: ID of the anomaly (for get, update, delete, get_metrics)
+                - anomaly_id: ID of the anomaly (for get, update, delete)
                 - alert_id: ID of the alert (for get)
                 - anomaly_data: Data for creating/updating anomalies
                 - page: Page number for pagination (default: 0)
@@ -160,7 +159,6 @@ class ReveniumTools:
                             "update",
                             "delete",
                             "clear_all",
-                            "get_metrics",
                             "query",
                             "get_capabilities",
                             "get_examples",
@@ -1045,8 +1043,6 @@ action="create_simple", workflow_type="customer_onboarding", customer_email="use
                 - template_name: Name of template to use (for create_from_template)
                 - category: Template category filter (for get_templates)
                 - overrides: Override values when creating from template
-                - source_id: Source ID (for assign_to_source, remove_from_source, get_source_elements)
-                - element_ids: List of element IDs (for assign_to_source, remove_from_source)
                 - text: Natural language text (for create_from_description, parse_natural_language)
                 - example_type: Type of examples to retrieve
 

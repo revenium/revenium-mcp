@@ -4,6 +4,10 @@ Tests MeteringElementsManager, MeteringElementsValidator, and MeteringElementsMa
 Focuses on label population logic, CRUD operations, template management, and handle_action routing.
 """
 
+import inspect
+import json
+import re
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,8 +16,46 @@ from src.revenium_mcp_server.tools_decomposed.metering_elements_management impor
     MeteringElementsValidator,
     MeteringElementsManagement,
 )
+from src.revenium_mcp_server.auth import AuthConfig
+from src.revenium_mcp_server.client import ReveniumAPIError, ReveniumClient
 from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.tool_configuration.registry import ToolConfigurationRegistry
 from mcp.types import TextContent
+
+
+STORED_ELEMENT = {
+    "id": "el_1",
+    "name": "tokens",
+    "description": "old",
+    "type": "NUMBER",
+    "label": "tokens",
+}
+
+PREVIEW_BODY_HEADING = "**Body the update would send:**"
+
+
+def _recording_element_client() -> ReveniumClient:
+    """A real client whose element GET serves STORED_ELEMENT and whose PUT is recorded."""
+    client = ReveniumClient(
+        auth_config=AuthConfig(
+            api_key="test-key-xyz",
+            team_id="team_abc",
+            base_url="https://api.test.revenium.ai",
+            timeout=5.0,
+            max_retries=0,
+        )
+    )
+    client.get_metering_element_definition_by_id = AsyncMock(
+        return_value=json.loads(json.dumps(STORED_ELEMENT))
+    )
+    client.put = AsyncMock(return_value={"id": "el_1", "name": "tokens"})
+    return client
+
+
+def _previewed_body(preview_text: str) -> dict:
+    assert PREVIEW_BODY_HEADING in preview_text
+    body_text = preview_text.split(PREVIEW_BODY_HEADING, 1)[1].split("**Dry Run:**", 1)[0]
+    return json.loads(body_text)
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +425,16 @@ class TestUpdateElement:
         assert result["id"] == "elem_123"
 
 
+    @pytest.mark.asyncio
+    async def test_preview_without_a_client_refuses_instead_of_crashing(self, manager, mock_client):
+        with pytest.raises(ToolError) as refusal:
+            await manager.preview_update(
+                mock_client, {"element_id": "elem_123", "element_data": {"name": "x"}}
+            )
+        assert "nothing was sent" in refusal.value.message
+        mock_client.update_metering_element_definition.assert_not_awaited()
+
+
 # ===========================================================================
 # MeteringElementsManager — delete_element
 # ===========================================================================
@@ -427,34 +479,129 @@ class TestGetTemplates:
 
 
 # ===========================================================================
-# MeteringElementsManager — assign_to_source
+# MeteringElementsManagement — assign_to_source is not offered (BACK-4629)
 # ===========================================================================
 
 
-class TestAssignToSource:
-    """MeteringElementsManager.assign_to_source — source assignment."""
+class _RecordingClient:
+    """Records every client method the tool reaches for; answers nothing."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        async def record(*args, **kwargs):
+            self.calls.append(name)
+            return {}
+
+        return record
+
+
+class TestSourceAssignmentIsNotOffered:
+    """The platform has no assign-elements-to-source operation, so the tool
+    must neither claim an assignment nor advertise the action."""
+
+    @pytest.fixture
+    def mgmt(self):
+        return MeteringElementsManagement()
 
     @pytest.mark.asyncio
-    async def test_missing_source_id_raises(self, manager, mock_client):
-        with pytest.raises(Exception) as exc_info:
-            await manager.assign_to_source(mock_client, {"element_ids": ["e1"]})
-        assert "source_id" in str(exc_info.value).lower()
+    async def test_invocation_is_an_error_and_writes_nothing(self, mgmt):
+        recording_client = _RecordingClient()
+        with patch.object(
+            mgmt, "get_client", new_callable=AsyncMock, return_value=recording_client
+        ) as get_client:
+            with pytest.raises(ToolError) as exc_info:
+                await mgmt.handle_action(
+                    "assign_to_source",
+                    {"source_id": "src_does_not_exist", "element_ids": ["elem_1"]},
+                )
+
+        assert recording_client.calls == []
+        get_client.assert_not_awaited()
+        error = exc_info.value
+        assert error.error_code == "BUSINESS_RULE_VIOLATION"
+        assert "nothing was assigned" in error.message
+        assert "assigned successfully" not in error.message.lower()
+        assert "manage_sources" in error.message
+        assert "meteringElementDefinitionIds" in error.message
 
     @pytest.mark.asyncio
-    async def test_missing_element_ids_raises(self, manager, mock_client):
-        with pytest.raises(Exception) as exc_info:
-            await manager.assign_to_source(mock_client, {"source_id": "src_123"})
-        assert "element_ids" in str(exc_info.value).lower()
+    async def test_supported_actions_and_schema_drop_the_action(self, mgmt):
+        actions = await mgmt._get_supported_actions()
+        schema = await mgmt._get_input_schema()
+        capabilities = await mgmt._get_tool_capabilities()
+
+        assert "assign_to_source" not in actions
+        assert "assign_to_source" not in schema["properties"]["action"]["enum"]
+        assert "source_id" not in schema["properties"]
+        assert "element_ids" not in schema["properties"]
+        assert all("assign_to_source" not in c.parameters for c in capabilities)
 
     @pytest.mark.asyncio
-    async def test_valid_assignment_returns_success(self, manager, mock_client):
-        result = await manager.assign_to_source(
-            mock_client,
-            {"source_id": "src_123", "element_ids": ["e1", "e2"]},
+    @pytest.mark.parametrize(
+        "help_action", ["get_capabilities", "get_examples", "get_agent_summary"]
+    )
+    async def test_help_never_points_to_unwired_actions(self, mgmt, help_action):
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=MagicMock()):
+            result = await mgmt.handle_action(help_action, {})
+
+        text = result[0].text
+        assert "assign_to_source" not in text
+        assert "get_source_elements" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "help_action", ["get_capabilities", "get_examples", "get_agent_summary"]
+    )
+    async def test_help_says_the_link_list_replaces_existing_links(self, mgmt, help_action):
+        """meteringElementDefinitionIds is written whole and never read back, so
+        following the help must not drop the source's existing links."""
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=MagicMock()):
+            result = await mgmt.handle_action(help_action, {})
+
+        text = result[0].text.lower()
+        assert "replaces" in text
+        assert "meteringelementdefinitions[].id" in text
+
+    @pytest.mark.asyncio
+    async def test_error_tells_the_caller_to_keep_the_existing_links(self, mgmt):
+        with pytest.raises(ToolError) as exc_info:
+            await mgmt.handle_action("assign_to_source", {})
+
+        error = exc_info.value
+        assert "REPLACES" in error.message
+        assert "meteringElementDefinitions[].id" in error.message
+        assert error.examples["read_current_links"].startswith('manage_sources(action="get"')
+        assert "<existing id" in error.examples["link_elements"]
+        assert "<new element id>" in error.examples["link_elements"]
+
+
+class TestSourceAssignmentThroughAnalyticsRegistry:
+    """The analytics registry route answers assign_to_source with the same
+    guidance as the tool, not the generic action rejection."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_context", [{"_tool_name": "manage_metering_elements"}, {}])
+    async def test_registry_route_raises_the_shared_guidance(self, tool_context):
+        from src.revenium_mcp_server.registries.analytics_registry import AnalyticsRegistry
+        from src.revenium_mcp_server.tools_decomposed.metering_elements_management import (
+            source_assignment_unsupported_error,
         )
-        assert result["source_id"] == "src_123"
-        assert result["assigned_elements"] == ["e1", "e2"]
-        assert result["status"] == "assigned"
+
+        registry = AnalyticsRegistry()
+        with patch.object(
+            registry, "_standardized_tool_execution", new_callable=AsyncMock
+        ) as tool_execution:
+            with pytest.raises(ToolError) as exc_info:
+                await registry.handle_action(
+                    "assign_to_source",
+                    {"source_id": "src_1", "element_ids": ["elem_1"], **tool_context},
+                )
+
+        tool_execution.assert_not_awaited()
+        assert exc_info.value.message == source_assignment_unsupported_error().message
+        assert exc_info.value.error_code == "BUSINESS_RULE_VIOLATION"
 
 
 # ===========================================================================
@@ -586,6 +733,53 @@ class TestMeteringElementsManagementHandleAction:
         assert isinstance(result[0], TextContent)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [400, 404])
+    async def test_update_dry_run_for_a_missing_element_raises_not_found(self, mgmt, status_code):
+        """BACK-4818: a preview of an edit to an element that does not exist fails like the get does."""
+        client = MagicMock()
+        client.team_id = "test_team_id_456"
+        client.get_metering_element_definition_by_id = AsyncMock(
+            side_effect=ReveniumAPIError(
+                "Invalid Metering Element ID", status_code=status_code
+            )
+        )
+        client.update_metering_element_definition = AsyncMock()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = client
+            with pytest.raises(ReveniumAPIError) as not_found:
+                await mgmt.handle_action(
+                    "update",
+                    {
+                        "element_id": "zzzzzz9",
+                        "element_data": {"description": "x"},
+                        "dry_run": True,
+                    },
+                )
+
+        assert "Invalid Metering Element ID" in not_found.value.message
+        client.update_metering_element_definition.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_dry_run_body_equals_the_put_body_the_update_sends(self, mgmt):
+        """BACK-4818: the preview shows exactly the body the real update would PUT."""
+        client = _recording_element_client()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = client
+            preview = await mgmt.handle_action(
+                "update",
+                {"element_id": "el_1", "element_data": {"description": "x"}, "dry_run": True},
+            )
+            assert client.put.await_count == 0
+            await mgmt.handle_action(
+                "update", {"element_id": "el_1", "element_data": {"description": "x"}}
+            )
+
+        put_body = client.put.await_args.kwargs["data"]
+        assert put_body["description"] == "x"
+        assert put_body["teamId"] == "team_abc"
+        assert _previewed_body(preview[0].text) == json.loads(json.dumps(put_body, default=str))
+
+    @pytest.mark.asyncio
     async def test_create_dry_run_valid_returns_dry_run_text(self, mgmt):
         with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_gc.return_value = MagicMock()
@@ -714,6 +908,28 @@ class TestMeteringElementsManagementHandleAction:
         assert "System elements cannot be modified" in text
 
 
+    @pytest.mark.asyncio
+    async def test_dry_run_refuses_an_unknown_template_like_the_real_create(self, mgmt):
+        client = MagicMock()
+        client.create_metering_element_definition = AsyncMock(return_value={})
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            with pytest.raises(ToolError) as dry:
+                await mgmt.handle_action(
+                    "create_from_template", {"template_name": "api_usage", "dry_run": True}
+                )
+            with pytest.raises(ToolError) as live:
+                await mgmt.handle_action("create_from_template", {"template_name": "api_usage"})
+            with pytest.raises(ToolError):
+                await mgmt.handle_action("create_from_template", {"dry_run": True})
+
+        assert dry.value.message == "Template 'api_usage' not found"
+        assert dry.value.message == live.value.message
+        assert dry.value.examples["available_templates"] == list(
+            MeteringElementsManager().element_templates
+        )
+        client.create_metering_element_definition.assert_not_called()
+
+
 class TestMeteringElementsCapabilitiesElementTypesFallback:
     """Element Types section in get_capabilities must always render concrete items.
 
@@ -752,6 +968,28 @@ class TestMeteringElementsCapabilitiesElementTypesFallback:
         assert "**STRING**" in text
         assert "**BOOLEAN**" in text
 
+    @pytest.mark.asyncio
+    async def test_overview_names_only_registered_templates(self, mgmt):
+        """BACK-4796: the overview names the templates get_templates holds."""
+        text = await mgmt._build_enhanced_capabilities_text(None)
+        line = next(
+            line for line in text.splitlines() if line.startswith("- **Configuration templates**")
+        )
+        assert set(re.findall(r"`([^`]+)`", line)) == set(
+            MeteringElementsManager().element_templates
+        )
+        assert "storage" not in line
+        assert "compute time" not in line
+
+    @pytest.mark.asyncio
+    async def test_agent_summary_states_the_registered_template_count(self, mgmt):
+        n = len(MeteringElementsManager().element_templates)
+        result = await mgmt._handle_get_agent_summary()
+        text = result[0].text
+        assert f"{n} predefined shipping templates" in text
+        assert "6+ predefined" not in text
+        assert "4 predefined" not in text
+
 
 from tests.unit._helpers_no_framework_leak import assert_no_framework_leak
 
@@ -769,3 +1007,64 @@ class TestMeteringElementsListPaginationValidation:
             )
         assert exc.value.field == "size"
         assert_no_framework_leak(exc.value.message)
+
+
+class TestMeteringElementsListPastLastPage:
+    @pytest.mark.asyncio
+    async def test_list_past_last_page_names_the_pages_that_exist(self):
+        mgmt = MeteringElementsManagement()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_client.get_metering_element_definitions = AsyncMock(
+                return_value={
+                    "page": {
+                        "number": 500,
+                        "size": 20,
+                        "totalPages": 2,
+                        "totalElements": 31,
+                    }
+                }
+            )
+            mock_gc.return_value = mock_client
+            result = await mgmt.handle_action("list", {"page": 500, "size": 20})
+        text = result[0].text
+        assert (
+            "The page requested (page=500) is past the last. The list has 31 items "
+            "on 2 pages. Pass page=1, size=20 for the last page, or page=0, size=20 "
+            "for the first."
+        ) in text, text
+        assert "permissions" not in text, text
+
+
+class TestTemplateHintsNameRealTemplates:
+    """Every template name the tool suggests must exist in the template registry."""
+
+    @pytest.mark.asyncio
+    async def test_every_template_hint_names_a_registered_template(self):
+        mgmt = MeteringElementsManagement()
+        manager = MeteringElementsManager()
+        parts = []
+        for args in ({}, {"template_name": "nope"}):
+            with pytest.raises(ToolError) as exc:
+                await manager.create_from_template(MagicMock(), args)
+            parts.append(str(exc.value.examples))
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=MagicMock()):
+            with pytest.raises(ToolError) as unknown:
+                await mgmt.handle_action("no_such_action", {})
+            parts.append(str(unknown.value.examples))
+            capabilities = ""
+            for action in ("get_capabilities", "get_examples", "get_agent_summary"):
+                text = (await mgmt.handle_action(action, {}))[0].text
+                parts.append(text)
+                if action == "get_capabilities":
+                    capabilities = text
+        parts.append(
+            inspect.getsource(ToolConfigurationRegistry._register_manage_metering_elements)
+        )
+
+        names = set(re.findall(r"template_name=\\?['\"](\w+)\\?['\"]", "\n".join(parts)))
+        assert names, "no template_name hints found to check"
+        assert names <= set(manager.element_templates), names - set(manager.element_templates)
+
+        section = capabilities.split("## **Available Templates**", 1)[1].split("\n\n##", 1)[0]
+        assert "requestDuration" not in section

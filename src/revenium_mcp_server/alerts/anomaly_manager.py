@@ -5,13 +5,19 @@ for AI anomalies in the Revenium platform.
 """
 
 import json
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..client import ReveniumAPIError, ReveniumClient
-from ..common.error_handling import ToolError, ErrorCodes
+from ..common.error_handling import (
+    ToolError,
+    ErrorCodes,
+    create_structured_validation_error,
+    raise_refusal,
+)
 from ..error_handlers import (
     handle_alert_tool_errors,
     validate_anomaly_id,
@@ -22,13 +28,66 @@ from ..alert_operators import (
     ACCEPTED_OPERATORS,
     CHANGE_OPERATORS,
     FILTER_LIST_OPERATOR,
+    OPERATOR_LABELS,
     accepted_operators_for,
-    historical_operator_notice,
     is_rejected_operator,
     rejected_operator_message,
+    threshold_is_percentage,
     validate_filter_rows,
 )
+from .alert_manager import format_alert_value
 from ..validators import InputValidator
+from .anomaly_inventory import read_every_anomaly
+from .notification_recipients import RECIPIENT_FIELDS, update_recipients
+from .update_fidelity import (
+    ordered_periods_for,
+    refuse_platform_rule_breach,
+    refuse_unknown_data_source,
+    refuse_update_rule_breach,
+    refuse_unsupported_update_fields,
+    resolve_update_period,
+    threshold_number,
+    verify_update_applied,
+)
+
+_RESOLVED_AFTER_CONVERSION = frozenset(RECIPIENT_FIELDS) | {"period"}
+
+# Fields every stored alert carries; an update may change them but never empty them.
+_REQUIRED_UPDATE_FIELDS = frozenset(
+    {
+        "alert_type", "metric_type", "operator_type", "tracking_period",
+        "name", "alertType", "metricType", "operatorType", "periodDuration", "enabled",
+    }
+)
+
+# A null here means no change. AIAnomalyService.update keeps the stored dataSource,
+# isPercentage and minSampleCount when sent null (dev check, 2026-10-18).
+_NO_CHANGE_WHEN_NULL = frozenset(
+    {"dataSource", "isPercentage", "minSampleCount", "is_percentage", "webhook_configurations"}
+)
+_NO_CHANGE_WHEN_BLANK = frozenset({"is_percentage", "webhook_configurations"})
+
+
+def _changes_nothing(key: str, value: Any) -> bool:
+    """Whether an update value leaves the stored field as it is."""
+    if key in _NO_CHANGE_WHEN_BLANK and isinstance(value, str):
+        return not value.strip()
+    return value is None and key in _NO_CHANGE_WHEN_NULL
+
+
+@dataclass(frozen=True)
+class UpdatePlan:
+    """The body an update would send, after every check the live update runs."""
+
+    anomaly_id: str
+    body: Dict[str, Any]
+    changes: Dict[str, Any]
+
+
+def _as_number(threshold: Any) -> Any:
+    """A threshold string in number form, sent as the number create sends; anything else as given."""
+    number = threshold_number(threshold)
+    return number if isinstance(threshold, str) and number is not None else threshold
 
 
 def format_filter_row(filter_item: Dict[str, Any]) -> str:
@@ -47,11 +106,47 @@ def format_filter_row(filter_item: Dict[str, Any]) -> str:
     return f"{dimension} {operator} '{filter_item.get('value', 'N/A')}'"
 
 
+def alert_label(name: Any, anomaly_id: Any) -> str:
+    """How an answer names an alert: name and id, or the id alone when the platform sent no name."""
+    named = isinstance(name, str) and bool(name.strip())
+    if anomaly_id is None:
+        return f"Alert with no id ({name})" if named else "Alert with no id"
+    return f"{name} ({anomaly_id})" if named else f"{anomaly_id} (no name)"
+
+
+def refuse_clearing_required_field(field_name: str, value: Any) -> None:
+    """Refuse a null or blank value for a field every stored alert must carry, before the update is sent."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        raise create_structured_validation_error(
+            message=f"{field_name} is required; send a value, or leave it out to keep the stored one",
+            field=field_name,
+            value=value,
+            suggestions=[
+                f"Send a value for {field_name}, or leave it out to keep the stored one"
+            ],
+        )
+
+
 FIRING_STATE_LABELS = {
     "FIRING": "Firing",
     "NOT_FIRING": "Not firing",
     "UNKNOWN": "Unknown (could not be read just now)",
 }
+
+
+def _threshold_label(anomaly: Dict[str, Any]) -> str:
+    threshold = anomaly.get("threshold", "N/A")
+    if threshold_is_percentage(anomaly):
+        return f"{threshold}% (percentage)"
+    if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
+        return format_alert_value(threshold, str(anomaly.get("metricType") or ""))
+    return str(threshold)
+
+
+def _operator_label(operator_type: Any) -> str:
+    """The operator in words with the platform's name beside it, or the raw name."""
+    label = OPERATOR_LABELS.get(operator_type)
+    return f"{label} ({operator_type})" if label else str(operator_type)
 
 
 def format_status(anomaly: Dict[str, Any]) -> str:
@@ -69,6 +164,69 @@ def format_status(anomaly: Dict[str, Any]) -> str:
     if enabled:
         return f"{status}; firing state: {label}"
     return f"{status}; last firing state: {label}"
+
+
+_REFUSAL_REASON_LIMIT = 200
+_REFUSALS_LISTED = 10
+
+
+def _refusal_reason(error: Exception) -> str:
+    """The platform's reason for a refused delete, on one line and at most 200 characters."""
+    reason = " ".join(str(error).split()) or type(error).__name__
+    return reason[:_REFUSAL_REASON_LIMIT]
+
+
+def _is_client_error(error: Exception) -> bool:
+    return isinstance(error, ReveniumAPIError) and 400 <= (error.status_code or 0) < 500
+
+
+def _names_a_missing_id(error: ReveniumAPIError) -> bool:
+    if error.status_code == 404:
+        return True
+    return error.status_code == 400 and "failed to decode hashed id" in str(error.response_data).lower()
+
+
+async def _slack_configuration_found(client: ReveniumClient, config_id: str) -> Optional[bool]:
+    """True or False when the lookup settles it, None when it fails for another reason."""
+    try:
+        await client.get_slack_configuration_by_id(config_id)
+    except ReveniumAPIError as lookup_error:
+        return False if _names_a_missing_id(lookup_error) else None
+    except Exception:
+        return None
+    return True
+
+
+async def _refuse_unknown_slack_configuration(
+    client: ReveniumClient, body: Dict[str, Any], error: Exception, verb: str
+) -> None:
+    """Name the Slack configuration a refused anomaly write carried that this organization lacks.
+
+    The platform answers a bad id in slackConfigurations on the anomaly endpoint, so the
+    client's message names the alert's id instead. Returns when the lookups cannot show
+    a missing configuration, and the caller re-raises its original error.
+    """
+    slack_ids = body.get("slackConfigurations") or []
+    if not slack_ids or not _is_client_error(error):
+        return
+    found = {config_id: await _slack_configuration_found(client, config_id) for config_id in slack_ids}
+    missing = [config_id for config_id, exists in found.items() if exists is False]
+    if not missing or None in found.values():
+        return
+    noun, was = ("Slack configuration", "was") if len(missing) == 1 else ("Slack configurations", "were")
+    raise ValidationError(
+        message=(
+            f"{noun} {', '.join(missing)} {was} not found in this organization; "
+            f"nothing was {verb}"
+        ),
+        field="slackConfigurations",
+        value=missing,
+        expected="The id of a Slack configuration this organization has",
+        suggestion=(
+            "Run slack_management(action='list_configurations') to see this "
+            "organization's Slack configurations, then retry with one of those ids"
+        ),
+    )
 
 
 class AnomalyManager:
@@ -252,7 +410,7 @@ class AnomalyManager:
                 f"  • Type: {anomaly.get('alertType', 'N/A')}\n"
                 f"  • Metric: {anomaly.get('metricType', 'N/A')}\n"
                 f"  • {status}\n"
-                f"  • Threshold: {anomaly.get('threshold', 'N/A')}\n"
+                f"  • Threshold: {_threshold_label(anomaly)}\n"
                 f"  • Created: {(anomaly.get('createdAt') or anomaly.get('created', 'N/A'))[:10] if (anomaly.get('createdAt') or anomaly.get('created')) else 'N/A'}"
                 f"{filter_summary}"
                 f"{persistence_info}\n"
@@ -304,8 +462,8 @@ class AnomalyManager:
         # 500 is deliberately NOT folded: a backend outage is not evidence the
         # anomaly is missing, and reporting it as not-found would send the
         # caller looking for a deleted record instead of a broken service.
-        # AlertManager.get_alert does fold 500, from BACK-1142's evidence on
-        # that endpoint; leaving that asymmetry alone is out of scope here.
+        # AlertManager.get_alert does not fold a 5xx either; it names it a
+        # server error (BACK-4705).
         try:
             anomaly = await client.get_anomaly_by_id(anomaly_id)
         except ReveniumAPIError as e:
@@ -370,24 +528,9 @@ class AnomalyManager:
             if metric_type:
                 result_text += f"\n  • **Metric:** {metric_type}"
             if threshold is not None:
-                threshold_text = str(threshold)
-                if anomaly.get('isPercentage', False):
-                    threshold_text += "%"
+                threshold_text = _threshold_label(anomaly)
                 if operator_type:
-                    operator_mapping = {
-                        "GREATER_THAN": ">",
-                        "GREATER_THAN_OR_EQUAL_TO": "≥",
-                        "LESS_THAN": "<",
-                        "LESS_THAN_OR_EQUAL_TO": "≤",
-                        "EQUALS": "=",
-                        "NOT_EQUALS": "≠",
-                        # Refused on create/update, still stored on existing alerts.
-                        "EQUAL_TO": "=",
-                        "NOT_EQUAL_TO": "≠",
-                        "INCREASES_BY": "increases by",
-                        "DECREASES_BY": "decreases by",
-                    }
-                    operator_symbol = operator_mapping.get(operator_type, operator_type)
+                    operator_symbol = OPERATOR_LABELS.get(operator_type, operator_type)
                     result_text += f"\n  • **Threshold:** {operator_symbol} {threshold_text}"
                 else:
                     result_text += f"\n  • **Threshold:** {threshold_text}"
@@ -411,11 +554,11 @@ class AnomalyManager:
         return [TextContent(type="text", text=result_text)]
 
     def validate_anomaly_payload(self, anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate anomaly_data exactly as create_anomaly does, without creating.
+        """Validate the shape of anomaly_data, without converting or creating.
 
-        Single validation source for the live create path AND dry-run, so the
-        two can never diverge (a false-green dry-run tells the caller a create
-        will succeed when it will 400).
+        This is only the first step of a create. Previews and validation must call
+        prepare_create, which adds the detection_rules conversion and the short-period
+        refusal the create runs; this method alone approves payloads the create refuses.
 
         Returns:
             The validated/sanitized data dict.
@@ -462,6 +605,9 @@ class AnomalyManager:
                 InputValidator.validate_detection_rule(rule)
                 for rule in anomaly_data["detection_rules"]
             ]
+            if "is_percentage" in anomaly_data:
+                validated_data["is_percentage"] = self._percentage_flag(anomaly_data["is_percentage"])
+            validated_data.update(self._detection_rules_notification_targets(anomaly_data))
         elif self._has_direct_api_format(anomaly_data):
             # User provided direct API format - validate and use as-is
             validated_data.update(self._validate_direct_api_format(anomaly_data))
@@ -470,7 +616,7 @@ class AnomalyManager:
                 message="Either detection_rules or direct API format (alertType, metricType, operatorType, threshold) is required",
                 field="anomaly_data",
                 expected="Detection rules list OR direct API format fields",
-                suggestion="• For real-time monitoring: `create_threshold_alert(name='Alert', threshold=100, period_minutes=5)`\n"
+                suggestion="• For real-time monitoring: `create_threshold_alert(name='Alert', threshold=100, period_minutes=15)`\n"
                 "• For budget tracking: `create_cumulative_usage_alert(name='Budget', threshold=1000, period='monthly')`\n\n"
                 "**Or** provide all required fields: alertType, metricType, operatorType, threshold",
             )
@@ -495,27 +641,62 @@ class AnomalyManager:
 
         return validated_data
 
-    @handle_alert_tool_errors("create_anomaly")
-    async def create_anomaly(
-        self, client: ReveniumClient, anomaly_data: Dict[str, Any]
-    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Create a new AI anomaly with comprehensive validation.
+    @staticmethod
+    def _detection_rules_notification_targets(anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
+        """The recipients and Slack channels a detection_rules payload names, as lists."""
+        for field in ("notificationAddresses", "slackConfigurations", "slack_configurations"):
+            if field in anomaly_data and not isinstance(anomaly_data[field], list):
+                raise ValidationError(
+                    message=f"Invalid {field} value",
+                    field=field,
+                    value=type(anomaly_data[field]).__name__,
+                    expected="List/array",
+                )
+        targets: Dict[str, Any] = {}
+        if "notificationAddresses" in anomaly_data:
+            targets["notificationAddresses"] = anomaly_data["notificationAddresses"]
+        slack_configurations = [
+            *anomaly_data.get("slackConfigurations", []),
+            *anomaly_data.get("slack_configurations", []),
+        ]
+        slack_config_id = anomaly_data.get("slackConfigId")
+        if isinstance(slack_config_id, str) and slack_config_id.strip():
+            slack_configurations.append(slack_config_id.strip())
+        if slack_configurations:
+            targets["slackConfigurations"] = list(dict.fromkeys(slack_configurations))
+        return targets
 
-        Args:
-            client: Revenium API client
-            anomaly_data: Anomaly configuration data
+    @staticmethod
+    def _percentage_flag(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            return value.strip().lower() == "true"
+        raise ValidationError(
+            message=f"is_percentage must be true or false, got {value!r}",
+            field="is_percentage",
+            value=value,
+            expected="true or false",
+        )
 
-        Returns:
-            Formatted response with created anomaly details
+    def prepare_create(self, anomaly_data: Dict[str, Any], team_id: Optional[str]) -> Dict[str, Any]:
+        """The body a create would send, after every check and conversion the create runs.
+
+        Shared by create_anomaly and the validate / create dry-run preview, so a preview
+        cannot approve what the create refuses. Undecorated: refusals reach the caller as raised.
         """
-        logger.info(f"Creating anomaly: {anomaly_data.get('name', 'Unnamed') if isinstance(anomaly_data, dict) else 'Unnamed'}")
-
+        # Before the shape check, whose periodDuration list would otherwise answer
+        # TEN_MINUTES with an unflagged "invalid value" instead of the period rule.
+        if isinstance(anomaly_data, dict):
+            refuse_platform_rule_breach(anomaly_data)
         validated_data = self.validate_anomaly_payload(anomaly_data)
 
         # Convert to API format (only if we have detection_rules, otherwise use direct format)
         if "detection_rules" in validated_data:
             try:
                 api_data = InputValidator.convert_to_api_format(validated_data)
+            except ToolError:
+                raise
             except Exception as e:
                 raise ValidationError(
                     message=f"Failed to convert to API format: {str(e)}",
@@ -535,7 +716,7 @@ class AnomalyManager:
             if "label" not in api_data and "name" in validated_data:
                 api_data["label"] = validated_data["name"]
             if "teamId" not in api_data:
-                api_data["teamId"] = client.team_id
+                api_data["teamId"] = team_id
 
             # Set defaults for optional fields if not provided
             api_data.setdefault("enabled", True)
@@ -555,6 +736,27 @@ class AnomalyManager:
                 else:
                     api_data["periodDuration"] = "FIFTEEN_MINUTES"  # Safe default
 
+        # The detection_rules conversion picks the period from time_window (15m when blank).
+        refuse_platform_rule_breach(api_data)
+        return api_data
+
+    @handle_alert_tool_errors("create_anomaly")
+    async def create_anomaly(
+        self, client: ReveniumClient, anomaly_data: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Create a new AI anomaly with comprehensive validation.
+
+        Args:
+            client: Revenium API client
+            anomaly_data: Anomaly configuration data
+
+        Returns:
+            Formatted response with created anomaly details
+        """
+        logger.info(f"Creating anomaly: {anomaly_data.get('name', 'Unnamed') if isinstance(anomaly_data, dict) else 'Unnamed'}")
+
+        api_data = self.prepare_create(anomaly_data, client.team_id)
+
         # DEBUG: Log the final API data before sending to help troubleshoot JSON issues
         logger.debug(f"Final API data type: {type(api_data)}")
         logger.debug(f"Final API data keys: {list(api_data.keys()) if isinstance(api_data, dict) else 'Not a dict'}")
@@ -565,6 +767,7 @@ class AnomalyManager:
             created_anomaly = await client.create_anomaly(api_data)
         except Exception as e:
             logger.error(f"Failed to create anomaly: {e}")
+            await _refuse_unknown_slack_configuration(client, api_data, e, "created")
             # DEBUG: Log additional context for JSON format errors
             if "json" in str(e).lower() or "format" in str(e).lower():
                 logger.error(f"JSON format error context - API data was: {json.dumps(api_data, indent=2, default=str)}")
@@ -577,7 +780,7 @@ class AnomalyManager:
                     value="See debug logs for details",
                     suggestions=[
                         "Use convenience methods for easier setup:",
-                        "• create_threshold_alert(name='Alert', threshold=100, period_minutes=5)",
+                        "• create_threshold_alert(name='Alert', threshold=100, period_minutes=15)",
                         "• create_cumulative_usage_alert(name='Budget', threshold=1000, period='monthly')",
                         "Or ensure all required fields are provided:",
                         "• name (string): Descriptive alert name",
@@ -600,8 +803,8 @@ class AnomalyManager:
             f"**ID:** `{created_anomaly.get('id', 'N/A')}`\n"
             f"**Alert Type:** {created_anomaly.get('alertType', 'N/A')}\n"
             f"**Metric Type:** {created_anomaly.get('metricType', 'N/A')}\n"
-            f"**Operator:** {created_anomaly.get('operatorType', 'N/A')}\n"
-            f"**Threshold:** {created_anomaly.get('threshold', 'N/A')}\n"
+            f"**Operator:** {_operator_label(created_anomaly.get('operatorType', 'N/A'))}\n"
+            f"**Threshold:** {_threshold_label(created_anomaly)}\n"
             f"**Check Frequency:** {created_anomaly.get('periodDuration', 'N/A')}\n"
             f"**Enabled:** {'Yes' if created_anomaly.get('enabled', True) else 'No'}\n"
             f"**Created:** {created_anomaly.get('createdAt', created_anomaly.get('created', 'N/A'))}"
@@ -632,19 +835,13 @@ class AnomalyManager:
 
         return [TextContent(type="text", text=result_text)]
 
-    @handle_alert_tool_errors("update_anomaly")
-    async def update_anomaly(
+    async def prepare_update(
         self, client: ReveniumClient, anomaly_id: str, update_data: Dict[str, Any]
-    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Update an existing AI anomaly.
+    ) -> UpdatePlan:
+        """Read the stored alert and build the update body, running every check the update runs.
 
-        Args:
-            client: Revenium API client
-            anomaly_id: ID of the anomaly to update
-            update_data: Data to update
-
-        Returns:
-            Formatted response with updated anomaly details
+        Shared by update_anomaly and preview_update, so a preview cannot approve what the
+        update refuses. Left undecorated: refusals reach the caller's decorator unchanged.
         """
         # Validate anomaly ID
         anomaly_id = validate_anomaly_id(anomaly_id)
@@ -657,6 +854,9 @@ class AnomalyManager:
                 expected="Dictionary with update fields",
             )
 
+        refuse_unsupported_update_fields(update_data)
+        refuse_unknown_data_source(update_data)
+
         logger.info(f"Updating anomaly: {anomaly_id}")
 
         # Get current anomaly data first (like enable/disable operations do)
@@ -668,20 +868,15 @@ class AnomalyManager:
         # Handle field name conversions for user-friendly field names
         converted_updates: Dict[str, Any] = {}
         for key, value in update_data.items():
-            if key == "email":
-                # Convert 'email' to 'notificationAddresses'
-                if isinstance(value, str):
-                    converted_updates["notificationAddresses"] = [value]
-                elif isinstance(value, list):
-                    converted_updates["notificationAddresses"] = value
-                else:
-                    converted_updates["notificationAddresses"] = [str(value)]
-            elif key == "notification_addresses":
-                # Convert 'notification_addresses' to 'notificationAddresses'
-                converted_updates["notificationAddresses"] = value
-            elif key == "slackConfigId" or key == "slack_config_id":
+            if key in _RESOLVED_AFTER_CONVERSION or _changes_nothing(key, value):
+                continue
+            if key in _REQUIRED_UPDATE_FIELDS:
+                refuse_clearing_required_field(key, value)
+            if key == "slackConfigId" or key == "slack_config_id":
                 # Convert 'slackConfigId' or 'slack_config_id' to 'slackConfigurations' array
-                if isinstance(value, str):
+                if value is None:
+                    converted_updates["slackConfigurations"] = []
+                elif isinstance(value, str):
                     converted_updates["slackConfigurations"] = [value]
                 elif isinstance(value, list):
                     converted_updates["slackConfigurations"] = value
@@ -743,25 +938,44 @@ class AnomalyManager:
             elif key == "period_minutes":
                 # Convert 'period_minutes' to 'periodDuration' with proper mapping
                 period_mapping = {
-                    1: "ONE_MINUTE",
-                    5: "FIVE_MINUTES",
                     15: "FIFTEEN_MINUTES",
                     30: "THIRTY_MINUTES",
                     60: "ONE_HOUR",
                     720: "TWELVE_HOURS",
-                    1440: "TWENTY_FOUR_HOURS",
+                    1440: "DAILY",  # as create_threshold_alert maps it
                 }
                 try:
                     minutes = int(float(value))
+                    alert_type = str(
+                        update_data.get("alertType")
+                        or update_data.get("alert_type")
+                        or current_anomaly.get("alertType")
+                        or ""
+                    ).upper()
                     if minutes in period_mapping:
                         converted_updates["periodDuration"] = period_mapping[minutes]
-                    else:
+                    elif alert_type == "CUMULATIVE_USAGE":
+                        budget_periods = ", ".join(ordered_periods_for("CUMULATIVE_USAGE", None))
                         raise ValidationError(
-                            message=f"Invalid period_minutes value: {minutes}",
+                            message=(
+                                f"Invalid period_minutes value: {minutes}; a CUMULATIVE_USAGE "
+                                f"(budget) alert takes only {budget_periods}"
+                            ),
                             field="period_minutes",
                             value=value,
-                            expected=f"One of: {list(period_mapping.keys())} minutes",
-                            suggestion="Use standard intervals: 1, 5, 15, 30, 60, 720, 1440 minutes",
+                            expected=f"period as one of: {budget_periods.lower()}",
+                            suggestion="Send period (daily, weekly, monthly or quarterly) instead of period_minutes",
+                        )
+                    else:
+                        raise ValidationError(
+                            message=(
+                                f"Invalid period_minutes value: {minutes}; the platform "
+                                "requires FIFTEEN_MINUTES or longer"
+                            ),
+                            field="period_minutes",
+                            value=value,
+                            expected="One of: 15, 30, 60, 720, 1440 minutes",
+                            suggestion="Use standard intervals: 15, 30, 60, 720, 1440 minutes",
                         )
                 except (ValueError, TypeError):
                     raise ValidationError(
@@ -778,7 +992,9 @@ class AnomalyManager:
                     converted_updates["isPercentage"] = str(value).lower() in ["true", "1", "yes"]
             elif key == "trigger_after_persists_duration":
                 # Convert 'trigger_after_persists_duration' to 'triggerAfterPersistsDuration'
-                converted_updates["triggerAfterPersistsDuration"] = str(value)
+                converted_updates["triggerAfterPersistsDuration"] = (
+                    None if value is None or value == "" else str(value)
+                )
             elif key == "tracking_period":
                 # Convert 'tracking_period' to 'periodDuration' for CUMULATIVE_USAGE alerts
                 # Map user-friendly period names to API format
@@ -794,6 +1010,8 @@ class AnomalyManager:
                 else:
                     # Pass through as-is if already in API format
                     converted_updates["periodDuration"] = str(value)
+            elif key == "threshold":
+                converted_updates["threshold"] = _as_number(value)
             elif key == "webhook_configurations":
                 # Convert 'webhook_configurations' to 'webhookConfigurations'
                 converted_updates["webhookConfigurations"] = (
@@ -803,20 +1021,43 @@ class AnomalyManager:
                 # Pass through other fields as-is
                 converted_updates[key] = value
 
+        self._convert_recipients(update_data, converted_updates)
+        self._convert_period(update_data, converted_updates, current_anomaly)
+
         # Apply the converted updates to the current data
         merged_data.update(converted_updates)
 
-        # The platform refuses EQUAL_TO and NOT_EQUAL_TO on update exactly as it does
-        # on create, and a read-modify-write can resubmit one the caller never typed.
-        operator_note = self._check_update_operator(converted_updates, merged_data)
+        self._check_update_operator(converted_updates, merged_data)
 
-        # An update is a read-modify-write, so the outgoing body is the merged one: a
-        # groupBy added to a stored QUALITY_RATE rule, or a coverage floor moved onto a
-        # cost alert, is caught on the body the platform would receive.
-        self._reject_metric_rule_violation(merged_data)
+        # The platform checks the whole merged alert on every update, stored values included.
+        refuse_update_rule_breach(merged_data, current_anomaly, converted_updates)
 
-        # Call the API client method with merged data
-        updated_anomaly = await client.update_anomaly(anomaly_id, merged_data)
+        return UpdatePlan(anomaly_id, merged_data, converted_updates)
+
+    @handle_alert_tool_errors("update_anomaly")
+    async def update_anomaly(
+        self, client: ReveniumClient, anomaly_id: str, update_data: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Update an existing AI anomaly.
+
+        Args:
+            client: Revenium API client
+            anomaly_id: ID of the anomaly to update
+            update_data: Data to update
+
+        Returns:
+            Formatted response with updated anomaly details
+        """
+        plan = await self.prepare_update(client, anomaly_id, update_data)
+        anomaly_id = plan.anomaly_id
+
+        try:
+            updated_anomaly = await client.update_anomaly(anomaly_id, plan.body)
+        except Exception as e:
+            await _refuse_unknown_slack_configuration(client, plan.changes, e, "updated")
+            raise
+
+        await verify_update_applied(client, anomaly_id, plan.changes, updated_anomaly)
 
         result_text = (
             f"**AI Anomaly Updated Successfully**\n\n"
@@ -825,9 +1066,8 @@ class AnomalyManager:
             f"**Status:** {updated_anomaly.get('enabled', True) and 'Enabled' or 'Disabled'}\n"
             f"**Updated:** {updated_anomaly.get('updatedAt', updated_anomaly.get('updated', 'N/A'))}"
         )
-
-        if operator_note:
-            result_text += f"\n\n{operator_note}"
+        if updated_anomaly.get("periodDuration"):
+            result_text += f"\n**Check Frequency:** {updated_anomaly['periodDuration']}"
 
         # An update is the one call that can change the filters, so it confirms
         # them the way get and create do — through format_filter_row, or an IN row
@@ -843,6 +1083,53 @@ class AnomalyManager:
         result_text += notification_text
 
         return [TextContent(type="text", text=result_text)]
+
+    @handle_alert_tool_errors("preview_update")
+    async def preview_update(
+        self, client: ReveniumClient, anomaly_id: str, update_data: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Answer what update_anomaly would do with the same arguments, without sending it."""
+        plan = await self.prepare_update(client, anomaly_id, update_data)
+        validation_result = {
+            "dry_run": True,
+            "operation": "update_anomaly",
+            "valid": True,
+            "message": "**Dry Run Successful**: Update data is valid and ready for application",
+            "would_update": {"anomaly_id": plan.anomaly_id, "changes": plan.changes},
+        }
+        result_text = f"**DRY RUN MODE**\n\n{json.dumps(validation_result, indent=2)}"
+        return [TextContent(type="text", text=result_text)]
+
+    @staticmethod
+    def _convert_recipients(update_data: Dict[str, Any], converted_updates: Dict[str, Any]) -> None:
+        recipients = update_recipients(update_data)
+        if recipients is not None:
+            converted_updates["notificationAddresses"] = recipients
+
+    @staticmethod
+    def _convert_period(
+        update_data: Dict[str, Any],
+        converted_updates: Dict[str, Any],
+        current_anomaly: Dict[str, Any],
+    ) -> None:
+        if "period" not in update_data:
+            return
+        period_duration = resolve_update_period(
+            update_data["period"],
+            converted_updates.get("alertType", current_anomaly.get("alertType")),
+            converted_updates.get("dataSource", current_anomaly.get("dataSource")),
+        )
+        explicit = converted_updates.get("periodDuration")
+        if explicit is not None and explicit != period_duration:
+            raise create_structured_validation_error(
+                message=(
+                    f"period '{update_data['period']}' and periodDuration '{explicit}' disagree; "
+                    "send one of them. Nothing was updated."
+                ),
+                field="period",
+                value=update_data["period"],
+            )
+        converted_updates["periodDuration"] = period_duration
 
     @handle_alert_tool_errors("delete_anomaly")
     async def delete_anomaly(
@@ -887,11 +1174,12 @@ class AnomalyManager:
         """
         logger.info("Clearing all anomalies")
 
-        # Get all anomalies first
-        response = await client.get_anomalies(page=0, size=1000)
-        anomalies = client._extract_embedded_data(response)
+        # Read every page before deleting anything: deleting while paging shifts
+        # later rows onto pages already read.
+        inventory = await read_every_anomaly(client)
+        anomalies = inventory.anomalies
 
-        if not anomalies:
+        if not anomalies and inventory.complete:
             return [
                 TextContent(
                     type="text",
@@ -899,55 +1187,47 @@ class AnomalyManager:
                 )
             ]
 
-        # Delete each anomaly
+        # Delete each anomaly, keeping the platform's reason for every refusal
         deleted_count = 0
+        refusals: List[str] = []
         for anomaly in anomalies:
+            anomaly_id = anomaly.get("id")
+            if not anomaly_id:
+                refusals.append("Alert with no id: no id returned by the platform")
+                continue
             try:
-                anomaly_id = anomaly.get("id")
-                if anomaly_id:
-                    await client.delete_anomaly(anomaly_id)
-                    deleted_count += 1
+                await client.delete_anomaly(anomaly_id)
+                deleted_count += 1
             except Exception as e:
-                logger.warning(f"Failed to delete anomaly {anomaly.get('id')}: {e}")
+                logger.warning(f"Failed to delete anomaly {anomaly_id}: {e}")
+                label = alert_label(anomaly.get("name"), anomaly_id)
+                refusals.append(f"{label}: {_refusal_reason(e)}")
 
+        cleared_everything = inventory.complete and deleted_count == len(anomalies)
+        if deleted_count == 0:
+            heading = "Anomalies Not Cleared"
+        elif cleared_everything:
+            heading = "Anomalies Cleared Successfully"
+        else:
+            heading = "Anomalies Partly Cleared"
         result_text = (
-            f"✅ **Anomalies Cleared Successfully**\n\n"
-            f"**Deleted:** {deleted_count} anomalies\n"
+            f"**{heading}**\n\n"
+            f"**Deleted:** {deleted_count} of {inventory.total} anomalies\n"
             f"**Total Found:** {len(anomalies)}"
+        )
+        result_text += inventory.coverage_note(
+            "deletes were attempted" if deleted_count == 0 else "anomalies were deleted"
         )
 
         if deleted_count < len(anomalies):
-            result_text += f"\n\n⚠️ **Warning:** {len(anomalies) - deleted_count} anomalies could not be deleted."
+            result_text += f"\n\n**Warning:** {len(anomalies) - deleted_count} anomalies could not be deleted."
+        if refusals:
+            result_text += "\n\n**Not deleted:**\n" + "\n".join(refusals[:_REFUSALS_LISTED])
+            if len(refusals) > _REFUSALS_LISTED:
+                result_text += f"\n... and {len(refusals) - _REFUSALS_LISTED} more"
 
-        return [TextContent(type="text", text=result_text)]
-
-    @handle_alert_tool_errors("get_anomaly_metrics")
-    async def get_anomaly_metrics(
-        self, client: ReveniumClient, anomaly_id: str
-    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Get metrics for a specific anomaly.
-
-        Args:
-            client: Revenium API client
-            anomaly_id: ID of the anomaly
-
-        Returns:
-            Formatted response with anomaly metrics
-        """
-        # Validate anomaly ID
-        anomaly_id = validate_anomaly_id(anomaly_id)
-
-        logger.info(f"Getting metrics for anomaly: {anomaly_id}")
-
-        # Call the API client method
-        metrics = await client.get_anomaly_metrics(anomaly_id)
-
-        result_text = (
-            f"📊 **Anomaly Metrics**\n\n"
-            f"**Anomaly ID:** `{anomaly_id}`\n"
-            f"**Metrics:** {json.dumps(metrics, indent=2) if metrics else 'No metrics available'}"
-        )
-
+        if deleted_count == 0 and anomalies:
+            raise_refusal(result_text, error_code=ErrorCodes.API_ERROR)
         return [TextContent(type="text", text=result_text)]
 
     def _format_notification_summary(self, anomaly_data: Dict[str, Any]) -> str:
@@ -1058,23 +1338,11 @@ class AnomalyManager:
 
     def _check_update_operator(
         self, converted_updates: Dict[str, Any], merged_data: Dict[str, Any]
-    ) -> Optional[str]:
-        """Apply the platform's write-time operator gates to an update body.
+    ) -> None:
+        """Apply the platform's write-time operator gates to an operator the caller moved.
 
-        An update is a read-modify-write: the stored definition is fetched and PUT
-        back whole, so the outgoing body can carry an operator the caller never
-        mentioned. The two cases are treated differently on purpose:
-
-        - The caller supplied an operator. It gets the same gates create gets — the
-          accepted set (AIAnomalyService.getOperator) and the per-alert-type
-          narrowing (acceptedOperatorsFor) — and a refused value raises here rather
-          than becoming an avoidable HTTP 400.
-        - The body only carries what the platform itself stored. Blocking that would
-          make an alert created before the refusal impossible to rename, enable or
-          disable through the MCP. The call goes out and the caller is told what it
-          carried, which is returned here as a note for the result text.
-
-        Returns the note to append to the result, or ``None``.
+        A stored operator the platform no longer accepts is refused by
+        refuse_update_rule_breach, which names the stored value and the fix.
         """
         submitted = converted_updates.get("operatorType")
         if submitted is not None:
@@ -1091,17 +1359,10 @@ class AnomalyManager:
             stored = merged_data.get("operatorType")
             operator = str(stored).upper() if stored else ""
 
-        if not operator:
-            return None
-        if is_rejected_operator(operator):
-            # Stored by the platform before it stopped accepting the value.
-            return historical_operator_notice(operator)
-
-        # The per-type narrowing only has to be re-checked when the caller moved one
-        # of the two fields it relates; an untouched stored pairing is the platform's
-        # own and is left to the platform.
+        if not operator or is_rejected_operator(operator):
+            return
         if submitted is None and "alertType" not in converted_updates:
-            return None
+            return
         alert_type = str(merged_data.get("alertType") or "")
         allowed = accepted_operators_for(alert_type)
         if operator not in allowed:
@@ -1114,7 +1375,6 @@ class AnomalyManager:
                 value=operator,
                 expected=f"One of: {', '.join(allowed)}",
             )
-        return None
 
     def _validate_direct_api_format(self, anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
         """Validate and sanitize direct API format data."""
@@ -1221,19 +1481,7 @@ class AnomalyManager:
 
         # Validate optional fields
         optional_fields = {
-            "periodDuration": [
-                "ONE_MINUTE",
-                "FIVE_MINUTES",
-                "FIFTEEN_MINUTES",
-                "THIRTY_MINUTES",
-                "ONE_HOUR",
-                "TWELVE_HOURS",
-                "TWENTY_FOUR_HOURS",
-                "DAILY",
-                "WEEKLY",
-                "MONTHLY",
-                "QUARTERLY",
-            ],
+            "periodDuration": "platform_period",
             "isPercentage": "boolean",
             "enabled": "boolean",
             "notificationAddresses": "list",
@@ -1255,17 +1503,11 @@ class AnomalyManager:
             if field in processed_data:
                 value = processed_data[field]
 
-                if (
-                    field == "periodDuration"
-                    and isinstance(field_type, list)
-                    and value not in field_type
-                ):
-                    raise ValidationError(
-                        message="Invalid periodDuration value",
-                        field=field,
-                        value=value,
-                        expected=f"One of: {', '.join(field_type)}",
-                    )
+                if field_type == "platform_period":
+                    from .alert_periods import refuse_unaccepted_period  # noqa: PLC0415
+
+                    refuse_platform_rule_breach(processed_data)
+                    refuse_unaccepted_period(value)
                 elif field_type == "boolean" and not isinstance(value, bool):
                     raise ValidationError(
                         message=f"Invalid {field} value",

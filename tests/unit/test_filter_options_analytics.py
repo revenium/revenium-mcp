@@ -271,6 +271,73 @@ class TestNewlyPublishedDimensions:
         client.get.assert_not_called()
 
 
+class TestUsersFilterOptionsCostSources:
+    """The users list is drawn from the same cost sources as get_user_costs.
+
+    The platform's own default for the users list is coding_assistant only,
+    so without costSources a person with SDK-metered or provider-billed spend
+    is missing from the list the per-user report names (BACK-4690).
+    """
+
+    @staticmethod
+    def _engine(get_return):
+        from src.revenium_mcp_server.analytics.simple_analytics_engine import (
+            SimpleAnalyticsEngine,
+        )
+
+        client = MagicMock()
+        client.team_id = "team-abc"
+        client.get = AsyncMock(return_value=get_return)
+        return SimpleAnalyticsEngine(client), client
+
+    @pytest.mark.asyncio
+    async def test_users_list_asks_for_every_cost_source_by_default(self, flag_off):
+        analyzer, client = _make_analyzer(get_return=_envelope(["a@example.com"]))
+
+        await analyzer.get_analytics_filter_options("users", "THIRTY_DAYS")
+
+        assert client.get.call_args[0][0] == "/api/v2/analytics/filter-options/users"
+        params = client.get.call_args.kwargs["params"]
+        assert params.get("costSources") == [
+            "coding_assistant",
+            "revenium_metered",
+            "provider_billing",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_users_list_uses_the_cost_sources_the_caller_names(self, flag_off):
+        engine, client = self._engine(_envelope(["a@example.com"]))
+
+        text = await engine.get_filter_options(
+            dimension="users", filters={"costSources": ["provider_billing"]}
+        )
+
+        assert "a@example.com" in text
+        params = client.get.call_args.kwargs["params"]
+        assert params.get("costSources") == ["provider_billing"]
+
+    @pytest.mark.asyncio
+    async def test_other_dimensions_send_no_cost_sources(self, flag_off):
+        engine, client = self._engine(_envelope(["gpt-4o"]))
+
+        await engine.get_filter_options(dimension="models")
+
+        assert "costSources" not in client.get.call_args.kwargs["params"]
+
+    @pytest.mark.asyncio
+    async def test_cost_sources_on_another_dimension_is_refused(self, flag_off):
+        engine, client = self._engine(_envelope(["gpt-4o"]))
+
+        with pytest.raises(ValidationError) as exc_info:
+            await engine.get_filter_options(
+                dimension="models", filters={"costSources": ["provider_billing"]}
+            )
+
+        assert exc_info.value.field == "filters.costSources"
+        assert "users" in exc_info.value.message
+        client.get.assert_not_called()
+
+
 class TestFilterOptionsReviewHardening:
     """Review round: dimension-aware guidance, client-side paging, e2e plumbing."""
 
@@ -293,10 +360,40 @@ class TestFilterOptionsReviewHardening:
         assert "filters.agents" not in text
 
     @pytest.mark.asyncio
-    async def test_guidance_generic_for_unmapped_dimension(self):
-        engine = self._engine_with_values(["t1"])
-        text = await engine.get_filter_options(dimension="teams")
-        assert "filter arguments" in text
+    async def test_guidance_for_unfilterable_dimension_names_no_cost_filter(self):
+        engine = self._engine_with_values(["c1"])
+        text = await engine.get_filter_options(dimension="customers")
+        assert "on the cost actions" not in text
+        assert "No cost report filters by customers" in text
+        assert "get_user_costs" in text
+
+    @pytest.mark.asyncio
+    async def test_ai_provider_guidance_does_not_point_at_the_tool_provider_filter(self):
+        """AI provider names are not tool provider names, so they never steer the tool filter."""
+        engine = self._engine_with_values(["openai"])
+        text = await engine.get_filter_options(dimension="providers")
+        assert "manage_tools" not in text
+        assert "filters.providers on get_user_costs" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dimension", ["tool-providers", "tool_providers"])
+    async def test_tool_provider_guidance_names_the_tool_cost_filter(self, dimension):
+        engine = self._engine_with_values(["brave"])
+        text = await engine.get_filter_options(dimension=dimension)
+        assert "the provider argument on manage_tools get_cost_by_provider" in text
+        assert "No cost report filters by" not in text
+
+    @pytest.mark.asyncio
+    async def test_fallback_guidance_names_every_cost_filter_key(self):
+        from src.revenium_mcp_server.analytics.validation import AnalyticsValidator
+
+        engine = self._engine_with_values(["c1"])
+        text = await engine.get_filter_options(dimension="customers")
+        user_keys = AnalyticsValidator._USER_COSTS_FILTER_KEYS
+        agent_keys = AnalyticsValidator._AGENT_COSTS_FILTER_KEYS
+        user_part, agent_part = text.split("get_department_costs", 1)
+        assert all(key in user_part for key in user_keys)
+        assert all(key in agent_part for key in agent_keys)
 
     @pytest.mark.asyncio
     async def test_overflow_page_retrieves_next_slice(self):

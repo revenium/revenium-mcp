@@ -17,6 +17,10 @@ from ..common.error_handling import (
     create_structured_validation_error,
 )
 from ..introspection.metadata import ToolType
+from ..tools_decomposed.metering_elements_management import (
+    SOURCE_ASSIGNMENT_ACTION,
+    source_assignment_unsupported_error,
+)
 from .base_tool_registry import BaseToolRegistry
 from .shared_parameters import (
     AnalyticsQueryBuilder,
@@ -134,6 +138,9 @@ class AnalyticsRegistry(BaseToolRegistry):
         self, action: str, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Route analytics actions to appropriate handlers with STRICT security validation (≤25 lines)."""
+        if action == SOURCE_ASSIGNMENT_ACTION:
+            raise source_assignment_unsupported_error()
+
         # Get tool context if available
         tool_name = arguments.get("_tool_name")
 
@@ -169,7 +176,6 @@ class AnalyticsRegistry(BaseToolRegistry):
             "delete",
             "get_templates",
             "create_from_template",
-            "assign_to_source",
             "get_capabilities",
             "get_examples",
         ]
@@ -226,7 +232,6 @@ class AnalyticsRegistry(BaseToolRegistry):
             "delete",
             "get_templates",
             "create_from_template",
-            "assign_to_source",
         ]:
             return await self._handle_metering_elements_action(action, arguments)
 
@@ -500,7 +505,7 @@ class AnalyticsRegistry(BaseToolRegistry):
             elif tool_name == "manage_metering_elements":
                 response += """## **Metering Elements - Approved Actions Only**
 - list, get, create, update, delete
-- get_templates, create_from_template, assign_to_source
+- get_templates, create_from_template
 - get_capabilities, get_examples
 
 """
@@ -535,7 +540,7 @@ class AnalyticsRegistry(BaseToolRegistry):
 
 ## **Metering Elements**
 - list, get, create, update, delete
-- get_templates, create_from_template, assign_to_source
+- get_templates, create_from_template
 
 ## **Registry**
 - get_capabilities, get_examples

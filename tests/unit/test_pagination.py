@@ -133,6 +133,16 @@ class TestPaginationHelper:
         assert helper.cache is None
         assert helper.enable_cache is False
 
+    def test_format_paginated_response_text_hints_carry_page_size(self):
+        from src.revenium_mcp_server.models import PaginatedResponse
+
+        response = PaginatedResponse.create(
+            items=[{"id": "a"}], page=1, size=5, total=13
+        )
+        text = PaginationHelper().format_paginated_response_text(response, str)
+        assert "`page: 2, size: 5`" in text
+        assert "`page: 0, size: 5`" in text
+
     def test_build_query_params_basic(self):
         """Test building basic query parameters."""
         helper = PaginationHelper()

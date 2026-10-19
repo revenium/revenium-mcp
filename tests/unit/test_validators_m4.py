@@ -620,7 +620,7 @@ class TestConvertToApiFormat:
                     "metric": "error_rate",
                     "operator": ">",
                     "value": 0.05,
-                    "time_window": "5m",
+                    "time_window": "15m",
                 }
             ],
         }
@@ -634,7 +634,7 @@ class TestConvertToApiFormat:
         assert result["alertType"] == "THRESHOLD"
         assert result["operatorType"] == "GREATER_THAN"
         assert result["metricType"] == "ERROR_RATE"
-        assert result["periodDuration"] == "FIVE_MINUTES"
+        assert result["periodDuration"] == "FIFTEEN_MINUTES"
 
     def test_no_detection_rules_raises(self):
         with pytest.raises(ValidationError) as exc_info:
@@ -676,12 +676,12 @@ class TestConvertToApiFormat:
         assert any("token_count" in s for s in exc_info.value.suggestions)
 
     def test_invalid_metric_time_suggestion(self):
-        # When the metric contains "time", the error suggestions must mention tokens_per_second.
+        # When the metric contains "time", the error suggestions must mention tokens_per_minute.
         data = self._user_data()
         data["detection_rules"][0]["metric"] = "response_time"
         with pytest.raises(ValidationError) as exc_info:
             InputValidator.convert_to_api_format(data)
-        assert any("tokens_per_second" in s for s in exc_info.value.suggestions)
+        assert any("tokens_per_minute" in s for s in exc_info.value.suggestions)
 
     def test_cumulative_usage_with_monthly_period(self):
         data = self._user_data()
@@ -711,10 +711,12 @@ class TestConvertToApiFormat:
 
     def test_all_period_durations_mapped(self):
         period_map = {
-            "1m": "ONE_MINUTE",
-            "5m": "FIVE_MINUTES",
+            "15m": "FIFTEEN_MINUTES",
             "1h": "ONE_HOUR",
-            "1d": "ONE_DAY",
+            "24h": "DAILY",
+            "1d": "DAILY",
+            "7d": "WEEKLY",
+            "30d": "THIRTY_DAYS",
         }
         for short, expected in period_map.items():
             data = self._user_data()
@@ -769,7 +771,7 @@ class TestConvertToApiFormat:
             "total_cost": "TOTAL_COST",
             "token_count": "TOKEN_COUNT",
             "error_count": "ERROR_COUNT",
-            "requests_per_second": "REQUESTS_PER_SECOND",
+            "requests_per_minute": "REQUESTS_PER_MINUTE",
         }
         for metric, expected in metrics_map.items():
             data = self._user_data()

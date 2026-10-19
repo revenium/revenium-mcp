@@ -5,7 +5,7 @@ following the proven alert/source/customer/product/workflow/metering management 
 """
 
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -51,6 +51,48 @@ _ELEMENT_TYPE_DESCRIPTIONS = {
     "NUMBER": "numeric metric (cost, weight, duration, count)",
     "STRING": "string identifier or category",
 }
+
+
+SOURCE_ASSIGNMENT_ACTION = "assign_to_source"
+
+OVERRIDES_READERS = ("create_from_template",)
+
+# The platform API declares no operation that assigns elements to a source;
+# the links are the writeOnly `meteringElementDefinitionIds` field of the
+# source itself (SourceResource_Write in specs/openapi/hypercurrent.json).
+# A source read never returns that field; its current links are only readable
+# as `meteringElementDefinitions[].id`, and an update replaces the whole list.
+_SOURCE_LINK_GUIDANCE = (
+    "Link metering elements to a source through manage_sources: "
+    "source_data.meteringElementDefinitionIds REPLACES the source's links, so "
+    "read the source first (manage_sources action='get') and send the IDs already "
+    "in its meteringElementDefinitions[].id together with the new element IDs, "
+    "with action='update' (or action='create' for a new source)."
+)
+
+_SOURCE_LINK_EXAMPLE = (
+    'manage_sources(action="update", source_id="<source id>", '
+    'source_data={"meteringElementDefinitionIds": '
+    '["<existing id from meteringElementDefinitions[].id>", "<new element id>"]})'
+)
+
+
+def source_assignment_unsupported_error() -> ToolError:
+    return ToolError(
+        message=(
+            f"'{SOURCE_ASSIGNMENT_ACTION}' is not available: the platform has no operation "
+            f"that assigns metering elements to a source, so nothing was assigned. "
+            f"{_SOURCE_LINK_GUIDANCE}"
+        ),
+        error_code=ErrorCodes.BUSINESS_RULE_VIOLATION,
+        field="action",
+        value=SOURCE_ASSIGNMENT_ACTION,
+        suggestions=[_SOURCE_LINK_GUIDANCE],
+        examples={
+            "read_current_links": 'manage_sources(action="get", source_id="<source id>")',
+            "link_elements": _SOURCE_LINK_EXAMPLE,
+        },
+    )
 
 
 class MeteringElementsManager:
@@ -199,19 +241,22 @@ class MeteringElementsManager:
 
         return response
 
-    async def create_from_template(
-        self, client: ReveniumClient, arguments: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Create metering element from template."""
+    def resolve_template(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolve the template named in `arguments`, with any overrides applied.
+
+        Shared by the real create and its dry run so both refuse a missing or
+        unknown template identically.
+        """
         template_name = arguments.get("template_name")
+        example = next(iter(self.element_templates))
         if not template_name:
             raise create_structured_missing_parameter_error(
                 parameter_name="template_name",
                 action="create_from_template",
                 examples={
-                    "usage": 'create_from_template(template_name="api_usage")',
+                    "usage": f'create_from_template(template_name="{example}")',
                     "available_templates": list(self.element_templates.keys()),
-                    "example_call": 'create_from_template(template_name="token_counter")',
+                    "example_call": f'create_from_template(template_name="{example}")',
                 },
             )
 
@@ -228,7 +273,7 @@ class MeteringElementsManager:
                 ],
                 examples={
                     "available_templates": available_templates,
-                    "usage": 'create_from_template(template_name="api_usage")',
+                    "usage": f'create_from_template(template_name="{example}")',
                     "get_templates": "get_templates() to see all options",
                 },
             )
@@ -238,15 +283,21 @@ class MeteringElementsManager:
         # Apply any overrides
         overrides = arguments.get("overrides", {})
         template.update(overrides)
+        return template
+
+    async def create_from_template(
+        self, client: ReveniumClient, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Create metering element from template."""
+        template = self.resolve_template(arguments)
 
         # Use the client's dedicated method for metering element definitions
         response = await client.create_metering_element_definition(template)
         return response
 
-    async def update_element(
-        self, client: ReveniumClient, arguments: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Update existing metering element using PartialUpdateHandler."""
+    @staticmethod
+    def _require_update_arguments(arguments: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """The element id and the changes an update needs, or a refusal naming the missing one."""
         element_id = arguments.get("element_id")
         element_data = arguments.get("element_data", {})
 
@@ -274,6 +325,38 @@ class MeteringElementsManager:
                     "note": "Partial updates preserve existing element configuration while changing specific fields",
                 },
             )
+        return element_id, element_data
+
+    async def preview_update(
+        self, client: ReveniumClient, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Read the element and return the body update_element would send, sending nothing."""
+        element_id, element_data = self._require_update_arguments(arguments)
+        if not hasattr(self, "update_handler"):
+            raise ToolError(
+                message=(
+                    "An update preview needs a platform client to read the element; "
+                    "nothing was sent"
+                ),
+                error_code=ErrorCodes.TOOL_ERROR,
+            )
+        payload = await self.update_handler.build_update_payload(
+            resource_id=element_id,
+            partial_data=element_data,
+            config=self.update_config_factory.get_config("metering_elements"),
+            action_context="update metering element",
+        )
+        return {
+            "element_id": element_id,
+            "changes": element_data,
+            "body": client.prepare_metering_element_update_body(payload),
+        }
+
+    async def update_element(
+        self, client: ReveniumClient, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Update existing metering element using PartialUpdateHandler."""
+        element_id, element_data = self._require_update_arguments(arguments)
 
         # Use PartialUpdateHandler if available, otherwise fall back to direct client call
         if hasattr(self, "update_handler") and hasattr(self, "update_config_factory"):
@@ -322,40 +405,6 @@ class MeteringElementsManager:
             "templates": self.element_templates,
             "total": len(self.element_templates),
         }
-
-
-
-    async def assign_to_source(
-        self, client: ReveniumClient, arguments: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Assign metering elements to a source."""
-        source_id = arguments.get("source_id")
-        element_ids = arguments.get("element_ids", [])
-
-        if not source_id:
-            raise create_structured_missing_parameter_error(
-                parameter_name="source_id",
-                action="assign_to_source",
-                examples={
-                    "usage": 'assign_to_source(source_id="src_123", element_ids=["elem_456"])',
-                    "valid_format": "Source ID should be a string identifier",
-                    "example_ids": ["src_123", "api_source", "stream_source"],
-                },
-            )
-        if not element_ids:
-            raise create_structured_missing_parameter_error(
-                parameter_name="element_ids",
-                action="assign_to_source",
-                examples={
-                    "usage": 'assign_to_source(source_id="src_123", element_ids=["elem_456", "elem_789"])',
-                    "valid_format": "Element IDs should be a list of string identifiers",
-                    "example_ids": ['["elem_456", "elem_789"]', '["usage_counter"]'],
-                },
-            )
-
-        # This would typically involve API calls to assign elements to sources
-        # For now, return a success response
-        return {"source_id": source_id, "assigned_elements": element_ids, "status": "assigned"}
 
 
 class MeteringElementsValidator:
@@ -492,14 +541,6 @@ class MeteringElementsManagement(ToolBase):
                     "type": "integer",
                     "description": "Page size for pagination (default: 20)",
                 },
-
-                # Source assignment
-                "source_id": {"type": "string", "description": "Source ID for element assignment"},
-                "element_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of element IDs for source assignment",
-                },
                 # Utility parameters
                 "dry_run": {
                     "type": "boolean",
@@ -518,6 +559,8 @@ class MeteringElementsManagement(ToolBase):
         ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle metering elements management actions."""
+        if action == SOURCE_ASSIGNMENT_ACTION:
+            raise source_assignment_unsupported_error()
         try:
             client = await self.get_client(ctx=ctx)
             # Initialize elements manager with client for PartialUpdateHandler support
@@ -572,7 +615,6 @@ class MeteringElementsManagement(ToolBase):
                     next_steps=[
                         "Use 'update' action to modify this element",
                         "Use 'delete' action to remove this element",
-                        "Use 'assign_to_source' to connect to data sources",
                     ],
                 )
             elif action == "create":
@@ -634,7 +676,6 @@ class MeteringElementsManagement(ToolBase):
                     data=result,
                     next_steps=[
                         f"Use 'get' action with element_id='{result.get('id')}' to view details",
-                        "Use 'assign_to_source' to connect to data sources",
                         "Use 'update' action to modify the element",
                     ],
                     action="create",
@@ -643,6 +684,8 @@ class MeteringElementsManagement(ToolBase):
                 # Handle dry_run mode for template creation
                 dry_run = arguments.get("dry_run", False)
                 if dry_run:
+                    # Refuse a missing or unknown template exactly as the real create does
+                    elements_manager.resolve_template(arguments)
                     template_name = arguments.get("template_name")
                     return [
                         TextContent(
@@ -677,7 +720,6 @@ class MeteringElementsManagement(ToolBase):
                     message = f"Metering element created from template '{template_name}'"
                     next_steps = [
                         f"Use 'get' action with element_id='{element_id}' to view details",
-                        "Use 'assign_to_source' to connect to data sources",
                         "Use 'update' action to modify the element",
                     ]
 
@@ -691,14 +733,15 @@ class MeteringElementsManagement(ToolBase):
                 # Handle dry_run mode for update operations
                 dry_run = arguments.get("dry_run", False)
                 if dry_run:
-                    element_id = arguments.get("element_id")
-                    element_data = arguments.get("element_data", {})
+                    preview = await elements_manager.preview_update(client, arguments)
                     return [
                         TextContent(
                             type="text",
                             text=f"🧪 **DRY RUN MODE - Element Update**\n\n"
-                            f"✅ **Would update element:** {element_id}\n"
-                            f"**Changes:** {json.dumps(element_data, indent=2)}\n\n"
+                            f"✅ **Would update element:** {preview['element_id']}\n"
+                            f"**Changes:** {json.dumps(preview['changes'], indent=2, default=str)}\n\n"
+                            f"**Body the update would send:**\n"
+                            f"{json.dumps(preview['body'], indent=2, default=str)}\n\n"
                             f"**Dry Run:** True (no actual update performed)",
                         )
                     ]
@@ -711,7 +754,6 @@ class MeteringElementsManagement(ToolBase):
                     next_steps=[
                         f"Use 'get' action with element_id='{result.get('id')}' to view updated details",
                         "Use 'list' action to see all elements",
-                        "Use 'assign_to_source' if element needs to be connected to data sources",
                     ],
                     action="update",
                 )
@@ -751,18 +793,6 @@ class MeteringElementsManagement(ToolBase):
                     )
                 ]
 
-            elif action == "assign_to_source":
-                result = await elements_manager.assign_to_source(client, arguments)
-                # Format assignment response consistently
-                return self.formatter.format_success_response(
-                    message="Elements assigned to source successfully",
-                    data=result,
-                    next_steps=[
-                        "Use 'get_source_elements' to verify assignment",
-                        "Elements are now available for use in products",
-                    ],
-                    action="assign_to_source",
-                )
             elif action == "validate":
                 result = await self.validator.validate_element(arguments)
                 # Format validation response consistently
@@ -799,11 +829,13 @@ class MeteringElementsManagement(ToolBase):
                             "get_examples",
                             "get_agent_summary",
                         ],
-                        "integration_actions": ["assign_to_source", "validate"],
+                        "integration_actions": ["validate"],
                         "example_usage": {
                             "list_elements": "list(page=0, size=10)",
-                            "create_from_template": "create_from_template(template_name='totalCost')",
-                            "assign_to_source": "assign_to_source(source_id='src_123', element_ids=['elem_456'])",
+                            "create_from_template": (
+                                f"create_from_template(template_name="
+                                f"'{next(iter(elements_manager.element_templates))}')"
+                            ),
                         },
                     },
                 )
@@ -868,13 +900,13 @@ class MeteringElementsManagement(ToolBase):
 - **Billing component definitions** that specify what metrics to track for customer pricing
 - **Usage measurement schemas** that define data types, units, and default values for billing
 - **Product pricing building blocks** that connect customer usage to subscription costs
-- **Configuration templates** for common billing scenarios (API calls, storage, compute time)
+- **Configuration templates**: three shipping templates, `shippingCost`, `shippingWeight` and `shippingContainerId`
 
 ### **Key Concepts**
 - **Elements** define billing metrics (API calls, data transfer, compute hours, etc.)
 - **Types** specify data format (NUMBER for quantities, STRING for identifiers)
 - **Templates** provide pre-built elements for common billing scenarios
-- **Source Assignment** connects elements to data collection points for customer billing
+- **Source links** live on the source: `meteringElementDefinitionIds` in `source_data` with `manage_sources` REPLACES the source's links, so read the source first and send its existing `meteringElementDefinitions[].id` values plus the new ones
 
 ## **Quick Start Commands**
 
@@ -897,7 +929,6 @@ validate(element_data={...})                   # Test before creating
 ```bash
 update(element_id="elem_123", element_data={...}) # Update existing
 delete(element_id="elem_123")                     # Remove element
-assign_to_source(source_id="src_123", element_ids=["elem_456"]) # Connect to sources
 ```"""
 
         # Element Types — prefer UCM, fall back to the canonical Revenium element-type
@@ -928,10 +959,8 @@ assign_to_source(source_id="src_123", element_ids=["elem_456"]) # Connect to sou
         else:
             # Fallback to basic templates
             text += "\n\n## **Available Templates**\n"
-            text += "- **shippingCost** - Shipping cost tracking (NUMBER, USD)\n"
-            text += "- **shippingWeight** - Package weight tracking (NUMBER, kg)\n"
-            text += "- **shippingContainerId** - Container identifier (STRING, text)\n"
-            text += "- **requestDuration** - Request duration tracking (NUMBER, milliseconds)\n"
+            for name, info in MeteringElementsManager().element_templates.items():
+                text += f"- **{name}** - {info['description']} ({info['type']})\n"
 
 
 
@@ -967,13 +996,12 @@ assign_to_source(source_id="src_123", element_ids=["elem_456"]) # Connect to sou
 ## **Business Rules**
 - Element names must be unique within your organization
 - Type cannot be changed after creation (NUMBER vs STRING)
-- Elements must be assigned to sources before use in products
 - Template-based elements inherit predefined configurations
 
 ## **Next Steps**
 1. Use `get_templates()` to see available element templates
 2. Use `create_from_template(template_name='shippingCost')` for quick setup
-3. Use `assign_to_source(source_id='...', element_ids=['...'])` to connect to data sources"""
+3. Link elements to a source with `manage_sources`: read the source, then update `meteringElementDefinitionIds` in `source_data` with its existing `meteringElementDefinitions[].id` values plus the new ones (the list replaces the source's links)"""
 
         return text
 
@@ -1079,28 +1107,20 @@ assign_to_source(source_id="src_123", element_ids=["elem_456"]) # Connect to sou
                 "}\n"
                 "```\n\n"
 
-                "## **Source Integration**\n\n"
-                "### **Assign Elements to Source (Dynamic ID Pattern)**\n"
+                "## **Linking Elements to a Source**\n\n"
+                "Links are stored on the source, not on the element. The source's\n"
+                "`meteringElementDefinitionIds` REPLACES its links, and a source read\n"
+                "returns them only as `meteringElementDefinitions[].id`, so send the\n"
+                "existing IDs together with the new ones:\n\n"
                 "```bash\n"
-                "# Step 1: List sources to get real source IDs\n"
-                'manage_sources(action="list")\n'
-                "# Copy a source ID from results\n"
-                "\n"
-                "# Step 2: List elements to get real element IDs\n"
+                "# Step 1: List elements to get real element IDs\n"
                 "list()\n"
-                "# Copy element IDs you want to assign\n"
                 "\n"
-                "# Step 3: Assign elements to source using real IDs\n"
-                'assign_to_source(source_id="COPIED_SOURCE_ID", element_ids=["COPIED_ELEMENT_ID_1", "COPIED_ELEMENT_ID_2"])\n'
-                "```\n\n"
-                "### **Get Elements for Source (Dynamic ID Pattern)**\n"
-                "```bash\n"
-                "# Step 1: List sources to get real source ID\n"
-                'manage_sources(action="list")\n'
-                "# Copy a source ID from results\n"
+                "# Step 2: Read the source and copy the IDs in meteringElementDefinitions[].id\n"
+                'manage_sources(action="get", source_id="COPIED_SOURCE_ID")\n'
                 "\n"
-                "# Step 2: Get elements assigned to that source\n"
-                'get_source_elements(source_id="COPIED_SOURCE_ID")\n'
+                "# Step 3: Update the source with the existing IDs plus the new ones\n"
+                'manage_sources(action="update", source_id="COPIED_SOURCE_ID", source_data={"meteringElementDefinitionIds": ["EXISTING_ELEMENT_ID", "COPIED_ELEMENT_ID_1"]})\n'
                 "```\n\n"
                 "## **Validation Examples**\n\n"
                 "### **Validate Element Before Creation**\n"
@@ -1131,15 +1151,12 @@ assign_to_source(source_id="src_123", element_ids=["elem_456"]) # Connect to sou
                 'create_from_template(template_name="shippingWeight")\n'
                 '# Returns: {"id": "By832y8", "name": "shippingWeight", "type": "NUMBER"}\n'
                 '# ✅ COPY THE REAL ID: "By832y8"\n\n'
-                "# 3. List sources to get real source ID\n"
-                'manage_sources(action="list")\n'
-                '# Copy a source ID from results (e.g., "src_abc789")\n\n'
-                "# 4. Assign elements to source using REAL IDs\n"
-                'assign_to_source(source_id="COPIED_SOURCE_ID", element_ids=["3ByPx16", "By832y8"])\n'
-                '# Returns: {"assigned": true, "source_id": "COPIED_SOURCE_ID", "element_count": 2}\n\n'
-                "# 5. Verify assignment using REAL source ID\n"
-                'get_source_elements(source_id="COPIED_SOURCE_ID")\n'
-                "# Returns: List of assigned elements with their configurations\n"
+                "# 3. Read the source; copy the IDs in meteringElementDefinitions[].id\n"
+                'manage_sources(action="get", source_id="COPIED_SOURCE_ID")\n'
+                '# Returns: {"meteringElementDefinitions": [{"id": "Ax71k2q", ...}], ...}\n\n'
+                "# 4. Update the source with the existing IDs plus the new ones\n"
+                "#    (the list REPLACES the source's links)\n"
+                'manage_sources(action="update", source_id="COPIED_SOURCE_ID", source_data={"meteringElementDefinitionIds": ["Ax71k2q", "3ByPx16", "By832y8"]})\n'
                 "\n"
                 "# 🔄 IMPORTANT: Always use list() first to get real IDs\n"
                 "# ⚠️ NEVER hardcode IDs - they are unique per account\n"
@@ -1161,17 +1178,17 @@ assign_to_source(source_id="src_123", element_ids=["elem_456"]) # Connect to sou
                 "for usage-based pricing in customer subscriptions and products.\n\n"
                 "**Key Features:**\n"
                 "• **CRUD Operations**: Create, read, update, delete metering element definitions\n"
-                "• **Template Support**: 6+ predefined templates for common billing metrics\n"
-                "• **Source Assignment**: Connect elements to data sources for collection\n"
+                f"• **Template Support**: {len(MeteringElementsManager().element_templates)} predefined shipping templates (get_templates)\n"
                 "• **Validation**: Comprehensive data validation and error handling\n"
-                "• **Template Organization**: 4 predefined templates for common billing scenarios\n"
                 "• **Dynamic IDs**: Always use list() first to get real IDs - never hardcode\n\n"
                 "**Use Cases**: Product pricing setup, subscription billing, usage tracking definitions\n\n"
                 "**Quick Start:**\n"
                 "1. Use `get_templates()` to see available metering element templates\n"
                 "2. Create with `create_from_template(template_name='shippingCost')`\n"
                 "3. List with `list()` to view all your metering elements\n"
-                "4. Assign with `assign_to_source(source_id='src_123', element_ids=['elem_456'])`",
+                "4. Link to a source with `manage_sources`: read the source, then update "
+                "`meteringElementDefinitionIds` in `source_data` with its existing "
+                "`meteringElementDefinitions[].id` values plus the new ones (the list replaces the source's links)",
             )
         ]
 
@@ -1209,14 +1226,6 @@ assign_to_source(source_id="src_123", element_ids=["elem_456"]) # Connect to sou
                     "create_from_template(template_name='shippingCost')",
                 ],
             ),
-            ToolCapability(
-                name="Source Assignment",
-                description="Assign metering elements to data sources for customer usage collection and pricing calculations",
-                parameters={"assign_to_source": {"source_id": "str", "element_ids": "list"}},
-                examples=[
-                    "assign_to_source(source_id='src_123', element_ids=['elem_456', 'elem_789'])"
-                ],
-            ),
         ]
 
     async def _get_supported_actions(self) -> List[str]:
@@ -1229,8 +1238,6 @@ assign_to_source(source_id="src_123", element_ids=["elem_456"]) # Connect to sou
             "update",
             "delete",
             "get_templates",
-
-            "assign_to_source",
             "validate",
             "get_capabilities",
             "get_examples",

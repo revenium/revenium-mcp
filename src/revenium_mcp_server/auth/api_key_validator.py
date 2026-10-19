@@ -16,6 +16,7 @@ from loguru import logger
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from ..client import get_shared_http_client
+from ..platform_lockout import lockout_message, platform_lockouts, stated_wait_seconds
 
 DEFAULT_CACHE_TTL_SECONDS = 30
 _CACHE_MAXSIZE = 10_000
@@ -28,6 +29,14 @@ _INVALID_KEY_MESSAGE = "API key is invalid, revoked, or unknown"
 
 class ApiKeyValidationError(Exception):
     """Base class for all API-key validation failures."""
+
+
+class PlatformLockoutValidationError(ApiKeyValidationError):
+    """The platform asked this key to wait (HTTP 429) before its next request."""
+
+    def __init__(self, wait_seconds: int) -> None:
+        super().__init__(lockout_message(wait_seconds))
+        self.wait_seconds = wait_seconds
 
 
 class InvalidTokenError(ApiKeyValidationError):
@@ -123,6 +132,7 @@ class ApiKeyValidator:
                 "management surface"
             )
 
+        self._refuse_inside_a_platform_wait(token)
         key = _cache_key(token)
         # Fast path: cache hits return concurrently without the lock.
         cached: ApiKeyIdentity | None = self._cache.get(key)
@@ -155,11 +165,17 @@ class ApiKeyValidator:
                 async with self._inflight_guard:
                     self._inflight_locks.pop(key, None)
 
+    def _refuse_inside_a_platform_wait(self, token: str) -> None:
+        seconds_left = platform_lockouts.remaining(token, self._base_url)
+        if seconds_left is not None:
+            raise PlatformLockoutValidationError(seconds_left)
+
     async def _fetch(
         self,
         token: str,
         scope: Literal["WRITE", "READ", "METERING", "UNKNOWN"],
     ) -> ApiKeyIdentity:
+        self._refuse_inside_a_platform_wait(token)
         client = get_shared_http_client()
         try:
             resp = await client.get(
@@ -216,6 +232,12 @@ class ApiKeyValidator:
                 raise ApiKeyValidationError(
                     "Malformed /users/me response from platform"
                 ) from exc
+        if status == 429:
+            wait = stated_wait_seconds(resp.headers, resp.text)
+            if wait is not None:
+                logger.info("API-key validation 429 for key_fingerprint={}", fp)
+                platform_lockouts.record(token, self._base_url, wait)
+                raise PlatformLockoutValidationError(wait)
         if status == 401:
             # Defensive branch: the live platform rejects unrecognized keys with
             # 403 (see below), never 401. Classifying 401 identically means the

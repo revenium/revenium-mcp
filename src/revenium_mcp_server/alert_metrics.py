@@ -82,8 +82,6 @@ METRIC_BUCKETS: Dict[str, Tuple[str, ...]] = {
     "performance_metrics": (
         "TOKENS_PER_MINUTE",
         "REQUESTS_PER_MINUTE",
-        "TOKENS_PER_SECOND",
-        "REQUESTS_PER_SECOND",
     ),
     "quality_metrics": (
         "ERROR_RATE",
@@ -202,7 +200,7 @@ def _check_min_sample_count(payload: Mapping[str, Any]) -> Optional[MetricRuleVi
 
     value = payload["minSampleCount"]
     if value is None:
-        # Explicitly null is what the platform reads as "use the safety floor".
+        # Null sets no floor: a create stores none, and an update keeps the stored one.
         return None
 
     metric_type = payload.get("metricType")
@@ -244,9 +242,11 @@ def check_metric_rules(payload: Mapping[str, Any]) -> Optional[MetricRuleViolati
     """The first metric prerequisite ``payload`` breaks, or ``None`` when it breaks none.
 
     ``payload`` is an alert body in API shape (``metricType``, ``alertType``, ``groupBy``,
-    ``filters``, ``minSampleCount``). Every rule mirrors
-    ``AIAnomalyService.validateQualityRateRule``, so a rejection here is one the platform
-    would have issued anyway — just earlier, and with the prerequisite spelled out.
+    ``filters``, ``minSampleCount``). The QUALITY_RATE rules mirror
+    ``AIAnomalyService.validateQualityRateRule``, so those rejections are ones the platform
+    would have issued anyway, just earlier and with the prerequisite spelled out. The
+    minSampleCount check is deliberately stricter than the platform, which stores the
+    value on any other metric and never reads it.
 
     Nothing here validates the metric name itself: an unrecognised metric passes straight
     through to the platform.

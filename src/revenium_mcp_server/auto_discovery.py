@@ -12,12 +12,30 @@ import httpx
 from loguru import logger
 
 from .constants import DEFAULT_BASE_URL
+from .platform_lockout import lockout_message, platform_lockouts, stated_wait_seconds
+
+
+def email_from_user_profile(user_data: Dict) -> Optional[str]:
+    """The /users/me email: the platform returns it as the user's label, some shapes as email."""
+    for key in ("email", "label"):
+        value = user_data.get(key)
+        if isinstance(value, str) and "@" in value:
+            return value
+    return None
 
 
 class AutoDiscoveryError(Exception):
     """Exception raised during auto-discovery process."""
 
     pass
+
+
+class DiscoveryLockedOutError(AutoDiscoveryError):
+    """The platform answered HTTP 429; ``wait_seconds`` is None when it stated no wait."""
+
+    def __init__(self, wait_seconds: Optional[int]) -> None:
+        super().__init__(lockout_message(wait_seconds))
+        self.wait_seconds = wait_seconds
 
 
 class AutoDiscoveryService:
@@ -45,6 +63,10 @@ class AutoDiscoveryService:
         """
         logger.info("Auto-discovering Revenium configuration from API...")
 
+        seconds_left = platform_lockouts.remaining(self.api_key, self.base_url)
+        if seconds_left is not None:
+            raise DiscoveryLockedOutError(seconds_left)
+
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 # Call /users/me endpoint
@@ -54,6 +76,11 @@ class AutoDiscoveryService:
                 )
 
                 # Handle different response codes
+                if response.status_code == 429:
+                    wait = stated_wait_seconds(response.headers, response.text)
+                    if wait is not None:
+                        platform_lockouts.record(self.api_key, self.base_url, wait)
+                    raise DiscoveryLockedOutError(wait)
                 if response.status_code == 401:
                     raise AutoDiscoveryError(
                         "Invalid API key. Please check your REVENIUM_API_KEY and try again."
@@ -139,9 +166,8 @@ class AutoDiscoveryService:
             raise AutoDiscoveryError("Invalid team data found. Please contact support.")
         config["REVENIUM_TEAM_ID"] = team_id
 
-        # Extract default email if available
-        user_email = user_data.get("label")  # User label is typically the email
-        if user_email and "@" in user_email:
+        user_email = email_from_user_profile(user_data)
+        if user_email:
             config["REVENIUM_DEFAULT_EMAIL"] = user_email
 
         return config

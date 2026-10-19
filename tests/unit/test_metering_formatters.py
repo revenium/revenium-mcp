@@ -14,6 +14,7 @@ Covers:
 - _format_subscriber_details
 """
 
+import pytest
 
 from src.revenium_mcp_server.tools_decomposed.metering_management import (
     _CACHE_TOKEN_FIELDS,
@@ -185,6 +186,26 @@ class TestFormatPerformanceMetrics:
     def test_no_perf_fields_returns_empty(self):
         result = self.mm._format_performance_metrics({"model": "gpt-4"})
         assert result == ""
+
+    def test_zero_metrics_are_shown_not_hidden(self):
+        result = self.mm._format_performance_metrics(
+            {"requestDuration": 0, "timeToFirstToken": 0, "tokensPerMinute": 0.0}
+        )
+        assert "Performance Metrics" in result
+        assert "**Duration**: 0ms" in result
+        assert "**Time to First Token**: 0ms" in result
+        assert "**Tokens per Minute**: 0" in result
+
+    def test_zero_time_to_first_token_shown_beside_duration(self):
+        result = self.mm._format_performance_metrics(
+            {"requestDuration": 2500, "timeToFirstToken": 0}
+        )
+        assert "**Duration**: 2500ms" in result
+        assert "**Time to First Token**: 0ms" in result
+        assert "Tokens per Minute" not in result
+
+    def test_null_metric_still_returns_empty(self):
+        assert self.mm._format_performance_metrics({"requestDuration": None}) == ""
 
 
 # ===========================================================================
@@ -887,6 +908,29 @@ class TestCacheTokenRendering:
         """The cache section belongs to the full detail rendering only."""
         result = self.mm._format_transaction_summary(CACHE_TRANSACTION_FULL)
         assert "Cache" not in result
+
+
+class TestReasoningTokenRendering:
+    """BACK-4794: the reasoning count renders, and an absent one never as 0."""
+
+    def setup_method(self):
+        self.mm = make_mm()
+
+    def test_zero_renders(self):
+        result = self.mm._format_full_transaction_details({"reasoningTokenCount": 0})
+        assert "- **Reasoning Tokens**: 0\n" in result
+
+    @pytest.mark.parametrize("data", [{}, {"reasoningTokenCount": None}])
+    def test_absent_renders_nothing(self, data):
+        result = self.mm._format_full_transaction_details(data)
+        assert "Reasoning Tokens" not in result
+
+    def test_summary_row_is_unchanged(self):
+        data = {**FULL_TRANSACTION, "reasoningTokenCount": 100}
+        assert self.mm._format_transaction_summary(
+            data
+        ) == self.mm._format_transaction_summary(FULL_TRANSACTION)
+        assert "Reasoning" not in self.mm._format_transaction_summary(data)
 
 
 class TestCacheFieldsTrackedByPresenceDiagnostic:

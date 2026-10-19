@@ -11,15 +11,15 @@ import re
 import time
 import uuid
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import (
     TYPE_CHECKING,
     Any,
-    Awaitable,
-    Callable,
     Dict,
     FrozenSet,
+    Iterable,
     List,
+    Mapping,
     Optional,
     Tuple,
     Union,
@@ -32,23 +32,23 @@ from loguru import logger
 
 from mcp.types import TextContent, ImageContent, EmbeddedResource
 
-from ..client import ReveniumClient
+from ..auth import AuthenticationError
+from ..client import ReveniumAPIError, ReveniumClient
 from ..agent_friendly import UnifiedResponseFormatter
+from ..auth.tenant_scope import TenantScope, tenant_scope
+from ..common.tenant_scoped_store import TenantScopedStore
 from ..common.validation import validate_pagination_params
 from ..endpoint_registry import get_endpoint_path
 from .unified_tool_base import ToolBase
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
+    api_error_refusal,
     create_structured_validation_error,
     create_structured_missing_parameter_error,
 )
 
 # Performance monitoring removed - infrastructure monitoring handled externally
-from ..coding_assistant_policy import (
-    get_policy_cache,
-    filter_transactions_by_policy,
-)
 from ..core.response_cache import response_cache, cache_response
 from ..introspection.metadata import ToolType, ToolCapability, ToolDependency, DependencyType
 from ..trace_fields import extract_trace_fields
@@ -604,6 +604,11 @@ _COMPLETIONS_FILTER_PARAM_MAP: Dict[str, str] = {
 # the scope is visible in the request instead of implied by its absence.
 _DEFAULT_INCLUDE_CODING_ASSISTANTS = True
 
+# Provider values of the coding assistants, from `includeCodingAssistantProviders` in the completions contract.
+_CODING_ASSISTANT_PROVIDERS = frozenset(
+    {"ClaudeCode", "ClaudeCowork", "CursorIde", "GeminiCli", "CodexCli", "GithubCopilot"}
+)
+
 # String spellings accepted for the boolean, mirroring preprocess_boolean_parameters
 # so a direct (non-registry) call site behaves the same as an MCP client call.
 _INCLUDE_CODING_ASSISTANTS_TRUE_STRINGS = frozenset(
@@ -635,21 +640,78 @@ def _resolve_include_coding_assistants(arguments: Dict[str, Any]) -> bool:
     return _DEFAULT_INCLUDE_CODING_ASSISTANTS
 
 
-def _coding_assistant_scope_note(include_coding_assistants: bool) -> str:
+def _coding_assistant_providers_in(rows: Iterable[Mapping[str, Any]]) -> List[str]:
+    """Sorted distinct coding-assistant providers present in the returned rows."""
+    found = set()
+    for row in rows:
+        provider = row.get("provider") if isinstance(row, Mapping) else None
+        if isinstance(provider, str) and provider in _CODING_ASSISTANT_PROVIDERS:
+            found.add(provider)
+    return sorted(found)
+
+
+def _exact_id_lookup_scope_note() -> str:
+    """Scope line for a lookup by transaction id or trace id, which the platform
+    answers without applying the coding-assistant filter."""
+    return (
+        "**Scope**: a lookup by transaction id or trace id returns the record "
+        "whether or not it comes from a coding assistant; "
+        "include_coding_assistants has no effect on it.\n"
+    )
+
+
+def _coding_assistant_scope_note(
+    include_coding_assistants: bool,
+    returned_rows: Iterable[Mapping[str, Any]] = (),
+    session_rows: Iterable[Mapping[str, Any]] = (),
+    exact_id_lookup: bool = False,
+) -> str:
     """One-line statement of which records the response covers.
 
     A user reading the response on its own must be able to tell whether
-    coding-assistant records were in scope.
+    coding-assistant records were in scope. With the flag false the platform
+    still returns the assistants the team pays API rates for, so the note
+    names the assistants actually present in `returned_rows` rather than
+    claiming everything was excluded. `session_rows` are unwrapped session-store
+    hits: the platform filter never saw them, so they are named separately.
+    `exact_id_lookup` marks a lookup by transaction id or trace id, which the
+    platform answers without applying the filter, so the flag is not offered.
     """
+    if exact_id_lookup:
+        return _exact_id_lookup_scope_note()
     if include_coding_assistants:
         return (
             "**Scope**: coding-assistant records (Claude Code, Gemini CLI, and similar) "
-            "are INCLUDED. Pass include_coding_assistants=false to exclude them.\n"
+            "are INCLUDED. Pass include_coding_assistants=false to exclude assistants "
+            "billed as seat subscriptions; assistants your team pays API rates for "
+            "(apiRateProviders, readable with manage_customers "
+            "get_coding_assistant_billing_settings) stay in the results.\n"
         )
-    return (
-        "**Scope**: coding-assistant records (Claude Code, Gemini CLI, and similar) "
-        "are EXCLUDED. Pass include_coding_assistants=true to include them.\n"
-    )
+    providers = _coding_assistant_providers_in(returned_rows)
+    if providers:
+        note = (
+            "**Scope**: include_coding_assistants=false was sent, but the platform "
+            f"returned coding-assistant records from {', '.join(providers)}, because "
+            "your team pays API rates for them (apiRateProviders, readable with "
+            "manage_customers get_coding_assistant_billing_settings). They are shown "
+            "as returned. Pass include_coding_assistants=true to include every "
+            "coding assistant."
+        )
+    else:
+        note = (
+            "**Scope**: coding assistants billed as seat subscriptions are EXCLUDED; "
+            "assistants your team pays API rates for (apiRateProviders, readable with "
+            "manage_customers get_coding_assistant_billing_settings) are still included. "
+            "Pass include_coding_assistants=true to include every coding assistant."
+        )
+    session_providers = _coding_assistant_providers_in(session_rows)
+    if session_providers:
+        note += (
+            f" Records from {', '.join(session_providers)} were found among this "
+            "session's own submissions, which the platform filter does not apply "
+            "to, so they are shown as submitted."
+        )
+    return note + "\n"
 
 
 # The prompt-cache token fields and their display labels, in the order the
@@ -994,6 +1056,14 @@ _SYNC_VALIDATED_OPTIONAL_STRING_FIELDS: Tuple[str, ...] = (
     "subscriber_email_source",
 )
 
+# Optional token counts beyond input and output, metered as sent and 0 when
+# omitted. Validated by the output_tokens rule (>= 0, <= 10,000,000).
+_TOKEN_DETAIL_FIELDS: Tuple[str, ...] = (
+    "reasoning_tokens",
+    "cache_creation_tokens",
+    "cache_read_tokens",
+)
+
 # Every field the sync fast-path validator reads. The validation cache key is
 # built from exactly these, so a cached verdict can only be reused for a payload
 # the validator would have judged identically.
@@ -1151,12 +1221,135 @@ def _skill_vocabulary_errors(arguments: Dict[str, Any]) -> List[str]:
     return errors
 
 
+class TransactionSearchFailed(Exception):
+    """A transaction search that did not complete.
+
+    Distinct from an empty search: "not found" is only true of a search that
+    completed. `pages_searched` is how many pages answered before `page` failed.
+    `platform_failed` is True when the platform did not answer (an error
+    status, refused access, a timeout) and False when the search failed on
+    its own side, for example reading an answer it could not parse.
+    """
+
+    def __init__(
+        self,
+        transaction_id: str,
+        page: Optional[int],
+        pages_searched: int,
+        cause: Exception,
+        platform_failed: bool = True,
+    ) -> None:
+        super().__init__(str(cause) or type(cause).__name__)
+        self.transaction_id = transaction_id
+        self.page = page
+        self.pages_searched = pages_searched
+        self.cause = cause
+        self.platform_failed = platform_failed
+
+
+# Upper bounds for one lookup_transactions call. A batch is searched in rounds:
+# every id still pending is searched once per round, at most
+# _LOOKUP_SEARCH_CONCURRENCY at a time, with one pause of retry_interval between
+# rounds, and the pauses of one call never add up to more than the wait budget
+# (itself at most _LOOKUP_MAX_WAIT_SECONDS). A caller value outside a bound is
+# clamped and the answer names the change.
+_LOOKUP_MAX_IDS = 50
+_LOOKUP_MAX_ROUNDS = 10
+_LOOKUP_MAX_RETRY_INTERVAL = 60
+_LOOKUP_MAX_WAIT_SECONDS = 300
+_LOOKUP_MAX_PAGES = 10
+# The platform serves at most 100 rows a page (spring.data.web.pageable.max-page-size).
+_LOOKUP_MAX_PAGE_SIZE = 100
+_LOOKUP_SEARCH_CONCURRENCY = 5
+_LOOKUP_DEFAULT_ROUNDS = 3
+_LOOKUP_DEFAULT_RETRY_INTERVAL = 15
+_LOOKUP_DEFAULT_PAGES = 10
+# The platform page cap; every page filters by transactionId, so a full page costs nothing extra.
+_LOOKUP_DEFAULT_PAGE_SIZE = 100
+
+
+def _lookup_int_setting(arguments: Dict[str, Any], field: str) -> Optional[int]:
+    """Return the caller's whole-number value for `field`, or None when not sent.
+
+    A bool is refused even though it is an int in Python: `max_retries=True`
+    is a caller mistake, not one round.
+    """
+    value = arguments.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise create_structured_validation_error(
+            message=f"{field} must be a whole number; got {value!r}.",
+            field=field,
+            value=value,
+            suggestions=[f"Pass {field} as an integer, for example {field}=3"],
+        )
+    return int(value)
+
+
+def _clamp_lookup_setting(
+    field: str, value: int, low: int, high: int, adjustments: List[str]
+) -> int:
+    """Clamp a caller-sent lookup setting into [low, high], recording any change."""
+    if value > high:
+        adjustments.append(f"{field} {value} is above the limit of {high}; used {high}")
+        return high
+    if value < low:
+        adjustments.append(f"{field} {value} is below the minimum of {low}; used {low}")
+        return low
+    return value
+
+
+def _lookup_page_range(
+    arguments: Dict[str, Any], adjustments: List[str]
+) -> Union[int, List[int]]:
+    """Resolve `search_page_range`: a page count, or a [start, end] pair of pages."""
+    value = arguments.get("search_page_range")
+    if value is None:
+        return _LOOKUP_DEFAULT_PAGES
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _clamp_lookup_setting(
+            "search_page_range", value, 1, _LOOKUP_MAX_PAGES, adjustments
+        )
+    if (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+        and 0 <= value[0] <= value[1]
+    ):
+        start, end = value
+        if end - start + 1 > _LOOKUP_MAX_PAGES:
+            used = [start, start + _LOOKUP_MAX_PAGES - 1]
+            adjustments.append(
+                f"search_page_range [{start}, {end}] covers {end - start + 1} pages, "
+                f"above the limit of {_LOOKUP_MAX_PAGES}; used {used}"
+            )
+            return used
+        return [start, end]
+    raise create_structured_validation_error(
+        message=(
+            "search_page_range must be a page count or a [start, end] pair of page "
+            f"numbers with 0 <= start <= end; got {value!r}."
+        ),
+        field="search_page_range",
+        value=value,
+        suggestions=[
+            f"Pass a page count from 1 to {_LOOKUP_MAX_PAGES}, for example search_page_range=5",
+            "Or pass a range, for example search_page_range=[0, 4]",
+        ],
+    )
+
+
 class MeteringTransactionManager:
     """Internal manager for AI transaction metering operations."""
 
+    MAX_SESSION_TRANSACTIONS = 1000
+
     def __init__(self) -> None:
         """Initialize metering transaction manager."""
-        self.transaction_store: Dict[str, Dict[str, Any]] = {}
+        self.transaction_store: TenantScopedStore[Dict[str, Any]] = TenantScopedStore(
+            max_entries=self.MAX_SESSION_TRANSACTIONS
+        )
 
         # Performance optimization: Cache for validation results
         self._validation_cache: Dict[str, bool] = {}
@@ -1390,6 +1583,28 @@ class MeteringTransactionManager:
             # Auto-populate with current time
             logger.debug(f"Auto-populating {field_name} with current time")
             return now_time
+
+    def _backfilled_timestamp(
+        self,
+        arguments: Dict[str, Any],
+        field_name: str,
+        offset_from_request_ms: int,
+        now_time: str,
+    ) -> str:
+        """The caller's value for field_name, else request_time plus the offset, else now."""
+        request_time = arguments.get("request_time")
+        if arguments.get(field_name) is None and request_time is not None:
+            return self._offset_from_request_time(request_time, offset_from_request_ms)
+        return self._process_timestamp_field(arguments, field_name, now_time)
+
+    def _offset_from_request_time(self, request_time: str, offset_ms: int) -> str:
+        """request_time (already validated) plus offset_ms, as ISO UTC with 'Z'."""
+        dt = datetime.fromisoformat(request_time.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return self._iso_utc(dt + timedelta(milliseconds=offset_ms))
 
     def _track_operation_time(self, operation: str, execution_time_ms: float) -> None:
         """Track operation execution time for performance monitoring."""
@@ -1868,7 +2083,12 @@ The subscriber data structure has been updated. The old individual fields are no
         """Async validation for numeric fields."""
         errors = []
 
-        for field in ["input_tokens", "output_tokens", "duration_ms"]:
+        for field in [
+            "input_tokens",
+            "output_tokens",
+            "duration_ms",
+            *_TOKEN_DETAIL_FIELDS,
+        ]:
             if field in arguments:
                 value = arguments[field]
                 original_value = value
@@ -2739,9 +2959,9 @@ The subscriber data structure has been updated. The old individual fields are no
         wire, so accepting the snake_case aliases silently would lose data —
         surface a clear error pointing callers at the new field names.
 
-        Called from both the live submit and the dry-run branch of
-        MeteringManagement.handle_action, so that a payload dry-run calls valid
-        cannot fail on submit (and vice versa).
+        Called from the live submit, the dry-run branch and the validate action
+        of MeteringManagement.handle_action, so that a payload a dry run or
+        validate calls valid cannot fail on submit (and vice versa).
         """
         for old_name, new_name in _DEPRECATED_SUBMISSION_ALIASES.items():
             if old_name in arguments:
@@ -2760,8 +2980,23 @@ The subscriber data structure has been updated. The old individual fields are no
                     ],
                 )
 
+    def reject_unrecognized_transaction_id(self, arguments: Dict[str, Any]) -> None:
+        """Reject a caller-supplied transaction_id the backend would drop.
+
+        Called from the live submit, the dry-run branch and the validate action
+        of MeteringManagement.handle_action, so neither a dry run nor validate
+        calls valid an id the live submit refuses.
+        """
+        if arguments.get("transaction_id") is not None:
+            self._validate_transaction_id_format(arguments["transaction_id"])
+
     async def submit_transaction(
-        self, client: ReveniumClient, arguments: Dict[str, Any], *, ctx: Optional["TenantContext"] = None
+        self,
+        client: ReveniumClient,
+        arguments: Dict[str, Any],
+        scope: TenantScope,
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> Dict[str, Any]:
         # UCM-only validation - let the API handle required field validation
         # No hardcoded required fields - API will validate based on UCM capabilities
@@ -2800,19 +3035,11 @@ The subscriber data structure has been updated. The old individual fields are no
             )
 
         user_supplied_id = arguments.get("transaction_id")
-        if user_supplied_id is not None:
-            self._validate_transaction_id_format(user_supplied_id)
+        self.reject_unrecognized_transaction_id(arguments)
         transaction_id = user_supplied_id or self._generate_transaction_id()
 
         # Build payload with required fields matching the API format
         now_time = self._iso_utc()
-
-        # Process timestamp fields with validation and auto-population
-        request_time = self._process_timestamp_field(arguments, "request_time", now_time)
-        response_time = self._process_timestamp_field(arguments, "response_time", now_time)
-        completion_start_time = self._process_timestamp_field(
-            arguments, "completion_start_time", now_time
-        )
 
         # Handle time_to_first_token with smart defaults and validation
         time_to_first_token = arguments.get("time_to_first_token")
@@ -2858,6 +3085,17 @@ The subscriber data structure has been updated. The old individual fields are no
             # Auto-calculate as 10% of total duration (reasonable default for streaming)
             time_to_first_token = int(arguments["duration_ms"]) // 10
             logger.debug(f"Auto-calculated time_to_first_token: {time_to_first_token}ms")
+
+        # Process timestamp fields with validation and auto-population. A given
+        # request_time anchors the omitted response and completion-start times,
+        # so a backfilled transaction is not recorded as finishing now.
+        request_time = self._process_timestamp_field(arguments, "request_time", now_time)
+        response_time = self._backfilled_timestamp(
+            arguments, "response_time", int(arguments["duration_ms"]), now_time
+        )
+        completion_start_time = self._backfilled_timestamp(
+            arguments, "completion_start_time", time_to_first_token, now_time
+        )
 
         # ticketId is capped by the API (metering spec
         # AICompletionMetadataResource.ticketId maxLength, mirrored in
@@ -3097,7 +3335,7 @@ The subscriber data structure has been updated. The old individual fields are no
                 payload[key] = value
 
         # Extract and add trace fields (10 tracing fields for distributed tracing)
-        # These are extracted from arguments with env var fallback
+        # Extracted from arguments, with env var fallback on a local server only
         # Note: trace fields from usage_metadata CAN override default operationType
         # as per the distributed tracing design (user-provided values take precedence)
         trace_fields = extract_trace_fields(arguments)
@@ -3167,13 +3405,16 @@ The subscriber data structure has been updated. The old individual fields are no
                 logger.error(f"📦 Failed payload: {sanitized_payload}")
                 raise
 
-        # Store transaction for verification
-        self.transaction_store[transaction_id] = {
-            "payload": payload,
-            "timestamp": datetime.now(timezone.utc),
-            "verified": False,
-            "submitted": True,
-        }
+        self.transaction_store.put(
+            scope,
+            transaction_id,
+            {
+                "payload": payload,
+                "timestamp": datetime.now(timezone.utc),
+                "verified": False,
+                "submitted": True,
+            },
+        )
 
         return {
             "transaction_id": transaction_id,
@@ -3203,7 +3444,9 @@ The subscriber data structure has been updated. The old individual fields are no
             examples={"valid_format": example},
         )
 
-    async def get_transaction_status(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def get_transaction_status(
+        self, arguments: Dict[str, Any], scope: TenantScope
+    ) -> Dict[str, Any]:
         """Get status of a specific transaction."""
         transaction_id = arguments.get("transaction_id")
 
@@ -3218,8 +3461,8 @@ The subscriber data structure has been updated. The old individual fields are no
                 },
             )
 
-        if transaction_id in self.transaction_store:
-            stored_data = self.transaction_store[transaction_id]
+        stored_data = self.transaction_store.get(scope, transaction_id)
+        if stored_data is not None:
             return {
                 "transaction_id": transaction_id,
                 "found": True,
@@ -3248,7 +3491,25 @@ The subscriber data structure has been updated. The old individual fields are no
             ToolError: If transaction_ids is empty or invalid
         """
         if transaction_ids:
-            transaction_ids[:] = [tid for tid in transaction_ids if isinstance(tid, str) and tid.strip()]
+            # dict.fromkeys keeps the first occurrence of each id, in request order
+            transaction_ids[:] = list(
+                dict.fromkeys(
+                    tid for tid in transaction_ids if isinstance(tid, str) and tid.strip()
+                )
+            )
+        if len(transaction_ids or []) > _LOOKUP_MAX_IDS:
+            raise create_structured_validation_error(
+                message=(
+                    f"lookup_transactions takes at most {_LOOKUP_MAX_IDS} transaction ids "
+                    f"per call; got {len(transaction_ids)}."
+                ),
+                field="transaction_ids",
+                value=len(transaction_ids),
+                suggestions=[
+                    f"Split the ids into batches of {_LOOKUP_MAX_IDS} and look up each "
+                    "batch in its own call"
+                ],
+            )
         if not transaction_ids:
             raise create_structured_missing_parameter_error(
                 parameter_name="transaction_ids",
@@ -3264,7 +3525,7 @@ The subscriber data structure has been updated. The old individual fields are no
             )
 
     def _check_session_store(
-        self, transaction_ids: Optional[List[str]]
+        self, transaction_ids: Optional[List[str]], scope: TenantScope
     ) -> Tuple[Dict[str, Any], List[str]]:
         """Check local session store for transaction data.
 
@@ -3273,24 +3534,22 @@ The subscriber data structure has been updated. The old individual fields are no
 
         Args:
             transaction_ids: List of transaction IDs to check, or None for all unverified
+            scope: Organization whose submissions are searched
 
         Returns:
             Tuple of (found_transactions_dict, remaining_ids_for_api_search)
         """
         if transaction_ids:
-            # Extract exact pattern from lines 1442-1443
             found_in_session = {
-                tid: self.transaction_store.get(tid)
+                tid: self.transaction_store.get(scope, tid)
                 for tid in transaction_ids
-                if tid in self.transaction_store
+                if self.transaction_store.contains(scope, tid)
             }
-            # Calculate remaining IDs that need API search
-            remaining_ids = [tid for tid in transaction_ids if tid not in self.transaction_store]
+            remaining_ids = [tid for tid in transaction_ids if tid not in found_in_session]
         else:
-            # Extract exact pattern from lines 1444-1445
             found_in_session = {
                 tid: data
-                for tid, data in self.transaction_store.items()
+                for tid, data in self.transaction_store.items(scope)
                 if not data.get("verified", False)
             }
             remaining_ids = []
@@ -3324,85 +3583,6 @@ The subscriber data structure has been updated. The old individual fields are no
                 "error": f"Unexpected result type: {type(result)}",
                 "source": "error",
             }
-
-    async def _handle_retry_attempt(
-        self,
-        operation_func: Callable[[], Awaitable[Tuple[Any, Dict[str, Any]]]],
-        transaction_id: str,
-        attempt: int,
-        max_retries: int,
-        operation_name: str,
-    ) -> Tuple[bool, Any, Dict[str, Any], Optional[Exception]]:
-        """Handle single retry attempt using extracted patterns."""
-        try:
-            # Extract logging pattern from line 1631
-            logger.info(
-                f"🔍 Executing {operation_name} for {transaction_id} (attempt {attempt + 1}/{max_retries})"
-            )
-
-            # Execute operation function
-            result, metadata = await operation_func()
-
-            if result:
-                # Extract success logging pattern from line 1643
-                logger.info(f"✅ {operation_name.capitalize()} successful for {transaction_id}")
-                return True, result, metadata, None
-
-            return False, None, {}, None
-
-        except Exception as e:
-            # Extract exception handling pattern from lines 1651-1658
-            logger.warning(
-                f"⚠️ Error in {operation_name} for {transaction_id} (attempt {attempt + 1}): {e}"
-            )
-            return False, None, {}, e
-
-    async def _execute_with_retry(
-        self,
-        operation_func: Callable[[], Awaitable[Tuple[Any, Dict[str, Any]]]],
-        transaction_id: str,
-        max_retries: int,
-        retry_interval: int,
-        operation_name: str = "operation",
-        retry_on_empty: bool = True,
-    ) -> Tuple[bool, Any, Dict[str, Any], Optional[Exception]]:
-        """Execute operation with retry logic.
-
-        Executes the provided operation with configurable retry attempts,
-        including proper timing, logging, and error handling. With
-        ``retry_on_empty=False`` an empty result (an authoritative not-found,
-        as opposed to a raised transport error) returns immediately instead of
-        burning the remaining attempts.
-        """
-        last_error = None
-
-        # Extract retry loop pattern from lines 1629-1658
-        for attempt in range(max_retries):
-            success, result, metadata, error = await self._handle_retry_attempt(
-                operation_func, transaction_id, attempt, max_retries, operation_name
-            )
-
-            if success:
-                metadata = dict(metadata or {})
-                metadata.setdefault("attempts_made", attempt + 1)
-                return True, result, metadata, None
-
-            if error:
-                last_error = error
-
-            # An empty result with no exception is a completed search that
-            # found nothing — only keep polling when the caller asked for it.
-            if error is None and not retry_on_empty:
-                return False, None, {"attempts_made": attempt + 1}, last_error
-
-            # Extract retry delay logic from lines 1647-1649 and 1656-1658
-            if attempt < max_retries - 1:
-                logger.info(
-                    f"⏳ {operation_name.capitalize()} failed for {transaction_id}, retrying in {retry_interval}s..."
-                )
-                await asyncio.sleep(retry_interval)
-
-        return False, None, {"attempts_made": max_retries}, last_error
 
     def _build_result_entry(
         self,
@@ -3493,29 +3673,94 @@ The subscriber data structure has been updated. The old individual fields are no
         return _normalize_return_data_level(arguments)
 
     def _extract_lookup_parameters(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract and validate lookup_transactions parameters."""
-        params = {
-            "transaction_ids": arguments.get("transaction_ids", []),
+        """Extract and validate lookup_transactions parameters.
+
+        Every setting has an upper bound (the `_LOOKUP_*` constants). A value the
+        caller sent outside a bound is clamped and a sentence naming the change
+        goes into `adjustments`, which the answer repeats.
+
+        Sending any of `max_retries`, `retry_interval` or `wait_seconds` turns
+        polling on. `wait_seconds` is the wait budget (the most seconds of
+        pauses between rounds); sent alone it also sets the number of rounds
+        that fit in it. Without it the budget is the pauses `max_retries`
+        rounds take.
+        """
+        transaction_ids = arguments.get("transaction_ids", [])
+        self._validate_lookup_parameters(transaction_ids)
+
+        adjustments: List[str] = []
+        sent_rounds = _lookup_int_setting(arguments, "max_retries")
+        sent_interval = _lookup_int_setting(arguments, "retry_interval")
+        sent_page_size = _lookup_int_setting(arguments, "page_size")
+        sent_wait = _lookup_int_setting(arguments, "wait_seconds")
+
+        retry_interval = (
+            _LOOKUP_DEFAULT_RETRY_INTERVAL
+            if sent_interval is None
+            else _clamp_lookup_setting(
+                "retry_interval", sent_interval, 0, _LOOKUP_MAX_RETRY_INTERVAL, adjustments
+            )
+        )
+        wait_seconds: Optional[int] = None
+        if sent_wait is not None:
+            wait_seconds = _clamp_lookup_setting(
+                "wait_seconds", sent_wait, 0, _LOOKUP_MAX_WAIT_SECONDS, adjustments
+            )
+        if sent_rounds is not None:
+            max_retries = _clamp_lookup_setting(
+                "max_retries", sent_rounds, 1, _LOOKUP_MAX_ROUNDS, adjustments
+            )
+        elif wait_seconds is not None:
+            # One search, then one more after each pause that fits in the wait.
+            needed_rounds = 1 + wait_seconds // max(retry_interval, 1)
+            max_retries = min(needed_rounds, _LOOKUP_MAX_ROUNDS)
+            if needed_rounds > _LOOKUP_MAX_ROUNDS:
+                adjustments.append(
+                    f"wait_seconds {wait_seconds} at retry_interval {retry_interval} needs "
+                    f"{needed_rounds} searches, above the limit of {_LOOKUP_MAX_ROUNDS}; "
+                    f"searched at most {_LOOKUP_MAX_ROUNDS} times, waiting at most "
+                    f"{(_LOOKUP_MAX_ROUNDS - 1) * retry_interval}s"
+                )
+        else:
+            max_retries = _LOOKUP_DEFAULT_ROUNDS
+        # Without wait_seconds the wait is the pauses max_retries rounds take:
+        # (3 - 1) x 15 = 30 s with the defaults.
+        wait_budget = (
+            wait_seconds
+            if wait_seconds is not None
+            else min((max_retries - 1) * retry_interval, _LOOKUP_MAX_WAIT_SECONDS)
+        )
+        page_size = (
+            _LOOKUP_DEFAULT_PAGE_SIZE
+            if sent_page_size is None
+            else _clamp_lookup_setting(
+                "page_size", sent_page_size, 1, _LOOKUP_MAX_PAGE_SIZE, adjustments
+            )
+        )
+        search_page_range = _lookup_page_range(arguments, adjustments)
+
+        return {
+            "transaction_ids": transaction_ids,
             "check_session_first": True,  # Always check session first as internal optimization
-            "wait_seconds": arguments.get("wait_seconds", 30),
-            "max_retries": arguments.get("max_retries", 3),
-            "retry_interval": arguments.get("retry_interval", 15),
+            # The polling wait, whether sent or derived. It and max_retries
+            # only apply when retry_on_empty is on; a plain lookup searches
+            # once without waiting (the echo's `polling` says which)
+            "wait_seconds": wait_budget,
+            "max_retries": max_retries,
+            "retry_interval": retry_interval,
             # Polling for a not-yet-visible transaction (the post-submit
             # verification flow) is opt-in via the explicit retry knobs; a
             # plain lookup of a missing id must return promptly.
-            "retry_on_empty": ("max_retries" in arguments)
-            or ("retry_interval" in arguments),
-            "search_page_range": arguments.get("search_page_range", 50),
-            "page_size": arguments.get("page_size", 1000),
+            "retry_on_empty": any(
+                sent is not None for sent in (sent_rounds, sent_interval, sent_wait)
+            ),
+            "search_page_range": search_page_range,
+            "page_size": page_size,
             "early_termination": arguments.get("early_termination", True),
             "return_transaction_data": self._normalize_return_data_parameter(arguments),
             "filters": _extract_completions_filters(arguments),
+            "adjustments": adjustments,
         }
-
-        # Validate parameters using extracted validation logic
-        self._validate_lookup_parameters(params["transaction_ids"])
-
-        return params
 
     def _build_configuration_object(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Build configuration object for response transparency."""
@@ -3526,12 +3771,16 @@ The subscriber data structure has been updated. The old individual fields are no
             "search_page_range": params["search_page_range"],
             "page_size": params["page_size"],
             "early_termination": params["early_termination"],
+            # False for a plain lookup: one search, no wait, whatever
+            # wait_seconds and max_retries say
+            "polling": params.get("retry_on_empty", False),
+            "adjustments": params.get("adjustments", []),
         }
 
 
 
     async def _process_session_results(
-        self, transaction_ids: List[str]
+        self, transaction_ids: List[str], scope: TenantScope
     ) -> Tuple[List[Dict[str, Any]], List[str]]:
         """Process session store results and return formatted entries.
 
@@ -3540,7 +3789,7 @@ The subscriber data structure has been updated. The old individual fields are no
         results = []
 
         # Always check session store first (internal optimization)
-        found_in_session, remaining_ids = self._check_session_store(transaction_ids)
+        found_in_session, remaining_ids = self._check_session_store(transaction_ids, scope)
 
         # Process session store results
         for tid, transaction_data in found_in_session.items():
@@ -3588,20 +3837,27 @@ The subscriber data structure has been updated. The old individual fields are no
                 message=message,
             )
 
-    async def _process_api_results(
-        self, client: ReveniumClient, remaining_ids: List[str], params: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """Process API search results for remaining transaction IDs."""
-        results: List[Dict[str, Any]] = []
+    async def _pause(self, seconds: int) -> None:
+        """Wait between lookup rounds."""
+        await asyncio.sleep(seconds)
 
-        if not remaining_ids:
-            return results
+    async def _search_lookup_id(
+        self,
+        client: ReveniumClient,
+        tid: str,
+        params: Dict[str, Any],
+        semaphore: asyncio.Semaphore,
+    ) -> Dict[str, Any]:
+        """Search one id for a lookup round; never raises, so one id cannot sink gather.
 
-        # Process each remaining transaction with retry logic
-        for tid in remaining_ids:
-            # Create operation function for retry logic
-            async def search_operation() -> Any:
-                return await self._search_transaction_pages(
+        The outcome's `kind` is "found", "empty" (a completed search that did
+        not find the id), "failed" (the search did not complete; see
+        `TransactionSearchFailed`) or "raise" (an auth failure or other
+        ToolError, re-raised unchanged after the round).
+        """
+        async with semaphore:
+            try:
+                data, metadata = await self._search_transaction_pages(
                     client,
                     tid,
                     params["search_page_range"],
@@ -3609,29 +3865,125 @@ The subscriber data structure has been updated. The old individual fields are no
                     params["early_termination"],
                     filters=params.get("filters"),
                 )
+            except (ToolError, PermissionError, AuthenticationError) as e:
+                return {"kind": "raise", "error": e}
+            except TransactionSearchFailed as e:
+                return {"kind": "failed", "error": e}
+            except Exception as e:
+                return {
+                    "kind": "failed",
+                    "error": TransactionSearchFailed(
+                        tid, page=None, pages_searched=0, cause=e, platform_failed=False
+                    ),
+                }
+        if data:
+            return {"kind": "found", "data": data, "metadata": metadata or {}}
+        return {"kind": "empty", "metadata": metadata or {}}
 
-            success, transaction_data, search_metadata, error = await self._execute_with_retry(
-                search_operation,
-                tid,
-                params["max_retries"],
-                params["retry_interval"],
-                "lookup",
-                retry_on_empty=params.get("retry_on_empty", False),
-            )
+    async def _process_api_results(
+        self, client: ReveniumClient, remaining_ids: List[str], params: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Search the platform for the ids the session store did not hold.
 
-            result_entry = self._build_api_result_entry(
-                tid,
-                success,
-                transaction_data,
-                search_metadata,
-                search_metadata.get("attempts_made", 1),
+        Searches in rounds: every pending id once per round (concurrently, at
+        most `_LOOKUP_SEARCH_CONCURRENCY` at a time), then one pause of
+        `retry_interval` before the next round. Polling stops when nothing is
+        pending, when polling is off (a plain lookup searches once), when an id
+        failed this round, after `max_retries` rounds, or when the next pause
+        would take the call past its wait budget. The budget counts pauses only.
+        Results come back in request order.
+        """
+        if not remaining_ids:
+            return []
+
+        rounds = params.get("max_retries", 1) if params.get("retry_on_empty", False) else 1
+        retry_interval = params.get("retry_interval", 0)
+        wait_budget = params.get("wait_seconds", (rounds - 1) * retry_interval)
+        semaphore = asyncio.Semaphore(_LOOKUP_SEARCH_CONCURRENCY)
+
+        outcomes: Dict[str, Dict[str, Any]] = {}
+        attempts = dict.fromkeys(remaining_ids, 0)
+        pending = list(remaining_ids)
+        slept = 0
+        stopped_by_budget = False
+        stopped_by_failure = False
+
+        for round_number in range(1, rounds + 1):
+            logger.info(
+                f"🔍 Lookup round {round_number}/{rounds}: searching {len(pending)} transaction(s)"
             )
-            results.append(result_entry)
+            round_outcomes = await asyncio.gather(
+                *(self._search_lookup_id(client, tid, params, semaphore) for tid in pending)
+            )
+            for tid, outcome in zip(pending, round_outcomes):
+                attempts[tid] += 1
+                outcomes[tid] = outcome
+            searched_this_round = pending
+            pending = [tid for tid in pending if outcomes[tid]["kind"] == "empty"]
+
+            if not pending or round_number == rounds:
+                break
+            if any(outcomes[tid]["kind"] in ("failed", "raise") for tid in searched_this_round):
+                # The call answers with an error either way; the ids still
+                # pending are reported as unfinished, not as missing.
+                stopped_by_failure = True
+                break
+            if slept + retry_interval > wait_budget:
+                stopped_by_budget = True
+                break
+            logger.info(
+                f"⏳ {len(pending)} transaction(s) not visible yet, searching again in {retry_interval}s"
+            )
+            await self._pause(retry_interval)
+            slept += retry_interval
+
+        for tid in remaining_ids:
+            if outcomes[tid]["kind"] == "raise":
+                raise outcomes[tid]["error"]
+
+        results: List[Dict[str, Any]] = []
+        for tid in remaining_ids:
+            outcome = outcomes[tid]
+            if outcome["kind"] == "failed":
+                failure: TransactionSearchFailed = outcome["error"]
+                entry = self._build_result_entry(
+                    transaction_id=tid,
+                    found=False,
+                    source="api",
+                    attempts=attempts[tid],
+                    message=f"Transaction {tid} lookup failed: {failure}",
+                )
+                entry["search_failure"] = {
+                    "cause": str(failure),
+                    "page": failure.page,
+                    "pages_searched": failure.pages_searched,
+                    "platform_failed": failure.platform_failed,
+                }
+            else:
+                entry = self._build_api_result_entry(
+                    tid,
+                    outcome["kind"] == "found",
+                    outcome.get("data"),
+                    outcome["metadata"],
+                    attempts[tid],
+                )
+                if stopped_by_budget and outcome["kind"] == "empty":
+                    entry["message"] += f"; stopped polling after {slept}s, the wait budget"
+                if stopped_by_failure and outcome["kind"] == "empty":
+                    entry["polling_unfinished"] = True
+                    entry["message"] += (
+                        f"; polling stopped after {attempts[tid]} of {rounds} searches "
+                        "because another id's search failed"
+                    )
+            results.append(entry)
 
         return results
 
     async def lookup_transactions(
-        self, client: ReveniumClient, arguments: Dict[str, Any]
+        self,
+        client: ReveniumClient,
+        arguments: Dict[str, Any],
+        scope: TenantScope,
     ) -> Dict[str, Any]:
         """Unified transaction lookup with automatic optimization.
 
@@ -3645,7 +3997,7 @@ The subscriber data structure has been updated. The old individual fields are no
 
         # Phase 1: Process session store results (always check session first)
         session_results, remaining_ids = await self._process_session_results(
-            params["transaction_ids"]
+            params["transaction_ids"], scope
         )
 
         # Phase 2: Process API search results
@@ -3654,22 +4006,71 @@ The subscriber data structure has been updated. The old individual fields are no
         # Combine all results
         all_results = session_results + api_results
 
+        # A search the platform did not answer is not a "not found"
+        if any(r.get("search_failure") for r in all_results):
+            raise self._lookup_failure_error(all_results)
+
         # Build final unified response using extracted response builder
         return self._build_lookup_response(all_results, configuration)
+
+    def _lookup_failure_error(self, results: List[Dict[str, Any]]) -> ToolError:
+        """The error a lookup answers with when the platform failed for some ids.
+
+        Names each failed id with its cause (and how far its search got), then
+        what the lookup could still establish for the other ids.
+        """
+        failed = [r for r in results if r.get("search_failure")]
+        found = [r["transaction_id"] for r in results if r.get("found")]
+        missing = [r for r in results if not r.get("found") and not r.get("search_failure")]
+        not_found = [r["transaction_id"] for r in missing if not r.get("polling_unfinished")]
+        unfinished = [r["transaction_id"] for r in missing if r.get("polling_unfinished")]
+        platform_failed = all(r["search_failure"]["platform_failed"] for r in failed)
+        lines = [
+            f"Transaction lookup failed for {len(failed)} of {len(results)}: "
+            + ("the platform did not answer." if platform_failed else "the search did not complete.")
+        ]
+        for r in failed:
+            failure = r["search_failure"]
+            line = f"- {r['transaction_id']}: {failure['cause']}"
+            if not failure["platform_failed"]:
+                line += " (the platform answered, but the lookup could not read the answer)"
+            if failure["pages_searched"] > 0:
+                line += (
+                    f" (incomplete: {failure['pages_searched']} page(s) searched "
+                    f"before page {failure['page']} failed)"
+                )
+            lines.append(line)
+        lines.append(f"Found: {', '.join(found) or 'none'}")
+        lines.append(f"Not found: {', '.join(not_found) or 'none'}")
+        if unfinished:
+            lines.append(
+                "Not found yet, polling stopped early by the failure: " + ", ".join(unfinished)
+            )
+        return ToolError(
+            message="\n".join(lines),
+            error_code=ErrorCodes.API_ERROR,
+            field="transaction_ids",
+            value=[r["transaction_id"] for r in failed],
+            suggestions=[
+                "Retry the lookup for the failed ids and any not found yet; the platform may have been briefly unavailable",
+                "A 403 means this API key cannot read the team's completions; check the key's team and permissions",
+            ],
+        )
 
     async def _search_transaction_pages(
         self,
         client: ReveniumClient,
         transaction_id: str,
-        search_page_range: Union[int, Tuple[int, int]] = 50,
-        page_size: int = 1000,
+        search_page_range: Union[int, Tuple[int, int]] = _LOOKUP_DEFAULT_PAGES,
+        page_size: int = _LOOKUP_DEFAULT_PAGE_SIZE,
         early_termination: bool = True,
         filters: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         """Search across multiple pages for a specific transaction with comprehensive auto-pagination.
 
         This method implements efficient transaction search with maximum API efficiency,
-        searching up to 5,000 transactions by default using 1,000 transactions per API call.
+        searching at most `_LOOKUP_MAX_PAGES` pages of up to `_LOOKUP_MAX_PAGE_SIZE` transactions per API call. Every request
+        carries transactionId, so the platform filters by id server-side.
         When filters are provided (especially startDate/endDate or transactionId), the API
         narrows results server-side, dramatically reducing pages needed.
 
@@ -3677,7 +4078,7 @@ The subscriber data structure has been updated. The old individual fields are no
             client: Revenium API client
             transaction_id: Transaction ID to search for
             search_page_range: Pages to search - int for 0 to N-1, tuple for (start, end) range
-            page_size: Transactions per API call (default: 1000 - maximum supported)
+            page_size: Transactions per API call (default: `_LOOKUP_DEFAULT_PAGE_SIZE`, the platform's page cap)
             early_termination: Stop searching when transaction is found (default: True)
             filters: Optional dict of camelCase API filter params (e.g. startDate, provider).
                      Passing transactionId here enables direct API lookup instead of page scanning.
@@ -3686,6 +4087,12 @@ The subscriber data structure has been updated. The old individual fields are no
             Tuple of (transaction_data, search_metadata) where:
             - transaction_data: Dict with transaction info if found, None if not found
             - search_metadata: Dict with search statistics and results
+
+        Raises:
+            TransactionSearchFailed: A page the platform did not answer. An empty
+                page ends the search as not found; a failed one is not an answer.
+            ToolError / PermissionError / AuthenticationError: Auth failures,
+                unchanged.
         """
         endpoint = get_endpoint_path("completions")
 
@@ -3713,6 +4120,7 @@ The subscriber data structure has been updated. The old individual fields are no
         )
 
         for page in range(start_page, end_page + 1):
+            page_answered = False
             try:
                 params = {
                     "teamId": client.team_id,
@@ -3729,6 +4137,7 @@ The subscriber data structure has been updated. The old individual fields are no
 
                 logger.debug(f"🔍 Searching page {page} (size: {page_size})")
                 response = await client.get(endpoint, params=params)
+                page_answered = True
                 if not isinstance(response, dict):
                     response = {}
 
@@ -3782,9 +4191,17 @@ The subscriber data structure has been updated. The old individual fields are no
                     )
                     break
 
+            except (ToolError, PermissionError, AuthenticationError):
+                raise
             except Exception as e:
                 logger.warning(f"❌ Failed to search page {page}: {e}")
-                break
+                raise TransactionSearchFailed(
+                    transaction_id=transaction_id,
+                    page=page,
+                    pages_searched=total_pages_searched,
+                    cause=e,
+                    platform_failed=not page_answered,
+                ) from e
 
         # Compile search metadata
         search_metadata = {
@@ -3887,6 +4304,7 @@ class MeteringManagement(ToolBase):
         ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle metering management actions with response caching."""
+        scope = tenant_scope(ctx)
         try:
             # Clear request-scoped caches for fresh request
             response_cache.clear_request_cache()
@@ -3903,11 +4321,11 @@ class MeteringManagement(ToolBase):
 
             # Route to appropriate handler
             if action == "submit_ai_transaction":
-                # Deprecated-alias rejection runs before the dry_run split so
-                # both branches return the same verdict for the same payload:
-                # a dry run must never call valid a payload the live submit
-                # refuses.
+                # The deprecated-alias and transaction-id checks run before the
+                # dry_run split so both branches return the same verdict on
+                # them.
                 self.transaction_manager.reject_deprecated_submission_aliases(arguments)
+                self.transaction_manager.reject_unrecognized_transaction_id(arguments)
 
                 # Handle dry_run mode for transaction submission
                 dry_run = arguments.get("dry_run", False)
@@ -3963,6 +4381,9 @@ class MeteringManagement(ToolBase):
                             ("effort", "Effort"),
                             ("model_host", "Model Host"),
                             ("subscriber_email_source", "Subscriber Email Source"),
+                            ("reasoning_tokens", "Reasoning Tokens"),
+                            ("cache_creation_tokens", "Cache Creation Tokens"),
+                            ("cache_read_tokens", "Cache Read Tokens"),
                             *(
                                 (argument, label)
                                 for argument, _, label in _PROMPT_CONTEXT_FIELDS
@@ -4004,7 +4425,9 @@ class MeteringManagement(ToolBase):
                             )
                         ]
 
-                result = await self.transaction_manager.submit_transaction(client, arguments, ctx=ctx)
+                result = await self.transaction_manager.submit_transaction(
+                    client, arguments, scope, ctx=ctx
+                )
                 return [
                     TextContent(
                         type="text",
@@ -4019,7 +4442,7 @@ class MeteringManagement(ToolBase):
                 ]
 
             elif action == "get_transaction_status":
-                result = await self.transaction_manager.get_transaction_status(arguments)
+                result = await self.transaction_manager.get_transaction_status(arguments, scope)
                 if result["found"]:
                     return [
                         TextContent(
@@ -4044,6 +4467,10 @@ class MeteringManagement(ToolBase):
                     ]
 
             elif action == "validate":
+                # The same refusals the submit runs first; their ToolError
+                # propagates as it does from submit, never as "Validation Failed".
+                self.transaction_manager.reject_deprecated_submission_aliases(arguments)
+                self.transaction_manager.reject_unrecognized_transaction_id(arguments)
                 result = await self.validator.validate_transaction(arguments, ctx=ctx)
                 if result["valid"]:
                     # Field validation passing is not the same as the model
@@ -4070,20 +4497,9 @@ class MeteringManagement(ToolBase):
                         )
                     ]
             elif action == "lookup_transactions":
-                result = await self.transaction_manager.lookup_transactions(client, arguments)
-
-                allowed = await get_policy_cache().get_allowed_metric_providers(
-                    client, getattr(ctx, "tenant_id", None) if ctx else None
+                result = await self.transaction_manager.lookup_transactions(
+                    client, arguments, scope
                 )
-                for r in result.get("results", []):
-                    if r.get("found") and "transaction_data" in r:
-                        filtered = filter_transactions_by_policy(
-                            [r["transaction_data"]], allowed
-                        )
-                        if not filtered:
-                            r["found"] = False
-                            r["message"] = "Filtered by tenant provider policy"
-                            r.pop("transaction_data", None)
 
                 found_results = result.get("results", [])
                 found_count = sum(1 for r in found_results if r.get("found"))
@@ -4106,9 +4522,7 @@ class MeteringManagement(ToolBase):
                     f"**Sources**: {result['summary']['sources']['session']} session, "
                     f"{result['summary']['sources']['api']} API\n"
                 )
-                response_text += _coding_assistant_scope_note(
-                    _resolve_include_coding_assistants(arguments)
-                )
+                response_text += _exact_id_lookup_scope_note()
                 response_text += "\n"
 
                 # Extract and normalize return_transaction_data parameter
@@ -4146,15 +4560,18 @@ class MeteringManagement(ToolBase):
                             response_text += f"- {transaction_result['message']}\n"
                     response_text += "\n"
 
+                for adjustment in result.get("configuration", {}).get("adjustments", []):
+                    response_text += f"**Adjusted**: {adjustment}\n"
+
                 return [TextContent(type="text", text=response_text)]
             elif action == "lookup_recent_transactions":
                 recent_text = await self._handle_lookup_recent_transactions(
-                    client, arguments, ctx=ctx
+                    client, arguments
                 )
                 return [TextContent(type="text", text=recent_text)]
             elif action == "analyze_recent_transactions":
                 return await self._handle_analyze_recent_transactions(
-                    client, arguments, ctx=ctx
+                    client, arguments
                 )
             elif action == "get_capabilities":
                 return await self._handle_get_capabilities(ctx=ctx)
@@ -4251,12 +4668,13 @@ class MeteringManagement(ToolBase):
         self,
         client: ReveniumClient,
         arguments: Dict[str, Any],
-        *,
-        ctx: Optional["TenantContext"] = None,
     ) -> str:
         # Extract and validate parameters
         page = arguments.get("page", 0)
-        page_size = arguments.get("recent_page_size") if "recent_page_size" in arguments else arguments.get("page_size", 20)
+        page_size_key = (
+            "recent_page_size" if "recent_page_size" in arguments else "page_size"
+        )
+        page_size = arguments.get(page_size_key, 20)
         # Set default to "summary" for recent transactions lookup
         if "return_transaction_data" not in arguments:
             arguments = arguments.copy()
@@ -4283,17 +4701,20 @@ class MeteringManagement(ToolBase):
 
         if not isinstance(page_size, int) or page_size < 1 or page_size > 100:
             raise create_structured_validation_error(
-                message=f"Invalid recent_page_size parameter: {page_size}. Must be an integer between 1 and 100.",
-                field="recent_page_size",
+                message=(
+                    f"Invalid {page_size_key} parameter: {page_size}. "
+                    "Must be an integer between 1 and 100."
+                ),
+                field=page_size_key,
                 value=page_size,
                 suggestions=[
-                    "Use recent_page_size=20 for default pagination",
-                    "Use recent_page_size=10 for smaller pages",
-                    "Maximum recent_page_size is 100"
+                    "Use page_size=20 for default pagination",
+                    "Use page_size=10 for smaller pages",
+                    "Maximum page_size is 100"
                 ],
                 examples={
-                    "default": "lookup_recent_transactions(recent_page_size=20)",
-                    "small_pages": "lookup_recent_transactions(recent_page_size=10)",
+                    "default": "lookup_recent_transactions(page_size=20)",
+                    "small_pages": "lookup_recent_transactions(page_size=10)",
                     "valid_range": "1-100"
                 }
             )
@@ -4305,22 +4726,15 @@ class MeteringManagement(ToolBase):
             client, page, page_size, filters=filters
         )
 
-        allowed = await get_policy_cache().get_allowed_metric_providers(
-            client, getattr(ctx, "tenant_id", None) if ctx else None
-        )
-        pre_filter_count = len(transactions)
-        transactions = filter_transactions_by_policy(transactions, allowed)
-        pagination_info["total_found"] = len(transactions)
-        if pre_filter_count > 0 and len(transactions) == 0:
-            pagination_info["has_more"] = False
-
         response_text = "**Recent Transactions**\n\n"
         response_text += f"**Page**: {pagination_info['page']} (size: {pagination_info['page_size']})\n"
         response_text += f"**Found**: {pagination_info['total_found']} transactions\n"
         if pagination_info.get('has_more'):
             response_text += f"**More Available**: Use page={pagination_info['page'] + 1} for next page\n"
         response_text += _coding_assistant_scope_note(
-            bool(filters.get("includeCodingAssistants"))
+            bool(filters.get("includeCodingAssistants")),
+            transactions,
+            exact_id_lookup=bool(filters and ("transactionId" in filters or "traceId" in filters)),
         )
         response_text += "\n"
 
@@ -4456,6 +4870,7 @@ class MeteringManagement(ToolBase):
         # Add each section using dedicated helper methods
         details += self._format_cost_breakdown(data)
         details += self._format_cache_tokens(data)
+        details += self._format_reasoning_tokens(data)
         details += self._format_model_execution(data)
         details += self._format_performance_metrics(data)
         details += self._format_attribution_details(data)
@@ -4587,6 +5002,18 @@ class MeteringManagement(ToolBase):
 
         return details
 
+    def _format_reasoning_tokens(self, data: Dict[str, Any]) -> str:
+        """Format the reasoning-token count a submit stores (BACK-4794).
+
+        A top-level line, not part of the cache section: reasoning tokens are
+        not a cache figure. 0 is a real reading and renders; an absent or null
+        count renders nothing rather than a 0 nobody reported.
+        """
+        count = data.get("reasoningTokenCount")
+        if count is None:
+            return ""
+        return f"- **Reasoning Tokens**: {count}\n"
+
     def _format_model_execution(self, data: Dict[str, Any]) -> str:
         """Format where the model actually ran and how hard it was asked to think.
 
@@ -4613,20 +5040,25 @@ class MeteringManagement(ToolBase):
         return details
 
     def _format_performance_metrics(self, data: Dict[str, Any]) -> str:
-        """Format performance metrics section with proper units."""
+        """Format performance metrics section with proper units.
+
+        Each metric is gated on `is not None`, like `_format_cost_breakdown`: a
+        0 ms time to first token (a non-streamed call) or a 0 duration is a
+        reported value, and a truthy gate would hide it as if it were missing.
+        """
         perf_fields = ['requestDuration', 'timeToFirstToken', 'tokensPerMinute']
-        if not any(data.get(field) for field in perf_fields):
+        if not any(data.get(field) is not None for field in perf_fields):
             return ""
 
         details = "- **Performance Metrics**:\n"
 
-        if data.get('requestDuration'):
+        if data.get('requestDuration') is not None:
             details += f"  - **Duration**: {data.get('requestDuration')}ms\n"
 
-        if data.get('timeToFirstToken'):
+        if data.get('timeToFirstToken') is not None:
             details += f"  - **Time to First Token**: {data.get('timeToFirstToken')}ms\n"
 
-        if data.get('tokensPerMinute'):
+        if data.get('tokensPerMinute') is not None:
             details += f"  - **Tokens per Minute**: {data.get('tokensPerMinute')}\n"
 
         return details
@@ -4944,8 +5376,6 @@ class MeteringManagement(ToolBase):
         self,
         client: ReveniumClient,
         arguments: Dict[str, Any],
-        *,
-        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Analyze recent transactions from Revenium reporting API to identify field mapping issues.
 
@@ -4960,11 +5390,8 @@ class MeteringManagement(ToolBase):
         re-raises for `standardized_tool_execution` so the result carries
         isError. This one does the same.
         """
-        # Sample size. Only `page_size` is declared on the manage_metering
-        # closure, and FastMCP derives the accepted arguments from that
-        # signature, so it is the only spelling that can reach this handler.
-        # (`recent_page_size`, which _handle_lookup_recent_transactions prefers,
-        # is not declared either - see its schema description.)
+        # Sample size. `recent_page_size` can still arrive through the params
+        # bag, but only _handle_lookup_recent_transactions honours it.
         sample_size = arguments.get("page_size", 20)
 
         # PAGINATION VALIDATION: the endpoint truncates a page at 100.
@@ -4974,55 +5401,29 @@ class MeteringManagement(ToolBase):
                 "automatically capping to 100"
             )
             sample_size = 100
+        elif sample_size < 1:
+            logger.warning(
+                f"Requested page_size {sample_size} is below the minimum of 1, raising it to 1"
+            )
+            sample_size = 1
 
         # Delegate to the shared paginated fetch helper to avoid duplicating
         # request construction, filter application, and response-structure parsing.
         endpoint = get_endpoint_path("completions")  # Retained for report output below
         filters = _extract_completions_filters(arguments)
-        scope_note = _coding_assistant_scope_note(
-            bool(filters.get("includeCodingAssistants"))
-        )
         transactions, _ = await self._fetch_recent_transactions_paginated(
             client, page=0, page_size=sample_size, filters=filters or None
         )
+        scope_note = _coding_assistant_scope_note(
+            bool(filters.get("includeCodingAssistants")),
+            transactions,
+            exact_id_lookup=bool(filters and ("transactionId" in filters or "traceId" in filters)),
+        )
         sampled = len(transactions)
 
-        # Same tenant provider policy the other two completions reads apply.
-        # This action reports raw field values, so skipping the filter here
-        # would make it the one read path that surfaces coding-assistant
-        # records the tenant is not subscribed to.
-        allowed = await get_policy_cache().get_allowed_metric_providers(
-            client, getattr(ctx, "tenant_id", None) if ctx else None
-        )
-        transactions = filter_transactions_by_policy(transactions, allowed)
-
         total_found = len(transactions)
-        excluded_by_policy = sampled - total_found
 
         if total_found == 0:
-            # Two very different answers share this branch, and conflating
-            # them is how the tool ends up telling someone their data never
-            # arrived. Only one page is fetched, so a page made entirely of
-            # records outside the tenant's provider scope leaves nothing to
-            # analyse while eligible records may sit on later pages.
-            if excluded_by_policy:
-                return [
-                    TextContent(
-                        type="text",
-                        text=(
-                            "**No Transactions In Scope To Analyze**\n\n"
-                            + scope_note
-                            + f"\nSampled {sampled} transaction(s) from the reporting API; "
-                            f"all {excluded_by_policy} were excluded by the tenant provider "
-                            "policy (coding-assistant providers the tenant is not subscribed "
-                            "to), leaving none to analyze.\n\n"
-                            "This is NOT an empty reporting API: only the first page is "
-                            "sampled, so eligible transactions may sit on later pages. Raise "
-                            "`page_size` (up to 100) or narrow with a filter such as "
-                            "`provider` to reach them."
-                        ),
-                    )
-                ]
             return [
                 TextContent(
                     type="text",
@@ -5065,15 +5466,6 @@ class MeteringManagement(ToolBase):
         report = "# **Recent Transactions Field Analysis**\n\n"
         report += f"**Analysis Date:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
         report += f"**Transactions Sampled:** {sampled}\n"
-        # Stated whenever the policy removed anything, so every percentage
-        # below has a visible denominator: a caller comparing this count
-        # with lookup_recent_transactions must be able to see the gap
-        # rather than infer missing data.
-        if excluded_by_policy:
-            report += (
-                f"**Excluded By Policy:** {excluded_by_policy} (coding-assistant "
-                "providers not in the tenant's scope)\n"
-            )
         report += f"**Transactions Analyzed:** {total_found}\n"
         report += f"**API Endpoint:** `{endpoint}`\n"
         report += scope_note + "\n"
@@ -5345,6 +5737,9 @@ get_field_documentation()
 - `query_source` (optional) - Which subsystem of the coding assistant issued the call
 - `speed` (optional) - Speed mode the call ran in, e.g. `fast` or `normal`
 - `subagent_type` (optional) - Subagent type that made the call, e.g. `general-purpose`
+- `reasoning_tokens` (optional) - Reasoning tokens, sent as `reasoningTokenCount`; 0 when omitted
+- `cache_creation_tokens` (optional) - Prompt-cache write tokens, sent as `cacheCreationTokenCount`; 0 when omitted
+- `cache_read_tokens` (optional) - Prompt-cache read tokens, sent as `cacheReadTokenCount`; 0 when omitted
 
 ### **Field Validation Rules**
 
@@ -5372,6 +5767,7 @@ get_field_documentation()
 - `speed`: String, 1-16 characters matching `^[A-Za-z0-9_-]+$` (e.g. `fast`) — open vocabulary
 - `query_source`, `subagent_type`: String, 1-128 characters matching `^[A-Za-z0-9._:-]+$` (e.g. `repl_main_thread`, `general-purpose`) — open vocabulary
 - `prompt_length`: Non-negative integer (character count)
+- `reasoning_tokens`, `cache_creation_tokens`, `cache_read_tokens`: Non-negative integer (≥ 0, ≤ 10,000,000)
 - `response_quality_score`: Float between 0.0 and 1.0 (inclusive)
 - `is_streamed`: Boolean (true/false, accepts string conversion)
 - `time_to_first_token`: Non-negative integer in milliseconds (≥ 0, ≤ 60,000ms)
@@ -5502,16 +5898,16 @@ for one that wrote nothing to the cache.
 
 ## **Pagination**
 
-- **Revenium API supports up to 1,000 transactions per request**
-- **Auto-pagination searches up to 5,000 transactions by default**
+- **Revenium API supports up to 100 transactions per request**
+- **lookup_transactions filters by transaction id on the server and searches at most 10 pages**
 
 ### **Unified Lookup Best Practices**
 ```bash
 # OPTIMAL: Single transaction lookup
 lookup_transactions(transaction_ids=["tx_abc123"])       # Automatically optimized
 
-# BATCH: Multiple transaction lookup
-lookup_transactions(transaction_ids=["tx_abc", "tx_de"]) # Efficient batch processing
+# BATCH: Multiple transaction lookup (at most 50 ids per call)
+lookup_transactions(transaction_ids=["tx_abc", "tx_de"]) # Every id searched together, once per round
 
 # CUSTOM: Lookup with custom settings
 lookup_transactions(transaction_ids=["tx_abc123"], max_retries=5)
@@ -5519,9 +5915,10 @@ lookup_transactions(transaction_ids=["tx_abc123"], max_retries=5)
 ## **Search Options**
 - `search_page_range` (integer or array) - Pages to search for lookup_transactions:
   - Integer: Search pages 0 to N-1 (e.g., 5 = first 5 pages)
-  - Array: Search specific range [start, end] (e.g., [10, 20] = pages 10-20)
-  - Default: 5 pages (5,000 transactions)
-- `page_size` (integer) - Transactions per API call (1-1000):
+  - Array: Search specific range [start, end] (e.g., [10, 19] = pages 10-19)
+  - Default: 10 pages, and at most 10: a larger value is lowered to 10 and the answer says so
+  - The lookup filters by transaction id on the server, so the first page normally holds the match; a range that starts past page 0 skips it
+- `page_size` (integer) - Transactions per API call (1-100, default: 100):
 - `early_termination` (boolean) - Stop searching when target transaction found:
   - true: Stop immediately when transaction found (faster)
   - false: Search all specified pages (complete coverage)
@@ -5529,10 +5926,12 @@ lookup_transactions(transaction_ids=["tx_abc123"], max_retries=5)
 - `return_transaction_data` (string|boolean) - Transaction data detail level:
   - "no": Show only verification status (✅ Found/❌ Not Found) - default
   - "summary": Show core fields (Model, Provider, Input/Output Tokens, plus Trace Type when the transaction carries one)
-  - "full": Show comprehensive details including metadata, costs, attribution, cache tokens, session tracking (traceId, traceType, traceName, parentTransactionId, operationType, operationSubtype, clientSurface, agenticJobId, agenticJobName, agenticJobType, agenticJobVersion, ticketId) and prompt context (promptId, promptLength, querySource, speed, subagentType)
+  - "full": Show comprehensive details including metadata, costs, attribution, cache tokens, reasoning tokens, session tracking (traceId, traceType, traceName, parentTransactionId, operationType, operationSubtype, clientSurface, agenticJobId, agenticJobName, agenticJobType, agenticJobVersion, ticketId) and prompt context (promptId, promptLength, querySource, speed, subagentType)
   - Boolean support: true="full", false="no"
-- `wait_seconds` (integer) - Wait time for transaction verification (0-300):
-  - Default: 30 seconds
+- `wait_seconds` (integer) - Most seconds a lookup spends waiting between searches for a transaction not visible yet; turns polling on (0-300):
+  - Sent alone, it also sets how many searches fit in it at retry_interval (default 15 s)
+  - When not sent, the wait is the pauses max_retries rounds take at retry_interval: (3 - 1) × 15 = 30 seconds by default, at most 300
+  - A lookup that sends none of max_retries, retry_interval or wait_seconds searches once and does not wait
 
 ### **Quick Recent Transaction Lookup**
 ```json
@@ -5543,17 +5942,17 @@ lookup_transactions(transaction_ids=["tx_abc123"], max_retries=5)
   "search_page_range": 5
 }
 ```
-### **Deep Historical Transaction Search**
+### **Widest Transaction Search**
 ```json
 {
   "action": "lookup_transactions",
   "transaction_ids": ["tx_abc123def456"],
-  "page_size": 1000,
-  "search_page_range": [20, 50],
+  "page_size": 100,
+  "search_page_range": 10,
   "early_termination": true
 }
 ```
-*Searches pages 20-50 (31,000 transactions) for historical lookup with early termination*
+*Searches pages 0-9 (up to 1,000 transactions, the most one lookup searches) with early termination. The lookup filters by transaction id on the server, so the first page normally holds the match. A range that starts past page 0, such as [20, 29], skips that page and answers Not Found for a transaction that exists.*
 
 ## **Recent Transactions Lookup (No IDs Required)**
 Browse recent transactions without needing specific transaction IDs. Perfect for discovery and monitoring.
@@ -5588,7 +5987,7 @@ Browse recent transactions without needing specific transaction IDs. Perfect for
 
 ### **Parameters for Recent Transactions**
 - `page` (optional): Page number (0-based, default: 0)
-- `page_size` (optional): Transactions per page (1-50, default: 20)
+- `page_size` (optional): Transactions per page (1-100, default: 20)
 - `return_transaction_data` (optional): Detail level - "no", "summary", "full" (default: "summary"); boolean true selects "full"
 - `include_coding_assistants` (optional): Include coding-assistant records such as Claude Code and Gemini CLI (default: true)
 
@@ -5618,8 +6017,12 @@ attribution actually landing?" - it is a data-quality check, not an analytics ag
 `lookup_transactions`, `lookup_recent_transactions` and `analyze_recent_transactions` INCLUDE
 coding-assistant records (Claude Code, Gemini CLI, and similar) by default, matching what the
 AI insights tool returns, so a check of whether coding-assistant data arrived cannot answer "no"
-for data that landed. Pass `include_coding_assistants=false` for the excluded view. Every
-response from these actions states which records were in scope.
+for data that landed.
+Pass `include_coding_assistants=false` to exclude assistants billed as seat subscriptions;
+assistants your team pays API rates for (`apiRateProviders`, readable with `manage_customers`
+get_coding_assistant_billing_settings) stay in the results. A lookup by transaction id or
+trace id (`lookup_transactions`, or a `transaction_id` or `trace_id` filter) returns the record
+whatever the flag says. Every response from these actions states which records were in scope.
 
 ## **Next Steps**
 1. Use `lookup_transactions()` to find and verify transactions
@@ -5679,12 +6082,10 @@ import aiohttp
 import os
 from typing import Dict, Any
 
-from ..constants import DEFAULT_BASE_URL
-
 class ReveniumMeteringClient:
     def __init__(self):
         self.api_key = os.getenv("REVENIUM_API_KEY")
-        self.base_url = os.getenv("REVENIUM_BASE_URL", DEFAULT_BASE_URL)
+        self.base_url = os.getenv("REVENIUM_BASE_URL", "https://api.revenium.ai")
 
     async def submit_transaction(self, transaction_data: Dict[str, Any]) -> Dict[str, Any]:
         # api.revenium.ai uses x-api-key; Bearer is for app.revenium.ai/api/v2
@@ -5815,6 +6216,9 @@ main();
 - `duration_ms`: Integer (≥ 0, ≤ 10,000,000) - zero is accepted (republished and synthetic traces carry no measured duration)
 
 ### **Optional Fields**
+- `reasoning_tokens`: Integer (≥ 0, ≤ 10,000,000) - 0 when omitted
+- `cache_creation_tokens`: Integer (≥ 0, ≤ 10,000,000) - 0 when omitted
+- `cache_read_tokens`: Integer (≥ 0, ≤ 10,000,000) - 0 when omitted
 - **String fields**: `organization_name`, `task_type`, `agent`, `trace_id`, `product_name`, `subscription_id`, `stop_reason`
   - Length: 1-500 chars, no `<>\"'&`
 - **Capped string fields**: `ticket_id` (1-256 chars), `skill_name` / `skill_plugin_name` / `skill_marketplace_name` (1-256 chars), `skill_invocation_trigger` (1-32 chars)
@@ -5827,7 +6231,7 @@ main();
 ### **Timestamp Format**
 - Format: ISO UTC with milliseconds `"2025-06-16T15:30:45.123Z"`
 - Fields: `request_time`, `response_time`, `completion_start_time`
-- Auto-populated if not provided
+- Auto-populated if not provided (from `request_time` + `duration_ms` / `time_to_first_token` when `request_time` is given, else the current time)
 
 ### **Subscriber Object**
 ```json
@@ -5917,6 +6321,7 @@ report the flag. The pin is read-only here - it is set by a platform operator.
 - `response_quality_score` (float, 0.0-1.0)
 - `is_streamed` (boolean)
 - `time_to_first_token` (integer, ≤ 60,000ms)
+- `reasoning_tokens`, `cache_creation_tokens`, `cache_read_tokens` (integer, ≥ 0, ≤ 10,000,000) - reasoning and prompt-cache token counts, sent as `reasoningTokenCount`, `cacheCreationTokenCount`, `cacheReadTokenCount`; 0 when omitted
 
 ## **Subscriber Object**
 ```json
@@ -5930,14 +6335,14 @@ report the flag. The pin is read-only here - it is set by a platform operator.
 ## **Timestamp Fields**
 - `request_time`, `response_time`, `completion_start_time` (string)
 - Format: `"2025-06-16T15:30:45.123Z"` (ISO UTC with 'Z')
-- Auto-populated if not provided
+- Auto-populated if not provided: with `request_time` given, an omitted `response_time` is `request_time` + `duration_ms` and an omitted `completion_start_time` is `request_time` + `time_to_first_token`; otherwise each is the current time
 
 ## **Pagination Control**
-- `search_page_range` (integer/array) - Pages to search (default: 5)
-- `page_size` (integer) - Transactions per call (1-1000, default: 1000)
+- `search_page_range` (integer/array) - Pages to search (default: 10, at most 10)
+- `page_size` (integer) - Transactions per call (1-100, default: 100)
 - `early_termination` (boolean) - Stop when found (default: true)
 - `return_transaction_data` (string|boolean) - Detail level: "no" (default), "summary", "full"; true="full"
-- `wait_seconds` (integer) - Wait time (0-300, default: 30)
+- `wait_seconds` (integer) - Most seconds a lookup waits between searches; turns polling on (0-300; when not sent, the pauses max_retries rounds take, 30 by default; a lookup that sends none of max_retries, retry_interval or wait_seconds searches once and does not wait)
 
 ## **Field Groups**
 - **Basic**: `model`, `provider`, `input_tokens`, `output_tokens`, `duration_ms`
@@ -6102,7 +6507,6 @@ Use `validate()` before submission."""
                     "Pins are set by a platform operator and are read-only here.\n"
                 )
                 text += '**💡 Tip**: Use `search_ai_models(query="<provider>")` to find specific models\n'
-                text += '**💡 Tip**: Use `get_ai_model(model_id="<id>")` for detailed model information'
 
                 return [TextContent(type="text", text=text)]
             else:
@@ -6117,11 +6521,8 @@ Use `validate()` before submission."""
             # Re-raise ToolError exceptions without modification
             # This preserves helpful error messages with specific suggestions
             raise
-        except Exception as e:
-            logger.error(f"Error listing AI models: {e}")
-            from ..common.error_handling import format_error_response
-
-            return format_error_response(e, "listing AI models")
+        except ReveniumAPIError as e:
+            raise api_error_refusal(e, "listing AI models") from e
 
     async def _handle_search_ai_models(
         self,
@@ -6224,9 +6625,6 @@ Use `validate()` before submission."""
                     "list; `no` means they track upstream; `unavailable` means this "
                     "server does not report the flag. The pin is read-only here.\n\n"
                 )
-                text += (
-                    '**Tip**: Use `get_ai_model(model_id="<id>")` for complete model details'
-                )
 
                 return [TextContent(type="text", text=text)]
             else:
@@ -6237,11 +6635,8 @@ Use `validate()` before submission."""
                     )
                 ]
 
-        except Exception as e:
-            logger.error(f"Error searching AI models: {e}")
-            from ..common.error_handling import format_error_response
-
-            return format_error_response(e, "searching AI models")
+        except ReveniumAPIError as e:
+            raise api_error_refusal(e, "searching AI models") from e
 
     async def _handle_get_supported_providers(
         self,
@@ -6337,11 +6732,8 @@ Use `validate()` before submission."""
                     )
                 ]
 
-        except Exception as e:
-            logger.error(f"Error getting supported providers: {e}")
-            from ..common.error_handling import format_error_response
-
-            return format_error_response(e, "getting supported providers")
+        except ReveniumAPIError as e:
+            raise api_error_refusal(e, "getting supported providers") from e
 
     async def _catalog_advisory(
         self, client: ReveniumClient, arguments: Dict[str, Any]
@@ -6601,11 +6993,8 @@ Use `validate()` before submission."""
                 return [TextContent(type="text", text=text)]
 
 
-        except Exception as e:
-            logger.error(f"Error validating model/provider: {e}")
-            from ..common.error_handling import format_error_response
-
-            return format_error_response(e, "validating model/provider")
+        except ReveniumAPIError as e:
+            raise api_error_refusal(e, "validating model/provider") from e
 
     async def _handle_estimate_transaction_cost(
         self,
@@ -6725,11 +7114,8 @@ Use `validate()` before submission."""
                     )
                 ]
 
-        except Exception as e:
-            logger.error(f"Error estimating transaction cost: {e}")
-            from ..common.error_handling import format_error_response
-
-            return format_error_response(e, "estimating transaction cost")
+        except ReveniumAPIError as e:
+            raise api_error_refusal(e, "estimating transaction cost") from e
 
     async def _handle_get_examples(
         self, arguments: Optional[Dict[str, Any]] = None
@@ -6836,7 +7222,9 @@ Use `validate()` before submission."""
                 '  "provider": "anthropic",\n'
                 '  "input_tokens": 2000,\n'
                 '  "output_tokens": 1200,\n'
-                '  "duration_ms": 3500\n'
+                '  "duration_ms": 3500,\n'
+                '  "cache_creation_tokens": 1024,\n'
+                '  "cache_read_tokens": 4096\n'
                 "}\n"
                 "```\n\n"
                 "### **3. Google Gemini Transaction**\n"
@@ -6970,21 +7358,22 @@ Use `validate()` before submission."""
                 '  "search_page_range": 2\n'
                 "}\n"
                 "```\n"
-                "*Searches only first 200 transactions (2 pages × 100) for fast lookup*\n\n"
+                "*Searches up to 2 pages; the server filters by id, so the match is normally on the first*\n\n"
                 "### **Comprehensive Historical Lookup**\n"
                 "```json\n"
                 "{\n"
                 '  "action": "lookup_transactions",\n'
                 '  "transaction_ids": ["tx_abc123"],\n'
-                '  "page_size": 1000,\n'
-                '  "search_page_range": 50,\n'
+                '  "page_size": 100,\n'
+                '  "search_page_range": 10,\n'
                 '  "max_retries": 5\n'
                 "}\n"
                 "```\n"
-                "*Searches up to 50,000 transactions (50 pages × 1,000) for comprehensive lookup*\n\n"
+                f"*Searches up to {_LOOKUP_MAX_PAGES * _LOOKUP_MAX_PAGE_SIZE:,} transactions ({_LOOKUP_MAX_PAGES} pages × {_LOOKUP_MAX_PAGE_SIZE:,}), the most one lookup searches*\n\n"
                 "**🚀 Performance Notes:**\n"
-                "- **Auto-pagination**: Searches up to 50,000 recent transactions by default\n"
-                "- **Maximum efficiency**: 1,000 transactions per API call (maximum supported)\n"
+                f"- **Server-side filtering**: The lookup filters by transaction id on the server and searches at most {_LOOKUP_MAX_PAGES} pages\n"
+                f"- **Batches**: Up to {_LOOKUP_MAX_IDS} ids per call, all searched together once per round, with one pause between rounds\n"
+                f"- **Maximum efficiency**: {_LOOKUP_MAX_PAGE_SIZE} transactions per API call (the platform's page cap)\n"
                 "- **Smart search**: Early termination when transactions found\n"
                 "- **Historical coverage**: Comprehensive search across transaction history\n\n"
                 "## **Pagination Performance Guide**\n\n"
@@ -6995,13 +7384,13 @@ Use `validate()` before submission."""
                 "**Performance**: Fast response, minimal API calls\n\n"
                 "### **Standard Searches (Recent Days)**\n"
                 "**Use Case**: Looking for transactions from last few days\n"
-                "**Parameters**: `page_size: 500`, `search_page_range: 10`\n"
-                "**Example**: `page_size: 500, search_page_range: 10` = 5,000 transactions\n"
+                "**Parameters**: `page_size: 100`, `search_page_range: 5`\n"
+                "**Example**: `page_size: 100, search_page_range: 5` = 500 transactions\n"
                 "**Performance**: Balanced speed and coverage\n\n"
                 "### **Comprehensive Searches (Historical)**\n"
                 "**Use Case**: Deep historical lookup or large-scale verification\n"
-                "**Parameters**: `page_size: 1000`, `search_page_range: 50`\n"
-                "**Example**: `page_size: 1000, search_page_range: 50` = 50,000 transactions\n"
+                f"**Parameters**: `page_size: {_LOOKUP_MAX_PAGE_SIZE}`, `search_page_range: {_LOOKUP_MAX_PAGES}` (the limits)\n"
+                f"**Example**: `page_size: {_LOOKUP_MAX_PAGE_SIZE}, search_page_range: {_LOOKUP_MAX_PAGES}` = {_LOOKUP_MAX_PAGES * _LOOKUP_MAX_PAGE_SIZE:,} transactions\n"
                 "**Performance**: Maximum coverage, optimal API efficiency\n\n"
                 "## **Transaction Lookup and Status**\n\n"
                 "### **Single Transaction Lookup (Recommended)**\n"
@@ -7020,18 +7409,20 @@ Use `validate()` before submission."""
                 '  "search_page_range": 5\n'
                 "}\n"
                 "```\n"
-                "*Searches first 500 transactions (5 pages × 100) for fast recent lookup*\n\n"
-                "### **Deep Historical Transaction Search**\n"
+                "*Searches up to 5 pages; the server filters by id, so the match is normally on the first*\n\n"
+                "### **Widest Transaction Search**\n"
                 "```json\n"
                 "{\n"
                 '  "action": "lookup_transactions",\n'
                 '  "transaction_ids": ["tx_abc123def456"],\n'
-                '  "page_size": 1000,\n'
-                '  "search_page_range": [20, 50],\n'
+                '  "page_size": 100,\n'
+                f'  "search_page_range": {_LOOKUP_MAX_PAGES},\n'
                 '  "early_termination": true\n'
                 "}\n"
                 "```\n"
-                "*Searches pages 20-50 (31,000 transactions) for historical lookup with early termination*\n\n"
+                f"*Searches pages 0-{_LOOKUP_MAX_PAGES - 1} (up to {_LOOKUP_MAX_PAGES * _LOOKUP_MAX_PAGE_SIZE:,} transactions, the most one lookup searches) with early termination. "
+                "The lookup filters by transaction id on the server, so the first page normally holds the match. "
+                "A range that starts past page 0, such as [20, 29], skips that page and answers Not Found for a transaction that exists.*\n\n"
                 "### **Check Local Transaction Status**\n"
                 "```json\n"
                 "{\n"
@@ -7127,7 +7518,7 @@ Use `validate()` before submission."""
                 '  "output_tokens": 600,\n'
                 '  "duration_ms": 1800,\n'
                 '  "request_time": "2025-03-02T15:30:45.123Z"\n'
-                "  // response_time and completion_start_time will be auto-populated\n"
+                "  // response_time = request_time + duration_ms, completion_start_time = request_time + time_to_first_token\n"
                 "  // time_to_first_token will be auto-calculated (180ms)\n"
                 "}\n"
                 "```\n\n"
@@ -7192,7 +7583,7 @@ Use `validate()` before submission."""
                 "```\n\n"
                 "### **Troubleshooting Tips**\n"
                 "- **Validation errors**: Use validate() action to test before submit_ai_transaction()\n"
-                "- **Missing transactions**: Increase wait_seconds (try 60-90s) and max_retries (3-5)\n"
+                f"- **Missing transactions**: Increase wait_seconds (try 60-90s, at most {_LOOKUP_MAX_WAIT_SECONDS}) and max_retries (3-5, at most {_LOOKUP_MAX_ROUNDS})\n"
                 "- **Field conflicts**: Check field compatibility matrix above\n"
                 "- **Subscriber format**: Use new object structure, not individual fields\n"
                 "- **Model/provider**: Always validate combination with validate_model_provider() first",
@@ -7949,19 +8340,19 @@ Use `validate()` before submission."""
                 name="Transaction Lookup by ID",
                 description="Find specific transactions by their IDs. Requires transaction IDs and searches efficiently using session cache and API search.",
                 parameters={
-                    "transaction_ids": "list (required) - Transaction IDs to lookup",
-                    "max_retries": "int (optional) - Maximum retry attempts (default: 3)",
-                    "retry_interval": "int (optional) - Seconds between retries (default: 15)",
-                    "search_page_range": "int|array (optional) - Pages to search (default: 50)",
-                    "page_size": "int (optional) - Transactions per page (default: 1000)",
+                    "transaction_ids": f"list (required) - Transaction IDs to lookup, at most {_LOOKUP_MAX_IDS} per call",
+                    "max_retries": f"int (optional) - Search rounds for ids not visible yet (default: {_LOOKUP_DEFAULT_ROUNDS}, 1-{_LOOKUP_MAX_ROUNDS})",
+                    "retry_interval": f"int (optional) - Seconds between search rounds (default: {_LOOKUP_DEFAULT_RETRY_INTERVAL}, 0-{_LOOKUP_MAX_RETRY_INTERVAL})",
+                    "wait_seconds": f"int (optional) - Most seconds of waiting between searches; turns polling on (0-{_LOOKUP_MAX_WAIT_SECONDS})",
+                    "search_page_range": f"int|array (optional) - Pages to search (default: {_LOOKUP_DEFAULT_PAGES}, at most {_LOOKUP_MAX_PAGES})",
+                    "page_size": f"int (optional) - Transactions per page (default: {_LOOKUP_DEFAULT_PAGE_SIZE}, at most {_LOOKUP_MAX_PAGE_SIZE})",
                     "early_termination": "bool (optional) - Stop when found (default: true)",
-                    "include_coding_assistants": "bool (optional) - Include coding-assistant records such as Claude Code and Gemini CLI (default: true)",
+                    "include_coding_assistants": "bool (optional) - Accepted, but has no effect: a lookup by transaction id returns the record whether or not it comes from a coding assistant",
                 },
                 examples=[
                     "lookup_transactions(transaction_ids=['tx_abc123'])  # Single transaction lookup",
                     "lookup_transactions(transaction_ids=['tx_abc123', 'tx_def456'])  # Batch lookup",
                     "lookup_transactions(transaction_ids=['tx_abc123'], max_retries=5)  # With custom retries",
-                    "lookup_transactions(transaction_ids=['tx_abc123'], include_coding_assistants=False)  # Exclude coding assistants",
                 ],
             ),
             ToolCapability(
@@ -7969,7 +8360,7 @@ Use `validate()` before submission."""
                 description="Browse recent transactions with pagination. No transaction IDs required - perfect for discovery and monitoring.",
                 parameters={
                     "page": "int (optional) - Page number for pagination (0-based, default: 0)",
-                    "page_size": "int (optional) - Number of transactions per page (1-50, default: 20)",
+                    "page_size": "int (optional) - Number of transactions per page (1-100, default: 20)",
                     "return_transaction_data": "str|bool (optional) - Detail level: 'no', 'summary', 'full' (default: 'summary'); true selects 'full'",
                     "include_coding_assistants": "bool (optional) - Include coding-assistant records such as Claude Code and Gemini CLI (default: true)",
                 },
@@ -7977,7 +8368,7 @@ Use `validate()` before submission."""
                     "lookup_recent_transactions()  # Get first 20 recent transactions",
                     "lookup_recent_transactions(page=1, page_size=10)  # Get next 10 transactions",
                     "lookup_recent_transactions(return_transaction_data='full')  # Get detailed transaction data",
-                    "lookup_recent_transactions(include_coding_assistants=False)  # Exclude coding assistants",
+                    "lookup_recent_transactions(include_coding_assistants=False)  # Exclude assistants billed as seat subscriptions",
                 ],
             ),
             ToolCapability(
@@ -8072,6 +8463,18 @@ Use `validate()` before submission."""
                     "type": "integer",
                     "description": "Request duration in milliseconds - required for submit_ai_transaction (>= 0, <= 10,000,000)",
                 },
+                "reasoning_tokens": {
+                    "type": "integer",
+                    "description": "Reasoning tokens for submit_ai_transaction, sent as reasoningTokenCount (>= 0, <= 10,000,000); defaults to 0 when omitted",
+                },
+                "cache_creation_tokens": {
+                    "type": "integer",
+                    "description": "Prompt-cache write tokens for submit_ai_transaction, sent as cacheCreationTokenCount (>= 0, <= 10,000,000); defaults to 0 when omitted",
+                },
+                "cache_read_tokens": {
+                    "type": "integer",
+                    "description": "Prompt-cache read tokens for submit_ai_transaction, sent as cacheReadTokenCount (>= 0, <= 10,000,000); defaults to 0 when omitted",
+                },
                 # Enterprise Attribution Fields (optional)
                 "organization_name": {
                     "type": "string",
@@ -8141,13 +8544,12 @@ Use `validate()` before submission."""
                 # Pagination and Search Control Parameters
                 "search_page_range": {
                     "type": ["integer", "array"],
-                    "description": "Pages to search for lookup_transactions. Integer for 0 to N-1 pages (e.g., 5 = first 5 pages), or [start, end] array for specific range (e.g., [10, 20]). Default: 5 pages (5,000 transactions)",
+                    "description": f"Pages to search for lookup_transactions. Integer for 0 to N-1 pages (e.g., 5 = first 5 pages), or [start, end] array for specific range (e.g., [10, 19]). Default {_LOOKUP_DEFAULT_PAGES} pages, at most {_LOOKUP_MAX_PAGES}: a larger value is lowered to {_LOOKUP_MAX_PAGES} and the answer says so. The lookup filters by transaction id on the server, so the first page normally holds the match, and a range that starts past page 0 skips it.",
                 },
                 "page_size": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 1000,
-                    "description": "Transactions per API call for pagination. For lookup_transactions: use smaller values (50-100) for quick recent searches, larger values (500-1000) for comprehensive historical searches, default 1000. This is also the only accepted page/sample size for the two recent-transactions actions, where the endpoint caps a page at 100: lookup_recent_transactions rejects a value above 100 (default 20), analyze_recent_transactions caps it at 100 (default 20).",
+                    "description": "Transactions per API call for pagination. For lookup_transactions: 1-100 (the platform serves at most 100 rows a page), default 100; a value outside the range is moved to the nearest limit and the answer says so. This is also the only accepted page/sample size for the two recent-transactions actions, where the endpoint caps a page at 100: lookup_recent_transactions refuses a value above 100 (default 20), analyze_recent_transactions caps it at 100 (default 20).",
                 },
                 "early_termination": {
                     "type": "boolean",
@@ -8164,9 +8566,7 @@ Use `validate()` before submission."""
                 },
                 "wait_seconds": {
                     "type": "integer",
-                    "minimum": 0,
-                    "maximum": 300,
-                    "description": "Wait time for transaction verification. Default: 30 seconds",
+                    "description": f"Most seconds a lookup spends waiting between searches for a transaction not visible yet; turns polling on. 0-{_LOOKUP_MAX_WAIT_SECONDS}. Sent alone, it also sets how many searches fit in it at retry_interval. When not sent, the wait is the pauses max_retries rounds take at retry_interval (({_LOOKUP_DEFAULT_ROUNDS} - 1) x {_LOOKUP_DEFAULT_RETRY_INTERVAL} = {(_LOOKUP_DEFAULT_ROUNDS - 1) * _LOOKUP_DEFAULT_RETRY_INTERVAL} seconds by default, at most {_LOOKUP_MAX_WAIT_SECONDS}). A lookup that sends none of max_retries, retry_interval or wait_seconds searches once and does not wait. A value outside the range is moved to the nearest limit and the answer says so - used with lookup_transactions",
                 },
                 # Integration Guide Parameters
                 "language": {
@@ -8193,27 +8593,22 @@ Use `validate()` before submission."""
                 "transaction_ids": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Array of transaction IDs to lookup - required for lookup_transactions",
+                    "maxItems": _LOOKUP_MAX_IDS,
+                    "description": f"Array of transaction IDs to lookup - required for lookup_transactions, at most {_LOOKUP_MAX_IDS} per call (split larger batches)",
                 },
                 "max_retries": {
                     "type": "integer",
-                    "description": "Maximum retry attempts for failed lookups (default: 3) - used with lookup_transactions",
+                    "description": f"Search rounds for transactions not visible yet (default: {_LOOKUP_DEFAULT_ROUNDS}, 1-{_LOOKUP_MAX_ROUNDS}); turns polling on. Every pending id is searched once per round. A value outside the range is moved to the nearest limit and the answer says so - used with lookup_transactions",
                 },
                 "retry_interval": {
                     "type": "integer",
-                    "description": "Seconds between retry attempts (default: 15) - used with lookup_transactions",
+                    "description": f"Seconds between search rounds (default: {_LOOKUP_DEFAULT_RETRY_INTERVAL}, 0-{_LOOKUP_MAX_RETRY_INTERVAL}); 0 means back-to-back rounds, at most {_LOOKUP_MAX_ROUNDS}; turns polling on. A value outside the range is moved to the nearest limit and the answer says so - used with lookup_transactions",
                 },
                 # Recent Transactions Lookup Parameters (lookup_recent_transactions)
                 "page": {
                     "type": "integer",
                     "minimum": 0,
                     "description": "Page number for pagination (0-based, default: 0) - used with lookup_recent_transactions",
-                },
-                "recent_page_size": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 100,
-                    "description": "NOT ACCEPTED by the registered manage_metering tool: this name is absent from the _register_manage_metering closure signature, which is what FastMCP derives the tool's arguments from, so a call passing it is rejected before any handler runs. _handle_lookup_recent_transactions still prefers it when present, which only happens for a direct in-process call. Use page_size - it is what sets the page for lookup_recent_transactions and the sample size for analyze_recent_transactions.",
                 },
                 # Search Filters for lookup_recent_transactions and analyze_recent_transactions.
                 # All filters are sent directly to the completions API; only non-None values are included.
@@ -8234,7 +8629,7 @@ Use `validate()` before submission."""
                 # Coding-assistant scope
                 "include_coding_assistants": {
                     "type": "boolean",
-                    "description": "Whether coding-assistant records (Claude Code, Gemini CLI, and similar) are in scope. Default: true - this MCP includes them so transaction lookups agree with the AI insights tool. Pass false to exclude them, matching the raw API default. Used with lookup_transactions, lookup_recent_transactions and analyze_recent_transactions.",
+                    "description": "Whether coding-assistant records (Claude Code, Gemini CLI, and similar) are in scope. Default: true - this MCP includes them so transaction lookups agree with the AI insights tool. Pass false to exclude assistants billed as seat subscriptions, matching the raw API default; assistants your team pays API rates for (apiRateProviders) stay in the results. Used with lookup_recent_transactions and analyze_recent_transactions. A lookup by transaction id or trace id (lookup_transactions, or a transaction_id or trace_id filter) returns the record whatever this flag says.",
                 },
                 # Cost / performance ranges
                 "total_cost_min": {
@@ -8246,11 +8641,11 @@ Use `validate()` before submission."""
                     "description": "Maximum total transaction cost (inclusive).",
                 },
                 "request_duration_min": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "Minimum request duration in milliseconds (inclusive).",
                 },
                 "request_duration_max": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "Maximum request duration in milliseconds (inclusive).",
                 },
                 # Entity filters (organization_name is declared above in the Enterprise
@@ -8347,11 +8742,11 @@ Use `validate()` before submission."""
                 },
                 "response_time": {
                     "type": "string",
-                    "description": "ISO 8601 UTC timestamp ('Z'-suffixed) of when the response completed. Auto-populated for submit_ai_transaction when omitted.",
+                    "description": "ISO 8601 UTC timestamp ('Z'-suffixed) of when the response completed. When omitted for submit_ai_transaction it is request_time plus duration_ms if request_time is given, otherwise the current time.",
                 },
                 "completion_start_time": {
                     "type": "string",
-                    "description": "ISO 8601 UTC timestamp ('Z'-suffixed) of the first streamed token. Worth sending for streamed responses; auto-populated when omitted.",
+                    "description": "ISO 8601 UTC timestamp ('Z'-suffixed) of the first streamed token. Worth sending for streamed responses. When omitted it is request_time plus time_to_first_token if request_time is given, otherwise the current time.",
                 },
                 "is_streamed": {
                     "type": "boolean",
@@ -8375,19 +8770,19 @@ Use `validate()` before submission."""
                     "description": "Time to first token in milliseconds (>= 0, <= 60000). Auto-calculated from duration_ms if not provided.",
                 },
                 "time_to_first_token_min": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "Minimum time-to-first-token in milliseconds (inclusive).",
                 },
                 "time_to_first_token_max": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "Maximum time-to-first-token in milliseconds (inclusive).",
                 },
                 "mediation_latency_min": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "Minimum mediation latency in milliseconds (inclusive).",
                 },
                 "mediation_latency_max": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "Maximum mediation latency in milliseconds (inclusive).",
                 },
                 # Quality / config ranges
@@ -8432,15 +8827,15 @@ Use `validate()` before submission."""
                 # Distributed Tracing Fields (optional, for observability)
                 "environment": {
                     "type": "string",
-                    "description": "Deployment environment (e.g., 'production', 'staging', 'development'). Falls back to REVENIUM_ENVIRONMENT, ENVIRONMENT, or DEPLOYMENT_ENV env vars. Also used as a search filter for lookup_recent_transactions.",
+                    "description": "Deployment environment (e.g., 'production', 'staging', 'development'). Falls back to REVENIUM_ENVIRONMENT, ENVIRONMENT, or DEPLOYMENT_ENV env vars on a local server only; the hosted server never fills it. Also used as a search filter for lookup_recent_transactions.",
                 },
                 "region": {
                     "type": "string",
-                    "description": "Cloud region or data center (e.g., 'us-east-1', 'eu-west-1'). Falls back to REVENIUM_REGION, AWS_REGION, AZURE_REGION, or GCP_REGION env vars.",
+                    "description": "Cloud region or data center (e.g., 'us-east-1', 'eu-west-1'). Falls back to REVENIUM_REGION, AWS_REGION, AZURE_REGION, or GCP_REGION env vars on a local server only; the hosted server never fills it.",
                 },
                 "credential_alias": {
                     "type": "string",
-                    "description": "Human-readable credential name (e.g., 'prod-api-key'). Falls back to REVENIUM_CREDENTIAL_ALIAS env var.",
+                    "description": "Human-readable credential name (e.g., 'prod-api-key'). Falls back to REVENIUM_CREDENTIAL_ALIAS env var on a local server only; the hosted server never fills it.",
                 },
                 "trace_type": {
                     "type": "string",
@@ -8555,7 +8950,8 @@ Use `validate()` before submission."""
                 "`model`, and more — the full set matches `lookup_transactions` filters "
                 "(see get_field_documentation)\n"
                 "- `includeCodingAssistants` (optional): the API defaults this to false, "
-                "which drops Claude Code / Gemini CLI records. The MCP always sends it "
+                "which drops coding assistants billed as seat subscriptions (assistants "
+                "the team pays API rates for stay). The MCP always sends it "
                 "explicitly and defaults it to true; direct REST callers must set it "
                 "themselves to see the same records\n"
                 "**Response**: 200 OK with a paginated transaction list\n"
@@ -8583,7 +8979,7 @@ Use `validate()` before submission."""
                 "**Query Parameters**:\n"
                 "- `teamId` (required): Your team/organization ID\n"
                 "- `page` (optional): Page number (default: 0)\n"
-                "- `size` (optional): Page size (default: 20, max: 50)\n"
+                "- `size` (optional): Page size (default: 20, max: 100)\n"
                 "**Response**: 200 OK with model list\n\n"
                 "### **5. Search AI Models**\n"
                 "```http\n"
@@ -8596,7 +8992,7 @@ Use `validate()` before submission."""
                 "- `query` (required): Search term (model name, provider, etc.)\n"
                 "- `teamId` (required): Your team/organization ID\n"
                 "- `page` (optional): Page number (default: 0)\n"
-                "- `size` (optional): Page size (default: 20, max: 50)\n"
+                "- `size` (optional): Page size (default: 20, max: 100)\n"
                 "**Response**: 200 OK with matching models\n\n"
                 "## **Request Headers**\n\n"
                 "### **By Endpoint Type**\n"
@@ -9512,29 +9908,32 @@ Use `validate()` before submission."""
                 type="text",
                 text="# **Complete Integration Guide**\n\n"
                 f"## **JavaScript/Node.js Integration for {use_case.replace('_', ' ').title()}**\n\n"
-                "### **🚀 Official Revenium Node.js Packages (Recommended)**\n\n"
-                "**For production use, see Revenium's official Node.js packages:**\n"
-                "📦 **https://app.revenium.ai** - Review the get connected section\n\n"
-                "The official packages provide:\n"
+                "### **🚀 Official Revenium Node.js Package (Recommended)**\n\n"
+                "**For production use, install Revenium's official Node.js package:**\n"
+                "📦 **`@revenium/middleware`** - https://www.npmjs.com/package/@revenium/middleware\n\n"
+                "```bash\n"
+                "npm install @revenium/middleware\n"
+                "```\n\n"
+                "The official package provides:\n"
                 "- ✅ **Production-ready implementations** with full TypeScript support\n"
                 "- ✅ **Comprehensive up-to-date examples** maintained by the Revenium team\n"
-                "- ✅ **Latest API compatibility** and automatic updates\n"
-                "**⚠️ Important**: Always obtain the latest examples and implementation guidance from the official npm packages above, as they are continuously updated with the most current API specifications and best practices.\n\n"
+                "- ✅ **Latest API compatibility** and automatic updates\n\n"
+                "**⚠️ Important**: Always obtain the latest examples and implementation guidance from the `@revenium/middleware` package above, as it is continuously updated with the most current API specifications and best practices.\n\n"
                 "### **Basic Integration Overview**\n\n"
                 "For basic integration concepts, the general approach involves:\n\n"
-                "1. **Install official Revenium package** from npm\n"
+                "1. **Install `@revenium/middleware`** from npm\n"
                 "2. **Configure API credentials** using environment variables\n"
                 "3. **Add small code snippet to wrap normal AI calls with Revenium metering**\n"
                 "### **Environment Setup**\n\n"
                 "```bash\n"
-                "# Environment variables (standard across all implementations)\n"
-                "REVENIUM_API_KEY=rev_your_key_here\n"
-                "REVENIUM_BASE_URL=https://api.revenium.ai\n"
+                "# Environment variables read by @revenium/middleware\n"
+                "REVENIUM_METERING_API_KEY=rev_your_key_here\n"
+                "REVENIUM_METERING_BASE_URL=https://api.revenium.ai\n"
                 "```\n\n"
                 "### **Next Steps**\n\n"
                 "1. **Visit Revenium**: https://app.revenium.ai and review the get connected section\n"
                 "2. **Review the latest documentation** and examples provided there\n"
-                "3. **Install the appropriate package** for your Node.js version\n"
+                "3. **Install `@revenium/middleware`**\n"
                 "4. **Follow the official integration examples** for your specific use case\n\n"
                 "### **Support Resources**\n\n"
                 "- **Get Connected**: https://app.revenium.ai\n"
@@ -9542,7 +9941,7 @@ Use `validate()` before submission."""
                 "- **Dashboard**: Monitor transactions and costs in real-time\n"
                 "- **Support**: Contact support for integration assistance\n\n"
                 "**Note**: This MCP tool provides Python-focused integration guidance. "
-                "For JavaScript/Node.js, always refer to the official npm packages for the most current and comprehensive implementation examples.",
+                "For JavaScript/Node.js, refer to the `@revenium/middleware` README on npm for the most current and comprehensive implementation examples.",
             )
         ]
 

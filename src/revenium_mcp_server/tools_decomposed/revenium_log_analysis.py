@@ -18,6 +18,7 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
+from ..analytics.paging import PageInfo
 from ..client import ReveniumAPIError
 from ..common.error_handling import ErrorCodes, ToolError
 from ..introspection.metadata import ToolType
@@ -32,8 +33,10 @@ from .log_analysis_constants import (
     UNSUPPORTED_ACTION_TEMPLATE,
 )
 from .log_filters import LogFilter
-from .log_formatters import LogResponseFormatter
+from .log_formatters import LogResponseFormatter, PageCoverage
 from .unified_tool_base import ToolBase
+
+_SEARCH_PAGE_REQUEST_SIZE = 1000
 
 # Three of the four tenant flags have no published read-only endpoint: the
 # platform hides GET /v2/api/tenants/{id} from its API contract, so the only
@@ -327,9 +330,13 @@ class ReveniumLogAnalysis(ToolBase):
         log_type: str,
         pages: int,
         ctx: Optional["TenantContext"] = None,
-    ) -> List[Dict[str, Any]]:
-        """Retrieve logs from multiple pages and aggregate."""
+    ) -> tuple[List[Dict[str, Any]], PageCoverage]:
+        """Retrieve logs from multiple pages and aggregate, with the pages actually read."""
         all_entries = []
+        pages_read = 0
+        platform = PageInfo()
+        failed_page: Optional[int] = None
+        failure: Optional[str] = None
 
         for page in range(pages):
             try:
@@ -339,14 +346,15 @@ class ReveniumLogAnalysis(ToolBase):
                     self.default_size,
                     ctx=ctx,
                 )
+                pages_read += 1
+                platform = PageInfo.from_envelope(response)
 
                 embedded = response.get("_embedded", {})
                 entries = embedded.get("systemLogResourceList", [])
                 all_entries.extend(entries)
 
                 # Stop if we've reached the end
-                page_info = response.get("page", {})
-                if page >= page_info.get("totalPages", 1) - 1:
+                if platform.total_pages is None or page >= platform.total_pages - 1:
                     break
 
             except PermissionError:
@@ -354,9 +362,18 @@ class ReveniumLogAnalysis(ToolBase):
                 raise
             except Exception as e:
                 logger.warning(f"Failed to retrieve page {page}: {e}")
+                failed_page, failure = page, self._failure_text(e)
                 break
 
-        return all_entries
+        coverage = PageCoverage(
+            pages_read=pages_read,
+            entries_read=len(all_entries),
+            platform=platform,
+            failed_page=failed_page,
+            failure=failure,
+            page_limit=pages,
+        )
+        return all_entries, coverage
 
     async def _search_all_pages(
         self,
@@ -366,19 +383,25 @@ class ReveniumLogAnalysis(ToolBase):
         search_term: Optional[str],
         max_pages: int = 50,
         ctx: Optional["TenantContext"] = None,
-    ) -> tuple[List[Dict[str, Any]], Dict[str, Any], int]:
-        """Search across all pages for comprehensive results."""
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any], PageCoverage]:
+        """Search page by page up to max_pages and report how much was covered."""
         all_matches = []
         applied_filters = {}
         total_pages_searched = 0
+        entries_read = 0
+        platform = PageInfo()
+        failed_page: Optional[int] = None
+        failure: Optional[str] = None
 
         logger.info(f"Starting comprehensive search across up to {max_pages} pages")
 
         for page in range(max_pages):
             try:
-                # Get data from this page with maximum size for efficiency
                 endpoint = self.log_endpoints.get(log_type, self.log_endpoints["internal"])
-                response = await self._make_api_call(endpoint, page, 1000, ctx=ctx)
+                response = await self._make_api_call(
+                    endpoint, page, _SEARCH_PAGE_REQUEST_SIZE, ctx=ctx
+                )
+                platform = PageInfo.from_envelope(response)
 
                 # Extract entries
                 embedded = response.get("_embedded", {})
@@ -398,15 +421,15 @@ class ReveniumLogAnalysis(ToolBase):
                 all_matches.extend(filtered_entries)
                 applied_filters = page_filters  # Keep the filter info
                 total_pages_searched += 1
+                entries_read += len(log_entries)
 
                 # Log progress for searches with results
                 if len(filtered_entries) > 0:
                     logger.info(f"Found {len(filtered_entries)} matches on page {page}")
 
                 # Check if we've reached the last page
-                page_info = response.get("page", {})
-                if page >= page_info.get("totalPages", 1) - 1:
-                    logger.info(f"Reached last page ({page_info.get('totalPages', 1)} total pages)")
+                if platform.total_pages is None or page >= platform.total_pages - 1:
+                    logger.info(f"Reached last page ({platform.total_pages} total pages)")
                     break
 
             except PermissionError:
@@ -414,12 +437,21 @@ class ReveniumLogAnalysis(ToolBase):
                 raise
             except Exception as e:
                 logger.warning(f"Failed to search page {page}: {e}")
+                failed_page, failure = page, self._failure_text(e)
                 break
 
         logger.info(
             f"Search complete: {len(all_matches)} total matches across {total_pages_searched} pages"
         )
-        return all_matches, applied_filters, total_pages_searched
+        coverage = PageCoverage(
+            pages_read=total_pages_searched,
+            entries_read=entries_read,
+            platform=platform,
+            failed_page=failed_page,
+            failure=failure,
+            page_limit=max_pages,
+        )
+        return all_matches, applied_filters, coverage
 
     def _analyze_operation_patterns(self, all_entries: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Analyze operation patterns and generate insights."""
@@ -464,8 +496,15 @@ class ReveniumLogAnalysis(ToolBase):
             ],
         }
 
-    def _format_analysis_response(self, analysis: Dict[str, Any], log_type: str, pages: int) -> str:
+    def _format_analysis_response(
+        self,
+        analysis: Dict[str, Any],
+        log_type: str,
+        pages: int,
+        stop_note: Optional[str] = None,
+    ) -> str:
         """Format operation analysis response."""
+        stopped = f"- **Stopped Early**: {stop_note}\n" if stop_note else ""
         # Handle case where no entries were found
         if "error" in analysis:
             return f"""
@@ -474,7 +513,7 @@ class ReveniumLogAnalysis(ToolBase):
 ## Summary
 - **Total Operations Analyzed**: 0
 - **Pages Analyzed**: {pages}
-- **Status**: {analysis['error']}
+{stopped}- **Status**: {analysis['error']}
 
 ## Result
 No log entries found for analysis. This may be expected for integration logs.
@@ -491,7 +530,7 @@ No log entries found for analysis. This may be expected for integration logs.
 ## Summary
 - **Total Operations Analyzed**: {analysis['total_operations']:,}
 - **Pages Analyzed**: {pages}
-- **Failure Rate**: {analysis['failure_rate']:.2%}
+{stopped}- **Failure Rate**: {analysis['failure_rate']:.2%}
 - **Unique Operations**: {len(analysis['operation_counts'])}
 
 ## Top Operations by Frequency
@@ -597,6 +636,15 @@ No log entries found for analysis. This may be expected for integration logs.
             text[: cls._MAX_RENDERED_ERROR_FIELD_CHARS],
             f" (truncated, {excess} more characters)",
         )
+
+    @classmethod
+    def _failure_text(cls, error: Exception) -> str:
+        """Name a page failure by its message, or by its type when the message says nothing."""
+        name = type(error).__name__
+        text = str(error).strip() or name
+        if text.endswith(":"):
+            text = f"{text} {name}"
+        return "".join(cls._bounded_error_field(text))
 
     @classmethod
     def _structured_error_lines(cls, err: Dict[str, Any]) -> List[str]:
@@ -1249,10 +1297,12 @@ No log entries found for analysis. This may be expected for integration logs.
 
         try:
             # Get entries from multiple pages
-            all_entries = await self._get_multi_page_logs(log_type, pages, ctx=ctx)
+            all_entries, coverage = await self._get_multi_page_logs(log_type, pages, ctx=ctx)
 
             # Use formatter for multi-page response
-            return self.response_formatter.format_multi_page_response(all_entries, log_type, pages)
+            return self.response_formatter.format_multi_page_response(
+                all_entries, log_type, coverage.pages_read, stop_note=coverage.failure_note()
+            )
 
         except ToolError:
             raise
@@ -1280,7 +1330,7 @@ No log entries found for analysis. This may be expected for integration logs.
         try:
             if search_all_pages:
                 # Comprehensive search across all pages
-                all_matches, applied_filters, pages_searched = await self._search_all_pages(
+                all_matches, applied_filters, coverage = await self._search_all_pages(
                     log_type,
                     arguments.get("operation_filter"),
                     arguments.get("status_filter"),
@@ -1290,7 +1340,7 @@ No log entries found for analysis. This may be expected for integration logs.
 
                 # Format comprehensive search response
                 return self.response_formatter.format_comprehensive_search_response(
-                    all_matches, log_type, pages_searched, applied_filters
+                    all_matches, log_type, coverage, applied_filters
                 )
             else:
                 # Single page search (existing behavior)
@@ -1329,9 +1379,11 @@ No log entries found for analysis. This may be expected for integration logs.
         pages = arguments.get("pages", 3)  # Default to 3 pages for analysis
 
         try:
-            all_entries = await self._get_multi_page_logs(log_type, pages, ctx=ctx)
+            all_entries, coverage = await self._get_multi_page_logs(log_type, pages, ctx=ctx)
             analysis = self._analyze_operation_patterns(all_entries)
-            response_text = self._format_analysis_response(analysis, log_type, pages)
+            response_text = self._format_analysis_response(
+                analysis, log_type, coverage.pages_read, stop_note=coverage.failure_note()
+            )
             return [TextContent(type="text", text=response_text)]
 
         except ToolError:

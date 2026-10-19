@@ -345,14 +345,16 @@ class TestHandleActionFullRouting:
         assert "user@company.com" in result[0].text
 
     @pytest.mark.asyncio
-    async def test_resolve_subscriber_email_to_id_not_found(self, cred_tool):
-        """resolve_subscriber_email_to_id returns not-found message when email doesn't match."""
+    async def test_resolve_subscriber_email_to_id_miss_is_an_error(self, cred_tool):
+        """An email that matches nobody is an error, not a success-shaped answer."""
         cred_tool.client.resolve_subscriber_email_to_id = AsyncMock(return_value=None)
-        result = await cred_tool.handle_action(
-            "resolve_subscriber_email_to_id", {"email": "nobody@example.com"}
-        )
-        assert isinstance(result[0], TextContent)
-        assert "Not Found" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await cred_tool.handle_action(
+                "resolve_subscriber_email_to_id", {"email": "nobody@example.com"}
+            )
+        assert "No subscriber found with email: nobody@example.com" in exc.value.message
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert exc.value.field == "email"
 
     @pytest.mark.asyncio
     async def test_resolve_subscriber_email_to_id_missing_email(self, cred_tool):
@@ -372,6 +374,45 @@ class TestHandleActionFullRouting:
             )
 
     @pytest.mark.asyncio
+    async def test_resolve_organization_name_unconfirmed_is_refused_without_retry_advice(
+        self, cred_tool
+    ):
+        from src.revenium_mcp_server.client import OrganizationNameUnresolvedError
+
+        cred_tool.client.resolve_organization_name_to_id = AsyncMock(
+            side_effect=OrganizationNameUnresolvedError(
+                "2 organizations are named 'Twin' (ids: twinA, twinB); "
+                "pass organizationId to choose one",
+                matched_ids=["twinA", "twinB"],
+            )
+        )
+        with pytest.raises(ToolError) as exc:
+            await cred_tool.handle_action("resolve_organization_name_to_id", {"name": "Twin"})
+        assert exc.value.error_code == ErrorCodes.INVALID_PARAMETER
+        assert exc.value.field == "name"
+        assert "twinA" in exc.value.message
+        assert "organizationId" in exc.value.message
+        rendered = " ".join([exc.value.message, *exc.value.suggestions])
+        assert "Retry" not in rendered
+        assert "API connection" not in rendered
+
+    @pytest.mark.asyncio
+    async def test_resolve_subscriber_email_keeps_the_auth_envelope(self, cred_tool):
+        from src.revenium_mcp_server.common.auth_response_envelope import (
+            auth_error_to_tool_error,
+        )
+
+        cred_tool.client.resolve_subscriber_email_to_id = AsyncMock(
+            side_effect=auth_error_to_tool_error("missing credential")
+        )
+        with pytest.raises(ToolError) as exc:
+            await cred_tool.handle_action(
+                "resolve_subscriber_email_to_id", {"email": "user@company.com"}
+            )
+        assert exc.value.error_code == ErrorCodes.UNAUTHORIZED
+        assert "Failed to resolve" not in exc.value.message
+
+    @pytest.mark.asyncio
     async def test_resolve_organization_name_to_id_found(self, cred_tool):
         """resolve_organization_name_to_id returns org ID when name is found."""
         cred_tool.client.resolve_organization_name_to_id = AsyncMock(return_value="org_456")
@@ -383,14 +424,16 @@ class TestHandleActionFullRouting:
         assert "Acme Corp" in result[0].text
 
     @pytest.mark.asyncio
-    async def test_resolve_organization_name_to_id_not_found(self, cred_tool):
-        """resolve_organization_name_to_id returns not-found message when name doesn't match."""
+    async def test_resolve_organization_name_to_id_miss_is_an_error(self, cred_tool):
+        """A name that matches no organization is an error, not a success-shaped answer."""
         cred_tool.client.resolve_organization_name_to_id = AsyncMock(return_value=None)
-        result = await cred_tool.handle_action(
-            "resolve_organization_name_to_id", {"name": "NoSuchOrg"}
-        )
-        assert isinstance(result[0], TextContent)
-        assert "Not Found" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await cred_tool.handle_action(
+                "resolve_organization_name_to_id", {"name": "NoSuchOrg"}
+            )
+        assert "No organization found with name: NoSuchOrg" in exc.value.message
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert exc.value.field == "name"
 
     @pytest.mark.asyncio
     async def test_resolve_organization_name_to_id_missing_name(self, cred_tool):
@@ -718,34 +761,196 @@ class TestCreateCredential:
         assert payload["subscriberId"] == "sub_resolved"
         assert "subscriber_email" not in payload
 
+    @staticmethod
+    def _credential_data(**overrides):
+        data = {
+            "label": "Key",
+            "organizationId": "o1",
+            "externalId": "k",
+            "externalSecret": "s",
+        }
+        data.update(overrides)
+        return data
+
     @pytest.mark.asyncio
-    async def test_create_handles_subscriber_email_resolution_failure(self, cred_tool, mock_client):
-        """Resolution failure for subscriber_email is logged and skipped (lines 611-612)."""
-        mock_client.resolve_subscriber_email_to_id = AsyncMock(
-            side_effect=Exception("not found")
-        )
-        created = {"id": "c6"}
-        mock_client.create_credential = AsyncMock(return_value=created)
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credential_data",
-            return_value=created,
-        ):
-            # Should not raise; just log warning
-            result = await cred_tool._create_credential(
+    async def test_create_refuses_a_subscriber_email_that_matches_nobody(self, cred_tool, mock_client):
+        mock_client.resolve_subscriber_email_to_id = AsyncMock(return_value=None)
+        mock_client.create_credential = AsyncMock(return_value={"id": "never"})
+
+        with pytest.raises(ToolError) as exc:
+            await cred_tool.handle_action("create", {
+                "credential_data": self._credential_data(subscriber_email="nobody@test.com"),
+            })
+
+        assert "nobody@test.com" in exc.value.message
+        assert "not created" in exc.value.message
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert exc.value.field == "subscriber_email"
+        mock_client.create_credential.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_refused_twice_with_the_same_arguments_still_refuses(
+        self, cred_tool, mock_client
+    ):
+        """The execution path can run a failed call a second time with the same
+        arguments, so a refusal must leave the caller's credential_data intact."""
+        mock_client.resolve_subscriber_email_to_id = AsyncMock(return_value=None)
+        mock_client.create_credential = AsyncMock(return_value={"id": "never"})
+        arguments = {
+            "credential_data": self._credential_data(subscriber_email="nobody@test.com"),
+        }
+
+        for _ in range(2):
+            with pytest.raises(ToolError) as exc:
+                await cred_tool.handle_action("create", arguments)
+            assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+            assert "nobody@test.com" in exc.value.message
+
+        assert arguments["credential_data"]["subscriber_email"] == "nobody@test.com"
+        assert "subscriberId" not in arguments["credential_data"]
+        mock_client.create_credential.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_dry_run_refuses_a_subscriber_email_that_matches_nobody(
+        self, cred_tool, mock_client
+    ):
+        mock_client.resolve_subscriber_email_to_id = AsyncMock(return_value=None)
+        validator = MagicMock()
+        validator.validate_create_operation = AsyncMock()
+
+        with pytest.raises(ToolError) as exc:
+            await cred_tool._create_credential(
                 {
-                    "credential_data": {
-                        "label": "Key",
-                        "subscriber_email": "bad@test.com",
-                        "subscriberId": "s1",  # fallback
-                        "organizationId": "o1",
-                        "externalId": "k",
-                        "externalSecret": "s",
-                    }
+                    "dry_run": True,
+                    "credential_data": self._credential_data(subscriber_email="nobody@test.com"),
                 },
                 client=mock_client,
-                dry_run_validator=MagicMock(),
+                dry_run_validator=validator,
             )
-        assert result["id"] == "c6"
+
+        assert "nobody@test.com" in exc.value.message
+        validator.validate_create_operation.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_stops_when_the_subscriber_lookup_fails(self, cred_tool, mock_client):
+        """A failed lookup stops the create even when a subscriberId was also given."""
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        mock_client.resolve_subscriber_email_to_id = AsyncMock(
+            side_effect=ReveniumAPIError("Upstream unavailable", status_code=500)
+        )
+        mock_client.create_credential = AsyncMock(return_value={"id": "never"})
+
+        with pytest.raises(ToolError) as exc:
+            await cred_tool.handle_action("create", {
+                "credential_data": self._credential_data(
+                    subscriber_email="bad@test.com", subscriberId="s1",
+                ),
+            })
+
+        assert "Upstream unavailable" in exc.value.message
+        assert "no credential was created" in exc.value.message.lower()
+        assert "credential not found" not in exc.value.message.lower()
+        assert exc.value.error_code == ErrorCodes.API_ERROR
+        assert exc.value.field == "subscriber_email"
+        mock_client.create_credential.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_refuses_an_organization_name_the_search_cannot_confirm(
+        self, cred_tool, mock_client
+    ):
+        from src.revenium_mcp_server.client import OrganizationNameUnresolvedError
+
+        mock_client.resolve_organization_name_to_id = AsyncMock(
+            side_effect=OrganizationNameUnresolvedError(
+                "2 organizations are named 'Twin' (ids: twinA, twinB); "
+                "pass organizationId to choose one",
+                matched_ids=["twinA", "twinB"],
+            )
+        )
+        mock_client.create_credential = AsyncMock(return_value={"id": "never"})
+
+        with pytest.raises(ToolError) as exc:
+            await cred_tool.handle_action("create", {
+                "credential_data": self._credential_data(
+                    subscriberId="s1", organization_name="Twin",
+                ),
+            })
+
+        assert exc.value.error_code == ErrorCodes.INVALID_PARAMETER
+        assert exc.value.field == "organization_name"
+        assert "twinA" in exc.value.message
+        assert "organizationId" in exc.value.message
+        assert "no credential was created" in exc.value.message.lower()
+        rendered = " ".join([exc.value.message, *exc.value.suggestions])
+        assert "Retry" not in rendered
+        assert "API connection" not in rendered
+        mock_client.create_credential.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_keeps_the_auth_envelope_from_a_failed_lookup(
+        self, cred_tool, mock_client
+    ):
+        from src.revenium_mcp_server.common.auth_response_envelope import (
+            auth_error_to_tool_error,
+        )
+
+        mock_client.resolve_subscriber_email_to_id = AsyncMock(
+            side_effect=auth_error_to_tool_error("missing credential")
+        )
+        mock_client.create_credential = AsyncMock(return_value={"id": "never"})
+
+        with pytest.raises(ToolError) as exc:
+            await cred_tool.handle_action("create", {
+                "credential_data": self._credential_data(subscriber_email="a@test.com"),
+            })
+
+        assert exc.value.error_code == ErrorCodes.UNAUTHORIZED
+        assert "lookup" not in exc.value.message.lower()
+        mock_client.create_credential.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_with_an_empty_organization_name_makes_no_lookup(self, cred_tool, mock_client):
+        mock_client.resolve_organization_name_to_id = AsyncMock(return_value="o_any")
+        mock_client.get_organizations = AsyncMock(return_value={})
+        mock_client.create_credential = AsyncMock(return_value={"id": "never"})
+
+        with pytest.raises(ToolError) as exc:
+            await cred_tool.handle_action("create", {
+                "credential_data": self._credential_data(
+                    subscriberId="s1", organization_name="  ",
+                ),
+            })
+
+        assert exc.value.error_code == ErrorCodes.MISSING_PARAMETER
+        assert exc.value.field == "organization_name"
+        mock_client.resolve_organization_name_to_id.assert_not_awaited()
+        mock_client.get_organizations.assert_not_awaited()
+        mock_client.create_credential.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_organization_lookup_404_does_not_say_credential_not_found(
+        self, cred_tool, mock_client
+    ):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        mock_client.resolve_organization_name_to_id = AsyncMock(
+            side_effect=ReveniumAPIError("Account not found", status_code=404)
+        )
+        mock_client.create_credential = AsyncMock(return_value={"id": "never"})
+
+        with pytest.raises(ToolError) as exc:
+            await cred_tool.handle_action("create", {
+                "credential_data": self._credential_data(
+                    subscriberId="s1", organization_name="Acme Corp",
+                ),
+            })
+
+        assert "organization" in exc.value.message.lower()
+        assert "Account not found" in exc.value.message
+        assert "credential not found" not in exc.value.message.lower()
+        assert exc.value.field == "organization_name"
+        mock_client.create_credential.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_create_resolves_organization_name(self, cred_tool, mock_client):

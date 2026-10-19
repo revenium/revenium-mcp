@@ -206,6 +206,30 @@ class TestConsoleFormat:
         assert '{{' in fmt
         assert '}}' in fmt
 
+    @pytest.mark.parametrize(
+        "value,rendered",
+        [
+            (
+                "see https://app.<your-environment>.revenium.ai",
+                "error='see https://app.<your-environment>.revenium.ai'",
+            ),
+            ("<red>not a colour</red>", "error='<red>not a colour</red>'"),
+            # The escape stays visible after a literal backslash: cosmetic only.
+            ("a\\<b", "error='a\\\\\\<b'"),
+        ],
+    )
+    def test_angle_brackets_in_values_reach_the_sink(self, value, rendered):
+        """BACK-4717: an extra holding '<' must log as written, not raise a colour-tag error."""
+        import io
+
+        sink = io.StringIO()
+        handler_id = logger.add(sink, format=_console_format, colorize=True, catch=False)
+        try:
+            logger.error("x", error=value)
+        finally:
+            logger.remove(handler_id)
+        assert rendered in sink.getvalue()
+
 
 class TestPerformanceDecorator:
     """Test performance monitoring decorator."""

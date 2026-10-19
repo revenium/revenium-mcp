@@ -7,7 +7,11 @@ diagnostic insights, and temporal analysis.
 
 import pytest
 
-from src.revenium_mcp_server.tools_decomposed.log_formatters import LogResponseFormatter
+from src.revenium_mcp_server.analytics.paging import PageInfo
+from src.revenium_mcp_server.tools_decomposed.log_formatters import (
+    LogResponseFormatter,
+    PageCoverage,
+)
 from mcp.types import TextContent
 
 
@@ -111,6 +115,55 @@ class TestFormatLogResponse:
         }
         result = formatter.format_log_response(api_response, "internal", 0, 200)
         assert "Entry 1" not in result[0].text
+
+    @staticmethod
+    def _platform_page(entries):
+        return {
+            "_embedded": {"systemLogResourceList": entries},
+            "page": {"size": 50, "totalElements": 78828, "totalPages": 1577, "number": 0},
+        }
+
+    def test_filtered_page_labels_the_platform_total_as_unfiltered(self, formatter):
+        """A status filter prints the page's matches, never the unfiltered total as its own."""
+        failure = {
+            "operation": "EMAIL_DISPATCH",
+            "status": "FAILURE",
+            "details": "SMTP timeout",
+            "created": "2026-10-15T08:00:00Z",
+        }
+        result = formatter.format_log_response(
+            self._platform_page([failure]),
+            "filtered_internal",
+            0,
+            50,
+            applied_filters={"status_filter": "FAILURE", "log_type_filter": "internal"},
+        )
+        text = result[0].text
+        assert "- **Total Entries**: 78,828" not in text
+        assert "Large dataset available" not in text
+        assert "- **Matches On This Page**: 1" in text
+        lines_with_total = [line for line in text.splitlines() if "78,828" in line]
+        assert lines_with_total
+        assert all("unfiltered" in line for line in lines_with_total)
+
+    def test_unfiltered_search_keeps_the_platform_total(self, formatter):
+        """Only the log type applied: the platform total is the search's own total."""
+        entry = {
+            "operation": "AI_METRIC_PROCESSING",
+            "status": "SUCCESS",
+            "details": "Processed metric",
+            "created": "2026-10-15T08:00:00Z",
+        }
+        result = formatter.format_log_response(
+            self._platform_page([entry]),
+            "filtered_internal",
+            0,
+            50,
+            applied_filters={"log_type_filter": "internal"},
+        )
+        text = result[0].text
+        assert "- **Total Entries**: 78,828" in text
+        assert "Large dataset available: 78,828 total entries across 1577 pages" in text
 
 
 class TestDiagnosticInsights:
@@ -224,7 +277,7 @@ class TestFormatComprehensiveSearchResponse:
             },
         ]
         result = formatter.format_comprehensive_search_response(
-            matches, "internal", 5
+            matches, "internal", PageCoverage(5, 500, PageInfo(total_pages=5, total_elements=500))
         )
         text = result[0].text
         assert "Comprehensive Search" in text
@@ -234,7 +287,7 @@ class TestFormatComprehensiveSearchResponse:
     def test_search_no_matches_shows_recommendations(self, formatter):
         """Search with no matches shows recommendations section."""
         result = formatter.format_comprehensive_search_response(
-            [], "internal", 5
+            [], "internal", PageCoverage(5, 500, PageInfo(total_pages=5, total_elements=500))
         )
         text = result[0].text
         assert "No Matches Found" in text
@@ -243,7 +296,7 @@ class TestFormatComprehensiveSearchResponse:
     def test_search_with_filters(self, formatter):
         """Search response includes applied filters."""
         result = formatter.format_comprehensive_search_response(
-            [], "internal", 3, applied_filters={"search_term": "error"}
+            [], "internal", PageCoverage(3, 300, PageInfo(total_pages=3, total_elements=300)), applied_filters={"search_term": "error"}
         )
         assert "search_term" in result[0].text
 

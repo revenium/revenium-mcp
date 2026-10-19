@@ -4,8 +4,10 @@ Tests the JobManager and JobManagement classes from the decomposed tools module.
 Focuses on 7 business actions, meta-actions, and the 409 Conflict edge case.
 """
 
+import copy
 import json
 
+import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,7 +24,8 @@ from src.revenium_mcp_server.tools_decomposed.job_management import (
     _session_attribution_intervals,
     _strip_links,
 )
-from src.revenium_mcp_server.client import ReveniumAPIError
+from src.revenium_mcp_server.auth import AuthConfig
+from src.revenium_mcp_server.client import ReveniumAPIError, ReveniumClient
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from mcp.types import TextContent
 
@@ -89,6 +92,40 @@ ROI_SUMMARY_RESPONSE = {
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+_FLAT_JOB_TRANSACTIONS = {
+    "transactions": [
+        {"transactionId": "txn-1", "cost": 0.0, "status": "success"},
+        {"transactionId": "txn-2", "cost": 0.5751113, "status": "success"},
+    ],
+    "totalCount": 2,
+}
+
+
+@pytest.fixture
+def recording_real_client():
+    """A real ReveniumClient whose HTTP GET answers ``body`` and records each request."""
+
+    def build(body):
+        client = ReveniumClient(
+            auth_config=AuthConfig(
+                api_key="test_key_12345",
+                team_id="team_abc",
+                base_url="https://api.test.revenium.ai",
+                timeout=10.0,
+            )
+        )
+        platform_requests = []
+
+        async def recorded_get(path, params=None, **kwargs):
+            platform_requests.append((path, dict(params or {})))
+            return body
+
+        client.get = recorded_get
+        return client, platform_requests
+
+    return build
+
 
 @pytest.fixture
 def mock_client():
@@ -321,19 +358,68 @@ class TestJobManagerGetJobTransactions:
     """Test JobManager.get_job_transactions behavior."""
 
     @pytest.mark.asyncio
-    async def test_get_job_transactions_returns_paginated_data(self, job_manager, mock_client):
-        """Getting transactions returns paginated results."""
-        mock_client.get_job_transactions.return_value = {}
-        mock_client._extract_embedded_data.return_value = [{"txn_id": "t1"}, {"txn_id": "t2"}]
-        mock_client._extract_pagination_info.return_value = {"totalPages": 1, "totalElements": 2}
+    async def test_flat_platform_body_is_listed_with_its_total(self, recording_real_client):
+        """BACK-4636: the documented body is parsed by the real code path."""
+        client, platform_requests = recording_real_client(_FLAT_JOB_TRANSACTIONS)
 
-        result = await job_manager.get_job_transactions({"job_id": "j1", "page": 0, "size": 20})
+        result = await JobManager(client).get_job_transactions({"job_id": "code-review-PR-879"})
 
-        assert result["action"] == "get_job_transactions"
-        assert result["job_id"] == "j1"
-        assert len(result["data"]) == 2
-        assert result["pagination"]["page"] == 0
-        mock_client.get_job_transactions.assert_called_once_with("j1", page=0, size=20)
+        assert [t["transactionId"] for t in result["data"]] == ["txn-1", "txn-2"]
+        assert result["data"][1]["cost"] == 0.5751113
+        assert result["total_count"] == 2
+        assert "pagination" not in result
+        path, params = platform_requests[0]
+        assert path == "/profitstream/v2/api/jobs/code-review-PR-879/transactions"
+        assert "page" not in params
+        assert "size" not in params
+
+    @pytest.mark.asyncio
+    async def test_job_without_calls_answers_empty_list_and_zero(self, recording_real_client):
+        client, _ = recording_real_client({"transactions": [], "totalCount": 0})
+
+        result = await JobManager(client).get_job_transactions({"job_id": "idle-job"})
+
+        assert result["data"] == []
+        assert result["total_count"] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body, observed",
+        [
+            ({"_embedded": {"transactions": []}, "page": {"totalElements": 0}}, "['_embedded', 'page']"),
+            ({"totalCount": 3}, "['totalCount']"),
+            ([{"transactionId": "t1"}], "the body is a list"),
+            (None, "the body is a NoneType"),
+        ],
+    )
+    async def test_unpublished_body_raises_instead_of_answering_empty(
+        self, recording_real_client, body, observed
+    ):
+        """BACK-4636: a body without a transactions array is a contract failure, not an idle job."""
+        client, _ = recording_real_client(body)
+
+        with pytest.raises(ToolError) as exc_info:
+            await JobManager(client).get_job_transactions({"job_id": "j1"})
+
+        assert exc_info.value.error_code == ErrorCodes.API_ERROR
+        assert observed in exc_info.value.message
+        assert "NOT the same as the job having none" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_rendered_answer_prints_no_invented_paging(self, recording_real_client):
+        client, _ = recording_real_client(_FLAT_JOB_TRANSACTIONS)
+        mgmt = JobManagement()
+
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            result = await mgmt.handle_action(
+                "get_job_transactions", {"job_id": "code-review-PR-879"}
+            )
+
+        text = result[0].text
+        assert '"total_count": 2' in text
+        assert "txn-2" in text
+        for invented in ("total_pages", "total_items", '"page"', '"size"', "has_next"):
+            assert invented not in text
 
     @pytest.mark.asyncio
     async def test_get_job_transactions_missing_id_raises_error(self, job_manager):
@@ -423,7 +509,7 @@ class TestJobManagerGetConversionFunnel:
 
         assert result["action"] == "get_conversion_funnel"
         mock_client.get_job_conversion_funnel.assert_called_once_with(
-            startDate="2025-01-01", jobType="LEAD"
+            startDate="2025-01-01T00:00:00.000Z", jobType="LEAD"
         )
 
 
@@ -509,11 +595,11 @@ class TestJobManagerGetRoiSummary:
         )
 
         mock_client.get_jobs_roi_summary.assert_called_once_with(
-            startDate="2025-01-01", endDate="2025-12-31"
+            startDate="2025-01-01T00:00:00.000Z", endDate="2025-12-31T23:59:59.999Z"
         )
         assert result["filters_applied"] == {
-            "startDate": "2025-01-01",
-            "endDate": "2025-12-31",
+            "startDate": "2025-01-01T00:00:00.000Z",
+            "endDate": "2025-12-31T23:59:59.999Z",
         }
         assert "filters_not_applied" not in result
 
@@ -522,13 +608,17 @@ class TestJobManagerGetRoiSummary:
         """The caller-facing surface still takes the snake_case spellings."""
         mock_client.get_jobs_roi_summary.return_value = ROI_SUMMARY_RESPONSE
 
-        await job_manager.get_roi_summary(
+        result = await job_manager.get_roi_summary(
             {"filters": {"start_date": "2025-01-01", "end_date": "2025-12-31"}}
         )
 
         mock_client.get_jobs_roi_summary.assert_called_once_with(
-            startDate="2025-01-01", endDate="2025-12-31"
+            startDate="2025-01-01T00:00:00.000Z", endDate="2025-12-31T23:59:59.999Z"
         )
+        assert result["filters_applied"] == {
+            "startDate": "2025-01-01T00:00:00.000Z",
+            "endDate": "2025-12-31T23:59:59.999Z",
+        }
 
     @pytest.mark.asyncio
     async def test_get_roi_summary_reports_a_filter_it_cannot_apply(
@@ -545,7 +635,9 @@ class TestJobManagerGetRoiSummary:
             {"filters": {"startDate": "2025-01-01", "environment": "production"}}
         )
 
-        mock_client.get_jobs_roi_summary.assert_called_once_with(startDate="2025-01-01")
+        mock_client.get_jobs_roi_summary.assert_called_once_with(
+            startDate="2025-01-01T00:00:00.000Z"
+        )
         assert result["filters_not_applied"]["parameters"] == ["environment"]
         assert "does not declare" in result["filters_not_applied"]["reason"]
 
@@ -952,17 +1044,16 @@ class TestJobManagementBusinessActions:
     @pytest.mark.asyncio
     async def test_get_job_transactions_action_returns_transactions(self, job_mgmt, mock_mgmt_client):
         """get_job_transactions action returns transaction data."""
-        mock_mgmt_client.get_job_transactions = AsyncMock(return_value={})
-        mock_mgmt_client._extract_embedded_data.return_value = [{"txn_id": "t1"}]
-        mock_mgmt_client._extract_pagination_info.return_value = {"totalPages": 1, "totalElements": 1}
-
-        result = await job_mgmt.handle_action(
-            "get_job_transactions", {"job_id": "j1", "page": 0, "size": 20}
+        mock_mgmt_client.get_job_transactions = AsyncMock(
+            return_value={"transactions": [{"transactionId": "t1"}], "totalCount": 1}
         )
+
+        result = await job_mgmt.handle_action("get_job_transactions", {"job_id": "j1"})
 
         assert len(result) >= 1
         assert isinstance(result[0], TextContent)
         assert "j1" in result[0].text
+        mock_mgmt_client.get_job_transactions.assert_awaited_once_with("j1")
 
     @pytest.mark.asyncio
     async def test_get_job_roi_action_returns_roi_data(self, job_mgmt, mock_mgmt_client):
@@ -1165,30 +1256,28 @@ class TestJobManagerPaginationBoundary:
         mock_client.get_jobs.assert_called_once_with(page=999_999, size=20)
 
     @pytest.mark.asyncio
-    async def test_get_job_transactions_max_int_page_raises_structured_400(
-        self, job_manager, mock_client
-    ):
-        """The same guard applies to get_job_transactions, the other paginated
-        action on this tool."""
-        with pytest.raises(ToolError) as exc_info:
-            await job_manager.get_job_transactions(
-                {"job_id": "j1", "page": 2_147_483_647, "size": 10}
-            )
-        assert getattr(exc_info.value, "field", None) == "page"
-        mock_client.get_job_transactions.assert_not_called()
+    async def test_get_job_transactions_default_paging_is_accepted(self, job_manager, mock_client):
+        """The manage_jobs closure always sends page=0 and size=20, shared with list_jobs."""
+        mock_client.get_job_transactions.return_value = {"transactions": [], "totalCount": 0}
+
+        await job_manager.get_job_transactions({"job_id": "j1", "page": 0, "size": 20})
+
+        mock_client.get_job_transactions.assert_awaited_once_with("j1")
 
     @pytest.mark.asyncio
-    async def test_get_job_transactions_max_int_size_raises_structured_400(
-        self, job_manager, mock_client
+    @pytest.mark.parametrize("label, value", [("page", 1), ("size", 50)])
+    async def test_get_job_transactions_refuses_non_default_paging(
+        self, job_manager, mock_client, label, value
     ):
-        """The size upper-bound guard also applies to get_job_transactions."""
+        """BACK-4636: the action is not paged, so a page or size cannot be honoured."""
+        arguments = {"job_id": "j1", "page": 0, "size": 20, label: value}
+
         with pytest.raises(ToolError) as exc_info:
-            await job_manager.get_job_transactions(
-                {"job_id": "j1", "page": 0, "size": 2_147_483_647}
-            )
-        err = exc_info.value
-        assert getattr(err, "field", None) == "size"
-        assert "exceeds maximum" in err.message
+            await job_manager.get_job_transactions(arguments)
+
+        assert exc_info.value.field == label
+        assert "not paged" in exc_info.value.message
+        assert "every transaction" in exc_info.value.message
         mock_client.get_job_transactions.assert_not_called()
 
 
@@ -1292,20 +1381,23 @@ class TestGetJobTransactionsStripsLinks:
     """get_job_transactions must strip _links from each transaction item."""
 
     @pytest.mark.asyncio
-    async def test_get_job_transactions_strips_links(self, job_manager, mock_client):
-        mock_client.get_job_transactions.return_value = {"_embedded": {"transactions": []}}
-        mock_client._extract_embedded_data.return_value = [
+    async def test_get_job_transactions_strips_links(self, recording_real_client):
+        client, _ = recording_real_client(
             {
-                "id": "t1",
-                "_links": {"self": {"href": "https://api-lb.dev.hcapp.io/profitstream/v2/api/transactions/t1"}},
+                "transactions": [
+                    {
+                        "transactionId": "t1",
+                        "_links": {"self": {"href": "https://api-lb.dev.hcapp.io/profitstream/v2/api/transactions/t1"}},
+                    }
+                ],
+                "totalCount": 1,
             }
-        ]
-        mock_client._extract_pagination_info.return_value = {"totalPages": 1, "totalElements": 1}
+        )
 
-        result = await job_manager.get_job_transactions({"job_id": "j1", "page": 0, "size": 10})
+        result = await JobManager(client).get_job_transactions({"job_id": "j1"})
 
-        for tx in result["data"]:
-            assert "_links" not in tx
+        assert [tx["transactionId"] for tx in result["data"]] == ["t1"]
+        assert "_links" not in result["data"][0]
         assert "api-lb.dev.hcapp.io" not in json.dumps(result)
 
 
@@ -1523,6 +1615,75 @@ class TestListSessionAttributions:
             await job_manager.list_session_attributions({"session_id": SESSION_ID})
 
         assert exc_info.value.status_code == 404
+
+
+@pytest.fixture
+def session_wire_client():
+    """A real ReveniumClient whose transport records each request and answers
+    the empty collection a never-attributed session gets."""
+    client = ReveniumClient(
+        auth_config=AuthConfig(
+            api_key="test_key_12345",
+            team_id="team_abc",
+            base_url="https://api.test.revenium.ai",
+            timeout=10.0,
+        )
+    )
+    sent = []
+
+    def answer(request):
+        sent.append((request.method, request.url.raw_path.decode()))
+        return httpx.Response(200, json={})
+
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    return client, sent
+
+
+class TestSessionIdStaysOnItsOwnPath:
+    """A session id is opaque text from the assistant, so '?', '#' or a space in
+    it must not move the request to another endpoint, and an id that cannot be
+    one path segment is refused before any request."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "session_id,segment",
+        [
+            ("x?teamId=other#", "x%3FteamId%3Dother%23"),
+            ("a b", "a%20b"),
+            (SESSION_ID, SESSION_ID),
+            ("sess-abc123", "sess-abc123"),
+        ],
+        ids=["query_and_fragment", "space", "uuid", "platform_example"],
+    )
+    async def test_the_session_id_is_one_path_segment_on_the_wire(
+        self, session_wire_client, session_id, segment
+    ):
+        client, sent = session_wire_client
+
+        result = await JobManager(client).list_session_attributions({"session_id": session_id})
+
+        assert result["count"] == 0
+        assert sent == [
+            ("GET", f"/profitstream/v2/api/sessions/{segment}/attribution?teamId=team_abc")
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "session_id",
+        ["..", ".", "../jobs/x", "a/b", "  "],
+        ids=["dot_dot", "dot", "parent_then_jobs", "slash", "blank"],
+    )
+    async def test_a_session_id_off_its_path_is_refused_before_any_request(
+        self, session_wire_client, session_id
+    ):
+        client, sent = session_wire_client
+
+        with pytest.raises(ToolError) as excinfo:
+            await JobManager(client).list_session_attributions({"session_id": session_id})
+
+        assert excinfo.value.field == "session_id"
+        assert excinfo.value.suggestions[0] == job_management_module._SESSION_ID.suggestions[0]
+        assert sent == []
 
 
 class TestSessionAttributionEnvelopeShape:
@@ -3870,3 +4031,526 @@ class TestUpsertCreateBranchThroughDispatch:
         assert "Economics declared for job type mcp-test-new" in text
         assert "Economics updated" not in text
         assert '"created": true' in text
+
+
+# ---------------------------------------------------------------------------
+# Date filters cover whole days (BACK-4716)
+# ---------------------------------------------------------------------------
+
+_WHOLE_DAYS = ("2026-10-01T00:00:00.000Z", "2026-10-14T23:59:59.999Z")
+
+# (action, the body the platform answers, the method that sends the request)
+_DATE_ACTIONS = [
+    (
+        "list_jobs",
+        {"_embedded": {"jobs": []}, "page": {"totalPages": 1, "totalElements": 0}},
+    ),
+    ("get_conversion_funnel", {"totalJobs": 0}),
+    ("get_roi_summary", ROI_SUMMARY_RESPONSE),
+]
+
+
+async def _run_date_action(client, action, filters):
+    return await getattr(JobManager(client), action)({"filters": filters})
+
+
+class TestJobDateFiltersCoverWholeDays:
+    """Every date filter in manage_jobs takes the same two forms.
+
+    The platform parses the list and funnel bounds as instants, so a calendar
+    day was refused with "Invalid date format", and reads the ROI summary's
+    calendar end day as its midnight, so the last day was dropped.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action,body", _DATE_ACTIONS, ids=[a[0] for a in _DATE_ACTIONS])
+    @pytest.mark.parametrize(
+        "filters",
+        [
+            {"startDate": "2026-10-01", "endDate": "2026-10-14"},
+            {"start_date": "2026-10-01", "end_date": "2026-10-14"},
+            {"startDate": _WHOLE_DAYS[0], "endDate": _WHOLE_DAYS[1]},
+            {"startDate": "2026-10-01T02:00:00+02:00", "endDate": "2026-10-14T23:59:59.999Z"},
+        ],
+        ids=["calendar_days", "snake_case_calendar_days", "instants", "offset_instant"],
+    )
+    async def test_both_forms_reach_the_platform_as_whole_day_instants(
+        self, recording_real_client, action, body, filters
+    ):
+        client, platform_requests = recording_real_client(body)
+
+        await _run_date_action(client, action, filters)
+
+        [(_, params)] = platform_requests
+        assert (params["startDate"], params["endDate"]) == _WHOLE_DAYS
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action,body", _DATE_ACTIONS, ids=[a[0] for a in _DATE_ACTIONS])
+    @pytest.mark.parametrize(
+        "filters",
+        [{"endDate": "2026-10-14"}, {"startDate": "", "endDate": "2026-10-14"}],
+        ids=["end_only", "blank_start"],
+    )
+    async def test_a_calendar_end_day_alone_covers_that_whole_day(
+        self, recording_real_client, action, body, filters
+    ):
+        client, platform_requests = recording_real_client(body)
+
+        await _run_date_action(client, action, filters)
+
+        [(_, params)] = platform_requests
+        assert params["endDate"] == "2026-10-14T23:59:59.999Z"
+        assert "startDate" not in params
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action,body", _DATE_ACTIONS, ids=[a[0] for a in _DATE_ACTIONS])
+    @pytest.mark.parametrize(
+        "filters,field",
+        [
+            ({"startDate": "2026/10/01"}, "startDate"),
+            ({"endDate": "2026-10-14T00:00:00"}, "endDate"),
+            ({"startDate": "2026-10-15", "endDate": "2026-10-14"}, "startDate"),
+        ],
+        ids=["unreadable_start", "zoneless_end", "reversed"],
+    )
+    async def test_an_unreadable_or_reversed_window_is_refused_before_any_request(
+        self, recording_real_client, action, body, filters, field
+    ):
+        client, platform_requests = recording_real_client(body)
+
+        with pytest.raises(ToolError) as excinfo:
+            await _run_date_action(client, action, filters)
+
+        assert excinfo.value.field == field
+        assert "yyyy-MM-dd" in " ".join(excinfo.value.suggestions)
+        assert "start_date" not in excinfo.value.message
+        assert "end_date" not in excinfo.value.message
+        assert platform_requests == []
+
+    @pytest.mark.asyncio
+    async def test_the_roi_summary_reports_the_bounds_it_sent(self, recording_real_client):
+        client, _ = recording_real_client(ROI_SUMMARY_RESPONSE)
+
+        result = await _run_date_action(
+            client, "get_roi_summary", {"startDate": "2026-10-01", "endDate": "2026-10-14"}
+        )
+
+        assert result["filters_applied"] == {
+            "startDate": _WHOLE_DAYS[0],
+            "endDate": _WHOLE_DAYS[1],
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action,body", _DATE_ACTIONS, ids=[a[0] for a in _DATE_ACTIONS])
+    async def test_every_published_date_example_is_sent_as_instants(
+        self, recording_real_client, job_mgmt, action, body
+    ):
+        examples = json.loads((await job_mgmt.handle_action("get_examples", {}))[0].text)
+        published = [
+            example["filters"]
+            for example in examples[action].values()
+            if isinstance(example, dict) and isinstance(example.get("filters"), dict)
+        ]
+        for filters in published:
+            client, platform_requests = recording_real_client(body)
+
+            await _run_date_action(client, action, filters)
+
+            [(_, params)] = platform_requests
+            for bound in ("startDate", "endDate"):
+                if bound in filters:
+                    assert params[bound].endswith(".000Z") or params[bound].endswith(".999Z")
+
+    @pytest.mark.asyncio
+    async def test_a_refused_roi_summary_names_what_the_platform_refused(
+        self, job_manager, mock_client
+    ):
+        mock_client.get_jobs_roi_summary.side_effect = ReveniumAPIError(
+            "Invalid request - startDate: Invalid date", status_code=400
+        )
+
+        with pytest.raises(ToolError) as excinfo:
+            await job_manager.get_roi_summary({})
+
+        assert "startDate: Invalid date" in excinfo.value.message
+
+
+# ---------------------------------------------------------------------------
+# The ROI and funnel headings name their window (BACK-4716)
+# ---------------------------------------------------------------------------
+
+
+class TestJobWindowHeadings:
+    """With no dates the ROI summary answers the platform's default window and
+    the funnel answers with no window at all, so each heading says which one
+    the figures below it cover instead of reading as the whole picture."""
+
+    @staticmethod
+    def _first_lines(result):
+        return result[0].text.split("\n")[:2]
+
+    @pytest.mark.asyncio
+    async def test_the_roi_heading_names_the_platform_default_window(
+        self, job_mgmt, mock_mgmt_client
+    ):
+        mock_mgmt_client.get_jobs_roi_summary.return_value = copy.deepcopy(ROI_SUMMARY_RESPONSE)
+
+        result = await job_mgmt.handle_action("get_roi_summary", {})
+
+        assert self._first_lines(result) == [
+            "ROI summary across all job types from 2026-08-05T00:00:00.000Z "
+            "to 2026-09-04T00:00:00.000Z:",
+            "No startDate or endDate was given, so this is the platform's default "
+            "window; pass startDate and endDate for another one.",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_roi_heading_for_a_requested_window_has_no_default_note(
+        self, job_mgmt, mock_mgmt_client
+    ):
+        response = copy.deepcopy(ROI_SUMMARY_RESPONSE)
+        response["period"] = {"start": _WHOLE_DAYS[0], "end": _WHOLE_DAYS[1]}
+        mock_mgmt_client.get_jobs_roi_summary.return_value = response
+
+        result = await job_mgmt.handle_action(
+            "get_roi_summary",
+            {"filters": {"startDate": "2026-10-01", "endDate": "2026-10-14"}},
+        )
+
+        assert self._first_lines(result) == [
+            f"ROI summary across all job types from {_WHOLE_DAYS[0]} to {_WHOLE_DAYS[1]}:",
+            "",
+        ]
+        assert "default window" not in result[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "filters,note",
+        [
+            ({"endDate": "2026-10-14"}, "No startDate was given, so the platform chose the start."),
+            ({"startDate": "2026-10-01"}, "No endDate was given, so the platform chose the end."),
+        ],
+        ids=["end_only", "start_only"],
+    )
+    async def test_the_roi_heading_notes_the_side_the_platform_chose(
+        self, job_mgmt, mock_mgmt_client, filters, note
+    ):
+        mock_mgmt_client.get_jobs_roi_summary.return_value = copy.deepcopy(ROI_SUMMARY_RESPONSE)
+
+        result = await job_mgmt.handle_action("get_roi_summary", {"filters": filters})
+
+        assert self._first_lines(result) == [
+            "ROI summary across all job types from 2026-08-05T00:00:00.000Z "
+            "to 2026-09-04T00:00:00.000Z:",
+            note,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_roi_heading_says_when_the_response_names_no_window(
+        self, job_mgmt, mock_mgmt_client
+    ):
+        response = copy.deepcopy(ROI_SUMMARY_RESPONSE)
+        del response["period"]
+        mock_mgmt_client.get_jobs_roi_summary.return_value = response
+
+        result = await job_mgmt.handle_action("get_roi_summary", {})
+
+        assert self._first_lines(result) == [
+            "ROI summary across all job types (the response did not say which "
+            "window it covers):",
+            "No startDate or endDate was given, so this is the platform's default "
+            "window; pass startDate and endDate for another one.",
+        ]
+
+    @staticmethod
+    def _answer_one_page_of_jobs(mock_mgmt_client):
+        mock_mgmt_client.get_jobs.return_value = {}
+        mock_mgmt_client._extract_embedded_data.return_value = [{"id": "j1"}]
+        mock_mgmt_client._extract_pagination_info.return_value = {
+            "totalPages": 3,
+            "totalElements": 25,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "filters,heading",
+        [
+            (
+                {"startDate": "2026-10-01", "endDate": "2026-10-14"},
+                f"Jobs created from {_WHOLE_DAYS[0]} to {_WHOLE_DAYS[1]} (page 2):",
+            ),
+            (
+                {"startDate": "2026-10-01"},
+                f"Jobs created from {_WHOLE_DAYS[0]} onward (page 2):",
+            ),
+            (
+                {"endDate": "2026-10-14"},
+                f"Jobs created up to {_WHOLE_DAYS[1]} (page 2):",
+            ),
+        ],
+        ids=["both", "start_only", "end_only"],
+    )
+    async def test_the_jobs_list_heading_names_the_window_sent(
+        self, job_mgmt, mock_mgmt_client, filters, heading
+    ):
+        self._answer_one_page_of_jobs(mock_mgmt_client)
+
+        result = await job_mgmt.handle_action(
+            "list_jobs",
+            {"page": 1, "size": 10, "filters": {**filters, "executionStatus": "SUCCESS"}},
+        )
+
+        assert self._first_lines(result) == [heading, ""]
+        payload = json.loads(result[0].text.split("\n\n", 1)[1])
+        assert payload["filters_applied"] == {
+            "executionStatus": "SUCCESS",
+            **{
+                name: value
+                for name, value in (("startDate", _WHOLE_DAYS[0]), ("endDate", _WHOLE_DAYS[1]))
+                if name in filters
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_jobs_list_heading_says_no_window_was_sent(
+        self, job_mgmt, mock_mgmt_client
+    ):
+        self._answer_one_page_of_jobs(mock_mgmt_client)
+
+        result = await job_mgmt.handle_action("list_jobs", {"page": 0, "size": 10})
+
+        assert self._first_lines(result) == [
+            "Jobs (page 1), all creation dates (no startDate or endDate was given):",
+            "",
+        ]
+        payload = json.loads(result[0].text.split("\n\n", 1)[1])
+        assert payload["filters_applied"] is None
+
+    @pytest.mark.asyncio
+    async def test_the_funnel_heading_says_no_window_was_sent(self, job_mgmt, mock_mgmt_client):
+        mock_mgmt_client.get_job_conversion_funnel.return_value = {"totalJobs": 3}
+
+        result = await job_mgmt.handle_action("get_conversion_funnel", {})
+
+        assert self._first_lines(result) == [
+            "Conversion funnel analytics with no date window (no startDate or "
+            "endDate was given):",
+            "",
+        ]
+        mock_mgmt_client.get_job_conversion_funnel.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "filters,heading",
+        [
+            (
+                {"startDate": "2026-10-01", "endDate": "2026-10-14"},
+                f"Conversion funnel analytics from {_WHOLE_DAYS[0]} to {_WHOLE_DAYS[1]}:",
+            ),
+            (
+                {"startDate": "2026-10-01"},
+                f"Conversion funnel analytics from {_WHOLE_DAYS[0]} onward:",
+            ),
+            (
+                {"endDate": "2026-10-14"},
+                f"Conversion funnel analytics up to {_WHOLE_DAYS[1]}:",
+            ),
+        ],
+        ids=["both", "start_only", "end_only"],
+    )
+    async def test_the_funnel_heading_names_the_window_sent(
+        self, job_mgmt, mock_mgmt_client, filters, heading
+    ):
+        mock_mgmt_client.get_job_conversion_funnel.return_value = {"totalJobs": 3}
+
+        result = await job_mgmt.handle_action("get_conversion_funnel", {"filters": filters})
+
+        assert self._first_lines(result) == [heading, ""]
+        payload = json.loads(result[0].text.split("\n\n", 1)[1])
+        assert payload["filters_applied"] == {
+            name: value
+            for name, value in (("startDate", _WHOLE_DAYS[0]), ("endDate", _WHOLE_DAYS[1]))
+            if name in filters
+        }
+
+
+# ---------------------------------------------------------------------------
+# Every job-id action sends the id as one path segment (BACK-4716)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def wire_recording_client():
+    """A real ReveniumClient whose transport records the bytes each request sends."""
+    client = ReveniumClient(
+        auth_config=AuthConfig(
+            api_key="test_key_12345",
+            team_id="team_abc",
+            base_url="https://api.test.revenium.ai",
+            timeout=10.0,
+        )
+    )
+    sent = []
+
+    def answer(request):
+        sent.append((request.method, request.url.raw_path.decode()))
+        return httpx.Response(200, json={"transactions": [], "totalCount": 0})
+
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    return client, sent
+
+
+# (action, method, path suffix after the job id, the action's other arguments)
+_JOB_ID_ACTIONS = [
+    ("get_job", "GET", "", {}),
+    ("get_job_transactions", "GET", "/transactions", {}),
+    ("get_job_roi", "GET", "/roi", {}),
+    ("report_outcome", "POST", "/outcome", {"outcome_data": {"executionStatus": "SUCCESS"}}),
+    (
+        "amend_outcome",
+        "PATCH",
+        "/outcome",
+        {"outcome_data": {"outcomeValue": 1}, "expected_entity_version": 1},
+    ),
+    (
+        "append_outcome_metrics",
+        "POST",
+        "/outcome/metrics",
+        {"metrics": [{"key": "quality_rate", "value": 0.9}]},
+    ),
+]
+
+
+class TestEveryJobIdActionSendsTheIdAsOnePathSegment:
+    """A job id is the caller's own free text, so a slash, '#' or '?' in it
+    must not move the request to another job or another endpoint."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action,method,suffix,extra", _JOB_ID_ACTIONS, ids=[a[0] for a in _JOB_ID_ACTIONS]
+    )
+    async def test_a_job_id_with_a_hash_reaches_its_own_path(
+        self, wire_recording_client, action, method, suffix, extra
+    ):
+        client, sent = wire_recording_client
+
+        await getattr(JobManager(client), action)({"job_id": "claims-2026-10-15#7", **extra})
+
+        assert sent == [
+            (method, f"/profitstream/v2/api/jobs/claims-2026-10-15%237{suffix}?teamId=team_abc")
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action,method,suffix,extra", _JOB_ID_ACTIONS, ids=[a[0] for a in _JOB_ID_ACTIONS]
+    )
+    @pytest.mark.parametrize("job_id", ["..", "."])
+    async def test_a_job_id_off_its_path_is_refused_before_any_request(
+        self, wire_recording_client, action, method, suffix, extra, job_id
+    ):
+        client, sent = wire_recording_client
+
+        with pytest.raises(ToolError) as excinfo:
+            await getattr(JobManager(client), action)({"job_id": job_id, **extra})
+
+        assert excinfo.value.field == "job_id"
+        assert sent == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action,method,suffix,extra", _JOB_ID_ACTIONS, ids=[a[0] for a in _JOB_ID_ACTIONS]
+    )
+    async def test_a_job_id_with_a_slash_is_refused_naming_the_rule_before_any_request(
+        self, wire_recording_client, action, method, suffix, extra
+    ):
+        client, sent = wire_recording_client
+
+        with pytest.raises(ToolError) as excinfo:
+            await getattr(JobManager(client), action)({"job_id": "claims/2026-10-15", **extra})
+
+        assert excinfo.value.field == "job_id"
+        assert "must not contain '/'" in excinfo.value.message
+        assert sent == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action,method,suffix,extra", _JOB_ID_ACTIONS, ids=[a[0] for a in _JOB_ID_ACTIONS]
+    )
+    @pytest.mark.parametrize(
+        "job_id,segment",
+        [("a%2Fb", "a%252Fb"), ("x..y", "x..y")],
+        ids=["encoded_slash_text", "dots_inside"],
+    )
+    async def test_a_job_id_without_a_real_slash_is_sent_as_one_segment(
+        self, wire_recording_client, action, method, suffix, extra, job_id, segment
+    ):
+        client, sent = wire_recording_client
+
+        await getattr(JobManager(client), action)({"job_id": job_id, **extra})
+
+        assert sent == [
+            (method, f"/profitstream/v2/api/jobs/{segment}{suffix}?teamId=team_abc")
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("job_id", ["types", "conversion-funnel"])
+    async def test_a_reserved_job_id_is_refused_where_its_bare_path_is_another_endpoint(
+        self, wire_recording_client, job_id
+    ):
+        client, sent = wire_recording_client
+
+        with pytest.raises(ToolError) as excinfo:
+            await JobManager(client).get_job({"job_id": job_id})
+
+        assert excinfo.value.field == "job_id"
+        assert sent == []
+
+    @pytest.mark.parametrize("job_id", [["types"], {"id": "types"}, 7])
+    def test_a_job_id_that_is_not_text_is_left_to_the_platform_on_a_bare_path(
+        self, job_id
+    ):
+        job_management_module._refuse_job_id_off_its_path(
+            job_id, "get_job", path_ends_at_id=True
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action,method,suffix,extra",
+        [a for a in _JOB_ID_ACTIONS if a[2]],
+        ids=[a[0] for a in _JOB_ID_ACTIONS if a[2]],
+    )
+    @pytest.mark.parametrize("job_id", ["types", "conversion-funnel"])
+    async def test_a_reserved_job_id_still_reaches_its_own_sub_path(
+        self, wire_recording_client, action, method, suffix, extra, job_id
+    ):
+        client, sent = wire_recording_client
+
+        await getattr(JobManager(client), action)({"job_id": job_id, **extra})
+
+        assert sent == [(method, f"/profitstream/v2/api/jobs/{job_id}{suffix}?teamId=team_abc")]
+
+    @pytest.mark.asyncio
+    async def test_a_padded_dot_id_is_one_ordinary_segment(self, wire_recording_client):
+        client, sent = wire_recording_client
+
+        await JobManager(client).get_job({"job_id": " .. "})
+
+        assert sent == [("GET", "/profitstream/v2/api/jobs/%20..%20?teamId=team_abc")]
+
+    @pytest.mark.asyncio
+    async def test_the_outcome_reply_names_the_job_whose_outcome_path_was_written(
+        self, job_mgmt, wire_recording_client
+    ):
+        client, sent = wire_recording_client
+
+        with patch.object(job_mgmt, "get_client", new_callable=AsyncMock) as get_client:
+            get_client.return_value = client
+            result = await job_mgmt.handle_action(
+                "report_outcome",
+                {"job_id": "claims-2026-10-15#7", "outcome_data": {"executionStatus": "SUCCESS"}},
+            )
+
+        assert result[0].text.startswith("Outcome reported for job claims-2026-10-15#7:")
+        assert sent == [
+            ("POST", "/profitstream/v2/api/jobs/claims-2026-10-15%237/outcome?teamId=team_abc")
+        ]

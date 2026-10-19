@@ -111,7 +111,38 @@ class TestMapPlanFields:
             "setup_fees": [{"amount": 50, "name": "Onboarding"}],
         }
         result = APIFieldMapper.map_plan_fields(plan)
-        assert result["setups"][0]["flatAmount"] == 50
+        assert result.get("setupFees") == [
+            {"flatAmount": 50, "name": "Onboarding", "type": "ORGANIZATION"}
+        ]
+        assert "setups" not in result
+
+    def test_camel_case_setup_fees_still_pass_through(self):
+        fees = [{"name": "x", "type": "SUBSCRIPTION", "flatAmount": 50}]
+        result = APIFieldMapper.map_plan_fields({"name": "P", "setupFees": fees})
+        assert result["setupFees"] == [{"name": "x", "type": "SUBSCRIPTION", "flatAmount": 50}]
+        assert "setups" not in result
+
+    def test_create_product_body_carries_snake_case_setup_fee(self):
+        product = {
+            "name": "P",
+            "version": "1",
+            "plan": {
+                "name": "PP",
+                "setup_fees": [{"name": "s", "type": "SUBSCRIPTION", "flatAmount": 50}],
+            },
+        }
+        plan = APIFieldMapper.map_product_fields(product)["plan"]
+        assert plan.get("setupFees") == [{"name": "s", "type": "SUBSCRIPTION", "flatAmount": 50}]
+        assert "setups" not in plan
+
+    def test_both_setup_fee_spellings_are_combined(self):
+        camel = {"name": "camel", "type": "SUBSCRIPTION", "flatAmount": 75}
+        snake = {"name": "snake", "type": "SUBSCRIPTION", "flatAmount": 50}
+        # The snake key comes first in the dict; the camel fees still lead.
+        plan = {"name": "P", "setup_fees": [snake], "setupFees": [camel]}
+        result = APIFieldMapper.map_plan_fields(plan)
+        assert result.get("setupFees") == [camel, snake]
+        assert "setups" not in result
 
     def test_maps_nested_elements(self):
         plan = {
@@ -137,7 +168,6 @@ class TestMapProductFields:
     def test_adds_default_fields(self):
         product = {"name": "P", "version": "1.0"}
         result = APIFieldMapper.map_product_fields(product)
-        assert result["published"] is True
         assert result["notifyClientOnInvoice"] is False
         assert result["paymentSource"] == "INVOICE_ONLY_NO_PAYMENT"
         assert result["subscriptionAllowMidPeriodCancellation"] is False
@@ -146,6 +176,16 @@ class TestMapProductFields:
         product = {"name": "P", "version": "1.0", "published": False}
         result = APIFieldMapper.map_product_fields(product)
         assert result["published"] is False
+
+    def test_does_not_invent_published(self):
+        """BACK-4662: create and update share this mapper, so it must not publish."""
+        result = APIFieldMapper.map_product_fields({"name": "P", "version": "1.0"})
+        assert "published" not in result
+
+    def test_explicit_published_true_is_kept(self):
+        product = {"name": "P", "version": "1.0", "published": True}
+        result = APIFieldMapper.map_product_fields(product)
+        assert result["published"] is True
 
     def test_maps_nested_plan(self):
         product = {

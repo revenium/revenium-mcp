@@ -101,6 +101,34 @@ class TestValidateCredentialData:
             await handler.validate_credential_data({})
 
     @pytest.mark.asyncio
+    async def test_update_hint_names_only_accepted_inputs(self, handler):
+        """Every keyword the hint shows must be one the registered tool accepts."""
+        import inspect
+        import re
+
+        from src.revenium_mcp_server.tool_configuration.config import ToolConfig
+        from src.revenium_mcp_server.tool_configuration.registry import (
+            ToolConfigurationRegistry,
+        )
+
+        mcp = MagicMock()
+        registry = ToolConfigurationRegistry(
+            tool_config=ToolConfig.create_for_testing(profile="business")
+        )
+        await registry._register_manage_subscriber_credentials(mcp)
+        closure = mcp.tool.return_value.call_args[0][0]
+        declared = set(inspect.signature(closure).parameters)
+
+        with pytest.raises(ToolError) as exc_info:
+            await handler.validate_credential_data({})
+
+        examples = exc_info.value.examples
+        hints = {key: value for key, value in examples.items() if key.startswith("usage")}
+        keywords = {name for hint in hints.values() for name in re.findall(r"(\w+)=", hint)}
+        assert sorted(keywords - declared) == []
+        assert "credential_id=" in hints["usage_update"]
+
+    @pytest.mark.asyncio
     async def test_valid_create_data_passes(self, handler):
         """Complete credential data for create passes validation."""
         result = await handler.validate_credential_data({

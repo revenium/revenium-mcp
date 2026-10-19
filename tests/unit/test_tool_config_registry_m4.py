@@ -440,21 +440,21 @@ class TestManageAlertsJsonPreprocessing:
         assert captured_args["anomaly_data"]["name"] == "test"
 
     @pytest.mark.asyncio
-    async def test_malformed_json_string_anomaly_data_returns_error_text(self):
-        """Malformed anomaly_data JSON string returns a TextContent error message."""
-        from mcp.types import TextContent
+    async def test_malformed_json_string_anomaly_data_raises(self):
+        """Malformed anomaly_data JSON string raises a ToolError."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_alerts")
 
-        result = await registered_fn(
-            action="create",
-            anomaly_data="not valid json {{{{",
-        )
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(
+                action="create",
+                anomaly_data="not valid json {{{{",
+            )
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        assert "anomaly_data" in result[0].text.lower()
+        assert raised.value.field == "anomaly_data"
+        assert raised.value.message.startswith("Invalid JSON for anomaly_data:")
 
     @pytest.mark.asyncio
     async def test_dict_anomaly_data_passed_through_unchanged(self):
@@ -522,27 +522,31 @@ class TestManageAlertsBudgetProgressParams:
 
     @pytest.mark.asyncio
     async def test_anomaly_ids_non_list_json_rejected(self):
-        from mcp.types import TextContent
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_alerts")
-        result = await registered_fn(
-            action="get_budget_progress", anomaly_ids='{"not": "a list"}'
-        )
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        assert "anomaly_ids" in result[0].text.lower()
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(
+                action="get_budget_progress", anomaly_ids='{"not": "a list"}'
+            )
+        assert raised.value.field == "anomaly_ids"
+        assert raised.value.message.startswith("Invalid JSON for anomaly_ids:")
+        assert "anomaly_ids must be a JSON array" in raised.value.message
 
     @pytest.mark.asyncio
     async def test_anomaly_ids_malformed_json_rejected(self):
-        from mcp.types import TextContent
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_alerts")
-        result = await registered_fn(
-            action="get_budget_progress", anomaly_ids="not json {{{"
-        )
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        assert "anomaly_ids" in result[0].text.lower()
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(
+                action="get_budget_progress", anomaly_ids="not json {{{"
+            )
+        assert raised.value.field == "anomaly_ids"
+        assert raised.value.message.startswith("Invalid JSON for anomaly_ids:")
+        assert "anomaly_ids must be a JSON array" in raised.value.message
 
     @pytest.mark.asyncio
     async def test_include_trend_and_now_forwarded(self):
@@ -561,20 +565,21 @@ class TestManageAlertsBudgetProgressParams:
 
 class TestManageSourcesJsonPreprocessing:
     @pytest.mark.asyncio
-    async def test_malformed_source_data_returns_error_text(self):
-        """Malformed source_data JSON string returns a TextContent error response."""
-        from mcp.types import TextContent
+    async def test_malformed_source_data_raises(self):
+        """Malformed source_data JSON string raises a ToolError."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_sources")
 
-        result = await registered_fn(
-            action="create",
-            source_data="{bad json",
-        )
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(
+                action="create",
+                source_data="{bad json",
+            )
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
+        assert raised.value.field == "source_data"
+        assert raised.value.message.startswith("Invalid JSON for source_data:")
 
     @pytest.mark.asyncio
     async def test_valid_json_string_source_data_is_parsed(self):
@@ -656,6 +661,75 @@ class TestBusinessAnalyticsDimensionForwarding:
         assert "dimension" not in captured_args
 
 
+class TestBusinessAnalyticsUserCostsPageSize:
+    """FRONT-3434: get_user_costs reaches its handler with a page of 100 users unless the caller
+    sends a size, while the other actions keep the tool's default of 20."""
+
+    @pytest.mark.asyncio
+    async def test_page_size_default_follows_the_action(self):
+        registered_fn = await _get_registered_closure(
+            _make_registry(), "_register_business_analytics_management"
+        )
+        calls: list = []
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            calls.append(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="get_user_costs", period="THIRTY_DAYS")
+            await registered_fn(action="get_user_costs", period="THIRTY_DAYS", size=10)
+            await registered_fn(action="get_department_costs", period="THIRTY_DAYS")
+
+        assert [call["size"] for call in calls] == [100, 10, 20]
+
+
+class TestBusinessAnalyticsCalendarRange:
+    """FRONT-3434: start_date and end_date reach the cost actions through the registered tool."""
+
+    @pytest.mark.asyncio
+    async def test_registered_tool_declares_both(self):
+        from fastmcp import FastMCP
+
+        mcp = FastMCP("front-3434")
+        await _make_registry()._register_business_analytics_management(mcp)
+        tools = {tool.name: tool for tool in await mcp.list_tools(run_middleware=False)}
+        properties = tools["business_analytics_management"].parameters["properties"]
+        assert "start_date" in properties
+        assert "end_date" in properties
+
+    @pytest.mark.asyncio
+    async def test_both_are_forwarded_to_a_cost_action_and_omitted_when_absent(self):
+        registered_fn = await _get_registered_closure(
+            _make_registry(), "_register_business_analytics_management"
+        )
+        calls: list = []
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            calls.append(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(
+                action="get_provider_costs", start_date="2026-09-01", end_date="2026-09-30"
+            )
+            await registered_fn(
+                action="get_team_costs",
+                params={"start_date": "2026-09-01", "end_date": "2026-09-30"},
+            )
+            await registered_fn(action="get_provider_costs", period="THIRTY_DAYS")
+
+        assert (calls[0]["start_date"], calls[0]["end_date"]) == ("2026-09-01", "2026-09-30")
+        assert (calls[1]["start_date"], calls[1]["end_date"]) == ("2026-09-01", "2026-09-30")
+        assert "start_date" not in calls[2] and "end_date" not in calls[2]
+
+
 # ---------------------------------------------------------------------------
 # manage_metering closure — ticket/skill attribution forwarding
 # ---------------------------------------------------------------------------
@@ -725,37 +799,39 @@ class TestManageMeteringAttributionForwarding:
 
 class TestManageWorkflowsJsonPreprocessing:
     @pytest.mark.asyncio
-    async def test_malformed_context_returns_error_text(self):
-        """Malformed context JSON string returns a TextContent error response."""
-        from mcp.types import TextContent
+    async def test_malformed_context_raises(self):
+        """Malformed context JSON string raises a ToolError."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_workflows")
 
-        result = await registered_fn(
-            action="start",
-            context="{invalid",
-        )
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(
+                action="start",
+                context="{invalid",
+            )
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
+        assert raised.value.field == "context"
+        assert raised.value.message.startswith("Invalid JSON for context:")
 
     @pytest.mark.asyncio
-    async def test_malformed_workflow_data_returns_error_text(self):
-        """Malformed workflow_data JSON string returns a TextContent error response."""
-        from mcp.types import TextContent
+    async def test_malformed_workflow_data_raises(self):
+        """Malformed workflow_data JSON string raises a ToolError."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_workflows")
 
-        result = await registered_fn(
-            action="create",
-            context=None,
-            workflow_data="{broken",
-        )
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(
+                action="create",
+                context=None,
+                workflow_data="{broken",
+            )
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
+        assert raised.value.field == "workflow_data"
+        assert raised.value.message.startswith("Invalid JSON for workflow_data:")
 
     @pytest.mark.asyncio
     async def test_valid_json_context_parsed(self):
@@ -788,22 +864,23 @@ class TestManageWorkflowsJsonPreprocessing:
 
 class TestManageSubscriberCredentialsJsonPreprocessing:
     @pytest.mark.asyncio
-    async def test_malformed_credential_data_returns_error_text(self):
-        """Malformed credential_data JSON string returns a TextContent error."""
-        from mcp.types import TextContent
+    async def test_malformed_credential_data_raises(self):
+        """Malformed credential_data JSON string raises a ToolError."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(
             registry, "_register_manage_subscriber_credentials"
         )
 
-        result = await registered_fn(
-            action="create",
-            credential_data="not-json",
-        )
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(
+                action="create",
+                credential_data="not-json",
+            )
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
+        assert raised.value.field == "credential_data"
+        assert raised.value.message.startswith("Invalid JSON for credential_data:")
 
     @pytest.mark.asyncio
     async def test_valid_json_credential_data_parsed(self):
@@ -838,37 +915,39 @@ class TestManageSubscriberCredentialsJsonPreprocessing:
 
 class TestManageProductsJsonPreprocessing:
     @pytest.mark.asyncio
-    async def test_malformed_product_data_returns_error_text(self):
-        """Malformed product_data JSON string returns a TextContent error."""
-        from mcp.types import TextContent
+    async def test_malformed_product_data_raises(self):
+        """Malformed product_data JSON string raises a ToolError."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_products")
 
-        result = await registered_fn(
-            action="create",
-            product_data="{broken-json",
-        )
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(
+                action="create",
+                product_data="{broken-json",
+            )
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
+        assert raised.value.field == "product_data"
+        assert raised.value.message.startswith("Invalid JSON for product_data:")
 
     @pytest.mark.asyncio
-    async def test_malformed_resource_data_returns_error_text(self):
-        """Malformed resource_data JSON string returns a TextContent error (product_data=None)."""
-        from mcp.types import TextContent
+    async def test_malformed_resource_data_raises(self):
+        """Malformed resource_data JSON string raises a ToolError (product_data=None)."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_products")
 
-        result = await registered_fn(
-            action="create",
-            product_data=None,
-            resource_data="bad json>>",
-        )
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(
+                action="create",
+                product_data=None,
+                resource_data="bad json>>",
+            )
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
+        assert raised.value.field == "resource_data"
+        assert raised.value.message.startswith("Invalid JSON for resource_data:")
 
     @pytest.mark.asyncio
     async def test_valid_product_data_json_parsed(self):
@@ -980,20 +1059,21 @@ class TestManageCustomersJsonPreprocessing:
         assert captured_args["confirm"] is confirm
 
     @pytest.mark.asyncio
-    async def test_malformed_resource_data_returns_error_text(self):
-        """Malformed resource_data JSON returns a TextContent error."""
-        from mcp.types import TextContent
+    async def test_malformed_resource_data_raises(self):
+        """Malformed resource_data JSON raises a ToolError."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_customers")
 
-        result = await registered_fn(
-            action="update",
-            resource_data="{garbage",
-        )
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(
+                action="update",
+                resource_data="{garbage",
+            )
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
+        assert raised.value.field == "resource_data"
+        assert raised.value.message.startswith("Invalid JSON for resource_data:")
 
     @pytest.mark.asyncio
     async def test_resource_id_mapped_to_organization_id_for_organizations(self):
@@ -1169,22 +1249,23 @@ class TestManageCustomersJsonPreprocessing:
 
 class TestManageSubscriptionsJsonPreprocessing:
     @pytest.mark.asyncio
-    async def test_malformed_subscription_data_returns_error_text(self):
-        """Malformed subscription_data JSON string returns TextContent error."""
-        from mcp.types import TextContent
+    async def test_malformed_subscription_data_raises(self):
+        """Malformed subscription_data JSON string raises a ToolError."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(
             registry, "_register_manage_subscriptions"
         )
 
-        result = await registered_fn(
-            action="create",
-            subscription_data="{bad",
-        )
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(
+                action="create",
+                subscription_data="{bad",
+            )
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
+        assert raised.value.field == "subscription_data"
+        assert raised.value.message.startswith("Invalid JSON for subscription_data:")
 
     @pytest.mark.asyncio
     async def test_valid_subscription_data_json_parsed(self):
@@ -1219,22 +1300,23 @@ class TestManageSubscriptionsJsonPreprocessing:
 
 class TestManageMeteringElementsJsonPreprocessing:
     @pytest.mark.asyncio
-    async def test_malformed_element_data_returns_error_text(self):
-        """Malformed element_data JSON string returns TextContent error."""
-        from mcp.types import TextContent
+    async def test_malformed_element_data_raises(self):
+        """Malformed element_data JSON string raises a ToolError."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(
             registry, "_register_manage_metering_elements"
         )
 
-        result = await registered_fn(
-            action="create",
-            element_data="{{not-json",
-        )
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(
+                action="create",
+                element_data="{{not-json",
+            )
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
+        assert raised.value.field == "element_data"
+        assert raised.value.message.startswith("Invalid JSON for element_data:")
 
     @pytest.mark.asyncio
     async def test_valid_element_data_json_parsed(self):
@@ -1893,46 +1975,49 @@ class TestManageAgentsJsonPreprocessing:
         assert captured_args["agent_data"]["telemetryKey"] == "my-agent"
 
     @pytest.mark.asyncio
-    async def test_malformed_json_string_agent_data_returns_error_text(self):
-        from mcp.types import TextContent
+    async def test_malformed_json_string_agent_data_raises(self):
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_agents")
 
-        result = await registered_fn(action="create", agent_data="not json {{{{")
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(action="create", agent_data="not json {{{{")
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        assert "agent_data" in result[0].text
+        assert raised.value.field == "agent_data"
+        assert raised.value.message.startswith("Invalid JSON for agent_data:")
+        assert "agent_data must be a JSON object" in raised.value.message
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("scalar", ['"just-a-string"', "1", "[]", "true"])
-    async def test_non_object_json_agent_data_returns_error_text(self, scalar):
+    async def test_non_object_json_agent_data_raises(self, scalar):
         """JSON that parses to a non-dict is rejected with a structured message
         instead of reaching the manager and failing on .get()."""
-        from mcp.types import TextContent
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_agents")
 
-        result = await registered_fn(action="create", agent_data=scalar)
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(action="create", agent_data=scalar)
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        assert "JSON object" in result[0].text
+        assert raised.value.field == "agent_data"
+        assert raised.value.message.startswith("Invalid JSON for agent_data:")
+        assert "agent_data must be a JSON object" in raised.value.message
 
     @pytest.mark.asyncio
-    async def test_non_object_json_filters_returns_error_text(self):
-        from mcp.types import TextContent
+    async def test_non_object_json_filters_raises(self):
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_agents")
 
-        result = await registered_fn(action="list", filters="[]")
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(action="list", filters="[]")
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        assert "JSON object" in result[0].text
+        assert raised.value.field == "filters"
+        assert raised.value.message.startswith("Invalid JSON for filters:")
+        assert "filters must be a JSON object" in raised.value.message
 
     @pytest.mark.asyncio
     async def test_squad_params_forwarded_through_closure(self):
@@ -1992,46 +2077,49 @@ class TestManageCostControlsJsonPreprocessing:
         assert captured_args["control_data"]["name"] == "Monthly Guardrail"
 
     @pytest.mark.asyncio
-    async def test_malformed_json_string_control_data_returns_error_text(self):
-        from mcp.types import TextContent
+    async def test_malformed_json_string_control_data_raises(self):
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
 
-        result = await registered_fn(action="create", control_data="not json {{{{")
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(action="create", control_data="not json {{{{")
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        assert "control_data" in result[0].text
+        assert raised.value.field == "control_data"
+        assert raised.value.message.startswith("Invalid JSON for control_data:")
+        assert "control_data must be a JSON object" in raised.value.message
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("scalar", ['"just-a-string"', "1", "[]", "true"])
-    async def test_non_object_json_control_data_returns_error_text(self, scalar):
+    async def test_non_object_json_control_data_raises(self, scalar):
         """JSON that parses to a non-dict is rejected with a structured message
         instead of reaching the manager and failing on .get()."""
-        from mcp.types import TextContent
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
 
-        result = await registered_fn(action="create", control_data=scalar)
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(action="create", control_data=scalar)
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        assert "JSON object" in result[0].text
+        assert raised.value.field == "control_data"
+        assert raised.value.message.startswith("Invalid JSON for control_data:")
+        assert "control_data must be a JSON object" in raised.value.message
 
     @pytest.mark.asyncio
-    async def test_non_object_json_filters_returns_error_text(self):
-        from mcp.types import TextContent
+    async def test_non_object_json_filters_raises(self):
+        from src.revenium_mcp_server.common.error_handling import ToolError
 
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
 
-        result = await registered_fn(action="list", filters="[]")
+        with pytest.raises(ToolError) as raised:
+            await registered_fn(action="list", filters="[]")
 
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        assert "JSON object" in result[0].text
+        assert raised.value.field == "filters"
+        assert raised.value.message.startswith("Invalid JSON for filters:")
+        assert "filters must be a JSON object" in raised.value.message
 
 
 class TestManageCostControlsNumericPreprocessing:
@@ -3200,6 +3288,66 @@ class TestManageJobsClosureParameters:
         assert "session_id" not in captured
 
 
+def _argument_names_read_by(node):
+    """The literal ``arguments`` keys one AST node reads, if any."""
+    import ast
+
+    def is_arguments(expr):
+        return isinstance(expr, ast.Name) and expr.id == "arguments"
+
+    def literal(expr):
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return {expr.value}
+        return set()
+
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and is_arguments(node.func.value)
+        and node.args
+    ):
+        return literal(node.args[0])
+    if (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.ctx, ast.Load)
+        and is_arguments(node.value)
+    ):
+        return literal(node.slice)
+    if (
+        isinstance(node, ast.Compare)
+        and len(node.ops) == 1
+        and isinstance(node.ops[0], ast.In)
+        and is_arguments(node.comparators[0])
+    ):
+        return literal(node.left)
+    if (
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "param_fields"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.List)
+    ):
+        return {name for element in node.value.elts for name in literal(element)}
+    return set()
+
+
+def _argument_names_read_in(*module_names):
+    """Every literal ``arguments`` key the named tools_decomposed modules read."""
+    import ast
+    from pathlib import Path
+
+    import src.revenium_mcp_server.tools_decomposed as package
+
+    names = set()
+    for module_name in module_names:
+        tree = ast.parse((Path(package.__file__).parent / module_name).read_text())
+        for node in ast.walk(tree):
+            names |= _argument_names_read_by(node)
+    return names
+
+
 class TestSubscriberCredentialsClosureParameters:
     @pytest.mark.asyncio
     async def test_both_organization_id_spellings_are_registered(self):
@@ -3213,6 +3361,279 @@ class TestSubscriberCredentialsClosureParameters:
         assert "organizationId" in params
         assert "organization_id" in params
         assert "filters" in params
+
+    #: Names a handler reads that the closure leaves undeclared on purpose.
+    _DELIBERATELY_UNDECLARED = {
+        "description": (
+            "collides with a natural credential field and would route create "
+            "through natural-language parsing; the handler file is owned by PR 443"
+        ),
+        "operation_type": "set by handle_action from credential_id",
+    }
+
+    _HANDLER_MODULES = (
+        "subscriber_credentials_management.py",
+        "credential_business_handler.py",
+        "credential_documentation_handler.py",
+    )
+
+    @classmethod
+    def _names_the_handlers_read(cls):
+        return _argument_names_read_in(*cls._HANDLER_MODULES)
+
+    @pytest.mark.asyncio
+    async def test_every_input_the_handlers_read_is_declared(self):
+        """FastMCP refuses an undeclared name, so a handler read beneath one is
+        unreachable: the troubleshooting guide asked for an issue description
+        and then refused the field."""
+        import inspect
+
+        registry = _make_registry(profile="business")
+        closure = await _get_registered_closure(registry, "_register_manage_subscriber_credentials")
+        declared = set(inspect.signature(closure).parameters)
+
+        undeclared = (
+            self._names_the_handlers_read() - declared - set(self._DELIBERATELY_UNDECLARED)
+        )
+
+        assert sorted(undeclared) == []
+
+    @pytest.mark.asyncio
+    async def test_every_schema_property_is_declared(self):
+        import inspect
+
+        from src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management import (
+            SubscriberCredentialsManagement,
+        )
+
+        registry = _make_registry(profile="business")
+        closure = await _get_registered_closure(registry, "_register_manage_subscriber_credentials")
+        declared = set(inspect.signature(closure).parameters)
+        schema = await SubscriberCredentialsManagement(ucm_helper=None)._get_input_schema()
+
+        assert sorted(set(schema["properties"]) - declared) == []
+
+
+#: Names subscription_management.py reads that manage_subscriptions leaves
+#: undeclared on purpose, each with the reason.
+_SUBSCRIPTIONS_DELIBERATELY_UNDECLARED = {
+    "name": (
+        "create's name-only fallback; the create action always builds "
+        "subscription_data first"
+    ),
+    "clientEmailAddress": (
+        "a top-level fallback for create; the documented place is "
+        "subscription_data, and auto-generate fills the field before it is read"
+    ),
+    "text": "create_simple and create_from_text are not routed by handle_action",
+    "billing_frequency": (
+        "create_simple and create_from_text are not routed by handle_action"
+    ),
+    "type": "create_simple and create_from_text are not routed by handle_action",
+    "credentials_data": "create_with_credentials is retired and no action routes to it",
+}
+
+_SUBSCRIPTION_INPUTS_TO_FORWARD = sorted(
+    _argument_names_read_in("subscription_management.py")
+    - set(_SUBSCRIPTIONS_DELIBERATELY_UNDECLARED)
+)
+
+_SUBSCRIPTION_SAMPLE_VALUES = {
+    "page": 1,
+    "size": 5,
+    "filters": {"type": "STANDARD"},
+    "auto_generate": False,
+    "dry_run": True,
+    "subscription_data": {"name": "probe"},
+}
+
+
+class TestManageSubscriptionsClosureParameters:
+    @pytest.mark.asyncio
+    async def test_every_input_the_handlers_read_is_declared(self):
+        """FastMCP refuses an undeclared name, so a handler read beneath one is
+        unreachable: subscription_nlp asked for a query and then refused it."""
+        import inspect
+
+        registry = _make_registry(profile="business")
+        closure = await _get_registered_closure(registry, "_register_manage_subscriptions")
+        declared = set(inspect.signature(closure).parameters)
+
+        undeclared = (
+            _argument_names_read_in("subscription_management.py")
+            - declared
+            - set(_SUBSCRIPTIONS_DELIBERATELY_UNDECLARED)
+        )
+
+        assert sorted(undeclared) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", _SUBSCRIPTION_INPUTS_TO_FORWARD)
+    async def test_every_declared_input_reaches_the_handler(self, name):
+        value = _SUBSCRIPTION_SAMPLE_VALUES.get(name, "acme")
+        is_error, text, captured = await _call_through_the_boundary(
+            "_register_manage_subscriptions",
+            "manage_subscriptions",
+            {"action": "get_capabilities", name: value},
+        )
+
+        assert not is_error, text
+        assert captured.get(name) == value
+
+
+class TestManageSubscriptionsTopLevelInputs:
+    """Each subscriptions action that reads a top-level input gets it through
+    the registered tool instead of a "not a recognized parameter" refusal."""
+
+    @staticmethod
+    async def _call(arguments, *, execute=False, client=None):
+        """With ``execute`` the real subscriptions handler answers, on ``client``.
+
+        The handler is called directly rather than through the introspection
+        registry, which other tests fill with instances this patch cannot reach.
+        """
+        if not execute:
+            return await _call_through_the_boundary(
+                "_register_manage_subscriptions", "manage_subscriptions", arguments
+            )
+        from src.revenium_mcp_server.tools_decomposed.subscription_management import (
+            SubscriptionManagement,
+        )
+
+        async def real_handler(tool_name, action, arguments, tool_class):
+            return await SubscriptionManagement(ucm_helper=None).handle_action(
+                action, arguments
+            )
+
+        with patch.object(
+            SubscriptionManagement, "get_client", AsyncMock(return_value=client)
+        ), patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=real_handler,
+        ):
+            return await _call_through_the_boundary(
+                "_register_manage_subscriptions",
+                "manage_subscriptions",
+                arguments,
+                execute=True,
+            )
+
+    @staticmethod
+    def _client():
+        client = MagicMock()
+        client.team_id = "team_1"
+        for method in (
+            "get_organizations",
+            "get_products",
+            "get_subscribers",
+            "get_credentials",
+            "get_subscriptions",
+        ):
+            setattr(client, method, AsyncMock(return_value={}))
+        client._extract_embedded_data = MagicMock(return_value=[])
+        client._extract_pagination_info = MagicMock(return_value={})
+        return client
+
+    @pytest.mark.asyncio
+    async def test_search_subscriptions_takes_search_query_at_the_top_level(self):
+        is_error, text, captured = await self._call(
+            {"action": "search_subscriptions", "search_query": "acme"}
+        )
+
+        assert not is_error, text
+        assert captured["search_query"] == "acme"
+
+    @pytest.mark.asyncio
+    async def test_search_subscriptions_takes_product_name_at_the_top_level(self):
+        is_error, text, captured = await self._call(
+            {"action": "search_subscriptions", "product_name": "Gold"}
+        )
+
+        assert not is_error, text
+        assert captured["product_name"] == "Gold"
+
+    @pytest.mark.asyncio
+    async def test_discover_products_takes_search_query_at_the_top_level(self):
+        is_error, text, captured = await self._call(
+            {"action": "discover_products", "search_query": "gold"}
+        )
+
+        assert not is_error, text
+        assert captured["search_query"] == "gold"
+
+    @pytest.mark.asyncio
+    async def test_get_supporting_data_uses_its_data_type(self):
+        client = self._client()
+
+        is_error, text, _ = await self._call(
+            {"action": "get_supporting_data", "data_type": "products", "size": 2},
+            execute=True,
+            client=client,
+        )
+
+        assert not is_error, text
+        client.get_products.assert_awaited_once()
+        client.get_organizations.assert_not_awaited()
+        client.get_subscribers.assert_not_awaited()
+        client.get_credentials.assert_not_awaited()
+        assert '"products"' in text
+        assert '"organizations"' not in text
+
+    @pytest.mark.asyncio
+    async def test_get_supporting_data_refuses_an_unknown_data_type(self):
+        client = self._client()
+
+        is_error, text, _ = await self._call(
+            {"action": "get_supporting_data", "data_type": "produtcs"},
+            execute=True,
+            client=client,
+        )
+
+        assert is_error, text
+        assert "produtcs" in text
+        assert "products" in text.replace("produtcs", "")
+        client.get_products.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_subscription_nlp_uses_its_query(self):
+        client = self._client()
+
+        is_error, text, _ = await self._call(
+            {"action": "subscription_nlp", "query": "list all subscriptions"},
+            execute=True,
+            client=client,
+        )
+
+        assert not is_error, text
+        client.get_subscriptions.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_examples_uses_its_example_type(self):
+        is_error, text, _ = await self._call(
+            {"action": "get_examples", "example_type": "trial_period"},
+            execute=True,
+            client=self._client(),
+        )
+
+        assert not is_error, text
+        assert "## **Example 1: Trial Subscription**" in text
+        assert "## **Example 2" not in text
+        assert "Enterprise Trial" in text
+
+    @pytest.mark.asyncio
+    async def test_get_examples_refuses_an_unknown_template_and_lists_the_valid_names(
+        self,
+    ):
+        is_error, text, _ = await self._call(
+            {"action": "get_examples", "example_type": "nope"},
+            execute=True,
+            client=self._client(),
+        )
+
+        assert is_error, text
+        assert "nope" in text
+        assert "trial_period" in text
+        assert "annual_billing" in text
 
 
 class TestManageMeteringPromptContextForwarding:
@@ -3309,3 +3730,700 @@ class TestManageAlertsProviderAndGroupLimit:
         assert calls[1]["group_limit"] == 10
         assert "provider" not in calls[2] and "group_limit" not in calls[2]
 
+
+
+async def _call_through_the_boundary(
+    register_method_name, tool_name, arguments, *, execute=False
+):
+    """Call a registered tool the way an MCP client does and capture what reaches it.
+
+    The real FastMCP binding and FrameworkLeakGuardMiddleware run, so an
+    undeclared name comes back as the customer-facing refusal. With
+    ``execute`` the real handler answers instead of the capturing stand-in.
+    """
+    from fastmcp import Client, FastMCP
+    from mcp.types import TextContent
+
+    from src.revenium_mcp_server.middleware.framework_leak_guard import (
+        FrameworkLeakGuardMiddleware,
+    )
+
+    mcp = FastMCP(f"{tool_name}-boundary")
+    mcp.add_middleware(FrameworkLeakGuardMiddleware())
+    await getattr(_make_registry(profile="business"), register_method_name)(mcp)
+    captured: dict = {}
+
+    async def fake_execution(tool_name, action, arguments, tool_class):
+        captured.update(arguments)
+        return [TextContent(type="text", text="ok")]
+
+    if execute:
+        async with Client(mcp) as client:
+            result = await client.call_tool(tool_name, arguments, raise_on_error=False)
+    else:
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    tool_name, arguments, raise_on_error=False
+                )
+    text = "\n".join(getattr(part, "text", "") for part in result.content)
+    return result.is_error, text, captured
+
+
+class TestManageMeteringTopLevelFilters:
+    """get_capabilities lists the completions filters and submission trace
+    fields as top-level arguments, so the registered tool must accept them there."""
+
+    @pytest.mark.asyncio
+    async def test_recent_transactions_take_dates_at_the_top_level(self):
+        sent = {
+            "start_date": "2026-10-14T00:00:00Z",
+            "end_date": "2026-10-15T00:00:00Z",
+            "total_cost_min": 0.5,
+            "request_duration_min": 500,
+        }
+        is_error, text, captured = await _call_through_the_boundary(
+            "_register_manage_metering",
+            "manage_metering",
+            {"action": "lookup_recent_transactions", **sent},
+        )
+
+        assert not is_error, text
+        for name, value in sent.items():
+            assert captured.get(name) == value, name
+        assert type(captured["request_duration_min"]) is int
+        assert type(captured["total_cost_min"]) is float
+
+    @pytest.mark.asyncio
+    async def test_submission_trace_fields_are_forwarded_at_the_top_level(self):
+        sent = {
+            "environment": "staging",
+            "retry_number": 1,
+            "usage_metadata": {"trace_type": "support-chat"},
+        }
+        is_error, text, captured = await _call_through_the_boundary(
+            "_register_manage_metering",
+            "manage_metering",
+            {"action": "submit_ai_transaction", **sent},
+        )
+
+        assert not is_error, text
+        for name, value in sent.items():
+            assert captured.get(name) == value, name
+
+
+class TestSubscriberCredentialsTopLevelInputs:
+    """Each local-text action answers with the input it was given, through the
+    registered tool, instead of refusing the field it asked for."""
+
+    @staticmethod
+    async def _call(arguments, *, execute=True):
+        return await _call_through_the_boundary(
+            "_register_manage_subscriber_credentials",
+            "manage_subscriber_credentials",
+            arguments,
+            execute=execute,
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_troubleshooting_guide_uses_its_input(self):
+        is_error, text, _ = await self._call(
+            {"action": "get_troubleshooting_guide", "issue_description": "billing missing"}
+        )
+        assert not is_error, text
+        assert '"issue": "billing missing"' in text
+
+    @pytest.mark.asyncio
+    async def test_parse_natural_language_uses_its_input(self):
+        sentence = "Create API key for john@company.com at Acme Corp"
+        is_error, text, _ = await self._call(
+            {"action": "parse_natural_language", "text": sentence}
+        )
+        assert not is_error, text
+        assert '"action": "parse_natural_language"' in text
+        assert sentence in text
+
+    @pytest.mark.asyncio
+    async def test_get_business_guidance_uses_its_input(self):
+        is_error, text, _ = await self._call(
+            {"action": "get_business_guidance", "scenario": "security_rotation"}
+        )
+        assert not is_error, text
+        assert '"scenario": "security_rotation"' in text
+
+    @pytest.mark.asyncio
+    async def test_get_onboarding_checklist_uses_its_input(self):
+        is_error, text, _ = await self._call(
+            {
+                "action": "get_onboarding_checklist",
+                "customer_info": {"name": "Acme Corp", "email": "ops@acme.example"},
+            }
+        )
+        assert not is_error, text
+        assert "Acme Corp" in text
+
+    @pytest.mark.asyncio
+    async def test_get_onboarding_checklist_takes_customer_info_as_a_json_string(self):
+        is_error, text, _ = await self._call(
+            {
+                "action": "get_onboarding_checklist",
+                "customer_info": '{"name": "Acme Corp", "email": "ops@acme.example"}',
+            }
+        )
+        assert not is_error, text
+        assert "Acme Corp" in text
+
+    @pytest.mark.asyncio
+    async def test_analyze_billing_impact_uses_its_input(self):
+        is_error, text, _ = await self._call(
+            {"action": "analyze_billing_impact", "operation": "delete"}
+        )
+        assert not is_error, text
+        assert '"operation": "delete"' in text
+
+    @pytest.mark.asyncio
+    async def test_get_examples_uses_its_input(self):
+        is_error, text, _ = await self._call(
+            {"action": "get_examples", "example_type": "validation"}
+        )
+        assert not is_error, text
+        assert "Validation Examples" in text
+
+    @pytest.mark.asyncio
+    async def test_individual_create_fields_are_forwarded(self):
+        secret = "s" * 12
+        is_error, text, captured = await self._call(
+            {
+                "action": "create",
+                "label": "Ops key",
+                "subscriberId": "sub_1",
+                "organizationId": "org_1",
+                "externalId": "ext_1",
+                "externalSecret": secret,
+                "tags": '["a", "b"]',
+                "subscriptionIds": ["subs_1"],
+            },
+            execute=False,
+        )
+
+        assert not is_error, text
+        assert captured["label"] == "Ops key"
+        assert captured["externalId"] == "ext_1"
+        assert captured["externalSecret"] == secret
+        assert captured["tags"] == ["a", "b"]
+        assert captured["subscriptionIds"] == ["subs_1"]
+
+
+class TestManageMeteringUsageMetadataJsonString:
+    """BACK-4674: a JSON-string usage_metadata must reach the handler as a dict."""
+
+    @pytest.mark.asyncio
+    async def test_a_json_string_usage_metadata_is_decoded(self):
+        is_error, text, captured = await _call_through_the_boundary(
+            "_register_manage_metering",
+            "manage_metering",
+            {
+                "action": "submit_ai_transaction",
+                "usage_metadata": '{"trace_type": "support-chat"}',
+            },
+        )
+
+        assert not is_error, text
+        assert captured["usage_metadata"] == {"trace_type": "support-chat"}
+
+    @pytest.mark.asyncio
+    async def test_a_json_string_usage_metadata_in_params_is_decoded(self):
+        is_error, text, captured = await _call_through_the_boundary(
+            "_register_manage_metering",
+            "manage_metering",
+            {
+                "action": "submit_ai_transaction",
+                "params": {"usage_metadata": '{"trace_type": "support-chat"}'},
+            },
+        )
+
+        assert not is_error, text
+        assert captured["usage_metadata"] == {"trace_type": "support-chat"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raw", ["not-json", '["trace_type"]'])
+    async def test_an_invalid_usage_metadata_is_an_error(self, raw):
+        is_error, text, captured = await _call_through_the_boundary(
+            "_register_manage_metering",
+            "manage_metering",
+            {"action": "submit_ai_transaction", "usage_metadata": raw},
+        )
+
+        assert is_error, text
+        assert "usage_metadata must be a JSON object" in text
+        assert captured == {}
+
+
+class TestSubscriberCredentialsInvalidCustomerInfo:
+    """BACK-4674: an unreadable customer_info is an error, not a successful call."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raw", ["not-json", '"Acme Corp"'])
+    async def test_an_invalid_customer_info_is_an_error(self, raw):
+        is_error, text, _ = await _call_through_the_boundary(
+            "_register_manage_subscriber_credentials",
+            "manage_subscriber_credentials",
+            {"action": "get_onboarding_checklist", "customer_info": raw},
+        )
+
+        assert is_error, text
+        assert "customer_info must be a JSON object" in text
+
+
+class TestSubscriberCredentialsFieldFolding:
+    """BACK-4674: a top-level credential field must not be dropped when the
+    handler reads only credential_data."""
+
+    @staticmethod
+    async def _call(arguments):
+        return await _call_through_the_boundary(
+            "_register_manage_subscriber_credentials",
+            "manage_subscriber_credentials",
+            arguments,
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_folds_top_level_fields_into_credential_data(self):
+        is_error, text, captured = await self._call(
+            {
+                "action": "update",
+                "credential_id": "cred_1",
+                "externalSecret": "s" * 12,
+                "tags": '["a"]',
+            }
+        )
+
+        assert not is_error, text
+        assert captured["credential_data"] == {
+            "externalSecret": "s" * 12,
+            "tags": ["a"],
+        }
+
+    @pytest.mark.asyncio
+    async def test_update_merges_top_level_fields_with_credential_data(self):
+        is_error, text, captured = await self._call(
+            {
+                "action": "update",
+                "credential_id": "cred_1",
+                "credential_data": '{"label": "Renamed"}',
+                "externalId": "ext_2",
+            }
+        )
+
+        assert not is_error, text
+        assert captured["credential_data"] == {
+            "label": "Renamed",
+            "externalId": "ext_2",
+        }
+
+    @pytest.mark.asyncio
+    async def test_create_with_credential_data_folds_top_level_fields(self):
+        is_error, text, captured = await self._call(
+            {
+                "action": "create",
+                "credential_data": {"label": "Ops key", "subscriberId": "sub_1"},
+                "externalSecret": "s" * 12,
+                "subscriptionIds": ["subs_1"],
+            }
+        )
+
+        assert not is_error, text
+        assert captured["credential_data"] == {
+            "label": "Ops key",
+            "subscriberId": "sub_1",
+            "externalSecret": "s" * 12,
+            "subscriptionIds": ["subs_1"],
+        }
+
+    @pytest.mark.asyncio
+    async def test_create_without_credential_data_is_left_to_the_handler(self):
+        is_error, text, captured = await self._call(
+            {"action": "create", "label": "Ops key", "externalId": "ext_1"}
+        )
+
+        assert not is_error, text
+        assert "credential_data" not in captured
+
+    @pytest.mark.asyncio
+    async def test_create_with_an_empty_credential_data_is_left_to_the_handler(self):
+        is_error, text, captured = await self._call(
+            {
+                "action": "create",
+                "credential_data": "{}",
+                "label": "Ops key",
+                "subscriberId": "sub_1",
+                "externalId": "ext_1",
+            }
+        )
+
+        assert not is_error, text
+        assert not captured.get("credential_data")
+
+    @pytest.mark.asyncio
+    async def test_the_same_value_both_ways_is_accepted(self):
+        is_error, text, captured = await self._call(
+            {
+                "action": "update",
+                "credential_id": "cred_1",
+                "credential_data": {"label": "Same"},
+                "label": "Same",
+            }
+        )
+
+        assert not is_error, text
+        assert captured["credential_data"] == {"label": "Same"}
+
+    @pytest.mark.asyncio
+    async def test_a_conflicting_value_is_an_error(self):
+        is_error, text, captured = await self._call(
+            {
+                "action": "update",
+                "credential_id": "cred_1",
+                "credential_data": {"label": "Inside"},
+                "label": "Top level",
+            }
+        )
+
+        assert is_error, text
+        assert "Conflicting values for label" in text
+        assert captured == {}
+
+
+def _stub_products_client():
+    client = MagicMock()
+    client.team_id = "team_test"
+    client.get_sources = AsyncMock(return_value={})
+    client.get_metering_element_definitions = AsyncMock(return_value={})
+    client.get_organizations = AsyncMock(return_value={})
+    client.create_product = AsyncMock(return_value={"id": "p_new", "name": "x"})
+    client.update_product = AsyncMock(return_value={"id": "p1", "name": "x"})
+    client.create_subscription = AsyncMock(return_value={"id": "sub_new"})
+    client._extract_embedded_data = MagicMock(return_value=[{"id": "src_1"}])
+    return client
+
+
+class TestManageProductsClosureParameters:
+    """Every input a products handler reads must be declared on the registered
+    tool, or FastMCP refuses it before the handler runs."""
+
+    @staticmethod
+    def _names_the_handler_reads():
+        import ast
+        from pathlib import Path
+
+        import src.revenium_mcp_server.tools_decomposed as package
+
+        tree = ast.parse((Path(package.__file__).parent / "product_management.py").read_text())
+        names = set()
+        for node in ast.walk(tree):
+            names |= _argument_names_read_by(node)
+        return names
+
+    @staticmethod
+    async def _closure():
+        return await _get_registered_closure(
+            _make_registry(profile="business"), "_register_manage_products"
+        )
+
+    @pytest.mark.asyncio
+    async def test_every_input_the_handlers_read_is_declared(self):
+        import inspect
+
+        declared = set(inspect.signature(await self._closure()).parameters)
+
+        assert sorted(self._names_the_handler_reads() - declared) == []
+
+    @pytest.mark.asyncio
+    async def test_every_declared_input_reaches_the_handler(self):
+        import inspect
+
+        closure = await self._closure()
+        sentinels = {name: object() for name in inspect.signature(closure).parameters}
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await closure(**sentinels)
+
+        for name, sentinel in sentinels.items():
+            assert captured.get(name) is sentinel, name
+
+    @pytest.mark.asyncio
+    async def test_quick_create_pricing_options_reach_the_handler(self):
+        sent = {
+            "pricing_model": "subscription",
+            "monthly_price": 29,
+            "setup_fee": 50,
+            "setup_fee_type": "per_customer",
+        }
+        is_error, text, captured = await _call_through_the_boundary(
+            "_register_manage_products",
+            "manage_products",
+            {"action": "create_simple", "name": "x", **sent},
+        )
+
+        assert not is_error, text
+        assert captured["monthly_price"] == 29.0
+        for name, value in sent.items():
+            assert captured.get(name) == value, name
+
+    @pytest.mark.asyncio
+    async def test_per_unit_price_reaches_the_handler(self):
+        is_error, text, captured = await _call_through_the_boundary(
+            "_register_manage_products",
+            "manage_products",
+            {"action": "create_simple", "name": "x", "per_unit_price": "0.01"},
+        )
+
+        assert not is_error, text
+        assert captured["per_unit_price"] == 0.01
+
+    @pytest.mark.parametrize(
+        "subscription_data",
+        [
+            {"name": "Sub", "clientEmailAddress": "a@example.com", "organizationId": "org_1"},
+            '{"name": "Sub", "clientEmailAddress": "a@example.com", "organizationId": "org_1"}',
+        ],
+        ids=["dict", "json_string"],
+    )
+    @pytest.mark.asyncio
+    async def test_create_with_subscription_takes_subscription_data(self, subscription_data):
+        is_error, text, captured = await _call_through_the_boundary(
+            "_register_manage_products",
+            "manage_products",
+            {
+                "action": "create_with_subscription",
+                "product_data": {"name": "P"},
+                "subscription_data": subscription_data,
+            },
+        )
+
+        assert not is_error, text
+        assert captured["subscription_data"] == {
+            "name": "Sub",
+            "clientEmailAddress": "a@example.com",
+            "organizationId": "org_1",
+        }
+
+    @pytest.mark.asyncio
+    async def test_malformed_subscription_data_is_an_error(self):
+        is_error, text, captured = await _call_through_the_boundary(
+            "_register_manage_products",
+            "manage_products",
+            {
+                "action": "create_with_subscription",
+                "product_data": {"name": "P"},
+                "subscription_data": "{broken",
+            },
+        )
+
+        assert is_error, text
+        assert "not a recognized parameter" not in text
+        assert "subscription_data" in text
+        assert captured == {}
+
+    @pytest.mark.asyncio
+    async def test_clarify_pricing_and_suggest_template_take_their_inputs(self):
+        is_error, text, captured = await _call_through_the_boundary(
+            "_register_manage_products",
+            "manage_products",
+            {"action": "clarify_pricing", "text": "$29 per month"},
+        )
+        assert not is_error, text
+        assert captured["text"] == "$29 per month"
+
+        is_error, text, captured = await _call_through_the_boundary(
+            "_register_manage_products",
+            "manage_products",
+            {"action": "suggest_template", "requirements": "api service"},
+        )
+        assert not is_error, text
+        assert captured["requirements"] == "api service"
+
+    @pytest.mark.asyncio
+    async def test_clarify_pricing_answers_from_its_text(self):
+        from src.revenium_mcp_server.tools_decomposed.product_management import (
+            ProductManagement,
+        )
+
+        with patch.object(
+            ProductManagement, "get_client", AsyncMock(return_value=_stub_products_client())
+        ):
+            is_error, text, _ = await _call_through_the_boundary(
+                "_register_manage_products",
+                "manage_products",
+                {"action": "clarify_pricing", "text": "$29 per month"},
+                execute=True,
+            )
+
+        assert not is_error, text
+        assert "29" in text, text
+        assert "Please provide pricing information" not in text
+
+    @pytest.mark.asyncio
+    async def test_suggest_template_answers_from_its_requirements(self):
+        from src.revenium_mcp_server.tools_decomposed.product_management import (
+            ProductManagement,
+        )
+
+        with patch.object(
+            ProductManagement, "get_client", AsyncMock(return_value=_stub_products_client())
+        ):
+            is_error, text, _ = await _call_through_the_boundary(
+                "_register_manage_products",
+                "manage_products",
+                {"action": "suggest_template", "requirements": "api service"},
+                execute=True,
+            )
+
+        assert not is_error, text
+        assert "simple_api_service" in text, text
+
+    @pytest.mark.asyncio
+    async def test_create_refuses_quick_create_prices_instead_of_ignoring_them(self):
+        from src.revenium_mcp_server.tools_decomposed.product_management import (
+            ProductManagement,
+        )
+
+        client = _stub_products_client()
+        with patch.object(ProductManagement, "get_client", AsyncMock(return_value=client)):
+            is_error, text, _ = await _call_through_the_boundary(
+                "_register_manage_products",
+                "manage_products",
+                {"action": "create", "name": "x", "monthly_price": 29},
+                execute=True,
+            )
+
+        assert is_error, text
+        assert "monthly_price" in text and "create_simple" in text, text
+        client.create_product.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_refuses_a_setup_fee_instead_of_ignoring_it(self):
+        from src.revenium_mcp_server.tools_decomposed.product_management import (
+            ProductManagement,
+        )
+
+        client = _stub_products_client()
+        with patch.object(ProductManagement, "get_client", AsyncMock(return_value=client)):
+            is_error, text, _ = await _call_through_the_boundary(
+                "_register_manage_products",
+                "manage_products",
+                {
+                    "action": "update",
+                    "product_id": "p1",
+                    "product_data": {"name": "y"},
+                    "setup_fee": 0,
+                },
+                execute=True,
+            )
+
+        assert is_error, text
+        assert "setup_fee" in text and "create_simple" in text, text
+        client.update_product.assert_not_awaited()
+
+
+class TestManageProductsCreatePreview:
+    """A preview that would be refused is an error, not a result."""
+
+    @pytest.mark.asyncio
+    async def test_a_failed_preview_sets_the_error_flag(self):
+        from src.revenium_mcp_server.tools_decomposed.product_management import (
+            ProductManagement,
+        )
+
+        client = _stub_products_client()
+        with patch.object(ProductManagement, "get_client", AsyncMock(return_value=client)):
+            is_error, text, _ = await _call_through_the_boundary(
+                "_register_manage_products",
+                "manage_products",
+                {"action": "create", "dry_run": True},
+                execute=True,
+            )
+
+        assert is_error, text
+        client.create_product.assert_not_awaited()
+
+
+def _client_that_refuses_aggregations_without_an_element():
+    """A products client that refuses a create body the way the dev platform does."""
+    from src.revenium_mcp_server.api_field_mapper import APIFieldMapper
+    from src.revenium_mcp_server.client import ReveniumAPIError
+
+    client = _stub_products_client()
+
+    async def create_product(product_data):
+        body = APIFieldMapper.map_product_fields(product_data)
+        for index, aggregation in enumerate(body.get("plan", {}).get("ratingAggregations", [])):
+            if not aggregation.get("elementDefinitionId"):
+                raise ReveniumAPIError(
+                    "Invalid JSON format - "
+                    f"plan.ratingAggregations[{index}].elementDefinitionId",
+                    status_code=400,
+                )
+        return {"id": "p_new", "name": body.get("name")}
+
+    client.create_product = AsyncMock(side_effect=create_product)
+    return client
+
+
+class TestDescriptionThatImpliesUsageBilling:
+    """A description such as "billed per call" names no metering element, so the
+    preview and the real create give the same verdict and the same note."""
+
+    _DESCRIPTION = "An API product billed per call"
+
+    async def _create(self, arguments):
+        from src.revenium_mcp_server.tools_decomposed.product_management import (
+            ProductManagement,
+        )
+
+        client = _client_that_refuses_aggregations_without_an_element()
+        with patch.object(ProductManagement, "get_client", AsyncMock(return_value=client)):
+            is_error, text, _ = await _call_through_the_boundary(
+                "_register_manage_products",
+                "manage_products",
+                {"action": "create", **arguments},
+                execute=True,
+            )
+        return is_error, text, client
+
+    @pytest.mark.parametrize(
+        "extra",
+        [{}, {"product_data": {"name": "Custom"}}],
+        ids=["description_only", "hybrid"],
+    )
+    @pytest.mark.asyncio
+    async def test_preview_and_real_create_agree_and_both_say_usage_billing_was_left_out(
+        self, extra
+    ):
+        arguments = {"description": self._DESCRIPTION, **extra}
+
+        preview_error, preview_text, preview_client = await self._create(
+            {**arguments, "dry_run": True}
+        )
+        real_error, real_text, real_client = await self._create(arguments)
+
+        preview_client.create_product.assert_not_awaited()
+        assert preview_error == real_error, (preview_text, real_text)
+        assert not real_error, real_text
+        sent = real_client.create_product.await_args[0][0]
+        assert not sent["plan"].get("rating_aggregations"), sent
+        assert not sent["plan"].get("ratingAggregations"), sent
+        for text in (preview_text, real_text):
+            assert "Usage billing was not set up" in text, text
+            assert "Call" in text and "elementDefinitionId" in text, text

@@ -266,7 +266,7 @@ class CapabilityDiscovery:
         """Discover customer-related capabilities from actual API validation."""
         # VALIDATED AGAINST ACTUAL REVENIUM API - 2025-06-15
         return {
-            "resource_types": ["users", "subscribers", "organizations", "teams", "relationships"],
+            "resource_types": ["users", "subscribers", "organizations", "teams"],
             "user_roles": ["ROLE_TENANT_ADMIN", "ROLE_API_CONSUMER"],  # VERIFIED: From actual API
             "organization_types": ["CONSUMER"],  # VERIFIED: Only type found in actual API
             "schemas": {

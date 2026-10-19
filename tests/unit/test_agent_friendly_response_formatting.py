@@ -86,6 +86,88 @@ class TestStandardResponse:
         assert "Previous page" in text
         assert "Next page" in text
 
+    SEVERAL_PAGES_SENTENCE = (
+        "The page requested (page=500) is past the last. The list has 31 items "
+        "on 2 pages. Pass page=1, size=20 for the last page, or page=0, size=20 "
+        "for the first."
+    )
+
+    def test_list_past_last_page_names_the_pages_that_exist(self):
+        text = StandardResponse.create_list_response(
+            items=[], title="Products", page=500, size=20, total_pages=2, total_items=31
+        )[0].text
+        assert self.SEVERAL_PAGES_SENTENCE in text
+        assert "permissions" not in text
+        assert "No items found" not in text
+
+    def test_list_past_last_page_with_one_page_points_to_page_zero(self):
+        text = StandardResponse.create_list_response(
+            items=[], title="Products", page=4, size=5, total_pages=1, total_items=3
+        )[0].text
+        assert (
+            "The page requested (page=4) is past the last. The list has 3 items "
+            "on 1 page. Pass page=0, size=5 for the only page."
+        ) in text
+
+    def test_list_page_equal_to_total_pages_is_past_the_end(self):
+        text = StandardResponse.create_list_response(
+            items=[], title="Products", page=2, size=20, total_pages=2, total_items=31
+        )[0].text
+        assert "The page requested (page=2) is past the last." in text
+        assert "permissions" not in text
+
+    def test_list_empty_page_inside_range_keeps_generic_advice(self):
+        text = StandardResponse.create_list_response(
+            items=[], title="Products", page=0, size=20, total_pages=2, total_items=31
+        )[0].text
+        assert "No items found" in text
+        assert "past the last" not in text
+
+    def test_list_past_end_with_unknown_total_keeps_generic_advice(self):
+        text = StandardResponse.create_list_response(
+            items=[], title="Products", page=5, size=20, total_pages=2, total_items=None
+        )[0].text
+        assert "No items found" in text
+        assert "past the last" not in text
+
+    def test_list_empty_with_zero_total_keeps_empty_advice(self):
+        text = StandardResponse.create_list_response(
+            items=[], title="Products", page=0, size=20, total_pages=1, total_items=0
+        )[0].text
+        assert "No items found" in text
+        assert "past the last" not in text
+
+    def test_list_next_page_hint_carries_page_size(self):
+        text = StandardResponse.create_list_response(
+            items=[{"id": "1"}], title="T", page=0, size=5, total_pages=7, total_items=31
+        )[0].text
+        assert "• Next page: page=1, size=5" in text
+
+    def test_list_previous_page_hint_carries_page_size(self):
+        text = StandardResponse.create_list_response(
+            items=[{"id": "1"}], title="T", page=3, size=5, total_pages=7, total_items=31
+        )[0].text
+        assert "• Previous page: page=2, size=5" in text
+
+    def test_list_last_page_has_no_next_page_hint(self):
+        text = StandardResponse.create_list_response(
+            items=[{"id": "1"}], title="T", page=6, size=5, total_pages=7, total_items=31
+        )[0].text
+        assert "Next page" not in text
+        assert "• Previous page: page=5, size=5" in text
+
+    def test_list_past_last_page_keeps_notes(self):
+        text = StandardResponse.create_list_response(
+            items=[],
+            title="Products",
+            page=500,
+            size=20,
+            total_pages=2,
+            total_items=31,
+            notes=["Scanned only part of the list."],
+        )[0].text
+        assert "**Note:** Scanned only part of the list." in text
+
     def test_create_item_response(self):
         result = StandardResponse.create_item_response(
             item={"name": "Widget"},

@@ -15,11 +15,17 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+from .analytics_window import AnalyticsWindow, CalendarRange
 from .config_store import get_config_value
+from .constants import DEFAULT_BASE_URL
 
 
 class NewApiRequiredError(RuntimeError):
     pass
+
+
+class CalendarRangeNeedsNewApiError(ValueError):
+    """A start_date/end_date range was asked of an endpoint with no analytics-API path."""
 
 
 # Default production base URL for the new analytics API
@@ -130,6 +136,15 @@ _ENDPOINT_REGISTRY: Dict[str, EndpointConfig] = {
     "cost_metrics_by_agents_over_time": EndpointConfig(
         old_path="/profitstream/v2/api/sources/metrics/ai/cost-metrics-by-agents-over-time",
         new_path="/api/v2/analytics/cost-by-agent",
+    ),
+    # The same report drawn by cost source (BACK-4690). force_new: the legacy
+    # route takes no cost source, and hosted deployments do not set
+    # REVENIUM_USE_NEW_ANALYTICS_API.
+    "cost_by_agent_by_cost_source": EndpointConfig(
+        old_path="/api/v2/analytics/cost-by-agent",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/cost-by-agent",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
     ),
     # ── Aggregated cost endpoints ──────────────────────────────────────────
     # Old: /profitstream/v2/api/sources/metrics/ai/cost-metric-by-provider
@@ -392,23 +407,38 @@ def _use_new_api() -> bool:
     return value in ("true", "1", "yes")
 
 
-def _should_use_new_path(config: "EndpointConfig") -> bool:
-    """Return True if this endpoint should route to its new path."""
+def _should_use_new_path(
+    config: "EndpointConfig", period: Optional[AnalyticsWindow] = None
+) -> bool:
+    """Return True if this endpoint should route to its new path for ``period``.
+
+    A calendar range routes to the new path whenever one exists, because the
+    legacy API takes only a named period; a named period follows ``force_new``
+    or the deployment flag.
+    """
     if config.new_path is None:
         return False
-    return config.force_new or _use_new_api()
+    return config.force_new or _use_new_api() or isinstance(period, CalendarRange)
 
 
-def _is_refused_without_new_api(config: "EndpointConfig") -> bool:
-    """True when a NEW_API_ONLY endpoint cannot be routed in this deployment."""
-    return config.mapping_status == "NEW_API_ONLY" and not _should_use_new_path(config)
+def _is_refused_without_new_api(
+    config: "EndpointConfig", period: Optional[AnalyticsWindow] = None
+) -> bool:
+    """True when a NEW_API_ONLY endpoint cannot be routed for ``period`` in this deployment.
+
+    Refusal is per window: a calendar range reaches an endpoint's new path even
+    on a deployment without the flag, so only a named period can be refused.
+    """
+    return config.mapping_status == "NEW_API_ONLY" and not _should_use_new_path(config, period)
 
 
 def requires_new_api_flag(key: str) -> bool:
-    """True when ``resolve_analytics_request`` would refuse ``key`` with ``NewApiRequiredError``.
+    """True when ``resolve_analytics_request`` would refuse ``key`` for a named period.
 
-    Lets a tool stop advertising an action its endpoint cannot serve, using the
-    same rule the resolver enforces instead of a second copy of it.
+    Lets a tool stop advertising an action its endpoint cannot serve for the
+    period names it documents, using the same rule the resolver enforces
+    instead of a second copy of it. A calendar range is never refused for an
+    endpoint with a new path (see ``_is_refused_without_new_api``).
     """
     return _is_refused_without_new_api(_ENDPOINT_REGISTRY[key])
 
@@ -427,11 +457,33 @@ def paired_app_base_url(
     ``_KNOWN_APP_BASE_URLS`` class attribute as ``known_hosts``).
     """
     mapping = KNOWN_APP_BASE_URLS if known_hosts is None else known_hosts
+    return mapping.get(_platform_host(platform_base_url), DEFAULT_APP_BASE_URL)
+
+
+def _platform_host(platform_base_url: Optional[str]) -> str:
     base = (platform_base_url or "").lower()
     host = urlparse(base).hostname or (
         base.removeprefix("https://").removeprefix("http://").split("/")[0].split(":")[0]
     )
-    return mapping.get(host.strip("/"), DEFAULT_APP_BASE_URL)
+    return host.strip("/")
+
+
+# Platform hosts whose customers hold production keys. A second production
+# region joins here, or it would be told its keys look like a dev environment's.
+PRODUCTION_PLATFORM_HOSTS = frozenset({_platform_host(DEFAULT_BASE_URL)})
+
+
+def is_production_platform(platform_base_url: Optional[str]) -> bool:
+    """True for an unset platform address (the production default) or a production host."""
+    host = _platform_host(platform_base_url)
+    return not host or host in PRODUCTION_PLATFORM_HOSTS
+
+
+def pairing_example(known_hosts: Dict[str, str]) -> str:
+    """One real platform-to-analytics pairing, for hints that ask for an analytics host."""
+    for platform_host, analytics_base_url in known_hosts.items():
+        return f"{analytics_base_url} pairs with https://{platform_host}"
+    return ""
 
 
 def _resolved_app_base_url() -> str:
@@ -456,14 +508,16 @@ def _resolved_app_base_url() -> str:
     return url
 
 
-def get_endpoint_path(endpoint_key: str) -> str:
+def get_endpoint_path(endpoint_key: str, period: Optional[AnalyticsWindow] = None) -> str:
     """Return the active API path for the given endpoint key.
 
-    When REVENIUM_USE_NEW_ANALYTICS_API is enabled, returns the new ClickHouse-backed
-    analytics path. Otherwise returns the legacy profitstream path.
+    When REVENIUM_USE_NEW_ANALYTICS_API is enabled, the endpoint is force_new, or
+    ``period`` is a calendar range, returns the new ClickHouse-backed analytics
+    path. Otherwise returns the legacy profitstream path.
 
     Args:
         endpoint_key: Registry key (e.g. 'cost_metric_by_provider')
+        period: The window the read covers, when the caller knows it
 
     Returns:
         The active path string to use for HTTP requests.
@@ -471,20 +525,24 @@ def get_endpoint_path(endpoint_key: str) -> str:
     Raises:
         KeyError: If the key is not in the registry
     """
-    config = get_endpoint_config(endpoint_key)
-    if _should_use_new_path(config):
+    config = get_endpoint_config(endpoint_key, period)
+    if _should_use_new_path(config, period):
         return config.new_path
     return config.old_path
 
 
-def get_endpoint_config(key: str) -> EndpointConfig:
+def get_endpoint_config(key: str, period: Optional[AnalyticsWindow] = None) -> EndpointConfig:
     """Return the EndpointConfig for the given endpoint key.
 
-    When REVENIUM_USE_NEW_ANALYTICS_API is true, the returned config reflects
-    the current REVENIUM_APP_BASE_URL so callers don't have to look it up separately.
+    Whenever the read routes to the new path (the flag is on, the endpoint is
+    force_new, or ``period`` is a calendar range on an endpoint with a new
+    path), the returned config carries the configured analytics base URL, so
+    callers don't have to look it up separately. Callers must pass the window
+    they will route with, or a calendar-range read gets the default host.
 
     Args:
         key: Registry key (e.g. 'cost_by_provider')
+        period: The window the read covers
 
     Returns:
         EndpointConfig for the requested endpoint
@@ -500,7 +558,7 @@ def get_endpoint_config(key: str) -> EndpointConfig:
         )
     config = _ENDPOINT_REGISTRY[key]
 
-    if _should_use_new_path(config):
+    if _should_use_new_path(config, period):
         # Patch new_base_url to whatever is currently configured
         try:
             app_base_url = _resolved_app_base_url()
@@ -533,10 +591,30 @@ def get_endpoint_config(key: str) -> EndpointConfig:
     return config
 
 
+def window_bounds(period: AnalyticsWindow) -> Tuple[str, str]:
+    """The startDate and endDate the analytics API is asked for, for a period name or a calendar range.
+
+    Raises:
+        ValueError: If ``period`` is a name with no window, so no answer is
+            labelled with a period it was not read for
+    """
+    from .analytics_parameters import TimePeriod
+    from .date_parser import period_to_date_range
+
+    if isinstance(period, CalendarRange):
+        return period.iso_bounds()
+    try:
+        time_period = TimePeriod(period)
+    except ValueError:
+        supported = ", ".join(member.value for member in TimePeriod)
+        raise ValueError(f"Unsupported period {period!r}; supported periods: {supported}") from None
+    return period_to_date_range(time_period)
+
+
 def resolve_analytics_request(
     key: str,
     team_id: str,
-    period: str,
+    period: AnalyticsWindow,
     extra_old_params: Optional[Dict[str, Any]] = None,
     extra_new_params: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
@@ -566,7 +644,10 @@ def resolve_analytics_request(
             caller-typed id: an API key naming any other team is refused with 403.
             Sent as teamId on both paths; omitted from new-API calls when empty.
         period: Period string (e.g. 'SEVEN_DAYS') — converted to ISO 8601 dates
-            for new API calls
+            for new API calls — or a CalendarRange, sent as its own bounds. A
+            CalendarRange routes to the new path whenever the endpoint has one,
+            flag or not, because the legacy API takes period names only; an
+            endpoint with no new path raises CalendarRangeNeedsNewApiError.
         extra_old_params: Additional params merged into old-API calls only
             (e.g. ``{"group": "TOTAL", "tokenType": "TOTAL"}``). Ignored when
             the new API is active.
@@ -578,32 +659,16 @@ def resolve_analytics_request(
         Tuple of (path, params, call_kwargs) ready to pass to ``client.get()``:
         ``await client.get(path, params=params, **call_kwargs)``
     """
-    config = get_endpoint_config(key)
+    config = get_endpoint_config(key, period)
 
-    if _is_refused_without_new_api(config):
+    if _is_refused_without_new_api(config, period):
         raise NewApiRequiredError(
             f"Endpoint {key!r} is new-API only and this server deployment does not route"
             " to the analytics API; set REVENIUM_USE_NEW_ANALYTICS_API=true on the server."
         )
 
-    if _should_use_new_path(config):
-        from .analytics_parameters import TimePeriod
-        from .date_parser import period_to_date_range
-
-        try:
-            start_date, end_date = period_to_date_range(TimePeriod(period))
-        except ValueError:
-            # Unknown period string — fall back to 30-day window rather than crash
-            logger.warning("Unknown period %r — falling back to 30-day window", period)
-            from datetime import datetime, timedelta, timezone
-
-            now = datetime.now(timezone.utc)
-            start = now - timedelta(days=30)
-            ms_start = start.microsecond // 1000
-            ms_end = now.microsecond // 1000
-            start_date = start.strftime(f"%Y-%m-%dT%H:%M:%S.{ms_start:03d}Z")
-            end_date = now.strftime(f"%Y-%m-%dT%H:%M:%S.{ms_end:03d}Z")
-
+    if _should_use_new_path(config, period):
+        start_date, end_date = window_bounds(period)
         new_params: Dict[str, Any] = {"startDate": start_date, "endDate": end_date}
         if extra_new_params:
             new_params.update(extra_new_params)
@@ -616,6 +681,11 @@ def resolve_analytics_request(
         )
 
     # ── Legacy profitstream API ────────────────────────────────────────────
+    if isinstance(period, CalendarRange):
+        raise CalendarRangeNeedsNewApiError(
+            f"start_date/end_date need the analytics API, and {key!r} has no analytics-API "
+            "route; its legacy route accepts only a named period. Pass period instead."
+        )
     params: Dict[str, Any] = {"teamId": team_id, "period": period}
     if extra_old_params:
         params.update(extra_old_params)

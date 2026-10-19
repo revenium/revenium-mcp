@@ -15,6 +15,8 @@ Targets the many missed lines in client.py including:
 - get_optimized_client / close_global_client
 """
 
+import json
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -31,6 +33,8 @@ from src.revenium_mcp_server.client import (
     get_shared_http_client,
 )
 from src.revenium_mcp_server.auth import AuthConfig
+from src.revenium_mcp_server.constants import DEFAULT_BASE_URL
+from src.revenium_mcp_server.endpoint_registry import KNOWN_APP_BASE_URLS, pairing_example
 
 
 # ---------------------------------------------------------------------------
@@ -433,8 +437,8 @@ class TestShouldRetry:
     def test_retry_on_503(self):
         assert self.client._should_retry(503) is True
 
-    def test_retry_on_429(self):
-        assert self.client._should_retry(429) is True
+    def test_no_retry_on_429(self):
+        assert self.client._should_retry(429) is False
 
     def test_retry_on_408(self):
         assert self.client._should_retry(408) is True
@@ -522,7 +526,7 @@ class TestRequest:
             with pytest.raises(ReveniumAPIError) as exc_info:
                 await self.client._request("POST", "/endpoint")
         # The enhanced message specifically contains this diagnostic header
-        assert "API Request Failed - JSON Format Issue" in exc_info.value.message
+        assert "API Request Failed - Request Data Refused" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_hashed_id_error_raises_enhanced_error(self):
@@ -552,6 +556,33 @@ class TestRequest:
             with pytest.raises(ReveniumAPIError) as exc_info:
                 await self.client._request("PUT", "/unknown")
         assert "Invalid Resource ID" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_dev_alert_decode_body_reads_as_invalid_alert_id(self):
+        """The exact body dev answers for a malformed alert history id keeps
+        reaching the hashed-id branch, never the JSON-format heuristic above it."""
+        body = {
+            "timestamp": "2026-10-17T20:43:44.562834994Z",
+            "status": 400,
+            "error": "Bad Request",
+            "message": "Failed to decode hashed Id: [NONEXISTENT_12345]",
+            "path": "/profitstream/v2/api/sources/ai/alert/NONEXISTENT_12345",
+            "details": {"Decoding error": "Failed to decode hashed Id: [NONEXISTENT_12345]"},
+        }
+        raw = json.dumps(body, separators=(",", ":"))
+        resp = _mock_httpx_response(400, json_data=body, reason_phrase="Bad Request")
+        resp.text = raw
+        resp.content = raw.encode()
+
+        with self._patch_httpx(resp):
+            with pytest.raises(ReveniumAPIError) as exc_info:
+                await self.client._request(
+                    "GET", "/profitstream/v2/api/sources/ai/alert/NONEXISTENT_12345"
+                )
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.message.startswith("Invalid Alert ID")
+        assert "JSON Format Issue" not in exc_info.value.message
 
     @pytest.mark.parametrize(
         "endpoint, expected_label",
@@ -903,22 +934,207 @@ class TestRequestWithRetry:
         client._request.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_retry_on_rate_limit_429(self):
-        """429 rate limiting triggers retry."""
-        client = _client(max_retries=1)
-        call_count = 0
+    async def test_a_read_answered_with_a_server_error_is_sent_twice(self):
+        """BACK-4717: a GET meeting a 5xx is retried once, after one second."""
+        client = _client(max_retries=3)
+        client._request = AsyncMock(
+            side_effect=ReveniumAPIError("unavailable", status_code=503)
+        )
+        sleep = AsyncMock()
+        with patch("src.revenium_mcp_server.client.asyncio.sleep", sleep):
+            with pytest.raises(ReveniumAPIError, match="unavailable"):
+                await client._request_with_retry("GET", "/ep")
+        assert client._request.call_count == 2
+        sleep.assert_awaited_once_with(1)
 
-        async def _stub(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise ReveniumAPIError("rate limited", status_code=429)
-            return {"success": True}
-
-        client._request = _stub
+    @pytest.mark.asyncio
+    async def test_a_read_with_retries_off_is_sent_once(self):
+        client = _client(max_retries=0)
+        client._request = AsyncMock(
+            side_effect=ReveniumAPIError("unavailable", status_code=503)
+        )
         with patch("src.revenium_mcp_server.client.asyncio.sleep", new_callable=AsyncMock):
-            result = await client._request_with_retry("GET", "/ep")
-        assert result == {"success": True}
+            with pytest.raises(ReveniumAPIError):
+                await client._request_with_retry("GET", "/ep")
+        assert client._request.call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("configured", [0, 1, 3])
+    async def test_the_read_cap_does_not_reach_writes(self, configured):
+        """The write retry count stays whatever is configured."""
+        client = _client(max_retries=configured)
+        client._request = AsyncMock(
+            side_effect=ReveniumAPIError("unavailable", status_code=503)
+        )
+        with patch("src.revenium_mcp_server.client.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(ReveniumAPIError):
+                await client._request_with_retry("POST", "/ep")
+        assert client._request.call_count == configured + 1
+
+    @pytest.mark.asyncio
+    async def test_a_rate_limit_429_is_not_resent(self):
+        """BACK-4717: a 429 is reported at once, never resent."""
+        client = _client(max_retries=3)
+        client._request = AsyncMock(
+            side_effect=ReveniumAPIError("rate limited", status_code=429)
+        )
+        with patch("src.revenium_mcp_server.client.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(ReveniumAPIError, match="rate limited"):
+                await client._request_with_retry("POST", "/ep")
+        client._request.assert_called_once()
+
+
+# ===========================================================================
+# Platform lockout (HTTP 429 with a stated wait)
+# ===========================================================================
+
+LOCKOUT_TEXT = (
+    "Too many failed requests. Please review your integration and retry after 42 seconds."
+)
+
+
+def _http_response(status_code, *, text="", headers=None, json_body=None):
+    request = httpx.Request("GET", "https://api.test.revenium.ai/x")
+    if json_body is not None:
+        return httpx.Response(status_code, json=json_body, headers=headers, request=request)
+    return httpx.Response(status_code, text=text, headers=headers, request=request)
+
+
+class TestPlatformLockout:
+    """BACK-4717: a 429 is never resent and a stated wait holds the key."""
+
+    def _send(self, client, *responses):
+        return patch.object(
+            client.client, "request", new_callable=AsyncMock, side_effect=list(responses)
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_lockout_answer_is_sent_once_and_names_the_wait(self, lockout_clock):
+        client = _client(max_retries=3)
+        sleep = AsyncMock()
+        with self._send(client, *[_http_response(429, text=LOCKOUT_TEXT)] * 4) as request:
+            with patch("src.revenium_mcp_server.client.asyncio.sleep", sleep):
+                with pytest.raises(ReveniumAPIError) as exc:
+                    await client.get("/x")
+        assert request.await_count == 1
+        sleep.assert_not_awaited()
+        assert exc.value.status_code == 429
+        assert "42 seconds" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_retry_after_header_sets_the_wait(self, lockout_clock):
+        client = _client(max_retries=3)
+        locked = _http_response(429, text="Slow down", headers={"Retry-After": "30"})
+        with self._send(client, *[locked] * 4):
+            with patch("src.revenium_mcp_server.client.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(ReveniumAPIError) as exc:
+                    await client.get("/x")
+        assert "wait 30 seconds" in exc.value.message
+        assert "Slow down" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_plain_rate_limit_is_not_called_failed_requests(self, lockout_clock):
+        client = _client(max_retries=3)
+        limited = _http_response(429, text="rate limit", headers={"Retry-After": "5"})
+        with self._send(client, *[limited] * 4):
+            with patch("src.revenium_mcp_server.client.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(ReveniumAPIError) as exc:
+                    await client.get("/x")
+        assert "5 seconds" in exc.value.message
+        assert "failed requests" not in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_call_inside_the_wait_sends_nothing_and_one_after_it_does(
+        self, lockout_clock
+    ):
+        client = _client(max_retries=3)
+        locked = _http_response(429, text=LOCKOUT_TEXT)
+        ok = _http_response(200, json_body={"id": "abc"})
+        with self._send(client, locked, ok) as request:
+            with patch("src.revenium_mcp_server.client.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(ReveniumAPIError):
+                    await client.get("/x")
+                assert request.await_count == 1
+
+                lockout_clock.advance(10.4)
+                with pytest.raises(ReveniumAPIError) as held:
+                    await client.get("/y")
+                assert request.await_count == 1
+                assert held.value.status_code == 429
+                assert "32 seconds" in held.value.message
+
+                lockout_clock.advance(32)
+                assert await client.get("/z") == {"id": "abc"}
+        assert request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_lockout_on_one_key_does_not_hold_back_another_key(self, lockout_clock):
+        locked_client = _client(max_retries=3)
+        other_client = ReveniumClient(
+            auth_config=AuthConfig(
+                api_key="another-key",
+                team_id="team_abc",
+                base_url="https://api.test.revenium.ai",
+                timeout=5.0,
+                max_retries=3,
+            )
+        )
+        locked = _http_response(429, text=LOCKOUT_TEXT)
+        ok = _http_response(200, json_body={"id": "abc"})
+        with self._send(locked_client, locked, ok) as request:
+            with patch("src.revenium_mcp_server.client.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(ReveniumAPIError):
+                    await locked_client.get("/x")
+                assert request.await_count == 1
+                assert await other_client.get("/x") == {"id": "abc"}
+        assert request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_429_without_a_stated_wait_is_reported_at_once(self, lockout_clock):
+        client = _client(max_retries=3)
+        sleep = AsyncMock()
+        with self._send(client, *[_http_response(429, text="Too many requests")] * 4) as request:
+            with patch("src.revenium_mcp_server.client.asyncio.sleep", sleep):
+                with pytest.raises(ReveniumAPIError) as exc:
+                    await client.get("/x")
+        assert request.await_count == 1
+        sleep.assert_not_awaited()
+        assert exc.value.status_code == 429
+
+    @pytest.mark.asyncio
+    async def test_a_lockout_on_a_write_is_not_resent(self, lockout_clock):
+        client = _client(max_retries=3)
+        with self._send(client, *[_http_response(429, text=LOCKOUT_TEXT)] * 4) as request:
+            with patch("src.revenium_mcp_server.client.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(ReveniumAPIError) as exc:
+                    await client.post("/x", data={"name": "n"})
+        assert request.await_count == 1
+        assert "42 seconds" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_problem_json_429_keeps_its_code(self, lockout_clock):
+        client = _client(max_retries=3)
+        problem = _http_response(
+            429,
+            json_body={
+                "type": "about:blank",
+                "title": "Too Many Requests",
+                "status": 429,
+                "detail": "Rate limit reached, retry after 12 seconds",
+                "code": "RATE_LIMITED",
+            },
+            headers={"Content-Type": "application/problem+json"},
+        )
+        with self._send(client, *[problem] * 4) as request:
+            with patch("src.revenium_mcp_server.client.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(ReveniumAPIError) as exc:
+                    await client.get(
+                        "/api/v2/analytics/x", base_url=DEFAULT_APP_BASE_URL, use_bearer=True
+                    )
+        assert request.await_count == 1
+        assert exc.value.code == "RATE_LIMITED"
+        assert exc.value.response_data["code"] == "RATE_LIMITED"
+        assert "12 seconds" in exc.value.message
 
 
 # ===========================================================================
@@ -1270,8 +1486,8 @@ class TestSubscriptionsAPI:
         assert "sub123" in call_url
 
     @pytest.mark.asyncio
-    async def test_cancel_subscription(self):
-        await self.client.cancel_subscription("sub123")
+    async def test_delete_subscription(self):
+        await self.client.delete_subscription("sub123")
         call_url = self.client.delete.call_args[0][0]
         assert "sub123" in call_url
 
@@ -1348,7 +1564,8 @@ class TestUsersAPI:
     async def test_get_user_by_email(self):
         await self.client.get_user_by_email("user@example.com")
         call_url = self.client.get.call_args[0][0]
-        assert "user@example.com" in call_url
+        assert call_url == "/profitstream/v2/api/users/lookup-by-email"
+        assert self.client.get.call_args.kwargs["params"]["email"] == "user@example.com"
 
     @pytest.mark.asyncio
     async def test_create_user(self):
@@ -1405,7 +1622,8 @@ class TestSubscribersAPI:
     async def test_get_subscriber_by_email(self):
         await self.client.get_subscriber_by_email("sub@example.com")
         call_url = self.client.get.call_args[0][0]
-        assert "sub@example.com" in call_url
+        assert call_url == "/profitstream/v2/api/subscribers/lookup-by-email"
+        assert self.client.get.call_args.kwargs["params"]["email"] == "sub@example.com"
 
     @pytest.mark.asyncio
     async def test_create_subscriber(self):
@@ -1488,37 +1706,55 @@ class TestCredentialsAPI:
 
 class TestResolverHelpers:
 
+    SUBSCRIBER_LOOKUP_PATH = "/profitstream/v2/api/subscribers/lookup-by-email"
+
     def setup_method(self):
         self.client = _client()
 
+    @staticmethod
+    def _organizations_page(rows, number, total_pages):
+        return {
+            "_embedded": {"organizations": rows},
+            "page": {"number": number, "totalPages": total_pages},
+        }
+
     @pytest.mark.asyncio
     async def test_resolve_subscriber_email_found(self):
-        self.client.get_subscribers = AsyncMock(return_value={
-            "_embedded": {
-                "subscribers": [
-                    {"id": "s1", "email": "alice@example.com"},
-                    {"id": "s2", "email": "bob@example.com"},
-                ]
-            }
-        })
+        self.client.get = AsyncMock(return_value={"id": "s1", "email": "alice@example.com"})
         result = await self.client.resolve_subscriber_email_to_id("alice@example.com")
         assert result == "s1"
 
     @pytest.mark.asyncio
     async def test_resolve_subscriber_email_not_found(self):
-        self.client.get_subscribers = AsyncMock(return_value={
-            "_embedded": {
-                "subscribers": [{"id": "s1", "email": "alice@example.com"}]
-            }
-        })
+        self.client.get = AsyncMock(
+            side_effect=ReveniumAPIError("Subscriber not found", status_code=404)
+        )
         result = await self.client.resolve_subscriber_email_to_id("nobody@example.com")
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_resolve_subscriber_email_exception_returns_none(self):
-        self.client.get_subscribers = AsyncMock(side_effect=ReveniumAPIError("fail", status_code=500))
-        result = await self.client.resolve_subscriber_email_to_id("error@example.com")
-        assert result is None
+    async def test_resolve_subscriber_email_asks_the_platform_lookup_by_email(self):
+        self.client.get = AsyncMock(return_value={
+            "id": "V8A1eQN", "subscriberId": "OTHER", "email": "Jane+Ops@Acme.com",
+        })
+
+        result = await self.client.resolve_subscriber_email_to_id("Jane+Ops@Acme.com")
+
+        assert result == "V8A1eQN"
+        assert self.client.get.call_args[0][0] == self.SUBSCRIBER_LOOKUP_PATH
+        assert self.client.get.call_args.kwargs["params"]["email"] == "Jane+Ops@Acme.com"
+
+    @pytest.mark.asyncio
+    async def test_resolve_subscriber_email_404_is_not_found(self):
+        self.client.get = AsyncMock(side_effect=ReveniumAPIError("missing", status_code=404))
+        assert await self.client.resolve_subscriber_email_to_id("late@example.com") is None
+
+    @pytest.mark.asyncio
+    async def test_resolve_subscriber_email_server_error_is_raised_not_hidden(self):
+        self.client.get = AsyncMock(side_effect=ReveniumAPIError("fail", status_code=500))
+        with pytest.raises(ReveniumAPIError) as exc:
+            await self.client.resolve_subscriber_email_to_id("error@example.com")
+        assert exc.value.status_code == 500
 
     @pytest.mark.asyncio
     async def test_resolve_organization_name_found(self):
@@ -1542,10 +1778,84 @@ class TestResolverHelpers:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_resolve_organization_name_exception_returns_none(self):
+    async def test_resolve_organization_name_server_error_is_raised_not_hidden(self):
         self.client.get_organizations = AsyncMock(side_effect=ReveniumAPIError("fail", status_code=500))
-        result = await self.client.resolve_organization_name_to_id("Boom Corp")
-        assert result is None
+        with pytest.raises(ReveniumAPIError) as exc:
+            await self.client.resolve_organization_name_to_id("Boom Corp")
+        assert exc.value.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_resolve_organization_name_reads_every_page(self):
+        first_page = [{"id": f"n{i}", "name": f"Other Org {i}"} for i in range(98)]
+        first_page += [{"id": "lower", "name": "late org"}, {"id": "ltd", "name": "Late Org Ltd"}]
+        self.client.get_organizations = AsyncMock(side_effect=[
+            self._organizations_page(first_page, 0, 2),
+            self._organizations_page([{"id": "late1", "name": "Late Org"}], 1, 2),
+        ])
+
+        result = await self.client.resolve_organization_name_to_id("Late Org")
+
+        assert result == "late1"
+        calls = self.client.get_organizations.await_args_list
+        assert [call.kwargs["page"] for call in calls] == [0, 1]
+        assert all(call.kwargs["query"] == "Late Org" for call in calls)
+
+    @pytest.mark.asyncio
+    async def test_resolve_organization_name_stops_at_the_page_cap_and_says_so(self, monkeypatch):
+        from src.revenium_mcp_server.client import OrganizationNameUnresolvedError
+
+        import src.revenium_mcp_server.client as client_module
+
+        cap = 3
+        monkeypatch.setattr(client_module, "_ORGANIZATION_NAME_SCAN_MAX_PAGES", cap, raising=False)
+        self.client.get_organizations = AsyncMock(side_effect=lambda **kw: self._organizations_page(
+            [{"id": f"p{kw['page']}", "name": "Near Miss Org"}], kw["page"], 50,
+        ))
+
+        with pytest.raises(OrganizationNameUnresolvedError) as exc:
+            await self.client.resolve_organization_name_to_id("Missing Org")
+
+        assert f"{cap} pages" in exc.value.message
+        pages_read = [call.kwargs["page"] for call in self.client.get_organizations.await_args_list]
+        assert pages_read == list(range(cap))
+
+    @pytest.mark.asyncio
+    async def test_resolve_organization_name_refuses_one_match_when_pages_were_left_unread(
+        self, monkeypatch
+    ):
+        from src.revenium_mcp_server.client import OrganizationNameUnresolvedError
+
+        import src.revenium_mcp_server.client as client_module
+
+        cap = 3
+        monkeypatch.setattr(client_module, "_ORGANIZATION_NAME_SCAN_MAX_PAGES", cap, raising=False)
+        self.client.get_organizations = AsyncMock(side_effect=lambda **kw: self._organizations_page(
+            [{"id": "only", "name": "Lone Org"}] if kw["page"] == 0 else [], kw["page"], 50,
+        ))
+
+        with pytest.raises(OrganizationNameUnresolvedError) as exc:
+            await self.client.resolve_organization_name_to_id("Lone Org")
+
+        assert f"{cap} pages" in exc.value.message
+        assert "organizationId" in exc.value.message
+        assert self.client.get_organizations.await_count == cap
+
+    @pytest.mark.asyncio
+    async def test_resolve_organization_name_with_two_exact_matches_is_refused(self):
+        from src.revenium_mcp_server.client import OrganizationNameUnresolvedError
+
+        self.client.get_organizations = AsyncMock(side_effect=[
+            self._organizations_page([{"id": "twinA", "name": "Twin Org"}], 0, 2),
+            self._organizations_page([{"id": "twinB", "name": "Twin Org"}], 1, 2),
+        ])
+
+        with pytest.raises(OrganizationNameUnresolvedError) as exc:
+            await self.client.resolve_organization_name_to_id("Twin Org")
+
+        assert "twinA" in exc.value.message
+        assert "twinB" in exc.value.message
+        assert "organizationId" in exc.value.message
+        assert exc.value.matched_ids == ["twinA", "twinB"]
 
 
 # ===========================================================================
@@ -1704,13 +2014,6 @@ class TestAnomaliesAPI:
         call_url = self.client.delete.call_args[0][0]
         assert "anomaly" in call_url
 
-    @pytest.mark.asyncio
-    async def test_get_anomaly_metrics(self):
-        await self.client.get_anomaly_metrics("anom1")
-        call_url = self.client.get.call_args[0][0]
-        assert "anom1" in call_url
-        assert "metric" in call_url
-
 
 # ===========================================================================
 # Alerts API
@@ -1840,6 +2143,29 @@ class TestMeteringElementDefinitionsAPI:
         await self.client.update_metering_element_definition("med1", {"name": "Updated"})
         call_data = self.client.put.call_args[1]["data"]
         assert call_data["teamId"] == "team_abc"
+
+    def test_prepare_metering_element_update_body_adds_the_configured_team_when_absent(self):
+        element = {"name": "Updated"}
+        body = self.client.prepare_metering_element_update_body(element)
+        assert body == {"name": "Updated", "teamId": "team_abc"}
+        assert element == {"name": "Updated"}
+
+    def test_prepare_metering_element_update_body_fills_the_configured_team_when_it_is_null(self):
+        body = self.client.prepare_metering_element_update_body({"name": "x", "teamId": None})
+        assert body == {"name": "x", "teamId": "team_abc"}
+
+    def test_prepare_metering_element_update_body_keeps_the_team_it_is_given(self):
+        element = {"name": "Updated", "teamId": "team_el"}
+        body = self.client.prepare_metering_element_update_body(element)
+        assert body == element
+        assert body is not element
+
+    @pytest.mark.asyncio
+    async def test_update_metering_element_definition_leaves_the_callers_data_untouched(self):
+        element = {"name": "Updated"}
+        await self.client.update_metering_element_definition("med1", element)
+        assert self.client.put.call_args[1]["data"]["teamId"] == "team_abc"
+        assert element == {"name": "Updated"}
 
     @pytest.mark.asyncio
     async def test_update_metering_element_definition_reraises_exception(self):
@@ -2074,6 +2400,63 @@ def _mock_get_config_value(values):
     return _fn
 
 
+UNPAIRED_PLATFORM_HINT = "REVENIUM_BASE_URL points at a non-production Revenium platform"
+
+
+class TestAnalyticsHostHint:
+    """BACK-4717: the "set REVENIUM_APP_BASE_URL" hint on an analytics 401/403/404
+    is for a non-production platform address only, and names a real pairing."""
+
+    REFUSAL = {"code": "UNAUTHORIZED", "message": "Invalid or inactive API key"}
+
+    async def _refusal_message(self, monkeypatch, platform_base_url, status=401):
+        monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
+        if platform_base_url is None:
+            monkeypatch.delenv("REVENIUM_BASE_URL", raising=False)
+        else:
+            monkeypatch.setenv("REVENIUM_BASE_URL", platform_base_url)
+        client = _client()
+        refusal = _http_response(status, json_body=self.REFUSAL)
+        with patch.object(client.client, "request", new_callable=AsyncMock, return_value=refusal):
+            with pytest.raises(ReveniumAPIError) as exc:
+                await client.get(
+                    "/api/v2/analytics/x", base_url=DEFAULT_APP_BASE_URL, use_bearer=True
+                )
+        return exc.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "platform_base_url",
+        [None, "", DEFAULT_BASE_URL, "https://API.revenium.ai/"],
+    )
+    @pytest.mark.parametrize("status", [401, 403, 404])
+    async def test_a_production_platform_gets_no_dev_key_hint(
+        self, monkeypatch, platform_base_url, status
+    ):
+        message = await self._refusal_message(monkeypatch, platform_base_url, status)
+        assert "Invalid or inactive API key" in message
+        assert UNPAIRED_PLATFORM_HINT not in message
+        assert "REVENIUM_APP_BASE_URL" not in message
+
+    @pytest.mark.asyncio
+    async def test_an_unpaired_non_production_platform_keeps_the_hint(self, monkeypatch):
+        message = await self._refusal_message(
+            monkeypatch, "https://api.staging.example.invalid"
+        )
+        assert "REVENIUM_APP_BASE_URL" in message
+        assert message.index("Invalid or inactive API key") < message.index(
+            "REVENIUM_APP_BASE_URL"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_hint_example_is_a_real_pairing(self, monkeypatch):
+        message = await self._refusal_message(
+            monkeypatch, "https://api.staging.example.invalid"
+        )
+        assert pairing_example(KNOWN_APP_BASE_URLS) in message
+        assert "<" not in message
+
+
 class TestAppBaseUrlDriftError:
     """When a Bearer analytics call hits the default prod app host and returns
     401/403/404 while REVENIUM_APP_BASE_URL was never configured, the error
@@ -2091,7 +2474,9 @@ class TestAppBaseUrlDriftError:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status_code", [401, 403, 404])
-    async def test_enhances_bearer_error_on_default_app_host(self, status_code, monkeypatch):
+    async def test_enhances_bearer_error_on_default_app_host_for_a_non_production_platform(
+        self, status_code, monkeypatch
+    ):
         monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
         resp = _mock_httpx_response(
             status_code,
@@ -2103,7 +2488,12 @@ class TestAppBaseUrlDriftError:
         resp.text = '{"message":"Invalid or inactive API key"}'
         with patch(
             "src.revenium_mcp_server.client.get_config_value",
-            side_effect=_mock_get_config_value({"REVENIUM_APP_BASE_URL": None}),
+            side_effect=_mock_get_config_value(
+                {
+                    "REVENIUM_APP_BASE_URL": None,
+                    "REVENIUM_BASE_URL": "https://api.staging.example.invalid",
+                }
+            ),
         ):
             with self._patch_httpx(resp):
                 with pytest.raises(ReveniumAPIError) as exc_info:
@@ -2114,8 +2504,8 @@ class TestAppBaseUrlDriftError:
                         use_bearer=True,
                     )
         message = exc_info.value.message
-        assert "REVENIUM_APP_BASE_URL is not set" in message
-        assert f"HTTP {status_code}" in message
+        assert UNPAIRED_PLATFORM_HINT in message
+        assert message.startswith(f"HTTP {status_code}: Invalid or inactive API key")
 
     @pytest.mark.asyncio
     async def test_no_enhancement_when_app_base_url_explicitly_set(self, monkeypatch):
@@ -2143,7 +2533,7 @@ class TestAppBaseUrlDriftError:
                         base_url="https://app.revenium.ai",
                         use_bearer=True,
                     )
-        assert "REVENIUM_APP_BASE_URL is not set" not in exc_info.value.message
+        assert UNPAIRED_PLATFORM_HINT not in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_no_enhancement_when_use_bearer_false(self, monkeypatch):
@@ -2159,12 +2549,22 @@ class TestAppBaseUrlDriftError:
         resp.text = '{"message":"Invalid or inactive API key"}'
         with patch(
             "src.revenium_mcp_server.client.get_config_value",
-            side_effect=_mock_get_config_value({"REVENIUM_APP_BASE_URL": None}),
+            side_effect=_mock_get_config_value(
+                {
+                    "REVENIUM_APP_BASE_URL": None,
+                    "REVENIUM_BASE_URL": "https://api.staging.example.invalid",
+                }
+            ),
         ):
             with self._patch_httpx(resp):
                 with pytest.raises(ReveniumAPIError) as exc_info:
-                    await self.client._request("GET", "/profitstream/v2/api/sources")
-        assert "REVENIUM_APP_BASE_URL is not set" not in exc_info.value.message
+                    await self.client._request(
+                        "GET",
+                        "/api/v2/analytics/cost-by-tool",
+                        base_url="https://app.revenium.ai",
+                        use_bearer=False,
+                    )
+        assert UNPAIRED_PLATFORM_HINT not in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_no_enhancement_on_500(self, monkeypatch):
@@ -2180,7 +2580,12 @@ class TestAppBaseUrlDriftError:
         resp.text = '{"message":"internal error"}'
         with patch(
             "src.revenium_mcp_server.client.get_config_value",
-            side_effect=_mock_get_config_value({"REVENIUM_APP_BASE_URL": None}),
+            side_effect=_mock_get_config_value(
+                {
+                    "REVENIUM_APP_BASE_URL": None,
+                    "REVENIUM_BASE_URL": "https://api.staging.example.invalid",
+                }
+            ),
         ):
             with self._patch_httpx(resp):
                 with pytest.raises(ReveniumAPIError) as exc_info:
@@ -2190,7 +2595,7 @@ class TestAppBaseUrlDriftError:
                         base_url="https://app.revenium.ai",
                         use_bearer=True,
                     )
-        assert "REVENIUM_APP_BASE_URL is not set" not in exc_info.value.message
+        assert UNPAIRED_PLATFORM_HINT not in exc_info.value.message
 
 class TestRequestSanitizesDictReprLeak:
     """BACK-1313: HTTP error sanitizers strip dict-repr suffix and Error ID
@@ -2519,9 +2924,7 @@ class TestJobTypeEconomicsPaths:
     @pytest.mark.asyncio
     async def test_the_agentic_job_id_is_percent_encoded(self):
         """agenticJobId is a user-supplied external identifier, not an opaque
-        platform id, so a slash in it must not change which endpoint is called.
-        The older job methods in this block still interpolate raw ids; that is
-        deliberately out of scope here."""
+        platform id, so a slash in it must not change which endpoint is called."""
         self.client.post = AsyncMock(return_value={})
 
         await self.client.append_job_outcome_metrics("a/b c", [{"key": "k", "value": 1}])
@@ -2547,10 +2950,101 @@ class TestJobTypeEconomicsPaths:
         assert self.client.post.call_args_list[1].kwargs["data"] == entries
 
 
+class TestJobIdPathsOnTheWire:
+    """Every job-id method sends the id as ONE encoded path segment.
+
+    agenticJobId is the caller's own free text. Interpolated raw, a slash split
+    it into two segments, a '#' or '?' cut the rest of the path off as a
+    fragment or query, and a dot-segment was resolved away, so the request
+    reached another job or another endpoint.
+    """
+
+    _METHODS = [
+        ("get_job_by_id", "GET", "", ()),
+        ("get_job_transactions", "GET", "/transactions", ()),
+        ("get_job_roi", "GET", "/roi", ()),
+        ("report_job_outcome", "POST", "/outcome", ({"executionStatus": "SUCCESS"},)),
+        ("amend_job_outcome", "PATCH", "/outcome", ({"outcomeValue": 1},)),
+        (
+            "append_job_outcome_metrics",
+            "POST",
+            "/outcome/metrics",
+            ([{"key": "quality_rate", "value": 0.9}],),
+        ),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "method_name,method,suffix,args", _METHODS, ids=[m[0] for m in _METHODS]
+    )
+    @pytest.mark.parametrize(
+        "job_id,segment",
+        [
+            ("claims/2026-10-15#7", "claims%2F2026-10-15%237"),
+            ("..", "%2E%2E"),
+            (".", "%2E"),
+            ("a?b", "a%3Fb"),
+            ("x..y", "x..y"),
+        ],
+        ids=["slash_and_hash", "dot_dot", "dot", "question_mark", "dots_inside"],
+    )
+    async def test_the_job_id_is_one_segment_on_the_wire(
+        self, method_name, method, suffix, args, job_id, segment
+    ):
+        client = _client()
+        sent = []
+
+        def answer(request):
+            sent.append((request.method, request.url.raw_path.decode()))
+            return httpx.Response(200, json={})
+
+        client.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+
+        await getattr(client, method_name)(job_id, *args)
+
+        assert sent == [
+            (method, f"/profitstream/v2/api/jobs/{segment}{suffix}?teamId=team_abc")
+        ]
+
+
+class TestSessionAttributionPathOnTheWire:
+    """The session id is sent as ONE encoded path segment, as the job id is,
+    so no session id can move the read to another resource or endpoint."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "session_id,segment",
+        [
+            ("../jobs/x", "..%2Fjobs%2Fx"),
+            ("..", "%2E%2E"),
+            (".", "%2E"),
+            ("a?b", "a%3Fb"),
+            ("x..y", "x..y"),
+            ("sess-abc123", "sess-abc123"),
+        ],
+        ids=["parent_then_jobs", "dot_dot", "dot", "question_mark", "dots_inside", "platform_example"],
+    )
+    async def test_the_session_id_is_one_segment_on_the_wire(self, session_id, segment):
+        client = _client()
+        sent = []
+
+        def answer(request):
+            sent.append((request.method, request.url.raw_path.decode()))
+            return httpx.Response(200, json={})
+
+        client.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+
+        await client.get_session_attributions(session_id)
+
+        assert sent == [
+            ("GET", f"/profitstream/v2/api/sessions/{segment}/attribution?teamId=team_abc")
+        ]
+
+
 class TestJobTypeEconomicsAppendsAreNotRetried:
     """A repeated append records a second baseline version or a second fact,
     and none of these operations declares an idempotency key for the platform
-    to dedupe on. `_should_retry` resends on 408, 429 and every 5xx, so the
+    to dedupe on. `_should_retry` resends on 408 and every 5xx, so the
     three appends opt out of the retry loop for the reason `amend_job_outcome`
     does. The GETs and the economics PUT are safe to repeat and keep the
     default."""

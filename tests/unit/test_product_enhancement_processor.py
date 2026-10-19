@@ -869,8 +869,8 @@ class TestCreateFromDescription:
         assert call_args["plan"]["name"] == "My Product Plan"
 
     @pytest.mark.asyncio
-    async def test_source_assigned_when_available(self):
-        """Default source is assigned when sources exist."""
+    async def test_no_source_attached_when_sources_exist(self):
+        """A description names no source, so none is attached and it stays unpublished."""
         client = _make_client()
         client._extract_embedded_data.return_value = [{"id": "src_42"}]
         client.create_product.return_value = {"id": "p9"}
@@ -885,7 +885,8 @@ class TestCreateFromDescription:
             await proc.create_from_description({"description": "a product"})
 
         call_args = client.create_product.call_args[0][0]
-        assert call_args["sourceIds"] == ["src_42"]
+        assert "sourceIds" not in call_args
+        assert call_args["published"] is False
 
     @pytest.mark.asyncio
     async def test_no_source_available_still_creates(self):

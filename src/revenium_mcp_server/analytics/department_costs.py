@@ -9,18 +9,14 @@ in when the call was made.
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
+from ..analytics_window import AnalyticsWindow
+from .bucket_aggregation import metric_type_for
+from .paging import PageInfo
 from .validation import DEFAULT_USER_COST_SOURCES
 
 DEPARTMENT_COSTS_ENDPOINT_KEY = "cost_metric_by_department_aggregated"
 
 UNASSIGNED_DEPARTMENT_ID = "unassigned"
-
-METRIC_TYPE_BY_AGGREGATION: Mapping[str, str] = {
-    "TOTAL": "sum",
-    "MEAN": "avg",
-    "MAXIMUM": "max",
-    "MINIMUM": "min",
-}
 
 _OWN_METRIC_TYPES = {
     "cost": "COST_METRIC_BY_DEPARTMENT",
@@ -34,7 +30,7 @@ _WITH_SUBDEPARTMENTS_SUFFIX = "_WITH_SUBDEPARTMENTS"
 class DepartmentCostsQuery:
     """The validated get_department_costs arguments."""
 
-    period: str
+    period: AnalyticsWindow
     aggregation: str
     filters: Dict[str, List[str]] = field(default_factory=dict)
     page: Optional[int] = None
@@ -42,7 +38,7 @@ class DepartmentCostsQuery:
 
     @property
     def metric_type(self) -> str:
-        return METRIC_TYPE_BY_AGGREGATION[self.aggregation]
+        return metric_type_for(self.aggregation)
 
     def request_params(self) -> Dict[str, Any]:
         """Query parameters beside the date window and the resolved team."""
@@ -93,10 +89,7 @@ class DepartmentCostsPage:
     setup: DepartmentSetup
     period_start: Optional[str]
     period_end: Optional[str]
-    page_number: Optional[int]
-    page_size: Optional[int]
-    total_pages: Optional[int]
-    total_elements: Optional[int]
+    paging: PageInfo
 
 
 def parse_department_costs(envelope: Mapping[str, Any]) -> DepartmentCostsPage:
@@ -104,16 +97,12 @@ def parse_department_costs(envelope: Mapping[str, Any]) -> DepartmentCostsPage:
     embedded = _mapping(envelope.get("_embedded"))
     items = embedded.get("items")
     period = _mapping(envelope.get("period"))
-    page = _mapping(envelope.get("page"))
     return DepartmentCostsPage(
         groups=[_parse_group(item) for item in items or [] if isinstance(item, Mapping)],
         setup=_parse_setup(_mapping(envelope.get("departmentSetup"))),
         period_start=period.get("start"),
         period_end=period.get("end"),
-        page_number=page.get("number"),
-        page_size=page.get("size"),
-        total_pages=page.get("totalPages"),
-        total_elements=page.get("totalElements"),
+        paging=PageInfo.from_envelope(envelope),
     )
 
 

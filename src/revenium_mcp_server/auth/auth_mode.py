@@ -24,3 +24,19 @@ def read_auth_mode() -> str:
             f"AUTH_MODE must be 'env', 'clerk', or 'api_key', got {mode!r}"
         )
     return mode
+
+
+def auth_mode_is_explicit() -> bool:
+    """Return True when the operator set AUTH_MODE.
+
+    False means read_auth_mode's ``"env"`` default applies.
+    """
+    return os.getenv("AUTH_MODE") is not None
+
+
+def credentials_are_per_request() -> bool:
+    """True when each caller brings its own credential.
+
+    One process then serves many organizations, so process-wide state mixes them.
+    """
+    return read_auth_mode() in ("clerk", "api_key")

@@ -7,7 +7,10 @@ Maps RFC 7807 problem-details codes to structured tool errors.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Union, cast
+from datetime import datetime
+from typing import (
+    TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union, cast,
+)
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -17,6 +20,7 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
+from ..analytics_window import CalendarRangeError, utc_instant_bounds
 from ..client import ReveniumAPIError
 from ..common.department_aliases import deprecated_argument_properties
 from ..common.error_handling import (
@@ -24,6 +28,7 @@ from ..common.error_handling import (
     ToolError,
     create_structured_validation_error,
 )
+from ..common.validation import preprocess_boolean_parameters
 from ..introspection.metadata import ToolType
 from .unified_tool_base import ToolBase
 
@@ -164,6 +169,87 @@ class AIInsightsManagement(ToolBase):
             )
         return value
 
+    @staticmethod
+    def _read_yes_no(arguments: Dict[str, Any], field: str, default: bool) -> bool:
+        """Read a yes/no argument given as a boolean or as text such as "false".
+
+        The advertised schema is action + params, and params values arrive as
+        typed, so "false" must not be truth-tested. None or blank text means the
+        argument was omitted; any other value is refused.
+        """
+        value = arguments.get(field)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return default
+        read = preprocess_boolean_parameters({field: value}, [field])[field]
+        if isinstance(read, bool):
+            return read
+        raise create_structured_validation_error(
+            message=f"{field} must be true or false, got {value!r}",
+            field=field,
+            value=value,
+            suggestions=[f"Pass {field}=true or {field}=false, or omit it"],
+            examples={"correct_usage": {field: default}},
+        )
+
+    @staticmethod
+    def _list_runs_window(arguments: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """since and until as the UTC instants list_runs sends, or None when absent.
+
+        The platform reads a bare day as its first instant, so until=2026-10-14
+        would drop the runs made that day. A yyyy-MM-dd day covers the whole UTC
+        day (since from its first millisecond, until to its last); an ISO 8601
+        time is sent as the same instant in UTC, and one without a zone is UTC,
+        as the platform already reads it.
+        """
+        since = AIInsightsManagement._list_runs_bound(arguments, "since")
+        until = AIInsightsManagement._list_runs_bound(arguments, "until")
+        if since and until and datetime.fromisoformat(since) > datetime.fromisoformat(until):
+            raise create_structured_validation_error(
+                message=f"since ({since}) is after until ({until})",
+                field="since",
+                value=arguments.get("since"),
+                suggestions=["Pass a since at or before until, or swap the two"],
+                examples={"correct_usage": {"since": "2026-10-01", "until": "2026-10-14"}},
+            )
+        return since, until
+
+    @staticmethod
+    def _list_runs_bound(arguments: Dict[str, Any], field: str) -> Optional[str]:
+        raw = arguments.get(field)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return None
+        value = raw
+        if isinstance(raw, str) and not AIInsightsManagement._is_calendar_day(raw):
+            try:
+                zone_less = datetime.fromisoformat(raw.strip()).tzinfo is None
+            except ValueError:
+                zone_less = False
+            if zone_less:
+                value = f"{raw.strip()}+00:00"
+        try:
+            if field == "since":
+                return utc_instant_bounds(value, None)[0]
+            return utc_instant_bounds(None, value)[1]
+        except CalendarRangeError:
+            raise create_structured_validation_error(
+                message=f"{field} {raw!r} is not a yyyy-MM-dd UTC day or an ISO 8601 time",
+                field=field,
+                value=raw,
+                suggestions=[
+                    f"Pass {field} as a day such as 2026-10-14 or a time such as "
+                    "2026-10-14T18:00:00Z, or omit it",
+                ],
+                examples={"correct_usage": {field: "2026-10-14"}},
+            ) from None
+
+    @staticmethod
+    def _is_calendar_day(value: str) -> bool:
+        try:
+            datetime.strptime(value.strip(), "%Y-%m-%d")
+        except ValueError:
+            return False
+        return True
+
     async def _autopaginate(
         self,
         client_method: Callable[..., Awaitable[Dict[str, Any]]],
@@ -201,13 +287,14 @@ class AIInsightsManagement(ToolBase):
         ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         max_results = self._validate_max_results(arguments)
+        since, until = self._list_runs_window(arguments)
         client = await self.get_client(ctx=ctx)
         runs = await self._autopaginate(
             client.list_recommendation_runs,
             max_results=max_results,
             status=arguments.get("status"),
-            since=arguments.get("since"),
-            until=arguments.get("until"),
+            since=since,
+            until=until,
             triggered_by=arguments.get("triggered_by"),
         )
         return self.formatter.format_success_response(
@@ -232,7 +319,7 @@ class AIInsightsManagement(ToolBase):
                     "Pass run_id from a prior trigger_run or list_runs response",
                 ],
             )
-        slim = arguments.get("slim", True)
+        slim = self._read_yes_no(arguments, "slim", True)
         client = await self.get_client(ctx=ctx)
         # The run dict is rendered verbatim, so the filters the backend echoes
         # back — filterDepartmentId / filterIncludeDescendants included (BACK-2757),
@@ -375,13 +462,13 @@ class AIInsightsManagement(ToolBase):
         except ReveniumAPIError as error:
             if not self._is_not_found(error):
                 raise
-            return self.formatter.format_error_response(
+            raise ToolError(
                 message=f"Run '{run_id}' was not found.",
                 error_code=ErrorCodes.RESOURCE_NOT_FOUND,
                 suggestions=[
                     "Confirm the run_id / recommendation_id from list_runs or trigger_run",
                 ],
-            )
+            ) from error
         return self.formatter.format_success_response(
             message=f"Run {run_id} exists and has 0 feedback items",
             data={"feedback": [], "count": 0, "run_id": run_id, "run_exists": True},
@@ -405,6 +492,11 @@ class AIInsightsManagement(ToolBase):
                     suggestions=["e.g. 2026-01-01T00:00:00Z"],
                 )
 
+        include_descendants = self._read_yes_no(arguments, "filter_include_descendants", True)
+        include_coding_assistants = self._read_yes_no(
+            arguments, "filter_include_coding_assistants", True
+        )
+
         client = await self.get_client(ctx=ctx)
         result = await client.trigger_recommendation_run(
             period_start=cast(str, period_start),
@@ -415,8 +507,8 @@ class AIInsightsManagement(ToolBase):
             filter_consuming_org_id=arguments.get("filter_consuming_org_id"),
             filter_environment=arguments.get("filter_environment", ""),
             filter_department_id=arguments.get("filter_department_id", ""),
-            filter_include_descendants=arguments.get("filter_include_descendants", True),
-            filter_include_coding_assistants=arguments.get("filter_include_coding_assistants", True),
+            filter_include_descendants=include_descendants,
+            filter_include_coding_assistants=include_coding_assistants,
             exclude_investigator_ids=arguments.get("exclude_investigator_ids"),
         )
         run_id = result.get("runId")
@@ -530,8 +622,9 @@ class AIInsightsManagement(ToolBase):
             "`recommendationsSummary`). Pass `slim=false` to get raw findingsJson + "
             "parsedFindings.\n\n"
             "## List recent runs\n"
-            "`action=list_runs`, optional `status=completed`, `since=...`, "
-            "`triggered_by=api`, `max_results=200` (auto-paginates up to "
+            "`action=list_runs`, optional `status=completed`, `since=2026-10-01`, "
+            "`until=2026-10-14` (both days included, as whole UTC days; an ISO 8601 "
+            "time also works and is UTC when it has no zone), `triggered_by=api`, `max_results=200` (auto-paginates up to "
             f"{AIInsightsManagement.HARD_CAP_MAX_RESULTS}).\n\n"
             "## Submit feedback\n"
             "`action=submit_feedback`, `run_id`, `recommendation_id`, "
@@ -597,8 +690,17 @@ class AIInsightsManagement(ToolBase):
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 1000},
                 "cursor": {"type": "string"},
                 "status": {"type": "string"},
-                "since": {"type": "string"},
-                "until": {"type": "string"},
+                "since": {
+                    "type": "string",
+                    "description": "Runs created at or after this: a yyyy-MM-dd UTC day "
+                                   "or an ISO 8601 time; a time without a zone is UTC",
+                },
+                "until": {
+                    "type": "string",
+                    "description": "Runs created at or before this: a yyyy-MM-dd UTC day "
+                                   "(the whole day is included) or an ISO 8601 time; a "
+                                   "time without a zone is UTC",
+                },
                 "triggered_by": {"type": "string"},
                 "dismissal_reason": {"type": "string"},
                 "confidence_rating": {"type": "integer", "minimum": -1, "maximum": 1},
@@ -637,7 +739,7 @@ class AIInsightsManagement(ToolBase):
                 ],
             )
         if code == "IDEMPOTENCY_BACKEND_UNAVAILABLE":
-            return self.formatter.format_error_response(
+            raise ToolError(
                 message="AI Insights backend is temporarily unavailable. Retry shortly.",
                 error_code=ErrorCodes.RESOURCE_UNAVAILABLE,
                 suggestions=[
@@ -645,7 +747,7 @@ class AIInsightsManagement(ToolBase):
                 ],
             )
         if code == "NOT_FOUND":
-            return self.formatter.format_error_response(
+            raise ToolError(
                 message=raw_message,
                 error_code=ErrorCodes.RESOURCE_NOT_FOUND,
                 suggestions=[

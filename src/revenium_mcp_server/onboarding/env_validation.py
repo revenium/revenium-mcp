@@ -7,13 +7,18 @@ debug_auto_discovery tool (enhanced_server.py lines 442-454) to ensure 100% cons
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 from loguru import logger
 
+if TYPE_CHECKING:
+    from ..client import ReveniumClient
+
 # Import existing configuration infrastructure - REUSE EXISTING
 from ..auth.auth_mode import read_auth_mode
-from ..config_store import get_config_value
+from ..auth.claims_middleware import current_tenant_context
+from ..common.default_slack_configuration import DEFAULT_SLACK_CONFIG_ENV, get_default_slack_config_id
+from ..config_store import get_config_value, get_environment_value
 from ..endpoint_registry import _resolved_app_base_url, _use_new_api, get_endpoint_path
 
 # Connectivity-probe status values (the "status" key of the api_connectivity dict):
@@ -45,6 +50,23 @@ _METERING_KEY_MESSAGE = (
     "key. A 403 does not prove the key is recognized, so verify the exact key value "
     "before swapping scopes."
 )
+
+
+def request_settings() -> Optional[Dict[str, Tuple[bool, str]]]:
+    """The key and team a hosted caller brought on its request.
+
+    Each maps to whether it is present and how to show it. ``None`` for a local
+    server, where the server's own settings are the caller's.
+    """
+    request_context = current_tenant_context()
+    if request_context is None:
+        return None
+    credential = "your sign-in" if request_context.clerk_jwt else "your API key"
+    team_id = request_context.team_id
+    return {
+        "REVENIUM_API_KEY": (True, f"Provided by {credential} on this request"),
+        "REVENIUM_TEAM_ID": (bool(team_id), team_id or "NOT SET"),
+    }
 
 
 def read_forbidden_detail(api_key: Optional[str]) -> str:
@@ -162,7 +184,7 @@ class EnvironmentVariableValidator:
         ]
 
         for var in revenium_vars:
-            value = os.getenv(var)
+            value = get_environment_value(var)
             if "API_KEY" in var and value:
                 env_vars[var] = "SET (hidden)"
             elif value:
@@ -182,7 +204,7 @@ class EnvironmentVariableValidator:
 
         # Apply same logic pattern to extended variables
         for var in self.EXTENDED_VARS:
-            value = os.getenv(var)
+            value = get_default_slack_config_id() if var == DEFAULT_SLACK_CONFIG_ENV else get_environment_value(var)
             if "API_KEY" in var and value:
                 env_vars[var] = "SET (hidden)"
             elif value:
@@ -374,7 +396,7 @@ class EnvironmentVariableValidator:
             # Add extended variables
             extended_values = {
                 "app_base_url": get_config_value("REVENIUM_APP_BASE_URL"),
-                "slack_config_id": get_config_value("REVENIUM_DEFAULT_SLACK_CONFIG_ID"),
+                "slack_config_id": get_default_slack_config_id(),
             }
 
             # Merge with base values
@@ -484,11 +506,20 @@ class EnvironmentVariableValidator:
 
         return auth_result
 
-    async def validate_all_debug_auto_discovery_format(self) -> ValidationResult:
-        """EXACT REUSE: Perform complete validation using identical logic from debug_auto_discovery.
+    async def validate_all_debug_auto_discovery_format(
+        self,
+        client: Optional["ReveniumClient"] = None,
+        api_connectivity: Optional[Dict[str, Any]] = None,
+    ) -> ValidationResult:
+        """Validate the configuration and judge readiness from a platform read.
 
-        This directly reuses the validation logic from enhanced_server.py debug_auto_discovery tool
-        to ensure 100% consistency with the existing diagnostic functionality.
+        Args:
+            client: The caller's request-scoped client. When given, connectivity
+                is read with the caller's own credentials.
+            api_connectivity: A read this tool call already made (see
+                ``onboarding/platform_read.py``), so the platform is read once.
+
+        Without either, the process-environment probe runs (startup log only).
 
         Returns:
             ValidationResult with all validation information (same format as debug_auto_discovery)
@@ -500,8 +531,13 @@ class EnvironmentVariableValidator:
         # EXACT REUSE: Get environment variables using debug_auto_discovery format
         env_vars_dict = self.get_debug_auto_discovery_env_vars()
 
-        # EXACT REUSE: Test API connectivity using debug_auto_discovery logic
-        api_connectivity = await self.test_api_connectivity_debug_auto_discovery()
+        if api_connectivity is None:
+            if client is not None:
+                from .platform_read import probe_platform_read
+
+                api_connectivity = await probe_platform_read(client)
+            else:
+                api_connectivity = await self.test_api_connectivity_debug_auto_discovery()
 
         # EXACT REUSE: Test discovered configuration using debug_auto_discovery logic
         discovered_config = await self.test_discovered_configuration_debug_auto_discovery()
@@ -527,6 +563,16 @@ class EnvironmentVariableValidator:
         # read (403) and from a transport failure: see API_AUTH_REJECTED_MESSAGE.
         api_auth_rejected = api_status == "failed" and api_connectivity.get("status_code") == 401
 
+        # A hosted caller brings its own credential and team on the request; the
+        # server's settings describe the server, not the caller.
+        caller_settings = request_settings()
+        hosted_caller = caller_settings is not None
+        if caller_settings is not None:
+            env_vars_dict = {name: shown for name, (_present, shown) in caller_settings.items()}
+            organization_slack_default = get_default_slack_config_id()
+            if organization_slack_default:
+                env_vars_dict[DEFAULT_SLACK_CONFIG_ENV] = organization_slack_default
+
         # Convert env_vars_dict to variables format with proper EnvironmentVariableStatus objects
         variables = {}
         for var_name, display_value in env_vars_dict.items():
@@ -549,7 +595,7 @@ class EnvironmentVariableValidator:
             required = var_name in ["REVENIUM_API_KEY"]
 
             # Determine if auto-discoverable
-            auto_discoverable = var_name in [
+            auto_discoverable = not hosted_caller and var_name in [
                 "REVENIUM_TEAM_ID",
                 "REVENIUM_TENANT_ID",
                 "REVENIUM_OWNER_ID",
@@ -577,7 +623,7 @@ class EnvironmentVariableValidator:
 
             variables[var_name] = EnvironmentVariableStatus(
                 name=var_name,
-                value=os.getenv(var_name) if is_set else None,
+                value=get_environment_value(var_name) if is_set and not hosted_caller else None,
                 is_set=is_set,
                 is_sensitive=is_sensitive,
                 display_value=display_value,
@@ -587,11 +633,13 @@ class EnvironmentVariableValidator:
                 auto_discoverable=auto_discoverable,
             )
 
-        # Overall status depends on the auth mode. In clerk/OAuth mode there is no
-        # static API key (auth is per-request via the Clerk JWT), so health is based
-        # on the OAuth configuration being present — not REVENIUM_API_KEY/connectivity,
-        # which are expected to be absent and would otherwise report a false failure.
-        api_key_available = env_vars_dict.get("REVENIUM_API_KEY", "NOT SET") != "NOT SET"
+        credential_source = "request" if hosted_caller else "environment"
+        if caller_settings is not None:
+            api_key_available = caller_settings["REVENIUM_API_KEY"][0]
+            team_id_available = caller_settings["REVENIUM_TEAM_ID"][0]
+        else:
+            api_key_available = env_vars_dict.get("REVENIUM_API_KEY", "NOT SET") != "NOT SET"
+            team_id_available = env_vars_dict.get("REVENIUM_TEAM_ID", "NOT SET") != "NOT SET"
         auth_mode = read_auth_mode()
         required_clerk_envs = (
             "CLERK_DOMAIN",
@@ -601,16 +649,16 @@ class EnvironmentVariableValidator:
         )
         clerk_configured = all((os.getenv(name) or "").strip() for name in required_clerk_envs)
         if auth_mode == "clerk":
-            core_functional = clerk_configured
             # The auth probe requires REVENIUM_API_KEY, absent by design in clerk mode —
             # base the flag on the OAuth config instead of a probe that always fails.
             auth_config_works = clerk_configured
-        else:
-            core_functional = api_key_available and api_works
+        # In every mode the system is ready only when a read actually succeeded.
+        core_functional = api_works
 
         summary = {
             "api_key_available": api_key_available,
-            "team_id_available": env_vars_dict.get("REVENIUM_TEAM_ID", "NOT SET") != "NOT SET",
+            "team_id_available": team_id_available,
+            "credential_source": credential_source,
             "auto_discovery_works": auto_discovery_works,
             "discovered_count": discovered_count,
             "required_fields_discovered": discovered_count >= 1,  # Lowered threshold
@@ -624,13 +672,14 @@ class EnvironmentVariableValidator:
                 api_connectivity.get("error") if api_read_forbidden else None
             ),
             "api_auth_rejected": api_auth_rejected,
+            "api_unreachable": api_status == "error",
             "api_auth_rejected_detail": (
                 api_connectivity.get("error") if api_auth_rejected else None
             ),
             "auth_config_works": auth_config_works,
             "auth_mode": auth_mode,
             "clerk_configured": clerk_configured,
-            "overall_status": core_functional,  # api_key mode: key + connectivity; clerk mode: OAuth config present
+            "overall_status": core_functional,
             "configuration_method": (
                 "Auto-Discovery (Simplified)"
                 if auto_discovery_works
@@ -658,13 +707,18 @@ class EnvironmentVariableValidator:
 _validator = EnvironmentVariableValidator()
 
 
-async def validate_environment_variables() -> ValidationResult:
-    """Convenience function to validate all environment variables using debug_auto_discovery logic.
+async def validate_environment_variables(
+    client: Optional["ReveniumClient"] = None,
+    api_connectivity: Optional[Dict[str, Any]] = None,
+) -> ValidationResult:
+    """Validate the configuration; see ``validate_all_debug_auto_discovery_format``.
 
     Returns:
         ValidationResult with complete validation information (same format as debug_auto_discovery)
     """
-    return await _validator.validate_all_debug_auto_discovery_format()
+    return await _validator.validate_all_debug_auto_discovery_format(
+        client=client, api_connectivity=api_connectivity
+    )
 
 
 def get_debug_auto_discovery_env_vars() -> Dict[str, str]:

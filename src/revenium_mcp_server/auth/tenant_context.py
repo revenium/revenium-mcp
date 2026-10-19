@@ -53,7 +53,21 @@ class TenantContext(BaseModel):
     )
     user_id: Optional[str] = Field(
         None,
-        description="Authenticated user identifier (Clerk `sub` claim)",
+        description=(
+            "Authenticated user identifier: the platform user id in api_key mode, "
+            "the Clerk `sub` claim in clerk mode"
+        ),
+    )
+    owner_id: Optional[str] = Field(
+        None,
+        description=(
+            "The caller's own platform user id, used as the owner of the records "
+            "the caller creates"
+        ),
+    )
+    email: Optional[str] = Field(
+        None,
+        description="The caller's own email address, the default for their notifications",
     )
     scopes: Optional[List[str]] = Field(
         None,

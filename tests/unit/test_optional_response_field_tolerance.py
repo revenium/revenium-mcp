@@ -23,6 +23,7 @@ from src.revenium_mcp_server.tools_decomposed.product_management import (
     ProductHierarchyManager,
     ProductManagement,
     ProductManager,
+    _first_id_bearing_entry_id,
 )
 from src.revenium_mcp_server.tools_decomposed.job_management import JobManager
 from src.revenium_mcp_server.tools_decomposed.cost_controls_management import (
@@ -48,6 +49,7 @@ def _product_client():
     client.get_sources = AsyncMock(return_value={})
     client.get_metering_element_definitions = AsyncMock(return_value={})
     client.get_organizations = AsyncMock(return_value={})
+    client.get_organization_by_id = AsyncMock(return_value={"id": "org_1"})
     client._extract_embedded_data = MagicMock(return_value=[])
     client.create_product = AsyncMock(return_value={"id": "p_new", "name": "New"})
     client.create_subscription = AsyncMock(
@@ -92,7 +94,11 @@ def _valid_product_data():
 
 
 def _valid_subscription_data():
-    return {"name": "Customer Subscription", "clientEmailAddress": "customer@company.com"}
+    return {
+        "name": "Customer Subscription",
+        "clientEmailAddress": "customer@company.com",
+        "organizationId": "org_1",
+    }
 
 
 # ===========================================================================
@@ -102,8 +108,7 @@ def _valid_subscription_data():
 
 class TestCreateProductSourceAssignment:
     @pytest.mark.asyncio
-    async def test_skips_source_entry_without_id(self):
-        """A source lacking `id` is skipped in favor of the first id-bearing one."""
+    async def test_attaches_no_source_even_when_one_exists(self):
         client = _product_client()
         client._extract_embedded_data.return_value = [{"name": "no-id"}, {"id": "src_2"}]
         mgr = ProductManager(client)
@@ -111,7 +116,8 @@ class TestCreateProductSourceAssignment:
             engine.validate_for_mcp.return_value = {"isError": False, "content": []}
             await mgr.create_product({"product_data": {"name": "P", "plan": {"name": "PP"}}})
         sent = client.create_product.call_args[0][0]
-        assert sent.get("sourceIds") == ["src_2"]
+        assert "sourceIds" not in sent
+        assert client.get_sources.await_count == 0
 
     @pytest.mark.asyncio
     async def test_no_source_with_id_assigns_no_default(self):
@@ -133,14 +139,15 @@ class TestCreateProductSourceAssignment:
 
 class TestCreateSimpleSourceAssignment:
     @pytest.mark.asyncio
-    async def test_skips_source_entry_without_id(self):
+    async def test_attaches_no_source_even_when_one_exists(self):
         client = _product_client()
         client._extract_embedded_data.return_value = [{"name": "no-id"}, {"id": "src_2"}]
         proc = _make_enh_processor(client)
         with patch(_GET_CONFIG, return_value=None):
             await proc.create_simple({"name": "Test"})
         sent = client.create_product.call_args[0][0]
-        assert sent.get("sourceIds") == ["src_2"]
+        assert "sourceIds" not in sent
+        assert client.get_sources.await_count == 0
 
     @pytest.mark.asyncio
     async def test_no_source_with_id_assigns_no_default(self):
@@ -160,7 +167,7 @@ class TestCreateSimpleSourceAssignment:
 
 class TestCreateFromDescriptionSourceAssignment:
     @pytest.mark.asyncio
-    async def test_skips_source_entry_without_id(self):
+    async def test_attaches_no_source_even_when_one_exists(self):
         client = _product_client()
         client._extract_embedded_data.return_value = [{"name": "no-id"}, {"id": "src_2"}]
         nlp = MagicMock()
@@ -172,7 +179,8 @@ class TestCreateFromDescriptionSourceAssignment:
         with patch(_GET_CONFIG, return_value=None):
             await proc.create_from_description({"description": "a product"})
         sent = client.create_product.call_args[0][0]
-        assert sent.get("sourceIds") == ["src_2"]
+        assert "sourceIds" not in sent
+        assert client.get_sources.await_count == 0
 
 
 # ===========================================================================
@@ -409,10 +417,7 @@ class TestDefaultScanWindow:
     @pytest.mark.asyncio
     async def test_default_source_fetch_requests_a_scan_window(self):
         client = _product_client()
-        mgr = ProductManager(client)
-        with patch(_VALIDATION_ENGINE) as engine, patch(_GET_CONFIG, return_value=None):
-            engine.validate_for_mcp.return_value = {"isError": False, "content": []}
-            await mgr.create_product({"product_data": {"name": "P", "plan": {"name": "PP"}}})
+        await _first_id_bearing_entry_id(client.get_sources, client._extract_embedded_data)
         assert client.get_sources.await_args.kwargs.get("size", 1) >= 10
 
 
@@ -424,12 +429,10 @@ class TestDefaultScanWindow:
         page0 = [{"name": f"no-id-{n}"} for n in range(20)]
         page1 = [{"id": "src_deep"}]
         client._extract_embedded_data.side_effect = [page0, page1]
-        mgr = ProductManager(client)
-        with patch(_VALIDATION_ENGINE) as engine, patch(_GET_CONFIG, return_value=None):
-            engine.validate_for_mcp.return_value = {"isError": False, "content": []}
-            await mgr.create_product({"product_data": {"name": "P", "plan": {"name": "PP"}}})
-        sent = client.create_product.call_args[0][0]
-        assert sent.get("sourceIds") == ["src_deep"]
+        found = await _first_id_bearing_entry_id(
+            client.get_sources, client._extract_embedded_data
+        )
+        assert found == ("src_deep", False)
         assert client.get_sources.await_count == 2
 
     @pytest.mark.asyncio
@@ -438,12 +441,10 @@ class TestDefaultScanWindow:
         no default assigned."""
         client = _product_client()
         client._extract_embedded_data.side_effect = [[{"name": "no-id"}]]
-        mgr = ProductManager(client)
-        with patch(_VALIDATION_ENGINE) as engine, patch(_GET_CONFIG, return_value=None):
-            engine.validate_for_mcp.return_value = {"isError": False, "content": []}
-            await mgr.create_product({"product_data": {"name": "P", "plan": {"name": "PP"}}})
-        sent = client.create_product.call_args[0][0]
-        assert not sent.get("sourceIds")
+        found = await _first_id_bearing_entry_id(
+            client.get_sources, client._extract_embedded_data
+        )
+        assert found == (None, False)
         assert client.get_sources.await_count == 1
 
     @pytest.mark.asyncio
@@ -453,13 +454,11 @@ class TestDefaultScanWindow:
         client = _product_client()
         full_idless = [{"name": "no-id"} for _ in range(20)]
         client._extract_embedded_data.side_effect = [full_idless] * 10
-        mgr = ProductManager(client)
-        with patch(_VALIDATION_ENGINE) as engine, patch(_GET_CONFIG, return_value=None):
-            engine.validate_for_mcp.return_value = {"isError": False, "content": []}
-            await mgr.create_product({"product_data": {"name": "P", "plan": {"name": "PP"}}})
-        sent = client.create_product.call_args[0][0]
-        assert not sent.get("sourceIds")
-        assert client.get_sources.await_count <= 5
+        found = await _first_id_bearing_entry_id(
+            client.get_sources, client._extract_embedded_data
+        )
+        assert found == (None, True)
+        assert client.get_sources.await_count == 5
 
 
     @pytest.mark.asyncio

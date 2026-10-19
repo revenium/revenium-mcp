@@ -4,8 +4,6 @@ Tests the pure formatting functions that transform API response data
 into user-facing TextContent output.
 """
 
-from unittest.mock import patch
-
 from mcp.types import TextContent
 
 from src.revenium_mcp_server.tools_decomposed.slack_config_formatters import (
@@ -120,14 +118,26 @@ class TestFormatPaginationInfo:
         assert "Previous page" in result
         assert "Next page" in result
 
+    def test_hints_carry_requested_size_by_keyword(self):
+        result = format_pagination_info(1, 3, size=5)
+        assert "page=0, size=5)" in result
+        assert "page=2, size=5)" in result
+
+    def test_list_forwards_size_by_keyword(self):
+        response = {
+            "content": [{"id": "cfg-1", "name": "A"}],
+            "totalElements": 12,
+            "totalPages": 3,
+        }
+        text = format_configurations_list(response, page=0, size=5)[0].text
+        assert "page=1, size=5)" in text
+
 
 class TestFormatConfigurationDetails:
     """Test single configuration detail view formatting."""
 
-    @patch("src.revenium_mcp_server.tools_decomposed.slack_config_formatters.get_config_value")
-    def test_shows_default_badge_when_is_default(self, mock_config):
+    def test_shows_default_badge_when_is_default(self):
         """When viewing the current default config, it should say so."""
-        mock_config.return_value = "cfg-123"
         config = {
             "name": "My Config",
             "teamName": "Team A",
@@ -135,14 +145,12 @@ class TestFormatConfigurationDetails:
             "created": "2025-01-01",
             "updated": "2025-01-02",
         }
-        result = format_configuration_details(config, "cfg-123")
+        result = format_configuration_details(config, "cfg-123", is_default=True)
 
         assert "current default" in result[0].text.lower()
 
-    @patch("src.revenium_mcp_server.tools_decomposed.slack_config_formatters.get_config_value")
-    def test_no_default_badge_when_not_default(self, mock_config):
+    def test_no_default_badge_when_not_default(self):
         """Non-default configs should not show the default badge."""
-        mock_config.return_value = "other-cfg"
         config = {
             "name": "My Config",
             "teamName": "Team A",
@@ -168,6 +176,14 @@ class TestFormatDefaultSetSuccess:
         assert "#prod-alerts" in text
         assert "cfg-prod" in text
         assert ".env" in text
+
+    def test_hosted_organization_gets_no_env_hint(self):
+        config = {"name": "Prod Alerts", "teamName": "ProdTeam", "channelName": "#prod-alerts"}
+        text = format_default_set_success(config, "cfg-prod", hosted=True)[0].text
+
+        assert "cfg-prod" in text
+        assert ".env" not in text
+        assert "your organization" in text
 
 
 class TestFormatNoDefaultMessage:

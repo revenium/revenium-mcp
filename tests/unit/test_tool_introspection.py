@@ -68,21 +68,23 @@ class TestToolIntrospectionActions:
 
     @pytest.mark.asyncio
     async def test_unknown_action_raises_tool_error(self, introspection_tool):
-        """Unknown action raises ToolError which is caught and formatted."""
-        result = await introspection_tool.handle_action("bogus_action", {})
-        text = result[0].text
+        """Unknown action raises ToolError carrying the formatted guidance."""
+        with pytest.raises(ToolError) as exc_info:
+            await introspection_tool.handle_action("bogus_action", {})
+        text = exc_info.value.message
         assert "bogus_action" in text
         # Should include suggestions about valid actions
         assert "get_capabilities" in text
 
     @pytest.mark.asyncio
     async def test_tool_error_from_service_is_formatted(self, introspection_tool):
-        """ToolError raised by service is caught and formatted."""
+        """ToolError raised by service is re-raised with its formatted text."""
         introspection_tool.introspection_service.handle_introspection_action = AsyncMock(
             side_effect=ToolError(message="tool not found", error_code="NOT_FOUND")
         )
-        result = await introspection_tool.handle_action("list_tools", {})
-        assert "tool not found" in result[0].text
+        with pytest.raises(ToolError) as exc_info:
+            await introspection_tool.handle_action("list_tools", {})
+        assert "tool not found" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_generic_exception_is_reraised(self, introspection_tool):

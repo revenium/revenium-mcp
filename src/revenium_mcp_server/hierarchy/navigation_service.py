@@ -6,7 +6,7 @@ across the three-tier hierarchy: Products → Subscriptions → Subscriber Crede
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -24,6 +24,52 @@ class NavigationResult:
     navigation_path: List[str]
     metadata: Dict[str, Any]
     error_message: Optional[str] = None
+    incomplete: bool = False
+
+
+class _SubscriptionPageError(Exception):
+    """A subscriptions page could not be read, so the walk cannot be complete."""
+
+    def __init__(self, page: int, cause: Exception):
+        super().__init__(f"subscriptions page {page}: {cause}")
+        self.page = page
+        self.cause = cause
+
+
+def _incomplete_walk_result(
+    entity_type: str, entity_id: str, error: _SubscriptionPageError
+) -> NavigationResult:
+    return NavigationResult(
+        success=False,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        related_entities=[],
+        navigation_path=[],
+        metadata={"failed_page": error.page},
+        error_message=(
+            f"Could not read subscriptions page {error.page} ({error.cause}). "
+            "The subscription list is incomplete, so no answer was built from "
+            "the pages read before it. Retry the request."
+        ),
+        incomplete=True,
+    )
+
+
+def _references_product(subscription: Dict[str, Any], product_id: str) -> bool:
+    product = subscription.get("product")
+    return (
+        subscription.get("product_id") == product_id
+        or subscription.get("productId") == product_id
+        or (isinstance(product, dict) and product.get("id") == product_id)
+    )
+
+
+def _references_credential(subscription: Dict[str, Any], credential_id: str) -> bool:
+    credentials = subscription.get("credentials") or []
+    return any(
+        isinstance(credential, dict) and credential.get("id") == credential_id
+        for credential in credentials
+    )
 
 
 @dataclass
@@ -104,39 +150,12 @@ class HierarchyNavigationService:
                     error_message=f"Error accessing product: {str(e)}",
                 )
 
-            # Get subscriptions for this product
-            subscriptions = []
-            page = 0
-            page_size = 50
-
-            while True:
-                try:
-                    response = await self.client.get_subscriptions(page=page, size=page_size)
-                    page_subscriptions = self.client._extract_embedded_data(response)
-
-                    # Filter subscriptions for this product
-                    product_subscriptions = [
-                        sub
-                        for sub in page_subscriptions
-                        if (
-                            sub.get("product_id") == product_id
-                            or sub.get("productId") == product_id
-                            or (
-                                sub.get("product")
-                                and sub.get("product", {}).get("id") == product_id
-                            )
-                        )
-                    ]
-                    subscriptions.extend(product_subscriptions)
-
-                    # Check if we have more pages
-                    if len(page_subscriptions) < page_size:
-                        break
-                    page += 1
-
-                except Exception as e:
-                    logger.error(f"Error fetching subscriptions page {page}: {e}")
-                    break
+            try:
+                subscriptions = await self._collect_subscriptions(
+                    lambda sub: _references_product(sub, product_id)
+                )
+            except _SubscriptionPageError as error:
+                return _incomplete_walk_result("products", product_id, error)
 
             result = NavigationResult(
                 success=True,
@@ -347,6 +366,46 @@ class HierarchyNavigationService:
                 error_message=f"Navigation error: {str(e)}",
             )
 
+    async def _collect_subscriptions(
+        self, matches: Callable[[Dict[str, Any]], bool]
+    ) -> List[Dict[str, Any]]:
+        """Read every subscriptions page and keep the ones ``matches`` accepts.
+
+        Raises:
+            _SubscriptionPageError: a page could not be read; nothing collected so
+                far may be used as an answer.
+        """
+        collected: List[Dict[str, Any]] = []
+        page = 0
+        page_size = 50
+        while True:
+            try:
+                response = await self.client.get_subscriptions(page=page, size=page_size)
+                page_subscriptions = self.client._extract_embedded_data(response)
+            except Exception as e:
+                logger.error(f"Error fetching subscriptions page {page}: {e}")
+                raise _SubscriptionPageError(page, e) from e
+
+            collected.extend(
+                sub for sub in page_subscriptions if isinstance(sub, dict) and matches(sub)
+            )
+            if len(page_subscriptions) < page_size:
+                return collected
+            page += 1
+
+    @staticmethod
+    def _incomplete_hierarchy(walk: NavigationResult) -> NavigationResult:
+        return NavigationResult(
+            success=False,
+            entity_type=walk.entity_type,
+            entity_id=walk.entity_id,
+            related_entities=[],
+            navigation_path=[],
+            metadata=walk.metadata,
+            error_message=walk.error_message,
+            incomplete=True,
+        )
+
     # Cache Management
 
     async def _get_cached_result(self, cache_key: str) -> Optional[NavigationResult]:
@@ -407,38 +466,14 @@ class HierarchyNavigationService:
                     error_message=f"Credential {credential_id} not found",
                 )
 
-            # Find subscriptions that reference this credential (reverse lookup)
-            # Since credentials don't have subscriptionIds, we need to search subscriptions
-            # that have this credential in their credentials array
-            subscriptions = []
-            page = 0
-            page_size = 50
-
-            while True:
-                try:
-                    response = await self.client.get_subscriptions(page=page, size=page_size)
-                    page_subscriptions = self.client._extract_embedded_data(response)
-
-                    # Filter subscriptions that reference this credential
-                    credential_subscriptions = []
-                    for sub in page_subscriptions:
-                        sub_credentials = sub.get("credentials", [])
-                        # Check if this credential is in the subscription's credentials array
-                        for cred in sub_credentials:
-                            if cred.get("id") == credential_id:
-                                credential_subscriptions.append(sub)
-                                break
-
-                    subscriptions.extend(credential_subscriptions)
-
-                    # Check if we have more pages
-                    if len(page_subscriptions) < page_size:
-                        break
-                    page += 1
-
-                except Exception as e:
-                    logger.error(f"Error fetching subscriptions page {page}: {e}")
-                    break
+            # Credentials carry no subscription ids, so search every subscription's
+            # credentials array (reverse lookup)
+            try:
+                subscriptions = await self._collect_subscriptions(
+                    lambda sub: _references_credential(sub, credential_id)
+                )
+            except _SubscriptionPageError as error:
+                return _incomplete_walk_result("credentials", credential_id, error)
 
             if not subscriptions:
                 return NavigationResult(
@@ -506,6 +541,7 @@ class HierarchyNavigationService:
                     navigation_path=[],
                     metadata={},
                     error_message=f"Could not find subscription for credential: {subscription_result.error_message}",
+                    incomplete=subscription_result.incomplete,
                 )
 
             # Get product for the first subscription (credentials typically have one primary subscription)
@@ -594,6 +630,8 @@ class HierarchyNavigationService:
 
                         # Get subscriptions for product
                         sub_result = await self.get_subscriptions_for_product(entity_id)
+                        if sub_result.incomplete:
+                            return self._incomplete_hierarchy(sub_result)
                         if sub_result.success:
                             hierarchy_data["subscriptions"] = sub_result.related_entities
 
@@ -639,6 +677,8 @@ class HierarchyNavigationService:
 
                         # Get subscription for credential
                         sub_result = await self.get_subscription_for_credential(entity_id)
+                        if sub_result.incomplete:
+                            return self._incomplete_hierarchy(sub_result)
                         if sub_result.success:
                             hierarchy_data["subscriptions"] = sub_result.related_entities
 

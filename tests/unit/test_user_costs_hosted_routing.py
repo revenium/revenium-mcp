@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.revenium_mcp_server import endpoint_registry
+from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.endpoint_registry import (
     get_endpoint_path,
     requires_new_api_flag,
@@ -74,14 +75,27 @@ def _client(payload):
     return client
 
 
-async def _run_user_costs(analytics_tool, payload=USER_COSTS_PAYLOAD, filters=None):
+def _user_costs_request(analytics_tool, payload, filters):
     client = _client(payload)
     analytics_tool.get_client = AsyncMock(return_value=client)
     arguments = {"period": "THIRTY_DAYS"}
     if filters is not None:
         arguments["filters"] = filters
+    return client, arguments
+
+
+async def _run_user_costs(analytics_tool, payload=USER_COSTS_PAYLOAD, filters=None):
+    client, arguments = _user_costs_request(analytics_tool, payload, filters)
     result = await analytics_tool.handle_action("get_user_costs", arguments)
     return client, result[0].text
+
+
+async def _refused_user_costs(analytics_tool, payload=USER_COSTS_PAYLOAD, filters=None):
+    """The client and the text of the error get_user_costs raises."""
+    client, arguments = _user_costs_request(analytics_tool, payload, filters)
+    with pytest.raises(ToolError) as exc:
+        await analytics_tool.handle_action("get_user_costs", arguments)
+    return client, exc.value.message
 
 
 def _sent_cost_sources(client):
@@ -159,7 +173,7 @@ class TestHandler:
     async def test_refusal_names_the_server_configuration_not_the_tenant(
         self, analytics_tool, refused_user_costs
     ):
-        client, text = await _run_user_costs(analytics_tool)
+        client, text = await _refused_user_costs(analytics_tool)
 
         client.get.assert_not_awaited()
         assert OLD_REFUSAL_TEXT not in text
@@ -168,7 +182,7 @@ class TestHandler:
 
 
 class TestCostSourcesDefault:
-    """Coding-assistant usage is real spend or an estimate under coding_assistant depending on the team's API-rate setting, so an omitted filter asks for every source (BACK-4136)."""
+    """A call's cost source is where its row came from, so which source holds a tenant's spend depends on how its usage arrives and an omitted filter asks for every source (BACK-4136, FRONT-3434)."""
 
     @pytest.mark.asyncio
     async def test_omitted_cost_sources_ask_for_the_answerable_sources(self, analytics_tool):
@@ -212,7 +226,8 @@ class TestCostSourcesDefault:
             '(`filters.costSources=["coding_assistant", "revenium_metered", "provider_billing"]`); pass a subset to narrow it'
         ) in text
         assert "returns no rows" not in text
-        assert "under `coding_assistant` otherwise" in text
+        assert "usage the team pays API rates for is under `coding_assistant`" in text
+        assert "real spend under `revenium_metered` or `provider_billing`" not in text
         assert "AI by Employee" in text
         assert "this action defaults to" not in text
 

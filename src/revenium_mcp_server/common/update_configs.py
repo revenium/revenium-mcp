@@ -7,7 +7,56 @@ for each resource type in the Revenium Platform API.
 from typing import Any, Dict
 
 from ..client import ReveniumClient
+from .error_handling import create_structured_validation_error
 from .partial_update_handler import FieldTransformers, UpdateConfig
+
+
+_KEEP_STORED_TIERS_HINT = "Leave 'tiers' out of the plan to keep the stored tiers"
+_SEND_A_TIER_HINT = "Send at least one tier in the shape the product's get action returns"
+
+
+def _tier_count(plan: Dict[str, Any]) -> int:
+    aggregations = plan.get("ratingAggregations") or []
+    aggregation_tiers = sum(
+        len(aggregation.get("tiers") or [])
+        for aggregation in aggregations
+        if isinstance(aggregation, dict)
+    )
+    return len(plan.get("tiers") or []) + aggregation_tiers
+
+
+def refuse_plan_without_tiers(
+    current: Dict[str, Any], caller: Dict[str, Any], merged: Dict[str, Any]
+) -> None:
+    """Refuse a plan change that leaves the product with no pricing tier.
+
+    Applies the create path's rule (ProductValidationEngine requires plan.tiers)
+    only when the caller changes the plan, so other edits of a stored tierless
+    product still go through.
+    """
+    if "plan" not in caller:
+        return
+    plan = merged.get("plan")
+    if not isinstance(plan, dict):
+        return
+    if _tier_count(plan) > 0:
+        return
+    stored_plan = current.get("plan")
+    if isinstance(stored_plan, dict) and _tier_count(stored_plan) > 0:
+        message = "Required plan field 'tiers' is empty: the update would remove every pricing tier"
+        suggestions = [_KEEP_STORED_TIERS_HINT, _SEND_A_TIER_HINT]
+    else:
+        message = (
+            "Required plan field 'tiers' is missing: the product currently has no pricing tier "
+            "and the update must add at least one"
+        )
+        suggestions = [_SEND_A_TIER_HINT]
+    raise create_structured_validation_error(
+        message=message,
+        field="plan.tiers",
+        value=plan.get("tiers"),
+        suggestions=suggestions,
+    )
 
 
 class UpdateConfigs:
@@ -38,16 +87,6 @@ class UpdateConfigs:
                 "organizationId",
             ],
             default_fields={"teamId": client.team_id},
-            preserve_fields=[
-                "id",
-                "createdAt",
-                "updatedAt",
-                "version",
-                # Preserve relationship and association fields (fixes FINDING #4)
-                "subscriptionIds",
-                "tags",
-                "metadata",
-            ],
         )
 
     @staticmethod
@@ -77,19 +116,12 @@ class UpdateConfigs:
             id_field="id",
             required_fields=["name", "version", "plan", "paymentSource"],
             default_fields=default_fields,
-            preserve_fields=[
-                "id",
-                "createdAt",
-                "updatedAt",
-                "ownerId",
-                # Preserve relationship and association fields
-                "source_ids",
-                "sla_ids",
-                "custom_pricing_rule_ids",
-                "notification_addresses_on_invoice",
-                "tags",
-                "terms",
-            ],
+            field_transformations={
+                "owner": {"ownerId": FieldTransformers.extract_owner_id},
+                "team": {"teamId": FieldTransformers.reference_to_id},
+            },
+            nested_merge_fields=["plan"],
+            merged_data_check=refuse_plan_without_tiers,
         )
 
     @staticmethod
@@ -119,16 +151,6 @@ class UpdateConfigs:
             id_field="id",
             required_fields=["name"],
             default_fields=default_fields,
-            preserve_fields=[
-                "id",
-                "createdAt",
-                "updatedAt",
-                "productId",
-                "ownerId",
-                "teamId",
-                "subscriberId",
-                "organizationId",
-            ],
             field_transformations={
                 "owner": {"ownerId": FieldTransformers.extract_owner_id},
                 "client": {
@@ -138,6 +160,7 @@ class UpdateConfigs:
                 "organization": {"organizationId": FieldTransformers.object_to_id},
                 "product": {"productId": FieldTransformers.object_to_id},
             },
+            derived_field_dependencies={"clientEmailAddress": "subscriberId"},
         )
 
     @staticmethod
@@ -153,13 +176,7 @@ class UpdateConfigs:
         from ..config_store import get_config_value
 
         # Build default fields
-        default_fields = {
-            "teamId": client.team_id,
-            "code": "",
-            "assetUsageIdentifier": "API_ENDPOINT",
-            "planId": "",
-            "sourceType": "",
-        }
+        default_fields = {"teamId": client.team_id}
 
         # Add ownerId if available (consistent with source creation)
         owner_id = get_config_value("REVENIUM_OWNER_ID")
@@ -171,36 +188,13 @@ class UpdateConfigs:
             get_method=client.get_source_by_id,
             update_method=client.update_source,
             id_field="id",
-            required_fields=["name", "description", "version", "type"],
+            required_fields=["name", "version", "type", "ownerId", "teamId"],
             default_fields=default_fields,
-            preserve_fields=[
-                "createdAt",
-                "updatedAt",
-                "ownerId",
-                "teamId",
-                "meteringElementDefinitionIds",
-                "code",
-                "assetUsageIdentifier",
-                "planId",
-                "identityProviderConfigurationId",
-                "environmentId",
-                "tags",
-                "sourceClassifications",
-                # "method" removed - should be updatable, not preserved
-                "syncedWithApiGateway",
-                "autoDiscoveryEnabled",
-                "resource",
-                "logoURL",
-                "devPortalLink",
-                "sourceType",
-                "externalId",
-                "externalUsagePlanId",
-            ],
             field_transformations={
                 "owner": {"ownerId": FieldTransformers.extract_owner_id},
                 "team": {"teamId": FieldTransformers.object_to_id},
             },
-            field_mappings={"externalUsagePlanId": "externalPlanId"},
+            accepts_metadata=True,
         )
 
     @staticmethod
@@ -245,50 +239,21 @@ class UpdateConfigs:
 
         mapping = method_mapping[resource_type]
 
-        # Define preserve fields based on resource type
-        preserve_fields = ["id", "createdAt", "updatedAt"]
-
-        # Add resource-specific relationship fields and transformations
-        field_transformations = {}
+        field_transformations: Dict[str, Dict[str, Any]] = {}
         if resource_type == "user":
-            # Note: "roles" removed from preserve_fields to allow role updates via partial updates
-            preserve_fields.extend(
-                ["organization_id", "team_id", "teamIds", "permissions", "role", "tenant"]
-            )
             field_transformations = {"teams": {"teamIds": FieldTransformers.extract_team_ids}}
         elif resource_type == "subscriber":
-            # Only preserve fields that should never be updated by users
-            # Remove firstName, lastName, email from preserve_fields to allow updates
-            # Note: "roles" removed from preserve_fields to allow role updates via partial updates
-            preserve_fields.extend(
-                [
-                    "subscription_ids",
-                    "organization_id",
-                    "user_id",
-                    "billing_address",
-                    "payment_method",
-                    "subscriberId",
-                    "tenant",
-                ]
-            )
             field_transformations = {
                 "organizations": {"organizationIds": FieldTransformers.objects_array_to_ids}
             }
         elif resource_type == "organization":
-            preserve_fields.extend(["parent_organization_id", "contact_info", "address"])
-            # BACK-1270 / BACK-911 regression — the organizations API GET returns
-            # the parent as a populated nested ``parent`` object, but the PUT
-            # endpoint only persists the relationship when the scalar ``parentId``
-            # field is present. Project ``parent.id`` into ``parentId`` so a
-            # partial update (e.g. name-only) does not silently null the parent
-            # link server-side.
+            # BACK-1270 / BACK-911: the organizations GET returns the parent only as
+            # a nested ``parent`` object, but the PUT persists the relationship only
+            # from the scalar ``parentId``; without this a name-only update would
+            # null the parent link server-side.
             field_transformations = {
                 "parent": {"parentId": FieldTransformers.object_to_id},
             }
-        elif resource_type == "team":
-            preserve_fields.extend(
-                ["organization_id", "parent_team_id", "owner_id", "members", "permissions"]
-            )
 
         default_fields: Dict[str, Any] = {}
         if resource_type in ["user", "subscriber"]:
@@ -305,8 +270,8 @@ class UpdateConfigs:
             id_field="id",
             required_fields=mapping["required_fields"],
             default_fields=default_fields,
-            preserve_fields=preserve_fields,
             field_transformations=field_transformations,
+            accepts_metadata=resource_type in ("organization", "team"),
         )
 
     @staticmethod
@@ -326,7 +291,7 @@ class UpdateConfigs:
             id_field="id",
             required_fields=["name"],
             default_fields={},
-            preserve_fields=["id", "createdAt", "updatedAt"],
+            field_transformations={"team": {"teamId": FieldTransformers.reference_to_id}},
         )
 
 

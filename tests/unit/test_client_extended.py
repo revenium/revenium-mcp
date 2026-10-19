@@ -142,7 +142,7 @@ class TestShouldRetry:
         (500, True),
         (502, True),
         (503, True),
-        (429, True),
+        (429, False),
         (408, True),
         (400, False),
         (401, False),
@@ -315,8 +315,8 @@ class TestSubscriptionAPIMethods:
         self.client.post.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_cancel_subscription(self):
-        await self.client.cancel_subscription("sub_42")
+    async def test_delete_subscription(self):
+        await self.client.delete_subscription("sub_42")
         assert "sub_42" in self.client.delete.call_args[0][0]
 
 
@@ -372,7 +372,8 @@ class TestUserAPIMethods:
     async def test_get_user_by_email(self):
         await self.client.get_user_by_email("alice@example.com")
         endpoint = self.client.get.call_args[0][0]
-        assert "alice@example.com" in endpoint
+        assert endpoint == "/profitstream/v2/api/users/lookup-by-email"
+        assert self.client.get.call_args.kwargs["params"]["email"] == "alice@example.com"
 
     @pytest.mark.asyncio
     async def test_get_current_user(self):
@@ -1266,6 +1267,26 @@ class TestLookupByEmailAPIMethods:
     async def test_lookup_subscriber_by_email_returns_payload(self):
         result = await self.client.lookup_subscriber_by_email("bob@example.com")
         assert result["id"] == "x1"
+
+    @pytest.mark.asyncio
+    async def test_get_user_by_email_reads_the_lookup_by_email_path(self):
+        await self.client.get_user_by_email("Jane+Ops@Acme.com")
+        endpoint = self.client.get.call_args[0][0]
+        params = self.client.get.call_args.kwargs["params"]
+        assert endpoint == "/profitstream/v2/api/users/lookup-by-email"
+        assert "@" not in endpoint
+        assert params["email"] == "Jane+Ops@Acme.com"
+        assert params["teamId"] == "team_abc"
+
+    @pytest.mark.asyncio
+    async def test_get_subscriber_by_email_reads_the_lookup_by_email_path(self):
+        await self.client.get_subscriber_by_email("Jane+Ops@Acme.com")
+        endpoint = self.client.get.call_args[0][0]
+        params = self.client.get.call_args.kwargs["params"]
+        assert endpoint == "/profitstream/v2/api/subscribers/lookup-by-email"
+        assert "@" not in endpoint
+        assert params["email"] == "Jane+Ops@Acme.com"
+        assert params["teamId"] == "team_abc"
 
 
 # ===========================================================================

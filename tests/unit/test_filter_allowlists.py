@@ -209,13 +209,13 @@ _TOOL_CASES = [
         "list_jobs",
         _list_jobs,
         {"execution_status": "SUCCESS", "start_date": "2026-01-01"},
-        {"executionStatus": "SUCCESS", "startDate": "2026-01-01"},
+        {"executionStatus": "SUCCESS", "startDate": "2026-01-01T00:00:00.000Z"},
     ),
     (
         "get_conversion_funnel",
         _conversion_funnel,
         {"job_type": "LEAD", "end_date": "2026-01-31"},
-        {"jobType": "LEAD", "endDate": "2026-01-31"},
+        {"jobType": "LEAD", "endDate": "2026-01-31T23:59:59.999Z"},
     ),
     ("list_tools", _list_tools, {"query": "search"}, {"query": "search"}),
     (

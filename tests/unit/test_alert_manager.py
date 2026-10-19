@@ -6,7 +6,7 @@ natural language query parsing, and duration calculation.
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src.revenium_mcp_server.alerts.alert_manager import (
     PRE_RULE_ACTIVITY_LABEL,
@@ -14,6 +14,7 @@ from src.revenium_mcp_server.alerts.alert_manager import (
     AlertManager,
 )
 from src.revenium_mcp_server.client import ReveniumAPIError
+from src.revenium_mcp_server.common.error_handling import ToolError
 
 
 @pytest.fixture
@@ -151,12 +152,12 @@ class TestExtractThresholdCondition:
 
     def test_large_number_formatting_millions(self, manager):
         alert = {"anomaly": {"operatorType": "GREATER_THAN", "threshold": 2500000}}
-        assert manager._extract_threshold_condition(alert) == "> 2.5M"
+        assert manager._extract_threshold_condition(alert) == "> 2,500,000"
 
     def test_large_number_formatting_thousands(self, manager):
         alert = {"anomaly": {"operatorType": "GREATER_THAN_OR_EQUAL_TO", "threshold": 5000}}
         result = manager._extract_threshold_condition(alert)
-        assert result == "\u2265 5.0K"
+        assert result == "\u2265 5,000"
 
     def test_all_operator_mappings(self, manager):
         """All operator types should map to readable symbols."""
@@ -197,10 +198,10 @@ class TestExtractTriggeredValue:
         assert manager._extract_triggered_value({"triggeredValue": 42}) == "42"
 
     def test_thousands(self, manager):
-        assert manager._extract_triggered_value({"triggeredValue": 5000}) == "5.0K"
+        assert manager._extract_triggered_value({"triggeredValue": 5000}) == "5,000"
 
     def test_millions(self, manager):
-        assert manager._extract_triggered_value({"triggeredValue": 1500000}) == "1.5M"
+        assert manager._extract_triggered_value({"triggeredValue": 1500000}) == "1,500,000"
 
     def test_string_value(self, manager):
         assert manager._extract_triggered_value({"triggeredValue": "custom"}) == "custom"
@@ -546,7 +547,7 @@ class TestListAlerts:
         assert "Cost Alert" in text
         assert "Active" in text
         assert "TOTAL_COST" in text
-        assert "> 100" in text
+        assert "> $100.00" in text
 
     @pytest.mark.asyncio
     async def test_query_appended_to_output(self, manager):
@@ -642,41 +643,72 @@ class TestGetAlert:
         assert "https://api.revenium.io/alerts/3" in result[0].text
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("status_code", [403, 404, 500])
+    @pytest.mark.parametrize("status_code", [403, 404])
     async def test_get_alert_translates_not_found_status_codes(self, manager, status_code):
-        """get_alert folds 403/404/500 from the alerts service into the
+        """get_alert folds 403/404 from the alerts service into the
         AlertNotFoundError envelope so the @handle_alert_tool_errors
         decorator renders a rich 'alert not found' message — callers
         no longer see the catch-all 'Unexpected Error' prose surfaced
         by the decorator's last-resort handler (BACK-1142; same shape
-        as BACK-1098 on manage_tools)."""
+        as BACK-1098 on manage_tools). The envelope is raised so the caller
+        sees it flagged as an error (BACK-4705)."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
         client = MagicMock()
         client.get_alert_by_id = AsyncMock(
             side_effect=ReveniumAPIError("not found", status_code=status_code)
         )
 
-        result = await manager.get_alert(client, "NONEXISTENT_12345")
+        with pytest.raises(ToolError) as exc_info:
+            await manager.get_alert(client, "NONEXISTENT_12345")
 
-        assert len(result) == 1
-        text = result[0].text
+        assert exc_info.value.error_code == "ALERT_NOT_FOUND"
+        text = exc_info.value.message
         assert "Unexpected Error" not in text
         assert "NONEXISTENT_12345" in text
         # AlertNotFoundError.format_user_message() renders 'not found' prose
         assert "not found" in text.lower()
 
     @pytest.mark.asyncio
-    async def test_get_alert_other_status_codes_propagate_as_exception(self, manager):
-        """A 502 (or any non-403/404/500) is not folded into AlertNotFoundError;
-        it propagates as ReveniumAPIError so the MCP envelope reports isError=true."""
+    @pytest.mark.parametrize("status_code", [500, 503])
+    async def test_get_alert_server_error_is_not_a_not_found(self, manager, status_code):
+        """A platform server error on an alert history read is named a server
+        error and flagged, never folded into 'not found' (BACK-4705)."""
+        from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
+
         client = MagicMock()
         client.get_alert_by_id = AsyncMock(
-            side_effect=ReveniumAPIError("bad gateway", status_code=502)
+            side_effect=ReveniumAPIError("upstream broke", status_code=status_code)
         )
 
-        with pytest.raises(ReveniumAPIError) as exc_info:
-            await manager.get_alert(client, "alert-id")
+        with pytest.raises(ToolError) as exc_info:
+            await manager.get_alert(client, "alert_abc")
 
-        assert exc_info.value.status_code == 502
+        assert exc_info.value.error_code == ErrorCodes.API_ERROR
+        message = exc_info.value.message
+        assert "server error" in message.lower()
+        assert "alert_abc" in message
+        assert str(status_code) in message
+        assert "not found" not in message.lower()
+
+    @pytest.mark.asyncio
+    async def test_get_alert_other_status_codes_propagate_as_exception(self, manager):
+        """A malformed id answers 400, which the client already words as
+        "Invalid Alert ID"; get_alert must pass that error on unchanged rather
+        than fold it into AlertNotFoundError."""
+        client_error = ReveniumAPIError(
+            "Invalid Alert ID\n\nThe provided alert ID is not valid or does not exist.",
+            status_code=400,
+        )
+        client = MagicMock()
+        client.get_alert_by_id = AsyncMock(side_effect=client_error)
+
+        with pytest.raises(ReveniumAPIError) as exc_info:
+            await manager.get_alert(client, "NONEXISTENT_12345")
+
+        assert exc_info.value is client_error
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.message.startswith("Invalid Alert ID")
 
     @pytest.mark.asyncio
     async def test_get_alert_unauthorized_tool_error_propagates_not_invalid_value(
@@ -719,11 +751,13 @@ class TestUpdateAlert:
 
     @pytest.mark.asyncio
     async def test_non_dict_update_data_returns_error(self, manager):
-        """Validation errors are caught by decorator and returned as text."""
+        """Validation errors are caught by the decorator and raised flagged."""
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
         client = MagicMock()
-        result = await manager.update_alert(client, "a1", "not-a-dict")
-        assert len(result) == 1
-        assert "must be a dictionary" in result[0].text
+        with pytest.raises(ToolError) as exc_info:
+            await manager.update_alert(client, "a1", "not-a-dict")
+        assert "must be a dictionary" in exc_info.value.message
 
 
 class TestDeleteAlert:
@@ -858,3 +892,210 @@ class TestPreRuleActivityRendering:
 
         result = await manager.get_alert(client, "alert-pra")
         assert PRE_RULE_ACTIVITY_LABEL not in result[0].text
+
+
+def _sent_instant(client, key):
+    value = client.get_alerts.await_args.kwargs[key]
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+class TestAlertHistoryWindowFollowsTheClock:
+    """The server builds one tool at startup; every window must count from the question."""
+
+    @pytest.mark.asyncio
+    async def test_last_hour_counts_back_from_the_question_not_from_tool_start(
+        self, frozen_utc_clock
+    ):
+        from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
+
+        frozen_utc_clock.current = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+        client = _list_client(_alert_with_pre_rule_activity())
+        tool = AlertManagement()
+        tool.get_client = AsyncMock(return_value=client)
+
+        asked = datetime(2026, 10, 15, 14, 0, tzinfo=timezone.utc)
+        frozen_utc_clock.current = asked
+        await tool.handle_action(
+            "list", {"resource_type": "alerts", "query": "show alerts from the last hour"}
+        )
+        assert _sent_instant(client, "end") == asked
+        assert _sent_instant(client, "start") == asked - timedelta(hours=1)
+
+        asked_again = asked + timedelta(seconds=10)
+        frozen_utc_clock.current = asked_again
+        await tool.handle_action(
+            "list", {"resource_type": "alerts", "query": "show alerts from the last hour"}
+        )
+        assert _sent_instant(client, "end") == asked_again
+        assert _sent_instant(client, "start") == asked_again - timedelta(hours=1)
+
+        await tool.handle_action(
+            "list", {"resource_type": "alerts", "query": "show high cost alerts"}
+        )
+        assert _sent_instant(client, "end") == asked_again
+        assert _sent_instant(client, "start") == asked_again - timedelta(days=30)
+
+
+class TestAlertHistoryNamesItsWindow:
+    """Every answer says which window it read, and an unusable window is refused."""
+
+    @pytest.mark.asyncio
+    async def test_the_answer_names_the_window_it_read(self, manager, frozen_utc_clock):
+        client = _list_client(_alert_with_pre_rule_activity())
+        result = await manager.list_alerts(
+            client, query="show alerts from 2026-10-12 to 2026-10-14"
+        )
+        assert (
+            "**Window:** 2026-10-12T00:00:00.000Z to 2026-10-14T23:59:59.999Z (UTC)"
+            in result[0].text
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_empty_answer_still_names_the_window(self, manager, frozen_utc_clock):
+        client = _list_client(_alert_with_pre_rule_activity())
+        client._extract_embedded_data = MagicMock(return_value=[])
+        result = await manager.list_alerts(client, query="show alerts yesterday")
+        text = result[0].text
+        assert "No alerts found" in text
+        assert "**Window:** 2026-10-14T00:00:00.000Z to 2026-10-14T23:59:59.999Z (UTC)" in text
+
+    @pytest.mark.asyncio
+    async def test_the_answer_says_when_no_date_range_was_recognized(
+        self, manager, frozen_utc_clock
+    ):
+        client = _list_client(_alert_with_pre_rule_activity())
+        result = await manager.list_alerts(client, query="show alerts last quarter")
+        text = result[0].text
+        assert "**Window:** 2026-09-15T15:30:45.123Z to 2026-10-15T15:30:45.123Z (UTC)" in text
+        assert "no date range recognized in the question, so the last 30 days" in text
+
+    @pytest.mark.asyncio
+    async def test_an_inverted_range_is_refused_without_a_platform_call(
+        self, manager, frozen_utc_clock
+    ):
+        client = _list_client(_alert_with_pre_rule_activity())
+        with pytest.raises(ToolError) as exc_info:
+            await manager.list_alerts(client, query="show alerts from 2026-10-14 to 2026-10-12")
+        assert str(exc_info.value).startswith("Window refused:")
+        assert exc_info.value.field == "query"
+        assert client.get_alerts.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_date_is_refused_as_an_error_naming_the_filter(
+        self, manager, frozen_utc_clock
+    ):
+        client = _list_client(_alert_with_pre_rule_activity())
+        with pytest.raises(ToolError) as exc_info:
+            await manager.list_alerts(client, filters={"start": "garbage"})
+        assert str(exc_info.value).startswith("Window refused:")
+        assert exc_info.value.field == "filters.start"
+        assert client.get_alerts.await_count == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "start",
+        ["2026-10-01", "2026-10-01T00:00:00Z", "2026-10-01T02:00:00+02:00"],
+    )
+    async def test_every_date_form_reaches_the_platform_in_millisecond_utc(
+        self, manager, frozen_utc_clock, start
+    ):
+        client = _list_client(_alert_with_pre_rule_activity())
+        await manager.list_alerts(client, filters={"start": start, "end": "2026-10-15"})
+        sent = client.get_alerts.await_args.kwargs
+        assert (sent["start"], sent["end"]) == (
+            "2026-10-01T00:00:00.000Z",
+            "2026-10-15T23:59:59.999Z",
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_calendar_days_are_sent_in_the_platform_form(
+        self, manager, frozen_utc_clock
+    ):
+        client = _list_client(_alert_with_pre_rule_activity())
+        await manager.list_alerts(client, filters={"start": "2026-10-12", "end": "2026-10-14"})
+        sent = client.get_alerts.await_args.kwargs
+        assert (sent["start"], sent["end"]) == (
+            "2026-10-12T00:00:00.000Z",
+            "2026-10-14T23:59:59.999Z",
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_dates_survive_an_undated_question(self, manager, frozen_utc_clock):
+        client = _list_client(_alert_with_pre_rule_activity())
+        result = await manager.list_alerts(
+            client,
+            filters={"start": "2026-10-01T00:00:00.000Z", "end": "2026-10-02T00:00:00.000Z"},
+            query="show high cost alerts",
+        )
+        sent = client.get_alerts.await_args.kwargs
+        assert (sent["start"], sent["end"]) == (
+            "2026-10-01T00:00:00.000Z",
+            "2026-10-02T00:00:00.000Z",
+        )
+        assert "no date range recognized" not in result[0].text
+
+
+def _fired_alert(triggered_value, threshold, metric_type, **anomaly_fields):
+    return {
+        "triggeredValue": triggered_value,
+        "anomaly": {
+            "operatorType": "GREATER_THAN",
+            "threshold": threshold,
+            "metricType": metric_type,
+            **anomaly_fields,
+        },
+    }
+
+
+class TestAlertValuesKeepTheirUnits:
+    """A fired value prints in full, with a currency for cost, never as 1.0K."""
+
+    def test_cost_overshoot_keeps_its_cents_and_currency(self, manager):
+        alert = _fired_alert(1023.48633754, 1000.0, "TOTAL_COST")
+        assert manager._extract_threshold_condition(alert) == "> $1,000.00"
+        assert manager._extract_triggered_value(alert) == "$1,023.49"
+
+    def test_cost_under_a_thousand_is_rounded_to_cents(self, manager):
+        alert = _fired_alert(705.02063079, 700.0, "TOTAL_COST")
+        assert manager._extract_threshold_condition(alert) == "> $700.00"
+        assert manager._extract_triggered_value(alert) == "$705.02"
+
+    def test_small_cost_keeps_its_significant_digits(self, manager):
+        alert = _fired_alert(0.0523, 0.05, "COST_PER_TRANSACTION")
+        assert manager._extract_threshold_condition(alert) == "> $0.05"
+        assert manager._extract_triggered_value(alert) == "$0.0523"
+
+    def test_counts_keep_every_digit(self, manager):
+        alert = _fired_alert(1500000, 1023, "TOKEN_COUNT")
+        assert manager._extract_threshold_condition(alert) == "> 1,023"
+        assert manager._extract_triggered_value(alert) == "1,500,000"
+
+    def test_percentage_rule_has_no_currency(self, manager):
+        alert = _fired_alert(35.5, 20, "TOTAL_COST", isPercentage=True)
+        assert manager._extract_triggered_value(alert) == "35.5"
+        assert manager._extract_threshold_condition(alert) == "> 20%"
+
+    def test_percent_increase_condition_reads_in_words(self, manager):
+        alert = _fired_alert(35.5, 20, "TOTAL_COST", operatorType="PERCENT_INCREASE")
+        assert manager._extract_threshold_condition(alert) == "increases by 20%"
+
+    def test_cost_below_a_millionth_keeps_its_significant_digits(self, manager):
+        alert = _fired_alert(0.0000002, 0.0000001, "COST_PER_TRANSACTION")
+        assert manager._extract_threshold_condition(alert) == "> $0.0000001"
+        assert manager._extract_triggered_value(alert) == "$0.0000002"
+
+    def test_fraction_below_a_millionth_keeps_its_significant_digits(self, manager):
+        alert = _fired_alert(0.0000002, 0.0000001, "ERROR_RATE")
+        assert manager._extract_triggered_value(alert) == "0.0000002"
+
+    def test_negative_cost_puts_the_sign_first(self, manager):
+        alert = _fired_alert(-5, 0, "TOTAL_COST")
+        assert manager._extract_triggered_value(alert) == "-$5.00"
+
+    @pytest.mark.asyncio
+    async def test_list_shows_the_overshoot(self, manager):
+        alert = {"id": "l3moXN", **_fired_alert(1023.48633754, 1000.0, "TOTAL_COST")}
+        result = await manager.list_alerts(_list_client(alert))
+        text = result[0].text
+        assert "Condition: > $1,000.00" in text
+        assert "Triggered Value: $1,023.49" in text

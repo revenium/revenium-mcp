@@ -22,24 +22,27 @@ class AgentCostsFormatter(AnalyticsResponseFormatter):
 
         Args:
             data: Agent cost data from API
-            params: Formatting parameters (period, aggregation)
+            params: Formatting parameters (period, aggregation, and the
+                endpoint_key the rows were read with when it is not ENDPOINT_KEY)
 
         Returns:
             Formatted agent costs response string
         """
         period = params.get("period", "Unknown")
         aggregation = params.get("aggregation", "Unknown")
+        endpoint_key = params.get("endpoint_key", self.ENDPOINT_KEY)
 
         if not data:
             return self.utilities.format_no_data_response(
                 "agent costs",
                 period,
                 f"aggregation: {aggregation}",
-                scope_note=self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY),
+                scope_note=self.utilities.coding_assistant_scope_note(endpoint_key, period),
             )
 
         return self._format_agent_costs_content(
-            data, {"period": period, "aggregation": aggregation}
+            data,
+            {"period": period, "aggregation": aggregation, "endpoint_key": endpoint_key},
         )
 
     def _format_agent_costs_content(
@@ -173,4 +176,6 @@ class AgentCostsFormatter(AnalyticsResponseFormatter):
         footer = self.utilities.add_insights_footer(
             "agent costs", period, f"{aggregation} aggregation"
         )
-        return f"{footer}\n{self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY)}"
+        endpoint_key = params.get("endpoint_key", self.ENDPOINT_KEY)
+        scope_note = self.utilities.coding_assistant_scope_note(endpoint_key, period)
+        return f"{footer}\n{scope_note}"

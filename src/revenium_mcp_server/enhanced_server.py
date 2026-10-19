@@ -10,6 +10,7 @@ Licensed under the MIT License. See LICENSE file for details.
 
 import asyncio
 import os
+import sys
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, List, Optional, Union
 
@@ -162,6 +163,23 @@ def _require_envs(names: list[str], *, label: str = "Required env vars") -> dict
     return {n: os.getenv(n, "").strip() for n in names}
 
 
+_MULTI_CUSTOMER_AUTH_MODES = ("api_key", "clerk")
+
+
+def warn_if_server_key_in_multi_customer_mode(auth_mode: str) -> None:
+    """Warn, without refusing to start: infrastructure may set the key on purpose."""
+    if auth_mode not in _MULTI_CUSTOMER_AUTH_MODES or not os.getenv("REVENIUM_API_KEY"):
+        return
+    logger.warning(
+        "REVENIUM_API_KEY is set while AUTH_MODE={} serves many customers. Callers "
+        "keep their own owner, team, tenant and email, but every other setting "
+        "auto-discovery resolves, and every diagnostic that probes the platform "
+        "with the server-wide key, act as that key's user for all customers. "
+        "Unset REVENIUM_API_KEY unless this deployment needs it.",
+        auth_mode,
+    )
+
+
 def _register_tenant_middleware(
     mcp: "FastMCP", auth_mode: str, *, validator: Any = None
 ) -> None:
@@ -172,16 +190,35 @@ def _register_tenant_middleware(
     env -> no-op (single-tenant; ContextVar path not exercised).
     """
     if auth_mode == "clerk":
+        from .auth.caller_profile import CallerProfileLookup
         from .auth.claims_middleware import TenantContextMiddleware
         from .auth.tenant_resolver import get_resolver
 
-        mcp.add_middleware(TenantContextMiddleware(get_resolver()))
+        mcp.add_middleware(TenantContextMiddleware(get_resolver(), CallerProfileLookup()))
     elif auth_mode == "api_key":
         if validator is None:
             raise ValueError("validator is required for api_key mode")
         from .auth.api_key_middleware import ApiKeyAuthMiddleware
 
         mcp.add_middleware(ApiKeyAuthMiddleware(validator))
+
+
+def configure_startup_logging(startup_verbose: bool) -> None:
+    """Replace every loguru sink with the one stderr sink the running server keeps.
+
+    stderr, never stdout: the stdio transport reserves stdout for JSON-RPC.
+    """
+    if "LOG_LEVEL" in os.environ:
+        log_level = os.getenv("LOG_LEVEL", "WARNING")
+    else:
+        log_level = "INFO" if startup_verbose else "WARNING"
+
+    logger.remove()
+    logger.add(
+        sink=sys.stderr,
+        level=log_level,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    )
 
 
 def create_enhanced_server(auth: Optional[Any] = None) -> FastMCP:
@@ -198,27 +235,9 @@ def create_enhanced_server(auth: Optional[Any] = None) -> FastMCP:
     # This ensures Augment/MCP client environment variables take precedence
     load_dotenv(override=False)
 
-    # Configure logging - CRITICAL: Use stderr to comply with MCP stdio transport
-    # MCP protocol requires stdout to contain ONLY valid JSON-RPC messages
-    import sys
-
     # Startup verbosity control: quiet by default, verbose with MCP_STARTUP_VERBOSE=true
     startup_verbose = os.getenv("MCP_STARTUP_VERBOSE", "false").lower() == "true"
-
-    # Set log level based on startup verbosity and LOG_LEVEL override
-    if "LOG_LEVEL" in os.environ:
-        # Explicit LOG_LEVEL always takes precedence
-        log_level = os.getenv("LOG_LEVEL", "WARNING")
-    else:
-        # Default behavior: quiet startup (WARNING) unless verbose mode requested
-        log_level = "INFO" if startup_verbose else "WARNING"
-
-    logger.remove()
-    logger.add(
-        sink=sys.stderr,  # Use stderr instead of stdout for MCP compliance
-        level=log_level,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    )
+    configure_startup_logging(startup_verbose)
 
     # Only show configuration messages in verbose mode
     if startup_verbose:
@@ -495,6 +514,7 @@ async def main() -> None:
     # Create server
     mcp = create_enhanced_server(auth=auth_obj)
     _register_tenant_middleware(mcp, auth_mode, validator=api_key_validator)
+    warn_if_server_key_in_multi_customer_mode(auth_mode)
 
     # STARTUP CHECK: Validate API key configuration
     api_key = os.getenv("REVENIUM_API_KEY")
@@ -623,9 +643,10 @@ async def main() -> None:
             if onboarding_status["status"] == "initialized":
                 is_first_time = onboarding_status["onboarding_state"]["is_first_time"]
                 overall_ready = onboarding_status["environment_validation"]["overall_status"]
-                logger.info(
-                    f"Onboarding: {'First-time user' if is_first_time else 'Returning user'}, System ready: {overall_ready}"
+                user_type = {True: "First-time user", False: "Returning user"}.get(
+                    is_first_time, "unknown"
                 )
+                logger.info(f"Onboarding: {user_type}, System ready: {overall_ready}")
             else:
                 logger.debug(f"Onboarding status: {onboarding_status['status']}")
         except Exception as e:

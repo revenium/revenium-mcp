@@ -5,7 +5,7 @@ engine and add introspection capabilities to the MCP server.
 """
 
 import asyncio
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -14,6 +14,9 @@ from ..common.error_handling import ToolError
 from ..tools_decomposed.unified_tool_base import ToolBase
 from .engine import introspection_engine
 from .service import tool_introspection_service
+
+if TYPE_CHECKING:
+    from ..auth.tenant_context import TenantContext
 
 
 class IntrospectionIntegration:
@@ -266,7 +269,12 @@ class IntrospectionIntegration:
             raise
 
     async def handle_tool_execution(
-        self, tool_name: str, action: str, arguments: Dict[str, Any]
+        self,
+        tool_name: str,
+        action: str,
+        arguments: Dict[str, Any],
+        *,
+        ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle tool execution with optimized performance tracking.
 
@@ -274,6 +282,7 @@ class IntrospectionIntegration:
             tool_name: Name of the tool
             action: Action to perform
             arguments: Action arguments
+            ctx: Tenant context the request acts for, handed to the tool's handler
 
         Returns:
             Tool response
@@ -303,7 +312,7 @@ class IntrospectionIntegration:
             # Cast provider to ToolBase since all registered providers are ToolBase instances
             if provider and hasattr(provider, "handle_action"):
                 tool_provider = cast(ToolBase, provider)
-                result = await tool_provider.handle_action(action, arguments)
+                result = await tool_provider.handle_action(action, arguments, ctx=ctx)
                 success = True
                 return result
 

@@ -15,6 +15,8 @@ import pytest
 import yaml
 
 from src.revenium_mcp_server import endpoint_registry
+from src.revenium_mcp_server.analytics.department_costs import parse_department_costs
+from src.revenium_mcp_server.analytics.paging import PageInfo
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.endpoint_registry import get_endpoint_path, requires_new_api_flag
@@ -92,13 +94,26 @@ def analytics_tool():
         return BusinessAnalyticsManagement()
 
 
-async def _run(analytics_tool, arguments, payload):
+def _serve(analytics_tool, payload):
     client = MagicMock()
     client.team_id = RESOLVED_TEAM
     client.get = AsyncMock(return_value=payload)
     analytics_tool.get_client = AsyncMock(return_value=client)
+    return client
+
+
+async def _run(analytics_tool, arguments, payload):
+    client = _serve(analytics_tool, payload)
     result = await analytics_tool.handle_action("get_department_costs", arguments)
     return client, result[0].text
+
+
+async def _refused(analytics_tool, arguments, payload):
+    """The client and the text of the error the action raises."""
+    client = _serve(analytics_tool, payload)
+    with pytest.raises(ToolError) as exc:
+        await analytics_tool.handle_action("get_department_costs", arguments)
+    return client, exc.value.message
 
 
 class TestRegistry:
@@ -171,7 +186,7 @@ class TestRequest:
 
     @pytest.mark.asyncio
     async def test_an_unknown_filter_key_is_refused_before_any_call(self, analytics_tool):
-        client, text = await _run(
+        client, text = await _refused(
             analytics_tool,
             {"period": "THIRTY_DAYS", "filters": {"departments": ["k5jYw2"]}},
             _envelope([]),
@@ -186,8 +201,9 @@ class TestRequest:
         client.team_id = RESOLVED_TEAM
         client.get = AsyncMock(side_effect=ReveniumAPIError("Invalid input", status_code=400))
         analytics_tool.get_client = AsyncMock(return_value=client)
-        result = await analytics_tool.handle_action("get_department_costs", {"period": "THIRTY_DAYS"})
-        assert "Department Costs Analysis Failed" in result[0].text
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("get_department_costs", {"period": "THIRTY_DAYS"})
+        assert "Department Costs Analysis Failed" in exc.value.message
 
 
 class TestDepartmentSetup:
@@ -233,6 +249,17 @@ class TestDepartmentSetup:
         _, text = await _run(analytics_tool, {"period": "HOUR"}, _envelope([]))
         assert "No department groups returned" in text
         assert "$0.00" not in text
+
+
+class TestPageBlock:
+    def test_the_page_block_is_read_by_the_shared_parser(self):
+        """FRONT-3434: a page field that is not a whole number reads as unknown, as on
+        get_user_costs, instead of reaching the paging arithmetic."""
+        envelope = _envelope([ENGINEERING], page={"number": "0", "size": 20, "totalPages": 1.5})
+
+        paging = parse_department_costs(envelope).paging
+
+        assert paging == PageInfo(number=None, size=20, total_pages=None, total_elements=None)
 
 
 class TestPagePastTheLast:
@@ -309,6 +336,16 @@ class TestGroups:
         assert "Parent: none (a top-level department)" in text
         assert "not the numeric department ids manage_customers list_departments returns" in text
         assert "never pass one kind where the other is expected" in text
+
+    @pytest.mark.asyncio
+    async def test_cost_sources_note_states_where_a_call_is_counted(self, analytics_tool):
+        """FRONT-3434: coding-assistant telemetry is under coding_assistant whatever the
+        API-rate setting, which decides only whether such calls count."""
+        _, text = await _run(analytics_tool, {"period": "THIRTY_DAYS"}, _envelope([ENGINEERING]))
+        assert "A call's cost source is where its row came from" in text
+        assert "coding-assistant telemetry is under `coding_assistant` whatever" in text
+        assert "decides whether coding-assistant calls are counted, not which cost source" in text
+        assert "real spend under `revenium_metered` or `provider_billing`" not in text
 
     @pytest.mark.asyncio
     async def test_the_sum_note_is_only_made_for_totals(self, analytics_tool):

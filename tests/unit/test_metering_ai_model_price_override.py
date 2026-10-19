@@ -298,8 +298,9 @@ class TestEmbeddedReadIsKeyAgnostic:
         with patch.object(
             mgmt, "get_client", new_callable=AsyncMock, return_value=client
         ):
-            result = await mgmt._handle_search_ai_models({"query": "gpt"})
-        text = result[0].text
+            with pytest.raises(ToolError) as exc_info:
+                await mgmt._handle_search_ai_models({"query": "gpt"})
+        text = exc_info.value.message
         assert "malformed" in text.lower()
         assert "No models found" not in text
         assert "AI Models Search Results" not in text

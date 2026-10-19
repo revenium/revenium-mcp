@@ -35,7 +35,7 @@ class CustomerCostsFormatter(AnalyticsResponseFormatter):
                 "customer costs",
                 period,
                 f"aggregation: {aggregation}",
-                scope_note=self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY),
+                scope_note=self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY, period),
             )
 
         return self._format_customer_costs_content(data, period, aggregation)
@@ -84,6 +84,6 @@ class CustomerCostsFormatter(AnalyticsResponseFormatter):
         response += self.utilities.add_insights_footer(
             "customer costs", period, f"{aggregation} aggregation"
         )
-        response += f"\n{self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY)}"
+        response += f"\n{self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY, period)}"
 
         return response
