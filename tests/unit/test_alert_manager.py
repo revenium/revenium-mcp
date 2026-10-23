@@ -970,12 +970,20 @@ class TestAlertHistoryNamesItsWindow:
         assert "no date range recognized in the question, so the last 30 days" in text
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "show alerts from 2026-10-14 to 2026-10-12",
+            "show alerts from Oct 14 to Oct 12",
+            "show alerts from October 14th to October 2nd",
+        ],
+    )
     async def test_an_inverted_range_is_refused_without_a_platform_call(
-        self, manager, frozen_utc_clock
+        self, manager, frozen_utc_clock, query
     ):
         client = _list_client(_alert_with_pre_rule_activity())
         with pytest.raises(ToolError) as exc_info:
-            await manager.list_alerts(client, query="show alerts from 2026-10-14 to 2026-10-12")
+            await manager.list_alerts(client, query=query)
         assert str(exc_info.value).startswith("Window refused:")
         assert exc_info.value.field == "query"
         assert client.get_alerts.await_count == 0

@@ -31,6 +31,19 @@ class TestFormatConfigurationsList:
         assert "No Slack Configurations Found" in result[0].text
         assert "initiate_oauth" in result[0].text
 
+    def test_page_past_the_end_names_the_total_instead_of_offering_setup(self):
+        """BACK-4731: an organization with 32 configurations is not told none exist."""
+        response = {"content": [], "totalElements": 32, "totalPages": 2}
+        result = format_configurations_list(response, page=500, size=20)
+
+        text = result[0].text
+        assert "page=500" in text
+        assert "past the last" in text
+        assert "32 items on 2 pages" in text
+        assert "page=1, size=20" in text
+        assert "No Slack configurations are currently set up" not in text
+        assert "initiate_oauth" not in text
+
     def test_single_configuration_shows_details(self):
         """A single config should show its name, workspace, and channel."""
         response = {

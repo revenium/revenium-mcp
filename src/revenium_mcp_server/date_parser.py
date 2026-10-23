@@ -6,9 +6,12 @@ into API-compatible date ranges for alert history retrieval.
 
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from .analytics_parameters import TimePeriod
 
 
 #: The window an alert history question that names no dates reads.
@@ -281,15 +284,16 @@ class DateRangeParser:
     ) -> datetime:
         """The year a month and day named without one falls in.
 
-        Alone, it is the most recent such day. As the end of a range, it is the
-        first such day on or after the range's start, so "from Dec 28 to Jan 3"
-        crosses New Year and "from Oct 12 to Oct 18" stays in one year.
+        Alone, it is the most recent such day. As the end of a range, it falls in
+        the start's year, or the next year when its month comes before the start's,
+        so "from Dec 28 to Jan 3" crosses New Year, "from Oct 12 to Oct 18" stays in
+        one year, and "from Oct 14 to Oct 12" ends before it starts.
         """
         if not_before is None:
             day = midnight.replace(month=month, day=day_of_month)
             return day.replace(year=day.year - 1) if day > midnight else day
         day = midnight.replace(year=not_before.year, month=month, day=day_of_month)
-        if day.date() < not_before.date():
+        if month < not_before.month:
             return day.replace(year=day.year + 1)
         return day
 
@@ -320,33 +324,31 @@ def period_to_date_range(period: "TimePeriod") -> Tuple[str, str]:
     Raises:
         ValueError: If the period is not a recognized TimePeriod value
     """
+    now = datetime.now(timezone.utc)
+    return _format_iso8601(period_start(period, now)), _format_iso8601(now)
+
+
+def period_start(period: "TimePeriod", end: datetime) -> datetime:
+    """The start of the rolling ``period`` that ends at ``end``.
+
+    Raises:
+        ValueError: If the period is not a recognized TimePeriod value
+    """
     from .analytics_parameters import TimePeriod
 
-    now = datetime.now(timezone.utc)
-
     if period == TimePeriod.HOUR:
-        start = now - timedelta(hours=1)
-    elif period == TimePeriod.EIGHT_HOURS:
-        start = now - timedelta(hours=8)
-    elif period == TimePeriod.TWENTY_FOUR_HOURS:
-        start = now - timedelta(hours=24)
-    elif period == TimePeriod.SEVEN_DAYS:
-        start = now - timedelta(days=7)
-    elif period == TimePeriod.THIRTY_DAYS:
-        start = now - timedelta(days=30)
-    elif period == TimePeriod.TWELVE_MONTHS:
-        # Go back exactly 12 calendar months
-        month = now.month - 12
-        year = now.year
-        if month <= 0:
-            month += 12
-            year -= 1
-        # Handle day overflow (e.g. March 31 → 12 months back is March 31 of prev year)
+        return end - timedelta(hours=1)
+    if period == TimePeriod.EIGHT_HOURS:
+        return end - timedelta(hours=8)
+    if period == TimePeriod.TWENTY_FOUR_HOURS:
+        return end - timedelta(hours=24)
+    if period == TimePeriod.SEVEN_DAYS:
+        return end - timedelta(days=7)
+    if period == TimePeriod.THIRTY_DAYS:
+        return end - timedelta(days=30)
+    if period == TimePeriod.TWELVE_MONTHS:
+        # The same calendar day a year earlier, or that month's last day when it has fewer days
         import calendar
-        max_day = calendar.monthrange(year, month)[1]
-        day = min(now.day, max_day)
-        start = now.replace(year=year, month=month, day=day)
-    else:
-        raise ValueError(f"Unrecognized TimePeriod: {period!r}")
-
-    return _format_iso8601(start), _format_iso8601(now)
+        max_day = calendar.monthrange(end.year - 1, end.month)[1]
+        return end.replace(year=end.year - 1, day=min(end.day, max_day))
+    raise ValueError(f"Unrecognized TimePeriod: {period!r}")

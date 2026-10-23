@@ -3,8 +3,8 @@
 Targets previously-uncovered branches across:
   - ProductManager (list, get, create, update, delete)
   - ProductValidator (get_capabilities, get_examples, validate_configuration)
-  - ProductEnhancementProcessor (create_simple, create_from_description,
-    get_templates, suggest_template, clarify_pricing, _validate_setup_fee_configuration,
+  - ProductEnhancementProcessor (create_simple, get_templates,
+    suggest_template, clarify_pricing, _validate_setup_fee_configuration,
     _generate_setup_fee_suggestions)
   - ProductHierarchyManager (get_subscriptions, get_related_credentials,
     _validate_create_with_subscription_parameters, _validate_required_fields,
@@ -903,138 +903,6 @@ class TestCreateSimple:
 
 
 # ===========================================================================
-# ProductEnhancementProcessor.create_from_description
-# ===========================================================================
-
-
-class TestCreateFromDescription:
-    @pytest.mark.asyncio
-    async def test_create_from_description_missing_description_raises(self):
-        client = _make_client()
-        processor = ProductEnhancementProcessor(client)
-        processor.nlp_processor = None
-
-        with pytest.raises(ToolError) as exc_info:
-            await processor.create_from_description({})
-
-        assert "description" in exc_info.value.message.lower()
-
-    @pytest.mark.asyncio
-    async def test_create_from_description_without_nlp_uses_fallback(self):
-        """No nlp_processor → falls back to create_simple."""
-        client = _make_client()
-        client.create_product = AsyncMock(return_value={"id": "p_fallback", "name": "Test"})
-        client._extract_embedded_data.return_value = []
-        processor = ProductEnhancementProcessor(client)
-        processor.nlp_processor = None
-
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
-            return_value=None,
-        ):
-            result = await processor.create_from_description(
-                {"description": "A test product"}
-            )
-
-        assert result["id"] == "p_fallback"
-
-    @pytest.mark.asyncio
-    async def test_create_from_description_with_nlp_fills_empty_name_chatbot(self):
-        """Empty name from NLP + 'chatbot' keyword → specific name."""
-        client = _make_client()
-        client._extract_embedded_data.return_value = []
-        client.create_product = AsyncMock(return_value={"id": "p_bot", "name": "chatbot"})
-        processor = ProductEnhancementProcessor(client)
-        mock_nlp = MagicMock()
-        mock_nlp.parse_product_request.return_value = {
-            "name": "",
-            "plan": {"name": "Plan", "type": "SUBSCRIPTION"},
-        }
-        processor.nlp_processor = mock_nlp
-
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
-            return_value=None,
-        ):
-            result = await processor.create_from_description(
-                {"description": "Build a chatbot service"}
-            )
-
-        call_args = client.create_product.call_args[0][0]
-        assert call_args["name"] == "Phase 1B validation chatbot"
-
-    @pytest.mark.asyncio
-    async def test_create_from_description_nlp_empty_name_api_keyword(self):
-        """Empty name from NLP + 'api' keyword → 'API Service'."""
-        client = _make_client()
-        client._extract_embedded_data.return_value = []
-        client.create_product = AsyncMock(return_value={"id": "p_api", "name": "API Service"})
-        processor = ProductEnhancementProcessor(client)
-        mock_nlp = MagicMock()
-        mock_nlp.parse_product_request.return_value = {
-            "name": "   ",
-            "plan": {"name": "Plan"},
-        }
-        processor.nlp_processor = mock_nlp
-
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
-            return_value=None,
-        ):
-            result = await processor.create_from_description({"description": "premium api tool"})
-
-        call_args = client.create_product.call_args[0][0]
-        assert call_args["name"] == "API Service"
-
-    @pytest.mark.asyncio
-    async def test_create_from_description_plan_name_filled_when_empty(self):
-        """Empty plan.name is set to '<product name> Plan'."""
-        client = _make_client()
-        client._extract_embedded_data.return_value = []
-        client.create_product = AsyncMock(return_value={"id": "p_fill", "name": "My Product"})
-        processor = ProductEnhancementProcessor(client)
-        mock_nlp = MagicMock()
-        mock_nlp.parse_product_request.return_value = {
-            "name": "My Product",
-            "plan": {"name": "", "type": "SUBSCRIPTION"},
-        }
-        processor.nlp_processor = mock_nlp
-
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
-            return_value=None,
-        ):
-            await processor.create_from_description({"description": "My product description"})
-
-        call_args = client.create_product.call_args[0][0]
-        assert call_args["plan"]["name"] == "My Product Plan"
-
-    @pytest.mark.asyncio
-    async def test_create_from_description_invalid_setup_fee_raises(self):
-        """Invalid setup fee config raises ToolError."""
-        client = _make_client()
-        processor = ProductEnhancementProcessor(client)
-        mock_nlp = MagicMock()
-        mock_nlp.parse_product_request.return_value = {
-            "name": "Fee Product",
-            "plan": {"name": "Plan"},
-            "setupFees": [{"name": "Fee", "type": "INVALID_TYPE", "flatAmount": 50.0}],
-        }
-        processor.nlp_processor = mock_nlp
-
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
-            return_value=None,
-        ):
-            with pytest.raises(ToolError) as exc_info:
-                await processor.create_from_description(
-                    {"description": "A product with setup fees"}
-                )
-
-        assert exc_info.value.field == "setupFees"
-
-
-# ===========================================================================
 # ProductEnhancementProcessor.get_templates
 # ===========================================================================
 
@@ -1622,6 +1490,40 @@ class TestHandleActionCreateSimple:
         assert "create_simple has no preview" in error.message
         assert "nothing was sent" in error.message
         assert 'action="create"' in error.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["create_simple", "create_with_subscription"])
+    @pytest.mark.parametrize("requested", ["", "maybe", " "])
+    async def test_a_dry_run_value_handed_in_directly_still_refuses(self, action, requested):
+        """BACK-4849: a caller that reaches handle_action without the dispatch
+        guard gets the same fail-closed decision, so an empty or unknown dry_run
+        string never lets the quick create write."""
+        mgmt, client = _make_mgmt()
+
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
+            return_value=None,
+        ), pytest.raises(ToolError) as exc_info:
+            await mgmt.handle_action(action, {"name": "Simple", "dry_run": requested})
+
+        client.create_product.assert_not_awaited()
+        client.create_subscription.assert_not_awaited()
+        assert exc_info.value.field == "dry_run"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("off", [False, 0, "false", None])
+    async def test_a_dry_run_switched_off_lets_the_quick_create_run(self, off):
+        mgmt, client = _make_mgmt()
+        client._extract_embedded_data.return_value = []
+        client.create_product = AsyncMock(return_value={"id": "p_simple", "name": "Simple"})
+
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
+            return_value=None,
+        ):
+            await mgmt.handle_action("create_simple", {"name": "Simple", "dry_run": off})
+
+        client.create_product.assert_awaited_once()
 
 
 # ===========================================================================

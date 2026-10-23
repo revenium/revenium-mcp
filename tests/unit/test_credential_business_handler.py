@@ -117,3 +117,23 @@ class TestAnalyzeBillingImpact:
         """Default operation is 'create' when not specified."""
         result = await handler.analyze_billing_impact({})
         assert result["operation"] == "create"
+
+
+class TestEveryAdvertisedScenarioHasGuidance:
+    """BACK-4738: a scenario the tool lists must answer with guidance, not {}."""
+
+    @pytest.mark.asyncio
+    async def test_every_available_scenario_returns_guidance(self, handler):
+        listing = await handler.get_business_guidance({"scenario": "not_a_scenario"})
+        for scenario in listing["available_scenarios"]:
+            result = await handler.get_business_guidance({"scenario": scenario})
+            assert result["guidance"].get("step_by_step_process"), scenario
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "scenario", ["security_rotation", "subscription_migration", "cost_optimization"]
+    )
+    async def test_a_scenario_without_guidance_is_not_offered(self, handler, scenario):
+        result = await handler.get_business_guidance({"scenario": scenario})
+        assert "error" in result
+        assert scenario not in result["available_scenarios"]

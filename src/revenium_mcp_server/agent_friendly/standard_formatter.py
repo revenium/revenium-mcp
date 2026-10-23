@@ -174,7 +174,7 @@ class UnifiedResponseFormatter:
         feedback = []
 
         # Check for setup fee structure migration opportunities
-        if action in ["create", "create_from_description", "update"]:
+        if action in ["create", "update"]:
             result_data = data if "result" not in data else data.get("result", {})
 
             # Check for setup fees in the result

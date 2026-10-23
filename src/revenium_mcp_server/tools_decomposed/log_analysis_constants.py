@@ -4,6 +4,8 @@ This module contains all large text blocks extracted from the main tool
 to comply with function length requirements.
 """
 
+from ..common.platform_paging import PLATFORM_MAX_PAGE_SIZE
+
 # The errorCode enum on GET /v2/api/tenants/{id}/ingestion-failures, pinned
 # to the committed snapshot by test_revenium_log_analysis.py. Dev answered a
 # value outside it with 200 and an empty page (2026-10-08), so a misspelt code
@@ -96,7 +98,7 @@ CAPABILITIES_TEXT = """
 {
   "action": "action_name",
   "page": 0,                    // Page number (default: 0)
-  "size": 200,                  // Records per page (default: 200, max: 1000)
+  "size": 100,                  // Records per page (default: 100, max: 100, the platform's page cap)
   "log_type": "internal",       // Log type: internal|integration|both
   "operation_filter": "AI_METRIC_PROCESSING",  // Filter by operation type
   "status_filter": "SUCCESS",   // Filter by status: SUCCESS|FAILURE|INFO|WARNING
@@ -109,7 +111,7 @@ CAPABILITIES_TEXT = """
 - **Log Types**: internal, integration, both
 - **Operation Types**: Dynamically determined by system (use partial matching like "AI_METRIC" or "EMAIL_DISPATCH")
 - **Status Types**: SUCCESS, FAILURE, INFO, WARNING
-- **Page Size**: 1-1000 records (default: 200)
+- **Page Size**: 1-100 records (default: 100; the platform serves at most 100 a page)
 
 ## 🔍 Advanced Filtering Examples
 
@@ -151,7 +153,7 @@ EXAMPLES_TEXT = """
 {
   "action": "get_internal_logs",
   "page": 0,
-  "size": 200
+  "size": 100
 }
 ```
 **Purpose**: Retrieve internal system logs (AI metering, email dispatch).
@@ -222,7 +224,7 @@ EXAMPLES_TEXT = """
   "pages": 2
 }
 ```
-**Purpose**: Get recent activity from first N pages (~400 most recent entries).
+**Purpose**: Get recent activity from the first N pages (here the 200 most recent entries, 100 a page); the answer says how many entries and pages it read out of how many exist.
 
 ### search_logs - Filter by Status
 ```json
@@ -282,7 +284,7 @@ EXAMPLES_TEXT = """
   "pages": 3
 }
 ```
-**Purpose**: Analyze operation patterns and frequencies across multiple pages.
+**Purpose**: Analyze operation patterns and frequencies across multiple pages; the answer says how many pages it read out of how many exist, and its counts and rates cover only the entries read.
 
 ## Operation Types
 Operation types are dynamically determined by the system. Common patterns include:
@@ -344,7 +346,10 @@ Use `get_capabilities()` for current status.
 
 # Error messages
 ERROR_MESSAGES = {
-    "size_limit": "Page size cannot exceed 1000 records",
+    "size_limit": (
+        f"Page size cannot exceed {PLATFORM_MAX_PAGE_SIZE} records: "
+        "the platform serves at most that many a page"
+    ),
     "api_error": "Failed to retrieve {log_type} logs: {error}",
     "filtering_error": "Failed to apply filters: {error}",
     "formatting_error": "Failed to format response: {error}",
@@ -353,7 +358,10 @@ ERROR_MESSAGES = {
 
 # Suggestions
 SUGGESTIONS = {
-    "size_limit": ["Use size <= 1000", "Use pagination for larger datasets"],
+    "size_limit": [
+        f"Use size <= {PLATFORM_MAX_PAGE_SIZE}",
+        "Use pagination for larger datasets",
+    ],
     "api_connectivity": [
         "Check API connectivity",
         "Verify page and size parameters",
@@ -378,7 +386,7 @@ SUGGESTIONS = {
 }
 
 # Default values
-DEFAULT_VALUES = {"size": 200, "sort": "created,desc", "page": 0, "pages": 1}
+DEFAULT_VALUES = {"size": PLATFORM_MAX_PAGE_SIZE, "sort": "created,desc", "page": 0, "pages": 1}
 
 # API endpoints
 LOG_ENDPOINTS = {

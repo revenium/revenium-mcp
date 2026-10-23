@@ -13,6 +13,7 @@ from mcp.types import TextContent
 
 from src.revenium_mcp_server.onboarding.env_validation import API_AUTH_REJECTED_MESSAGE
 from src.revenium_mcp_server.tools_decomposed.welcome_setup import WelcomeSetup
+from tests.unit._helpers_bare_calls import bare_setup_calls_in
 
 
 @pytest.fixture(autouse=True)
@@ -228,13 +229,8 @@ class TestSetupChecklist:
             "src.revenium_mcp_server.tools_decomposed.welcome_setup.validate_environment_variables",
             return_value=_mock_validation_result(),
         ), patch(
-            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_config_value",
-            side_effect=lambda key, *args: {
-                "REVENIUM_API_KEY": "test_key",
-                "REVENIUM_TEAM_ID": "team-1",
-                "REVENIUM_DEFAULT_EMAIL": None,
-                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": None,
-            }.get(key),
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.default_notification_email",
+            return_value=None,
         ):
             result = await welcome_tool.handle_action("setup_checklist", {})
         text = result[0].text
@@ -257,13 +253,8 @@ class TestSetupChecklist:
             "src.revenium_mcp_server.tools_decomposed.welcome_setup.validate_environment_variables",
             return_value=validation,
         ), patch(
-            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_config_value",
-            side_effect=lambda key, *args: {
-                "REVENIUM_API_KEY": "rev_mk_key",
-                "REVENIUM_TEAM_ID": "team-1",
-                "REVENIUM_DEFAULT_EMAIL": None,
-                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": None,
-            }.get(key),
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.default_notification_email",
+            return_value=None,
         ):
             result = await welcome_tool.handle_action("setup_checklist", {})
         text = result[0].text
@@ -289,13 +280,8 @@ class TestSetupChecklist:
             "src.revenium_mcp_server.tools_decomposed.welcome_setup.validate_environment_variables",
             return_value=validation,
         ), patch(
-            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_config_value",
-            side_effect=lambda key, *args: {
-                "REVENIUM_API_KEY": "rev_sk_unknown",
-                "REVENIUM_TEAM_ID": "team-1",
-                "REVENIUM_DEFAULT_EMAIL": None,
-                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": None,
-            }.get(key),
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.default_notification_email",
+            return_value=None,
         ):
             result = await welcome_tool.handle_action("setup_checklist", {})
         text = result[0].text
@@ -319,13 +305,29 @@ class TestSetupChecklist:
             "src.revenium_mcp_server.tools_decomposed.welcome_setup.validate_environment_variables",
             return_value=validation,
         ), patch(
-            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_config_value",
-            side_effect=lambda key, *args: None,
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.default_notification_email",
+            return_value=None,
         ):
             result = await welcome_tool.handle_action("setup_checklist", {})
         text = result[0].text
         assert "Configure required environment variables" in text
         assert "Restore API read access" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_placeholder_email_reads_as_not_configured(
+        self, welcome_tool, placeholder_notification_email
+    ):
+        """BACK-4743: the checklist reads the email through the walk alerts use."""
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_onboarding_state",
+            return_value=_mock_onboarding_state(),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.validate_environment_variables",
+            return_value=_mock_validation_result(),
+        ):
+            text = (await welcome_tool.handle_action("setup_checklist", {}))[0].text
+        assert "[ ] **Email Notifications**" in text
+        assert "[x] **Email Notifications**" not in text
 
     @pytest.mark.asyncio
     async def test_cached_key_without_probe_is_not_ready(self, welcome_tool):
@@ -342,13 +344,8 @@ class TestSetupChecklist:
             "src.revenium_mcp_server.tools_decomposed.welcome_setup.validate_environment_variables",
             return_value=validation,
         ), patch(
-            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_config_value",
-            side_effect=lambda key, *args: {
-                "REVENIUM_API_KEY": "rev_sk_cached",
-                "REVENIUM_TEAM_ID": "team-1",
-                "REVENIUM_DEFAULT_EMAIL": "user@test.com",
-                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": "slack-1",
-            }.get(key),
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.default_notification_email",
+            return_value="user@test.com",
         ):
             result = await welcome_tool.handle_action("setup_checklist", {})
         text = result[0].text
@@ -538,3 +535,42 @@ class TestBuildWelcomeMessage:
         validation = _mock_validation_result()
         result = welcome_tool._build_welcome_message(state, validation)
         assert "Welcome back" in result
+
+
+class TestEmailActionNamesACallTheServerAccepts:
+    """BACK-4966: the email step names a call the server answers, never verify_email_setup()."""
+
+    @staticmethod
+    async def _texts_without_an_email(welcome_tool):
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.get_onboarding_state",
+            return_value=_mock_onboarding_state(email=False),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.validate_environment_variables",
+            return_value=_mock_validation_result(),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.welcome_setup.default_notification_email",
+            return_value=None,
+        ):
+            return [
+                (await welcome_tool.handle_action(action, {}))[0].text
+                for action in ("setup_checklist", "next_steps")
+            ]
+
+    @pytest.mark.asyncio
+    async def test_local_checklist_names_the_update_email_call(self, welcome_tool, monkeypatch):
+        monkeypatch.delenv("AUTH_MODE", raising=False)
+        for text in await self._texts_without_an_email(welcome_tool):
+            assert "verify_email_setup(" not in bare_setup_calls_in(text), text
+            assert "system_setup(action='update_email', email='your@email.com')" in text
+
+    @pytest.mark.asyncio
+    async def test_hosted_checklist_names_the_alert_email_argument(
+        self, welcome_tool, monkeypatch
+    ):
+        monkeypatch.setenv("AUTH_MODE", "api_key")
+        monkeypatch.setattr(WelcomeSetup, "get_client", AsyncMock(return_value=MagicMock()))
+        for text in await self._texts_without_an_email(welcome_tool):
+            assert "verify_email_setup(" not in bare_setup_calls_in(text), text
+            assert "update_email" not in text
+            assert "manage_alerts(action='create_simple'" in text

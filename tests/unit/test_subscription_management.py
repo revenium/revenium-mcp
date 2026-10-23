@@ -1868,3 +1868,124 @@ class TestSearchSubscriptionsUsesPlatformSearch:
         )
 
         assert "query" not in requests[0]["params"]
+
+
+class TestSubscriptionCreateTeamAndBodyShape:
+    """BACK-4852: a create names a team or refuses it, and a non-object body is refused by name."""
+
+    @staticmethod
+    async def _expert_create(sub_mgmt, sub_manager, subscription_data):
+        return await sub_mgmt._handle_crud_actions(
+            "create",
+            {"subscription_data": subscription_data, "auto_generate": False},
+            sub_manager,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", [["name", "Monthly"], "Monthly", 7])
+    async def test_a_non_object_subscription_data_is_refused_by_name(
+        self, sub_mgmt, sub_manager, mock_client, body
+    ):
+        with pytest.raises(ToolError) as exc:
+            await self._expert_create(sub_mgmt, sub_manager, body)
+
+        assert exc.value.field == "subscription_data"
+        assert "must be an object" in exc.value.message
+        assert "nothing was created" in exc.value.message
+        mock_client.create_subscription.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_manager_refuses_a_non_object_body_too(self, sub_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await sub_manager.create_subscription({"subscription_data": "Monthly"})
+
+        assert exc.value.field == "subscription_data"
+        mock_client.create_subscription.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("team", ["team_given", {"id": "team_given"}])
+    async def test_a_team_in_subscription_data_is_honoured(
+        self, sub_mgmt, sub_manager, mock_client, team
+    ):
+        mock_client.create_subscription.return_value = {"id": "sub_new"}
+        await self._expert_create(
+            sub_mgmt,
+            sub_manager,
+            {
+                "name": "Monthly",
+                "product_id": "prod_1",
+                "clientEmailAddress": "buyer@acme.test",
+                "team": team,
+            },
+        )
+
+        body = mock_client.create_subscription.call_args[0][0]
+        assert body["teamId"] == "team_given"
+        assert "team" not in body
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "team_fields, filed_team",
+        [
+            ({"team": None}, "team_configured"),
+            ({"team": ""}, "team_configured"),
+            ({"teamId": ""}, "team_configured"),
+            ({"team": {"id": "team_given"}, "teamId": ""}, "team_given"),
+        ],
+    )
+    async def test_an_empty_team_or_team_id_names_no_team(
+        self, sub_mgmt, sub_manager, mock_client, team_fields, filed_team
+    ):
+        mock_client.team_id = "team_configured"
+        mock_client.create_subscription.return_value = {"id": "sub_new"}
+        await self._expert_create(
+            sub_mgmt,
+            sub_manager,
+            {
+                "name": "Monthly",
+                "product_id": "prod_1",
+                "clientEmailAddress": "buyer@acme.test",
+                **team_fields,
+            },
+        )
+
+        body = mock_client.create_subscription.call_args[0][0]
+        assert body["teamId"] == filed_team
+        assert "team" not in body
+
+    @pytest.mark.asyncio
+    async def test_two_different_teams_are_refused(self, sub_mgmt, sub_manager, mock_client):
+        with pytest.raises(ToolError) as exc:
+            await self._expert_create(
+                sub_mgmt,
+                sub_manager,
+                {
+                    "name": "Monthly",
+                    "product_id": "prod_1",
+                    "clientEmailAddress": "buyer@acme.test",
+                    "team": "team_a",
+                    "teamId": "team_b",
+                },
+            )
+
+        assert exc.value.field == "subscription_data.teamId"
+        mock_client.create_subscription.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stored_team", ["team_sub", {"id": "team_sub"}])
+    async def test_an_update_keeps_the_stored_team(self, mock_client, stored_team):
+        from src.revenium_mcp_server.common.partial_update_handler import PartialUpdateHandler
+        from src.revenium_mcp_server.common.update_configs import UpdateConfigs
+
+        mock_client.get_subscription_by_id = AsyncMock(
+            return_value={"id": "s1", "name": "Old", "team": stored_team}
+        )
+        mock_client.update_subscription = AsyncMock()
+        body = await PartialUpdateHandler().build_update_payload(
+            resource_id="s1",
+            partial_data={"name": "New"},
+            config=UpdateConfigs.create_subscriptions_config(mock_client),
+            action_context="update subscription",
+        )
+
+        assert body["teamId"] == "team_sub"

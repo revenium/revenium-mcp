@@ -19,7 +19,7 @@ git clone https://github.com/YOUR_USERNAME/revenium-mcp.git
 cd revenium-mcp
 
 # Create and activate virtual environment
-python -m venv venv
+python3 -m venv venv  # On Windows: py -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install package in editable mode with development dependencies

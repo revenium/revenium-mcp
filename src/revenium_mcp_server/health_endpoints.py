@@ -12,6 +12,9 @@ platform's answer to a keyless HEAD of the platform root
 (``_last_platform_probe``, rendered by ``_platform_state``) in every auth
 mode, refreshing it in the background when stale (``_kick_refresh``). That
 refresh never sends a key. The platform's status code never affects readiness.
+In the api_key and clerk modes ``/ready`` reads the same keyless HEAD
+(``_shared_platform_probe``), so a server polled on both routes sends one
+platform check per ``PROBE_TTL_SECONDS``.
 
 In stdio mode the routes are registered but never reachable (no HTTP server
 binds). This matches FastMCP's native pattern and keeps
@@ -76,7 +79,8 @@ async def _probe_platform_reachable() -> _ProbeResult:
     Any HTTP response (even 401/404/5xx) proves the host is reachable, which is
     all readiness needs in api_key mode (per-request keys are validated per
     call). Every result is recorded in ``_last_platform_probe`` for /health;
-    the status code never affects readiness.
+    the status code never affects readiness. Only ``_kick_refresh`` runs it,
+    so one HEAD is in flight at a time and results land in order.
     """
     global _last_platform_probe
     _last_platform_probe = await _head_platform()
@@ -115,7 +119,7 @@ async def _probe_revenium() -> _ProbeResult:
     from .auth.auth_mode import read_auth_mode
 
     if read_auth_mode() in ("api_key", "clerk"):
-        return await _probe_platform_reachable()
+        return await _shared_platform_probe()
 
     from .client import ReveniumClient
 
@@ -188,15 +192,28 @@ def _retrieve_refresh_exception(task: asyncio.Task[_ProbeResult]) -> None:
         task.exception()
 
 
-def _kick_refresh() -> None:
-    """Start one background keyless HEAD unless one is already running."""
+def _kick_refresh() -> asyncio.Task[_ProbeResult]:
+    """The background keyless HEAD in flight, started when none is running."""
     global _refresh_task
     if _refresh_task is not None and not _refresh_task.done():
-        return
+        return _refresh_task
     _refresh_task = asyncio.get_running_loop().create_task(
         _probe_platform_reachable()
     )
     _refresh_task.add_done_callback(_retrieve_refresh_exception)
+    return _refresh_task
+
+
+async def _shared_platform_probe() -> _ProbeResult:
+    """The keyless HEAD's answer /health shows: a fresh one, else the one in flight.
+
+    Shielded because the refresh is shared: a /ready request that is cancelled
+    must not cancel the HEAD another route is waiting on.
+    """
+    probe = _last_platform_probe
+    if _is_fresh(probe):
+        return probe
+    return await asyncio.shield(_kick_refresh())
 
 
 def register_health_endpoints(mcp: "FastMCP") -> None:

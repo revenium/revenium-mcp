@@ -8,6 +8,8 @@ errors fail its read as a whole.
 
 import re
 
+import httpx
+
 from ..auth import AuthenticationError
 from ..client import ReveniumAPIError
 from ..common.error_handling import ToolError
@@ -23,6 +25,7 @@ _CREDENTIAL_AND_CONFIGURATION_ERRORS = (
     CalendarRangeNeedsNewApiError,
 )
 _REJECTED_CREDENTIAL_STATUS = 401
+_PLATFORM_TIMEOUT_STATUSES = frozenset({408, 504})
 
 
 def fails_whole_call(error: BaseException) -> bool:
@@ -49,6 +52,17 @@ def is_server_configuration_error(error: BaseException) -> bool:
     ``REVENIUM_APP_BASE_URL``, is raised before any request is sent.
     """
     return isinstance(error, ToolError) and not isinstance(error, ReveniumAPIError)
+
+
+def platform_ran_out_of_time(error: BaseException) -> bool:
+    """Whether the platform, or the wait for it, ran out of time before the report was answered.
+
+    The client raises a transport timeout as a plain ``ReveniumAPIError``
+    raised while handling the ``httpx.TimeoutException``.
+    """
+    if isinstance(error, ReveniumAPIError) and error.status_code in _PLATFORM_TIMEOUT_STATUSES:
+        return True
+    return isinstance(error.__context__, httpx.TimeoutException)
 
 
 def read_failure_reason(error: BaseException) -> str:

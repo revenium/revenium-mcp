@@ -455,3 +455,34 @@ class TestDeletionWithIncompleteSubscriptionWalk:
             i.severity == ValidationSeverity.ERROR and "page 1" in i.message
             for i in validation.issues
         )
+
+    @pytest.mark.asyncio
+    async def test_a_search_too_broad_blocks_deletion_without_asking_for_a_retry(
+        self, validator, mock_lookup_service, mock_nav_service
+    ):
+        from src.revenium_mcp_server.hierarchy.navigation_service import NavigationResult
+
+        nav_result = NavigationResult(
+            success=False,
+            entity_type="products",
+            entity_id="prod_1",
+            related_entities=[],
+            navigation_path=[],
+            metadata={"search_term": "Prod", "search_limit": 500},
+            error_message="that search matches more than 500 subscriptions",
+            incomplete=True,
+            retryable=False,
+        )
+        mock_nav_service.get_subscriptions_for_product = AsyncMock(return_value=nav_result)
+        mock_lookup_service.resolve_product = AsyncMock(return_value=MagicMock())
+
+        validation = await validator.validate_hierarchy_operation({
+            "type": "delete",
+            "entity_type": "products",
+            "entity_id": "prod_1",
+        })
+
+        unverified = [i for i in validation.issues if i.code == "DEPENDENTS_UNVERIFIED"]
+        assert validation.valid is False
+        assert len(unverified) == 1
+        assert "search_subscriptions" in unverified[0].suggested_action

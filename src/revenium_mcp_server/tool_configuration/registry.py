@@ -42,6 +42,9 @@ from .schema_slimming import (
 # credential_data, so the closure folds them in for the other cases.
 CREDENTIAL_FIELD_ARGUMENTS = (
     "label",
+    "name",
+    "subscriberId",
+    "organizationId",
     "externalId",
     "externalSecret",
     "tags",
@@ -935,7 +938,7 @@ class ToolConfigurationRegistry:
             log_type: Optional[str] = None,
             operation_filter: Optional[str] = None,
             page: int = 0,
-            size: int = 200,
+            size: Optional[int] = None,
             pages: Optional[int] = None,
             search_all_pages: Optional[Union[bool, str]] = None,
             search_term: Optional[str] = None,
@@ -1128,6 +1131,7 @@ class ToolConfigurationRegistry:
             effort: Optional[str] = None,
             model_host: Optional[str] = None,
             subscriber_email_source: Optional[str] = None,
+            entrypoint: Optional[str] = None,
             # Prompt-context parameters (submission only), declared for the
             # same FastMCP reason as the two blocks above.
             prompt_id: Optional[str] = None,
@@ -1254,6 +1258,7 @@ class ToolConfigurationRegistry:
                 "effort": effort,
                 "model_host": model_host,
                 "subscriber_email_source": subscriber_email_source,
+                "entrypoint": entrypoint,
                 # Prompt-context parameters
                 "prompt_id": prompt_id,
                 "prompt_length": prompt_length,
@@ -2401,6 +2406,7 @@ class ToolConfigurationRegistry:
             parent_department_id: Optional[Union[int, str]] = None,
             parent_org_unit_id: Optional[Union[int, str]] = None,
             rule_id: Optional[_JSONScalar] = None,
+            include_advisory: Optional[Union[bool, str]] = None,
             since: Optional[_JSONScalar] = None,
             until: Optional[_JSONScalar] = None,
             level: Optional[_JSONScalar] = None,
@@ -2431,6 +2437,7 @@ class ToolConfigurationRegistry:
                 "parent_department_id": parent_department_id,
                 "parent_org_unit_id": parent_org_unit_id,
                 "rule_id": rule_id,
+                "include_advisory": include_advisory,
                 "since": since,
                 "until": until,
                 "level": level,
@@ -2489,6 +2496,7 @@ class ToolConfigurationRegistry:
             # NUMERIC PREPROCESSING
             numeric_params = {'page': int, 'size': int}
             arguments = preprocess_numeric_parameters(arguments, numeric_params)
+            arguments = preprocess_boolean_parameters(arguments, ["include_advisory"])
 
             # Remove None values
             arguments = {k: v for k, v in arguments.items() if v is not None}

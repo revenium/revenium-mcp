@@ -1023,27 +1023,25 @@ action="create_simple", workflow_type="customer_onboarding", customer_email="use
         This tool provides comprehensive metering element management capabilities including:
         - CRUD Operations: Create, read, update, delete metering element definitions
         - Templates: 20+ predefined templates for common AI metrics (costs, tokens, metadata, performance)
-        - Natural Language: Create elements from descriptions like "cost tracker for API calls"
-        - Source Assignment: Assign elements to data sources for usage tracking
-        - Analytics: Usage analytics and reporting (coming soon)
+        - Validation: Check element data before creating it
 
         Args:
             arguments: Dictionary containing:
-                - action: The action to perform (list, get, create, update, delete, get_templates, create_from_template, etc.)
+                - action: The action to perform (list, get, create, update, delete, get_templates,
+                  create_from_template, validate, get_capabilities, get_examples, get_agent_summary)
                 - element_id: Metering element definition ID (for get, update, delete)
                 - element_data: Element data object (for create, update)
                 - page: Page number for list operations (default: 0)
                 - size: Page size for list operations (default: 20)
                 - filters: Additional filters for list operations
                 - name: Element name (for create, update, or template lookup)
-                - description: Element description (for create, update, or natural language parsing)
+                - description: Element description (for create, update)
                 - type: Element type - NUMBER or STRING (for create, update)
                 - unit_of_measure: Unit of measurement (for create, update)
                 - default_value: Default value for the element (for create, update)
                 - template_name: Name of template to use (for create_from_template)
                 - category: Template category filter (for get_templates)
                 - overrides: Override values when creating from template
-                - text: Natural language text (for create_from_description, parse_natural_language)
                 - example_type: Type of examples to retrieve
 
         Returns:

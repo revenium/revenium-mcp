@@ -306,8 +306,9 @@ uvx revenium-mcp
 
 ```bash
 # Create and activate virtual environment
-python -m venv revenium-mcp-env
-source revenium-mcp-env/bin/activate  # On Windows: revenium-mcp-env\Scripts\activate
+# (on Windows: py -m venv revenium-mcp-env, then revenium-mcp-env\Scripts\activate)
+python3 -m venv revenium-mcp-env
+source revenium-mcp-env/bin/activate
 
 # Install package
 pip install revenium-mcp
@@ -374,10 +375,14 @@ claude mcp add revenium \
 ```
 
 **Option 2: Installation with python virtual environment**
+
+The virtual environment lives in your home folder, and the shell expands `$HOME` (quoted, so a home folder with a space in its name stays one path), so Claude Code stores an absolute interpreter path and can start the server from any folder.
+
+macOS and Linux:
 ```bash
 # Create and activate virtual environment
-python -m venv revenium-mcp-env
-source revenium-mcp-env/bin/activate  # On Windows: revenium-mcp-env\Scripts\activate
+python3 -m venv "$HOME/.revenium-mcp-env"
+source "$HOME/.revenium-mcp-env/bin/activate"
 
 # Install package
 pip install revenium-mcp
@@ -385,13 +390,31 @@ pip install revenium-mcp
 # Add to Claude Code using venv python (starter profile - default)
 claude mcp add revenium \
   -e REVENIUM_API_KEY=hak_your_api_key_here \
-  -- ./revenium-mcp-env/bin/python -m revenium_mcp_server
+  -- "$HOME/.revenium-mcp-env/bin/python" -m revenium_mcp_server
 
 # For business profile, add the environment variable:
 claude mcp add revenium \
   -e REVENIUM_API_KEY=hak_your_api_key_here \
   -e TOOL_PROFILE=business \
-  -- ./revenium-mcp-env/bin/python -m revenium_mcp_server
+  -- "$HOME/.revenium-mcp-env/bin/python" -m revenium_mcp_server
+```
+
+Windows (PowerShell):
+```powershell
+# Create virtual environment and install package
+py -m venv "$HOME\.revenium-mcp-env"
+& "$HOME\.revenium-mcp-env\Scripts\python.exe" -m pip install revenium-mcp
+
+# Add to Claude Code using venv python (starter profile - default)
+claude mcp add revenium `
+  -e REVENIUM_API_KEY=hak_your_api_key_here `
+  -- "$HOME\.revenium-mcp-env\Scripts\python.exe" -m revenium_mcp_server
+
+# For business profile, add the environment variable:
+claude mcp add revenium `
+  -e REVENIUM_API_KEY=hak_your_api_key_here `
+  -e TOOL_PROFILE=business `
+  -- "$HOME\.revenium-mcp-env\Scripts\python.exe" -m revenium_mcp_server
 ```
 
 #### Claude Code Slash Commands
@@ -679,7 +702,7 @@ Use the `system_diagnostics` tool to see exactly which values are being used fro
 ### Common Issues
 
 **Issue:** MCP server not appearing in AI assistant
-**Solution:** Verify installation with `uvx revenium-mcp --version` and check MCP client configuration
+**Solution:** Check that the server starts. Run it with its input closed: `uvx revenium-mcp < /dev/null` on macOS and Linux, `uvx revenium-mcp < NUL` in a Windows command prompt (for a virtual environment, run its python with `-m revenium_mcp_server` instead of `uvx revenium-mcp`). A working install prints `Revenium MCP Server vX.Y.Z ready with N tools` and exits; an `API KEY VALIDATION FAILED` or `API KEY VALIDATION ERROR` block above that line means the key or base URL needs fixing, and `REVENIUM_API_KEY is not set!` means no key reached the server. In Claude Code, `claude mcp list` shows whether Claude Code itself can start the server (`Connected`). Then check the MCP client configuration.
 
 **Issue:** Authentication errors
 **Solution:** Verify API key based on your setup:
@@ -758,9 +781,9 @@ For questions, issues, or feature requests:
 git clone https://github.com/revenium/revenium-mcp.git
 cd revenium-mcp
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# Create virtual environment (on Windows: py -m venv venv, then venv\Scripts\activate)
+python3 -m venv venv
+source venv/bin/activate
 
 # Install dependencies (including dev dependencies)
 pip install -e ".[dev]"

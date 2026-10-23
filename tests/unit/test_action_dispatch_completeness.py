@@ -782,3 +782,32 @@ class TestRemovedRoutesGetTheUnknownActionAnswer:
             await tool.handle_action(UNKNOWN_ACTION, {})
 
         assert not _times_named("validate", repr(unknown.value.examples))
+
+
+class TestProductSchemaOffersOnlyRoutedActions:
+    """BACK-4848: the products schema offered create_from_description, which no route reached."""
+
+    async def test_every_action_the_products_schema_offers_is_advertised_by_the_tool(self):
+        from src.revenium_mcp_server.json_schema_validator import JSONSchemaValidator
+
+        schema_actions = JSONSchemaValidator().schemas["manage_products"]["properties"]["action"][
+            "enum"
+        ]
+        advertised = set(await _advertised("manage_products"))
+
+        assert "create_from_description" not in schema_actions
+        assert sorted(set(schema_actions) - advertised) == []
+
+    async def test_create_from_description_gets_the_unknown_action_answer(
+        self, monkeypatch, tmp_path
+    ):
+        result = await _call_registered(
+            monkeypatch, tmp_path, "manage_products", {"action": "create_from_description"}
+        )
+        text = answer_text(result)
+
+        assert result.is_error is True, text
+        assert text.splitlines()[0] == (
+            "Error calling tool 'manage_products': "
+            "Unknown action 'create_from_description' is not supported"
+        )

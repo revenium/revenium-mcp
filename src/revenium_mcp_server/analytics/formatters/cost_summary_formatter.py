@@ -5,8 +5,9 @@ Dedicated formatter for cost summary responses,
 following single responsibility principle.
 """
 
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
+from ..envelope_reads import ENVELOPE_PAGE_SIZE, UnreadPages
 from .base_formatter import AnalyticsResponseFormatter, mask_api_key_name
 
 
@@ -51,11 +52,8 @@ class CostSummaryFormatter(AnalyticsResponseFormatter):
         top_providers = data.get("top_providers", [])
         top_models = data.get("top_models", [])
         top_customers = data.get("top_customers", [])
-        total_text = (
-            "not read (the provider part was not read; see Parts Not Read)"
-            if total_cost is None
-            else self.utilities.format_currency(total_cost)
-        )
+        incomplete: Dict[str, UnreadPages] = data.get("incomplete") or {}
+        total_text = self._total_text(total_cost, data.get("total_unread"))
 
         response = f"""# **Cost Summary**
 
@@ -65,7 +63,7 @@ class CostSummaryFormatter(AnalyticsResponseFormatter):
 - **Total Cost**: {total_text}
 - **Analysis Date**: {timestamp}
 
-{self._format_parts_not_read(data.get("not_read") or {})}## **Top Contributors**
+{self._format_parts_not_read(data.get("not_read") or {}, data.get("not_read_in_time") or [], period)}{self._format_parts_incomplete(incomplete)}## **Top Contributors**
 
 """
 
@@ -100,6 +98,38 @@ class CostSummaryFormatter(AnalyticsResponseFormatter):
 
         return f"{response}\n{self.utilities.coding_assistant_scope_note(self.ENDPOINT_KEY, period)}"
 
+    def _total_text(self, total_cost: Any, provider_unread: Optional[UnreadPages]) -> str:
+        """The total as the overview states it: not read, partial, or the provider sum."""
+        if total_cost is None:
+            return "not read (the provider part was not read; see Parts Not Read)"
+        total = self.utilities.format_currency(total_cost)
+        if provider_unread is None:
+            return total
+        return (
+            f"{total} (partial: the provider part read {provider_unread.pages_read} of "
+            f"{provider_unread.total_pages} pages; see Parts Read Incompletely)"
+        )
+
+    @staticmethod
+    def _format_parts_incomplete(incomplete: Dict[str, UnreadPages]) -> str:
+        """Name each part whose read stopped before its last page, with pages read of total."""
+        from ..simple_cost_analyzer import COST_SUMMARY_PARTS
+
+        if not incomplete:
+            return ""
+        lines = ["## **Parts Read Incompletely**", ""]
+        for part in COST_SUMMARY_PARTS:
+            unread = incomplete.get(part.key)
+            if unread is not None:
+                lines.append(
+                    f"- **{part.label}**: read {unread.pages_read} of {unread.total_pages} "
+                    f"pages of {ENVELOPE_PAGE_SIZE} rows, so its figures leave the rest out. "
+                    f"Read it with `{part.action}` over a shorter start_date/end_date range "
+                    "to cover all of it."
+                )
+        lines += ["", "The figures below for these parts cover only the pages read."]
+        return "\n".join(lines) + "\n\n"
+
     @staticmethod
     def _parts_read(data: Dict[str, Any]) -> Dict[str, bool]:
         """Whether each top list comes from a part that was read, keyed by its top key."""
@@ -112,19 +142,27 @@ class CostSummaryFormatter(AnalyticsResponseFormatter):
         }
 
     @staticmethod
-    def _format_parts_not_read(not_read: Dict[str, str]) -> str:
-        """Name each part that could not be read, its reason and the action that reads it alone."""
-        from ..simple_cost_analyzer import COST_SUMMARY_PARTS
+    def _format_parts_not_read(
+        not_read: Dict[str, str], not_read_in_time: List[str], period: str
+    ) -> str:
+        """Name each part that could not be read, its reason and the action that reads it alone.
+
+        A part that ran out of time would run out again over the same period,
+        so its retry names a shorter one.
+        """
+        from ..simple_cost_analyzer import COST_SUMMARY_PARTS, shorter_period_retry
 
         if not not_read:
             return ""
         lines = ["## **Parts Not Read**", ""]
         for part in COST_SUMMARY_PARTS:
-            if part.key in not_read:
-                lines.append(
-                    f"- **{part.label}**: {not_read[part.key]}. "
-                    f"Retry this part alone with `{part.action}`."
-                )
+            if part.key not in not_read:
+                continue
+            if part.key in not_read_in_time:
+                retry = shorter_period_retry(part, period)
+            else:
+                retry = f"Retry this part alone with `{part.action}`."
+            lines.append(f"- **{part.label}**: {not_read[part.key]}. {retry}")
         lines += ["", "The figures below cover only the parts that were read."]
         return "\n".join(lines) + "\n\n"
 

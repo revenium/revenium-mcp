@@ -15,6 +15,7 @@ discovers that id (``list``/``get`` on ``resource_type='organizations'``, or
 too would split one resource's read surface across two tools.
 """
 
+import json
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, ClassVar, Dict, List, Optional, Union
@@ -43,6 +44,7 @@ from ..hierarchy import (
     get_entity_lookup_service,
     get_hierarchy_navigation_service,
 )
+from ..hierarchy.navigation_service import incomplete_lookup_suggestions
 from ..introspection.metadata import ToolCapability, ToolType
 from ..log_context import redact_secret_fields
 from ..nlp.credential_nlp_processor import CredentialIntent, CredentialNLPProcessor
@@ -74,13 +76,7 @@ _CREDENTIAL_BY_ORGANIZATION_FILTER_MAP: Dict[str, str] = {
 }
 
 
-_INCOMPLETE_WALK_SUGGESTIONS = [
-    "Retry the request; one page of subscriptions failed to load",
-    "If it keeps failing, check that the Revenium API is reachable",
-]
-
-
-def _raise_if_walk_incomplete(
+def _raise_if_lookup_incomplete(
     navigation_result: Any, message: str, field: str, value: str
 ) -> None:
     if navigation_result.incomplete is True:
@@ -89,8 +85,56 @@ def _raise_if_walk_incomplete(
             error_code=ErrorCodes.API_ERROR,
             field=field,
             value=value,
-            suggestions=list(_INCOMPLETE_WALK_SUGGESTIONS),
+            suggestions=incomplete_lookup_suggestions(navigation_result),
         )
+
+
+def _existing_credential_error(existing: Dict[str, Any]) -> ToolError:
+    existing_id = existing.get("id", "unknown")
+    return ToolError(
+        message=(
+            f"Credential already existed: the platform returned the existing credential "
+            f"{existing_id} with this external ID, so nothing was created"
+        ),
+        error_code=ErrorCodes.RESOURCE_CONFLICT,
+        field="credential_data.externalId",
+        suggestions=[
+            f"Use 'get' with credential_id='{existing_id}' to read the existing credential",
+            f"Use 'update' with credential_id='{existing_id}' to change it",
+            "Send a different externalId to create a new credential",
+        ],
+        context={"existing_credential": existing},
+    )
+
+
+def _returned_value(returned: Dict[str, Any], key: str, nested: str) -> Any:
+    value = returned.get(key)
+    if value is not None:
+        return value
+    nested_record = returned.get(nested)
+    return nested_record.get("id") if isinstance(nested_record, dict) else None
+
+
+def _returned_an_existing_credential(sent: Dict[str, Any], returned: Any) -> bool:
+    """True when the record the platform returned for a create is not the one sent.
+
+    The platform answers a create whose external ID already exists with the
+    existing credential, unchanged, instead of an error; it masks external IDs,
+    so the name and the owning subscriber and organization are what can be
+    compared. The platform sets a credential's label to its name, so a label
+    sent beside a different name is not what comes back.
+    """
+    if not isinstance(returned, dict):
+        return False
+    comparisons = (
+        (sent.get("name", sent.get("label")), returned.get("name") or returned.get("label")),
+        (sent.get("subscriberId"), _returned_value(returned, "subscriberId", "subscriber")),
+        (sent.get("organizationId"), _returned_value(returned, "organizationId", "organization")),
+    )
+    return any(
+        sent_value is not None and returned_value is not None and sent_value != returned_value
+        for sent_value, returned_value in comparisons
+    )
 
 
 class CredentialsHierarchyManager:
@@ -128,7 +172,7 @@ class CredentialsHierarchyManager:
 
         if not navigation_result.success:
             message = f"Failed to get subscription for credential {credential_id}: {navigation_result.error_message}"
-            _raise_if_walk_incomplete(navigation_result, message, "credential_id", credential_id)
+            _raise_if_lookup_incomplete(navigation_result, message, "credential_id", credential_id)
             raise ToolError(
                 message=message,
                 error_code=ErrorCodes.RESOURCE_NOT_FOUND,
@@ -182,7 +226,7 @@ class CredentialsHierarchyManager:
 
         if not navigation_result.success:
             message = f"Failed to get hierarchy for credential {credential_id}: {navigation_result.error_message}"
-            _raise_if_walk_incomplete(navigation_result, message, "credential_id", credential_id)
+            _raise_if_lookup_incomplete(navigation_result, message, "credential_id", credential_id)
             raise ToolError(
                 message=message,
                 error_code=ErrorCodes.RESOURCE_NOT_FOUND,
@@ -547,11 +591,7 @@ class SubscriberCredentialsManagement(ToolBase):
                     ],
                 )
             elif action in ["create", "update", "delete"]:
-                return self.formatter.format_success_response(
-                    message=f"Credential {action} completed successfully",
-                    data=result,
-                    action=action,
-                )
+                return self._format_write_result(action, result)
             else:
                 # For other actions like validate, get_agent_summary, etc.
                 # Convert dict responses to TextContent for MCP compatibility
@@ -641,6 +681,21 @@ class SubscriberCredentialsManagement(ToolBase):
                     "Try the operation again",
                 ],
             )
+
+    def _format_write_result(
+        self, action: str, result: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        if result.get("dry_run"):
+            validity = "valid" if result.get("ready_to_proceed") else "not valid"
+            heading = f"Credential {action} preview (dry run): {validity}; nothing was created"
+            return [
+                TextContent(type="text", text=f"**{heading}**\n\n{json.dumps(result, indent=2)}")
+            ]
+        return self.formatter.format_success_response(
+            message=f"Credential {action} completed successfully",
+            data=result,
+            action=action,
+        )
 
     async def _list_credentials(self, arguments: Dict[str, Any], *, client: ReveniumClient) -> Dict[str, Any]:
         """List subscriber credentials with pagination."""
@@ -1020,6 +1075,8 @@ class SubscriberCredentialsManagement(ToolBase):
         # SECURITY: Obfuscate sensitive fields in created credential before returning to user
         # This prevents API keys and secrets from being exposed in tool outputs
         obfuscated_result = obfuscate_credential_data(result)
+        if _returned_an_existing_credential(credential_data, result):
+            raise _existing_credential_error(obfuscated_result)
 
         # Add business context to result
         obfuscated_result["business_context"] = self.business_context.get_billing_impact_explanation(

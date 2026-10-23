@@ -1,11 +1,13 @@
 """Turning the caller's ``email``, ``notificationAddresses`` and Slack channels into one list each."""
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from ..common.error_handling import create_structured_validation_error
 
 
 RECIPIENT_FIELDS = ("email", "notificationAddresses", "notification_addresses")
+NOTIFICATION_TARGET_FIELDS = ("notificationAddresses", "slackConfigurations", "webhookConfigurations")
+NO_RECIPIENT_MESSAGE = "Email address is required for alert notifications"
 
 
 def _as_address_list(addresses: Any, field: str = "notificationAddresses") -> List[str]:
@@ -100,3 +102,23 @@ def _distinct_addresses(candidates: List[str]) -> List[str]:
             seen.add(address.lower())
             recipients.append(address)
     return recipients
+
+
+def refuse_an_update_that_notifies_nobody(
+    changes: Mapping[str, Any], merged: Mapping[str, Any]
+) -> None:
+    """Refuse an update that empties the alert's last email, Slack channel and webhook, as create refuses one."""
+    if not any(field in changes for field in NOTIFICATION_TARGET_FIELDS):
+        return
+    if any(merged.get(field) for field in NOTIFICATION_TARGET_FIELDS):
+        return
+    raise create_structured_validation_error(
+        message=f"{NO_RECIPIENT_MESSAGE}; nothing was updated",
+        field="notificationAddresses",
+        value=[],
+        suggestions=[
+            "Keep at least one email in notificationAddresses, one Slack channel in "
+            "slackConfigurations or one webhook in webhookConfigurations",
+            "Leave notificationAddresses, slackConfigurations and webhookConfigurations out to keep the stored ones",
+        ],
+    )

@@ -71,7 +71,6 @@ def rank_entities(
     entity_key: str,
     default_name: str,
     name_of: Callable[[str], str] = lambda name: name,
-    keep_nonpositive: bool = False,
 ) -> List[Dict[str, Any]]:
     """One row per entity, its bucket values combined by ``aggregation``, costliest first.
 
@@ -79,13 +78,8 @@ def rank_entities(
     each a bucket of their own. A group entry's value is the sum of its numeric
     metricResults; an entry with none counts as no value rather than zero. Group
     entries naming the same entity inside one bucket add up to that entity's
-    single value for the bucket. An entity is left out when it has no value in
-    any bucket or its values sum to nothing, never because an idle bucket makes
-    its MINIMUM or MEAN zero. Each row's ``percentage`` is its share of the
-    figures listed.
-
-    With ``keep_nonpositive`` an entity is listed whenever it has a value in any
-    bucket, so a $0 provider and a credit are rows too, and shares follow
+    single value for the bucket. An entity is listed whenever it has a value in
+    any bucket, so a $0 provider and a credit are rows too, and shares follow
     ``rank_with_shares``: positive rows only, against the positive total.
     """
     values_by_entity: Dict[str, List[float]] = {}
@@ -93,22 +87,9 @@ def rank_entities(
         for name, value in _entity_values_in_bucket(groups, default_name, name_of).items():
             values_by_entity.setdefault(name, []).append(value)
 
-    listed = {
-        name: combine_bucket_values(values, aggregation)
-        for name, values in values_by_entity.items()
-        if keep_nonpositive or sum(values) > 0
-    }
-    if keep_nonpositive:
-        return rank_with_shares(
-            [{entity_key: name, "cost": figure} for name, figure in listed.items()]
-        )
-    listed_total = sum(listed.values())
-    ranked = sorted(listed.items(), key=lambda entry: entry[1], reverse=True)
-    return [
-        {
-            entity_key: name,
-            "cost": figure,
-            "percentage": figure / listed_total * 100 if listed_total > 0 else 0,
-        }
-        for name, figure in ranked
-    ]
+    return rank_with_shares(
+        [
+            {entity_key: name, "cost": combine_bucket_values(values, aggregation)}
+            for name, values in values_by_entity.items()
+        ]
+    )

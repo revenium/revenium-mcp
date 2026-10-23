@@ -4,8 +4,9 @@ This module defines the configuration objects used by PartialUpdateHandler
 for each resource type in the Revenium Platform API.
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, List
 
+from ..api_field_mapper import APIFieldMapper
 from ..client import ReveniumClient
 from .error_handling import create_structured_validation_error
 from .partial_update_handler import FieldTransformers, UpdateConfig
@@ -57,6 +58,57 @@ def refuse_plan_without_tiers(
         value=plan.get("tiers"),
         suggestions=suggestions,
     )
+
+
+def _tiers_without_unit_amount_or_bound(plan: Dict[str, Any]) -> List[str]:
+    names = []
+    for position, tier in enumerate(plan.get("tiers") or [], start=1):
+        if not isinstance(tier, dict):
+            continue
+        fields = APIFieldMapper.map_tier_fields(tier)
+        if fields.get("unitAmount") is None and fields.get("upTo") is None:
+            names.append(f"'{fields['name']}'" if fields.get("name") else f"number {position}")
+    return names
+
+
+def refuse_tier_without_unit_amount_or_bound(
+    current: Dict[str, Any], caller: Dict[str, Any], merged: Dict[str, Any]
+) -> None:
+    """Refuse a plan change whose tiers include one with neither unitAmount nor upTo.
+
+    The platform accepts such a flat-only tier on create but refuses it in every update
+    that carries the plan, because an update recreates the tiers.
+    """
+    if "plan" not in caller:
+        return
+    plan = merged.get("plan")
+    if not isinstance(plan, dict):
+        return
+    offending = _tiers_without_unit_amount_or_bound(plan)
+    if not offending:
+        return
+    raise create_structured_validation_error(
+        message=(
+            f"The platform refuses a plan update while a tier has neither unitAmount nor "
+            f"upTo, and tier {', '.join(offending)} has neither"
+        ),
+        field="plan.tiers",
+        value=plan.get("tiers"),
+        suggestions=[
+            "Send the tiers with unitAmount 0 on each flat-only tier to keep its price flat, "
+            "or give it an upTo",
+            "Leave 'plan' out of the update to change other product fields and keep the "
+            "stored plan as it is",
+        ],
+    )
+
+
+def refuse_unsendable_plan_change(
+    current: Dict[str, Any], caller: Dict[str, Any], merged: Dict[str, Any]
+) -> None:
+    """Refuse a plan change the platform would reject: no tier left, or a flat-only tier."""
+    refuse_plan_without_tiers(current, caller, merged)
+    refuse_tier_without_unit_amount_or_bound(current, caller, merged)
 
 
 class UpdateConfigs:
@@ -121,7 +173,8 @@ class UpdateConfigs:
                 "team": {"teamId": FieldTransformers.reference_to_id},
             },
             nested_merge_fields=["plan"],
-            merged_data_check=refuse_plan_without_tiers,
+            merged_data_check=refuse_unsendable_plan_change,
+            kept_when_absent=["plan"],
         )
 
     @staticmethod
@@ -153,6 +206,7 @@ class UpdateConfigs:
             default_fields=default_fields,
             field_transformations={
                 "owner": {"ownerId": FieldTransformers.extract_owner_id},
+                "team": {"teamId": FieldTransformers.reference_to_id},
                 "client": {
                     "subscriberId": FieldTransformers.object_to_id,
                     "clientEmailAddress": FieldTransformers.extract_label,
@@ -192,7 +246,7 @@ class UpdateConfigs:
             default_fields=default_fields,
             field_transformations={
                 "owner": {"ownerId": FieldTransformers.extract_owner_id},
-                "team": {"teamId": FieldTransformers.object_to_id},
+                "team": {"teamId": FieldTransformers.reference_to_id},
             },
             accepts_metadata=True,
         )

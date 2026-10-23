@@ -185,6 +185,7 @@ class UpdateConfig:
         nested_merge_fields: Optional[List[str]] = None,
         merged_data_check: Optional[MergedDataCheck] = None,
         accepts_metadata: bool = False,
+        kept_when_absent: Optional[List[str]] = None,
     ):
         """Initialize update configuration.
 
@@ -208,6 +209,8 @@ class UpdateConfig:
                 the update is sent; raises ToolError to refuse the update
             accepts_metadata: The platform stores a 'metadata' string for this
                 resource; when False, caller metadata is refused instead of ignored
+            kept_when_absent: Fields the platform keeps as stored when the body
+                omits them; they are sent only when the caller sends them
         """
         self.resource_type = resource_type
         self.get_method = get_method
@@ -221,6 +224,7 @@ class UpdateConfig:
         self.nested_merge_fields = nested_merge_fields or []
         self.merged_data_check = merged_data_check
         self.accepts_metadata = accepts_metadata
+        self.kept_when_absent = kept_when_absent or []
 
 
 @dataclass(frozen=True)
@@ -654,8 +658,9 @@ class PartialUpdateHandler:
         Args:
             data: Merged and transformed data
             config: Configuration for this resource type
-            caller_fields: Fields the caller sent; stored metadata is sent only when
-                the caller sent metadata, since the platform keeps it when absent
+            caller_fields: Fields the caller sent; stored metadata and the config's
+                kept_when_absent fields are sent only when the caller sent them,
+                since the platform keeps them when absent
 
         Returns:
             Final payload ready for API call
@@ -680,8 +685,11 @@ class PartialUpdateHandler:
             "meteringId",
             "descriptionAsHTML",
         ]
-        if METADATA_FIELD not in caller_fields:
-            fields_to_remove.append(METADATA_FIELD)
+        fields_to_remove.extend(
+            field
+            for field in [METADATA_FIELD, *config.kept_when_absent]
+            if field not in caller_fields
+        )
 
         for field in fields_to_remove:
             if field in final_payload:

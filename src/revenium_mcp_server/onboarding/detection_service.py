@@ -15,7 +15,7 @@ from ..auth.claims_middleware import current_tenant_context
 
 # Reuse existing cache infrastructure
 from ..config_cache import get_cache_info, is_config_cached
-from ..config_store import get_config_value
+from ..config_store import default_notification_email, get_config_value
 
 if TYPE_CHECKING:
     from .env_validation import ValidationResult
@@ -137,9 +137,7 @@ class OnboardingDetectionService:
                 status["api_key_configured"] = bool(get_config_value("REVENIUM_API_KEY"))
                 status["team_id_configured"] = bool(get_config_value("REVENIUM_TEAM_ID"))
 
-            # Check email configuration
-            email = get_config_value("REVENIUM_DEFAULT_EMAIL")
-            status["email_configured"] = bool(email)
+            status["email_configured"] = default_notification_email() is not None
 
             status["slack_configured"] = has_slack
 

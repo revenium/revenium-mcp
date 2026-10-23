@@ -151,6 +151,7 @@ logs
 # Cache directories
 .cache/
 .revenium_cache
+.revenium_notification_email
 revenium-platformapi-mcp.code-workspace
 .mcp.json
 

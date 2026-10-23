@@ -12,6 +12,7 @@ import httpx
 from loguru import logger
 
 from .constants import DEFAULT_BASE_URL
+from .log_context import mask_secret_values, secret_field_values
 from .platform_lockout import lockout_message, platform_lockouts, stated_wait_seconds
 
 
@@ -22,6 +23,16 @@ def email_from_user_profile(user_data: Dict) -> Optional[str]:
         if isinstance(value, str) and "@" in value:
             return value
     return None
+
+
+def _body_without_secrets(response: httpx.Response, *credentials: Optional[str]) -> str:
+    """The response body with the credentials sent and any secret-named field values masked."""
+    try:
+        echoed = secret_field_values(response.json())
+    except ValueError:
+        echoed = set()
+    secrets = echoed | {credential for credential in credentials if credential}
+    return mask_secret_values(response.text, secrets) or ""
 
 
 class AutoDiscoveryError(Exception):
@@ -96,7 +107,10 @@ class AutoDiscoveryService:
                         "API endpoint not found. Please check your REVENIUM_BASE_URL."
                     )
                 elif response.status_code != 200:
-                    raise AutoDiscoveryError(f"API error: {response.status_code} - {response.text}")
+                    raise AutoDiscoveryError(
+                        f"API error: {response.status_code} - "
+                        f"{_body_without_secrets(response, self.api_key)}"
+                    )
 
                 # Parse response
                 try:
@@ -238,7 +252,8 @@ class AutoDiscoveryService:
                     return True
                 else:
                     raise AutoDiscoveryError(
-                        f"Configuration validation failed: {response.status_code} - {response.text}"
+                        f"Configuration validation failed: {response.status_code} - "
+                        f"{_body_without_secrets(response, self.api_key, config.get('REVENIUM_API_KEY'))}"
                     )
 
         except httpx.TimeoutException:

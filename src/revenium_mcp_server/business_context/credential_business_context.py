@@ -16,9 +16,6 @@ class BusinessScenario(Enum):
     NEW_CUSTOMER_ONBOARDING = "new_customer_onboarding"
     BILLING_TROUBLESHOOTING = "billing_troubleshooting"
     CREDENTIAL_AUDIT = "credential_audit"
-    SUBSCRIPTION_MIGRATION = "subscription_migration"
-    SECURITY_ROTATION = "security_rotation"
-    COST_OPTIMIZATION = "cost_optimization"
 
 
 @dataclass

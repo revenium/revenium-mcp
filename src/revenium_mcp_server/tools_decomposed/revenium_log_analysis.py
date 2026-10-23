@@ -21,6 +21,7 @@ from ..agent_friendly import UnifiedResponseFormatter
 from ..analytics.paging import PageInfo
 from ..client import ReveniumAPIError
 from ..common.error_handling import ErrorCodes, ToolError
+from ..common.platform_paging import PLATFORM_MAX_PAGE_SIZE
 from ..introspection.metadata import ToolType
 from .log_analysis_constants import (
     CAPABILITIES_TEXT,
@@ -35,8 +36,6 @@ from .log_analysis_constants import (
 from .log_filters import LogFilter
 from .log_formatters import LogResponseFormatter, PageCoverage
 from .unified_tool_base import ToolBase
-
-_SEARCH_PAGE_REQUEST_SIZE = 1000
 
 # Three of the four tenant flags have no published read-only endpoint: the
 # platform hides GET /v2/api/tenants/{id} from its API contract, so the only
@@ -212,7 +211,7 @@ class ReveniumLogAnalysis(ToolBase):
 
     tool_name: ClassVar[str] = "revenium_log_analysis"
     tool_description: ClassVar[str] = (
-        "Revenium log analysis for system troubleshooting and diagnostic investigation. Key actions: get_internal_logs, get_integration_logs, get_recent_logs, search_logs, analyze_operations, get_ingestion_failures, set_strict_ingestion_mode, set_attribution_detail_text, set_usage_billing, get_usage_billing. Default size: 200 records (max: 1000). Use get_examples() for usage guidance and get_capabilities() for status."
+        "Revenium log analysis for system troubleshooting and diagnostic investigation. Key actions: get_internal_logs, get_integration_logs, get_recent_logs, search_logs, analyze_operations, get_ingestion_failures, set_strict_ingestion_mode, set_attribution_detail_text, set_usage_billing, get_usage_billing. Default size: 100 records, also the most the platform serves a page. Use get_examples() for usage guidance and get_capabilities() for status."
     )
     business_category: ClassVar[str] = "System & Monitoring Tools"
     tool_type: ClassVar[ToolType] = ToolType.UTILITY
@@ -270,13 +269,13 @@ class ReveniumLogAnalysis(ToolBase):
 
     def _validate_page_size(self, size: int) -> None:
         """Validate page size parameter."""
-        if size > 1000:  # Test actual API limit
+        if size > PLATFORM_MAX_PAGE_SIZE:
             raise ToolError(
-                message="Page size cannot exceed 1000 records",
+                message=ERROR_MESSAGES["size_limit"],
                 error_code=ErrorCodes.INVALID_PARAMETER,
                 field="size",
                 value=size,
-                suggestions=["Use size <= 1000", "Use pagination for larger datasets"],
+                suggestions=SUGGESTIONS["size_limit"],
             )
 
     async def _make_api_call(
@@ -399,7 +398,7 @@ class ReveniumLogAnalysis(ToolBase):
             try:
                 endpoint = self.log_endpoints.get(log_type, self.log_endpoints["internal"])
                 response = await self._make_api_call(
-                    endpoint, page, _SEARCH_PAGE_REQUEST_SIZE, ctx=ctx
+                    endpoint, page, PLATFORM_MAX_PAGE_SIZE, ctx=ctx
                 )
                 platform = PageInfo.from_envelope(response)
 
@@ -500,11 +499,12 @@ class ReveniumLogAnalysis(ToolBase):
         self,
         analysis: Dict[str, Any],
         log_type: str,
-        pages: int,
-        stop_note: Optional[str] = None,
+        coverage: PageCoverage,
     ) -> str:
-        """Format operation analysis response."""
+        """Format operation analysis response with the pages read out of those that exist."""
+        stop_note = coverage.failure_note()
         stopped = f"- **Stopped Early**: {stop_note}\n" if stop_note else ""
+        pages = coverage.pages_read_of_total()
         # Handle case where no entries were found
         if "error" in analysis:
             return f"""
@@ -528,9 +528,9 @@ No log entries found for analysis. This may be expected for integration logs.
 # Operation Pattern Analysis ({log_type.title()} Logs)
 
 ## Summary
-- **Total Operations Analyzed**: {analysis['total_operations']:,}
+- **Total Operations Analyzed**: {coverage.entries_read_of_total()}
 - **Pages Analyzed**: {pages}
-{stopped}- **Failure Rate**: {analysis['failure_rate']:.2%}
+{stopped}{self._sample_scope(coverage)}- **Failure Rate**: {analysis['failure_rate']:.2%}
 - **Unique Operations**: {len(analysis['operation_counts'])}
 
 ## Top Operations by Frequency
@@ -563,6 +563,15 @@ No log entries found for analysis. This may be expected for integration logs.
             response_text += f"- 📊 Large dataset ({analysis['total_operations']:,} operations) provides reliable patterns\n"
 
         return response_text
+
+    @staticmethod
+    def _sample_scope(coverage: PageCoverage) -> str:
+        if not coverage.entries_not_read:
+            return ""
+        return (
+            f"- **Scope**: counts and rates cover the {coverage.entries_read:,} entries read, "
+            f"not the {coverage.entries_not_read:,} left unread\n"
+        )
 
     def _create_action_error(self, action: str, error: Exception) -> ToolError:
         """Create standardized action error."""
@@ -1301,7 +1310,7 @@ No log entries found for analysis. This may be expected for integration logs.
 
             # Use formatter for multi-page response
             return self.response_formatter.format_multi_page_response(
-                all_entries, log_type, coverage.pages_read, stop_note=coverage.failure_note()
+                all_entries, log_type, coverage
             )
 
         except ToolError:
@@ -1381,9 +1390,7 @@ No log entries found for analysis. This may be expected for integration logs.
         try:
             all_entries, coverage = await self._get_multi_page_logs(log_type, pages, ctx=ctx)
             analysis = self._analyze_operation_patterns(all_entries)
-            response_text = self._format_analysis_response(
-                analysis, log_type, coverage.pages_read, stop_note=coverage.failure_note()
-            )
+            response_text = self._format_analysis_response(analysis, log_type, coverage)
             return [TextContent(type="text", text=response_text)]
 
         except ToolError:

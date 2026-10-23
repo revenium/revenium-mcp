@@ -2835,6 +2835,19 @@ class TestTeamCodingAssistantBillingSettingsRead:
         assert result["confirmation_semantics"] == CODING_ASSISTANT_CONFIRMATION_NOTE
         assert result["read_only"] == CODING_ASSISTANT_BILLING_READ_ONLY_NOTE
 
+    def test_confirmation_note_follows_the_filter_settings_contract(self):
+        """BACK-4913: team_explicit also covers a new team's answered defaults, and a
+        save confirms only the providers it lists or removes."""
+        note = CODING_ASSISTANT_CONFIRMATION_NOTE
+        assert "all at once" not in note
+        assert "stored its own settings" not in note
+        assert "confirms only the providers the save lists as billed at API rates" in note
+        assert "and the ones it removes from that list" in note
+        assert "a new team starts with every assistant confirmed" in note
+        assert "or the answered defaults a new team starts with" in note
+        assert "including a team still on the account's default settings" in note
+        assert "defaults nobody has answered for yet" in note
+
     @pytest.mark.asyncio
     async def test_deprecated_legacy_fields_are_not_rendered(self, team_manager, mock_client):
         """enabled/defaultProviders/allowUserOverride are retired switches, not live settings."""

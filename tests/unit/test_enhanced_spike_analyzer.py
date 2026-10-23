@@ -24,6 +24,7 @@ import httpx
 import pytest
 from unittest.mock import MagicMock
 
+from src.revenium_mcp_server.analytics import enhanced_spike_analyzer
 from src.revenium_mcp_server.analytics.enhanced_spike_analyzer import (
     EnhancedSpikeAnalyzer,
     TemporalAnomaly,
@@ -195,6 +196,50 @@ class TestBuildEntityTimeMatrix:
         }
         self.analyzer._build_entity_time_matrix(data)
         assert self.analyzer.entity_dimension_map["X"] == "providers"
+
+
+    @staticmethod
+    def _rollup_bucket(rollup_name):
+        return {
+            "startTimestamp": 1000,
+            "groups": [
+                {"groupName": "key-a", "metrics": [{"metricResult": 10}]},
+                {"groupName": rollup_name, "metrics": [{"metricResult": 90}]},
+            ],
+        }
+
+    @pytest.mark.parametrize("rollup_name", ["Other API keys", "other api keys"])
+    def test_a_direct_period_read_leaves_out_the_rollup_it_is_told_to(self, rollup_name):
+        """The helpers take the roll-up rule as an argument, not from an earlier matrix build."""
+        matrix = {}
+        self.analyzer.entity_dimension_map = {}
+
+        self.analyzer._process_single_period_data(
+            self._rollup_bucket(rollup_name), matrix, "api_keys", skip_rollup=True
+        )
+        self.analyzer._process_time_series_data(
+            [self._rollup_bucket(rollup_name)], matrix, "api_keys", skip_rollup=True
+        )
+
+        assert list(matrix) == ["KEY-A"]
+
+    def test_a_matrix_build_does_not_carry_the_rollup_rule_into_the_next(self):
+        data = {"api_keys": [self._rollup_bucket("Other API keys")]}
+        self.analyzer._build_entity_time_matrix(data, rollup_dimensions={"api_keys"})
+
+        matrix = self.analyzer._build_entity_time_matrix(data)
+
+        assert sorted(matrix) == ["KEY-A", "OTHER API KEYS"]
+
+    @pytest.mark.parametrize("rollup_name", ["Other API keys", "OTHER API KEYS", "other api keys"])
+    def test_the_matrix_and_the_detection_series_drop_the_same_rollup_names(self, rollup_name):
+        data = {"api_keys": [self._rollup_bucket(rollup_name)]}
+
+        matrix = self.analyzer._build_entity_time_matrix(data, rollup_dimensions={"api_keys"})
+        _, series = self.analyzer._build_detection_series(data, "api_keys", skip_rollup=True)
+
+        assert list(matrix) == ["KEY-A"]
+        assert list(series) == [("api_keys", "KEY-A")]
 
 
 class TestBucketStarts:
@@ -700,6 +745,17 @@ class TestFormatNewEntityResults:
         assert agents.startswith("1 new and 1 activated agents")
         assert "2 new" not in agents
 
+    def test_the_api_key_line_names_api_keys_in_plain_words(self):
+        """The per-type line says "API keys", not the raw "api_keys" (BACK-4846)."""
+        result = self.analyzer._format_new_entity_results(
+            [self._entity("key-new", "api_key", 5.0, NEW_ENTITY)]
+            + [self._entity(f"key-{index}", "api_key", 5.0, ACTIVATION) for index in range(10)]
+        )
+
+        summary = result["new_entities_by_type"]["api_key"]["summary"]
+        assert summary.startswith("1 new and 10 activated API keys,")
+        assert "api_key" not in summary
+
     def test_summary_leaves_out_a_count_of_zero(self):
         result = self.analyzer._format_new_entity_results(
             [self._entity("daytime-bot", "agent", 10.0, ACTIVATION)]
@@ -980,7 +1036,7 @@ class TestDimensionReportPaging:
         text = BusinessAnalyticsManagement(ucm_helper=None)._format_anomaly_results_markdown(
             result
         )
-        assert "**Time groups analyzed:** providers 14, agents 7" in text
+        assert "**Time groups analyzed for anomalies:** providers 14, agents 7" in text
 
 
 class TestDimensionReadCancellation:
@@ -1024,38 +1080,150 @@ class TestDimensionReadCancellation:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class TestNewEntityDetectionSplit:
-    """The baseline is a share of the buckets the report returned, whatever their size."""
+_NOW = datetime(2026, 10, 16, 12, tzinfo=timezone.utc)
+_NOW_ISO = "2026-10-16T12:00:00.000Z"
+_WEEK_BEFORE = _NOW - timedelta(days=14)
+
+
+@pytest.fixture
+def frozen_now(monkeypatch):
+    monkeypatch.setattr(enhanced_spike_analyzer, "utc_now", lambda: _NOW)
+
+
+def _six_hour_buckets_from(first, groups_per_bucket):
+    return [
+        {
+            "startTimestamp": _iso(first + timedelta(hours=6 * index)),
+            "groups": [
+                {"groupName": name, "metrics": [{"metricResult": cost}]}
+                for name, cost in groups.items()
+            ],
+        }
+        for index, groups in enumerate(groups_per_bucket)
+    ]
+
+
+def _legacy_half_days():
+    """The legacy SEVEN_DAYS grid: 15 half-day buckets from midnight, unlike the analytics window."""
+    first = _NOW.replace(hour=0) - timedelta(days=7)
+    return [
+        {
+            "startTimestamp": _iso(first + timedelta(hours=12 * index)),
+            "groups": [{"groupName": "codexcli", "metrics": [{"metricResult": 40.0}]}],
+        }
+        for index in range(15)
+    ]
+
+
+class _DetectionReports(FakeReportClient):
+    """The legacy route answers its own half-day grid; the analytics route answers a read
+    ending now with the window and any other with the comparison period."""
+
+    def __init__(self, window, comparison):
+        super().__init__(window, page_size=20)
+        self.window = window
+        self.comparison = comparison
+        self.detection_reads = []
+
+    async def get(self, path, params=None, **kwargs):
+        params = params or {}
+        self.calls.append((path, dict(params), kwargs))
+        self.in_flight += 1
+        self.most_in_flight = max(self.most_in_flight, self.in_flight)
+        try:
+            await asyncio.sleep(0)
+        finally:
+            self.in_flight -= 1
+        if not kwargs.get("use_bearer"):
+            return _legacy_half_days()
+        ends_now = params.get("endDate") == _NOW_ISO
+        if not params.get("page"):
+            self.detection_reads.append("window" if ends_now else "comparison")
+        buckets = self.window if ends_now else self.comparison
+        pages = [buckets[i:i + self.page_size] for i in range(0, len(buckets), self.page_size)]
+        number = params.get("page", 0)
+        return {
+            "_embedded": {"items": pages[number]},
+            "page": {
+                "number": number,
+                "size": self.page_size,
+                "totalPages": len(pages),
+                "totalElements": len(buckets),
+            },
+        }
+
+
+@pytest.mark.usefixtures("frozen_now")
+class TestNewEntityDetectionComparison:
+    """The window is compared with the period of the same length just before it (BACK-4842)."""
+
+    @staticmethod
+    def _steady_and_newbot(first, newbot_from=None):
+        def groups(index):
+            late = newbot_from is not None and index >= newbot_from
+            return {"codexcli": 20.0, **({"newbot": 15.0} if late else {})}
+
+        return _six_hour_buckets_from(first, [groups(index) for index in range(28)])
 
     @pytest.mark.asyncio
-    async def test_new_api_six_hour_buckets_split_by_bucket_share(self, monkeypatch):
-        monkeypatch.setenv("REVENIUM_USE_NEW_ANALYTICS_API", "true")
-        buckets = _six_hour_buckets([20.0] * 28)
-        for bucket in buckets[20:]:
-            bucket["groups"].append({"groupName": "newbot", "metrics": [{"metricResult": 15.0}]})
-        client = FakeReportClient(buckets, page_size=20)
+    async def test_a_legacy_deployment_still_reads_both_detection_periods_on_the_analytics_route(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+        client = _DetectionReports(
+            window=self._steady_and_newbot(_NOW - timedelta(days=7), newbot_from=20),
+            comparison=self._steady_and_newbot(_WEEK_BEFORE),
+        )
 
         result = await EnhancedSpikeAnalyzer(client).analyze_temporal_anomalies(
             "SEVEN_DAYS", detect_new_entities=True
         )
 
-        assert "new_entity_detection" in result
+        assert sorted(client.detection_reads) == ["comparison", "window"]
+        assert [params.get("period") for _, params, kwargs in client.calls if not kwargs] == [
+            "SEVEN_DAYS"
+        ]
         detection = result["new_entity_detection"]
-        assert detection["baseline"]["buckets"] == 8
-        assert detection["baseline"]["start"] == "2026-10-09T00:00:00+00:00"
-        assert detection["baseline"]["end"] == "2026-10-10T18:00:00+00:00"
-        assert detection["recent"]["buckets"] == 20
+        assert detection["comparison_period"] == "SEVEN_DAYS"
+        assert detection["window"] == {"start": "2026-10-09T12:00:00.000Z", "end": _NOW_ISO}
+        assert detection["comparison"] == {
+            "start": "2026-10-02T12:00:00.000Z",
+            "end": "2026-10-09T11:59:59.999Z",
+        }
+        assert detection["recent"]["buckets"] == 28
+        assert detection["baseline"]["buckets"] == 28
         entities = result["new_entities_by_type"]["provider"]["entities"]
         assert [entity["entity_name"] for entity in entities] == ["NEWBOT"]
         assert entities[0]["first_active_date"] == "2026-10-14"
         assert entities[0]["periods_active"] == 8
 
+    @pytest.mark.asyncio
+    async def test_a_source_paused_at_the_window_start_that_ran_the_week_before_is_not_new(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+        window = _six_hour_buckets_from(
+            _NOW - timedelta(days=7),
+            [{"codexcli": 20.0, **({"pausebot": 9.0} if index >= 12 else {})} for index in range(28)],
+        )
+        comparison = _six_hour_buckets_from(
+            _WEEK_BEFORE,
+            [{"codexcli": 20.0, **({"pausebot": 9.0} if index < 20 else {})} for index in range(28)],
+        )
+
+        result = await EnhancedSpikeAnalyzer(
+            _DetectionReports(window=window, comparison=comparison)
+        ).analyze_temporal_anomalies("SEVEN_DAYS", detect_new_entities=True)
+
+        assert result["new_entity_detection"]["status"] == "none"
+        assert "new_entities_by_type" not in result
+
     @staticmethod
-    def _daily_agent_buckets(bucket_count):
-        """Daily agent buckets from 2026-10-09, steadybot with cost in every one."""
+    def _daily_agent_buckets(first, bucket_count):
+        """Daily agent buckets from first, steadybot with cost in every one."""
         return [
             {
-                "startTimestamp": _iso(_FIRST_BUCKET + timedelta(days=index)),
+                "startTimestamp": _iso(first + timedelta(days=index)),
                 "groups": [
                     {"groupName": "steadybot", "metrics": [{"metricResult": 10.0}]}
                 ],
@@ -1063,28 +1231,35 @@ class TestNewEntityDetectionSplit:
             for index in range(bucket_count)
         ]
 
-    @staticmethod
-    def _providers_with_newbot():
-        buckets = _six_hour_buckets([20.0] * 28)
-        newbot = {"groupName": "newbot", "metrics": [{"metricResult": 15.0}]}
-        for bucket in buckets[20:]:
-            bucket["groups"].append(dict(newbot))
-        return buckets
+    @classmethod
+    def _providers_with_newbot(cls, first):
+        return cls._steady_and_newbot(first, newbot_from=20)
 
     @staticmethod
-    async def _detect(data):
-        collection = TemporalCollection(data=data, not_read={}, incomplete={})
-        return await _make_analyzer()._detect_new_entities(
-            collection, "SEVEN_DAYS", list(data)
-        )
+    async def _detect(window, comparison, period="SEVEN_DAYS"):
+        analyzer = _make_analyzer()
+
+        async def collect(span, dimensions, semaphore=None):
+            data = window if span.end == _NOW else comparison
+            return TemporalCollection(data=data, not_read={}, incomplete={})
+
+        analyzer._collect_temporal_data = collect
+        return await analyzer._detect_new_entities(period, list(window))
 
     @pytest.mark.asyncio
     async def test_another_dimensions_bucket_grid_leaves_the_first_unchanged(self):
-        providers = self._providers_with_newbot()
+        providers = self._providers_with_newbot(_FIRST_BUCKET)
+        steady = self._steady_and_newbot(_FIRST_BUCKET - timedelta(days=7))
 
-        alone, alone_outcome = await self._detect({"providers": providers})
+        alone, alone_outcome = await self._detect(
+            {"providers": providers}, {"providers": steady}
+        )
         both, both_outcome = await self._detect(
-            {"providers": providers, "agents": self._daily_agent_buckets(7)}
+            {"providers": providers, "agents": self._daily_agent_buckets(_FIRST_BUCKET, 7)},
+            {
+                "providers": steady,
+                "agents": self._daily_agent_buckets(_FIRST_BUCKET - timedelta(days=7), 7),
+            },
         )
 
         assert [entity.entity_name for entity in alone] == ["NEWBOT"]
@@ -1092,47 +1267,44 @@ class TestNewEntityDetectionSplit:
             ("provider", "NEWBOT")
         ]
         spans = both_outcome["spans_by_dimension"]
-        span_keys = ("whole_window", "baseline", "recent", "buckets_start_at_midnight")
+        span_keys = ("baseline", "recent", "buckets_start_at_midnight")
         assert spans["providers"] == {key: alone_outcome[key] for key in span_keys}
-        assert spans["agents"]["baseline"]["buckets"] == 2
-        assert spans["agents"]["recent"]["buckets"] == 5
-        assert "whole_window" not in both_outcome
+        assert spans["agents"]["baseline"]["buckets"] == 7
+        assert spans["agents"]["recent"]["buckets"] == 7
+        assert "recent" not in both_outcome
 
     @pytest.mark.asyncio
-    async def test_a_dimension_with_one_bucket_is_not_compared_but_others_are(self):
+    async def test_a_dimension_whose_window_returned_no_bucket_is_not_compared_but_others_are(self):
         found, outcome = await self._detect(
+            {"providers": self._providers_with_newbot(_FIRST_BUCKET), "agents": []},
             {
-                "providers": self._providers_with_newbot(),
-                "agents": self._daily_agent_buckets(1),
-            }
+                "providers": self._steady_and_newbot(_FIRST_BUCKET - timedelta(days=7)),
+                "agents": self._daily_agent_buckets(_FIRST_BUCKET - timedelta(days=7), 7),
+            },
         )
 
         assert outcome["status"] == "found"
         assert [entity.entity_name for entity in found] == ["NEWBOT"]
         assert outcome["dimensions_not_compared"] == {
-            "agents": (
-                "the report returned 1 bucket, and at least 2 are needed to compare "
-                "a baseline with a recent part"
-            )
+            "agents": "the report returned no bucket for the window, so nothing could be compared"
         }
-        assert outcome["recent"]["buckets"] == 20
+        assert outcome["recent"]["buckets"] == 28
 
     @staticmethod
-    def _api_key_buckets(late_groups):
+    def _api_key_buckets(first, late_groups):
         """28 six-hour buckets with codexcli in each, and late_groups from bucket 20 on."""
-        buckets = _six_hour_buckets([20.0] * 28)
-        for bucket in buckets[20:]:
-            bucket["groups"].extend(
-                {"groupName": name, "metrics": [{"metricResult": cost}]}
-                for name, cost in late_groups.items()
-            )
-        return buckets
+        return _six_hour_buckets_from(
+            first,
+            [{"codexcli": 20.0, **(late_groups if index >= 20 else {})} for index in range(28)],
+        )
 
-    @staticmethod
-    async def _detect_api_keys(buckets):
-        result = await EnhancedSpikeAnalyzer(
-            FakeReportClient(buckets, page_size=20)
-        ).analyze_temporal_anomalies(
+    @classmethod
+    async def _detect_api_keys(cls, late_groups):
+        client = _DetectionReports(
+            window=cls._api_key_buckets(_NOW - timedelta(days=7), late_groups),
+            comparison=cls._api_key_buckets(_WEEK_BEFORE, {}),
+        )
+        result = await EnhancedSpikeAnalyzer(client).analyze_temporal_anomalies(
             "SEVEN_DAYS", include_dimensions=["api_keys"], detect_new_entities=True
         )
         entities = result.get("new_entities_by_type", {}).get("api_key", {}).get("entities", [])
@@ -1147,10 +1319,9 @@ class TestNewEntityDetectionSplit:
             BusinessAnalyticsManagement,
         )
 
-        monkeypatch.setenv("REVENIUM_USE_NEW_ANALYTICS_API", "true")
-        buckets = self._api_key_buckets({"Other API keys": 40.0, "newkey": 15.0})
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
 
-        detection, names = await self._detect_api_keys(buckets)
+        detection, names = await self._detect_api_keys({"Other API keys": 40.0, "newkey": 15.0})
 
         assert names == ["NEWKEY"]
         assert "20" in detection["dimensions_capped"]["api_keys"]
@@ -1165,37 +1336,280 @@ class TestNewEntityDetectionSplit:
     async def test_the_cap_is_not_named_when_the_analytics_route_returned_no_rollup(
         self, monkeypatch
     ):
-        monkeypatch.setenv("REVENIUM_USE_NEW_ANALYTICS_API", "true")
-        buckets = self._api_key_buckets({f"key-{index}": 15.0 for index in range(4)})
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
 
-        detection, names = await self._detect_api_keys(buckets)
+        detection, names = await self._detect_api_keys(
+            {f"key-{index}": 15.0 for index in range(4)}
+        )
 
         assert sorted(names) == [f"KEY-{index}" for index in range(4)]
         assert not detection.get("dimensions_capped")
 
+    @staticmethod
+    def _capped_api_key_detection(comparison_rollup_cost, window_rollup_cost=30.0):
+        """risingkey and sparsekey enter the window from bucket 20; the comparison names
+        sparsekey in its first 4 buckets only and rolls the keys it does not name into
+        Other API keys at comparison_rollup_cost per bucket. A window_rollup_cost of None
+        leaves the window uncapped."""
+        window_rollup = {} if window_rollup_cost is None else {"Other API keys": window_rollup_cost}
+        window = _six_hour_buckets_from(
+            _NOW - timedelta(days=7),
+            [
+                {
+                    "codexcli": 20.0,
+                    **window_rollup,
+                    **({"risingkey": 15.0, "sparsekey": 15.0} if index >= 20 else {}),
+                }
+                for index in range(28)
+            ],
+        )
+        comparison = _six_hour_buckets_from(
+            _WEEK_BEFORE,
+            [
+                {
+                    "codexcli": 20.0,
+                    "Other API keys": comparison_rollup_cost,
+                    **({"sparsekey": 5.0} if index < 4 else {}),
+                }
+                for index in range(28)
+            ],
+        )
+        return _DetectionReports(window=window, comparison=comparison)
+
+    @classmethod
+    async def _api_key_answer(cls, client, **arguments):
+        result = await EnhancedSpikeAnalyzer(client).analyze_temporal_anomalies(
+            "SEVEN_DAYS", include_dimensions=["api_keys"], detect_new_entities=True, **arguments
+        )
+        entities = result.get("new_entities_by_type", {}).get("api_key", {}).get("entities", [])
+        return result["new_entity_detection"], {
+            entity["entity_name"]: entity["introduction_type"] for entity in entities
+        }
+
     @pytest.mark.asyncio
-    async def test_a_legacy_key_named_other_api_keys_is_still_reported_as_new(
+    async def test_a_window_key_the_capped_comparison_does_not_name_is_not_classified(
+        self, monkeypatch
+    ):
+        """The comparison names only its 20 costliest keys, so a key it does not name may be in its roll-up."""
+        from src.revenium_mcp_server.tools_decomposed.business_analytics_management import (
+            BusinessAnalyticsManagement,
+        )
+
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+
+        detection, kinds = await self._api_key_answer(
+            self._capped_api_key_detection(comparison_rollup_cost=30.0)
+        )
+
+        assert kinds == {"SPARSEKEY": ACTIVATION}
+        assert detection["unclassified"] == {"api_keys": 1}
+        assert "comparison_without_cost" not in detection
+        lines = []
+        BusinessAnalyticsManagement._render_detection_window(detection, lines)
+        assert (
+            "1 API key with cost in the window could not be classified as new or activated: "
+            "the comparison period names only its 20 costliest API keys and it was not among "
+            "them, so whether it had cost then is unknown."
+        ) in lines
+
+    @pytest.mark.asyncio
+    async def test_a_cap_on_the_comparison_only_is_told_by_the_unclassified_line_not_the_window_cap(
+        self, monkeypatch
+    ):
+        from src.revenium_mcp_server.tools_decomposed.business_analytics_management import (
+            BusinessAnalyticsManagement,
+        )
+
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+
+        detection, kinds = await self._api_key_answer(
+            self._capped_api_key_detection(comparison_rollup_cost=30.0, window_rollup_cost=None)
+        )
+
+        assert kinds == {"SPARSEKEY": ACTIVATION}
+        assert not detection.get("dimensions_capped")
+        lines = []
+        BusinessAnalyticsManagement._render_detection_window(detection, lines)
+        assert not any(line.startswith("Capped for new-entity detection") for line in lines)
+        assert any(
+            line.startswith("1 API key with cost in the window could not be classified")
+            for line in lines
+        )
+
+    @staticmethod
+    def _nothing_named_detection(window_keys):
+        """Only codexcli runs in both periods; window_keys enter the window from bucket 20
+        while the comparison rolls the keys it does not name into Other API keys."""
+        window = _six_hour_buckets_from(
+            _NOW - timedelta(days=7),
+            [
+                {"codexcli": 20.0, **(dict.fromkeys(window_keys, 15.0) if index >= 20 else {})}
+                for index in range(28)
+            ],
+        )
+        comparison = _six_hour_buckets_from(
+            _WEEK_BEFORE,
+            [{"codexcli": 20.0, "Other API keys": 30.0} for _ in range(28)],
+        )
+        return _DetectionReports(window=window, comparison=comparison)
+
+    @staticmethod
+    def _rendered_window(detection):
+        from src.revenium_mcp_server.tools_decomposed.business_analytics_management import (
+            BusinessAnalyticsManagement,
+        )
+
+        lines = []
+        BusinessAnalyticsManagement._render_detection_window(detection, lines)
+        return "\n".join(lines)
+
+    @pytest.mark.asyncio
+    async def test_nothing_found_is_limited_to_keys_with_known_history_when_some_are_unclassified(
         self, monkeypatch
     ):
         monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
-        buckets = self._api_key_buckets({"Other API keys": 40.0})
 
-        detection, names = await self._detect_api_keys(buckets)
+        detection, kinds = await self._api_key_answer(
+            self._nothing_named_detection(["risingkey"]), min_new_entity_threshold=10.0
+        )
 
-        assert names == ["OTHER API KEYS"]
-        assert not detection.get("dimensions_capped")
+        assert kinds == {}
+        assert detection["status"] == "none"
+        assert detection["unclassified"] == {"api_keys": 1}
+        rendered = self._rendered_window(detection)
+        assert (
+            "No new or activated API key reached $10.00, counting only the API keys whose "
+            "comparison history is known, in the recent part"
+        ) in rendered
+        assert "1 API key with cost in the window could not be classified" in rendered
+
+    @pytest.mark.asyncio
+    async def test_nothing_found_keeps_the_plain_sentence_when_no_key_is_unclassified(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+
+        detection, kinds = await self._api_key_answer(
+            self._nothing_named_detection([]), min_new_entity_threshold=10.0
+        )
+
+        assert kinds == {}
+        assert detection["status"] == "none"
+        assert "unclassified" not in detection
+        rendered = self._rendered_window(detection)
+        assert "No new or activated API key reached $10.00 in the recent part" in rendered
+        assert "could not be classified" not in rendered
+
+    @pytest.mark.asyncio
+    async def test_a_key_below_the_threshold_is_not_counted_as_unclassified(self, monkeypatch):
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+
+        detection, kinds = await self._api_key_answer(
+            self._capped_api_key_detection(comparison_rollup_cost=30.0),
+            min_new_entity_threshold=1000.0,
+        )
+
+        assert kinds == {}
+        assert "unclassified" not in detection
+
+    @pytest.mark.asyncio
+    async def test_a_comparison_rollup_without_cost_leaves_an_unnamed_key_new(self, monkeypatch):
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+
+        detection, kinds = await self._api_key_answer(
+            self._capped_api_key_detection(comparison_rollup_cost=0.0)
+        )
+
+        assert kinds == {"RISINGKEY": NEW_ENTITY, "SPARSEKEY": ACTIVATION}
+        assert "unclassified" not in detection
+
+    @pytest.mark.asyncio
+    async def test_the_window_and_comparison_reads_share_one_read_limit(self):
+        client = _DetectionReports(
+            window=self._steady_and_newbot(_NOW - timedelta(days=7)),
+            comparison=self._steady_and_newbot(_WEEK_BEFORE),
+        )
+        analyzer = EnhancedSpikeAnalyzer(client)
+        window, comparison = analyzer._detection_ranges("SEVEN_DAYS", "SEVEN_DAYS")
+
+        await analyzer._read_window_and_comparison(
+            window, comparison, ["providers", "agents", "api_keys"]
+        )
+
+        assert sorted(client.detection_reads) == ["comparison"] * 3 + ["window"] * 3
+        assert client.most_in_flight == enhanced_spike_analyzer.MAX_CONCURRENT_DIMENSION_READS
+
+    @pytest.mark.asyncio
+    async def test_without_the_flag_time_groups_count_the_anomaly_read_not_the_detection_window(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+        client = _DetectionReports(
+            window=self._steady_and_newbot(_NOW - timedelta(days=7), newbot_from=20),
+            comparison=self._steady_and_newbot(_WEEK_BEFORE),
+        )
+
+        result = await EnhancedSpikeAnalyzer(client).analyze_temporal_anomalies(
+            "SEVEN_DAYS", detect_new_entities=True
+        )
+
+        assert result["time_groups_analyzed"] == 15
+        assert result["new_entity_detection"]["recent"]["buckets"] == 28
 
     def test_introduction_period_names_two_half_day_buckets_with_times(self):
         starts = [
-            datetime(2026, 10, 8, 12, tzinfo=timezone.utc),
             datetime(2026, 10, 9, tzinfo=timezone.utc),
             datetime(2026, 10, 9, 12, tzinfo=timezone.utc),
         ]
 
         found = StatisticalAnomalyDetector().detect_new_cost_sources(
-            {("providers", "NEWBOT"): [0.0, 5.0, 5.0]}, starts, "SEVEN_DAYS"
+            {("providers", "NEWBOT"): [5.0, 5.0]}, starts, {}, 1, "SEVEN_DAYS"
         )
 
         assert [entity.introduction_period for entity in found] == [
             "the 2 buckets starting 2026-10-09 00:00 UTC to 2026-10-09 12:00 UTC"
         ]
+
+
+class TestApiKeyRollupAnomalies:
+    """The analytics API key roll-up is not an anomaly entity (BACK-4846)."""
+
+    @staticmethod
+    def _rollup_spike_buckets():
+        """28 six-hour buckets: key-a steady, the analytics roll-up steady but for one $522.08 spike."""
+        buckets = _six_hour_buckets([20.0] * 28)
+        for index, bucket in enumerate(buckets):
+            bucket["groups"] = [
+                {"groupName": "key-a", "metrics": [{"metricResult": 20.0 + index % 2}]},
+                {
+                    "groupName": "Other API keys",
+                    "metrics": [{"metricResult": 522.08 if index == 12 else 10.0 + index % 2}],
+                },
+            ]
+        return buckets
+
+    @staticmethod
+    async def _api_key_anomalies(buckets):
+        return await EnhancedSpikeAnalyzer(
+            FakeReportClient(buckets, page_size=20)
+        ).analyze_temporal_anomalies("SEVEN_DAYS", include_dimensions=["api_keys"])
+
+    @pytest.mark.asyncio
+    async def test_the_analytics_api_key_rollup_is_not_an_anomaly_entity(self, monkeypatch):
+        """The roll-up of the keys the route does not name is not an API key (BACK-4846)."""
+        monkeypatch.setenv("REVENIUM_USE_NEW_ANALYTICS_API", "true")
+
+        result = await self._api_key_anomalies(self._rollup_spike_buckets())
+
+        assert [a["entity_name"] for a in result["temporal_anomalies"]] == []
+        assert result["entities_analyzed"] == {"api_keys": 1}
+
+    @pytest.mark.asyncio
+    async def test_a_legacy_key_named_other_api_keys_is_still_an_anomaly_entity(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+
+        result = await self._api_key_anomalies(self._rollup_spike_buckets())
+
+        assert [a["entity_name"] for a in result["temporal_anomalies"]] == ["OTHER API KEYS"]

@@ -336,6 +336,12 @@ class TestAlertHistoryPhrasesNameTheirWindow:
                 "2025-12-28T00:00:00.000Z",
                 "2026-01-03T23:59:59.999Z",
             ),
+            (
+                datetime(2026, 10, 17, 9, 0, 0, tzinfo=timezone.utc),
+                "from Oct 14 to Oct 12",
+                "2026-10-14T00:00:00.000Z",
+                "2026-10-12T23:59:59.999Z",
+            ),
         ],
     )
     def test_calendar_edges(self, frozen_utc_clock, now, phrase, start, end):

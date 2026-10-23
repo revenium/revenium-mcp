@@ -3,6 +3,7 @@
 import math
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import (
     Any,
     Callable,
@@ -57,14 +58,6 @@ PROVIDER_FILTER_DIMENSIONS = ("WORKSPACE", "API_KEY", "MODEL", "PROVIDER")
 DATA_SOURCES = ("SDK", "PROVIDER")
 # AIAlertType in AIAnomaly.kt.
 ALERT_TYPES = ("THRESHOLD", "CUMULATIVE_USAGE", "RELATIVE_CHANGE")
-# AIAlertMetricType in AIAnomaly.kt; getMetricType refuses any other name.
-METRIC_TYPES = (
-    "TOTAL_COST", "COST_PER_TRANSACTION", "TOKENS_PER_MINUTE", "TOKEN_COUNT",
-    "INPUT_TOKEN_COUNT", "OUTPUT_TOKEN_COUNT", "CACHED_TOKEN_COUNT", "TOKENS_PER_REQUEST",
-    "TIME_TO_FIRST_TOKEN", "DURATION", "ERROR_COUNT", "ERROR_RATE", "QUALITY_RATE",
-    "REQUESTS_PER_MINUTE", "IMAGE_COUNT", "DURATION_SECONDS", "CHARACTER_COUNT",
-    "CREDITS_CONSUMED", "COST_PER_IMAGE", "COST_PER_SECOND", "VIDEO_COUNT", "AUDIO_COUNT",
-)
 # AIAlertTrackingPeriod in AIAnomaly.kt: what triggerAfterPersistsDuration deserializes to.
 TRACKING_PERIODS = (
     "ONE_MINUTE", "FIVE_MINUTES", "FIFTEEN_MINUTES", "THIRTY_MINUTES", "ONE_HOUR",
@@ -191,16 +184,29 @@ def _check_data_source(alert: Mapping[str, Any], _stored: Any) -> Optional[RuleB
     )
 
 
+@lru_cache(maxsize=1)
+def platform_metric_types() -> Tuple[str, ...]:
+    """AIAlertMetricType as the generated contract lists it; getMetricType refuses any other name.
+
+    Imported on first use, as ``accepted_period_durations`` does, so loading this module
+    does not load the generated models.
+    """
+    from ..generated.hypercurrent_models import MetricType  # noqa: PLC0415
+
+    return tuple(member.value for member in MetricType)
+
+
 def _check_metric(alert: Mapping[str, Any], _stored: Any) -> Optional[RuleBreach]:
     metric = alert.get("metricType")
-    if metric is None or metric in METRIC_TYPES:
+    accepted = platform_metric_types()
+    if metric is None or metric in accepted:
         return None
     return RuleBreach(
         "metricType",
         metric,
         f"metricType {metric} is not a metric the platform has",
-        (f"Send metricType as one of: {', '.join(METRIC_TYPES)}",),
-        accepted=METRIC_TYPES,
+        (f"Send metricType as one of: {', '.join(accepted)}",),
+        accepted=accepted,
     )
 
 
@@ -733,7 +739,7 @@ def _normalized_filters(rows: Any) -> Any:
     if not isinstance(rows, list):
         return rows
     normalized = [
-        {key: row[key] for key in _FILTER_ROW_KEYS if row.get(key) not in (None, "", [])}
+        {key: row[key] for key in _FILTER_ROW_KEYS if row.get(key) not in (None, [])}
         if isinstance(row, dict)
         else row
         for row in rows

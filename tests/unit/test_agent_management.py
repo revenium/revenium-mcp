@@ -850,6 +850,76 @@ class TestSquadManagerTimeline:
 # ===========================================================================
 
 
+class TestObservedListHeadings:
+    """list_discovered, list_squads and list_squad_executions head the page with the platform total (BACK-4836)."""
+
+    OBSERVED_LISTS = [
+        pytest.param(
+            "list_discovered", "get_discovered_agents", "discovered agents over SEVEN_DAYS",
+            id="list_discovered",
+        ),
+        pytest.param("list_squads", "get_squads", "squads", id="list_squads"),
+        pytest.param(
+            "list_squad_executions", "get_squad_executions", "squad executions",
+            id="list_squad_executions",
+        ),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action, client_method, noun", OBSERVED_LISTS)
+    @pytest.mark.parametrize("page_info, row_count, page, heading, total", LIST_HEADING_CASES)
+    async def test_heading_counts_the_page_against_the_platform_total(
+        self, agent_mgmt, mock_client, action, client_method, noun,
+        page_info, row_count, page, heading, total,
+    ):
+        mock_client._extract_embedded_data.return_value = rows(row_count)
+        mock_client._extract_pagination_info.return_value = page_info
+        getattr(mock_client, client_method).return_value = {}
+        agent_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await agent_mgmt.handle_action(
+            action, {"page": page, "size": 20, "period": "SEVEN_DAYS"}
+        )
+
+        shown_heading, body = heading_and_body(result[0].text)
+        assert shown_heading == heading.format(noun=noun)
+        assert body["total_records"] == total
+        assert body["total_found"] == row_count
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action, client_method, noun", OBSERVED_LISTS)
+    async def test_two_rows_of_1951_read_as_1951(
+        self, agent_mgmt, mock_client, action, client_method, noun
+    ):
+        mock_client._extract_embedded_data.return_value = rows(2)
+        mock_client._extract_pagination_info.return_value = {"totalElements": 1951, "totalPages": 976}
+        getattr(mock_client, client_method).return_value = {}
+        agent_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await agent_mgmt.handle_action(action, {"size": 2, "period": "SEVEN_DAYS"})
+
+        shown_heading, _ = heading_and_body(result[0].text)
+        assert shown_heading == f"Found 2 of 1951 {noun} (page 1 of 976):"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action, client_method, noun", OBSERVED_LISTS)
+    async def test_a_reply_with_no_pagination_block_prints_the_page_count(
+        self, agent_mgmt, mock_client, action, client_method, noun
+    ):
+        mock_client._extract_embedded_data.return_value = rows(3)
+        mock_client._extract_pagination_info.return_value = {}
+        getattr(mock_client, client_method).return_value = {}
+        agent_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await agent_mgmt.handle_action(action, {"period": "SEVEN_DAYS"})
+
+        shown_heading, body = heading_and_body(result[0].text)
+        assert shown_heading == (
+            f"Found 3 {noun} on page 1; the platform reported no total, so more may exist:"
+        )
+        assert body["total_records"] is None
+
+
 class TestSquadActionRouting:
     """handle_action routes the four squad actions to SquadManager."""
 

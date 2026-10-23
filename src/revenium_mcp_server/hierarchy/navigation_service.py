@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from loguru import logger
 
-from ..client import ReveniumClient
+from ..client import ReveniumAPIError, ReveniumClient
 
 
 @dataclass
@@ -25,19 +25,68 @@ class NavigationResult:
     metadata: Dict[str, Any]
     error_message: Optional[str] = None
     incomplete: bool = False
+    retryable: bool = True
 
 
-class _SubscriptionPageError(Exception):
-    """A subscriptions page could not be read, so the walk cannot be complete."""
+SUBSCRIPTION_PAGE_SIZE = 50
 
+# The platform offers no product filter, only a text search, and an
+# organization can hold tens of thousands of subscriptions (49,423 in 989 pages
+# on dev, 1.3 to 1.5 s a page, BACK-4736). Ten pages keeps a lookup near
+# fifteen seconds; a search matching more is refused rather than walked.
+MAX_SUBSCRIPTION_SEARCH_PAGES = 10
+
+
+class _IncompleteSubscriptionsError(Exception):
+    """The subscriptions a lookup needs could not all be read."""
+
+    retryable = True
+
+    def __init__(self, message: str, metadata: Dict[str, Any]):
+        super().__init__(message)
+        self.message = message
+        self.metadata = metadata
+
+
+class _SubscriptionPageError(_IncompleteSubscriptionsError):
     def __init__(self, page: int, cause: Exception):
-        super().__init__(f"subscriptions page {page}: {cause}")
-        self.page = page
-        self.cause = cause
+        super().__init__(
+            f"Could not read subscriptions page {page} ({cause}). The subscription "
+            "list is incomplete, so no answer was built from the pages read before "
+            "it. Retry the request.",
+            {"failed_page": page},
+        )
 
 
-def _incomplete_walk_result(
-    entity_type: str, entity_id: str, error: _SubscriptionPageError
+class _SubscriptionReadError(_IncompleteSubscriptionsError):
+    def __init__(self, subscription_id: str, cause: Exception):
+        super().__init__(
+            f"Could not read subscription {subscription_id} ({cause}). The "
+            "subscription list is incomplete, so no answer was built from the "
+            "subscriptions read before it. Retry the request.",
+            {"failed_subscription_id": subscription_id},
+        )
+
+
+class _SubscriptionSearchTooBroadError(_IncompleteSubscriptionsError):
+    retryable = False
+
+    def __init__(self, search_term: str):
+        limit = MAX_SUBSCRIPTION_SEARCH_PAGES * SUBSCRIPTION_PAGE_SIZE
+        super().__init__(
+            f"The platform cannot filter subscriptions by product, so they are "
+            f"found by searching for the product name '{search_term}', and that "
+            f"search matches more than {limit} subscriptions. This lookup reads at "
+            f"most {limit}, so it gives no answer rather than part of one. Read them "
+            f"page by page with manage_subscriptions(action=\"search_subscriptions\", "
+            f"product_name=\"{search_term}\", page=0) and keep the ones whose "
+            f"product id matches.",
+            {"search_term": search_term, "search_limit": limit},
+        )
+
+
+def _incomplete_lookup_result(
+    entity_type: str, entity_id: str, error: _IncompleteSubscriptionsError
 ) -> NavigationResult:
     return NavigationResult(
         success=False,
@@ -45,14 +94,32 @@ def _incomplete_walk_result(
         entity_id=entity_id,
         related_entities=[],
         navigation_path=[],
-        metadata={"failed_page": error.page},
-        error_message=(
-            f"Could not read subscriptions page {error.page} ({error.cause}). "
-            "The subscription list is incomplete, so no answer was built from "
-            "the pages read before it. Retry the request."
-        ),
+        metadata=error.metadata,
+        error_message=error.message,
         incomplete=True,
+        retryable=error.retryable,
     )
+
+
+RETRY_INCOMPLETE_LOOKUP_SUGGESTIONS = [
+    "Retry the request; a page or a subscription failed to load",
+    "If it keeps failing, check that the Revenium API is reachable",
+]
+
+
+def incomplete_lookup_suggestions(result: NavigationResult) -> List[str]:
+    """What a caller can do about an incomplete lookup: retry a failed read, or
+    page through a search too broad for one lookup, where a retry never helps."""
+    if result.retryable:
+        return list(RETRY_INCOMPLETE_LOOKUP_SUGGESTIONS)
+    search_term = result.metadata.get("search_term", "")
+    return [
+        f'Page through manage_subscriptions(action="search_subscriptions", '
+        f'product_name="{search_term}", page=0) and keep the subscriptions whose '
+        "product id matches",
+        "Retrying gives the same answer: the subscription search matches more "
+        "subscriptions than one lookup reads",
+    ]
 
 
 def _references_product(subscription: Dict[str, Any], product_id: str) -> bool:
@@ -64,12 +131,20 @@ def _references_product(subscription: Dict[str, Any], product_id: str) -> bool:
     )
 
 
-def _references_credential(subscription: Dict[str, Any], credential_id: str) -> bool:
-    credentials = subscription.get("credentials") or []
-    return any(
-        isinstance(credential, dict) and credential.get("id") == credential_id
-        for credential in credentials
-    )
+def _linked_subscription_ids(credential: Dict[str, Any]) -> List[str]:
+    """The subscription ids a credential names.
+
+    A credential read answers ``subscriptions`` (id and label per link); the
+    ``subscriptionIds`` field is the write-side form and is absent from reads on
+    dev (BACK-4736 probe), but either is honoured.
+    """
+    linked = [
+        str(subscription["id"])
+        for subscription in credential.get("subscriptions") or []
+        if isinstance(subscription, dict) and subscription.get("id")
+    ]
+    linked.extend(str(sid) for sid in credential.get("subscriptionIds") or [] if sid)
+    return list(dict.fromkeys(linked))
 
 
 @dataclass
@@ -151,11 +226,12 @@ class HierarchyNavigationService:
                 )
 
             try:
-                subscriptions = await self._collect_subscriptions(
-                    lambda sub: _references_product(sub, product_id)
+                subscriptions = await self._search_subscriptions(
+                    str(product.get("name") or ""),
+                    lambda sub: _references_product(sub, product_id),
                 )
-            except _SubscriptionPageError as error:
-                return _incomplete_walk_result("products", product_id, error)
+            except _IncompleteSubscriptionsError as error:
+                return _incomplete_lookup_result("products", product_id, error)
 
             result = NavigationResult(
                 success=True,
@@ -366,21 +442,24 @@ class HierarchyNavigationService:
                 error_message=f"Navigation error: {str(e)}",
             )
 
-    async def _collect_subscriptions(
-        self, matches: Callable[[Dict[str, Any]], bool]
+    async def _search_subscriptions(
+        self, search_term: str, matches: Callable[[Dict[str, Any]], bool]
     ) -> List[Dict[str, Any]]:
-        """Read every subscriptions page and keep the ones ``matches`` accepts.
+        """Read the subscriptions the platform's search returns for ``search_term``
+        and keep the ones ``matches`` accepts.
 
         Raises:
             _SubscriptionPageError: a page could not be read; nothing collected so
                 far may be used as an answer.
+            _SubscriptionSearchTooBroadError: the search returns more pages than
+                MAX_SUBSCRIPTION_SEARCH_PAGES.
         """
         collected: List[Dict[str, Any]] = []
-        page = 0
-        page_size = 50
-        while True:
+        for page in range(MAX_SUBSCRIPTION_SEARCH_PAGES):
             try:
-                response = await self.client.get_subscriptions(page=page, size=page_size)
+                response = await self.client.get_subscriptions(
+                    page=page, size=SUBSCRIPTION_PAGE_SIZE, query=search_term
+                )
                 page_subscriptions = self.client._extract_embedded_data(response)
             except Exception as e:
                 logger.error(f"Error fetching subscriptions page {page}: {e}")
@@ -389,9 +468,39 @@ class HierarchyNavigationService:
             collected.extend(
                 sub for sub in page_subscriptions if isinstance(sub, dict) and matches(sub)
             )
-            if len(page_subscriptions) < page_size:
+            if len(page_subscriptions) < SUBSCRIPTION_PAGE_SIZE:
                 return collected
-            page += 1
+        raise _SubscriptionSearchTooBroadError(search_term)
+
+    async def _read_subscriptions(
+        self, subscription_ids: List[str]
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Read each subscription by id.
+
+        Returns:
+            The subscriptions read, and the ids the platform answered 404 for.
+            A link to a subscription that no longer resolves is skipped instead
+            of failing every lookup for the credential: a retry cannot change a
+            404.
+
+        Raises:
+            _SubscriptionReadError: a subscription could not be read for any
+                other reason.
+        """
+        subscriptions: List[Dict[str, Any]] = []
+        unresolved: List[str] = []
+        for subscription_id in subscription_ids:
+            try:
+                subscriptions.append(await self.client.get_subscription_by_id(subscription_id))
+            except ReveniumAPIError as e:
+                if e.status_code != 404:
+                    logger.error(f"Error fetching subscription {subscription_id}: {e}")
+                    raise _SubscriptionReadError(subscription_id, e) from e
+                unresolved.append(subscription_id)
+            except Exception as e:
+                logger.error(f"Error fetching subscription {subscription_id}: {e}")
+                raise _SubscriptionReadError(subscription_id, e) from e
+        return subscriptions, unresolved
 
     @staticmethod
     def _incomplete_hierarchy(walk: NavigationResult) -> NavigationResult:
@@ -404,6 +513,7 @@ class HierarchyNavigationService:
             metadata=walk.metadata,
             error_message=walk.error_message,
             incomplete=True,
+            retryable=walk.retryable,
         )
 
     # Cache Management
@@ -466,14 +576,13 @@ class HierarchyNavigationService:
                     error_message=f"Credential {credential_id} not found",
                 )
 
-            # Credentials carry no subscription ids, so search every subscription's
-            # credentials array (reverse lookup)
             try:
-                subscriptions = await self._collect_subscriptions(
-                    lambda sub: _references_credential(sub, credential_id)
+                subscriptions, unresolved = await self._read_subscriptions(
+                    _linked_subscription_ids(credential)
                 )
-            except _SubscriptionPageError as error:
-                return _incomplete_walk_result("credentials", credential_id, error)
+            except _IncompleteSubscriptionsError as error:
+                return _incomplete_lookup_result("credentials", credential_id, error)
+            unresolved_metadata = {"unresolved_subscription_ids": unresolved} if unresolved else {}
 
             if not subscriptions:
                 return NavigationResult(
@@ -482,7 +591,7 @@ class HierarchyNavigationService:
                     entity_id=credential_id,
                     related_entities=[],
                     navigation_path=[],
-                    metadata={},
+                    metadata=unresolved_metadata,
                     error_message="No subscriptions found that reference this credential",
                 )
 
@@ -497,6 +606,7 @@ class HierarchyNavigationService:
                     "subscription_count": len(subscriptions),
                     "subscription_ids": [sub.get("id") for sub in subscriptions],
                     "navigation_direction": "upward",
+                    **unresolved_metadata,
                 },
             )
 
@@ -542,6 +652,7 @@ class HierarchyNavigationService:
                     metadata={},
                     error_message=f"Could not find subscription for credential: {subscription_result.error_message}",
                     incomplete=subscription_result.incomplete,
+                    retryable=subscription_result.retryable,
                 )
 
             # Get product for the first subscription (credentials typically have one primary subscription)

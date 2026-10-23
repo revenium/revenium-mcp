@@ -1685,6 +1685,34 @@ class TestSessionIdStaysOnItsOwnPath:
         assert excinfo.value.suggestions[0] == job_management_module._SESSION_ID.suggestions[0]
         assert sent == []
 
+    @pytest.mark.asyncio
+    async def test_a_padded_session_id_is_sent_stripped(self, session_wire_client):
+        """BACK-4844: the blank check reads the stripped id, so the stripped id is sent."""
+        client, sent = session_wire_client
+
+        result = await JobManager(client).list_session_attributions(
+            {"session_id": f"  {SESSION_ID} "}
+        )
+
+        assert result["session_id"] == SESSION_ID
+        assert sent == [
+            ("GET", f"/profitstream/v2/api/sessions/{SESSION_ID}/attribution?teamId=team_abc")
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("session_id", ["a\\b", "a%b", "a;b"])
+    async def test_a_session_id_the_platform_refuses_in_a_path_is_refused(
+        self, session_wire_client, session_id
+    ):
+        client, sent = session_wire_client
+
+        with pytest.raises(ToolError) as excinfo:
+            await JobManager(client).list_session_attributions({"session_id": session_id})
+
+        assert excinfo.value.field == "session_id"
+        assert "the platform refuses any request whose path carries" in excinfo.value.message
+        assert sent == []
+
 
 class TestSessionAttributionEnvelopeShape:
     """An envelope this code does not recognise must not read as "no attributions"."""
@@ -4478,8 +4506,8 @@ class TestEveryJobIdActionSendsTheIdAsOnePathSegment:
     )
     @pytest.mark.parametrize(
         "job_id,segment",
-        [("a%2Fb", "a%252Fb"), ("x..y", "x..y")],
-        ids=["encoded_slash_text", "dots_inside"],
+        [("x..y", "x..y"), ("a\u00e9b", "a%C3%A9b")],
+        ids=["dots_inside", "non_ascii"],
     )
     async def test_a_job_id_without_a_real_slash_is_sent_as_one_segment(
         self, wire_recording_client, action, method, suffix, extra, job_id, segment
@@ -4491,6 +4519,29 @@ class TestEveryJobIdActionSendsTheIdAsOnePathSegment:
         assert sent == [
             (method, f"/profitstream/v2/api/jobs/{segment}{suffix}?teamId=team_abc")
         ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action,method,suffix,extra", _JOB_ID_ACTIONS, ids=[a[0] for a in _JOB_ID_ACTIONS]
+    )
+    @pytest.mark.parametrize(
+        "job_id,character",
+        [("claims\\2026", "\\"), ("a%2Fb", "%"), ("claims;v=2", ";")],
+        ids=["backslash", "percent", "semicolon"],
+    )
+    async def test_a_job_id_the_platform_refuses_in_a_path_is_refused_naming_the_character(
+        self, wire_recording_client, action, method, suffix, extra, job_id, character
+    ):
+        """BACK-4844: the platform answers these with a bare 400 naming no reason."""
+        client, sent = wire_recording_client
+
+        with pytest.raises(ToolError) as excinfo:
+            await getattr(JobManager(client), action)({"job_id": job_id, **extra})
+
+        assert excinfo.value.field == "job_id"
+        assert f"must not contain '{character}'" in excinfo.value.message
+        assert "the platform refuses any request whose path carries" in excinfo.value.message
+        assert sent == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("job_id", ["types", "conversion-funnel"])

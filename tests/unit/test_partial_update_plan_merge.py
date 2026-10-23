@@ -156,3 +156,76 @@ class TestPublicationIsNotInvented:
     async def test_update_keeps_a_stored_published_product_published(self):
         client = await _update_product({**STORED_PRODUCT, "published": True}, {"name": "renamed"})
         assert APIFieldMapper.map_product_fields(client.sent)["published"] is True
+
+
+FLAT_ONLY_TIER = {
+    "id": "1372713702",
+    "name": "Base",
+    "startingFrom": 0.0,
+    "upTo": None,
+    "unitAmount": None,
+    "flatAmount": 10.0,
+}
+FLAT_ONLY_PRODUCT = {
+    **STORED_PRODUCT,
+    "plan": {**STORED_PRODUCT["plan"], "tiers": [FLAT_ONLY_TIER]},
+}
+
+
+async def _refused_plan_update(stored, caller_data):
+    client = RecordingClient(stored)
+    config = UpdateConfigs.create_products_config(client)
+    with pytest.raises(ToolError) as refusal:
+        await PartialUpdateHandler().update_with_merge(stored["id"], caller_data, config)
+    return client, refusal.value
+
+
+class TestUpdateWithoutPlanLeavesTheStoredPlanAlone:
+    """BACK-4860: the platform refuses a flat-only tier in any PUT that carries the plan."""
+
+    @pytest.mark.asyncio
+    async def test_description_only_update_of_a_flat_only_product_sends_no_plan(self):
+        client = await _update_product(FLAT_ONLY_PRODUCT, {"description": "new words"})
+        assert client.sent["description"] == "new words"
+        assert "plan" not in client.sent
+
+    @pytest.mark.asyncio
+    async def test_name_only_update_of_a_per_unit_product_sends_no_plan(self):
+        client = await _update_product(STORED_PRODUCT, {"name": "renamed"})
+        assert "plan" not in client.sent
+
+    @pytest.mark.asyncio
+    async def test_a_plan_change_of_a_per_unit_product_still_sends_the_merged_plan(self):
+        client = await _update_product(STORED_PRODUCT, {"plan": {"charge": 5}})
+        assert client.sent["plan"]["charge"] == 5
+        assert client.sent["plan"]["tiers"] == STORED_TIERS
+
+
+class TestPlanChangeWithAFlatOnlyTierIsRefused:
+    @pytest.mark.asyncio
+    async def test_a_plan_change_keeping_a_flat_only_tier_names_the_tier_and_sends_nothing(self):
+        client, refusal = await _refused_plan_update(FLAT_ONLY_PRODUCT, {"plan": {"charge": 5}})
+        assert refusal.message == (
+            "The platform refuses a plan update while a tier has neither unitAmount nor "
+            "upTo, and tier 'Base' has neither"
+        )
+        assert refusal.field == "plan.tiers"
+        assert any("unitAmount 0" in hint for hint in refusal.suggestions)
+        assert any("Leave 'plan' out" in hint for hint in refusal.suggestions)
+        assert client.put_bodies == []
+
+    @pytest.mark.asyncio
+    async def test_sent_snake_case_flat_tiers_without_a_name_are_named_by_position(self):
+        tiers = [
+            {"up_to": 100, "unit_amount": 0.01},
+            {"up_to": None, "unit_amount": None, "flat_amount": 5},
+        ]
+        client, refusal = await _refused_plan_update(STORED_PRODUCT, {"plan": {"tiers": tiers}})
+        assert refusal.message.endswith("tier number 2 has neither")
+        assert client.put_bodies == []
+
+    @pytest.mark.asyncio
+    async def test_a_flat_tier_sent_with_unit_amount_zero_is_sent(self):
+        flat_priced = {**FLAT_ONLY_TIER, "unitAmount": 0}
+        client = await _update_product(FLAT_ONLY_PRODUCT, {"plan": {"tiers": [flat_priced]}})
+        assert client.sent["plan"]["tiers"] == [flat_priced]

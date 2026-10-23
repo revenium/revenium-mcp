@@ -13,7 +13,11 @@ from loguru import logger
 
 from ..client import ReveniumClient
 from .entity_lookup_service import EntityLookupService
-from .navigation_service import HierarchyNavigationService, NavigationResult
+from .navigation_service import (
+    HierarchyNavigationService,
+    NavigationResult,
+    incomplete_lookup_suggestions,
+)
 
 
 class ValidationSeverity(Enum):
@@ -91,8 +95,8 @@ class ImpactAnalysis:
 
 def _unchecked_dependents_message(nav_result: NavigationResult) -> str:
     return (
-        "Cannot confirm the product has no dependent subscriptions because a "
-        f"subscriptions page failed to load: {nav_result.error_message}"
+        "Cannot confirm the product has no dependent subscriptions: "
+        f"{nav_result.error_message}"
     )
 
 
@@ -689,7 +693,7 @@ class CrossTierValidator:
                             entity_type=entity_type,
                             entity_id=entity_id,
                             field=None,
-                            suggested_action="Retry the validation",
+                            suggested_action=incomplete_lookup_suggestions(nav_result)[0],
                             metadata={"dependent_type": dependent_type},
                         )
                     )

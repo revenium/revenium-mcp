@@ -310,7 +310,6 @@ class JSONSchemaValidator:
                         "create_simple",
                         "get_templates",
                         "suggest_template",
-                        "create_from_description",
                         "create_with_subscription",
                     ],
                     "description": "Action to perform on products",
@@ -399,13 +398,13 @@ class JSONSchemaValidator:
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 1000,
-                    "description": "Natural language description for create_from_description actions",
+                    "description": "Natural language description for create actions",
                 },
                 "text": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 1000,
-                    "description": "Alternative parameter name for description",
+                    "description": "Pricing text for clarify_pricing",
                 },
                 "field": {
                     "type": "string",

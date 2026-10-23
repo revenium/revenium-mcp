@@ -13,6 +13,7 @@ from loguru import logger
 
 from ..client import ReveniumAPIError, ReveniumClient
 from ..common.error_handling import ErrorCodes, ToolError
+from ..common.money import render_dollars, render_rounded_dollars
 from .ucm_integration import AnalyticsUCMIntegration
 
 
@@ -1156,7 +1157,7 @@ class BusinessAnalyticsEngine:
         total_cost = getattr(cost_trends, "total_cost", 0)
         if total_cost > 0:
             insights.append(
-                f"💰 Total cost for {period.replace('_', ' ').lower()}: ${total_cost:.2f}"
+                f"💰 Total cost for {period.replace('_', ' ').lower()}: {render_dollars(total_cost)}"
             )
 
         # Trend direction insight
@@ -1192,7 +1193,7 @@ class BusinessAnalyticsEngine:
             top_provider = max(cost_by_provider.items(), key=lambda x: x[1])
             provider_percentage = (top_provider[1] / total_cost * 100) if total_cost > 0 else 0
             insights.append(
-                f"🏢 Top cost driver: {top_provider[0]} (${top_provider[1]:.2f}, {provider_percentage:.1f}%)"
+                f"🏢 Top cost driver: {top_provider[0]} ({render_dollars(top_provider[1])}, {provider_percentage:.1f}%)"
             )
 
         # Model insights
@@ -1201,7 +1202,7 @@ class BusinessAnalyticsEngine:
             top_model = max(cost_by_model.items(), key=lambda x: x[1])
             model_percentage = (top_model[1] / total_cost * 100) if total_cost > 0 else 0
             insights.append(
-                f"🤖 Most expensive model: {top_model[0]} (${top_model[1]:.2f}, {model_percentage:.1f}%)"
+                f"🤖 Most expensive model: {top_model[0]} ({render_dollars(top_model[1])}, {model_percentage:.1f}%)"
             )
 
         return insights
@@ -1271,7 +1272,7 @@ class BusinessAnalyticsEngine:
 
             # Overall spike insights
             insights.append(f"🚨 Cost spike investigation for {period.replace('_', ' ').lower()}")
-            insights.append(f"📊 Analysis threshold: ${threshold:.2f}")
+            insights.append(f"📊 Analysis threshold: {render_dollars(threshold)}")
 
             if contributors:
                 insights.append(f"🔍 Identified {len(contributors)} spike contributors")
@@ -1293,10 +1294,10 @@ class BusinessAnalyticsEngine:
                         f"🏆 Primary spike driver: {top_contributor.get('name', 'Unknown')} ({top_contributor.get('type', 'unknown')})"
                     )
                     insights.append(
-                        f"💰 Spike cost: ${spike_cost:.2f} (baseline: ${baseline_cost:.2f})"
+                        f"💰 Spike cost: {render_dollars(spike_cost)} (baseline: {render_dollars(baseline_cost)})"
                     )
                     insights.append(
-                        f"📈 Cost increase: ${increase:.2f} ({percentage_display:+.1f}%) [UNIFIED CALCULATION]"
+                        f"📈 Cost increase: {render_dollars(increase)} ({percentage_display:+.1f}%) [UNIFIED CALCULATION]"
                     )
                 else:
                     # Fallback to old logic if unified calculation not available
@@ -1305,10 +1306,10 @@ class BusinessAnalyticsEngine:
                         f"🏆 Primary spike driver: {top_contributor.get('name', 'Unknown')} ({top_contributor.get('type', 'unknown')})"
                     )
                     insights.append(
-                        f"💰 Spike cost: ${spike_cost:.2f} (baseline: ${baseline_cost:.2f})"
+                        f"💰 Spike cost: {render_dollars(spike_cost)} (baseline: {render_dollars(baseline_cost)})"
                     )
                     insights.append(
-                        f"📈 Cost increase: ${increase:.2f} ({percentage_increase:+.1f}%) [OLD LOGIC - FIX NOT APPLIED]"
+                        f"📈 Cost increase: {render_dollars(increase)} ({percentage_increase:+.1f}%) [OLD LOGIC - FIX NOT APPLIED]"
                     )
 
                 # Provider-specific insights
@@ -1425,9 +1426,9 @@ class BusinessAnalyticsEngine:
         net_profit = getattr(profitability_data, "net_profit", 0)
         profit_margin = getattr(profitability_data, "profit_margin", 0)
 
-        insights.append(f"💰 Total Revenue: ${total_revenue:,.2f}")
-        insights.append(f"💸 Total Cost: ${total_cost:,.2f}")
-        insights.append(f"📈 Net Profit: ${net_profit:,.2f}")
+        insights.append(f"💰 Total Revenue: {render_dollars(total_revenue)}")
+        insights.append(f"💸 Total Cost: {render_dollars(total_cost)}")
+        insights.append(f"📈 Net Profit: {render_dollars(net_profit)}")
         insights.append(f"📊 Profit Margin: {profit_margin:.1f}%")
 
         # Profitability health assessment
@@ -1459,7 +1460,7 @@ class BusinessAnalyticsEngine:
                     profitability_by_customer.items(), key=lambda x: x[1].get("profit", 0)
                 )
                 insights.append(
-                    f"🏆 Top customer: {top_customer[0]} (${top_customer[1].get('profit', 0):,.2f} profit)"
+                    f"🏆 Top customer: {top_customer[0]} ({render_dollars(top_customer[1].get('profit', 0))} profit)"
                 )
 
         # Product profitability insights
@@ -1481,7 +1482,7 @@ class BusinessAnalyticsEngine:
                     profitability_by_product.items(), key=lambda x: x[1].get("profit", 0)
                 )
                 insights.append(
-                    f"🥇 Top product: {top_product[0]} (${top_product[1].get('profit', 0):,.2f} profit)"
+                    f"🥇 Top product: {top_product[0]} ({render_dollars(top_product[1].get('profit', 0))} profit)"
                 )
 
         return insights
@@ -1560,7 +1561,7 @@ class BusinessAnalyticsEngine:
 
                     insights.append(f"🤖 Model breakdown: {total_models} models analyzed")
                     insights.append(
-                        f"🏆 Top model: {top_model[0]} (${top_model[1]:.2f}, {top_model_percentage:.1f}%)"
+                        f"🏆 Top model: {top_model[0]} ({render_dollars(top_model[1])}, {top_model_percentage:.1f}%)"
                     )
 
                     # Identify expensive models
@@ -1583,7 +1584,7 @@ class BusinessAnalyticsEngine:
 
                     insights.append(f"🏢 Provider breakdown: {total_providers} providers analyzed")
                     insights.append(
-                        f"🏆 Top provider: {top_provider[0]} (${top_provider[1]:.2f}, {top_provider_percentage:.1f}%)"
+                        f"🏆 Top provider: {top_provider[0]} ({render_dollars(top_provider[1])}, {top_provider_percentage:.1f}%)"
                     )
 
             # Customer breakdown insights
@@ -1594,7 +1595,7 @@ class BusinessAnalyticsEngine:
                     top_customer = max(cost_by_customer.items(), key=lambda x: x[1])
 
                     insights.append(f"👥 Customer breakdown: {total_customers} customers analyzed")
-                    insights.append(f"🏆 Top customer: {top_customer[0]} (${top_customer[1]:.2f})")
+                    insights.append(f"🏆 Top customer: {top_customer[0]} ({render_dollars(top_customer[1])})")
 
             # Product breakdown insights
             if "cost_by_product" in breakdown_data:
@@ -1604,7 +1605,7 @@ class BusinessAnalyticsEngine:
                     top_product = max(cost_by_product.items(), key=lambda x: x[1])
 
                     insights.append(f"📦 Product breakdown: {total_products} products analyzed")
-                    insights.append(f"🏆 Top product: {top_product[0]} (${top_product[1]:.2f})")
+                    insights.append(f"🏆 Top product: {top_product[0]} ({render_dollars(top_product[1])})")
 
             # Task breakdown insights
             if "cost_by_task" in breakdown_data:
@@ -1614,7 +1615,7 @@ class BusinessAnalyticsEngine:
                     top_task = max(cost_by_task.items(), key=lambda x: x[1])
 
                     insights.append(f"📋 Task breakdown: {total_tasks} task types analyzed")
-                    insights.append(f"🏆 Top task type: {top_task[0]} (${top_task[1]:.2f})")
+                    insights.append(f"🏆 Top task type: {top_task[0]} ({render_dollars(top_task[1])})")
 
             # Agent breakdown insights
             if "cost_by_agent" in breakdown_data:
@@ -1628,7 +1629,7 @@ class BusinessAnalyticsEngine:
 
                         insights.append(f"👤 Agent breakdown: {total_agents} agents analyzed")
                         insights.append(
-                            f"🏆 Top agent: {top_agent.get('name', 'Unknown')} (${top_agent.get('cost', 0):.2f})"
+                            f"🏆 Top agent: {top_agent.get('name', 'Unknown')} ({render_dollars(top_agent.get('cost', 0))})"
                         )
 
                         # Identify high-cost agents
@@ -1787,18 +1788,18 @@ class BusinessAnalyticsEngine:
 
             # Cost insights
             if total_cost > 0:
-                insights.append(f"💰 Total transaction costs for {period}: ${total_cost:.2f}")
+                insights.append(f"💰 Total transaction costs for {period}: {render_dollars(total_cost)}")
 
                 if avg_cost_per_transaction > 0:
                     insights.append(
-                        f"📊 Average cost per transaction: ${avg_cost_per_transaction:.4f}"
+                        f"📊 Average cost per transaction: {render_rounded_dollars(avg_cost_per_transaction)}"
                     )
 
             # Provider insights
             if cost_by_provider:
                 top_provider = max(cost_by_provider.items(), key=lambda x: x[1])
                 insights.append(
-                    f"🏆 Top provider by cost: {top_provider[0]} (${top_provider[1]:.2f})"
+                    f"🏆 Top provider by cost: {top_provider[0]} ({render_dollars(top_provider[1])})"
                 )
 
                 if len(cost_by_provider) > 1:
@@ -1808,7 +1809,7 @@ class BusinessAnalyticsEngine:
             # Model insights
             if cost_by_model:
                 top_model = max(cost_by_model.items(), key=lambda x: x[1])
-                insights.append(f"🤖 Top model by cost: {top_model[0]} (${top_model[1]:.2f})")
+                insights.append(f"🤖 Top model by cost: {top_model[0]} ({render_dollars(top_model[1])})")
 
             # Performance insights
             if performance_metrics:
@@ -1819,7 +1820,7 @@ class BusinessAnalyticsEngine:
                         )
                     if "avg_cost_per_transaction" in metrics:
                         insights.append(
-                            f"💡 {provider} avg cost: ${metrics['avg_cost_per_transaction']:.4f}/transaction"
+                            f"💡 {provider} avg cost: {render_rounded_dollars(metrics['avg_cost_per_transaction'])}/transaction"
                         )
 
         except Exception as e:
@@ -1855,7 +1856,7 @@ class BusinessAnalyticsEngine:
                 if cost_difference > 10:  # Significant cost difference
                     recommendations.append(
                         f"💡 Consider optimizing {highest_cost_provider[0]} usage - "
-                        f"${cost_difference:.2f} higher than {lowest_cost_provider[0]}"
+                        f"{render_dollars(cost_difference)} higher than {lowest_cost_provider[0]}"
                     )
 
             # Performance optimization recommendations
@@ -1870,7 +1871,7 @@ class BusinessAnalyticsEngine:
             # Transaction efficiency recommendations
             if avg_cost_per_transaction > 0.01:  # High cost per transaction
                 recommendations.append(
-                    f"🎯 Average cost per transaction (${avg_cost_per_transaction:.4f}) suggests "
+                    f"🎯 Average cost per transaction ({render_rounded_dollars(avg_cost_per_transaction)}) suggests "
                     "opportunities for batch processing or model optimization"
                 )
 
@@ -1880,7 +1881,7 @@ class BusinessAnalyticsEngine:
                 if len(models_sorted) > 1:
                     top_model = models_sorted[0]
                     recommendations.append(
-                        f"🤖 {top_model[0]} accounts for highest model costs (${top_model[1]:.2f}) - "
+                        f"🤖 {top_model[0]} accounts for highest model costs ({render_dollars(top_model[1])}) - "
                         "evaluate if smaller models could handle some workloads"
                     )
 
@@ -1920,16 +1921,16 @@ class BusinessAnalyticsEngine:
 
                 # Cost insights
                 if total_cost > 0:
-                    insights.append(f"💰 Total customer costs: ${total_cost:.2f}")
+                    insights.append(f"💰 Total customer costs: {render_dollars(total_cost)}")
                     avg_cost_per_customer = total_cost / len(organizations)
-                    insights.append(f"📈 Average cost per customer: ${avg_cost_per_customer:.2f}")
+                    insights.append(f"📈 Average cost per customer: {render_dollars(avg_cost_per_customer)}")
 
                 # Revenue insights
                 if total_revenue > 0:
-                    insights.append(f"💵 Total customer revenue: ${total_revenue:.2f}")
+                    insights.append(f"💵 Total customer revenue: {render_dollars(total_revenue)}")
                     avg_revenue_per_customer = total_revenue / len(organizations)
                     insights.append(
-                        f"📊 Average revenue per customer: ${avg_revenue_per_customer:.2f}"
+                        f"📊 Average revenue per customer: {render_dollars(avg_revenue_per_customer)}"
                     )
 
                 # Profitability insights
@@ -1947,7 +1948,7 @@ class BusinessAnalyticsEngine:
                     )
                     if top_customer[1].get("profit", 0) > 0:
                         insights.append(
-                            f"🏆 Top customer: {top_customer[0]} (${top_customer[1]['profit']:.2f} profit)"
+                            f"🏆 Top customer: {top_customer[0]} ({render_dollars(top_customer[1]['profit'])} profit)"
                         )
 
                 # Overall margin insights
@@ -2065,16 +2066,16 @@ class BusinessAnalyticsEngine:
 
                 # Cost insights
                 if total_cost > 0:
-                    insights.append(f"💰 Total product costs: ${total_cost:.2f}")
+                    insights.append(f"💰 Total product costs: {render_dollars(total_cost)}")
                     avg_cost_per_product = total_cost / len(products)
-                    insights.append(f"📈 Average cost per product: ${avg_cost_per_product:.2f}")
+                    insights.append(f"📈 Average cost per product: {render_dollars(avg_cost_per_product)}")
 
                 # Revenue insights
                 if total_revenue > 0:
-                    insights.append(f"💵 Total product revenue: ${total_revenue:.2f}")
+                    insights.append(f"💵 Total product revenue: {render_dollars(total_revenue)}")
                     avg_revenue_per_product = total_revenue / len(products)
                     insights.append(
-                        f"📊 Average revenue per product: ${avg_revenue_per_product:.2f}"
+                        f"📊 Average revenue per product: {render_dollars(avg_revenue_per_product)}"
                     )
 
                 # Profitability insights
@@ -2092,7 +2093,7 @@ class BusinessAnalyticsEngine:
                     )
                     if top_product[1].get("profit", 0) > 0:
                         insights.append(
-                            f"🏆 Top product: {top_product[0]} (${top_product[1]['profit']:.2f} profit)"
+                            f"🏆 Top product: {top_product[0]} ({render_dollars(top_product[1]['profit'])} profit)"
                         )
 
                 # Overall margin insights
@@ -2210,9 +2211,9 @@ class BusinessAnalyticsEngine:
 
                 # Cost insights
                 if total_cost > 0:
-                    insights.append(f"💰 Total agent costs: ${total_cost:.2f}")
+                    insights.append(f"💰 Total agent costs: {render_dollars(total_cost)}")
                     avg_cost_per_agent = total_cost / len(agents)
-                    insights.append(f"📈 Average cost per agent: ${avg_cost_per_agent:.2f}")
+                    insights.append(f"📈 Average cost per agent: {render_dollars(avg_cost_per_agent)}")
 
                 # Call volume insights
                 if total_calls > 0:
@@ -2244,7 +2245,7 @@ class BusinessAnalyticsEngine:
                 # Cost per call insights
                 avg_cost_per_call = period_analysis.get("average_cost_per_call", 0.0)
                 if avg_cost_per_call > 0:
-                    insights.append(f"💸 Average cost per call: ${avg_cost_per_call:.4f}")
+                    insights.append(f"💸 Average cost per call: {render_rounded_dollars(avg_cost_per_call)}")
 
         except Exception as e:
             logger.error(f"Error generating agent analytics insights: {e}")
@@ -2312,7 +2313,7 @@ class BusinessAnalyticsEngine:
             avg_cost_per_call = period_analysis.get("average_cost_per_call", 0.0)
             if avg_cost_per_call > 0.005:  # $0.005 threshold
                 recommendations.append(
-                    f"💡 Average cost per call (${avg_cost_per_call:.4f}) is high - "
+                    f"💡 Average cost per call ({render_rounded_dollars(avg_cost_per_call)}) is high - "
                     "review agent efficiency and model selection"
                 )
 
@@ -2358,11 +2359,11 @@ class BusinessAnalyticsEngine:
 
                 # Cost insights
                 if total_cost > 0:
-                    insights.append(f"💰 Total task costs: ${total_cost:.2f}")
+                    insights.append(f"💰 Total task costs: {render_dollars(total_cost)}")
                     if provider_count > 0:
                         avg_cost_per_provider = total_cost / provider_count
                         insights.append(
-                            f"📈 Average cost per provider: ${avg_cost_per_provider:.2f}"
+                            f"📈 Average cost per provider: {render_dollars(avg_cost_per_provider)}"
                         )
 
                 # Performance insights

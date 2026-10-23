@@ -11,6 +11,8 @@ from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from src.revenium_mcp_server.tools_decomposed.system_setup import SystemSetup
 from mcp.types import TextContent
 
+from tests.unit._helpers_bare_calls import bare_setup_calls_in
+
 
 @pytest.fixture
 def setup_tool():
@@ -26,6 +28,11 @@ def setup_tool():
         return_value=[TextContent(type="text", text="email result")]
     )
     return tool
+
+
+async def _email_capability(setup_tool):
+    capabilities = await setup_tool._get_tool_capabilities()
+    return next(c for c in capabilities if c.name == "Email Configuration Management")
 
 
 class TestSystemSetupRouting:
@@ -151,3 +158,99 @@ async def test_update_email_on_the_hosted_server_is_refused_through_system_setup
         )
     assert exc_info.value.error_code == ErrorCodes.ACTION_NOT_SUPPORTED
     assert "not available on the hosted server" in exc_info.value.message
+
+
+class TestGetExamplesNamesTheCallsThisServerAccepts:
+    """get_examples never sends a hosted caller to update_email, and names system_setup calls."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_mode", ["api_key", "clerk"])
+    async def test_hosted_examples_never_name_update_email(self, setup_tool, monkeypatch, auth_mode):
+        monkeypatch.setenv("AUTH_MODE", auth_mode)
+        text = (await setup_tool.handle_action("get_examples", {}))[0].text
+        assert "update_email" not in text
+        assert "manage_alerts(action='create_simple', threshold=100, email=" in text
+        assert "`setup_checklist()`" not in text
+
+    @pytest.mark.asyncio
+    async def test_local_examples_name_update_email_through_system_setup(self, setup_tool, monkeypatch):
+        monkeypatch.delenv("AUTH_MODE", raising=False)
+        text = (await setup_tool.handle_action("get_examples", {}))[0].text
+        assert '"action": "update_email"' in text
+        assert "system_setup(action='update_email', email='" in text
+        assert "`setup_checklist()`" not in text
+        assert "system_setup(action='setup_checklist')" in text
+
+
+def _email_examples_section(text):
+    return text.split("## **Email Configuration Examples**", 1)[1].split("## **Complete Setup Workflows**", 1)[0]
+
+
+class TestHelpHeadingsAndCalls:
+    """system_setup's help keeps the email example inside its section and names working calls."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "auth_mode,heading,absent_heading",
+        [
+            ("env", "### **Update Email Address**", None),
+            ("api_key", "### **Set the Notification Email**", "### **Update Email Address**"),
+        ],
+    )
+    async def test_the_set_email_example_is_a_subsection_of_the_email_examples(
+        self, setup_tool, monkeypatch, auth_mode, heading, absent_heading
+    ):
+        monkeypatch.setenv("AUTH_MODE", auth_mode)
+        text = (await setup_tool.handle_action("get_examples", {}))[0].text
+        section = _email_examples_section(text)
+        assert "\n## " not in section
+        assert heading in section
+        if absent_heading:
+            assert absent_heading not in section
+
+    @pytest.mark.asyncio
+    async def test_the_workflow_completes_setup_with_its_confirmation(self, setup_tool):
+        text = (await setup_tool.handle_action("get_examples", {}))[0].text
+        assert "`system_setup(action='complete_setup', confirm_completion=True)`" in text
+        assert "`system_setup(action='complete_setup')`" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_mode", ["env", "api_key"])
+    async def test_capabilities_summary_and_quick_start_name_system_setup_calls(
+        self, setup_tool, monkeypatch, auth_mode
+    ):
+        monkeypatch.setenv("AUTH_MODE", auth_mode)
+        texts = [
+            (await setup_tool.handle_action("get_capabilities", {}))[0].text,
+            (await setup_tool.handle_action("get_agent_summary", {}))[0].text,
+            "\n".join(await setup_tool._get_quick_start_guide()),
+            "\n".join(
+                example
+                for capability in await setup_tool._get_tool_capabilities()
+                for example in capability.examples
+            ),
+        ]
+        for text in texts:
+            assert not bare_setup_calls_in(text), text
+        assert "system_setup(action='complete_setup', confirm_completion=True)" in texts[0]
+        assert "system_setup(action='get_examples')" in texts[0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_mode", ["api_key", "clerk"])
+    async def test_hosted_capabilities_do_not_offer_update_email(
+        self, setup_tool, monkeypatch, auth_mode
+    ):
+        monkeypatch.setenv("AUTH_MODE", auth_mode)
+        text = (await setup_tool.handle_action("get_capabilities", {}))[0].text
+        assert "`update_email` - Not available on this server" in text
+        assert "system_setup(action='update_email'" not in text
+        email_capability = await _email_capability(setup_tool)
+        assert "update_email" not in email_capability.parameters
+
+    @pytest.mark.asyncio
+    async def test_local_capabilities_offer_update_email(self, setup_tool, monkeypatch):
+        monkeypatch.delenv("AUTH_MODE", raising=False)
+        text = (await setup_tool.handle_action("get_capabilities", {}))[0].text
+        assert "system_setup(action='update_email', email='your@email.com')" in text
+        email_capability = await _email_capability(setup_tool)
+        assert "update_email" in email_capability.parameters

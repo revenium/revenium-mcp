@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
 
 from ..auth.claims_middleware import current_tenant_context
+from ..client import ReveniumAPIError
 from .department_aliases import resolve_department_aliases
 from .dry_run_guard import normalise_dry_run, refuse_unsupported_dry_run
 from ..log_context import bind_tenant_context, clear_tenant_context, sanitize_error_message
@@ -52,7 +53,7 @@ async def standardized_tool_execution(
         UCMError: For UCM integration failures
     """
     from ..capability_manager.integration_service import ucm_integration_service
-    from ..common.error_handling import IntrospectionError, ToolError, ToolExecutionError
+    from ..common.error_handling import IntrospectionError, ToolError
     from ..introspection.integration import introspection_integration
 
     action, arguments = resolve_department_aliases(tool_name, action, arguments)
@@ -121,6 +122,10 @@ async def standardized_tool_execution(
             # waits only to raise the same error; introspection-layer failures
             # (ToolExecutionError subclasses) still fall back below.
             raise
+        except ReveniumAPIError as platform_error:
+            # Same reason as ToolError: a rerun doubles a timeout and resends a
+            # write the platform may already have committed (BACK-4841).
+            raise _execution_failure(platform_error, tool_name, action) from platform_error
         except (IntrospectionError, Exception) as e:
             # Introspection failed, fall back to direct execution
             introspection_time = (time.time() - introspection_start) * 1000
@@ -183,22 +188,7 @@ async def standardized_tool_execution(
                     # Re-raise the ToolError directly to preserve user-friendly message
                     raise fallback_error
 
-                error_str = sanitize_error_message(str(fallback_error))
-                if any(indicator in error_str for indicator in [
-                    "Invalid organization ID format",
-                    "Invalid subscriber",
-                    "Invalid user",
-                    "not found",
-                    "validation error",
-                    "missing parameter"
-                ]):
-                    raise ToolExecutionError(error_str, tool_name=tool_name, action=action)
-
-                raise ToolExecutionError(
-                    f"Tool execution failed: {error_str}",
-                    tool_name=tool_name,
-                    action=action,
-                )
+                raise _execution_failure(fallback_error, tool_name, action)
 
     except PermissionError:
         # Auth failures are expected control flow in clerk/api_key mode, not a
@@ -218,6 +208,28 @@ async def standardized_tool_execution(
         raise
     finally:
         clear_tenant_context(tokens)
+
+
+_SELF_EXPLAINING_ERROR_MARKERS = (
+    "Invalid organization ID format",
+    "Invalid subscriber",
+    "Invalid user",
+    "not found",
+    "validation error",
+    "missing parameter",
+)
+
+
+def _execution_failure(error: Exception, tool_name: str, action: str) -> Exception:
+    """The error the caller sees for an action that raised something other than a ToolError."""
+    from .error_handling import ToolExecutionError
+
+    error_str = sanitize_error_message(str(error))
+    if any(marker in error_str for marker in _SELF_EXPLAINING_ERROR_MARKERS):
+        return ToolExecutionError(error_str, tool_name=tool_name, action=action)
+    return ToolExecutionError(
+        f"Tool execution failed: {error_str}", tool_name=tool_name, action=action
+    )
 
 
 async def _carry_guidance_to_caller(error: Any, tool_name: str, tool_class: Any) -> None:

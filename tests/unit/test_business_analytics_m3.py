@@ -687,7 +687,7 @@ class TestFormatAnomalyResultsMarkdown:
         out = fmt(payload)
         assert "# Cost Anomaly Analysis — SEVEN_DAYS" in out
         assert "**Total anomalies detected:** 2" in out
-        assert "**Time groups analyzed:** 7" in out
+        assert "**Time groups analyzed for anomalies:** 7" in out
         assert "| OPENAI | provider | Monday | $123.45 |" in out
         assert "$10.00–$20.00" in out
         assert "### Anomaly Context" in out
@@ -1172,6 +1172,7 @@ class TestAnalyticsPackActions:
     @pytest.mark.asyncio
     async def test_token_breakdown_forwards_providers(self, mock_cls, tool):
         instance = self._mock_method(mock_cls, "get_token_breakdown", _TS_BUCKETS)
+        instance.get_analytics_filter_options = AsyncMock(return_value=["openai"])
         await tool.handle_action(
             "get_token_breakdown", {"period": "SEVEN_DAYS", "providers": ["openai"]}
         )
@@ -2041,7 +2042,9 @@ class TestHandleListPeriodCharges:
             (0.23200000000000004, "| 0.232 USD |", "0.23200000000000004"),
             (0.7999999999999999, "| 0.80 USD |", "0.7999"),
             (1e-12, "| 0.000000000001 USD |", "0.00 USD"),
-            (1234.56789012345, "| 1234.56789012345 USD |", "1234.56789012 USD"),
+            (1234.56789012345, "| 1234.56789 USD |", "1234.567890 USD"),
+            (0.534666666666667, "| 0.534667 USD |", "0.5346666"),
+            (0.0000015, "| 0.0000015 USD |", "0.000002 USD"),
         ],
     )
     async def test_float_noise_in_a_charge_is_not_printed(self, tool, amount, shown, hidden):
@@ -2742,13 +2745,20 @@ class TestAnomalyAnswerWhenAReportFails:
 
 # ────────────────────────────────────────────────────────────────────────────
 # analyze_cost_anomalies new-entity detection
-# ────────────────────────────────────────────────────────────────────────────
-
 _DIMENSION_PATHS = {
     "total-cost-by-provider-over-time": "providers",
     "cost-metrics-by-agents-over-time": "agents",
     "cost-metrics-by-subscriber-credential": "api_keys",
+    "/api/v2/analytics/cost-by-provider": "providers",
+    "/api/v2/analytics/cost-by-agent": "agents",
+    "/api/v2/analytics/cost-by-api-key": "api_keys",
 }
+
+# The instant detection treats as now, so its window and comparison bounds are fixed
+_NOW = datetime(2026, 10, 16, 12, tzinfo=timezone.utc)
+_NOW_ISO = "2026-10-16T12:00:00.000Z"
+WINDOW = "window"
+COMPARISON = "comparison"
 
 
 def _months_from(year, month, count):
@@ -2759,33 +2769,43 @@ def _months_from(year, month, count):
     return starts
 
 
-def _bucket_starts(period):
-    """The bucket starts the legacy report answers for each period."""
-    if period == "SEVEN_DAYS":
-        first = datetime(2026, 10, 3, tzinfo=timezone.utc)
-        return [first + timedelta(hours=12 * index) for index in range(14)]
-    if period == "THIRTY_DAYS":
-        first = datetime(2026, 9, 10, tzinfo=timezone.utc)
+def _half_days_from(first, count=14):
+    return [first + timedelta(hours=12 * index) for index in range(count)]
+
+
+def _bucket_starts(part):
+    """The bucket starts a report answers for a period name, or for a detection read."""
+    if part == WINDOW:
+        return _half_days_from(datetime(2026, 10, 9, 12, tzinfo=timezone.utc))
+    if part == COMPARISON:
+        return _half_days_from(datetime(2026, 10, 2, 12, tzinfo=timezone.utc))
+    if part == "SEVEN_DAYS":
+        return _half_days_from(datetime(2026, 10, 9, tzinfo=timezone.utc), count=15)
+    if part == "THIRTY_DAYS":
+        first = datetime(2026, 9, 16, tzinfo=timezone.utc)
         return [first + timedelta(days=index) for index in range(30)]
-    if period == "TWELVE_MONTHS":
+    if part == "TWELVE_MONTHS":
         return _months_from(2025, 11, 12)
-    if period == "TWENTY_FOUR_HOURS":
-        first = datetime(2026, 10, 16, tzinfo=timezone.utc)
+    if part == "TWENTY_FOUR_HOURS":
+        first = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
         return [first + timedelta(hours=index) for index in range(24)]
-    if period == "EIGHT_HOURS":
-        first = datetime(2026, 10, 16, 8, tzinfo=timezone.utc)
+    if part == "EIGHT_HOURS":
+        first = datetime(2026, 10, 16, 4, tzinfo=timezone.utc)
         return [first + timedelta(hours=index) for index in range(8)]
-    first = datetime(2026, 10, 16, 15, tzinfo=timezone.utc)
+    first = datetime(2026, 10, 16, 11, tzinfo=timezone.utc)
     return [first + timedelta(minutes=15 * index) for index in range(4)]
 
 
 class _NewEntityReports:
-    """Legacy over-time reports answered by period, recording each (path, period) read.
+    """Over-time reports for the anomaly read (by period) and the two detection reads.
 
-    ``costs`` maps (dimension, period) to {group name: one cost per bucket}, where
-    None leaves the group out of that bucket. A report not named answers openai
-    at $20 in every bucket. ``starts`` maps a period, or a (dimension, period),
-    to the bucket starts that report answers.
+    The anomaly read goes to the legacy route with a period name; detection reads
+    the analytics route with startDate/endDate, and a read ending at _NOW is the
+    window, any other the comparison period. ``costs`` maps (dimension, part) to
+    {group name: one cost per bucket}, where part is a period name, WINDOW or
+    COMPARISON and None leaves the group out of that bucket. A report not named
+    answers openai at $20 in every bucket. ``starts`` maps a part, or a
+    (dimension, part), to the bucket starts that report answers.
     """
 
     def __init__(self, costs=None, failing=(), starts=None, epoch_ms=False, reverse=False):
@@ -2796,22 +2816,29 @@ class _NewEntityReports:
         self.epoch_ms = epoch_ms
         self.reverse = reverse
         self.calls = []
+        self.detection_bounds = []
 
     def _stamp(self, start):
         if self.epoch_ms:
             return int(start.timestamp() * 1000)
         return f"{start:%Y-%m-%dT%H:%M:%S}.000Z"
 
+    def _part(self, params, analytics_route):
+        if not analytics_route:
+            return params.get("period")
+        self.detection_bounds.append((params["startDate"], params["endDate"]))
+        return WINDOW if params["endDate"] == _NOW_ISO else COMPARISON
+
     async def get(self, path, params=None, **kwargs):
-        period = (params or {}).get("period")
-        self.calls.append((path, period))
+        params = params or {}
+        analytics_route = bool(kwargs.get("use_bearer"))
+        part = self._part(params, analytics_route)
+        self.calls.append((path, part))
         dimension = next(name for fragment, name in _DIMENSION_PATHS.items() if fragment in path)
-        if (dimension, period) in self.failing:
+        if (dimension, part) in self.failing:
             raise ReveniumAPIError("Gateway timeout", status_code=504)
-        starts = self.starts.get(
-            (dimension, period), self.starts.get(period, _bucket_starts(period))
-        )
-        costs = self.costs.get((dimension, period), {"openai": [20.0] * len(starts)})
+        starts = self.starts.get((dimension, part), self.starts.get(part, _bucket_starts(part)))
+        costs = self.costs.get((dimension, part), {"openai": [20.0] * len(starts)})
         buckets = [
             {
                 "startTimestamp": self._stamp(start),
@@ -2825,16 +2852,24 @@ class _NewEntityReports:
         ]
         if self.reverse:
             buckets.reverse()
-        return buckets
+        if not analytics_route:
+            return buckets
+        return {
+            "_embedded": {"items": buckets},
+            "page": {"number": 0, "size": 100, "totalPages": 1, "totalElements": len(buckets)},
+        }
 
 
 def _gap_provider_week():
-    """openai misses one baseline and one recent bucket; newprov has cost in buckets 9, 10 and 12."""
+    """openai misses buckets in both reads; newprov has window cost in buckets 9, 10 and 12 only."""
     openai = [20.0] * 14
     openai[1] = None
     openai[11] = None
     newprov = [None] * 9 + [50.0, 50.0, None, 50.0, None]
-    return {("providers", "SEVEN_DAYS"): {"openai": openai, "newprov": newprov}}
+    return {
+        ("providers", WINDOW): {"openai": openai, "newprov": newprov},
+        ("providers", COMPARISON): {"openai": openai},
+    }
 
 
 def _section(answer):
@@ -2843,6 +2878,13 @@ def _section(answer):
     start = answer.index("## New Entities")
     end = answer.find("\n## ", start + 1)
     return answer[start:] if end == -1 else answer[start:end]
+
+
+@pytest.fixture
+def frozen_now(monkeypatch):
+    from src.revenium_mcp_server.analytics import enhanced_spike_analyzer
+
+    monkeypatch.setattr(enhanced_spike_analyzer, "utc_now", lambda: _NOW)
 
 
 async def _registered_answer(monkeypatch, reports, arguments):
@@ -2874,8 +2916,9 @@ async def _registered_answer(monkeypatch, reports, arguments):
     return "\n".join(getattr(block, "text", "") for block in result.content)
 
 
+@pytest.mark.usefixtures("frozen_now")
 class TestNewEntityDetectionAnswer:
-    """New-entity detection reports what appeared, when, and which window it compared."""
+    """New-entity detection reports what appeared, when, and which period it compared with."""
 
     async def _answer(self, tool, monkeypatch, reports, period, **arguments):
         monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
@@ -2886,7 +2929,7 @@ class TestNewEntityDetectionAnswer:
         return result[0].text
 
     @pytest.mark.asyncio
-    async def test_a_provider_absent_from_the_baseline_is_reported_as_new_with_its_first_bucket_date(
+    async def test_a_provider_absent_from_the_comparison_period_is_reported_as_new_with_its_first_bucket_date(
         self, monkeypatch
     ):
         monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
@@ -2905,81 +2948,181 @@ class TestNewEntityDetectionAnswer:
 
         section = _section(answer)
         assert "**NEWPROV** (new)" in section
-        assert "first active 2026-10-07" in section
-        assert "active in 3 of 10 recent buckets" in section
-        assert "the 4 buckets starting 2026-10-03 00:00 UTC to 2026-10-04 12:00 UTC" in section
-        assert "no cost from 2026-10-03 00:00 UTC to 2026-10-04 12:00 UTC" in section
+        assert "first active 2026-10-14" in section
+        assert "active in 3 of 14 recent buckets" in section
+        assert "the 14 buckets starting 2026-10-02 12:00 UTC to 2026-10-09 00:00 UTC" in section
+        assert "no cost from 2026-10-02 12:00 UTC to 2026-10-09 00:00 UTC" in section
         assert "OPENAI" not in section
 
     @pytest.mark.asyncio
-    async def test_a_provider_dormant_in_the_baseline_is_reported_as_activated(
+    @pytest.mark.parametrize(
+        "period, window_start, comparison_start",
+        [
+            ("SEVEN_DAYS", "2026-10-09T12:00:00.000Z", "2026-10-02T12:00:00.000Z"),
+            ("THIRTY_DAYS", "2026-09-16T12:00:00.000Z", "2026-08-17T12:00:00.000Z"),
+            ("TWELVE_MONTHS", "2025-10-16T12:00:00.000Z", "2024-10-16T12:00:00.000Z"),
+            ("TWENTY_FOUR_HOURS", "2026-10-15T12:00:00.000Z", "2026-10-08T12:00:00.000Z"),
+            ("EIGHT_HOURS", "2026-10-16T04:00:00.000Z", "2026-10-09T04:00:00.000Z"),
+            ("HOUR", "2026-10-16T11:00:00.000Z", "2026-10-09T11:00:00.000Z"),
+        ],
+    )
+    async def test_detection_reads_the_window_and_the_period_just_before_it(
+        self, tool, monkeypatch, period, window_start, comparison_start
+    ):
+        """Same length as the window, never under 7 days, ending a millisecond before it (BACK-4842)."""
+        reports = _NewEntityReports()
+
+        await self._answer(tool, monkeypatch, reports, period)
+
+        comparison_end = (
+            datetime.fromisoformat(window_start.replace("Z", "+00:00")) - timedelta(milliseconds=1)
+        ).strftime("%Y-%m-%dT%H:%M:%S.999Z")
+        assert sorted(reports.detection_bounds) == sorted(
+            [(window_start, _NOW_ISO), (comparison_start, comparison_end)]
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "period, length, floor",
+        [
+            ("SEVEN_DAYS", "7 days", False),
+            ("THIRTY_DAYS", "30 days", False),
+            ("TWELVE_MONTHS", "12 months", False),
+            ("HOUR", "7 days", True),
+            ("EIGHT_HOURS", "7 days", True),
+            ("TWENTY_FOUR_HOURS", "7 days", True),
+        ],
+    )
+    async def test_the_answer_states_the_comparison_period_it_used(
+        self, tool, monkeypatch, period, length, floor
+    ):
+        reports = _NewEntityReports()
+
+        section = _section(await self._answer(tool, monkeypatch, reports, period))
+
+        stated = next(line for line in section.splitlines() if "comparison period is" in line)
+        assert stated.startswith(f"The comparison period is the {length} before the {period} window")
+        assert ("no window is compared with less than 7 days" in stated) is floor
+        assert stated.endswith("the window ends 2026-10-16 12:00 UTC.")
+
+    @pytest.mark.asyncio
+    async def test_without_the_flag_the_time_group_count_names_the_anomaly_read_apart_from_detection(
         self, tool, monkeypatch
     ):
-        zeroprov = [5.0] + [0.0] * 8 + [30.0] * 5
-        reports = _NewEntityReports(
-            {("providers", "SEVEN_DAYS"): {"openai": [20.0] * 14, "zeroprov": zeroprov}}
-        )
+        """The legacy anomaly read and the analytics detection window return different grids."""
+        reports = _NewEntityReports()
+
+        answer = await self._answer(tool, monkeypatch, reports, "SEVEN_DAYS")
+
+        assert "**Time groups analyzed for anomalies:** 15" in answer
+        assert "**Time groups analyzed:**" not in answer
+        assert (
+            "in the recent part, the 14 buckets starting 2026-10-09 12:00 UTC to "
+            "2026-10-16 00:00 UTC"
+        ) in _section(answer)
+
+    @pytest.mark.asyncio
+    async def test_the_stated_comparison_period_names_its_bounds(self, tool, monkeypatch):
+        reports = _NewEntityReports()
 
         section = _section(await self._answer(tool, monkeypatch, reports, "SEVEN_DAYS"))
 
-        assert "**ZEROPROV** (activated)" in section
-        assert "**ZEROPROV** (new)" not in section
-        assert "first active 2026-10-07" in section
-        assert "no cost in 3 of 4 baseline buckets" in section
+        assert (
+            "The comparison period is the 7 days before the SEVEN_DAYS window: "
+            "2026-10-02 12:00 UTC up to 2026-10-09 12:00 UTC, where the window starts; "
+            "the window ends 2026-10-16 12:00 UTC."
+        ) in section
 
     @pytest.mark.asyncio
-    async def test_twelve_months_reports_a_provider_new_in_the_monthly_buckets(
+    async def test_an_agent_that_paused_and_resumed_in_the_window_is_not_new(
+        self, tool, monkeypatch
+    ):
+        """It ran in the week before, so a pause at the window's start does not make it new (BACK-4842)."""
+        pausebot_window = [None] * 5 + [12.0] * 9
+        pausebot_week_before = [12.0] * 10 + [None] * 4
+        reports = _NewEntityReports(
+            {
+                ("agents", WINDOW): {"steadybot": [10.0] * 14, "pausebot": pausebot_window},
+                ("agents", COMPARISON): {
+                    "steadybot": [10.0] * 14,
+                    "pausebot": pausebot_week_before,
+                },
+            }
+        )
+
+        section = _section(
+            await self._answer(
+                tool, monkeypatch, reports, "SEVEN_DAYS", include_dimensions=["agents"]
+            )
+        )
+
+        assert "PAUSEBOT" not in section
+        assert "No new agent appeared in the recent part" in section
+
+    @pytest.mark.asyncio
+    async def test_a_source_that_ran_in_the_year_before_is_not_new_over_twelve_months(
         self, tool, monkeypatch
     ):
         reports = _NewEntityReports(
             {
-                ("providers", "TWELVE_MONTHS"): {
+                ("providers", WINDOW): {
                     "openai": [20.0] * 12,
                     "newprov": [None] * 8 + [40.0] * 4,
-                }
-            }
+                    "oldprov": [None] * 8 + [40.0] * 4,
+                },
+                ("providers", COMPARISON): {
+                    "openai": [20.0] * 12,
+                    "oldprov": [15.0] * 12,
+                },
+            },
+            starts={
+                WINDOW: _months_from(2025, 11, 12),
+                COMPARISON: _months_from(2024, 11, 12),
+            },
         )
 
         section = _section(await self._answer(tool, monkeypatch, reports, "TWELVE_MONTHS"))
 
         assert "**NEWPROV** (new)" in section
+        assert "OLDPROV" not in section
         assert "first active 2026-07-01" in section
-        assert "the 1 bucket starting 2025-11-01" in section
-        assert "the 11 buckets starting 2025-12-01 to 2026-10-01" in section
+        assert "the 12 buckets starting 2025-11-01 to 2026-10-01" in section
+        assert "the 12 buckets starting 2024-11-01 to 2025-10-01" in section
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("period", ["HOUR", "EIGHT_HOURS", "TWENTY_FOUR_HOURS"])
-    async def test_a_short_window_reads_seven_days_for_new_entity_detection(
+    async def test_a_short_window_does_not_call_a_source_idle_overnight_new(
         self, tool, monkeypatch, period
     ):
-        hourly = len(_bucket_starts(period))
+        """A window shorter than the floor is compared with the 7 days before it (BACK-4842)."""
+        window_starts = _bucket_starts(period)
+        week_before = [
+            datetime(2026, 10, 9, tzinfo=timezone.utc) + timedelta(days=index)
+            for index in range(7)
+        ]
         reports = _NewEntityReports(
             {
-                ("providers", period): {
-                    "openai": [20.0] * hourly,
-                    "hourprov": [None] + [10.0] * (hourly - 1),
+                ("providers", WINDOW): {
+                    "openai": [20.0] * len(window_starts),
+                    "nightprov": [10.0] * len(window_starts),
+                    "newprov": [None] + [50.0] * (len(window_starts) - 1),
                 },
-                ("providers", "SEVEN_DAYS"): {
-                    "openai": [20.0] * 14,
-                    "hourprov": [10.0] * 14,
-                    "newprov": [None] * 9 + [50.0] * 5,
+                ("providers", COMPARISON): {
+                    "openai": [20.0] * 7,
+                    "nightprov": [10.0] * 6 + [None],
                 },
-            }
+            },
+            starts={WINDOW: window_starts, COMPARISON: week_before},
         )
 
         answer = await self._answer(tool, monkeypatch, reports, period)
 
-        assert [called_period for _, called_period in reports.calls] == [period, "SEVEN_DAYS"]
         header = answer.splitlines()[0]
         assert header.startswith("# Cost Anomaly Analysis") and header.endswith(period)
-        assert (
-            f"New-entity detection read SEVEN_DAYS of data (the 14 buckets starting "
-            f"2026-10-03 00:00 UTC to 2026-10-09 12:00 UTC), because {period} is too short"
-        ) in answer
         section = _section(answer)
         assert "**NEWPROV** (new)" in section
-        assert "HOURPROV" not in section
-        assert "2026-10-16" not in section
+        assert "NIGHTPROV" not in section
+        assert "the 7 buckets starting 2026-10-09 00:00 UTC to 2026-10-15 00:00 UTC" in section
 
     @pytest.mark.asyncio
     async def test_a_short_window_without_detection_sends_one_request(self, tool, monkeypatch):
@@ -2989,14 +3132,38 @@ class TestNewEntityDetectionAnswer:
 
         result = await tool._handle_analyze_cost_anomalies({"period": "TWENTY_FOUR_HOURS"})
 
-        assert [called_period for _, called_period in reports.calls] == ["TWENTY_FOUR_HOURS"]
+        assert [called_part for _, called_part in reports.calls] == ["TWENTY_FOUR_HOURS"]
         assert "SEVEN_DAYS" not in result[0].text
         assert "New Entities" not in result[0].text
 
     @pytest.mark.asyncio
+    async def test_a_provider_dormant_in_the_comparison_period_is_reported_as_activated(
+        self, tool, monkeypatch
+    ):
+        reports = _NewEntityReports(
+            {
+                ("providers", WINDOW): {
+                    "openai": [20.0] * 14,
+                    "zeroprov": [None] * 4 + [30.0] * 10,
+                },
+                ("providers", COMPARISON): {
+                    "openai": [20.0] * 14,
+                    "zeroprov": [5.0] + [0.0] * 13,
+                },
+            }
+        )
+
+        section = _section(await self._answer(tool, monkeypatch, reports, "SEVEN_DAYS"))
+
+        assert "**ZEROPROV** (activated)" in section
+        assert "**ZEROPROV** (new)" not in section
+        assert "first active 2026-10-11" in section
+        assert "no cost in 13 of 14 baseline buckets" in section
+
+    @pytest.mark.asyncio
     async def test_detection_that_finds_nothing_says_so(self, tool, monkeypatch):
         reports = _NewEntityReports(
-            {("providers", "SEVEN_DAYS"): {"openai": [20.0] * 14, "zeroall": [0.0] * 14}}
+            {("providers", WINDOW): {"openai": [20.0] * 14, "zeroall": [0.0] * 14}}
         )
 
         section = _section(await self._answer(tool, monkeypatch, reports, "SEVEN_DAYS"))
@@ -3004,34 +3171,34 @@ class TestNewEntityDetectionAnswer:
         sentence = next(line for line in section.splitlines() if line.startswith("No new"))
         assert sentence.startswith("No new provider appeared")
         assert "agent" not in sentence
-        assert "the 10 buckets starting 2026-10-05 00:00 UTC to 2026-10-09 12:00 UTC" in sentence
-        assert "the 4 buckets starting 2026-10-03 00:00 UTC to 2026-10-04 12:00 UTC" in sentence
+        assert "the 14 buckets starting 2026-10-09 12:00 UTC to 2026-10-16 00:00 UTC" in sentence
+        assert "the 14 buckets starting 2026-10-02 12:00 UTC to 2026-10-09 00:00 UTC" in sentence
         assert "ZEROALL" not in section
 
     @pytest.mark.asyncio
-    async def test_a_failed_seven_day_read_is_named_and_anomalies_still_render(
+    async def test_a_failed_window_read_is_named_and_anomalies_still_render(
         self, tool, monkeypatch
     ):
-        reports = _NewEntityReports(failing={("providers", "SEVEN_DAYS")})
+        reports = _NewEntityReports(failing={("providers", WINDOW)})
 
         answer = await self._answer(tool, monkeypatch, reports, "TWENTY_FOUR_HOURS")
 
         assert "**Total anomalies detected:** 0" in answer
         assert (
-            "New-entity detection could not run: the SEVEN_DAYS read it needs failed: "
-            "providers (HTTP 504: Gateway timeout)"
+            "New-entity detection could not run: a read it needs failed: "
+            "window read: providers (HTTP 504: Gateway timeout)"
         ) in _section(answer)
 
     @pytest.mark.asyncio
-    async def test_a_seven_day_read_failing_for_agents_only_is_named(self, tool, monkeypatch):
+    async def test_a_comparison_read_failing_for_agents_only_is_named(self, tool, monkeypatch):
         reports = _NewEntityReports(
             {
-                ("providers", "SEVEN_DAYS"): {
+                ("providers", WINDOW): {
                     "openai": [20.0] * 14,
                     "newprov": [None] * 9 + [50.0] * 5,
                 }
             },
-            failing={("agents", "SEVEN_DAYS")},
+            failing={("agents", COMPARISON)},
         )
 
         section = _section(
@@ -3047,7 +3214,7 @@ class TestNewEntityDetectionAnswer:
         assert "**NEWPROV** (new)" in section
         assert (
             "Not read for new-entity detection, so not examined: "
-            "agents (HTTP 504: Gateway timeout)"
+            "agents (comparison period read: HTTP 504: Gateway timeout)"
         ) in section
         sentence = next(line for line in section.splitlines() if "buckets starting" in line)
         assert sentence.startswith("Examined providers:")
@@ -3062,8 +3229,8 @@ class TestNewEntityDetectionAnswer:
         section = _section(await self._answer(tool, monkeypatch, reports, "SEVEN_DAYS"))
 
         assert "**NEWPROV** (new)" in section
-        assert "first active 2026-10-07" in section
-        assert "active in 3 of 10 recent buckets" in section
+        assert "first active 2026-10-14" in section
+        assert "active in 3 of 14 recent buckets" in section
         assert "OPENAI" not in section
 
     @pytest.mark.asyncio
@@ -3072,11 +3239,13 @@ class TestNewEntityDetectionAnswer:
     ):
         reports = _NewEntityReports(
             {
-                ("providers", "SEVEN_DAYS"): {"openai": [20.0] * 14, "shared": [20.0] * 14},
-                ("agents", "SEVEN_DAYS"): {
+                ("providers", WINDOW): {"openai": [20.0] * 14, "shared": [20.0] * 14},
+                ("providers", COMPARISON): {"openai": [20.0] * 14, "shared": [20.0] * 14},
+                ("agents", WINDOW): {
                     "bot": [20.0] * 14,
                     "shared": [None] * 9 + [40.0] * 5,
                 },
+                ("agents", COMPARISON): {"bot": [20.0] * 14},
             }
         )
 
@@ -3095,49 +3264,104 @@ class TestNewEntityDetectionAnswer:
         assert "### Provider" not in section
 
     @pytest.mark.asyncio
-    async def test_thirty_days_splits_seven_baseline_buckets(self, tool, monkeypatch):
+    async def test_thirty_days_compares_with_the_thirty_days_before(self, tool, monkeypatch):
+        first = datetime(2026, 9, 16, tzinfo=timezone.utc)
         reports = _NewEntityReports(
             {
-                ("providers", "THIRTY_DAYS"): {
+                ("providers", WINDOW): {
                     "openai": [20.0] * 30,
                     "newprov": [None] * 7 + [30.0] * 23,
-                }
-            }
+                },
+                ("providers", COMPARISON): {"openai": [20.0] * 30},
+            },
+            starts={
+                WINDOW: [first + timedelta(days=index) for index in range(30)],
+                COMPARISON: [first - timedelta(days=30 - index) for index in range(30)],
+            },
         )
 
         section = _section(await self._answer(tool, monkeypatch, reports, "THIRTY_DAYS"))
 
-        assert "the 7 buckets starting 2026-09-10 to 2026-09-16" in section
+        assert "the 30 buckets starting 2026-08-17 to 2026-09-15" in section
         assert "**NEWPROV** (new)" in section
-        assert "first active 2026-09-17" in section
-        assert "active in 23 of 23 recent buckets" in section
+        assert "first active 2026-09-23" in section
+        assert "active in 23 of 30 recent buckets" in section
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("bucket_count", [0, 1])
-    async def test_too_few_buckets_says_detection_could_not_run(
-        self, tool, monkeypatch, bucket_count
+    async def test_a_window_without_buckets_says_detection_could_not_run(
+        self, tool, monkeypatch
     ):
-        starts = _bucket_starts("SEVEN_DAYS")[:bucket_count]
         reports = _NewEntityReports(
-            {("providers", "SEVEN_DAYS"): {"openai": [20.0] * bucket_count}},
-            starts={"SEVEN_DAYS": starts},
+            {("providers", WINDOW): {"openai": []}}, starts={WINDOW: []}
         )
 
         section = _section(await self._answer(tool, monkeypatch, reports, "SEVEN_DAYS"))
 
         assert (
-            f"New-entity detection could not run: the report returned {bucket_count} "
-            f"bucket{'' if bucket_count == 1 else 's'}, and at least 2 are needed"
+            "New-entity detection could not run: the report returned no bucket for the "
+            "window, so nothing could be compared"
         ) in section
 
     @pytest.mark.asyncio
-    async def test_a_failed_agents_read_is_named_when_providers_return_too_few_buckets(
+    async def test_an_empty_comparison_period_is_named_and_window_sources_are_new(
         self, tool, monkeypatch
     ):
         reports = _NewEntityReports(
-            {("providers", "SEVEN_DAYS"): {"openai": [20.0]}},
-            failing={("agents", "SEVEN_DAYS")},
-            starts={("providers", "SEVEN_DAYS"): _bucket_starts("SEVEN_DAYS")[:1]},
+            {("providers", COMPARISON): {"openai": []}}, starts={COMPARISON: []}
+        )
+
+        section = _section(await self._answer(tool, monkeypatch, reports, "SEVEN_DAYS"))
+
+        assert "**OPENAI** (new)" in section
+        assert "the comparison period returned no bucket" in section
+        assert "with the baseline, no bucket returned." in section
+
+    @pytest.mark.asyncio
+    async def test_a_comparison_period_without_cost_says_everything_counts_as_new(
+        self, tool, monkeypatch
+    ):
+        """A team with no usage, or no data, before the window has every source new, and the answer says why (BACK-4842)."""
+        reports = _NewEntityReports(
+            {
+                ("providers", COMPARISON): {"openai": [0.0] * 14},
+                ("agents", WINDOW): {"newagent": [None] * 9 + [5.0] * 5},
+                ("agents", COMPARISON): {"oldagent": [3.0] * 14},
+            }
+        )
+
+        section = _section(
+            await self._answer(
+                tool,
+                monkeypatch,
+                reports,
+                "SEVEN_DAYS",
+                include_dimensions=["providers", "agents"],
+            )
+        )
+
+        assert "**OPENAI** (new)" in section
+        assert (
+            "The comparison period held no cost for providers, so every source there with "
+            "cost in the window counts as new: the team had no usage then, or the platform "
+            "holds no data that far back."
+        ) in section
+
+    @pytest.mark.asyncio
+    async def test_a_comparison_period_with_cost_adds_no_warning(self, tool, monkeypatch):
+        reports = _NewEntityReports()
+
+        section = _section(await self._answer(tool, monkeypatch, reports, "SEVEN_DAYS"))
+
+        assert "held no cost" not in section
+
+    @pytest.mark.asyncio
+    async def test_a_failed_agents_read_is_named_when_providers_return_no_window_bucket(
+        self, tool, monkeypatch
+    ):
+        reports = _NewEntityReports(
+            {("providers", WINDOW): {"openai": []}},
+            failing={("agents", WINDOW)},
+            starts={("providers", WINDOW): []},
         )
 
         section = _section(
@@ -3151,32 +3375,34 @@ class TestNewEntityDetectionAnswer:
         )
 
         assert (
-            "New-entity detection could not run: the report returned 1 bucket, "
-            "and at least 2 are needed"
+            "New-entity detection could not run: the report returned no bucket for the window"
         ) in section
         assert (
             "Not read for new-entity detection, so not examined: "
-            "agents (HTTP 504: Gateway timeout)"
+            "agents (window read: HTTP 504: Gateway timeout)"
         ) in section
 
     @pytest.mark.asyncio
     async def test_daily_agent_buckets_are_compared_on_their_own_grid(
         self, tool, monkeypatch
     ):
-        first = datetime(2026, 10, 3, tzinfo=timezone.utc)
-        daily = [first + timedelta(days=index) for index in range(7)]
+        def daily(first_day):
+            first = datetime(2026, 10, first_day, tzinfo=timezone.utc)
+            return [first + timedelta(days=index) for index in range(7)]
+
         reports = _NewEntityReports(
             {
-                ("providers", "SEVEN_DAYS"): {
+                ("providers", WINDOW): {
                     "openai": [20.0] * 14,
                     "newprov": [None] * 9 + [50.0] * 5,
                 },
-                ("agents", "SEVEN_DAYS"): {
+                ("agents", WINDOW): {
                     "steadybot": [10.0] * 7,
                     "newagent": [None] * 2 + [5.0] * 5,
                 },
+                ("agents", COMPARISON): {"steadybot": [10.0] * 7},
             },
-            starts={("agents", "SEVEN_DAYS"): daily},
+            starts={("agents", WINDOW): daily(10), ("agents", COMPARISON): daily(3)},
         )
 
         section = _section(
@@ -3191,19 +3417,19 @@ class TestNewEntityDetectionAnswer:
 
         assert "STEADYBOT" not in section
         assert (
-            "Examined providers: compared the recent part, the 10 buckets starting "
-            "2026-10-05 00:00 UTC to 2026-10-09 12:00 UTC, with the baseline, the 4 "
-            "buckets starting 2026-10-03 00:00 UTC to 2026-10-04 12:00 UTC. Examined "
-            "agents: compared the recent part, the 5 buckets starting 2026-10-05 to "
-            "2026-10-09, with the baseline, the 2 buckets starting 2026-10-03 to "
-            "2026-10-04."
+            "Examined providers: compared the recent part, the 14 buckets starting "
+            "2026-10-09 12:00 UTC to 2026-10-16 00:00 UTC, with the baseline, the 14 "
+            "buckets starting 2026-10-02 12:00 UTC to 2026-10-09 00:00 UTC. Examined "
+            "agents: compared the recent part, the 7 buckets starting 2026-10-10 to "
+            "2026-10-16, with the baseline, the 7 buckets starting 2026-10-03 to "
+            "2026-10-09."
         ) in section
         assert "**NEWPROV** (new)" in section
-        assert "active in 5 of 10 recent buckets" in section
-        assert "no cost from 2026-10-03 00:00 UTC to 2026-10-04 12:00 UTC" in section
+        assert "active in 5 of 14 recent buckets" in section
+        assert "no cost from 2026-10-02 12:00 UTC to 2026-10-09 00:00 UTC" in section
         assert "**NEWAGENT** (new)" in section
-        assert "active in 5 of 5 recent buckets" in section
-        assert "no cost from 2026-10-03 to 2026-10-04" in section
+        assert "active in 5 of 7 recent buckets" in section
+        assert "no cost from 2026-10-03 to 2026-10-09" in section
 
     @pytest.mark.asyncio
     async def test_nothing_found_above_the_threshold_names_the_threshold(
@@ -3212,7 +3438,7 @@ class TestNewEntityDetectionAnswer:
         """A source below min_new_entity_threshold did appear, so the answer names the threshold (BACK-4813)."""
         reports = _NewEntityReports(
             {
-                ("providers", "SEVEN_DAYS"): {
+                ("providers", WINDOW): {
                     "openai": [20.0] * 14,
                     "smallnew": [None] * 9 + [50.0] * 5,
                 }
@@ -3238,7 +3464,7 @@ class TestNewEntityDetectionAnswer:
     ):
         reports = _NewEntityReports(
             {
-                ("providers", "SEVEN_DAYS"): {
+                ("providers", WINDOW): {
                     "openai": [20.0] * 14,
                     "newprov": [None] * 9 + [50.0] * 5,
                     "smallnew": [None] * 9 + [1.0] * 5,
@@ -3260,7 +3486,7 @@ class TestNewEntityDetectionAnswer:
     async def test_nothing_found_with_threshold_zero_says_nothing_appeared(
         self, tool, monkeypatch
     ):
-        reports = _NewEntityReports({("providers", "SEVEN_DAYS"): {"openai": [20.0] * 14}})
+        reports = _NewEntityReports({("providers", WINDOW): {"openai": [20.0] * 14}})
 
         section = _section(
             await self._answer(
@@ -3280,3 +3506,10 @@ class TestNewEntityDetectionAnswer:
         description = schema["properties"]["detect_new_entities"]["description"]
         assert "activated" in description
         assert "absent from the baseline" not in description
+
+    @pytest.mark.asyncio
+    async def test_detect_new_entities_schema_names_the_comparison_period(self, tool):
+        schema = await tool._get_input_schema()
+
+        description = schema["properties"]["detect_new_entities"]["description"]
+        assert "the same length just before it and at least 7 days" in description

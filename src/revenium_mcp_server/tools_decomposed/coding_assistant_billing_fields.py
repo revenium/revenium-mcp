@@ -31,12 +31,16 @@ CODING_ASSISTANT_BILLING_SEMANTICS_NOTE = (
 
 CODING_ASSISTANT_CONFIRMATION_NOTE = (
     "confirmedProviders are the assistants someone on the team has confirmed a pricing "
-    "mode for, one at a time when the assistant is connected or all at once by saving "
-    "the settings in the app; an assistant outside that list keeps its unconfirmed "
-    "treatment. needsReview is true while some assistant's pricing mode has not been "
-    "explicitly confirmed. classificationSource says where the policy in force came "
-    "from: team_explicit when the team stored its own settings, tenant_default when it "
-    "has not and the tenant default applies."
+    "mode for, one at a time when the assistant is connected or by saving the settings "
+    "in the app, which confirms only the providers the save lists as billed at API "
+    "rates and the ones it removes from that list; a new team starts with every "
+    "assistant confirmed, and an assistant outside the list keeps its unconfirmed "
+    "treatment. needsReview is true while some assistant has no confirmed pricing mode, "
+    "including a team still on the account's default settings. classificationSource "
+    "says where the policy in force came from: team_explicit when the team has settings "
+    "someone answered for (saved, confirmed per assistant, or the answered defaults a "
+    "new team starts with), tenant_default when the team still uses the account's "
+    "default settings or defaults nobody has answered for yet."
 )
 
 CODING_ASSISTANT_BILLING_READ_ONLY_NOTE = (

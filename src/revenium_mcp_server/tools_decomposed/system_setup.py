@@ -12,15 +12,100 @@ if TYPE_CHECKING:
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
+from ..auth.auth_mode import credentials_are_per_request
 from ..common.error_handling import (
     create_structured_validation_error,
     raise_structured_error,
 )
 from ..introspection.metadata import ToolCapability, ToolType
-from .email_verification import EmailVerification
+from .email_verification import (
+    EmailVerification,
+    set_email_example,
+    set_email_step,
+    update_email_capability,
+)
 from .setup_checklist import SetupChecklist
+from .system_setup_calls import setup_call
 from .unified_tool_base import ToolBase
 from .welcome_setup import WelcomeSetup
+
+
+def complete_setup_workflows() -> str:
+    """The workflow steps of the examples, naming the calls this server accepts."""
+    call = setup_call
+    return "\n".join(
+        [
+            "### First-Time Setup",
+            f"1. `{call('show_welcome')}` - Get overview and welcome message",
+            f"2. `{call('setup_checklist')}` - Check what needs to be configured",
+            f"3. `{call('setup_guidance')}` - Get email setup instructions",
+            f"4. {set_email_step()}",
+            f"5. `{call('check_requirements')}` - Verify all requirements met",
+            f"6. `{call('complete_setup', confirm_completion=True)}` - Mark setup as complete",
+            "",
+            "### Configuration Validation",
+            f"1. `{call('check_requirements')}` - Verify critical items",
+            f"2. `{call('check_optional')}` - Check recommended settings",
+            f"3. `{call('check_system_status')}` - Validate connectivity",
+            f"4. `{call('get_recommendations')}` - Get improvement suggestions",
+            "",
+            "### Email Setup Only",
+            f"1. `{call('setup_guidance')}` - Get email configuration instructions",
+            f"2. `{call('validate_email', email='alerts@yourcompany.com')}` - Validate email format",
+            f"3. {set_email_step()}",
+            f"4. `{call('test_configuration')}` - Test email notifications",
+            f"5. `{call('check_status')}` - Verify configuration",
+            "",
+            "## **Troubleshooting**",
+            f"- **Setup Issues**: Use `{call('check_requirements')}` and `{call('get_recommendations')}`",
+            f"- **Email Problems**: Use `{call('setup_guidance')}` and `{call('test_configuration')}`",
+            f"- **Environment Issues**: Use `{call('environment_status')}` for detailed analysis",
+        ]
+    )
+
+
+def setup_workflow() -> str:
+    """The capabilities overview's onboarding steps, naming the calls this server accepts."""
+    call = setup_call
+    return "\n".join(
+        [
+            f"1. **Welcome**: Start with `{call('show_welcome')}` for overview",
+            f"2. **Check Status**: Use `{call('setup_checklist')}` for detailed status",
+            f"3. **Configure Email**: Use `{call('setup_guidance')}`, then: {set_email_step()}",
+            f"4. **Validate**: Use `{call('check_requirements')}` to verify setup",
+            f"5. **Complete**: Use `{call('complete_setup', confirm_completion=True)}` to finish onboarding",
+            "",
+            f"Use `{call('get_examples')}` for detailed usage examples and parameter guidance.",
+        ]
+    )
+
+
+def quick_start_steps() -> List[str]:
+    call = setup_call
+    return [
+        f"Start with {call('show_welcome')} to get system overview and onboarding guidance",
+        f"Run {call('setup_checklist')} to see comprehensive setup status and requirements",
+        f"Check {call('environment_status')} to verify critical configuration variables",
+        f"Use {call('check_requirements')} to validate essential system components",
+        f"Configure email with {call('setup_guidance')} and "
+        f"{call('validate_email', email='admin@company.com')} for notifications",
+        f"Complete setup with {call('complete_setup', confirm_completion=True)} "
+        "when all requirements are satisfied",
+    ]
+
+
+def email_action_parameters() -> Dict[str, Dict[str, str]]:
+    """The email actions this server answers, without update_email where it is refused."""
+    parameters = {
+        "check_status": {},
+        "update_email": {"email": "str"},
+        "validate_email": {"email": "str"},
+        "setup_guidance": {},
+        "test_configuration": {},
+    }
+    if credentials_are_per_request():
+        del parameters["update_email"]
+    return parameters
 
 
 class SystemSetup(ToolBase):
@@ -170,7 +255,7 @@ Unified system setup and onboarding combining welcome guidance, setup checklist,
 
 ### Email Configuration
 - `check_status` - Check current email configuration status
-- `update_email` - Update email configuration
+- `update_email` - """ + update_email_capability() + """
 - `validate_email` - Validate email address format
 - `setup_guidance` - Get email setup instructions
 - `test_configuration` - Test email notification setup
@@ -180,13 +265,7 @@ Unified system setup and onboarding combining welcome guidance, setup checklist,
 - `get_examples` - Show usage examples for all actions
 
 ## **Setup Workflow**
-1. **Welcome**: Start with `show_welcome()` for overview
-2. **Check Status**: Use `setup_checklist()` for detailed status
-3. **Configure Email**: Use `setup_guidance()` and `update_email()`
-4. **Validate**: Use `check_requirements()` to verify setup
-5. **Complete**: Use `complete_setup()` to finish onboarding
-
-Use `get_examples()` for detailed usage examples and parameter guidance.
+""" + setup_workflow() + """
 """
 
         return [TextContent(type="text", text=capabilities_text)]
@@ -253,10 +332,7 @@ Use `get_examples()` for detailed usage examples and parameter guidance.
 {"action": "check_status"}
 ```
 
-### Update Email Address
-```json
-{"action": "update_email", "email": "alerts@company.com"}
-```
+""" + set_email_example(heading="###") + """
 
 ### Validate Email Format
 ```json
@@ -275,31 +351,7 @@ Use `get_examples()` for detailed usage examples and parameter guidance.
 
 ## **Complete Setup Workflows**
 
-### First-Time Setup
-1. `show_welcome()` - Get overview and welcome message
-2. `setup_checklist()` - Check what needs to be configured
-3. `setup_guidance()` - Get email setup instructions
-4. `update_email()` - Configure notification email
-5. `check_requirements()` - Verify all requirements met
-6. `complete_setup()` - Mark setup as complete
-
-### Configuration Validation
-1. `check_requirements()` - Verify critical items
-2. `check_optional()` - Check recommended settings
-3. `check_system_status()` - Validate connectivity
-4. `get_recommendations()` - Get improvement suggestions
-
-### Email Setup Only
-1. `setup_guidance()` - Get email configuration instructions
-2. `validate_email()` - Validate email format
-3. `update_email()` - Set email address
-4. `test_configuration()` - Test email notifications
-5. `check_status()` - Verify configuration
-
-## **Troubleshooting**
-• **Setup Issues**: Use `check_requirements()` and `get_recommendations()`
-• **Email Problems**: Use `setup_guidance()` and `test_configuration()`
-• **Environment Issues**: Use `environment_status()` for detailed analysis
+""" + complete_setup_workflows() + """
 
 All actions support the same parameters as their original tools for 100% compatibility.
 """
@@ -326,11 +378,7 @@ All actions support the same parameters as their original tools for 100% compati
 • Setup completion tracking and status management
 
 **Quick Start**:
-1. Use show_welcome() to get system overview and onboarding introduction
-2. Use setup_checklist() to identify required configuration items
-3. Use check_requirements() to verify critical system requirements
-4. Use setup_guidance() for email configuration instructions
-5. Use complete_setup() to mark onboarding as finished
+""" + "\n".join(f"{i}. {step}" for i, step in enumerate(quick_start_steps(), 1)) + """
 
 **Common Use Cases**:
 • First-time system onboarding and configuration
@@ -404,8 +452,8 @@ All actions support the same parameters as their original tools for 100% compati
                     "get_agent_summary": {},
                 },
                 examples=[
-                    "show_welcome()",
-                    "get_agent_summary()",
+                    setup_call("show_welcome"),
+                    setup_call("get_agent_summary"),
                 ],
                 limitations=[
                     "Welcome content is static and environment-independent",
@@ -425,11 +473,11 @@ All actions support the same parameters as their original tools for 100% compati
                     "get_recommendations": {},
                 },
                 examples=[
-                    "setup_checklist()",
-                    "environment_status()",
-                    "check_requirements()",
-                    "get_recommendations()",
-                    "complete_setup(confirm_completion=True)",
+                    setup_call("setup_checklist"),
+                    setup_call("environment_status"),
+                    setup_call("check_requirements"),
+                    setup_call("get_recommendations"),
+                    setup_call("complete_setup", confirm_completion=True),
                 ],
                 limitations=[
                     "Setup validation requires environment variable access",
@@ -439,18 +487,12 @@ All actions support the same parameters as their original tools for 100% compati
             ToolCapability(
                 name="Email Configuration Management",
                 description="Email setup validation and configuration guidance",
-                parameters={
-                    "check_status": {},
-                    "update_email": {"email": "str"},
-                    "validate_email": {"email": "str"},
-                    "setup_guidance": {},
-                    "test_configuration": {},
-                },
+                parameters=email_action_parameters(),
                 examples=[
-                    "check_status()",
-                    "validate_email(email='admin@company.com')",
-                    "setup_guidance()",
-                    "test_configuration()",
+                    setup_call("check_status"),
+                    setup_call("validate_email", email="admin@company.com"),
+                    setup_call("setup_guidance"),
+                    setup_call("test_configuration"),
                 ],
                 limitations=[
                     "Email validation is format-based only",
@@ -461,11 +503,4 @@ All actions support the same parameters as their original tools for 100% compati
 
     async def _get_quick_start_guide(self) -> List[str]:
         """Get quick start guide."""
-        return [
-            "Start with show_welcome() to get system overview and onboarding guidance",
-            "Run setup_checklist() to see comprehensive setup status and requirements",
-            "Check environment_status() to verify critical configuration variables",
-            "Use check_requirements() to validate essential system components",
-            "Configure email with setup_guidance() and validate_email() for notifications",
-            "Complete setup with complete_setup() when all requirements are satisfied",
-        ]
+        return quick_start_steps()

@@ -9,22 +9,27 @@ import asyncio
 import os
 import threading
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 from loguru import logger
 
 from . import platform_lockout
 from .constants import DEFAULT_BASE_URL
+from .saved_notification_email import SavedNotificationEmail, saved_notification_email
 
 if TYPE_CHECKING:
     from .auth.tenant_context import TenantContext
 
 
+EMAIL_SETTING = "REVENIUM_DEFAULT_EMAIL"
+
+_SAVED_SETTINGS: Dict[str, SavedNotificationEmail] = {EMAIL_SETTING: saved_notification_email}
+
 _CALLER_IDENTITY_FIELDS = {
     "REVENIUM_TEAM_ID": "team_id",
     "REVENIUM_TENANT_ID": "tenant_id",
     "REVENIUM_OWNER_ID": "owner_id",
-    "REVENIUM_DEFAULT_EMAIL": "email",
+    EMAIL_SETTING: "email",
 }
 
 
@@ -52,6 +57,10 @@ def _caller_identity_value(caller: "TenantContext", env_var_name: str) -> Option
     return value
 
 
+def _non_empty(value: Optional[str]) -> Optional[str]:
+    return value or None
+
+
 @dataclass
 class DiscoveredConfig:
     """Configuration values discovered from the API."""
@@ -72,6 +81,13 @@ class DiscoveredConfig:
     def has_required_fields(self) -> bool:
         """Check if all required fields are available."""
         return all([self.api_key, self.team_id, self.tenant_id, self.owner_id])
+
+
+SOURCE_CALLER = "caller"
+SOURCE_SAVED = "saved"
+SOURCE_CACHE = "cache"
+SOURCE_ENVIRONMENT = "environment"
+SOURCE_DISCOVERY = "discovery"
 
 
 class ConfigurationStore:
@@ -263,16 +279,41 @@ class ConfigurationStore:
     def get_value_with_override(
         self, env_var_name: str, default: Optional[str] = None, team_id: str = _DEFAULT_TENANT
     ) -> Optional[str]:
-        caller = _signed_in_caller_for(env_var_name)
-        if caller is not None:
-            return _caller_identity_value(caller, env_var_name) or default
+        return self.get_value_with_source(env_var_name, team_id)[0] or default
 
-        return (
-            self._cached_override(env_var_name)
-            or os.getenv(env_var_name)
-            or self._discovered_value(env_var_name, team_id)
-            or default
+    def get_value_with_source(
+        self,
+        env_var_name: str,
+        team_id: str = _DEFAULT_TENANT,
+        usable: Callable[[Optional[str]], Optional[str]] = _non_empty,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """The setting's first usable (value, source) from one walk of the precedence; (None, None) when unset.
+
+        A layer whose value usable() rejects counts as unset and the walk moves on.
+        """
+        caller = _signed_in_caller_for(env_var_name)
+        if caller is None:
+            return self._first_override(env_var_name, team_id, usable)
+        value = usable(_caller_identity_value(caller, env_var_name))
+        return (value, SOURCE_CALLER) if value else (None, None)
+
+    def _first_override(
+        self,
+        env_var_name: str,
+        team_id: str,
+        usable: Callable[[Optional[str]], Optional[str]],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        lookups: Tuple[Tuple[str, Callable[[], Optional[str]]], ...] = (
+            (SOURCE_SAVED, lambda: self._saved_value(env_var_name)),
+            (SOURCE_CACHE, lambda: self._cached_override(env_var_name)),
+            (SOURCE_ENVIRONMENT, lambda: os.getenv(env_var_name)),
+            (SOURCE_DISCOVERY, lambda: self._discovered_value(env_var_name, team_id)),
         )
+        for source, lookup in lookups:
+            value = usable(lookup())
+            if value:
+                return value, source
+        return None, None
 
     def get_discovered_value(
         self, env_var_name: str, team_id: str = _DEFAULT_TENANT
@@ -321,6 +362,11 @@ class ConfigurationStore:
             logger.warning(f"Discovery failed in get_value_with_override: {e}")
 
     @staticmethod
+    def _saved_value(env_var_name: str) -> Optional[str]:
+        saved = _SAVED_SETTINGS.get(env_var_name)
+        return saved.read() if saved else None
+
+    @staticmethod
     def _cached_override(env_var_name: str) -> Optional[str]:
         try:
             from .config_cache import _default_cache
@@ -366,7 +412,7 @@ def get_discovered_config_sync() -> DiscoveredConfig:
 
 
 def get_config_value(env_var_name: str, default: Optional[str] = None) -> Optional[str]:
-    """Get configuration value with override pattern: cache → env var → discovered → default.
+    """Get configuration value with override pattern: saved → cache → env var → discovered → default.
 
     On a hosted request the caller's own team, tenant, owner and email (from the
     request's TenantContext) replace every other source for those settings.
@@ -413,11 +459,20 @@ def _usable_email(email: Optional[str]) -> Optional[str]:
 
 def configured_default_email() -> Optional[str]:
     """REVENIUM_DEFAULT_EMAIL when it holds a real address; on a hosted request, the caller's own."""
-    return _usable_email(get_environment_value("REVENIUM_DEFAULT_EMAIL"))
+    return _usable_email(get_environment_value(EMAIL_SETTING))
+
+
+def notification_email_with_source() -> Tuple[Optional[str], Optional[str]]:
+    """The notification email and the SOURCE_* layer it came from, skipping blanks and the placeholder.
+
+    check_status, the onboarding status views (setup_checklist, welcome_setup's
+    checklist and the onboarding state's email_configured) and alert creation all
+    go through this one walk, so every status view reports the address alerts
+    created without an email are sent to.
+    """
+    return get_config_store().get_value_with_source(EMAIL_SETTING, usable=_usable_email)
 
 
 def default_notification_email() -> Optional[str]:
-    """REVENIUM_DEFAULT_EMAIL, else the discovered one; on a hosted request, the caller's own."""
-    return configured_default_email() or _usable_email(
-        get_discovered_value("REVENIUM_DEFAULT_EMAIL")
-    )
+    """The address alerts created without an email go to; None when no layer holds a usable one."""
+    return notification_email_with_source()[0]

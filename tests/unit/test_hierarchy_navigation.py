@@ -7,6 +7,8 @@ across Products -> Subscriptions -> Credentials hierarchy.
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from src.revenium_mcp_server.client import ReveniumAPIError
+from src.revenium_mcp_server.hierarchy import navigation_service as navigation_module
 from src.revenium_mcp_server.hierarchy.navigation_service import (
     HierarchyNavigationService,
 )
@@ -190,7 +192,7 @@ class TestSubscriptionWalkPageFailure:
     def _serve_pages(mock_client, pages):
         """Serve ``pages[n]`` for page n; an Exception entry makes that page fail."""
 
-        def fetch(page, size):
+        def fetch(page, size, **filters):
             entry = pages[page]
             if isinstance(entry, Exception):
                 raise entry
@@ -211,13 +213,6 @@ class TestSubscriptionWalkPageFailure:
         ]
 
     @staticmethod
-    def _credential_subs(start, count, credential_id="cred_other"):
-        return [
-            {"id": f"sub_{n}", "credentials": [{"id": credential_id}]}
-            for n in range(start, start + count)
-        ]
-
-    @staticmethod
     def _assert_incomplete(result, failed_page):
         assert result.success is False
         assert getattr(result, "incomplete", False) is True
@@ -229,12 +224,6 @@ class TestSubscriptionWalkPageFailure:
     def product_exists(self, mock_client):
         mock_client.get_product_by_id = AsyncMock(
             return_value={"id": "prod_1", "name": "Test"}
-        )
-
-    @pytest.fixture
-    def credential_exists(self, mock_client):
-        mock_client.get_credential_by_id = AsyncMock(
-            return_value={"id": "cred_1", "label": "Cred"}
         )
 
     @pytest.mark.asyncio
@@ -317,106 +306,75 @@ class TestSubscriptionWalkPageFailure:
 
     @pytest.mark.asyncio
     async def test_malformed_subscription_does_not_fail_the_walk(
-        self, nav_service, mock_client, product_exists, credential_exists
+        self, nav_service, mock_client, product_exists
     ):
         malformed = {"id": "sub_bad", "credentials": None, "product": "a string"}
-        odd_credentials = {"id": "sub_odd", "credentials": ["not-a-dict", None]}
-        page_0 = [malformed, odd_credentials] + self._credential_subs(
-            0, self.PAGE_SIZE - 2
-        )
-        match = {
-            "id": "sub_match",
-            "product": {"id": "prod_1"},
-            "credentials": [{"id": "cred_1"}],
-        }
+        page_0 = [malformed] + self._product_subs(0, self.PAGE_SIZE - 1, "prod_2")
+        match = {"id": "sub_match", "product": {"id": "prod_1"}}
         self._serve_pages(mock_client, [page_0, [match]])
 
         by_product = await nav_service.get_subscriptions_for_product("prod_1")
-        by_credential = await nav_service.get_subscription_for_credential("cred_1")
 
         assert by_product.success is True
         assert [s["id"] for s in by_product.related_entities] == ["sub_match"]
-        assert by_credential.success is True
-        assert [s["id"] for s in by_credential.related_entities] == ["sub_match"]
-        assert self._requested_pages(mock_client) == [0, 1, 0, 1]
-
-    @pytest.mark.asyncio
-    async def test_credential_walk_failing_on_first_page_does_not_say_no_subscriptions(
-        self, nav_service, mock_client, credential_exists
-    ):
-        self._serve_pages(mock_client, [RuntimeError("502 Bad Gateway")])
-
-        result = await nav_service.get_subscription_for_credential("cred_1")
-
-        self._assert_incomplete(result, 0)
-        assert "No subscriptions found" not in result.error_message
-        assert nav_service._cache == {}
-        assert self._requested_pages(mock_client) == [0]
-
-    @pytest.mark.asyncio
-    async def test_credential_walk_failing_before_the_match_reports_incomplete(
-        self, nav_service, mock_client, credential_exists
-    ):
-        self._serve_pages(
-            mock_client,
-            [self._credential_subs(0, self.PAGE_SIZE), RuntimeError("timeout")],
-        )
-
-        result = await nav_service.get_subscription_for_credential("cred_1")
-
-        self._assert_incomplete(result, 1)
-        assert "No subscriptions found" not in result.error_message
-        assert nav_service._cache == {}
         assert self._requested_pages(mock_client) == [0, 1]
 
     @pytest.mark.asyncio
-    async def test_credential_found_on_first_page_then_later_page_fails_reports_incomplete(
-        self, nav_service, mock_client, credential_exists
+    async def test_the_product_lookup_asks_the_platform_to_search_by_the_product_name(
+        self, nav_service, mock_client, product_exists
     ):
-        page_0 = self._credential_subs(0, self.PAGE_SIZE - 1) + self._credential_subs(
-            99, 1, credential_id="cred_1"
-        )
-        self._serve_pages(mock_client, [page_0, RuntimeError("timeout")])
-
-        result = await nav_service.get_subscription_for_credential("cred_1")
-
-        self._assert_incomplete(result, 1)
-        assert nav_service._cache == {}
-        assert self._requested_pages(mock_client) == [0, 1]
-
-    @pytest.mark.asyncio
-    async def test_credential_with_no_subscription_after_full_walk_still_says_none_found(
-        self, nav_service, mock_client, credential_exists
-    ):
+        """BACK-4736: the platform narrows the subscriptions; the product id decides."""
         self._serve_pages(
             mock_client,
-            [self._credential_subs(0, self.PAGE_SIZE), self._credential_subs(50, 2)],
+            [self._product_subs(0, 2) + self._product_subs(2, 1, product_id="prod_9")],
         )
 
-        result = await nav_service.get_subscription_for_credential("cred_1")
+        result = await nav_service.get_subscriptions_for_product("prod_1")
+
+        assert [s["id"] for s in result.related_entities] == ["sub_0", "sub_1"]
+        assert [c.kwargs["query"] for c in mock_client.get_subscriptions.await_args_list] == [
+            "Test"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_search_matching_more_than_the_limit_is_refused_plainly(
+        self, nav_service, mock_client, product_exists
+    ):
+        """BACK-4736: a 989-page organization is never walked to the end."""
+        limit = navigation_module.MAX_SUBSCRIPTION_SEARCH_PAGES
+        self._serve_pages(
+            mock_client,
+            [self._product_subs(n * self.PAGE_SIZE, self.PAGE_SIZE) for n in range(989)],
+        )
+
+        result = await nav_service.get_subscriptions_for_product("prod_1")
 
         assert result.success is False
-        assert getattr(result, "incomplete", False) is False
-        assert result.error_message == (
-            "No subscriptions found that reference this credential"
-        )
-        assert self._requested_pages(mock_client) == [0, 1]
+        assert result.incomplete is True
+        assert result.related_entities == []
+        assert "cannot filter subscriptions by product" in result.error_message
+        assert f"more than {limit * self.PAGE_SIZE} subscriptions" in result.error_message
+        assert "search_subscriptions" in result.error_message
+        assert result.retryable is False
+        assert result.metadata["search_term"] == "Test"
+        assert self._requested_pages(mock_client) == list(range(limit))
+        assert nav_service._cache == {}
 
     @pytest.mark.asyncio
-    async def test_product_for_credential_carries_the_incomplete_walk(
-        self, nav_service, mock_client, credential_exists
+    async def test_a_search_ending_on_the_last_allowed_page_is_complete(
+        self, nav_service, mock_client, product_exists
     ):
-        self._serve_pages(
-            mock_client,
-            [self._credential_subs(0, self.PAGE_SIZE), RuntimeError("timeout")],
-        )
+        limit = navigation_module.MAX_SUBSCRIPTION_SEARCH_PAGES
+        pages = [
+            self._product_subs(n * self.PAGE_SIZE, self.PAGE_SIZE) for n in range(limit - 1)
+        ]
+        pages.append(self._product_subs(9999, 3))
+        self._serve_pages(mock_client, pages)
 
-        result = await nav_service.get_product_for_credential("cred_1")
+        result = await nav_service.get_subscriptions_for_product("prod_1")
 
-        assert result.success is False
-        assert getattr(result, "incomplete", False) is True
-        assert "page 1" in result.error_message
-        assert nav_service._cache == {}
+        assert result.success is True
+        assert len(result.related_entities) == (limit - 1) * self.PAGE_SIZE + 3
 
     @pytest.mark.asyncio
     async def test_full_hierarchy_from_product_fails_when_subscription_walk_is_incomplete(
@@ -433,17 +391,159 @@ class TestSubscriptionWalkPageFailure:
         assert not any(k.startswith("full_hierarchy_") for k in nav_service._cache)
         assert self._requested_pages(mock_client) == [0, 1]
 
+
+class TestCredentialLookupReadsItsLinkedSubscriptions:
+    """BACK-4736: a credential names the subscriptions it is linked to, so they
+    are read by id instead of walking every subscription in the organization."""
+
+    @staticmethod
+    def _credential(*subscription_ids):
+        return {
+            "id": "cred_1",
+            "label": "Cred",
+            "subscriptions": [{"id": sid, "label": sid} for sid in subscription_ids],
+        }
+
+    @staticmethod
+    def _serve_subscriptions(mock_client, answers):
+        def fetch(subscription_id):
+            answer = answers[subscription_id]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        mock_client.get_subscription_by_id = AsyncMock(side_effect=fetch)
+
     @pytest.mark.asyncio
-    async def test_full_hierarchy_from_credential_fails_when_subscription_walk_is_incomplete(
-        self, nav_service, mock_client, credential_exists
+    async def test_the_linked_subscriptions_are_read_by_id_and_nothing_is_walked(
+        self, nav_service, mock_client
     ):
-        self._serve_pages(
-            mock_client,
-            [self._credential_subs(0, self.PAGE_SIZE), RuntimeError("502 Bad Gateway")],
+        mock_client.get_credential_by_id = AsyncMock(
+            return_value=self._credential("sub_a", "sub_b")
         )
+        self._serve_subscriptions(
+            mock_client,
+            {"sub_a": {"id": "sub_a", "product": {"id": "prod_1"}}, "sub_b": {"id": "sub_b"}},
+        )
+
+        result = await nav_service.get_subscription_for_credential("cred_1")
+
+        assert result.success is True
+        assert [s["id"] for s in result.related_entities] == ["sub_a", "sub_b"]
+        assert result.metadata["subscription_ids"] == ["sub_a", "sub_b"]
+        mock_client.get_subscriptions.assert_not_awaited()
+        assert "credential_subscription_cred_1" in nav_service._cache
+
+    @pytest.mark.asyncio
+    async def test_a_credential_linked_to_nothing_still_says_none_found(
+        self, nav_service, mock_client
+    ):
+        mock_client.get_credential_by_id = AsyncMock(return_value=self._credential())
+
+        result = await nav_service.get_subscription_for_credential("cred_1")
+
+        assert result.success is False
+        assert result.incomplete is False
+        assert result.error_message == "No subscriptions found that reference this credential"
+        mock_client.get_subscriptions.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_linked_subscription_that_fails_to_load_reports_incomplete(
+        self, nav_service, mock_client
+    ):
+        mock_client.get_credential_by_id = AsyncMock(
+            return_value=self._credential("sub_a", "sub_b")
+        )
+        self._serve_subscriptions(
+            mock_client, {"sub_a": {"id": "sub_a"}, "sub_b": RuntimeError("502 Bad Gateway")}
+        )
+
+        result = await nav_service.get_subscription_for_credential("cred_1")
+
+        assert result.success is False
+        assert result.incomplete is True
+        assert result.related_entities == []
+        assert "subscription sub_b" in result.error_message
+        assert "No subscriptions found" not in result.error_message
+        assert nav_service._cache == {}
+
+    @pytest.mark.asyncio
+    async def test_a_linked_subscription_that_no_longer_exists_is_skipped(
+        self, nav_service, mock_client
+    ):
+        """A 404 cannot change on retry, so a stale link must not fail every lookup."""
+        mock_client.get_credential_by_id = AsyncMock(
+            return_value=self._credential("sub_a", "sub_gone")
+        )
+        self._serve_subscriptions(
+            mock_client,
+            {
+                "sub_a": {"id": "sub_a"},
+                "sub_gone": ReveniumAPIError("Not found", status_code=404),
+            },
+        )
+
+        result = await nav_service.get_subscription_for_credential("cred_1")
+
+        assert result.success is True
+        assert [s["id"] for s in result.related_entities] == ["sub_a"]
+        assert result.metadata["unresolved_subscription_ids"] == ["sub_gone"]
+
+    @pytest.mark.asyncio
+    async def test_a_credential_whose_only_link_is_gone_says_none_found(
+        self, nav_service, mock_client
+    ):
+        mock_client.get_credential_by_id = AsyncMock(return_value=self._credential("sub_gone"))
+        self._serve_subscriptions(
+            mock_client, {"sub_gone": ReveniumAPIError("Not found", status_code=404)}
+        )
+
+        result = await nav_service.get_subscription_for_credential("cred_1")
+
+        assert result.success is False
+        assert result.incomplete is False
+        assert result.error_message == "No subscriptions found that reference this credential"
+        assert result.metadata == {"unresolved_subscription_ids": ["sub_gone"]}
+
+    @pytest.mark.asyncio
+    async def test_a_credential_naming_its_links_as_subscription_ids_is_read_too(
+        self, nav_service, mock_client
+    ):
+        credential = self._credential("sub_a")
+        credential["subscriptionIds"] = ["sub_a", "sub_b"]
+        mock_client.get_credential_by_id = AsyncMock(return_value=credential)
+        self._serve_subscriptions(
+            mock_client, {"sub_a": {"id": "sub_a"}, "sub_b": {"id": "sub_b"}}
+        )
+
+        result = await nav_service.get_subscription_for_credential("cred_1")
+
+        assert [s["id"] for s in result.related_entities] == ["sub_a", "sub_b"]
+        assert mock_client.get_subscription_by_id.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_product_for_credential_carries_the_incomplete_lookup(
+        self, nav_service, mock_client
+    ):
+        mock_client.get_credential_by_id = AsyncMock(return_value=self._credential("sub_a"))
+        self._serve_subscriptions(mock_client, {"sub_a": RuntimeError("timeout")})
+
+        result = await nav_service.get_product_for_credential("cred_1")
+
+        assert result.success is False
+        assert result.incomplete is True
+        assert "subscription sub_a" in result.error_message
+        assert nav_service._cache == {}
+
+    @pytest.mark.asyncio
+    async def test_full_hierarchy_from_credential_fails_when_a_subscription_is_unread(
+        self, nav_service, mock_client
+    ):
+        mock_client.get_credential_by_id = AsyncMock(return_value=self._credential("sub_a"))
+        self._serve_subscriptions(mock_client, {"sub_a": RuntimeError("502 Bad Gateway")})
 
         result = await nav_service.get_full_hierarchy("credentials", "cred_1")
 
-        self._assert_incomplete(result, 1)
+        assert result.success is False
+        assert result.incomplete is True
         assert not any(k.startswith("full_hierarchy_") for k in nav_service._cache)
-        assert self._requested_pages(mock_client) == [0, 1]

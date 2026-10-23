@@ -12,7 +12,9 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 from mcp.types import TextContent
 
+from src.revenium_mcp_server.analytics.paging import PageInfo
 from src.revenium_mcp_server.client import ReveniumAPIError
+from src.revenium_mcp_server.tools_decomposed.log_formatters import PageCoverage
 from src.revenium_mcp_server.tools_decomposed.revenium_log_analysis import (
     TOGGLE_ONLY_TENANT_FLAGS_READ_PATH_NOTE,
     USAGE_BILLING_GATE_NOTE,
@@ -27,7 +29,9 @@ from src.revenium_mcp_server.tools_decomposed.log_analysis_constants import (
     CAPABILITIES_TEXT,
     EXAMPLES_TEXT,
     INGESTION_FAILURE_ERROR_CODES,
+    PLATFORM_MAX_PAGE_SIZE,
 )
+from src.revenium_mcp_server.tools_decomposed.system_diagnostics import SystemDiagnostics
 
 SNAPSHOT = Path(__file__).resolve().parents[2] / "specs" / "openapi" / "hypercurrent.json"
 
@@ -127,13 +131,13 @@ class TestValidatePageSize:
     """Test _validate_page_size boundary validation."""
 
     def test_valid_size_passes(self, log_tool):
-        """Size <= 1000 does not raise."""
-        log_tool._validate_page_size(1000)  # Should not raise
+        """The platform's page cap itself is accepted."""
+        log_tool._validate_page_size(100)  # Should not raise
 
     def test_size_exceeds_limit_raises(self, log_tool):
-        """Size > 1000 raises ToolError."""
-        with pytest.raises(ToolError, match="cannot exceed 1000"):
-            log_tool._validate_page_size(1001)
+        """BACK-4735: a size above the platform's 100-row page cap is refused, not promised."""
+        with pytest.raises(ToolError, match="cannot exceed 100 records"):
+            log_tool._validate_page_size(101)
 
     def test_small_size_passes(self, log_tool):
         """Small size value like 1 is valid."""
@@ -203,13 +207,21 @@ class TestAnalyzeOperationPatterns:
         assert all(count == 3 for _, count in top_ops)
 
 
+def _read(entries_read, pages_read, total_pages=None, total_elements=None):
+    return PageCoverage(
+        pages_read=pages_read,
+        entries_read=entries_read,
+        platform=PageInfo(total_pages=total_pages, total_elements=total_elements),
+    )
+
+
 class TestFormatAnalysisResponse:
     """Test _format_analysis_response output formatting."""
 
     def test_error_analysis_shows_no_entries(self, log_tool):
         """Analysis with error key shows 'No log entries found'."""
         analysis = {"error": "No entries to analyze"}
-        text = log_tool._format_analysis_response(analysis, "internal", 3)
+        text = log_tool._format_analysis_response(analysis, "internal", _read(0, 3))
         assert "No log entries found" in text
         assert "internal" in text.lower()
 
@@ -224,7 +236,7 @@ class TestFormatAnalysisResponse:
             "top_operations": [("CREATE", 60), ("DELETE", 40)],
             "problematic_operations": ["DELETE"],
         }
-        text = log_tool._format_analysis_response(analysis, "internal", 5)
+        text = log_tool._format_analysis_response(analysis, "internal", _read(100, 5))
         assert "100" in text
         assert "10.00%" in text  # failure rate
         assert "CREATE" in text
@@ -242,7 +254,7 @@ class TestFormatAnalysisResponse:
             "top_operations": [("OP", 10)],
             "problematic_operations": [],
         }
-        text = log_tool._format_analysis_response(analysis, "internal", 1)
+        text = log_tool._format_analysis_response(analysis, "internal", _read(10, 1))
         assert "High failure rate" in text
 
 
@@ -519,11 +531,11 @@ class TestIngestionHardening:
 
     @pytest.mark.asyncio
     async def test_failures_page_size_capped(self, log_tool):
-        """size is validated like every sibling handler (max 1000)."""
+        """size is validated like every sibling handler (max 100, the platform's page cap)."""
         client = _ingestion_client()
         log_tool.get_client = AsyncMock(return_value=client)
 
-        with pytest.raises(ToolError, match="1000"):
+        with pytest.raises(ToolError, match="cannot exceed 100 records"):
             await log_tool.handle_action("get_ingestion_failures", {"size": 5000})
         client.get_ingestion_failures.assert_not_called()
 
@@ -1727,10 +1739,10 @@ class TestSearchAllPagesCoverage:
 
     @pytest.mark.asyncio
     async def test_entries_searched_count_the_rows_the_platform_served(self, log_tool):
-        """The walk asks for 1000 a page; the platform serves 100, and the answer says so."""
+        """The walk asks for the platform's 100-row page cap, and the answer counts what was served."""
         log_tool._make_api_call = AsyncMock(side_effect=_every_page(789, 78828))
         text = await self._search(log_tool)
-        assert {c.args[2] for c in log_tool._make_api_call.await_args_list} == {1000}
+        assert {c.args[2] for c in log_tool._make_api_call.await_args_list} == {100}
         assert "- **Entries Searched**: 5,000 of 78,828" in text
         assert "- **Pages Searched**: 50 of 789" in text
 
@@ -1787,3 +1799,94 @@ class TestMultiPageCoverage:
         text = result[0].text
         assert "Pages Retrieved**: 1" in text
         assert self.STOPPED_ON_PAGE_2 in text
+
+
+class TestLogCoverageAgainstThePlatform:
+    """BACK-4735: log answers say what was read out of what exists, and promise no size the platform caps."""
+
+    @pytest.mark.asyncio
+    async def test_analyze_operations_says_pages_read_out_of_pages_that_exist(self, log_tool):
+        log_tool._make_api_call = AsyncMock(side_effect=_every_page(790, 78954))
+        result = await log_tool._handle_analyze_operations({"pages": 3})
+        text = result[0].text
+        assert "- **Pages Analyzed**: 3 of 790" in text
+        assert "- **Total Operations Analyzed**: 300 of 78,954" in text
+        assert (
+            "- **Scope**: counts and rates cover the 300 entries read, not the 78,654 left unread"
+            in text
+        )
+
+    @pytest.mark.asyncio
+    async def test_analyze_operations_over_every_entry_has_no_scope_note(self, log_tool):
+        log_tool._make_api_call = AsyncMock(side_effect=_every_page(2, 200))
+        result = await log_tool._handle_analyze_operations({"pages": 3})
+        text = result[0].text
+        assert "- **Pages Analyzed**: 2 of 2" in text
+        assert "Scope" not in text
+
+    @pytest.mark.asyncio
+    async def test_get_recent_logs_states_entries_read_and_the_platform_total(self, log_tool):
+        log_tool._make_api_call = AsyncMock(side_effect=_every_page(1021, 102057))
+        result = await log_tool._handle_get_recent_logs({"pages": 3})
+        text = result[0].text
+        assert "- **Total Entries Analyzed**: 300 of 102,057" in text
+        assert "- **Pages Retrieved**: 3 of 1021" in text
+        assert "Read 300 of 102,057 entries (3 of 1021 pages); the other 101,757 were not read" in text
+        assert "available" not in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_the_default_page_size_is_the_platform_cap(self, log_tool):
+        log_tool._make_api_call = AsyncMock(return_value=_log_page(_log_entries(1), 1, 1))
+        await log_tool._handle_get_internal_logs({})
+        assert log_tool._make_api_call.await_args.args[2] == PLATFORM_MAX_PAGE_SIZE == 100
+
+    def test_no_prose_promises_a_page_above_the_platform_cap(self):
+        prose = "\n".join(
+            [CAPABILITIES_TEXT, EXAMPLES_TEXT, ReveniumLogAnalysis.tool_description]
+        )
+        sizes = [int(n) for n in re.findall(r'"size":\s*(\d+)', prose)]
+        assert sizes and max(sizes) <= PLATFORM_MAX_PAGE_SIZE
+        assert "1000" not in prose
+        assert "max: 100" in CAPABILITIES_TEXT
+
+    @pytest.mark.asyncio
+    async def test_system_diagnostics_advertises_only_options_search_logs_reads(self):
+        capabilities = await SystemDiagnostics()._get_tool_capabilities()
+        log_capability = next(c for c in capabilities if c.name == "Log Analysis")
+        assert "pages" not in log_capability.parameters["search_logs"]
+        search_examples = [e for e in log_capability.examples if e.startswith("search_logs")]
+        assert search_examples
+        assert not any(re.search(r"\bpages=", e) for e in search_examples)
+
+
+class TestRegisteredLogPageSize:
+    """BACK-4735: through the registered system_diagnostics tool, a log read asks for the platform cap."""
+
+    @pytest.mark.asyncio
+    async def test_a_log_read_without_size_asks_for_the_platform_cap(self, monkeypatch):
+        from tests.unit._registered_tool_harness import answer_text, build_registered_tools
+
+        served = AsyncMock(return_value=_log_page(_log_entries(1), 1, 1))
+        monkeypatch.setattr(ReveniumLogAnalysis, "_make_api_call", served)
+        tools = await build_registered_tools()
+
+        result = await tools.call("system_diagnostics", {"action": "get_internal_logs"})
+
+        assert not result.is_error, answer_text(result)
+        assert served.await_args.args[2] == PLATFORM_MAX_PAGE_SIZE
+
+    @pytest.mark.asyncio
+    async def test_a_size_above_the_platform_cap_is_refused(self, monkeypatch):
+        from tests.unit._registered_tool_harness import answer_text, build_registered_tools
+
+        served = AsyncMock(return_value=_log_page(_log_entries(1), 1, 1))
+        monkeypatch.setattr(ReveniumLogAnalysis, "_make_api_call", served)
+        tools = await build_registered_tools()
+
+        result = await tools.call(
+            "system_diagnostics", {"action": "get_internal_logs", "size": 200}
+        )
+
+        assert result.is_error
+        assert "cannot exceed 100 records" in answer_text(result)
+        served.assert_not_awaited()

@@ -982,11 +982,29 @@ class TestMeteringElementsCapabilitiesElementTypesFallback:
         assert "compute time" not in line
 
     @pytest.mark.asyncio
+    async def test_overview_follows_a_new_template(self, mgmt, monkeypatch):
+        """BACK-4853: the overview line is derived from the templates, so a new one shows up."""
+        registered = MeteringElementsManager._build_element_templates
+
+        def with_one_more(self):
+            return {**registered(self), "apiCalls": {"name": "apiCalls", "description": "API calls", "type": "NUMBER"}}
+
+        monkeypatch.setattr(MeteringElementsManager, "_build_element_templates", with_one_more)
+        text = await mgmt._build_enhanced_capabilities_text(None)
+        line = next(
+            line for line in text.splitlines() if line.startswith("- **Configuration templates**")
+        )
+        assert line == (
+            "- **Configuration templates**: 4 templates, `shippingCost`, `shippingWeight`, "
+            "`shippingContainerId` and `apiCalls`"
+        )
+
+    @pytest.mark.asyncio
     async def test_agent_summary_states_the_registered_template_count(self, mgmt):
         n = len(MeteringElementsManager().element_templates)
         result = await mgmt._handle_get_agent_summary()
         text = result[0].text
-        assert f"{n} predefined shipping templates" in text
+        assert f"{n} predefined templates" in text
         assert "6+ predefined" not in text
         assert "4 predefined" not in text
 

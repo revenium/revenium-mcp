@@ -27,7 +27,7 @@ from .envelope_reads import (
 )
 from .paging import PageInfo
 from .ranked_rows import bare_cost, metric_total, rank_with_shares
-from .report_reads import fails_whole_call, read_failure_reason
+from .report_reads import fails_whole_call, platform_ran_out_of_time, read_failure_reason
 from ..tool_analytics_reports import (
     COST_BY_TOOL_AGENT,
     COST_BY_TOOL_AGGREGATED,
@@ -116,8 +116,10 @@ class SummaryPart:
     top_key: str
 
 
+TOTAL_PART = SummaryPart("provider_costs", "Providers", "get_provider_costs", "top_providers")
+
 COST_SUMMARY_PARTS = (
-    SummaryPart("provider_costs", "Providers", "get_provider_costs", "top_providers"),
+    TOTAL_PART,
     SummaryPart("model_costs", "Models", "get_model_costs", "top_models"),
     SummaryPart("customer_costs", "Customers", "get_customer_costs", "top_customers"),
     SummaryPart("api_key_costs", "API keys", "get_api_key_costs", "top_api_keys"),
@@ -139,21 +141,39 @@ def summary_part_time_limit_text() -> str:
     return f"{COST_SUMMARY_PART_TIME_LIMIT_SECONDS:g} seconds"
 
 
+@dataclass(frozen=True)
+class PartNotRead:
+    """Why a summary part was not read, and whether it ran out of time."""
+
+    reason: str
+    out_of_time: bool = False
+
+
 class TeamIdUnavailableError(Exception):
     """The server has no team id to read cost reports for."""
+
+
+def shorter_period_retry(part: SummaryPart, period: Any) -> str:
+    """How to read a part that ran out of time: the same period is likely to run out again."""
+    return (
+        f"The platform did not answer this report over {period} in time, so "
+        f"the same period is likely to run out again; read it with "
+        f"`{part.action}` over a shorter period or start_date/end_date range."
+    )
 
 
 class CostSummaryUnreadError(Exception):
     """No part of the cost summary could be read."""
 
-    def __init__(self, not_read: Dict[str, str]):
+    def __init__(self, not_read: Dict[str, PartNotRead], period: Any):
         self.not_read = not_read
         parts = {part.key: part for part in COST_SUMMARY_PARTS}
         super().__init__(
-            "No part of the cost summary could be read: "
-            + "; ".join(
-                f"{parts[key].label} ({parts[key].action}): {reason}"
-                for key, reason in not_read.items()
+            "No part of the cost summary could be read:\n"
+            + "\n".join(
+                f"- {parts[key].label} ({parts[key].action}): {part.reason}."
+                + (f" {shorter_period_retry(parts[key], period)}" if part.out_of_time else "")
+                for key, part in not_read.items()
             )
         )
 
@@ -413,7 +433,6 @@ class SimpleCostAnalyzer:
             ):
                 processed_data = rank_entities(
                     data, aggregation, entity_key="model", default_name="Unknown Model",
-                    keep_nonpositive=True,
                 )
                 total_cost = sum(row["cost"] for row in processed_data)
 
@@ -517,7 +536,6 @@ class SimpleCostAnalyzer:
             if data and isinstance(data[0], dict) and "groups" in data[0]:
                 processed_data = rank_entities(
                     data, aggregation, entity_key="customer", default_name="Unknown Customer",
-                    keep_nonpositive=True,
                 )
                 total_cost = sum(row["cost"] for row in processed_data)
 
@@ -881,7 +899,7 @@ class SimpleCostAnalyzer:
     async def get_analytics_filter_options(
         self,
         dimension: str,
-        period: str,
+        period: AnalyticsWindow,
         cost_sources: Optional[Sequence[str]] = None,
     ) -> List[str]:
         """Enumerate the valid filter values for an analytics dimension.
@@ -968,11 +986,11 @@ class SimpleCostAnalyzer:
 
     async def _read_summary_parts(
         self, period: AnalyticsWindow, aggregation: str
-    ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, str]]:
+    ) -> Tuple[Dict[str, RankedCosts], Dict[str, PartNotRead]]:
         """Read the five summary parts at once.
 
         Returns:
-            The rows of each part read, and the reason for each part not read
+            The rows of each part read, and why each part was not read
 
         Raises:
             CostSummaryUnreadError: When no part could be read
@@ -984,30 +1002,28 @@ class SimpleCostAnalyzer:
             return_exceptions=True,
         )
 
-        rows: Dict[str, List[Dict[str, Any]]] = {}
-        not_read: Dict[str, str] = {}
+        rows: Dict[str, RankedCosts] = {}
+        not_read: Dict[str, PartNotRead] = {}
         for part, outcome in zip(COST_SUMMARY_PARTS, outcomes):
             if isinstance(outcome, BaseException):
                 raise outcome
-            if isinstance(outcome, str):
+            if isinstance(outcome, PartNotRead):
                 not_read[part.key] = outcome
             else:
                 rows[part.key] = outcome
         if not rows:
-            raise CostSummaryUnreadError(not_read)
+            raise CostSummaryUnreadError(not_read, period)
         return rows, not_read
 
     async def _read_summary_part(
         self, part: SummaryPart, period: AnalyticsWindow, aggregation: str
-    ) -> Union[List[Dict[str, Any]], str]:
+    ) -> Union[RankedCosts, PartNotRead]:
         """Read one summary part within its time limit, or say why it could not be read."""
         scope = asyncio.timeout(COST_SUMMARY_PART_TIME_LIMIT_SECONDS)
         try:
             with recording_retried_errors() as retried:
                 async with scope:
-                    rows: List[Dict[str, Any]] = await getattr(self, part.action)(
-                        period, aggregation
-                    )
+                    rows: RankedCosts = await getattr(self, part.action)(period, aggregation)
             return rows
         except Exception as error:
             if isinstance(error, TimeoutError) and scope.expired():
@@ -1015,20 +1031,24 @@ class SimpleCostAnalyzer:
                 if retried.last is not None:
                     reason += f"; the platform last answered {read_failure_reason(retried.last)}"
                 self.logger.error(f"Cost summary part {part.key} {reason}")
-                return reason
+                return PartNotRead(reason, out_of_time=True)
             if fails_whole_call(error):
                 raise
             self.logger.error(f"Cost summary part {part.key} not read: {error}")
-            return read_failure_reason(error)
+            return PartNotRead(read_failure_reason(error), platform_ran_out_of_time(error))
 
     async def get_cost_summary(self, period: AnalyticsWindow, aggregation: str) -> Dict[str, Any]:
         """
         Get enhanced cost summary combining all 5 data sources.
 
         The five parts are read at once. A part that fails is named in
-        ``not_read`` with its reason; its breakdown entry is None and its top
-        list empty. The total is the provider sum, so it is None when the
-        provider part was not read. Each part has
+        ``not_read`` with its reason, and in ``not_read_in_time`` too when the
+        platform or the wait for it ran out of time; its breakdown entry is
+        None and its top list empty. A part whose read stopped at ``ENVELOPE_MAX_PAGES`` is
+        named in ``incomplete`` with its ``UnreadPages``; its sum and top list
+        cover only the pages read. The total is the provider sum, so it is
+        None when the provider part was not read and partial when that part
+        is incomplete, with its ``UnreadPages`` in ``total_unread``. Each part has
         ``COST_SUMMARY_PART_TIME_LIMIT_SECONDS``, whatever the request timeout;
         a part still reading then is cancelled and named as not read within
         that time. A top list holds only rows that added
@@ -1060,15 +1080,25 @@ class SimpleCostAnalyzer:
                 )
                 for part in COST_SUMMARY_PARTS
             }
-            total_cost = cost_breakdown["provider_costs"]
+            total_cost = cost_breakdown[TOTAL_PART.key]
+            total_rows = rows.get(TOTAL_PART.key)
 
             summary: Dict[str, Any] = {
                 "total_cost": total_cost,
+                "total_unread": total_rows.unread if total_rows is not None else None,
                 "cost_breakdown": cost_breakdown,
                 "period": period,
                 "aggregation": aggregation,
                 "timestamp": datetime.utcnow().isoformat(),
-                "not_read": not_read,
+                "not_read": {key: part.reason for key, part in not_read.items()},
+                "not_read_in_time": [
+                    key for key, part in not_read.items() if part.out_of_time
+                ],
+                "incomplete": {
+                    key: part_rows.unread
+                    for key, part_rows in rows.items()
+                    if part_rows.unread is not None
+                },
             }
             for part in COST_SUMMARY_PARTS:
                 summary[part.top_key] = _top_contributors(rows.get(part.key, []))
@@ -1094,7 +1124,6 @@ class SimpleCostAnalyzer:
             entity_key="provider",
             default_name="Unknown Provider",
             name_of=self._normalize_provider_name,
-            keep_nonpositive=True,
         )
 
     def _process_model_data(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1172,7 +1201,6 @@ class SimpleCostAnalyzer:
             aggregation,
             entity_key="api_key",
             default_name="Unknown API Key",
-            keep_nonpositive=True,
         )
     def _process_agent_data(
         self, data: List[Dict[str, Any]], aggregation: str
@@ -1187,7 +1215,6 @@ class SimpleCostAnalyzer:
             aggregation,
             entity_key="agent",
             default_name="Unknown Agent",
-            keep_nonpositive=True,
         )
     def _process_user_data(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Process user cost data from the cost-by-user-aggregated endpoint.

@@ -643,6 +643,41 @@ class TestHandleAnalyzeRecentTransactions:
         call_kwargs = client.get.call_args
         assert call_kwargs[1]["params"]["size"] == 100
 
+    @pytest.mark.parametrize(
+        "sent, used, adjusted",
+        [
+            (0, 1, "**Adjusted:** page_size 0 is below the minimum of 1; used 1"),
+            (-5, 1, "**Adjusted:** page_size -5 is below the minimum of 1; used 1"),
+            (200, 100, "**Adjusted:** page_size 200 is above the limit of 100; used 100"),
+        ],
+    )
+    async def test_a_moved_page_size_is_named_in_the_answer(self, sent, used, adjusted):
+        """BACK-4853: a page size moved into range says so, as lookup_transactions does."""
+        client = make_client()
+        client.get = AsyncMock(return_value={
+            "_embedded": {"aICompletionMetricResourceList": [{"transactionId": "tx_1", "model": "m"}]},
+        })
+        text = (
+            await self.mm._handle_analyze_recent_transactions(client, {"page_size": sent})
+        )[0].text
+        assert client.get.call_args[1]["params"]["size"] == used
+        assert adjusted in text
+
+    async def test_a_moved_page_size_is_named_when_nothing_comes_back(self):
+        client = make_client()
+        client.get = AsyncMock(return_value={"_embedded": {"aICompletionMetricResourceList": []}})
+        text = (await self.mm._handle_analyze_recent_transactions(client, {"page_size": 0}))[0].text
+        assert "No Recent Transactions" in text
+        assert "**Adjusted:** page_size 0 is below the minimum of 1; used 1" in text
+
+    async def test_a_page_size_in_range_has_no_adjusted_line(self):
+        client = make_client()
+        client.get = AsyncMock(return_value={
+            "_embedded": {"aICompletionMetricResourceList": [{"transactionId": "tx_1", "model": "m"}]},
+        })
+        text = (await self.mm._handle_analyze_recent_transactions(client, {"page_size": 5}))[0].text
+        assert "Adjusted" not in text
+
     async def test_upstream_failure_raises_instead_of_reporting_success(self):
         """BACK-2931: a failed read must not look like a successful analysis.
 

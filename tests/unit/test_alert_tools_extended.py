@@ -897,6 +897,38 @@ class TestSemanticIntentDetection:
         result = tools._detect_semantic_intent({"query": "list monitoring rules"})
         assert result == "anomalies"
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "show my active alert rules",
+            "rules for the duration of a spike",
+            "which rules notify me when cost spikes",
+            "show the last rule I made",
+            "show elasticsearch rules",
+            "show the rule definitions",
+        ],
+    )
+    def test_a_rule_question_with_a_history_leaning_word_reaches_the_rules(self, query):
+        assert AlertManagement()._detect_semantic_intent({"query": query}) == "anomalies"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "show alerts this week",
+            "show alerts today",
+            "show alerts from Oct 12 to Oct 14",
+            "show active alerts",
+            "show rules that fired in the last 24 hours",
+            "show budget alerts this month",
+        ],
+    )
+    def test_a_history_question_reaches_alert_history(self, query):
+        assert AlertManagement()._detect_semantic_intent({"query": query}) == "alerts"
+
+    @pytest.mark.parametrize("query", ["show elasticsearch thresholds", "show the whenever list"])
+    def test_a_keyword_inside_another_word_does_not_decide(self, query):
+        assert AlertManagement()._detect_semantic_intent({"query": query}) == "anomalies"
+
 
 # ===========================================================================
 # Every manage_alerts refusal reaches the caller flagged as an error

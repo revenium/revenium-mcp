@@ -99,14 +99,25 @@ def _new_idempotency_key() -> str:
 READ_SERVER_ERROR_RETRIES = 1
 
 
-def _retries_for(method: str, configured: int) -> int:
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+# Verified on dev 2026-10-22: the value is case-sensitive (ADVISORY is
+# ignored), and the platform drops the advisory rows whenever ruleId is sent.
+ENFORCEMENT_RULES_ADVISORY_INCLUDE = "advisory"
+
+
+def _retries_for(method: str, configured: int, headers: Optional[Dict[str, str]] = None) -> int:
     if method.upper() == "GET":
         return min(configured, READ_SERVER_ERROR_RETRIES)
-    return configured
+    if headers and IDEMPOTENCY_KEY_HEADER in headers:
+        return configured
+    # A write the platform may already have committed is never resent without
+    # a key it can dedupe on (BACK-4841).
+    return 0
 
 
 def _idempotency_headers(key: Optional[str] = None) -> Dict[str, str]:
-    return {"Idempotency-Key": key if key is not None else _new_idempotency_key()}
+    return {IDEMPOTENCY_KEY_HEADER: key if key is not None else _new_idempotency_key()}
 
 
 class RetriedErrors:
@@ -255,6 +266,16 @@ class ReveniumAPIError(Exception):
         self.response_data = response_data
         self.code = code
         super().__init__(self.message)
+
+    @property
+    def names_a_missing_id(self) -> bool:
+        """The platform holds no record under the id: a 404, or a 400 that cannot decode it."""
+        if self.status_code == 404:
+            return True
+        return (
+            self.status_code == 400
+            and "failed to decode hashed id" in str(self.response_data).lower()
+        )
 
 
 class OrganizationNameUnresolvedError(ValueError):
@@ -459,7 +480,6 @@ def _problem_details_message(problem: Any, status_code: int) -> str:
 # The organizations list narrows by `query` server side, so an exact name is
 # normally on the first page; the cap bounds a loose query that matches many.
 _ORGANIZATION_NAME_SCAN_MAX_PAGES = 10
-_ORGANIZATION_NAME_SCAN_PAGE_SIZE = 100
 
 
 class ReveniumClient:
@@ -868,7 +888,7 @@ class ReveniumClient:
         """
         if max_retries is None:
             max_retries = self.auth_config.max_retries
-        max_retries = _retries_for(method, max_retries)
+        max_retries = _retries_for(method, max_retries, extra_headers)
 
         last_error = None
 
@@ -2060,6 +2080,21 @@ class ReveniumClient:
             await self.post("/profitstream/v2/api/ai/cost-controls/department-group-preview", data=body),
         )
 
+    async def get_cost_control_filter_values(self, dimension: str = "PROVIDER") -> Dict[str, Any]:
+        """List the values a cost-control filter on ``dimension`` accepts for the team.
+
+        Upstream lists PROVIDER only and answers any other dimension with 400.
+        A platform released before the endpoint existed answers 404.
+
+        Args:
+            dimension: The filter dimension to list
+
+        Returns:
+            ``{"dimension": str, "values": [{"value", "label", "covers"}]}``
+        """
+        params = self._add_team_id_to_params({"dimension": dimension})
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/ai/filter-values", params=params))
+
     async def update_cost_control(self, control_id: str, control_data: Dict[str, Any]) -> Dict[str, Any]:
         """Update an existing cost control.
 
@@ -2174,7 +2209,9 @@ class ReveniumClient:
             "/profitstream/v2/api/ai/enforcement-events/affected", params=params
         ))
 
-    async def get_enforcement_rules(self, rule_id: Optional[str] = None) -> Dict[str, Any]:
+    async def get_enforcement_rules(
+        self, rule_id: Optional[str] = None, include_advisory: bool = False
+    ) -> Dict[str, Any]:
         """Get the compiled enforcement rules for the current team.
 
         The team id is the path parameter (not a query param) for this
@@ -2186,13 +2223,25 @@ class ReveniumClient:
                 carries answers 200 with an empty ``rules`` list rather than
                 404, so an empty answer to a narrowed read means "no such
                 rule", not "no rules on this team".
+            include_advisory: Send ``include=advisory`` so the answer also
+                carries the team's notify-only per-person budgets, after the
+                cost-control rows, as rows whose ``action`` is NOTIFY and whose
+                ``source`` is ANOMALY. Such a row never blocks. The server
+                ignores the flag whenever ``ruleId`` is sent, so the two are
+                refused together rather than answered with no advisory rows.
 
         Returns:
             Compiled enforcement rules, e.g. {"rules": [...], "compiledAt": ...}
         """
+        if rule_id is not None and include_advisory:
+            raise ValueError(
+                "advisory rows are served only on the whole-team read; drop rule_id"
+            )
         params: Dict[str, Any] = {}
         if rule_id is not None:
             params["ruleId"] = rule_id
+        if include_advisory:
+            params["include"] = ENFORCEMENT_RULES_ADVISORY_INCLUDE
         return cast(Dict[str, Any], await self.get(
             f"/profitstream/v2/api/ai/enforcement-rules/{self.team_id}", params=params
         ))
@@ -3451,12 +3500,15 @@ class ReveniumClient:
                 so the name cannot be confirmed unique or found.
             ReveniumAPIError: On any platform refusal.
         """
+        # Imported here: the common package imports this module while loading.
+        from .common.platform_paging import PLATFORM_MAX_PAGE_SIZE
+
         matches: List[Any] = []
         page = 0
         scan_complete = False
         while page < _ORGANIZATION_NAME_SCAN_MAX_PAGES:
             response = await self.get_organizations(
-                page=page, size=_ORGANIZATION_NAME_SCAN_PAGE_SIZE, query=name
+                page=page, size=PLATFORM_MAX_PAGE_SIZE, query=name
             )
             matches.extend(
                 org.get("id")
@@ -4772,21 +4824,19 @@ class ReveniumClient:
         amendment is not idempotent and a blind retry appends a duplicate
         revision.
 
-        ``use_retry=False`` is the load-bearing argument here, and the ONLY
-        call in this file that turns the transport retry off for that reason.
-        ``_should_retry`` resends on 408 and every 5xx, and each amendment
-        appends a JobOutcomeRevision row: a transient error arriving after the
-        origin already committed would turn one amendment into two, and the
-        caller would see a single success. The application-level "never retry a
-        409" rule in JobManager.amend_outcome does nothing about that loop one
-        layer down, so the guarantee has to be made here too. An idempotency
-        key would be the better fix — it is how submit_ai_transaction and the
-        tool-event writes stay safe under retry — but ``patch`` takes no
-        ``extra_headers`` (only ``post`` and ``put`` do) and the platform
-        declares no dedup key on this operation, so there is nothing for the
-        backend to dedupe on. Give this endpoint an Idempotency-Key server-side
-        and retry can come back; until then a transient failure surfaces to the
-        caller, who can re-read the job and decide.
+        The PATCH is sent exactly once. Each amendment appends a
+        JobOutcomeRevision row, so a transient error arriving after the origin
+        already committed would turn one amendment into two while the caller
+        saw a single success. ``_retries_for`` already sends every write that
+        carries no Idempotency-Key once (BACK-4841); ``use_retry=False`` keeps
+        that guarantee on this call even if the transport rule is relaxed, and
+        it skips ``_request_with_retry`` altogether. The application-level
+        "never retry a 409" rule in JobManager.amend_outcome does nothing about
+        the transport one layer down. Retry can come back only when the
+        platform declares a dedup key on this operation AND this call sends one
+        through ``extra_headers`` (which ``patch`` would first have to accept)
+        AND drops ``use_retry=False``. Until then a transient failure surfaces
+        to the caller, who can re-read the job and decide.
 
         Args:
             job_id: The job identifier
@@ -4842,19 +4892,20 @@ class ReveniumClient:
     #    URL by _quote_path_segment, as every job method's ``{job_id}`` segment
     #    is. A job type containing a slash, a space or a dot-segment would
     #    otherwise change which endpoint is called.
-    # 2. The three appends pass ``use_retry=False`` for the reason
-    #    ``amend_job_outcome`` does: they are not idempotent. A second delivery
-    #    of a baseline is a second version, and a second delivery of a fact is
-    #    a second fact (or a 409 against the active-fact constraint for a write
-    #    that already landed), and neither operation declares an idempotency
-    #    key for the platform to dedupe on. ``_should_retry`` resends on 408
-    #    and every 5xx, so a transient error arriving after the origin
-    #    committed would duplicate the row while the caller saw one success.
-    #    The revenium-python-sdk draws the same line on the same endpoints
-    #    (``_NON_IDEMPOTENT_RETRY_STATUSES`` in
+    # 2. Every write here is sent once. The transport never resends a write
+    #    that carries no Idempotency-Key (``_retries_for``, BACK-4841), and
+    #    none of these operations declares a key for the platform to dedupe
+    #    on. The three appends also pass ``use_retry=False``, as
+    #    ``amend_job_outcome`` does, because they are not idempotent: a second
+    #    delivery of a baseline is a second version, and a second delivery of
+    #    a fact is a second fact (or a 409 against the active-fact constraint
+    #    for a write that already landed), so that guarantee must survive any
+    #    relaxing of the transport rule. The revenium-python-sdk draws the
+    #    same line on the same endpoints (``_NON_IDEMPOTENT_RETRY_STATUSES`` in
     #    ``revenium_middleware/_core/outcomes.py`` keeps only 429, which this
-    #    transport has no way to express, so it gives that one up too).
-    #    GET and the economics PUT are safe to repeat and keep the default.
+    #    transport has no way to express, so it gives that one up too). Only
+    #    the GETs keep the read retry (``READ_SERVER_ERROR_RETRIES``); the
+    #    economics PUT is safe to repeat but, unkeyed, is sent once too.
 
     async def get_job_type_economics(self, job_type: str) -> Dict[str, Any]:
         """Read a job type's economics declaration and its current baseline.
@@ -5631,7 +5682,7 @@ class ReveniumClient:
             base_url=self._get_app_base_url(),
             use_bearer=True,
             unwrap_hal_embedded=False,
-            extra_headers={"Idempotency-Key": _new_idempotency_key()},
+            extra_headers=_idempotency_headers(),
         )
         return cast(Dict[str, Any], result)
 
@@ -5677,7 +5728,7 @@ class ReveniumClient:
             base_url=self._get_app_base_url(),
             use_bearer=True,
             unwrap_hal_embedded=False,
-            extra_headers={"Idempotency-Key": _new_idempotency_key()},
+            extra_headers=_idempotency_headers(),
         )
         return cast(Dict[str, Any], result)
 

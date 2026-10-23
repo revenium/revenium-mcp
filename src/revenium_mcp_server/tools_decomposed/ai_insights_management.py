@@ -7,7 +7,7 @@ Maps RFC 7807 problem-details codes to structured tool errors.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import (
     TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union, cast,
 )
@@ -32,6 +32,9 @@ from ..common.validation import preprocess_boolean_parameters
 from ..introspection.metadata import ToolType
 from .unified_tool_base import ToolBase
 
+
+INSIGHT_RUN_MAX_DAYS = 90
+"""The platform's longest run period (ApiV2InsightsRunsPostRequest.periodStart in generated/isotope_models.py)."""
 
 # BACK-2757. The department id is an opaque number the agent cannot guess, and
 # the only MCP surface that resolves a department name to it is
@@ -72,6 +75,8 @@ class AIInsightsManagement(ToolBase):
 
     DEFAULT_MAX_RESULTS = 100
     HARD_CAP_MAX_RESULTS = 1000
+    # The insights runs route's own limit bound (ApiV2InsightsRunsGetParametersQuery.limit
+    # in generated/isotope_models.py), not the Spring page cap in common/platform_paging.py.
     BACKEND_PAGE_LIMIT = 100
     # The documented per-page cap of the feedback endpoint. It cannot be
     # verified client-side (a bare-array response carries no page metadata),
@@ -243,12 +248,54 @@ class AIInsightsManagement(ToolBase):
             ) from None
 
     @staticmethod
-    def _is_calendar_day(value: str) -> bool:
+    def _period_start_of_a_whole_day(value: Any) -> str:
+        """A yyyy-MM-dd day as its first UTC millisecond; anything else as given."""
+        if AIInsightsManagement._is_calendar_day(value):
+            return cast(str, utc_instant_bounds(value, None)[0])
+        return cast(str, value)
+
+    @staticmethod
+    def _period_end_of_a_whole_day(value: Any) -> str:
+        """A yyyy-MM-dd day as its last UTC millisecond; anything else as given."""
+        if AIInsightsManagement._is_calendar_day(value):
+            return cast(str, utc_instant_bounds(None, value)[1])
+        return cast(str, value)
+
+    @staticmethod
+    def _refuse_more_days_than_a_run_covers(period_start: Any, period_end: Any) -> None:
+        """Two yyyy-MM-dd days span both whole days, so the platform would refuse the run past its cap."""
+        first_day = AIInsightsManagement._calendar_day(period_start)
+        last_day = AIInsightsManagement._calendar_day(period_end)
+        if first_day is None or last_day is None:
+            return
+        days = (last_day - first_day).days + 1
+        if days <= INSIGHT_RUN_MAX_DAYS:
+            return
+        latest_end = first_day + timedelta(days=INSIGHT_RUN_MAX_DAYS - 1)
+        raise create_structured_validation_error(
+            message=(
+                f"period_start {first_day} to period_end {last_day} covers {days} days, "
+                f"both included; a run covers at most {INSIGHT_RUN_MAX_DAYS}"
+            ),
+            field="period_end",
+            value=period_end,
+            suggestions=[f"End the period on {latest_end} or earlier, or split it into two runs"],
+            examples={"correct_usage": {"period_start": str(first_day), "period_end": str(latest_end)}},
+        )
+
+    @staticmethod
+    def _is_calendar_day(value: Any) -> bool:
+        return AIInsightsManagement._calendar_day(value) is not None
+
+    @staticmethod
+    def _calendar_day(value: Any) -> Optional[date]:
+        """The day a yyyy-MM-dd string names, read as utc_instant_bounds reads it, or None."""
+        if not isinstance(value, str):
+            return None
         try:
-            datetime.strptime(value.strip(), "%Y-%m-%d")
+            return datetime.strptime(value.strip(), "%Y-%m-%d").date()
         except ValueError:
-            return False
-        return True
+            return None
 
     async def _autopaginate(
         self,
@@ -492,6 +539,8 @@ class AIInsightsManagement(ToolBase):
                     suggestions=["e.g. 2026-01-01T00:00:00Z"],
                 )
 
+        self._refuse_more_days_than_a_run_covers(period_start, period_end)
+
         include_descendants = self._read_yes_no(arguments, "filter_include_descendants", True)
         include_coding_assistants = self._read_yes_no(
             arguments, "filter_include_coding_assistants", True
@@ -499,8 +548,8 @@ class AIInsightsManagement(ToolBase):
 
         client = await self.get_client(ctx=ctx)
         result = await client.trigger_recommendation_run(
-            period_start=cast(str, period_start),
-            period_end=cast(str, period_end),
+            period_start=self._period_start_of_a_whole_day(period_start),
+            period_end=self._period_end_of_a_whole_day(period_end),
             filter_agent=arguments.get("filter_agent"),
             filter_product_id=arguments.get("filter_product_id"),
             filter_trace_type=arguments.get("filter_trace_type"),
@@ -668,8 +717,18 @@ class AIInsightsManagement(ToolBase):
                         "not_applicable", "already_aware",
                     ],
                 },
-                "period_start": {"type": "string", "description": "ISO 8601 datetime"},
-                "period_end":   {"type": "string", "description": "ISO 8601 datetime"},
+                "period_start": {
+                    "type": "string",
+                    "description": (
+                        "ISO 8601 datetime, or a yyyy-MM-dd UTC day from its first instant"
+                    ),
+                },
+                "period_end": {
+                    "type": "string",
+                    "description": (
+                        "ISO 8601 datetime, or a yyyy-MM-dd UTC day through its last instant"
+                    ),
+                },
                 "filter_agent":             {"type": "array", "items": {"type": "string"}},
                 "filter_product_id":        {"type": "array", "items": {"type": "string"}},
                 "filter_trace_type":        {"type": "array", "items": {"type": "string"}},

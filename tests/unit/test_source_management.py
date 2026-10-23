@@ -62,6 +62,17 @@ def _previewed_body(preview_text: str) -> dict:
 # Fixtures
 # ---------------------------------------------------------------------------
 
+CONFIGURED_OWNER = "owner_test"
+_SOURCE_CONFIG_VALUE = "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value"
+
+
+@pytest.fixture(autouse=True)
+def configured_owner():
+    """The owner a local server is configured with; a test without one patches it away."""
+    with patch(_SOURCE_CONFIG_VALUE, return_value=CONFIGURED_OWNER):
+        yield
+
+
 @pytest.fixture
 def mock_client():
     """Create a mock ReveniumClient for SourceManager."""
@@ -98,7 +109,7 @@ async def _create_source_body(source_mgmt, arguments):
 
         with patch(
             "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value",
-            return_value=None,
+            return_value=CONFIGURED_OWNER,
         ):
             result = await source_mgmt.handle_action("create", arguments)
 
@@ -238,8 +249,8 @@ class TestSourceManagerCreate:
         assert data["type"] == "STREAM"
 
     @pytest.mark.asyncio
-    async def test_create_source_moves_url_to_configuration(self, source_manager, mock_client):
-        """Create moves top-level url into the configuration object."""
+    async def test_create_source_sends_url_as_resource(self, source_manager, mock_client):
+        """BACK-4739: the platform stores a source's URI as resource and has no url field."""
         mock_client.create_source.return_value = {"id": "s_new"}
 
         await source_manager.create_source({
@@ -247,8 +258,9 @@ class TestSourceManagerCreate:
         })
 
         data = mock_client.create_source.call_args[0][0]
-        assert "url" not in data or data.get("url") != "https://api.example.com"
-        assert data["configuration"]["url"] == "https://api.example.com"
+        assert "url" not in data
+        assert "configuration" not in data
+        assert data["resource"] == "https://api.example.com"
 
     @pytest.mark.asyncio
     async def test_create_source_moves_authentication_to_configuration(self, source_manager, mock_client):
@@ -332,6 +344,21 @@ class TestSourceManagerUpdate:
 
         call_kwargs = source_manager.update_handler.update_with_merge.call_args.kwargs
         assert call_kwargs["partial_data"]["type"] == "API"
+
+
+    @pytest.mark.asyncio
+    async def test_update_source_sends_folded_changes_and_leaves_the_callers_data(
+        self, source_manager
+    ):
+        source_manager.update_handler.update_with_merge = AsyncMock(return_value={"id": "s1"})
+        source_manager.update_config_factory.get_config = MagicMock(return_value={})
+        source_data = {"type": "api", "url": "https://new.example.com"}
+
+        await source_manager.update_source({"source_id": "s1", "source_data": source_data})
+
+        sent = source_manager.update_handler.update_with_merge.call_args.kwargs["partial_data"]
+        assert sent == {"type": "API", "resource": "https://new.example.com"}
+        assert source_data == {"type": "api", "url": "https://new.example.com"}
 
 
 class TestSourceManagerNormalizeType:
@@ -574,7 +601,7 @@ class TestSourceManagementHandleAction:
 
             with patch(
                 "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value",
-                return_value=None,
+                return_value=CONFIGURED_OWNER,
             ):
                 result = await source_mgmt.handle_action(
                     "create",
@@ -617,7 +644,7 @@ class TestSourceManagementHandleAction:
         assert body["meteringElementDefinitionIds"] == ["e1"]
         assert body["autoDiscoveryEnabled"] is True
         assert body["sourceClassifications"] == ["c"]
-        assert body["teamId"] == "test_team"
+        assert body["teamId"] == "other"
         assert source_data == before
 
     @pytest.mark.asyncio
@@ -682,7 +709,7 @@ class TestSourceManagementHandleAction:
         # The platform still receives every field.
         assert body["configuration"]["connection_string"] == "postgres://u:conn-secret-123@db/x"
         assert body["configuration"]["authentication"]["token"] == "auth-secret-789"
-        assert body["configuration"]["url"] == "https://user:url-secret-456@api.example.com"
+        assert body["resource"] == "https://user:url-secret-456@api.example.com"
 
     @pytest.mark.asyncio
     async def test_validate_auto_generate_keeps_caller_tags(self, source_mgmt):
@@ -725,7 +752,7 @@ class TestSourceManagementHandleAction:
         assert "successfully" in result[0].text.lower()
         assert body["name"] == "My API"
         assert body["type"] == "API"
-        assert body["configuration"]["url"] == "https://api.example.com"
+        assert body["resource"] == "https://api.example.com"
 
     @pytest.mark.asyncio
     async def test_create_source_data_name_wins_over_top_level(self, source_mgmt):
@@ -777,7 +804,7 @@ class TestSourceManagementHandleAction:
             {"name": "Events", "type": "stream", "stream_url": "wss://stream.example.com"},
         )
 
-        assert body["configuration"]["url"] == "wss://stream.example.com"
+        assert body["resource"] == "wss://stream.example.com"
         assert "stream_url" not in body
 
     @pytest.mark.asyncio
@@ -911,3 +938,443 @@ class TestSourceTypeParity:
             )
         text = result[0].text
         assert "**Type:** API" in text
+
+
+class TestSourceOwner:
+    """BACK-4740: a source is created for a known owner or refused before anything is sent."""
+
+    @pytest.mark.asyncio
+    async def test_a_create_with_no_known_owner_is_refused_naming_owner_id(self, source_mgmt):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_client.team_id = "test_team"
+            mock_client.create_source = AsyncMock(return_value={"id": "s_new"})
+            mock_gc.return_value = mock_client
+            with patch(_SOURCE_CONFIG_VALUE, return_value=None):
+                with pytest.raises(ToolError) as exc:
+                    await source_mgmt.handle_action("create", {"source_data": {"name": "My API"}})
+
+        assert exc.value.field == "ownerId"
+        assert "nothing was created" in exc.value.message
+        mock_client.create_source.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_preview_with_no_known_owner_is_refused_like_the_create(self, source_mgmt):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = MagicMock()
+            with patch(_SOURCE_CONFIG_VALUE, return_value=None):
+                with pytest.raises(ToolError) as exc:
+                    await source_mgmt.handle_action(
+                        "create", {"source_data": {"name": "My API"}, "dry_run": True}
+                    )
+
+        assert exc.value.field == "ownerId"
+        assert "nothing was created" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_caller_owner_is_sent_without_a_configured_one(self, source_manager, mock_client):
+        mock_client.create_source.return_value = {"id": "s_new"}
+        with patch(_SOURCE_CONFIG_VALUE, return_value=None):
+            await source_manager.create_source(
+                {"source_data": {"name": "Test", "type": "api", "ownerId": "owner_given"}}
+            )
+
+        assert mock_client.create_source.call_args[0][0]["ownerId"] == "owner_given"
+
+    @pytest.mark.asyncio
+    async def test_an_auto_generated_create_sends_the_caller_owner(self, source_mgmt):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_client.team_id = "test_team"
+            mock_client.create_source = AsyncMock(return_value={"id": "s_new"})
+            mock_gc.return_value = mock_client
+            with patch(_SOURCE_CONFIG_VALUE, return_value=None):
+                await source_mgmt.handle_action(
+                    "create", {"source_data": {"name": "My API", "ownerId": "owner_given"}}
+                )
+
+        assert mock_client.create_source.call_args[0][0]["ownerId"] == "owner_given"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("empty_owner", [None, ""])
+    async def test_an_explicit_create_with_an_empty_owner_is_refused(
+        self, source_mgmt, empty_owner
+    ):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_client.team_id = "test_team"
+            mock_client.create_source = AsyncMock(return_value={"id": "s_new"})
+            mock_gc.return_value = mock_client
+            with patch(_SOURCE_CONFIG_VALUE, return_value=None):
+                with pytest.raises(ToolError) as exc:
+                    await source_mgmt.handle_action(
+                        "create",
+                        {
+                            "source_data": {
+                                "name": "My API",
+                                "type": "API",
+                                "description": "d",
+                                "version": "1.0.0",
+                                "ownerId": empty_owner,
+                            },
+                            "auto_generate": False,
+                        },
+                    )
+
+        assert exc.value.field == "ownerId"
+        mock_client.create_source.assert_not_called()
+
+
+class TestSourceFieldsTheCreateKeeps:
+    """BACK-4739: the URL is sent where the platform stores it, and a field it drops is named."""
+
+    @staticmethod
+    async def _create(source_mgmt, source_data, stored):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_client.team_id = "test_team"
+            mock_client.create_source = AsyncMock(return_value=stored)
+            mock_gc.return_value = mock_client
+            result = await source_mgmt.handle_action("create", {"source_data": source_data})
+        return mock_client.create_source.call_args[0][0], result[0].text
+
+    @pytest.mark.asyncio
+    async def test_a_kept_url_type_and_metadata_are_not_named(self, source_mgmt):
+        body, text = await self._create(
+            source_mgmt,
+            {"name": "Model", "type": "ai", "url": "https://m.example.com", "metadata": "a=1"},
+            {"id": "s1", "name": "Model", "type": "AI", "resource": "https://m.example.com", "metadata": "a=1"},
+        )
+
+        assert body["resource"] == "https://m.example.com"
+        assert "Not stored by the platform" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_source_type_the_platform_replaces_is_named(self, source_mgmt):
+        _, text = await self._create(
+            source_mgmt,
+            {"name": "Model", "type": "ai", "sourceType": "ai", "metadata": "a=1"},
+            {"id": "s1", "name": "Model", "type": "AI", "sourceType": "UNKNOWN", "metadata": "a=1"},
+        )
+
+        assert "Not stored by the platform: sourceType (stored as 'UNKNOWN')." in text
+
+    @pytest.mark.asyncio
+    async def test_a_dropped_url_metadata_and_authentication_are_named(self, source_mgmt):
+        _, text = await self._create(
+            source_mgmt,
+            {
+                "name": "Api",
+                "url": "https://api.example.com",
+                "metadata": "a=1",
+                "authentication": {"type": "bearer", "token": "auth-secret-789"},
+            },
+            {"id": "s1", "name": "Api", "type": "API", "resource": None, "metadata": ""},
+        )
+
+        assert (
+            "Not stored by the platform: authentication, metadata (stored as ''), "
+            "url (stored as None)." in text
+        )
+        assert "auth-secret-789" not in text.split("Not stored by the platform", 1)[1].split("\n")[0]
+
+    @pytest.mark.asyncio
+    async def test_a_list_the_platform_empties_is_named(self, source_mgmt):
+        _, text = await self._create(
+            source_mgmt,
+            {"name": "Api", "tags": ["production"]},
+            {"id": "s1", "name": "Api", "type": "API", "tags": []},
+        )
+
+        assert "Not stored by the platform: tags (stored as [])." in text
+
+    @pytest.mark.asyncio
+    async def test_a_list_kept_in_another_order_is_not_named(self, source_mgmt):
+        _, text = await self._create(
+            source_mgmt,
+            {"name": "Api", "tags": ["production", "eu"]},
+            {"id": "s1", "name": "Api", "type": "API", "tags": ["eu", "production"]},
+        )
+
+        assert "Not stored by the platform" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_default_the_tool_filled_in_is_never_named(self, source_mgmt):
+        _, text = await self._create(
+            source_mgmt,
+            {"name": "Api"},
+            {"id": "s1", "name": "Api", "type": "API", "sourceType": "UNKNOWN"},
+        )
+
+        assert "Not stored by the platform" not in text
+
+    @pytest.mark.asyncio
+    async def test_an_update_sends_url_as_resource(self, source_mgmt):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = _recording_source_client()
+            result = await source_mgmt.handle_action(
+                "update",
+                {
+                    "source_id": "src_1",
+                    "source_data": {"url": "https://new.example.com"},
+                    "dry_run": True,
+                },
+            )
+
+        body = _previewed_body(result[0].text)
+        assert body["resource"] == "https://new.example.com"
+        assert "url" not in body
+
+    @pytest.mark.asyncio
+    async def test_a_create_naming_two_uris_is_refused(self, source_mgmt):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_client.team_id = "test_team"
+            mock_client.create_source = AsyncMock(return_value={"id": "s1"})
+            mock_gc.return_value = mock_client
+            with pytest.raises(ToolError) as exc:
+                await source_mgmt.handle_action(
+                    "create",
+                    {
+                        "source_data": {
+                            "name": "Api",
+                            "url": "https://new.example.com",
+                            "resource": "https://old.example.com",
+                        }
+                    },
+                )
+
+        assert exc.value.field == "source_data.url"
+        assert "nothing was created" in exc.value.message
+        mock_client.create_source.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_preview_naming_two_uris_is_refused_like_the_create(self, source_mgmt):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = MagicMock()
+            with pytest.raises(ToolError) as exc:
+                await source_mgmt.handle_action(
+                    "create",
+                    {
+                        "source_data": {
+                            "name": "Api",
+                            "url": "https://new.example.com",
+                            "resource": "https://old.example.com",
+                        },
+                        "dry_run": True,
+                    },
+                )
+
+        assert exc.value.field == "source_data.url"
+        assert "nothing was created" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_url_beside_an_empty_resource_is_sent_as_resource(
+        self, source_manager, mock_client
+    ):
+        mock_client.create_source.return_value = {"id": "s1"}
+        await source_manager.create_source(
+            {"source_data": {"name": "Api", "url": "https://new.example.com", "resource": None}}
+        )
+
+        assert mock_client.create_source.call_args[0][0]["resource"] == "https://new.example.com"
+
+    @pytest.mark.asyncio
+    async def test_an_update_naming_two_uris_is_refused(self, source_mgmt):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = _recording_source_client()
+            with pytest.raises(ToolError) as exc:
+                await source_mgmt.handle_action(
+                    "update",
+                    {
+                        "source_id": "src_1",
+                        "source_data": {
+                            "resource": "https://old.example.com",
+                            "url": "https://new.example.com",
+                        },
+                        "dry_run": True,
+                    },
+                )
+
+        assert exc.value.field == "source_data.url"
+        assert "nothing was changed" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_an_update_keeps_a_resource_sent_beside_an_empty_url(self, source_mgmt):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = _recording_source_client()
+            result = await source_mgmt.handle_action(
+                "update",
+                {
+                    "source_id": "src_1",
+                    "source_data": {"resource": "https://kept.example.com", "url": None},
+                    "dry_run": True,
+                },
+            )
+
+        assert _previewed_body(result[0].text)["resource"] == "https://kept.example.com"
+
+    @pytest.mark.asyncio
+    async def test_linked_metering_elements_returned_as_records_are_not_named(self, source_mgmt):
+        _, text = await self._create(
+            source_mgmt,
+            {"name": "Api", "meteringElementDefinitionIds": ["med_1"]},
+            {
+                "id": "s1",
+                "name": "Api",
+                "type": "API",
+                "meteringElementDefinitions": [{"id": "med_1"}, {"id": "med_default"}],
+            },
+        )
+
+        assert "Not stored by the platform" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_metering_element_the_platform_did_not_link_is_named(self, source_mgmt):
+        _, text = await self._create(
+            source_mgmt,
+            {"name": "Api", "meteringElementDefinitionIds": ["med_1", "med_2"]},
+            {
+                "id": "s1",
+                "name": "Api",
+                "type": "API",
+                "meteringElementDefinitions": [{"id": "med_1"}],
+            },
+        )
+
+        assert "Not stored by the platform: meteringElementDefinitionIds (not linked: med_2)." in text
+
+
+class TestSourceTeam:
+    """BACK-4852: a team named in source_data is honoured or refused, never swapped."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "source_data",
+        [
+            {"name": "Api", "teamId": "team_given"},
+            {"name": "Api", "team": "team_given"},
+            {"name": "Api", "team": {"id": "team_given"}},
+            {"name": "Api", "team": "team_given", "teamId": "team_given"},
+        ],
+    )
+    async def test_a_create_is_filed_under_the_team_it_names(self, source_mgmt, source_data):
+        body, _ = await _create_source_body(source_mgmt, {"source_data": source_data})
+
+        assert body["teamId"] == "team_given"
+        assert "team" not in body
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "team_fields",
+        [{"team": None}, {"team": ""}, {"teamId": ""}, {"team": None, "teamId": ""}],
+    )
+    async def test_an_empty_team_names_no_team(self, source_mgmt, team_fields):
+        body, _ = await _create_source_body(
+            source_mgmt, {"source_data": {"name": "Api", **team_fields}}
+        )
+
+        assert body["teamId"] == "test_team"
+        assert "team" not in body
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "team_fields",
+        [{"team": None}, {"team": ""}, {"teamId": ""}, {"team": None, "teamId": ""}],
+    )
+    async def test_the_manager_files_a_create_with_an_empty_team_under_the_configured_team(
+        self, source_manager, mock_client, team_fields
+    ):
+        mock_client.create_source.return_value = {"id": "s1"}
+        with patch(_SOURCE_CONFIG_VALUE, return_value=CONFIGURED_OWNER):
+            await source_manager.create_source({"source_data": {"name": "Api", **team_fields}})
+
+        body = mock_client.create_source.call_args[0][0]
+        assert body["teamId"] == "test_team_id_456"
+        assert "team" not in body
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("team", ["team_given", {"id": "team_given"}])
+    async def test_a_team_beside_an_empty_team_id_is_the_one_team(self, source_mgmt, team):
+        body, _ = await _create_source_body(
+            source_mgmt, {"source_data": {"name": "Api", "team": team, "teamId": ""}}
+        )
+
+        assert body["teamId"] == "team_given"
+
+    @pytest.mark.asyncio
+    async def test_the_manager_files_a_create_under_the_team_it_names(
+        self, source_manager, mock_client
+    ):
+        mock_client.create_source.return_value = {"id": "s1"}
+        await source_manager.create_source(
+            {"source_data": {"name": "Api", "team": {"id": "team_given"}}}
+        )
+
+        body = mock_client.create_source.call_args[0][0]
+        assert body["teamId"] == "team_given"
+        assert "team" not in body
+
+    @pytest.mark.asyncio
+    async def test_the_manager_refuses_a_create_naming_two_teams(
+        self, source_manager, mock_client
+    ):
+        with pytest.raises(ToolError) as exc:
+            await source_manager.create_source(
+                {"source_data": {"name": "Api", "team": "team_a", "teamId": "team_b"}}
+            )
+
+        assert exc.value.field == "source_data.teamId"
+        mock_client.create_source.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_create_naming_two_teams_is_refused(self, source_mgmt):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_client = MagicMock()
+            mock_client.create_source = AsyncMock()
+            mock_gc.return_value = mock_client
+            with pytest.raises(ToolError) as exc:
+                await source_mgmt.handle_action(
+                    "create",
+                    {"source_data": {"name": "Api", "team": "team_a", "teamId": "team_b"}},
+                )
+
+        assert exc.value.field == "source_data.teamId"
+        assert "nothing was created" in exc.value.message
+        mock_client.create_source.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_team_with_no_id_is_refused(self, source_mgmt):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = MagicMock()
+            with pytest.raises(ToolError) as exc:
+                await source_mgmt.handle_action(
+                    "create", {"source_data": {"name": "Api", "team": {"name": "Ops"}}}
+                )
+
+        assert exc.value.field == "source_data.team"
+
+    @pytest.mark.asyncio
+    async def test_an_update_keeps_a_team_stored_as_a_bare_id(self, source_mgmt):
+        client = _recording_source_client()
+        stored = dict(STORED_SOURCE, team="team_src")
+        client.get_source_by_id = AsyncMock(return_value=stored)
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = client
+            result = await source_mgmt.handle_action(
+                "update",
+                {"source_id": "src_1", "source_data": {"name": "renamed"}, "dry_run": True},
+            )
+
+        assert _previewed_body(result[0].text)["teamId"] == "team_src"
+
+    @pytest.mark.asyncio
+    async def test_an_update_honours_a_bare_string_team(self, source_mgmt):
+        with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
+            mock_gc.return_value = _recording_source_client()
+            result = await source_mgmt.handle_action(
+                "update",
+                {"source_id": "src_1", "source_data": {"team": "team_new"}, "dry_run": True},
+            )
+
+        assert _previewed_body(result[0].text)["teamId"] == "team_new"

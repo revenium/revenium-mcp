@@ -284,6 +284,7 @@ class AgentManager:
             "discovered_agents": discovered,
             "pagination": page_info,
             "total_found": len(discovered),
+            "total_records": platform_total(page_info),
             "page": page,
         }
 
@@ -362,6 +363,7 @@ class SquadManager:
             "rendered": [self._squad_line(s) for s in squads],
             "pagination": page_info,
             "total_found": len(squads),
+            "total_records": platform_total(page_info),
             "page": page,
         }
 
@@ -400,6 +402,7 @@ class SquadManager:
             "rendered": [self._execution_line(e) for e in executions],
             "pagination": page_info,
             "total_found": len(executions),
+            "total_records": platform_total(page_info),
             "page": page,
         }
 
@@ -902,10 +905,14 @@ class AgentManagement(ToolBase):
                 return [
                     TextContent(
                         type="text",
-                        text=(
-                            f"Found {result['total_found']} discovered agents over {result['period']} "
-                            f"(page {result.get('page', 0) + 1}):\n\n" + json.dumps(result, indent=2)
-                        ),
+                        text=format_page_count_heading(
+                            f"discovered agents over {result['period']}",
+                            result["total_found"],
+                            result["pagination"],
+                            result["page"],
+                        )
+                        + "\n\n"
+                        + json.dumps(result, indent=2),
                     )
                 ]
 
@@ -915,10 +922,14 @@ class AgentManagement(ToolBase):
                 return [
                     TextContent(
                         type="text",
-                        text=(
-                            f"Found {result['total_found']} squads "
-                            f"(page {result.get('page', 0) + 1}):\n\n" + json.dumps(result, indent=2)
-                        ),
+                        text=format_page_count_heading(
+                            "squads",
+                            result["total_found"],
+                            result["pagination"],
+                            result["page"],
+                        )
+                        + "\n\n"
+                        + json.dumps(result, indent=2),
                     )
                 ]
 
@@ -928,10 +939,14 @@ class AgentManagement(ToolBase):
                 return [
                     TextContent(
                         type="text",
-                        text=(
-                            f"Found {result['total_found']} squad executions "
-                            f"(page {result.get('page', 0) + 1}):\n\n" + json.dumps(result, indent=2)
-                        ),
+                        text=format_page_count_heading(
+                            "squad executions",
+                            result["total_found"],
+                            result["pagination"],
+                            result["page"],
+                        )
+                        + "\n\n"
+                        + json.dumps(result, indent=2),
                     )
                 ]
 

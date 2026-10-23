@@ -28,7 +28,7 @@ class TestLogAnalysisConstants:
 
     def test_default_values_provide_sensible_page_size(self):
         """Default page size is a reasonable number for API pagination."""
-        assert DEFAULT_VALUES["size"] == 200
+        assert DEFAULT_VALUES["size"] == 100
         assert DEFAULT_VALUES["page"] == 0
 
     def test_valid_log_types_include_both_and_individual(self):

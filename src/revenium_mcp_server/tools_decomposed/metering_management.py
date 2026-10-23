@@ -36,6 +36,7 @@ from ..auth import AuthenticationError
 from ..client import ReveniumAPIError, ReveniumClient
 from ..agent_friendly import UnifiedResponseFormatter
 from ..auth.tenant_scope import TenantScope, tenant_scope
+from ..common.platform_paging import PLATFORM_MAX_PAGE_SIZE
 from ..common.tenant_scoped_store import TenantScopedStore
 from ..common.validation import validate_pagination_params
 from ..endpoint_registry import get_endpoint_path
@@ -52,6 +53,7 @@ from ..common.error_handling import (
 from ..core.response_cache import response_cache, cache_response
 from ..introspection.metadata import ToolType, ToolCapability, ToolDependency, DependencyType
 from ..trace_fields import extract_trace_fields
+from ..common.money import render_exact_dollars
 
 
 # Import Prometheus metrics if available
@@ -123,14 +125,14 @@ _PROVIDER_VALIDATING_ACTIONS: FrozenSet[str] = frozenset({"submit_ai_transaction
 _PROVIDER_CATALOG_TTL_SECONDS = 600
 
 # Size of the model-listing scan _fetch_catalog_providers falls back to when the
-# catalog's providers endpoint is unavailable. The listing endpoint truncates
-# every page to roughly 100 models no matter how large a size is requested, so
-# that scan only ever observes the first page. Providers beyond it are covered by
+# catalog's providers endpoint is unavailable, and of the one page
+# get_supported_providers reads. A larger size is served as the platform's page
+# cap anyway, so the scan only ever observes the first page. Providers beyond it are covered by
 # _STATIC_PROVIDER_BASELINE and, for anything the platform added later, by the
 # on-miss targeted lookup in _provider_priced_by_catalog — which filters
 # server-side and therefore does not depend on where a provider's models happen
 # to fall in the listing.
-_PROVIDER_CATALOG_PAGE_SIZE = 1000
+_PROVIDER_CATALOG_PAGE_SIZE = PLATFORM_MAX_PAGE_SIZE
 
 # The catalog is fetched with the caller's own credentials and scoped to the
 # caller's team, so the cache is keyed per tenant: one worker process serves
@@ -420,6 +422,30 @@ def _format_price_pin(model: Any) -> str:
     return _PRICE_PIN_UNAVAILABLE
 
 
+_COST_DECIMALS = 6
+_PRICE_PER_1K_DECIMALS = 4
+_PRICE_PER_TOKEN_DECIMALS = 2
+
+
+def _format_cost(amount: Any) -> str:
+    return render_exact_dollars(amount, _COST_DECIMALS)
+
+
+def _format_price_per_1k_tokens(price_per_token: float) -> str:
+    return f"{render_exact_dollars(1000 * price_per_token, _PRICE_PER_1K_DECIMALS)} per 1K tokens"
+
+
+def _format_price_per_token(price: Any) -> str:
+    """A catalog price as "$X/token", plain decimals at any magnitude; n/a when the row has none."""
+    if isinstance(price, str):
+        try:
+            price = float(price)
+        except ValueError:
+            return "n/a"
+    rendered = render_exact_dollars(price, _PRICE_PER_TOKEN_DECIMALS)
+    return "n/a" if rendered == "n/a" else f"{rendered}/token"
+
+
 # The three answers an AI model listing can owe its caller, decided before any
 # listing text is built. `ReveniumClient._extract_embedded_data` answers `[]`
 # for every shape it does not recognise, so an `_embedded` block carrying no
@@ -577,6 +603,11 @@ _COMPLETIONS_FILTER_PARAM_MAP: Dict[str, str] = {
     # See _DEFAULT_INCLUDE_CODING_ASSISTANTS for the default and its reasoning.
     "include_coding_assistants": "includeCodingAssistants",
 }
+
+#: The names lookup_recent_transactions reads its page size from, first match wins:
+#: page_size is the documented name, and size is the paging argument the thin
+#: manage_metering schema advertises to every caller.
+_RECENT_PAGE_SIZE_KEYS = ("recent_page_size", "page_size", "size")
 
 # DECISION (BACK-2785) - do not flip this back without reading the reasoning.
 #
@@ -929,9 +960,9 @@ def _extract_completions_filters(arguments: Dict[str, Any]) -> Dict[str, Any]:
 #     shared skill-catalog columns they are persisted in. The persistence step
 #     runs fail-open, so an overlong value is not rejected — the catalog insert
 #     fails silently and the transaction loses its skill attribution forever.
-#   - effort / model_host / subscriber_email_source: metering spec
+#   - effort / model_host / subscriber_email_source / entrypoint: metering spec
 #     AICompletionMetadataResource.effort / .modelHost / .subscriberEmailSource
-#     maxLength — the API rejects the whole submission over them
+#     / .entrypoint maxLength — the API rejects the whole submission over them
 #   - prompt_id / query_source / speed / subagent_type: hypercurrent
 #     AICompletionMetadataResource @Size caps (BACK-3134), same whole-submission
 #     rejection
@@ -945,6 +976,7 @@ _OPTIONAL_STRING_MAX_LENGTH_OVERRIDES: Dict[str, int] = {
     "effort": 16,
     "model_host": 50,
     "subscriber_email_source": 20,
+    "entrypoint": 64,
     "prompt_id": 64,
     "query_source": 128,
     "speed": 16,
@@ -964,6 +996,7 @@ _COMPLETION_PROVENANCE_EXAMPLES: Dict[str, str] = {
     "effort": "high",
     "model_host": "bedrock",
     "subscriber_email_source": "jwt",
+    "entrypoint": "cli",
 }
 
 # The metering API stopped accepting organizationId / productId on the wire;
@@ -982,6 +1015,7 @@ _DEPRECATED_SUBMISSION_ALIASES: Dict[str, str] = {
 # never an allow-list, which would reject valid new levels.
 _SHORT_SLUG_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _EFFORT_PATTERN = _SHORT_SLUG_PATTERN
+_ENTRYPOINT_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # Prompt-context shapes, mirrored from hypercurrent AICompletionMetadataResource
 # (BACK-3134), which rejects the whole submission over any one of them. As with
@@ -1054,6 +1088,7 @@ _SYNC_VALIDATED_OPTIONAL_STRING_FIELDS: Tuple[str, ...] = (
     "effort",
     "model_host",
     "subscriber_email_source",
+    "entrypoint",
 )
 
 # Optional token counts beyond input and output, metered as sent and 0 when
@@ -1085,6 +1120,26 @@ def _optional_string_max_length(field: str) -> int:
     return _OPTIONAL_STRING_MAX_LENGTH_OVERRIDES.get(field, _OPTIONAL_STRING_MAX_LENGTH)
 
 
+def _empty_string_refusal(field: str) -> str:
+    """Refusal for a blank optional string, worded the same on every validation path."""
+    return f"{field}: Cannot be empty"
+
+
+def _slug_format_errors(
+    arguments: Dict[str, Any], field: str, pattern: "re.Pattern[str]", allowed: str
+) -> List[str]:
+    """Shape errors for an open-vocabulary slug field, in the validation-report bullet format."""
+    value = arguments.get(field)
+    # fullmatch, never match: two traps compound in a `.match()` + `$` gate.
+    # re.match only anchors the START of the string, and Python's `$` also
+    # matches immediately before a single trailing newline — so "high\n" would
+    # be accepted here and 400'd by the metering API. (Same bug, same fix:
+    # revenium-python-sdk-internal#100.)
+    if isinstance(value, str) and not pattern.fullmatch(value):
+        return [f"• {field}: Invalid format '{value}', must match {pattern.pattern} ({allowed})"]
+    return []
+
+
 def _effort_format_errors(arguments: Dict[str, Any]) -> List[str]:
     """Shape errors for `effort`.
 
@@ -1092,18 +1147,23 @@ def _effort_format_errors(arguments: Dict[str, Any]) -> List[str]:
     the same verdict as the submit path's structured pre-flight check. Only the
     shape is checked: the vocabulary is open by design.
     """
-    value = arguments.get("effort")
-    # fullmatch, never match: two traps compound in a `.match()` + `$` gate.
-    # re.match only anchors the START of the string, and Python's `$` also
-    # matches immediately before a single trailing newline — so "high\n" would
-    # be accepted here and 400'd by the metering API. (Same bug, same fix:
-    # revenium-python-sdk-internal#100.)
-    if isinstance(value, str) and not _EFFORT_PATTERN.fullmatch(value):
-        return [
-            f"• effort: Invalid format '{value}', must match {_EFFORT_PATTERN.pattern} "
-            "(letters, digits, underscore and hyphen only)"
-        ]
-    return []
+    return _slug_format_errors(
+        arguments, "effort", _EFFORT_PATTERN, "letters, digits, underscore and hyphen only"
+    )
+
+
+def _entrypoint_format_errors(arguments: Dict[str, Any]) -> List[str]:
+    """Shape errors for `entrypoint`, shared by every validation path like `effort`.
+
+    The pattern also rejects a blank value: the metering spec treats null as
+    "not reported" and rejects blank.
+    """
+    return _slug_format_errors(
+        arguments,
+        "entrypoint",
+        _ENTRYPOINT_PATTERN,
+        "letters, digits, dot, underscore and hyphen only",
+    )
 
 
 def _slug_violation(value: Any, pattern: "re.Pattern[str]", max_length: int) -> Optional[str]:
@@ -1258,14 +1318,14 @@ _LOOKUP_MAX_ROUNDS = 10
 _LOOKUP_MAX_RETRY_INTERVAL = 60
 _LOOKUP_MAX_WAIT_SECONDS = 300
 _LOOKUP_MAX_PAGES = 10
-# The platform serves at most 100 rows a page (spring.data.web.pageable.max-page-size).
-_LOOKUP_MAX_PAGE_SIZE = 100
+_LOOKUP_MAX_PAGE_SIZE = PLATFORM_MAX_PAGE_SIZE
 _LOOKUP_SEARCH_CONCURRENCY = 5
 _LOOKUP_DEFAULT_ROUNDS = 3
 _LOOKUP_DEFAULT_RETRY_INTERVAL = 15
 _LOOKUP_DEFAULT_PAGES = 10
-# The platform page cap; every page filters by transactionId, so a full page costs nothing extra.
-_LOOKUP_DEFAULT_PAGE_SIZE = 100
+# Every page filters by transactionId, so a full page costs nothing extra.
+_LOOKUP_DEFAULT_PAGE_SIZE = PLATFORM_MAX_PAGE_SIZE
+_RECENT_DEFAULT_PAGE_SIZE = 20
 
 
 def _lookup_int_setting(arguments: Dict[str, Any], field: str) -> Optional[int]:
@@ -1727,6 +1787,9 @@ class MeteringTransactionManager:
                     if not isinstance(value, str):
                         logger.warning(f"Invalid type for {field}: {type(value)}")
                         return False
+                    if not value.strip():
+                        logger.warning(f"Rejected {_empty_string_refusal(field)}")
+                        return False
                     # Security: Prevent injection and limit length.
                     #
                     # These logs stay VALUE-FREE for every field. The values are
@@ -1756,7 +1819,11 @@ class MeteringTransactionManager:
                 logger.warning(f"Rejected skill attribution: {'; '.join(vocabulary_errors)}")
                 return False
 
-            effort_errors = _effort_format_errors(arguments) + _email_source_shape_errors(arguments)
+            effort_errors = (
+                _effort_format_errors(arguments)
+                + _entrypoint_format_errors(arguments)
+                + _email_source_shape_errors(arguments)
+            )
             if effort_errors:
                 logger.warning(f"Rejected completion provenance: {'; '.join(effort_errors)}")
                 return False
@@ -2179,6 +2246,7 @@ The subscriber data structure has been updated. The old individual fields are no
             "effort",
             "model_host",
             "subscriber_email_source",
+            "entrypoint",
         ]
         for field in optional_string_fields:
             if field in arguments and arguments[field] is not None:
@@ -2187,7 +2255,7 @@ The subscriber data structure has been updated. The old individual fields are no
                     errors.append(f"• {field}: Expected string, got {type(value).__name__}")
                     continue
                 if not value.strip():
-                    errors.append(f"• {field}: Cannot be empty")
+                    errors.append(f"• {_empty_string_refusal(field)}")
                     continue
                 # Security: Prevent injection and limit length
                 max_length = _optional_string_max_length(field)
@@ -2202,6 +2270,7 @@ The subscriber data structure has been updated. The old individual fields are no
 
         errors.extend(_skill_vocabulary_errors(arguments))
         errors.extend(_effort_format_errors(arguments))
+        errors.extend(_entrypoint_format_errors(arguments))
         errors.extend(_email_source_shape_errors(arguments))
         errors.extend(_prompt_context_errors(arguments))
 
@@ -2695,6 +2764,7 @@ The subscriber data structure has been updated. The old individual fields are no
                 "effort",
                 "model_host",
                 "subscriber_email_source",
+                "entrypoint",
             ]
             for field in optional_string_fields:
                 if field in arguments and arguments[field] is not None:
@@ -2703,7 +2773,7 @@ The subscriber data structure has been updated. The old individual fields are no
                         errors.append(f"• {field}: Expected string, got {type(value).__name__}")
                         continue
                     if not value.strip():
-                        errors.append(f"• {field}: Cannot be empty")
+                        errors.append(f"• {_empty_string_refusal(field)}")
                         continue
                     # Security: Prevent injection and limit length
                     max_length = _optional_string_max_length(field)
@@ -2718,6 +2788,7 @@ The subscriber data structure has been updated. The old individual fields are no
 
             errors.extend(_skill_vocabulary_errors(arguments))
             errors.extend(_effort_format_errors(arguments))
+            errors.extend(_entrypoint_format_errors(arguments))
             errors.extend(_email_source_shape_errors(arguments))
             errors.extend(_prompt_context_errors(arguments))
 
@@ -2979,6 +3050,16 @@ The subscriber data structure has been updated. The old individual fields are no
                         "See BACK-1456 for the migration context.",
                     ],
                 )
+
+    def reject_what_submit_refuses(self, arguments: Dict[str, Any]) -> None:
+        """Run the deprecated-alias and transaction-id refusals the live submit runs first.
+
+        Every pre-flight path (dry run, validate, the field-validation tool's
+        validate_test_data) calls this, so none of them calls valid a payload
+        the submit refuses.
+        """
+        self.reject_deprecated_submission_aliases(arguments)
+        self.reject_unrecognized_transaction_id(arguments)
 
     def reject_unrecognized_transaction_id(self, arguments: Dict[str, Any]) -> None:
         """Reject a caller-supplied transaction_id the backend would drop.
@@ -3249,7 +3330,7 @@ The subscriber data structure has been updated. The old individual fields are no
         # The effort vocabulary is open, but its shape is not: the platform
         # enforces _EFFORT_PATTERN, so a value carrying spaces or punctuation is
         # rejected upstream after this call has reported success.
-        if _effort_format_errors(arguments) or _email_source_shape_errors(arguments):
+        if _effort_format_errors(arguments):
             raise create_structured_validation_error(
                 message=(
                     f"Invalid effort: '{arguments.get('effort')}' must match "
@@ -3270,6 +3351,7 @@ The subscriber data structure has been updated. The old individual fields are no
                 },
             )
 
+        self._reject_invalid_entrypoint(arguments)
         self._reject_invalid_prompt_context(arguments)
 
         # Build payload matching EXACT Revenium API requirements
@@ -3323,6 +3405,7 @@ The subscriber data structure has been updated. The old individual fields are no
             "effort": arguments.get("effort"),
             "modelHost": arguments.get("model_host"),
             "subscriberEmailSource": arguments.get("subscriber_email_source"),
+            "entrypoint": arguments.get("entrypoint"),
             **{
                 wire_name: arguments.get(argument)
                 for argument, wire_name in _PROMPT_CONTEXT_WIRE_NAMES.items()
@@ -3424,6 +3507,29 @@ The subscriber data structure has been updated. The old individual fields are no
             "tokens": f"{arguments['input_tokens']} input + {arguments['output_tokens']} output",
             "duration_ms": arguments["duration_ms"],
         }
+
+    def _reject_invalid_entrypoint(self, arguments: Dict[str, Any]) -> None:
+        """Raise a structured error for an entrypoint the platform would 400, blank included."""
+        if not _entrypoint_format_errors(arguments):
+            return
+        raise create_structured_validation_error(
+            message=(
+                f"Invalid entrypoint: '{arguments['entrypoint']}' must match "
+                f"{_ENTRYPOINT_PATTERN.pattern}"
+            ),
+            field="entrypoint",
+            value=arguments["entrypoint"],
+            suggestions=[
+                "Use letters, digits, dot, underscore or hyphen only - no spaces",
+                "Any well-formed value is accepted: the launch-surface vocabulary is open",
+                "Omit entrypoint when the launch surface is unknown - a blank value is rejected",
+            ],
+            examples={
+                "valid_format": _COMPLETION_PROVENANCE_EXAMPLES["entrypoint"],
+                "pattern": _ENTRYPOINT_PATTERN.pattern,
+                "max_length": _optional_string_max_length("entrypoint"),
+            },
+        )
 
     def _reject_invalid_prompt_context(self, arguments: Dict[str, Any]) -> None:
         """Raise a structured error naming the first prompt-context field the platform would 400."""
@@ -4324,8 +4430,7 @@ class MeteringManagement(ToolBase):
                 # The deprecated-alias and transaction-id checks run before the
                 # dry_run split so both branches return the same verdict on
                 # them.
-                self.transaction_manager.reject_deprecated_submission_aliases(arguments)
-                self.transaction_manager.reject_unrecognized_transaction_id(arguments)
+                self.transaction_manager.reject_what_submit_refuses(arguments)
 
                 # Handle dry_run mode for transaction submission
                 dry_run = arguments.get("dry_run", False)
@@ -4381,6 +4486,7 @@ class MeteringManagement(ToolBase):
                             ("effort", "Effort"),
                             ("model_host", "Model Host"),
                             ("subscriber_email_source", "Subscriber Email Source"),
+                            ("entrypoint", "Entrypoint"),
                             ("reasoning_tokens", "Reasoning Tokens"),
                             ("cache_creation_tokens", "Cache Creation Tokens"),
                             ("cache_read_tokens", "Cache Read Tokens"),
@@ -4469,8 +4575,7 @@ class MeteringManagement(ToolBase):
             elif action == "validate":
                 # The same refusals the submit runs first; their ToolError
                 # propagates as it does from submit, never as "Validation Failed".
-                self.transaction_manager.reject_deprecated_submission_aliases(arguments)
-                self.transaction_manager.reject_unrecognized_transaction_id(arguments)
+                self.transaction_manager.reject_what_submit_refuses(arguments)
                 result = await self.validator.validate_transaction(arguments, ctx=ctx)
                 if result["valid"]:
                     # Field validation passing is not the same as the model
@@ -4671,10 +4776,11 @@ class MeteringManagement(ToolBase):
     ) -> str:
         # Extract and validate parameters
         page = arguments.get("page", 0)
-        page_size_key = (
-            "recent_page_size" if "recent_page_size" in arguments else "page_size"
+        page_size_key = next(
+            (key for key in _RECENT_PAGE_SIZE_KEYS if arguments.get(key) is not None),
+            "page_size",
         )
-        page_size = arguments.get(page_size_key, 20)
+        page_size = arguments.get(page_size_key, _RECENT_DEFAULT_PAGE_SIZE)
         # Set default to "summary" for recent transactions lookup
         if "return_transaction_data" not in arguments:
             arguments = arguments.copy()
@@ -4699,23 +4805,23 @@ class MeteringManagement(ToolBase):
                 }
             )
 
-        if not isinstance(page_size, int) or page_size < 1 or page_size > 100:
+        if not isinstance(page_size, int) or not 1 <= page_size <= _LOOKUP_MAX_PAGE_SIZE:
             raise create_structured_validation_error(
                 message=(
                     f"Invalid {page_size_key} parameter: {page_size}. "
-                    "Must be an integer between 1 and 100."
+                    f"Must be an integer between 1 and {_LOOKUP_MAX_PAGE_SIZE}."
                 ),
                 field=page_size_key,
                 value=page_size,
                 suggestions=[
                     "Use page_size=20 for default pagination",
                     "Use page_size=10 for smaller pages",
-                    "Maximum page_size is 100"
+                    f"Maximum page_size is {_LOOKUP_MAX_PAGE_SIZE}"
                 ],
                 examples={
                     "default": "lookup_recent_transactions(page_size=20)",
                     "small_pages": "lookup_recent_transactions(page_size=10)",
-                    "valid_range": "1-100"
+                    "valid_range": f"1-{_LOOKUP_MAX_PAGE_SIZE}"
                 }
             )
 
@@ -4903,16 +5009,16 @@ class MeteringManagement(ToolBase):
             # nullable zero-cost row must render, not abort the whole detail.
             input_tokens = data.get('inputTokenCount') or 0
             rate = input_cost / input_tokens if input_tokens > 0 else 0
-            details += f"  - **Input Cost**: ${input_cost:.6f} ({input_tokens} tokens × ${rate:.8f}/token)\n"
+            details += f"  - **Input Cost**: {_format_cost(input_cost)} ({input_tokens} tokens × {_format_price_per_token(rate)})\n"
 
         output_cost = data.get('outputTokenCost')
         if output_cost is not None:
             output_tokens = data.get('outputTokenCount') or 0
             rate = output_cost / output_tokens if output_tokens > 0 else 0
-            details += f"  - **Output Cost**: ${output_cost:.6f} ({output_tokens} tokens × ${rate:.8f}/token)\n"
+            details += f"  - **Output Cost**: {_format_cost(output_cost)} ({output_tokens} tokens × {_format_price_per_token(rate)})\n"
 
         if data.get('totalCost') is not None:
-            details += f"  - **Total Cost**: ${data.get('totalCost'):.6f}\n"
+            details += f"  - **Total Cost**: {_format_cost(data.get('totalCost'))}\n"
 
         # clientReportedCost is populated only when the platform re-rated the
         # transaction against the tenant's own rate card, replacing what the
@@ -4925,7 +5031,7 @@ class MeteringManagement(ToolBase):
         client_reported_cost = data.get('clientReportedCost')
         if client_reported_cost is not None:
             details += (
-                f"  - **Client-Reported Cost**: ${client_reported_cost:.6f} "
+                f"  - **Client-Reported Cost**: {_format_cost(client_reported_cost)} "
                 "(reported by the client before the platform re-rated this "
                 "transaction; Total Cost above is the billed figure)\n"
             )
@@ -5392,20 +5498,11 @@ class MeteringManagement(ToolBase):
         """
         # Sample size. `recent_page_size` can still arrive through the params
         # bag, but only _handle_lookup_recent_transactions honours it.
-        sample_size = arguments.get("page_size", 20)
-
-        # PAGINATION VALIDATION: the endpoint truncates a page at 100.
-        if sample_size > 100:
-            logger.warning(
-                f"Requested page_size {sample_size} exceeds maximum of 100, "
-                "automatically capping to 100"
-            )
-            sample_size = 100
-        elif sample_size < 1:
-            logger.warning(
-                f"Requested page_size {sample_size} is below the minimum of 1, raising it to 1"
-            )
-            sample_size = 1
+        adjustments: List[str] = []
+        sample_size = _clamp_lookup_setting(
+            "page_size", arguments.get("page_size", _RECENT_DEFAULT_PAGE_SIZE), 1, _LOOKUP_MAX_PAGE_SIZE, adjustments
+        )
+        adjusted = "".join(f"**Adjusted:** {adjustment}\n" for adjustment in adjustments)
 
         # Delegate to the shared paginated fetch helper to avoid duplicating
         # request construction, filter application, and response-structure parsing.
@@ -5429,6 +5526,7 @@ class MeteringManagement(ToolBase):
                     type="text",
                     text=(
                         "**No Recent Transactions**\n\n"
+                        + adjusted
                         + scope_note
                         + "\nThe reporting API returned no transactions for this page and "
                         "filter set. Submit some test transactions first using "
@@ -5466,6 +5564,7 @@ class MeteringManagement(ToolBase):
         report = "# **Recent Transactions Field Analysis**\n\n"
         report += f"**Analysis Date:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
         report += f"**Transactions Sampled:** {sampled}\n"
+        report += adjusted
         report += f"**Transactions Analyzed:** {total_found}\n"
         report += f"**API Endpoint:** `{endpoint}`\n"
         report += scope_note + "\n"
@@ -5732,6 +5831,7 @@ get_field_documentation()
 - `effort` (optional) - Reasoning effort the model was asked for
 - `model_host` (optional) - Billing infrastructure hosting the model
 - `subscriber_email_source` (optional) - How the subscriber email was resolved
+- `entrypoint` (optional) - How the coding assistant was launched, e.g. `cli` or `sdk-py`
 - `prompt_id` (optional) - Opaque id of the human prompt that caused the call (never the prompt text)
 - `prompt_length` (optional) - Character count of that prompt (a count only, never the text)
 - `query_source` (optional) - Which subsystem of the coding assistant issued the call
@@ -5763,6 +5863,7 @@ get_field_documentation()
 - `effort`: String, 1-16 characters matching `^[A-Za-z0-9_-]+$` (e.g. `high`) — open vocabulary, any well-formed value is stored verbatim
 - `model_host`: String, 1-50 characters (e.g. `bedrock`, `vertex`, `anthropic`)
 - `subscriber_email_source`: String, 1-20 characters — how the email was resolved (e.g. `jwt`), never an email address
+- `entrypoint`: String, 1-64 characters matching `^[A-Za-z0-9._-]+$` (e.g. `cli`) — open vocabulary; omit it rather than sending a blank value
 - `prompt_id`: String, 1-64 characters matching `^[A-Za-z0-9_-]+$` (e.g. a UUID)
 - `speed`: String, 1-16 characters matching `^[A-Za-z0-9_-]+$` (e.g. `fast`) — open vocabulary
 - `query_source`, `subagent_type`: String, 1-128 characters matching `^[A-Za-z0-9._:-]+$` (e.g. `repl_main_thread`, `general-purpose`) — open vocabulary
@@ -5814,6 +5915,7 @@ validate(model="<model>", provider="<provider>", input_tokens=3000, output_token
   "effort": "high",
   "model_host": "bedrock",
   "subscriber_email_source": "jwt",
+  "entrypoint": "cli",
   "prompt_id": "0f2b8a54-6c31-4d7e-9a10-b5c7d2e84f63",
   "prompt_length": 412,
   "query_source": "repl_main_thread",
@@ -5918,6 +6020,7 @@ lookup_transactions(transaction_ids=["tx_abc123"], max_retries=5)
   - Array: Search specific range [start, end] (e.g., [10, 19] = pages 10-19)
   - Default: 10 pages, and at most 10: a larger value is lowered to 10 and the answer says so
   - The lookup filters by transaction id on the server, so the first page normally holds the match; a range that starts past page 0 skips it
+  - The range applies only without a `transaction_id` or `trace_id` filter: with either, only page 0 is searched
 - `page_size` (integer) - Transactions per API call (1-100, default: 100):
 - `early_termination` (boolean) - Stop searching when target transaction found:
   - true: Stop immediately when transaction found (faster)
@@ -5987,7 +6090,7 @@ Browse recent transactions without needing specific transaction IDs. Perfect for
 
 ### **Parameters for Recent Transactions**
 - `page` (optional): Page number (0-based, default: 0)
-- `page_size` (optional): Transactions per page (1-100, default: 20)
+- `page_size` (optional): Transactions per page (1-100, default: 20); `size` is read the same way when `page_size` is not sent
 - `return_transaction_data` (optional): Detail level - "no", "summary", "full" (default: "summary"); boolean true selects "full"
 - `include_coding_assistants` (optional): Include coding-assistant records such as Claude Code and Gemini CLI (default: true)
 
@@ -6223,7 +6326,7 @@ main();
   - Length: 1-500 chars, no `<>\"'&`
 - **Capped string fields**: `ticket_id` (1-256 chars), `skill_name` / `skill_plugin_name` / `skill_marketplace_name` (1-256 chars), `skill_invocation_trigger` (1-32 chars)
 - **Closed-vocabulary fields**: `skill_source` (`bundled`, `projectSettings`, `userSettings`, `plugin`), `skill_kind` (`workflow`)
-- **Completion provenance fields**: `effort` (1-16 chars, `^[A-Za-z0-9_-]+$`, open vocabulary), `model_host` (1-50 chars, e.g. `bedrock`), `subscriber_email_source` (1-20 chars, how the email was resolved — never an address)
+- **Completion provenance fields**: `effort` (1-16 chars, `^[A-Za-z0-9_-]+$`, open vocabulary), `model_host` (1-50 chars, e.g. `bedrock`), `subscriber_email_source` (1-20 chars, how the email was resolved — never an address), `entrypoint` (1-64 chars, `^[A-Za-z0-9._-]+$`, how the coding assistant was launched)
 - **Prompt-context fields**: `prompt_id` (1-64 chars, `^[A-Za-z0-9_-]+$`), `prompt_length` (non-negative integer), `query_source` / `subagent_type` (1-128 chars, `^[A-Za-z0-9._:-]+$`), `speed` (1-16 chars, `^[A-Za-z0-9_-]+$`) — open vocabularies, shape-checked only
 - **Numeric fields**: `response_quality_score` (float 0.0-1.0), `time_to_first_token` (integer ≤ 60,000ms)
 - **Boolean fields**: `is_streamed` (true/false, string conversion supported)
@@ -6313,6 +6416,7 @@ report the flag. The pin is read-only here - it is set by a platform operator.
 - `effort` (string, 1-16 chars, `^[A-Za-z0-9_-]+$`) - reasoning effort asked for, e.g. `high`; open vocabulary
 - `model_host` (string, 1-50 chars) - billing infrastructure, e.g. `bedrock`, `vertex`, `anthropic`
 - `subscriber_email_source` (string, 1-20 chars) - how the subscriber email was resolved, e.g. `jwt`; never an email address
+- `entrypoint` (string, 1-64 chars, `^[A-Za-z0-9._-]+$`) - how the coding assistant was launched, e.g. `cli`; open vocabulary
 - `prompt_id` (string, 1-64 chars, `^[A-Za-z0-9_-]+$`) - opaque id of the prompt that caused the call
 - `prompt_length` (integer, ≥ 0) - character count of that prompt
 - `query_source` (string, 1-128 chars, `^[A-Za-z0-9._:-]+$`) - subsystem that issued the call, e.g. `repl_main_thread`
@@ -6351,7 +6455,7 @@ report the flag. The pin is read-only here - it is set by a platform operator.
 - **Session**: + `trace_id`
 - **Billing**: + `product_name`, `subscription_id`, `subscriber`
 - **Ticket / Skill**: + `ticket_id`, `skill_name`, `skill_source`, `skill_kind`, `skill_plugin_name`, `skill_marketplace_name`, `skill_invocation_trigger`
-- **Completion provenance**: + `effort`, `model_host`, `subscriber_email_source`
+- **Completion provenance**: + `effort`, `model_host`, `subscriber_email_source`, `entrypoint`
 - **Prompt context**: + `prompt_id`, `prompt_length`, `query_source`, `speed`, `subagent_type`
 - **Timestamps**: + `request_time`, `response_time`, `completion_start_time`
 
@@ -6491,8 +6595,8 @@ Use `validate()` before submission."""
                         # defensible if the pin is visible. Read-only field —
                         # see _format_price_pin.
                         text += (
-                            f"- **{name}** (Input: ${input_cost}/token, "
-                            f"Output: ${output_cost}/token, "
+                            f"- **{name}** (Input: {_format_price_per_token(input_cost)}, "
+                            f"Output: {_format_price_per_token(output_cost)}, "
                             f"Price pinned: {_format_price_pin(model)})\n"
                         )
                     if len(provider_models) > 5:
@@ -6602,8 +6706,8 @@ Use `validate()` before submission."""
 
                     text += f"## **{name}** ({provider})\n"
                     text += f"- **ID**: {model_id}\n"
-                    text += f"- **Input Cost**: ${input_cost}/token\n"
-                    text += f"- **Output Cost**: ${output_cost}/token\n"
+                    text += f"- **Input Cost**: {_format_price_per_token(input_cost)}\n"
+                    text += f"- **Output Cost**: {_format_price_per_token(output_cost)}\n"
                     # BACK-3084: read-only price-pin status (see _format_price_pin).
                     text += f"- **Price Pinned**: {_format_price_pin(model)}\n"
 
@@ -6650,10 +6754,7 @@ Use `validate()` before submission."""
             _ = arguments  # Acknowledge the parameter to avoid linter warnings
             client = await self.get_client(ctx=ctx)
 
-            # Get all models to extract unique providers
-            response = await client.get_ai_models(
-                page=0, size=1000
-            )  # Get large page to capture all providers
+            response = await client.get_ai_models(page=0, size=_PROVIDER_CATALOG_PAGE_SIZE)
 
             if "_embedded" in response and "aIModelResourceList" in response["_embedded"]:
                 models = response["_embedded"]["aIModelResourceList"]
@@ -6691,7 +6792,8 @@ Use `validate()` before submission."""
                 if is_sample:
                     text += (
                         f"**Providers In This Sample**: {len(provider_stats)} "
-                        f"(from the first {len(models)} of {total_models} models)\n\n"
+                        f"(from the first {len(models)} of {total_models} models; the platform "
+                        f"serves at most {PLATFORM_MAX_PAGE_SIZE} models a page)\n\n"
                     )
                     text += (
                         "**Note**: the breakdown below is a sample of the catalog, not the "
@@ -6942,8 +7044,8 @@ Use `validate()` before submission."""
                 text += f"**Provider**: {exact_match.get('provider')}\n"
                 text += f"**Model ID**: {exact_match.get('id')}\n\n"
                 text += "**Cost Information**:\n"
-                text += f"- Input: ${exact_match.get('inputCostPerToken', 'N/A')}/token\n"
-                text += f"- Output: ${exact_match.get('outputCostPerToken', 'N/A')}/token\n\n"
+                text += f"- Input: {_format_price_per_token(exact_match.get('inputCostPerToken'))}\n"
+                text += f"- Output: {_format_price_per_token(exact_match.get('outputCostPerToken'))}\n\n"
                 text += "**✅ Ready for metering transactions**"
 
                 return [TextContent(type="text", text=text)]
@@ -7080,18 +7182,20 @@ Use `validate()` before submission."""
                     text += f"- **Output Tokens**: {output_tokens:,}\n"
                     text += f"- **Total Tokens**: {input_tokens + output_tokens:,}\n\n"
                     text += "### **Cost Breakdown**\n"
-                    text += f"- **Input Cost**: {input_tokens:,} × ${input_cost_per_token} = **${input_cost:.6f}**\n"
-                    text += f"- **Output Cost**: {output_tokens:,} × ${output_cost_per_token} = **${output_cost:.6f}**\n"
-                    text += f"- **Total Cost**: **${total_cost:.6f}**\n\n"
+                    text += (
+                        f"- **Input Cost**: {input_tokens:,} × {_format_price_per_token(input_cost_per_token)}"
+                        f" = **{_format_cost(input_cost)}**\n"
+                    )
+                    text += (
+                        f"- **Output Cost**: {output_tokens:,} × {_format_price_per_token(output_cost_per_token)}"
+                        f" = **{_format_cost(output_cost)}**\n"
+                    )
+                    text += f"- **Total Cost**: **{_format_cost(total_cost)}**\n\n"
 
-                    # Add cost per 1K tokens for reference
                     if input_tokens > 0:
-                        cost_per_1k_input = 1000 * input_cost_per_token
                         text += "### **Reference Rates**\n"
-                        text += f"- **Input**: ${cost_per_1k_input:.4f} per 1K tokens\n"
-                        text += (
-                            f"- **Output**: ${1000 * output_cost_per_token:.4f} per 1K tokens\n\n"
-                        )
+                        text += f"- **Input**: {_format_price_per_1k_tokens(input_cost_per_token)}\n"
+                        text += f"- **Output**: {_format_price_per_1k_tokens(output_cost_per_token)}\n\n"
 
                     text += "**💡 Ready to submit**: Use `submit_ai_transaction()` with these parameters"
 
@@ -8360,7 +8464,7 @@ Use `validate()` before submission."""
                 description="Browse recent transactions with pagination. No transaction IDs required - perfect for discovery and monitoring.",
                 parameters={
                     "page": "int (optional) - Page number for pagination (0-based, default: 0)",
-                    "page_size": "int (optional) - Number of transactions per page (1-100, default: 20)",
+                    "page_size": "int (optional) - Number of transactions per page (1-100, default: 20); size is read the same way when page_size is not sent",
                     "return_transaction_data": "str|bool (optional) - Detail level: 'no', 'summary', 'full' (default: 'summary'); true selects 'full'",
                     "include_coding_assistants": "bool (optional) - Include coding-assistant records such as Claude Code and Gemini CLI (default: true)",
                 },
@@ -8540,16 +8644,29 @@ Use `validate()` before submission."""
                     "type": "string",
                     "description": f"How the subscriber email was resolved (e.g. '{_COMPLETION_PROVENANCE_EXAMPLES['subscriber_email_source']}'), never an email address. Max {_optional_string_max_length('subscriber_email_source')} characters. Submission field for submit_ai_transaction.",
                 },
+                "entrypoint": {
+                    "type": "string",
+                    "description": f"How the coding assistant was launched (e.g. '{_COMPLETION_PROVENANCE_EXAMPLES['entrypoint']}', 'sdk-py', 'claude-vscode'). Max {_optional_string_max_length('entrypoint')} characters, must match {_ENTRYPOINT_PATTERN.pattern}; open vocabulary, stored verbatim. Omit it when unknown - a blank value is rejected. Submission field for submit_ai_transaction.",
+                },
                 **_prompt_context_input_schema(),
                 # Pagination and Search Control Parameters
                 "search_page_range": {
                     "type": ["integer", "array"],
-                    "description": f"Pages to search for lookup_transactions. Integer for 0 to N-1 pages (e.g., 5 = first 5 pages), or [start, end] array for specific range (e.g., [10, 19]). Default {_LOOKUP_DEFAULT_PAGES} pages, at most {_LOOKUP_MAX_PAGES}: a larger value is lowered to {_LOOKUP_MAX_PAGES} and the answer says so. The lookup filters by transaction id on the server, so the first page normally holds the match, and a range that starts past page 0 skips it.",
+                    "description": f"Pages to search for lookup_transactions. Integer for 0 to N-1 pages (e.g., 5 = first 5 pages), or [start, end] array for specific range (e.g., [10, 19]). Default {_LOOKUP_DEFAULT_PAGES} pages, at most {_LOOKUP_MAX_PAGES}: a larger value is lowered to {_LOOKUP_MAX_PAGES} and the answer says so. The lookup filters by transaction id on the server, so the first page normally holds the match, and a range that starts past page 0 skips it. The range applies only without a transaction_id or trace_id filter: with either, only page 0 is searched.",
                 },
                 "page_size": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Transactions per API call for pagination. For lookup_transactions: 1-100 (the platform serves at most 100 rows a page), default 100; a value outside the range is moved to the nearest limit and the answer says so. This is also the only accepted page/sample size for the two recent-transactions actions, where the endpoint caps a page at 100: lookup_recent_transactions refuses a value above 100 (default 20), analyze_recent_transactions caps it at 100 (default 20).",
+                    "description": (
+                        f"Transactions per API call for pagination. For lookup_transactions: 1-{_LOOKUP_MAX_PAGE_SIZE} "
+                        f"(the platform serves at most {PLATFORM_MAX_PAGE_SIZE} rows a page), default {_LOOKUP_DEFAULT_PAGE_SIZE}; "
+                        "a value outside the range is moved to the nearest limit and the answer says so. "
+                        f"For the two recent-transactions actions the endpoint also caps a page at {_LOOKUP_MAX_PAGE_SIZE}: "
+                        "lookup_recent_transactions also reads `size` when page_size is not sent (page_size wins when both are sent) "
+                        f"and refuses a value above {_LOOKUP_MAX_PAGE_SIZE} (default {_RECENT_DEFAULT_PAGE_SIZE}); "
+                        f"analyze_recent_transactions reads only page_size, moves it into 1-{_LOOKUP_MAX_PAGE_SIZE} "
+                        f"and the answer says so (default {_RECENT_DEFAULT_PAGE_SIZE})."
+                    ),
                 },
                 "early_termination": {
                     "type": "boolean",

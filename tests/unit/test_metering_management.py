@@ -1493,3 +1493,254 @@ class TestClientSurfacePresenceDiagnostic:
         text = await self._analyze([_completion_row(clientSurface="claude-code")])
         assert "- `clientSurface`" not in text
         assert "**clientSurface:**\n  1. `claude-code`" in text
+
+
+# ===========================================================================
+# MeteringManagement — sub-cent prices print as plain decimals (BACK-4536)
+# ===========================================================================
+
+
+JEV_PRICE_PER_TOKEN = 0.000000042
+
+
+def _priced_model(name, input_price, output_price=0.0):
+    return {
+        "id": f"model_{name}",
+        "name": name,
+        "provider": "TYPESAFE",
+        "inputCostPerToken": input_price,
+        "outputCostPerToken": output_price,
+    }
+
+
+async def _estimate(model, input_tokens):
+    mgmt = MeteringManagement()
+    client = make_model_catalog_client([model])
+    with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+        result = await mgmt.handle_action(
+            "estimate_transaction_cost",
+            {
+                "model": model["name"],
+                "provider": model["provider"],
+                "input_tokens": input_tokens,
+                "output_tokens": 1,
+            },
+        )
+    return result[0].text
+
+
+@pytest.mark.asyncio
+async def test_estimate_transaction_cost_jev_fixture():
+    jev = _priced_model("jev", JEV_PRICE_PER_TOKEN)
+
+    ten_tokens = await _estimate(jev, 10)
+    thousand_tokens = await _estimate(jev, 1000)
+
+    assert "10 × $0.000000042/token = **$0.00000042**" in ten_tokens, ten_tokens
+    assert "1,000 × $0.000000042/token = **$0.000042**" in thousand_tokens, thousand_tokens
+    for text in (ten_tokens, thousand_tokens):
+        assert "- **Input**: $0.000042 per 1K tokens" in text, text
+        assert "- **Input**: $0.0000 per 1K" not in text
+        assert "e-0" not in text
+
+
+@pytest.mark.asyncio
+async def test_estimate_transaction_cost_control_rate():
+    text = await _estimate(_priced_model("control", 0.000003, 0.000015), 1000)
+
+    assert "1,000 × $0.000003/token = **$0.003000**" in text, text
+    assert "- **Input**: $0.0030 per 1K tokens" in text
+    assert "- **Output**: $0.0150 per 1K tokens" in text
+    assert "- **Total Cost**: **$0.003015**" in text
+
+
+class TestListSearchValidatePrintPlainRate:
+    @staticmethod
+    async def _run(action, arguments):
+        jev = _priced_model("jev", JEV_PRICE_PER_TOKEN)
+        client = make_model_catalog_client([jev])
+        client.get_ai_models = AsyncMock(
+            return_value={
+                "_embedded": {"aIModelResourceList": [jev]},
+                "page": {"totalElements": 1, "totalPages": 1, "size": 20, "number": 0},
+            }
+        )
+        mgmt = MeteringManagement()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            result = await mgmt.handle_action(action, arguments)
+        return result[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action, arguments",
+        [
+            ("list_ai_models", {}),
+            ("search_ai_models", {"query": "jev"}),
+            ("validate_model_provider", {"model": "jev", "provider": "TYPESAFE"}),
+        ],
+    )
+    async def test_list_search_validate_print_plain_rate(self, action, arguments):
+        text = await self._run(action, arguments)
+
+        assert "$0.000000042/token" in text, text
+        assert "e-0" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_missing_price_reads_as_not_available(self):
+        client = make_model_catalog_client([{"id": "m", "name": "jev", "provider": "TYPESAFE"}])
+        mgmt = MeteringManagement()
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+            result = await mgmt.handle_action(
+                "validate_model_provider", {"model": "jev", "provider": "TYPESAFE"}
+            )
+
+        assert "- Input: n/a\n" in result[0].text, result[0].text
+
+
+def test_format_cost_breakdown_jev():
+    text = MeteringManagement()._format_cost_breakdown(
+        {
+            "inputTokenCount": 10,
+            "inputTokenCost": 0.00000042,
+            "outputTokenCount": 0,
+            "outputTokenCost": 0.0,
+            "totalCost": 0.00000042,
+        }
+    )
+
+    assert "**Input Cost**: $0.00000042 (10 tokens × $0.000000042/token)" in text, text
+    assert "**Total Cost**: $0.00000042" in text
+    assert "**Input Cost**: $0.000000 " not in text
+
+
+def test_a_price_of_a_cent_or_more_keeps_every_digit():
+    from revenium_mcp_server.common.money import render_exact_dollars
+    from revenium_mcp_server.tools_decomposed.metering_management import _format_price_per_token
+
+    assert _format_price_per_token(0.0125) == "$0.0125/token"
+    assert _format_price_per_token(0.0375) == "$0.0375/token"
+    assert render_exact_dollars(0.0125, 6) == "$0.012500"
+    assert render_exact_dollars(12.5, 2) == "$12.50"
+    assert render_exact_dollars(0.003, 4) == "$0.0030"
+
+
+# ===========================================================================
+# BACK-4950: entrypoint on transaction submission
+# ===========================================================================
+
+
+async def _submit_with_full_validation(mgmt, args):
+    with patch(
+        "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+    ) as rc:
+        rc.clear_request_cache = MagicMock()
+        rc.get_cached_response = AsyncMock(return_value=None)
+        rc.set_cached_response = AsyncMock()
+        return await mgmt.handle_action("submit_ai_transaction", args)
+
+
+class TestSubmitEntrypoint:
+    """entrypoint (how the coding assistant was launched) rides the payload opt-in only."""
+
+    @pytest.mark.parametrize("entrypoint", ["cli", "sdk-py", "claude-vscode", "sdk_ts.v2", "e" * 64])
+    @pytest.mark.asyncio
+    async def test_well_formed_entrypoint_is_sent_verbatim(self, entrypoint):
+        mgmt, client = _mgmt_with_client()
+        await _submit_without_async_validation(mgmt, {**VALID_TRANSACTION, "entrypoint": entrypoint})
+        assert _submitted_payload(client)["entrypoint"] == entrypoint
+
+    @pytest.mark.asyncio
+    async def test_absent_entrypoint_is_not_sent(self):
+        """Existing submissions keep byte-identical payloads: no key, never null."""
+        mgmt, client = _mgmt_with_client()
+        await _submit_without_async_validation(mgmt, VALID_TRANSACTION.copy())
+        assert "entrypoint" not in _submitted_payload(client)
+
+    @pytest.mark.asyncio
+    async def test_entrypoint_has_no_environment_fallback(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_ENTRYPOINT", "cli")
+        monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+        mgmt, client = _mgmt_with_client()
+        await _submit_without_async_validation(mgmt, VALID_TRANSACTION.copy())
+        assert "entrypoint" not in _submitted_payload(client)
+
+    @pytest.mark.parametrize("bad_value", ["", "   ", "has space", "cli!", "a/b", "cli\n", "e" * 65])
+    @pytest.mark.asyncio
+    async def test_malformed_entrypoint_is_refused_before_sending(self, bad_value):
+        """The platform 400s a blank, unslugged or overlong entrypoint."""
+        mgmt, client = _mgmt_with_client()
+        with pytest.raises(ToolError) as exc_info:
+            await _submit_without_async_validation(
+                mgmt, {**VALID_TRANSACTION, "entrypoint": bad_value}
+            )
+        assert "entrypoint" in str(exc_info.value)
+        client.post.assert_not_called()
+
+    @pytest.mark.parametrize("bad_value", ["", "has space"])
+    @pytest.mark.asyncio
+    async def test_full_validation_pipeline_refuses_malformed_entrypoint(self, bad_value):
+        mgmt, client = _mgmt_with_client()
+        with pytest.raises(ToolError) as exc_info:
+            await _submit_with_full_validation(mgmt, {**VALID_TRANSACTION, "entrypoint": bad_value})
+        assert "entrypoint" in str(exc_info.value)
+        client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_input_schema_declares_entrypoint(self):
+        mgmt, _ = _mgmt_with_client()
+        description = (await mgmt._get_input_schema())["properties"]["entrypoint"]["description"]
+        assert "64" in description
+        assert "^[A-Za-z0-9._-]+$" in description
+
+    @pytest.mark.asyncio
+    async def test_submission_guidance_lists_entrypoint(self):
+        mgmt, _ = _mgmt_with_client()
+        result = await mgmt.handle_action("get_capabilities", {})
+        assert "`entrypoint`" in "".join(item.text for item in result)
+
+
+class TestValidateEntrypoint:
+    """validate and the sync fast path reach the same verdict as submit."""
+
+    @staticmethod
+    async def _validate(args):
+        mgmt, _ = _mgmt_with_client()
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+        ) as rc:
+            rc.clear_request_cache = MagicMock()
+            rc.get_cached_response = AsyncMock(return_value=None)
+            rc.set_cached_response = AsyncMock()
+            result = await mgmt.handle_action("validate", args)
+        return result[0].text
+
+    @pytest.mark.asyncio
+    async def test_validate_accepts_well_formed_entrypoint(self):
+        text = await self._validate({**VALID_TRANSACTION, "entrypoint": "sdk-py"})
+        assert "Validation Successful" in text
+
+    @pytest.mark.parametrize("bad_value", ["", "has space", "e" * 65])
+    @pytest.mark.asyncio
+    async def test_validate_rejects_malformed_entrypoint(self, bad_value):
+        text = await self._validate({**VALID_TRANSACTION, "entrypoint": bad_value})
+        assert "Validation Failed" in text
+        assert "entrypoint" in text
+
+    @pytest.mark.parametrize(
+        "entrypoint, expected",
+        [("cli", True), ("e" * 64, True), ("", False), ("has space", False), ("e" * 65, False)],
+    )
+    def test_fast_path_agrees(self, entrypoint, expected):
+        manager = MeteringTransactionManager()
+        assert (
+            manager._validate_transaction_inputs({**VALID_TRANSACTION, "entrypoint": entrypoint})
+            is expected
+        )
+
+    def test_validation_cache_key_covers_entrypoint(self):
+        manager = MeteringTransactionManager()
+        assert manager._validate_transaction_inputs({**VALID_TRANSACTION, "entrypoint": "cli"}) is True
+        assert (
+            manager._validate_transaction_inputs({**VALID_TRANSACTION, "entrypoint": "bad value"})
+            is False
+        )

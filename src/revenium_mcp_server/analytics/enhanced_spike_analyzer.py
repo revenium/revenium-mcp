@@ -9,16 +9,20 @@ import asyncio
 import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Collection, Dict, Iterator, List, Optional, Tuple, Union, cast
 
 from loguru import logger
 
-from .formatters.base_formatter import BaseFormattingUtilities
-from .metric_units import render_dollars
+from ..analytics_parameters import TimePeriod
+from ..analytics_window import AnalyticsWindow, InstantRange
+from ..common.money import render_dollars
+from ..date_parser import period_start
+from .formatters.base_formatter import ANALYTICS_API_KEY_ROLLUP_GROUP, BaseFormattingUtilities
 from .report_reads import read_failure_reason
 from .simple_cost_analyzer import RankedReportRead, SimpleCostAnalyzer
 from .statistical_anomaly_detector import (
     DIMENSION_ENTITY_TYPES,
+    ENTITY_TYPE_NOUNS,
     SENSITIVITY_THRESHOLDS,
     NEW_ENTITY,
     DetectionSeries,
@@ -34,10 +38,18 @@ NEW_ENTITY_DETECTION_SUPPORTED_DIMENSIONS = {
     "providers", "agents", "api_keys"
 }
 
-# The analytics route's API key report names only the costliest keys and rolls
-# the rest into one group (get_cost_by_api_key in specs/openapi/isotope.json)
+# Maps dimension name → endpoint registry key for resolve_analytics_request
+# (BACK-718 migration — paths resolved per-call so feature flag toggles are handled)
+TEMPORAL_ANALYSIS_ENDPOINT_KEYS = {
+    "providers": "total_cost_by_provider_over_time",
+    "models": "total_cost_by_model",
+    "api_keys": "cost_metrics_by_subscriber_credential",
+    "agents": "cost_metrics_by_agents_over_time",
+    "customers": "cost_metric_by_organization",
+    "tokens": "tokens_per_minute_by_provider",
+}
+
 ANALYTICS_API_KEY_CAP = 20
-ANALYTICS_API_KEY_ROLLUP_GROUP = "Other API keys"
 API_KEYS_DIMENSION = "api_keys"
 API_KEY_CAP_NOTE = (
     f"the analytics route names only the {ANALYTICS_API_KEY_CAP} costliest API keys in "
@@ -45,9 +57,29 @@ API_KEY_CAP_NOTE = (
     f"not compared, so a new key outside the {ANALYTICS_API_KEY_CAP} is not reported"
 )
 
-# Windows too short to hold a baseline: new-entity detection reads this window instead
+# New-entity detection compares the window with the period of the same length
+# just before it, but never with less than COMPARISON_FLOOR, so an agent idle
+# over a night or a weekend does not count as new.
+COMPARISON_FLOOR = "SEVEN_DAYS"
 SHORT_WINDOWS = {"HOUR", "EIGHT_HOURS", "TWENTY_FOUR_HOURS"}
-DETECTION_WINDOW = "SEVEN_DAYS"
+COMPARISON_LENGTHS = {
+    "SEVEN_DAYS": "7 days",
+    "THIRTY_DAYS": "30 days",
+    "TWELVE_MONTHS": "12 months",
+}
+_ONE_MILLISECOND = timedelta(milliseconds=1)
+WINDOW_PART = "window"
+COMPARISON_PART = "comparison period"
+
+
+def comparison_period_for(period: str) -> str:
+    """The named length new-entity detection compares a window of ``period`` with."""
+    return COMPARISON_FLOOR if period in SHORT_WINDOWS else period
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
 
 # Dimension reports are read a few at a time, so one slow report (each read
 # retries on a gateway timeout) does not hold up the others, without sending
@@ -124,16 +156,7 @@ class EnhancedSpikeAnalyzer:
         self.detector = StatisticalAnomalyDetector()
         self.logger = logger
 
-        # Maps dimension name → endpoint registry key for resolve_analytics_request
-        # (BACK-718 migration — paths resolved per-call so feature flag toggles are handled)
-        self.temporal_analysis_endpoint_keys = {
-            "providers": "total_cost_by_provider_over_time",
-            "models": "total_cost_by_model",
-            "api_keys": "cost_metrics_by_subscriber_credential",
-            "agents": "cost_metrics_by_agents_over_time",
-            "customers": "cost_metric_by_organization",
-            "tokens": "tokens_per_minute_by_provider",
-        }
+        self.temporal_analysis_endpoint_keys = dict(TEMPORAL_ANALYSIS_ENDPOINT_KEYS)
 
         # Period validation mapping
         self.supported_periods = {
@@ -185,7 +208,9 @@ class EnhancedSpikeAnalyzer:
         collection = await self._collect_temporal_data(period, include_dimensions)
 
         # Step 2: Build entity-time matrix
-        entity_time_matrix = self._build_entity_time_matrix(collection.data)
+        entity_time_matrix = self._build_entity_time_matrix(
+            collection.data, rollup_dimensions=collection.capped.keys()
+        )
 
         # Step 3: Detect entity-level temporal anomalies
         entity_anomalies = await self._detect_entity_anomalies(
@@ -195,12 +220,10 @@ class EnhancedSpikeAnalyzer:
         # Step 4: Detect new entities if requested
         new_entities: List = []
         new_entity_detection: Optional[Dict[str, Any]] = None
-        period_conversion_notice = None
         if detect_new_entities:
             new_entities, new_entity_detection = await self._detect_new_entities(
-                collection, period, include_dimensions, min_new_entity_threshold
+                period, include_dimensions, min_new_entity_threshold
             )
-            period_conversion_notice = self._detection_window_notice(new_entity_detection)
 
         # Step 5: Sort by severity score and return formatted results
         entity_anomalies.sort(key=lambda x: x.severity_score, reverse=True)
@@ -215,7 +238,6 @@ class EnhancedSpikeAnalyzer:
             sensitivity,
             include_dimensions,
             new_entities,
-            period_conversion_notice,
             not_read=collection.not_read,
             incomplete=collection.incomplete,
             new_entity_detection=new_entity_detection,
@@ -223,7 +245,10 @@ class EnhancedSpikeAnalyzer:
         )
 
     async def _collect_temporal_data(
-        self, period: str, include_dimensions: List[str]
+        self,
+        period: AnalyticsWindow,
+        include_dimensions: List[str],
+        semaphore: Optional[asyncio.Semaphore] = None,
     ) -> TemporalCollection:
         """Collect time-series data from all specified endpoints.
 
@@ -233,8 +258,10 @@ class EnhancedSpikeAnalyzer:
         reason instead of standing in as an empty report.
 
         Args:
-            period: Time period for data collection
+            period: The named period, or the exact span, to read
             include_dimensions: Dimensions to collect data for
+            semaphore: The read limit to share with reads running at the same time;
+                a new one of MAX_CONCURRENT_DIMENSION_READS when omitted
 
         Returns:
             The reports read, in include_dimensions order, with the ones not read or read in part
@@ -253,7 +280,7 @@ class EnhancedSpikeAnalyzer:
             if dimension in self.temporal_analysis_endpoint_keys
         }
 
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_DIMENSION_READS)
+        semaphore = semaphore or asyncio.Semaphore(MAX_CONCURRENT_DIMENSION_READS)
         outcomes = await asyncio.gather(
             *(
                 self._read_dimension(semaphore, dimension, reader, request)
@@ -347,32 +374,42 @@ class EnhancedSpikeAnalyzer:
             return f"{pages}; buckets after {last} were not examined"
         return f"{pages}; pages after page {unread.pages_read} were not examined"
 
-    def _build_entity_time_matrix(self, time_series_data: Dict[str, Any]) -> Dict[str, List[Tuple[str, float]]]:
+    def _build_entity_time_matrix(
+        self, time_series_data: Dict[str, Any], rollup_dimensions: Collection[str] = ()
+    ) -> Dict[str, List[Tuple[str, float]]]:
         """Build entity-time matrix from time-series data.
 
         Args:
             time_series_data: Raw time-series data from API
+            rollup_dimensions: Dimensions whose report rolled the keys it does not
+                name into ANALYTICS_API_KEY_ROLLUP_GROUP; that group is not an
+                entity, so it is left out
 
         Returns:
             Entity-time matrix where keys are entity names and values are time series of (timestamp, cost) tuples
         """
-        entity_time_matrix = {}
+        entity_time_matrix: Dict[str, List[Tuple[str, float]]] = {}
         # Track entity to dimension mapping for proper type identification
         self.entity_dimension_map = {}
 
         for dimension, data in time_series_data.items():
+            skip_rollup = dimension in rollup_dimensions
             if isinstance(data, list) and data:
-                self._process_time_series_data(data, entity_time_matrix, dimension)
+                self._process_time_series_data(data, entity_time_matrix, dimension, skip_rollup)
             elif isinstance(data, dict) and "groups" in data:
-                self._process_single_period_data(data, entity_time_matrix, dimension)
+                self._process_single_period_data(data, entity_time_matrix, dimension, skip_rollup)
 
         self.logger.info(f"Built entity-time matrix with {len(entity_time_matrix)} entities")
         return entity_time_matrix
 
     def _process_time_series_data(
-        self, data: List[Dict], entity_time_matrix: Dict[str, List[Tuple[str, float]]], dimension: str
+        self,
+        data: List[Dict],
+        entity_time_matrix: Dict[str, List[Tuple[str, float]]],
+        dimension: str,
+        skip_rollup: bool = False,
     ) -> None:
-        """Process time-series format data with multiple time periods."""
+        """Process time-series format data with multiple time periods, leaving out the roll-up when ``skip_rollup``."""
         for time_entry in data:
             if not isinstance(time_entry, dict) or "groups" not in time_entry:
                 continue
@@ -403,6 +440,8 @@ class EnhancedSpikeAnalyzer:
 
                 raw_name = group.get("groupName")
                 entity_name = str(raw_name).upper() if raw_name else "UNKNOWN"
+                if skip_rollup and is_api_key_rollup(entity_name):
+                    continue
                 total_cost = self._calculate_group_cost(group.get("metrics", []))
 
                 self.entity_dimension_map[entity_name] = dimension
@@ -413,9 +452,13 @@ class EnhancedSpikeAnalyzer:
                 entity_time_matrix[entity_name].append((timestamp, total_cost))
 
     def _process_single_period_data(
-        self, data: Dict, entity_time_matrix: Dict[str, List[Tuple[str, float]]], dimension: str
+        self,
+        data: Dict,
+        entity_time_matrix: Dict[str, List[Tuple[str, float]]],
+        dimension: str,
+        skip_rollup: bool = False,
     ) -> None:
-        """Process single time period format data."""
+        """Process single time period format data, leaving out the roll-up when ``skip_rollup``."""
         # Extract timestamp from the data (use startTimestamp or first metric timestamp)
         timestamp = data.get("startTimestamp")
         if not timestamp:
@@ -439,6 +482,8 @@ class EnhancedSpikeAnalyzer:
 
             raw_name = group.get("groupName")
             entity_name = str(raw_name).upper() if raw_name else "UNKNOWN"
+            if skip_rollup and is_api_key_rollup(entity_name):
+                continue
             total_cost = self._calculate_group_cost(group.get("metrics", []))
 
             self.entity_dimension_map[entity_name] = dimension
@@ -448,7 +493,7 @@ class EnhancedSpikeAnalyzer:
             entity_time_matrix[entity_name].append((timestamp, total_cost))
 
     def _build_detection_series(
-        self, time_series_data: Dict[str, Any], dimension: str, skip_group: str = ""
+        self, time_series_data: Dict[str, Any], dimension: str, skip_rollup: bool = False
     ) -> Tuple[List[datetime], DetectionSeries]:
         """One dimension's bucket starts, oldest first, and a cost per bucket per name.
 
@@ -456,7 +501,7 @@ class EnhancedSpikeAnalyzer:
         can split the window into different buckets. A bucket where an entity
         has no group counts as no cost, so every series covers the same buckets.
         A name that repeats inside one bucket is summed; a group without a name,
-        or named ``skip_group`` in any case, is left out.
+        or the API key roll-up when ``skip_rollup`` is set, is left out.
         """
         costs: Dict[Tuple[str, str], Dict[datetime, float]] = {}
         starts = set()
@@ -466,7 +511,7 @@ class EnhancedSpikeAnalyzer:
                 if not isinstance(group, dict) or not group.get("groupName"):
                     continue
                 key = (dimension, str(group["groupName"]).upper())
-                if skip_group and key[1] == skip_group.upper():
+                if skip_rollup and is_api_key_rollup(key[1]):
                     continue
                 by_start = costs.setdefault(key, {})
                 by_start[start] = by_start.get(start, 0.0) + self._calculate_group_cost(
@@ -734,7 +779,7 @@ class EnhancedSpikeAnalyzer:
         for entity_type, data in entities_by_type.items():
             types = [entity["introduction_type"] for entity in data["entities"]]
             data["summary"] = (
-                f"{_new_and_activated(types, entity_type)}, "
+                f"{_new_and_activated(types, ENTITY_TYPE_NOUNS.get(entity_type, entity_type))}, "
                 f"{format_currency(data['total_cost_impact'])} in the recent part"
             )
 
@@ -1196,22 +1241,21 @@ class EnhancedSpikeAnalyzer:
 
     async def _detect_new_entities(
         self,
-        collection: TemporalCollection,
         period: str,
         include_dimensions: List[str],
         min_new_entity_threshold: float = 0.0,
     ) -> Tuple[List, Dict[str, Any]]:
-        """Detect new cost sources, and say what was examined or why detection could not run.
+        """Detect new cost sources, and say what was compared or why detection could not run.
 
-        A window in SHORT_WINDOWS holds no baseline, so the supported dimensions are
-        read again over DETECTION_WINDOW for detection only; the anomalies keep the
-        requested window.
+        The supported dimensions are read twice on the analytics API: over the
+        window ``period`` names, ending now, and over the comparison period that
+        ends where the window starts (``comparison_period_for``). A source is new
+        when it has cost in the window and none in the comparison period.
 
         Args:
-            collection: The reports read for the requested window
             period: The requested period
             include_dimensions: The requested dimensions
-            min_new_entity_threshold: Minimum recent cost to report an entity
+            min_new_entity_threshold: Minimum window cost to report an entity
 
         Returns:
             Tuple of (NewEntityIntroduction list, the detection outcome for the answer)
@@ -1221,10 +1265,13 @@ class EnhancedSpikeAnalyzer:
             for dimension in dict.fromkeys(include_dimensions)
             if dimension in NEW_ENTITY_DETECTION_SUPPORTED_DIMENSIONS
         ]
-        detection_period = DETECTION_WINDOW if period in SHORT_WINDOWS else period
+        comparison_period = comparison_period_for(period)
+        window, comparison = self._detection_ranges(period, comparison_period)
         outcome: Dict[str, Any] = {
             "requested_period": period,
-            "detection_period": detection_period,
+            "comparison_period": comparison_period,
+            "window": _iso_span(window),
+            "comparison": _iso_span(comparison),
             "min_new_entity_threshold": min_new_entity_threshold,
             "dimensions_examined": [],
             "dimensions_not_read": {},
@@ -1237,28 +1284,31 @@ class EnhancedSpikeAnalyzer:
                 outcome, f"none of the requested dimensions supports it (use {supported})"
             )
 
-        source = collection
-        if detection_period != period:
-            try:
-                source = await self._collect_temporal_data(detection_period, dimensions)
-            except TemporalDataUnavailableError as error:
-                failed = "; ".join(f"{name} ({reason})" for name, reason in error.not_read.items())
-                return [], self._not_run(
-                    outcome, f"the {detection_period} read it needs failed: {failed}"
-                )
+        try:
+            window_read, comparison_read = await self._read_window_and_comparison(
+                window, comparison, dimensions
+            )
+        except TemporalDataUnavailableError as error:
+            return [], self._not_run(outcome, f"a read it needs failed: {error}")
 
-        examined = [dimension for dimension in dimensions if dimension in source.data]
+        examined = [
+            dimension
+            for dimension in dimensions
+            if dimension in window_read.data and dimension in comparison_read.data
+        ]
+        parts = ((WINDOW_PART, window_read), (COMPARISON_PART, comparison_read))
         outcome["dimensions_examined"] = examined
-        outcome["dimensions_not_read"] = {
-            dimension: reason
-            for dimension, reason in source.not_read.items()
-            if dimension in dimensions
-        }
-        outcome["dimensions_incomplete"] = {
-            dimension: note for dimension, note in source.incomplete.items() if dimension in examined
-        }
+        outcome["dimensions_not_read"] = _by_dimension(
+            dimensions, parts, lambda read: read.not_read
+        )
+        outcome["dimensions_incomplete"] = _by_dimension(
+            examined, parts, lambda read: read.incomplete
+        )
+        capped = {**comparison_read.capped, **window_read.capped}
         outcome["dimensions_capped"] = {
-            dimension: note for dimension, note in source.capped.items() if dimension in examined
+            dimension: note
+            for dimension, note in window_read.capped.items()
+            if dimension in examined
         }
         if not examined:
             failed = "; ".join(
@@ -1270,19 +1320,41 @@ class EnhancedSpikeAnalyzer:
         spans_by_dimension: Dict[str, Dict[str, Any]] = {}
         not_compared: Dict[str, str] = outcome["dimensions_not_compared"]
         for dimension in examined:
-            skip = ANALYTICS_API_KEY_ROLLUP_GROUP if dimension in source.capped else ""
-            bucket_starts, series = self._build_detection_series(
-                source.data, dimension, skip_group=skip
+            skip_rollup = dimension in capped
+            window_starts, window_series = self._build_detection_series(
+                window_read.data, dimension, skip_rollup=skip_rollup
             )
+            comparison_starts, comparison_series = self._build_detection_series(
+                comparison_read.data, dimension, skip_rollup=skip_rollup
+            )
+            comparison_rolls_up_cost = (
+                dimension in comparison_read.capped
+                and self._rollup_cost(comparison_read.data[dimension]) > 0
+            )
+            if comparison_rolls_up_cost:
+                window_series, unclassified = self._without_unknown_history(
+                    window_series, comparison_series, min_new_entity_threshold
+                )
+                if unclassified:
+                    outcome.setdefault("unclassified", {})[dimension] = unclassified
             try:
                 found = self.detector.detect_new_cost_sources(
-                    series, bucket_starts, detection_period, min_new_entity_threshold
+                    window_series,
+                    window_starts,
+                    comparison_series,
+                    len(comparison_starts),
+                    period,
+                    min_new_entity_threshold,
                 )
             except ValueError as error:
                 not_compared[dimension] = str(error)
                 continue
             new_entities.extend(found)
-            spans_by_dimension[dimension] = self._spans(detection_period, bucket_starts)
+            spans_by_dimension[dimension] = self._spans(window_starts, comparison_starts)
+            if not comparison_rolls_up_cost and not any(
+                cost > 0 for costs in comparison_series.values() for cost in costs
+            ):
+                outcome.setdefault("comparison_without_cost", []).append(dimension)
         if not spans_by_dimension:
             return [], self._not_run(outcome, self._not_compared_reason(not_compared))
 
@@ -1293,6 +1365,75 @@ class EnhancedSpikeAnalyzer:
             outcome["spans_by_dimension"] = spans_by_dimension
         outcome["status"] = "found" if new_entities else "none"
         return new_entities, outcome
+
+    def _rollup_cost(self, response: Any) -> float:
+        """The cost the API key roll-up group holds across every bucket of a report."""
+        return sum(
+            self._calculate_group_cost(group.get("metrics") or [])
+            for group in _api_key_rollup_groups(response)
+        )
+
+    def _without_unknown_history(
+        self,
+        window_series: DetectionSeries,
+        comparison_series: DetectionSeries,
+        min_new_entity_threshold: float,
+    ) -> Tuple[DetectionSeries, int]:
+        """The window series the comparison period also names, and how many reportable ones it does not.
+
+        A comparison read that rolled cost into ANALYTICS_API_KEY_ROLLUP_GROUP may
+        hold a window key inside that group, so a key it does not name has an
+        unknown history and is neither new nor activated.
+        """
+        known = {key: costs for key, costs in window_series.items() if key in comparison_series}
+        unclassified = sum(
+            1
+            for key, costs in window_series.items()
+            if key not in known
+            and self.detector.reaches_threshold(costs, min_new_entity_threshold)
+        )
+        return known, unclassified
+
+    async def _read_window_and_comparison(
+        self, window: InstantRange, comparison: InstantRange, dimensions: List[str]
+    ) -> Tuple[TemporalCollection, TemporalCollection]:
+        """Both detection reads, at the same time, under one MAX_CONCURRENT_DIMENSION_READS limit.
+
+        Raises:
+            TemporalDataUnavailableError: When either read could not read any report
+        """
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_DIMENSION_READS)
+        reads = await asyncio.gather(
+            self._collect_temporal_data(window, dimensions, semaphore),
+            self._collect_temporal_data(comparison, dimensions, semaphore),
+            return_exceptions=True,
+        )
+        unavailable: List[str] = []
+        for part, read in zip((WINDOW_PART, COMPARISON_PART), reads):
+            if isinstance(read, TemporalDataUnavailableError):
+                unavailable.extend(
+                    f"{part} read: {name} ({reason})" for name, reason in read.not_read.items()
+                )
+            elif isinstance(read, BaseException):
+                raise read
+        if unavailable:
+            raise TemporalDataUnavailableError("; ".join(unavailable))
+        return cast(TemporalCollection, reads[0]), cast(TemporalCollection, reads[1])
+
+    @staticmethod
+    def _detection_ranges(period: str, comparison_period: str) -> Tuple[InstantRange, InstantRange]:
+        """The window ending now and the comparison period ending just before it starts.
+
+        The analytics API includes both bounds, so the comparison period ends one
+        millisecond before the window's first instant and no cost is counted twice.
+        """
+        now = utc_now()
+        window_start = period_start(TimePeriod(period), now)
+        comparison_start = period_start(TimePeriod(comparison_period), window_start)
+        return (
+            InstantRange(window_start, now),
+            InstantRange(comparison_start, window_start - _ONE_MILLISECOND),
+        )
 
     @staticmethod
     def _not_run(outcome: Dict[str, Any], reason: str) -> Dict[str, Any]:
@@ -1307,35 +1448,41 @@ class EnhancedSpikeAnalyzer:
             return reasons.pop()
         return "; ".join(f"{name}: {reason}" for name, reason in not_compared.items())
 
-    def _spans(self, period: str, bucket_starts: List[datetime]) -> Dict[str, Any]:
-        """The whole window, baseline and recent part of one dimension's buckets."""
-        baseline_count = self.detector.baseline_bucket_count(period, len(bucket_starts))
+    @staticmethod
+    def _spans(
+        window_starts: List[datetime], comparison_starts: List[datetime]
+    ) -> Dict[str, Any]:
+        """The buckets one dimension returned for the window (recent) and the comparison period (baseline)."""
         return {
-            "whole_window": bucket_span(bucket_starts),
-            "baseline": bucket_span(bucket_starts[:baseline_count]),
-            "recent": bucket_span(bucket_starts[baseline_count:]),
-            "buckets_start_at_midnight": starts_at_midnight(bucket_starts),
+            "recent": bucket_span(window_starts),
+            "baseline": bucket_span(comparison_starts) if comparison_starts else None,
+            "buckets_start_at_midnight": starts_at_midnight(
+                [*comparison_starts, *window_starts]
+            ),
         }
 
-    @staticmethod
-    def _detection_window_notice(detection: Dict[str, Any]) -> Optional[str]:
-        """The true sentence for a short window whose detection read DETECTION_WINDOW."""
-        requested = detection["requested_period"]
-        groups = detection_span_groups(detection)
-        if detection["detection_period"] == requested or not groups:
-            return None
-        if len(groups) == 1:
-            read = describe_part(groups[0][1], "whole_window")
-        else:
-            read = "; ".join(
-                f"{', '.join(dimensions)}: {describe_part(spans, 'whole_window')}"
-                for dimensions, spans in groups
-            )
-        return (
-            f"New-entity detection read {detection['detection_period']} of data "
-            f"({read}), because {requested} is too short to "
-            f"hold a baseline; the anomalies cover {requested} only."
-        )
+
+def _iso_span(span: InstantRange) -> Dict[str, str]:
+    start, end = span.iso_bounds()
+    return {"start": start, "end": end}
+
+
+def _by_dimension(
+    dimensions: List[str],
+    parts: Tuple[Tuple[str, TemporalCollection], ...],
+    notes_of: Callable[[TemporalCollection], Dict[str, str]],
+) -> Dict[str, str]:
+    """Each dimension's notes from the reads that carry one, named by the read."""
+    by_dimension: Dict[str, str] = {}
+    for dimension in dimensions:
+        notes = [
+            f"{part} read: {notes_of(read)[dimension]}"
+            for part, read in parts
+            if dimension in notes_of(read)
+        ]
+        if notes:
+            by_dimension[dimension] = "; ".join(notes)
+    return by_dimension
 
 
 def _new_and_activated(introduction_types: List[str], noun: str) -> str:
@@ -1346,22 +1493,82 @@ def _new_and_activated(introduction_types: List[str], noun: str) -> str:
     return f"{' and '.join(counts)} {noun}{'s' if total > 1 else ''}"
 
 
+def is_api_key_rollup(group_name: str) -> bool:
+    """Whether a group name, in any case, is the analytics route's roll-up of the API keys it does not name."""
+    return group_name.casefold() == ANALYTICS_API_KEY_ROLLUP_GROUP.casefold()
+
+
+def _api_key_rollup_groups(response: Any) -> Iterator[Dict[str, Any]]:
+    """The roll-up group of each bucket of an API key report that holds one."""
+    buckets = [response] if isinstance(response, dict) else response
+    for bucket in buckets if isinstance(buckets, list) else []:
+        if not isinstance(bucket, dict):
+            continue
+        for group in bucket.get("groups") or []:
+            if isinstance(group, dict) and is_api_key_rollup(str(group.get("groupName") or "")):
+                yield group
+
+
 def _has_api_key_rollup(response: Any) -> bool:
     """Whether any bucket of an API key report holds the roll-up group."""
-    rollup = ANALYTICS_API_KEY_ROLLUP_GROUP.upper()
-    buckets = [response] if isinstance(response, dict) else response
-    return any(
-        str(group.get("groupName") or "").upper() == rollup
-        for bucket in (buckets if isinstance(buckets, list) else [])
-        if isinstance(bucket, dict)
-        for group in bucket.get("groups") or []
-        if isinstance(group, dict)
-    )
+    return any(True for _ in _api_key_rollup_groups(response))
 
 
 def describe_part(spans: Dict[str, Any], part: str) -> str:
-    """'the N buckets starting A to B' for whole_window, baseline or recent of spans."""
+    """'the N buckets starting A to B' for the baseline or recent part of spans."""
+    if not spans.get(part):
+        return "no bucket returned"
     return describe_span(spans[part], not spans.get("buckets_start_at_midnight", True))
+
+
+def describe_comparison(detection: Dict[str, Any]) -> str:
+    """The sentence that names the comparison period a detection used, and why that long."""
+    period = detection["requested_period"]
+    comparison_period = detection["comparison_period"]
+    floor = (
+        f", because no window is compared with less than {COMPARISON_LENGTHS[COMPARISON_FLOOR]}"
+        if comparison_period != period
+        else ""
+    )
+    return (
+        f"The comparison period is the {COMPARISON_LENGTHS[comparison_period]} before the "
+        f"{period} window{floor}: {_shown_instant(detection['comparison']['start'])} up to "
+        f"{_shown_instant(detection['window']['start'])}, where the window starts; the "
+        f"window ends {_shown_instant(detection['window']['end'])}."
+    )
+
+
+def describe_comparison_without_cost(detection: Dict[str, Any]) -> Optional[str]:
+    """The warning for dimensions whose comparison period held no cost, so everything in the window is new."""
+    dimensions = detection.get("comparison_without_cost")
+    if not dimensions:
+        return None
+    return (
+        f"The comparison period held no cost for {', '.join(dimensions)}, so every source "
+        "there with cost in the window counts as new: the team had no usage then, or the "
+        "platform holds no data that far back."
+    )
+
+
+def describe_unclassified(detection: Dict[str, Any]) -> Optional[str]:
+    """The line for window API keys the capped comparison period does not name, so neither new nor activated."""
+    count = sum((detection.get("unclassified") or {}).values())
+    if not count:
+        return None
+    if count == 1:
+        subject, pronoun = "1 API key", "it was not among them, so whether it"
+    else:
+        subject, pronoun = f"{count} API keys", "they were not among them, so whether they"
+    return (
+        f"{subject} with cost in the window could not be classified as new or activated: "
+        f"the comparison period names only its {ANALYTICS_API_KEY_CAP} costliest API keys "
+        f"and {pronoun} had cost then is unknown."
+    )
+
+
+def _shown_instant(iso_instant: str) -> str:
+    instant = parse_bucket_instant(iso_instant)
+    return f"{instant:%Y-%m-%d %H:%M} UTC" if instant else iso_instant
 
 
 def detection_span_groups(
@@ -1371,7 +1578,7 @@ def detection_span_groups(
     by_dimension = detection.get("spans_by_dimension")
     if by_dimension:
         return [([dimension], spans) for dimension, spans in by_dimension.items()]
-    if not detection.get("whole_window"):
+    if not detection.get("recent"):
         return []
     not_compared = detection.get("dimensions_not_compared") or {}
     compared = [

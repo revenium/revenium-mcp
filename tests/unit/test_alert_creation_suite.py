@@ -104,7 +104,7 @@ class TestResolveNotificationEmail:
         discovered_email = "discovered@corp.com"
         with patch.dict("os.environ", {"REVENIUM_DEFAULT_EMAIL": "dummy@email.com"}):
             with patch(
-                "src.revenium_mcp_server.config_store.get_discovered_value",
+                "src.revenium_mcp_server.config_store.ConfigurationStore._discovered_value",
                 return_value=discovered_email,
             ):
                 result = tools._resolve_notification_email(None)
@@ -115,7 +115,7 @@ class TestResolveNotificationEmail:
         discovered_email = "discovered@test.com"
         with patch.dict("os.environ", {}, clear=True):
             with patch(
-                "src.revenium_mcp_server.config_store.get_discovered_value",
+                "src.revenium_mcp_server.config_store.ConfigurationStore._discovered_value",
                 return_value=discovered_email,
             ):
                 result = tools._resolve_notification_email(None)
@@ -126,7 +126,7 @@ class TestResolveNotificationEmail:
         discovered_email = "  trimme@test.com  "
         with patch.dict("os.environ", {}, clear=True):
             with patch(
-                "src.revenium_mcp_server.config_store.get_discovered_value",
+                "src.revenium_mcp_server.config_store.ConfigurationStore._discovered_value",
                 return_value=discovered_email,
             ):
                 result = tools._resolve_notification_email(None)
@@ -137,7 +137,7 @@ class TestResolveNotificationEmail:
         discovered_email = None
         with patch.dict("os.environ", {}, clear=True):
             with patch(
-                "src.revenium_mcp_server.config_store.get_discovered_value",
+                "src.revenium_mcp_server.config_store.ConfigurationStore._discovered_value",
                 return_value=discovered_email,
             ):
                 with pytest.raises(ValidationError) as exc_info:
@@ -149,7 +149,7 @@ class TestResolveNotificationEmail:
         discovered_email = "   "
         with patch.dict("os.environ", {}, clear=True):
             with patch(
-                "src.revenium_mcp_server.config_store.get_discovered_value",
+                "src.revenium_mcp_server.config_store.ConfigurationStore._discovered_value",
                 return_value=discovered_email,
             ):
                 with pytest.raises(ValidationError):
@@ -166,7 +166,7 @@ class TestResolveNotificationEmail:
         discovered_email = "discovered@corp.com"
         with patch.dict("os.environ", {"REVENIUM_DEFAULT_EMAIL": "env@corp.com"}):
             with patch(
-                "src.revenium_mcp_server.config_store.get_discovered_value",
+                "src.revenium_mcp_server.config_store.ConfigurationStore._discovered_value",
                 return_value=discovered_email,
             ):
                 result = tools._resolve_notification_email(None)
@@ -1396,7 +1396,7 @@ class TestAlertTextParserDefaultEmail:
     def test_parser_falls_back_to_the_discovered_email(self):
         with patch.dict("os.environ", {"REVENIUM_DEFAULT_EMAIL": "dummy@email.com"}):
             with patch(
-                "src.revenium_mcp_server.config_store.get_discovered_value",
+                "src.revenium_mcp_server.config_store.ConfigurationStore._discovered_value",
                 return_value="discovered@corp.com",
             ):
                 result = AlertSemanticProcessor().parse_alert_request("alert when cost exceeds 100")
@@ -1405,7 +1405,7 @@ class TestAlertTextParserDefaultEmail:
     def test_parser_names_no_recipient_when_nothing_is_known(self):
         with patch.dict("os.environ", {}, clear=True):
             with patch(
-                "src.revenium_mcp_server.config_store.get_discovered_value",
+                "src.revenium_mcp_server.config_store.ConfigurationStore._discovered_value",
                 return_value=None,
             ):
                 result = AlertSemanticProcessor().parse_alert_request("alert when cost exceeds 100")

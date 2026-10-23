@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.hierarchy.entity_lookup_service import (
     EntityLookupService,
+    EntityPageError,
     IDValidator,
     LookupResult,
     get_entity_lookup_service,
@@ -997,13 +998,64 @@ class TestGetAllEntities:
         assert result == entities
 
     @pytest.mark.asyncio
-    async def test_api_error_on_first_page_returns_empty_list(self):
-        """API error on the first page fetch returns empty list (loop break behavior)."""
+    async def test_api_error_on_first_page_raises_naming_the_page(self):
+        """BACK-4736: a failed page ends the read; an empty list would read as
+        "no such entity"."""
         mock_client = MagicMock()
         mock_client.get_products = AsyncMock(side_effect=RuntimeError("timeout"))
         service = EntityLookupService(client=mock_client)
-        result = await service._get_all_entities("products")
-        assert result == []
+        with pytest.raises(EntityPageError, match="products page 0"):
+            await service._get_all_entities("products")
+
+    @pytest.mark.asyncio
+    async def test_a_page_failing_after_others_returns_no_partial_list(self):
+        mock_client = MagicMock()
+        mock_client.get_subscriptions = AsyncMock(
+            side_effect=[{"page": 0}, RuntimeError("502 Bad Gateway")]
+        )
+        mock_client._extract_embedded_data = MagicMock(
+            return_value=[{"id": f"sub_{n}"} for n in range(50)]
+        )
+        service = EntityLookupService(client=mock_client)
+        with pytest.raises(EntityPageError, match="subscriptions page 1") as raised:
+            await service._get_all_entities("subscriptions")
+        assert raised.value.page == 1
+
+    @pytest.mark.asyncio
+    async def test_an_auto_lookup_over_a_failed_page_answers_with_the_failure(self):
+        mock_client = MagicMock()
+        mock_client.get_subscriptions = AsyncMock(side_effect=RuntimeError("timeout"))
+        service = EntityLookupService(client=mock_client)
+
+        result = await service._resolve_entity("subscriptions", "acme", "auto")
+
+        assert result.success is False
+        assert result.matches == []
+        assert result.metadata == {"incomplete": True}
+        assert "subscriptions page 0" in result.error_message
+        assert "No matches found" not in result.error_message
+        assert mock_client.get_subscriptions.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failed_page_is_not_remembered_as_a_miss(self):
+        platform = {"down": True}
+
+        async def get_subscriptions(**_):
+            if platform["down"]:
+                raise RuntimeError("timeout")
+            return {"page": 0}
+
+        mock_client = MagicMock()
+        mock_client.get_subscriptions = get_subscriptions
+        mock_client._extract_embedded_data = MagicMock(return_value=[{"id": "s1", "name": "acme"}])
+        service = EntityLookupService(client=mock_client)
+
+        await service._resolve_entity("subscriptions", "acme", "auto")
+        platform["down"] = False
+        retried = await service._resolve_entity("subscriptions", "acme", "auto")
+
+        assert retried.success is True
+        assert retried.matches == [{"id": "s1", "name": "acme"}]
 
 
 # ---------------------------------------------------------------------------

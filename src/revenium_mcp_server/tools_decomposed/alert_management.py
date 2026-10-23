@@ -16,6 +16,7 @@ Follows MCP best practices:
 """
 
 import json
+import re
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -29,8 +30,9 @@ from ..agent_friendly import UnifiedResponseFormatter
 from ..alerts import AlertManager, AlertSemanticProcessor, AnalyticsEngine, AnomalyManager
 from ..alerts.alert_manager import ALERT_FILTER_MAP, ALERT_HISTORY_DATE_FORMS
 from ..alerts.anomaly_inventory import read_every_anomaly
-from ..alerts.anomaly_manager import alert_label
+from ..alerts.anomaly_manager import alert_label, put_anomaly
 from ..alerts.notification_recipients import (
+    NO_RECIPIENT_MESSAGE,
     RECIPIENT_FIELDS,
     union_named_recipients,
     union_recipients,
@@ -40,6 +42,7 @@ from ..alerts.quick_actions import (
     FLAT_UPDATE_FIELDS,
     quick_action_is_percentage,
     quick_action_metric,
+    quick_action_threshold,
     refuse_unhonoured_arguments,
 )
 from ..alerts.semantic_processor import refuse_an_undecided_threshold, threshold_in_text
@@ -118,8 +121,9 @@ _ANOMALY_FILTER_MAP: Dict[str, str] = {
 # The portfolio's documented groupLimit bounds; the platform answers 400 outside them.
 BUDGET_PORTFOLIO_GROUP_LIMIT_RANGE = (1, 100)
 
-# The key search's documented page-size bounds. The platform clamps a size outside
-# them rather than refusing it, which would answer for a page size nobody asked for.
+# The key search's documented page-size bounds. ProviderDimensionsService.searchApiKeys
+# clamps a size outside them rather than refusing it, which would answer for a page
+# size nobody asked for. Its own bound, not the Spring page cap in common/platform_paging.py.
 PROVIDER_API_KEY_PAGE_SIZE_RANGE = (1, 100)
 
 # A key-search page starting at or past this result comes back empty with only the total.
@@ -160,6 +164,34 @@ def _bulk_answer(
     return [TextContent(type="text", text=result_text)]
 
 
+_UNAMBIGUOUS_HISTORY_WORDS = frozenset(
+    {"history", "historical", "fired", "triggered", "events", "incidents", "occurred",
+     "happened", "timeline", "resolved"}
+)
+_UNAMBIGUOUS_RULE_WORDS = frozenset(
+    {"rule", "rules", "definition", "definitions", "configuration", "config", "setup"}
+)
+_HISTORY_LEANING_WORDS = frozenset(
+    {"recent", "last", "past", "when", "active", "ongoing", "duration", "frequency"}
+)
+_RULE_LEANING_WORDS = frozenset(
+    {"create", "define", "configure", "manage", "enable", "disable", "threshold", "budget",
+     "quota", "monitoring", "watch", "track"}
+)
+_NOTHING_WAS = {"enable": "enabled", "disable": "disabled", "toggle": "toggled"}
+
+
+def _switch_action(enabled: bool) -> str:
+    return "enable" if enabled else "disable"
+
+
+async def _put_switched(
+    client: ReveniumClient, anomaly_id: str, body: Dict[str, Any], action: str
+) -> Dict[str, Any]:
+    """PUT a switched alert; a refusal over a missing Slack channel says nothing was switched."""
+    return await put_anomaly(client, anomaly_id, body, _NOTHING_WAS[action])
+
+
 async def _put_enabled(
     client: ReveniumClient,
     anomaly_id: str,
@@ -170,8 +202,10 @@ async def _put_enabled(
     """PUT the stored alert back with only `enabled` changed, once the platform's rules pass on it."""
     body = {**stored, "enabled": enabled}
     refuse_stored_alert_rule_breach(body, stored, action)
-    updated: Dict[str, Any] = await client.update_anomaly(anomaly_id, body)
-    return updated
+    try:
+        return await _put_switched(client, anomaly_id, body, action)
+    except ValidationError as e:
+        raise_refusal(e.format_user_message(), error_code=e.error_code, field=e.details.get("field"))
 
 
 def _format_budget_share(share: float) -> str:
@@ -709,65 +743,23 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
         if resource_type:
             return resource_type
 
-        # Check for semantic clues in other parameters
         query = arguments.get("query", "").lower()
         action = arguments.get("action", "").lower()
 
-        # Keywords that suggest historical alerts (events)
-        history_keywords = [
-            "history",
-            "historical",
-            "fired",
-            "triggered",
-            "events",
-            "incidents",
-            "recent",
-            "last",
-            "past",
-            "occurred",
-            "happened",
-            "when",
-            "timeline",
-            "resolved",
-            "active",
-            "ongoing",
-            "duration",
-            "frequency",
-        ]
-
-        # Keywords that suggest alert definitions (rules)
-        definition_keywords = [
-            "rules",
-            "definitions",
-            "configuration",
-            "config",
-            "setup",
-            "create",
-            "define",
-            "configure",
-            "manage",
-            "enable",
-            "disable",
-            "threshold",
-            "budget",
-            "quota",
-            "monitoring",
-            "watch",
-            "track",
-        ]
-
-        # Check query text for semantic clues
         if query:
-            if any(keyword in query for keyword in history_keywords):
-                return "alerts"  # Historical events
-            elif any(keyword in query for keyword in definition_keywords):
-                return "anomalies"  # Alert definitions
+            words = set(re.findall(r"[a-z]+", query))
+            if words & _UNAMBIGUOUS_HISTORY_WORDS:
+                return "alerts"
+            if words & _UNAMBIGUOUS_RULE_WORDS:
+                return "anomalies"
+            if words & _HISTORY_LEANING_WORDS or self.alert_manager.date_parser.match_date_range(query):
+                return "alerts"
+            if words & _RULE_LEANING_WORDS:
+                return "anomalies"
 
         # Check action for semantic clues
         if action in ["create", "update", "delete", "enable", "disable"]:
             return "anomalies"  # These actions work on definitions
-        elif action in ["query"] and any(keyword in query for keyword in history_keywords):
-            return "alerts"  # Query with historical context
 
         # Default to anomalies for backward compatibility
         return "anomalies"
@@ -1951,7 +1943,7 @@ Perfect for budget tracking and quota management.
 
 ## **Quick Creation**
 ```bash
-# Basic budget alert (email optional: defaults to your own email when hosted, REVENIUM_DEFAULT_EMAIL locally)
+# Basic budget alert (email optional: defaults to your own email when hosted; locally, the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
 create_cumulative_usage_alert(
   name="Monthly Budget",
   threshold=5000,
@@ -2158,7 +2150,7 @@ Perfect for real-time monitoring and spike detection.
 
 ## **Quick Creation**
 ```bash
-# Basic alert (email optional: defaults to your own email when hosted, REVENIUM_DEFAULT_EMAIL locally)
+# Basic alert (email optional: defaults to your own email when hosted; locally, the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
 create_threshold_alert(
   name="Cost Spike",
   threshold=100,
@@ -2717,10 +2709,10 @@ Complex configurations → create() with anomaly_data
 
 ## **Quick Creation Methods** (Basic Alerts)
 ```bash
-# Basic budget tracking (email optional: defaults to your own email when hosted, REVENIUM_DEFAULT_EMAIL locally)
+# Basic budget tracking (email optional: defaults to your own email when hosted; locally, the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
 create_cumulative_usage_alert(name="Budget", threshold=5000, period="monthly")
 
-# Basic real-time monitoring (email optional: defaults to your own email when hosted, REVENIUM_DEFAULT_EMAIL locally)
+# Basic real-time monitoring (email optional: defaults to your own email when hosted; locally, the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
 create_threshold_alert(name="Cost Spike", threshold=100, period_minutes=15)
 
 # With explicit email
@@ -2771,7 +2763,7 @@ create(resource_type="anomalies", anomaly_data={
   "email": "finance@company.com"
 })
 
-# Natural language (email optional: defaults to your own email when hosted, REVENIUM_DEFAULT_EMAIL locally)
+# Natural language (email optional: defaults to your own email when hosted; locally, the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
 create_from_text(text="Alert when monthly OpenAI spending exceeds $2000")
 ```
 
@@ -2862,7 +2854,7 @@ create(resource_type="anomalies", anomaly_data={
 **Best Practices**:
 1. **Always start with** `get_capabilities()` to understand available options
 2. **Use specific methods** like `create_cumulative_usage_alert()` for clarity
-3. **Email notifications**: Provide the email parameter, or leave it out to notify the signed-in user's own email on the hosted server, or REVENIUM_DEFAULT_EMAIL on a local server
+3. **Email notifications**: Provide the email parameter, or leave it out to notify the signed-in user's own email on the hosted server, or on a local server the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL
 4. **Test configurations** with `validate()` before creating alerts
 5. **Monitor alert patterns** with analytics to optimize thresholds
 
@@ -2899,7 +2891,7 @@ create(resource_type="anomalies", anomaly_data={
 
         if current_tenant_context() is not None:
             raise ValidationError(
-                message="Email address is required for alert notifications",
+                message=NO_RECIPIENT_MESSAGE,
                 field="email",
                 expected="Valid email address: your account profile has no email address on file",
                 suggestion="Provide the email parameter; a signed-in request never reads REVENIUM_DEFAULT_EMAIL",
@@ -2910,7 +2902,7 @@ create(resource_type="anomalies", anomaly_data={
             )
 
         raise ValidationError(
-            message="Email address is required for alert notifications",
+            message=NO_RECIPIENT_MESSAGE,
             field="email",
             expected="Valid email address or REVENIUM_DEFAULT_EMAIL environment variable",
             suggestion="Provide email parameter or set REVENIUM_DEFAULT_EMAIL environment variable",
@@ -3588,7 +3580,7 @@ create(resource_type="anomalies", anomaly_data={
         try:
             name = arguments.get("name", "Simple Alert")
             metric = quick_action_metric(arguments)
-            threshold = arguments.get("threshold", 100)
+            threshold = quick_action_threshold(arguments, default=100)
             dry_run = arguments.get("dry_run", False)
             is_percentage = quick_action_is_percentage(arguments)
 
@@ -3601,7 +3593,7 @@ create(resource_type="anomalies", anomaly_data={
                 "alertType": "THRESHOLD",
                 "metricType": metric,
                 "operatorType": "GREATER_THAN",
-                "threshold": float(threshold),
+                "threshold": threshold,
                 "isPercentage": is_percentage,
                 "periodDuration": "FIFTEEN_MINUTES",
                 "description": f"Simple alert for {metric} monitoring",
@@ -3850,7 +3842,7 @@ create(resource_type="anomalies", anomaly_data={
         self, client: ReveniumClient, anomaly_ids: List[str], *, enabled: bool
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Set ``enabled`` on each listed alert, skipping any whose stored values a rule refuses."""
-        verb = "Enable" if enabled else "Disable"
+        action = _switch_action(enabled)
         results = []
         successful = 0
         failed = 0
@@ -3859,12 +3851,12 @@ create(resource_type="anomalies", anomaly_data={
             try:
                 current_anomaly = await client.get_anomaly_by_id(anomaly_id)
                 body = {**current_anomaly, "enabled": enabled}
-                breach = stored_alert_refusal(body, current_anomaly, verb.lower())
+                breach = stored_alert_refusal(body, current_anomaly, action)
                 if breach is not None:
                     results.append(f"Failed: {anomaly_id}: {breach.message}")
                     failed += 1
                     continue
-                updated_anomaly = await client.update_anomaly(anomaly_id, body)
+                updated_anomaly = await _put_switched(client, anomaly_id, body, action)
                 results.append(f"Success: {alert_label(updated_anomaly.get('name'), anomaly_id)}")
                 successful += 1
             except ToolError:
@@ -3876,7 +3868,7 @@ create(resource_type="anomalies", anomaly_data={
                 failed += 1
 
         result_text = (
-            f"**Bulk {verb} Results**\n\n"
+            f"**Bulk {action.capitalize()} Results**\n\n"
             f"**Total Processed:** {len(anomaly_ids)}\n"
             f"**Successful:** {successful}\n"
             f"**Failed:** {failed}\n\n"
@@ -3989,7 +3981,8 @@ create(resource_type="anomalies", anomaly_data={
         self, client: ReveniumClient, *, enabled: bool
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Set ``enabled`` on every alert of the team and report how far it got."""
-        verb, state = ("Enable", "active") if enabled else ("Disable", "inactive")
+        action = _switch_action(enabled)
+        state = "active" if enabled else "inactive"
         done_label = "Enabled" if enabled else "Disabled"
         inventory = await read_every_anomaly(client)
 
@@ -3997,7 +3990,7 @@ create(resource_type="anomalies", anomaly_data={
             return [
                 TextContent(
                     type="text",
-                    text=f"**No alerts found**\n\nThere are no alerts in the system to {verb.lower()}.",
+                    text=f"**No alerts found**\n\nThere are no alerts in the system to {action}.",
                 )
             ]
 
@@ -4017,12 +4010,12 @@ create(resource_type="anomalies", anomaly_data={
             try:
                 current_anomaly = await client.get_anomaly_by_id(str(anomaly_id))
                 body = {**current_anomaly, "enabled": enabled}
-                breach = stored_alert_refusal(body, current_anomaly, verb.lower())
+                breach = stored_alert_refusal(body, current_anomaly, action)
                 if breach is not None:
                     results.append(f"Failed: {anomaly_name}: {breach.message}")
                     failed += 1
                     continue
-                await client.update_anomaly(str(anomaly_id), body)
+                await _put_switched(client, str(anomaly_id), body, action)
                 results.append(f"{done_label}: {anomaly_name}")
                 successful += 1
             except Exception as e:
@@ -4031,7 +4024,7 @@ create(resource_type="anomalies", anomaly_data={
 
         heading = "Complete" if inventory.complete else "Partial"
         result_text = (
-            f"**{verb} All Alerts - {heading}**\n\n"
+            f"**{action.capitalize()} All Alerts - {heading}**\n\n"
             f"**Total Alerts:** {inventory.total}\n"
             f"**{done_label}:** {successful}\n"
             f"**Already {done_label}:** {already_set}\n"
@@ -4656,7 +4649,7 @@ create(resource_type="anomalies", anomaly_data={
                 },
                 "email": {
                     "type": "string",
-                    "description": "Email for notifications (optional: defaults to the signed-in user's own email on the hosted server, or REVENIUM_DEFAULT_EMAIL on a local server)",
+                    "description": "Email for notifications (optional: defaults to the signed-in user's own email on the hosted server; on a local server, the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL)",
                 },
                 "slack_config_id": {
                     "type": "string",

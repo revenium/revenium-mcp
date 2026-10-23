@@ -960,16 +960,69 @@ class TestRequestWithRetry:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("configured", [0, 1, 3])
-    async def test_the_read_cap_does_not_reach_writes(self, configured):
-        """The write retry count stays whatever is configured."""
+    async def test_a_keyed_write_keeps_the_configured_retries(self, configured):
+        """A write the platform can dedupe on its Idempotency-Key may be resent."""
         client = _client(max_retries=configured)
         client._request = AsyncMock(
             side_effect=ReveniumAPIError("unavailable", status_code=503)
         )
         with patch("src.revenium_mcp_server.client.asyncio.sleep", new_callable=AsyncMock):
             with pytest.raises(ReveniumAPIError):
-                await client._request_with_retry("POST", "/ep")
+                await client._request_with_retry(
+                    "POST", "/ep", extra_headers={"Idempotency-Key": "k-1"}
+                )
         assert client._request.call_count == configured + 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+    @pytest.mark.parametrize("status_code", [408, 500, 503])
+    async def test_a_write_without_a_key_is_sent_once(self, method, status_code):
+        """BACK-4841: a write the platform may have committed is never resent."""
+        client = _client(max_retries=3)
+        client._request = AsyncMock(
+            side_effect=ReveniumAPIError("unavailable", status_code=status_code)
+        )
+        sleep = AsyncMock()
+        with patch("src.revenium_mcp_server.client.asyncio.sleep", sleep):
+            with pytest.raises(ReveniumAPIError, match="unavailable"):
+                await client._request_with_retry(method, "/ep")
+        client._request.assert_called_once()
+        sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_post_through_the_public_method_is_sent_once(self):
+        """BACK-4841: the transport sees one request for a failed unkeyed POST."""
+        client = _client(max_retries=3)
+        failed = _http_response(503, text="Service Unavailable")
+        with patch.object(
+            client.client, "request", new_callable=AsyncMock, side_effect=[failed] * 4
+        ) as request:
+            with patch("src.revenium_mcp_server.client.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(ReveniumAPIError):
+                    await client.post("/x", data={"name": "n"})
+        assert request.await_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda c: c.put_job_type_economics("claims", {"metrics": []}),
+            lambda c: c.report_job_outcome("job-1", {"status": "SUCCESS"}),
+        ],
+        ids=["economics_put", "report_job_outcome"],
+    )
+    async def test_the_unkeyed_job_writes_that_kept_the_retry_are_sent_once(self, call):
+        """BACK-4841: the economics PUT and the outcome POST carry no key, so
+        they lost the transport retry the BACK-3090/3091 comments described."""
+        client = _client(max_retries=3)
+        failed = _http_response(503, text="Service Unavailable")
+        with patch.object(
+            client.client, "request", new_callable=AsyncMock, side_effect=[failed] * 4
+        ) as request:
+            with patch("src.revenium_mcp_server.client.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(ReveniumAPIError):
+                    await call(client)
+        assert request.await_count == 1
 
     @pytest.mark.asyncio
     async def test_a_rate_limit_429_is_not_resent(self):

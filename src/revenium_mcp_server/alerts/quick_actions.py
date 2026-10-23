@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, Mapping
 
 from ..common.error_handling import create_structured_validation_error
+from .update_fidelity import threshold_number
 
 _DISPATCH_ARGUMENTS = frozenset({"action", "resource_type", "page", "size"})
 _OFF_SWITCHES = frozenset({"dry_run", "confirm"})
@@ -112,6 +113,20 @@ def quick_action_is_percentage(arguments: Mapping[str, Any]) -> bool:
         field="isPercentage",
         value=value,
         suggestions=["Send isPercentage=true for a percentage threshold such as an error rate"],
+    )
+
+
+def quick_action_threshold(arguments: Mapping[str, Any], default: float) -> float:
+    """The caller's threshold as the number it stands for, or ``default`` when it was not given."""
+    value = arguments.get("threshold", default)
+    number = threshold_number(value)
+    if number is not None:
+        return number
+    raise create_structured_validation_error(
+        message=f"threshold must be a number, got {value!r}",
+        field="threshold",
+        value=value,
+        suggestions=["Send threshold as a number, such as threshold=100"],
     )
 
 

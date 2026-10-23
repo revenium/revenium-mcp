@@ -18,7 +18,12 @@ from src.revenium_mcp_server.onboarding import (
 )
 from src.revenium_mcp_server.onboarding.detection_service import get_onboarding_state
 from src.revenium_mcp_server.onboarding.env_validation import validate_environment_variables
+from src.revenium_mcp_server.onboarding.platform_read import PlatformFacts
 from src.revenium_mcp_server.onboarding.conditional_registration import conditional_registry
+
+PLATFORM_READ_OK = {"status": "success", "status_code": 200, "payload": {}}
+NEW_ACCOUNT = PlatformFacts(read=PLATFORM_READ_OK, has_data=False, has_slack=False)
+ACCOUNT_WITH_DATA = PlatformFacts(read=PLATFORM_READ_OK, has_data=True, has_slack=False)
 
 
 class TestOnboardingFlowIntegration:
@@ -37,7 +42,7 @@ class TestOnboardingFlowIntegration:
                 with patch('src.revenium_mcp_server.onboarding.detection_service.get_cache_info', return_value=None):
 
                     # Step 1: Detect onboarding state
-                    onboarding_state = await get_onboarding_state()
+                    onboarding_state = await get_onboarding_state(NEW_ACCOUNT)
                     assert onboarding_state.is_first_time is True
                     assert onboarding_state.cache_exists is False
 
@@ -53,10 +58,11 @@ class TestOnboardingFlowIntegration:
                         assert 'tools_registered' in init_result
                         assert init_result['smart_defaults_enhanced'] is True
 
-                    # Step 3: Check onboarding status
+                    # Step 3: Check onboarding status. The status holds no platform
+                    # read, so whether the account is new is reported as unknown.
                     status = await get_onboarding_status()
                     assert status['status'] == 'initialized'
-                    assert status['onboarding_state']['is_first_time'] is True
+                    assert status['onboarding_state']['is_first_time'] is None
 
     @pytest.mark.asyncio
     async def test_returning_user_complete_flow(self):
@@ -73,23 +79,22 @@ class TestOnboardingFlowIntegration:
 
         with patch('src.revenium_mcp_server.onboarding.detection_service.is_config_cached', return_value=True):
             with patch('src.revenium_mcp_server.onboarding.detection_service.get_cache_info', return_value=mock_cache_info):
-                with patch('src.revenium_mcp_server.onboarding.detection_service.load_cached_config', return_value={'data': 'exists'}):
 
-                    # Step 1: Detect onboarding state
-                    onboarding_state = await get_onboarding_state()
-                    assert onboarding_state.is_first_time is False
-                    assert onboarding_state.cache_exists is True
+                # Step 1: Detect onboarding state
+                onboarding_state = await get_onboarding_state(ACCOUNT_WITH_DATA)
+                assert onboarding_state.is_first_time is False
+                assert onboarding_state.cache_exists is True
 
-                    # Step 2: Initialize onboarding system
-                    mock_mcp_server = Mock()
+                # Step 2: Initialize onboarding system
+                mock_mcp_server = Mock()
 
-                    with patch.object(conditional_registry, 'register_tools_conditionally',
-                                    return_value={'configuration_status': True}):
-                        init_result = await initialize_onboarding(mock_mcp_server)
+                with patch.object(conditional_registry, 'register_tools_conditionally',
+                                return_value={'configuration_status': True}):
+                    init_result = await initialize_onboarding(mock_mcp_server)
 
-                        assert init_result['status'] == 'success'
-                        # Conditional registration is currently disabled
-                        assert 'tools_registered' in init_result
+                    assert init_result['status'] == 'success'
+                    # Conditional registration is currently disabled
+                    assert 'tools_registered' in init_result
 
     @pytest.mark.asyncio
     async def test_environment_validation_integration(self):
@@ -176,15 +181,6 @@ class TestOnboardingFlowIntegration:
         # Test setting onboarding context
         await smart_defaults.set_onboarding_context(mock_onboarding_state)
         assert smart_defaults._onboarding_context is not None
-
-        # Test enhanced defaults for onboarding tools
-        enhanced_data = smart_defaults.get_onboarding_enhanced_defaults(
-            'welcome_and_setup',
-            'show_welcome',
-            {}
-        )
-
-        assert 'setup_completion_context' in enhanced_data
 
         # Test onboarding tool defaults
         tool_defaults = smart_defaults.get_onboarding_tool_defaults('welcome_and_setup')

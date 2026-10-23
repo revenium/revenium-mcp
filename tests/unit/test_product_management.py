@@ -892,12 +892,10 @@ class TestListProductsRejectsFloatSizeNoLeak:
 
 
 class TestUpdateProductPreservesFlatAmount:
-    """BACK-1270 / item #3 — name-only update on a flat_amount-tier product preserves tier.
+    """BACK-1270 / BACK-4860: a name-only update of a flat_amount-tier product keeps the tier.
 
-    The audit caught that update was rejecting `flat_amount` even though create
-    accepts it; the symptom was a 404 from the tier validator. Behaviour must be
-    truly partial: a name-only patch must NOT invalidate the existing tier
-    structure, and the merged payload must keep `flat_amount` intact.
+    The platform refuses a flat-only tier in any PUT that carries the plan, so the
+    update leaves the plan out and the platform keeps the stored tier as it is.
     """
 
     @pytest.mark.asyncio
@@ -920,22 +918,15 @@ class TestUpdateProductPreservesFlatAmount:
             side_effect=lambda _id, payload: {**existing, **payload}
         )
 
-        # Should not raise / not 404 from validator; should preserve tier.
         result = await product_manager.update_product({
             "product_id": "prod_123",
             "product_data": {"name": "new"},
         })
         assert "data" in result
         sent = mock_client.update_product.await_args.args[1]
-        # The merged payload must still describe a flat_amount tier (the field
-        # the API accepts on create must also be acceptable on update).
-        assert "plan" in sent and sent["plan"].get("tiers"), (
-            f"BACK-1270 #3: tier configuration dropped on partial update. payload={sent!r}"
-        )
-        assert sent["plan"]["tiers"][0].get("flat_amount") == "1.00", (
-            f"BACK-1270 #3: flat_amount stripped or rewritten on partial update. "
-            f"payload={sent!r}"
-        )
+        assert sent["name"] == "new"
+        assert "plan" not in sent
+        assert result["data"]["plan"]["tiers"][0]["flat_amount"] == "1.00"
 
 
 class TestProductsPaginationSafeInteger:

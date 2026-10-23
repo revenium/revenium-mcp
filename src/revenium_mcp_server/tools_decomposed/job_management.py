@@ -185,6 +185,7 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 from ..analytics_window import CalendarRangeError, utc_instant_bounds
 from ..client import ReveniumAPIError, ReveniumClient
 from ..common.error_handling import ErrorCodes, ToolError, raise_unknown_action_error
+from ..common.platform_paging import PLATFORM_MAX_PAGE_SIZE
 from ..common.validation import apply_filter_allowlist
 from ..introspection.metadata import (
     ResourceRelationship,
@@ -206,12 +207,10 @@ from .unified_tool_base import ToolBase
 # pathological inputs rather than a real cap on legitimate paging.
 _MAX_JOBS_PAGE = 1_000_000
 
-# BACK-1140: upper bound on the size parameter. Matches
-# PaginationPerformanceManager.MAXIMUM_LIMIT, the platform's page
-# maximum. Without this, size=2147483647 (32-bit MAX_INT)
+# BACK-1140: without an upper bound, size=2147483647 (32-bit MAX_INT)
 # passed the `size <= 0` guard and was forwarded to the backend, which
 # returned the same generic HTTP 500 this PR closed for page.
-_MAX_JOBS_SIZE = 100
+_MAX_JOBS_SIZE = PLATFORM_MAX_PAGE_SIZE
 
 _DEFAULT_JOBS_PAGE = 0
 _DEFAULT_JOBS_SIZE = 20
@@ -882,6 +881,17 @@ _SESSION_ID = _PathIdKind(
 )
 
 
+# The platform answers a bare 400 naming no reason for a path carrying any of
+# these, encoded or not (seen on dev for job ids, BACK-4844), so an id holding
+# one cannot be reached through its path by any caller. Refusing it here names
+# the character and locks out no job the platform would have served.
+_PLATFORM_REFUSED_PATH_CHARACTERS: Tuple[Tuple[str, str], ...] = (
+    ("\\", "a backslash"),
+    ("%", "a percent sign"),
+    (";", "a semicolon"),
+)
+
+
 def _refuse_id_off_its_path(value: Any, action: str, kind: _PathIdKind) -> None:
     """Refuse an id that cannot be the one path segment its endpoint expects.
 
@@ -916,6 +926,19 @@ def _refuse_id_off_its_path(value: Any, action: str, kind: _PathIdKind) -> None:
             value=value,
             suggestions=list(kind.suggestions),
         )
+    for character, name in _PLATFORM_REFUSED_PATH_CHARACTERS:
+        if character in value:
+            raise ToolError(
+                message=(
+                    f"{kind.field} must not contain '{character}' for {action} "
+                    f"action: the platform refuses any request whose path carries "
+                    f"{name}, so this {kind.owner} cannot be reached by its id."
+                ),
+                error_code=ErrorCodes.INVALID_PARAMETER,
+                field=kind.field,
+                value=value,
+                suggestions=list(kind.suggestions),
+            )
 
 
 def _refuse_job_id_off_its_path(
@@ -2276,6 +2299,7 @@ class JobManager:
                     "assistant that ran the session, not from this tool",
                 ],
             )
+        session_id = str(session_id).strip()
         _refuse_id_off_its_path(session_id, "list_session_attributions", _SESSION_ID)
         response = await self.client.get_session_attributions(session_id)
         intervals = _session_attribution_intervals(session_id, response)

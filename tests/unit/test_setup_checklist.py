@@ -16,6 +16,7 @@ from src.revenium_mcp_server.auth.tenant_context import TenantContext
 from src.revenium_mcp_server.onboarding.env_validation import API_AUTH_REJECTED_MESSAGE
 from src.revenium_mcp_server.tools_decomposed import setup_checklist as setup_checklist_module
 from src.revenium_mcp_server.tools_decomposed.setup_checklist import SetupChecklist
+from tests.unit._helpers_bare_calls import bare_setup_calls_in
 
 
 @pytest.fixture(autouse=True)
@@ -44,6 +45,14 @@ def _client_whose_slack_read_fails():
     client.get_data_connected_sources = AsyncMock(return_value={})
     client.get_slack_configurations = AsyncMock(side_effect=RuntimeError("slack down"))
     return client
+
+
+def notification_email(address):
+    """The shared notification-email walk answering one address."""
+    return patch(
+        "src.revenium_mcp_server.tools_decomposed.setup_checklist.default_notification_email",
+        return_value=address,
+    )
 
 
 @pytest.fixture
@@ -149,14 +158,13 @@ class TestShowChecklist:
             side_effect=lambda key, *args: {
                 "REVENIUM_API_KEY": "test_key",
                 "REVENIUM_TEAM_ID": "team-1",
-                "REVENIUM_DEFAULT_EMAIL": "user@test.com",
-                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": "slack-1",
             }.get(key),
-        ):
+        ), notification_email("user@test.com"):
             result = await checklist_tool.handle_action("show_checklist", {})
         text = result[0].text
         assert "Complete Setup Checklist" in text
         assert "READY" in text or "[OK]" in text
+        assert "   - Status: Configured (user@test.com)\n" in text
 
     @pytest.mark.asyncio
     async def test_show_checklist_draws_unknown_slack_as_unknown(self, checklist_tool):
@@ -284,14 +292,13 @@ class TestShowChecklist:
             side_effect=lambda key, *args: {
                 "REVENIUM_API_KEY": "rev_sk_cached",
                 "REVENIUM_TEAM_ID": "team-1",
-                "REVENIUM_DEFAULT_EMAIL": "user@test.com",
-                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": "slack-1",
             }.get(key),
-        ):
+        ), notification_email("user@test.com"):
             result = await checklist_tool.handle_action("show_checklist", {})
         text = result[0].text
         assert "Setup Complete!" not in text
         assert "API connectivity was not verified" in text
+        assert "   - Status: Configured (user@test.com)\n" in text
 
 
 class TestCheckRequirements:
@@ -362,15 +369,45 @@ class TestCheckOptional:
             return_value=_mock_validation_result(),
         ), patch(
             "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_config_value",
-            side_effect=lambda key, *args: {
-                "REVENIUM_DEFAULT_EMAIL": "user@test.com",
-                "REVENIUM_DEFAULT_SLACK_CONFIG_ID": None,
-            }.get(key, args[0] if args else None),
-        ):
+            side_effect=lambda key, *args: args[0] if args else None,
+        ), notification_email("user@test.com"):
             result = await checklist_tool.handle_action("check_optional", {})
         text = result[0].text
-        assert "Email Notifications" in text
+        assert "## [OK] **Email Notifications**" in text
+        assert "**Status**: user@test.com\n" in text
         assert "Slack Integration" in text
+
+
+class TestPlaceholderEmailReadsAsUnset:
+    """BACK-4743: the checklist reads the email through the walk alerts use, so the placeholder is unset."""
+
+    @pytest.mark.asyncio
+    async def test_show_checklist_reports_a_placeholder_email_as_not_configured(
+        self, checklist_tool, placeholder_notification_email
+    ):
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_onboarding_state",
+            return_value=_mock_onboarding_state(is_first_time=False),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=_mock_validation_result(),
+        ):
+            text = (await checklist_tool.handle_action("show_checklist", {}))[0].text
+        assert "[ ] **Email Notifications**\n   - Status: Not configured\n" in text
+        assert "dummy@email.com" not in text
+
+    @pytest.mark.asyncio
+    async def test_check_optional_reports_a_placeholder_email_as_not_set(
+        self, checklist_tool, placeholder_notification_email
+    ):
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=_mock_validation_result(),
+        ):
+            text = (await checklist_tool.handle_action("check_optional", {}))[0].text
+        assert "## ❌ **Email Notifications**" in text
+        assert "**Status**: NOT SET\n" in text
+        assert "dummy@email.com" not in text
 
 
 class TestCheckSystemStatus:
@@ -724,3 +761,40 @@ class TestUtcTimestamps:
         assert naive_calls == [], (
             "naive datetime.now() in a module whose stamps are labelled UTC: " + "; ".join(naive_calls)
         )
+
+
+class TestEmailActionNamesACallTheServerAccepts:
+    """BACK-4966: the email step names a call the server answers, never verify_email_setup()."""
+
+    @staticmethod
+    async def _texts_without_an_email(checklist_tool):
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.get_onboarding_state",
+            return_value=_mock_onboarding_state(is_first_time=False, email=False),
+        ), patch(
+            "src.revenium_mcp_server.tools_decomposed.setup_checklist.validate_environment_variables",
+            return_value=_mock_validation_result(),
+        ), notification_email(None):
+            return [
+                (await checklist_tool.handle_action(action, {}))[0].text
+                for action in ("show_checklist", "check_optional", "get_recommendations")
+            ]
+
+    @pytest.mark.asyncio
+    async def test_local_checklist_names_the_update_email_call(
+        self, checklist_tool, monkeypatch
+    ):
+        monkeypatch.delenv("AUTH_MODE", raising=False)
+        for text in await self._texts_without_an_email(checklist_tool):
+            assert "verify_email_setup(" not in bare_setup_calls_in(text), text
+            assert "system_setup(action='update_email', email='your@email.com')" in text
+
+    @pytest.mark.asyncio
+    async def test_hosted_checklist_names_the_alert_email_argument(
+        self, checklist_tool, monkeypatch
+    ):
+        monkeypatch.setenv("AUTH_MODE", "api_key")
+        for text in await self._texts_without_an_email(checklist_tool):
+            assert "verify_email_setup(" not in bare_setup_calls_in(text), text
+            assert "update_email" not in text
+            assert "manage_alerts(action='create_simple'" in text
