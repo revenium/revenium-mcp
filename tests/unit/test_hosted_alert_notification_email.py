@@ -523,3 +523,20 @@ async def test_create_from_text_sends_the_threshold_next_to_the_money_words(
     assert result.is_error is False, _text(result)
     sent = alerts.sent()
     assert {field: sent.get(field) for field in expected} == expected
+
+
+LOCAL_DEFAULT_ORDER = "the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL"
+
+
+@pytest.mark.asyncio
+async def test_the_email_parameter_names_the_saved_address_before_the_environment_variable():
+    schema = await AlertManagement()._get_input_schema()
+    description = schema["properties"]["email"]["description"]
+    assert f"on a local server, {LOCAL_DEFAULT_ORDER}" in description
+
+
+@pytest.mark.asyncio
+async def test_the_agent_summary_names_the_saved_address_before_the_environment_variable():
+    text = (await AlertManagement()._handle_get_agent_summary())[0].text
+    assert f"on a local server {LOCAL_DEFAULT_ORDER}" in text
+    assert "or REVENIUM_DEFAULT_EMAIL on a local server" not in text

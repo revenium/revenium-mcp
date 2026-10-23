@@ -11,12 +11,12 @@ from typing import Any, Dict, List, Optional
 from mcp.types import TextContent
 
 
-def _is_past_last_page(page: int, total_pages: int, total_items: Optional[int]) -> bool:
+def is_past_last_page(page: int, total_pages: int, total_items: Optional[int]) -> bool:
     """True when an empty page lies beyond a list that is known to have items."""
     return isinstance(total_items, int) and total_items > 0 and page >= total_pages
 
 
-def _past_last_page_sentence(
+def past_last_page_sentence(
     page: int, size: int, total_pages: int, total_items: Optional[int]
 ) -> str:
     """Say which pages exist, naming only the page argument the caller passes."""
@@ -163,9 +163,9 @@ class StandardResponse:
 
         content_parts = [" ".join(header_parts), ""]
 
-        if not items and _is_past_last_page(page, total_pages, total_items):
+        if not items and is_past_last_page(page, total_pages, total_items):
             content_parts.append(
-                _past_last_page_sentence(page, size, total_pages, total_items)
+                past_last_page_sentence(page, size, total_pages, total_items)
             )
         elif not items:
             content_parts.extend(

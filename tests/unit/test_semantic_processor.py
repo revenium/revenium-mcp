@@ -662,7 +662,7 @@ class TestParseAlertRequest:
     @patch.dict(os.environ, {"REVENIUM_DEFAULT_EMAIL": "dummy@email.com"})
     def test_dummy_email_never_becomes_a_placeholder_recipient(self, processor):
         with patch(
-            "src.revenium_mcp_server.config_store.get_discovered_value",
+            "src.revenium_mcp_server.config_store.ConfigurationStore._discovered_value",
             return_value=None,
         ):
             result = processor.parse_alert_request("alert when spending exceeds $100")

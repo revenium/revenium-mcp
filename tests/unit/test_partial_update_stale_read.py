@@ -190,9 +190,9 @@ async def test_a_partial_plan_written_earlier_is_kept_when_a_later_update_change
     await handler.update_with_merge("prod_1", {"plan": {"currency": "EUR"}}, config)
     await handler.update_with_merge("prod_1", {"name": "New name"}, config)
 
-    plan = client.put_bodies[1]["plan"]
-    assert plan["currency"] == "EUR"
-    assert plan["tiers"] == STORED["product"]["plan"]["tiers"]
+    assert "plan" not in client.put_bodies[1]
+    assert client.committed["plan"]["currency"] == "EUR"
+    assert client.committed["plan"]["tiers"] == STORED["product"]["plan"]["tiers"]
 
 
 @pytest.mark.asyncio
@@ -208,9 +208,10 @@ async def test_earlier_nested_edits_survive_a_later_nested_edit_and_a_name_only_
 
     third_body = client.put_bodies[2]
     assert third_body["name"] == "New name"
-    assert third_body["plan"]["currency"] == "EUR"
-    assert third_body["plan"]["tiers"] == new_tiers
+    assert "plan" not in third_body
+    assert client.put_bodies[1]["plan"]["currency"] == "EUR"
     assert client.committed["plan"]["currency"] == "EUR"
+    assert client.committed["plan"]["tiers"] == new_tiers
 
 
 @pytest.mark.asyncio

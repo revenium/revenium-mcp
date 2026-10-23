@@ -13,11 +13,13 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from src.revenium_mcp_server.tools_decomposed.cost_controls_management import (
+    ENFORCEMENT_ADVISORY_ROWS_NOTE,
     ENFORCEMENT_EVENT_ROW_FIELDS_NOTE,
     ENFORCEMENT_GROUP_PAIR_NOTE,
     ENFORCEMENT_ROSTER_NOTE,
     ENFORCEMENT_SUBREADS_UNPAGED_NOTE,
     DEPARTMENT_ENFORCEMENT_MAPS_NOTE,
+    FILTER_VALUES_NOTE,
     NOTIFICATION_EMAILS_PATCH_NOTE,
     CostControlsManager,
     CostControlsManagement,
@@ -53,6 +55,7 @@ def mock_client():
     client.get_enforcement_rules = AsyncMock()
     client.get_enforcement_rule_roster = AsyncMock()
     client.preview_department_group = AsyncMock()
+    client.get_cost_control_filter_values = AsyncMock()
     client._extract_embedded_data = MagicMock()
     client._extract_pagination_info = MagicMock()
     return client
@@ -443,7 +446,9 @@ class TestCostControlsManagerEnforcementRules:
             "compiledAt": "2026-01-01T00:00:00Z",
         }
         result = await cc_manager.get_enforcement_rules({})
-        mock_client.get_enforcement_rules.assert_called_once_with(rule_id=None)
+        mock_client.get_enforcement_rules.assert_called_once_with(
+            rule_id=None, include_advisory=False
+        )
         assert result["rules"][0]["id"] == "cc_1"
         assert result["compiledAt"] == "2026-01-01T00:00:00Z"
 
@@ -557,7 +562,10 @@ class TestCostControlsManagementMetadata:
         caps = await cc_mgmt._get_tool_capabilities()
         enforcement = next(c for c in caps if "get_enforcement_rules" in c.parameters)
 
-        assert set(enforcement.parameters["get_enforcement_rules"]) == {"rule_id"}
+        assert set(enforcement.parameters["get_enforcement_rules"]) == {
+            "rule_id",
+            "include_advisory",
+        }
         assert "groupBreakdown" not in json.dumps(enforcement.parameters)
 
     @pytest.mark.asyncio
@@ -622,6 +630,53 @@ class TestCostControlsManagementActions:
         assert body["total_records"] == total
         assert body["page"] == page
         assert body["total_found"] == row_count
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("page_info, row_count, page, heading, total", LIST_HEADING_CASES)
+    async def test_enforcement_events_heading_counts_the_page_against_the_platform_total(
+        self, cc_mgmt, mock_client, page_info, row_count, page, heading, total
+    ):
+        """BACK-4836: the enforcement events heading counts the page against the platform total."""
+        mock_client._extract_embedded_data.return_value = rows(row_count)
+        mock_client._extract_pagination_info.return_value = page_info
+        mock_client.get_enforcement_events.return_value = {}
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("list_enforcement_events", {"page": page, "size": 20})
+
+        shown_heading, body = heading_and_body(result[0].text)
+        assert shown_heading == heading.format(noun="enforcement events")
+        assert body["total_records"] == total
+        assert body["total_found"] == row_count
+
+    @pytest.mark.asyncio
+    async def test_two_enforcement_events_of_1951_read_as_1951(self, cc_mgmt, mock_client):
+        mock_client._extract_embedded_data.return_value = rows(2)
+        mock_client._extract_pagination_info.return_value = {"totalElements": 1951, "totalPages": 976}
+        mock_client.get_enforcement_events.return_value = {}
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("list_enforcement_events", {"size": 2})
+
+        shown_heading, _ = heading_and_body(result[0].text)
+        assert shown_heading == "Found 2 of 1951 enforcement events (page 1 of 976):"
+
+    @pytest.mark.asyncio
+    async def test_enforcement_events_with_no_pagination_block_print_the_page_count(
+        self, cc_mgmt, mock_client
+    ):
+        mock_client._extract_embedded_data.return_value = rows(3)
+        mock_client._extract_pagination_info.return_value = {}
+        mock_client.get_enforcement_events.return_value = {}
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("list_enforcement_events", {})
+
+        shown_heading, body = heading_and_body(result[0].text)
+        assert shown_heading == (
+            "Found 3 enforcement events on page 1; the platform reported no total, so more may exist:"
+        )
+        assert body["total_records"] is None
 
     @pytest.mark.asyncio
     async def test_list_action_formats_result(self, cc_mgmt, mock_client):
@@ -1880,7 +1935,9 @@ class TestGetEnforcementRulesNarrowedToOneRule:
 
         await cc_manager.get_enforcement_rules({"rule_id": "cc_123"})
 
-        mock_client.get_enforcement_rules.assert_awaited_once_with(rule_id="cc_123")
+        mock_client.get_enforcement_rules.assert_awaited_once_with(
+            rule_id="cc_123", include_advisory=False
+        )
 
     @pytest.mark.asyncio
     async def test_empty_rules_for_a_known_id_render_as_no_such_rule(
@@ -2047,3 +2104,356 @@ class TestGetEnforcementRuleRoster:
         )
 
         assert json.loads(result[0].text.split("\n\n", 1)[1]) == payload
+
+
+# ===========================================================================
+# BACK-4887: accepted cost-control filter values
+# ===========================================================================
+
+
+def _provider_filter_values():
+    """The dev response shape observed on 2026-10-20, trimmed to three rows."""
+    return {
+        "dimension": "PROVIDER",
+        "values": [
+            {
+                "value": "Anthropic",
+                "label": "Anthropic",
+                "covers": ["anthropic", "ClaudeCode", "ClaudeCowork", "foundry"],
+            },
+            {"value": "OpenAI", "label": "OpenAI", "covers": ["CodexCli", "openai"]},
+            {"value": "litellm", "label": "litellm", "covers": ["litellm"]},
+        ],
+    }
+
+
+class TestListFilterValues:
+    """list_filter_values reads the PROVIDER values a filter accepts."""
+
+    @pytest.mark.asyncio
+    async def test_renders_each_accepted_value_with_what_it_covers(self, cc_mgmt, mock_client):
+        mock_client.get_cost_control_filter_values.return_value = _provider_filter_values()
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("list_filter_values", {})
+
+        heading, payload = result[0].text.split("\n\n", 1)
+        assert heading.startswith("3 accepted PROVIDER filter value(s).")
+        assert "- Anthropic: covers anthropic, ClaudeCode, ClaudeCowork, foundry" in heading
+        assert "- litellm: covers litellm" in heading
+        assert json.loads(payload) == _provider_filter_values()
+        mock_client.get_cost_control_filter_values.assert_awaited_once_with("PROVIDER")
+
+    @pytest.mark.asyncio
+    async def test_lowercase_provider_is_accepted(self, cc_manager, mock_client):
+        mock_client.get_cost_control_filter_values.return_value = _provider_filter_values()
+
+        await cc_manager.list_filter_values({"dimension": "provider"})
+
+        mock_client.get_cost_control_filter_values.assert_awaited_once_with("PROVIDER")
+
+    @pytest.mark.asyncio
+    async def test_a_dimension_other_than_provider_is_refused_before_the_request(
+        self, cc_mgmt, mock_client
+    ):
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        with pytest.raises(ToolError) as raised:
+            await cc_mgmt.handle_action("list_filter_values", {"dimension": "MODEL"})
+
+        assert raised.value.field == "dimension"
+        assert "PROVIDER" in raised.value.message
+        assert "MODEL" in raised.value.message
+        mock_client.get_cost_control_filter_values.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_platform_without_the_endpoint_answers_not_offered_yet(
+        self, cc_mgmt, mock_client
+    ):
+        mock_client.get_cost_control_filter_values.side_effect = ReveniumAPIError(
+            "Not Found", status_code=404
+        )
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        with pytest.raises(ToolError) as raised:
+            await cc_mgmt.handle_action("list_filter_values", {})
+
+        assert "does not offer the list" in raised.value.message
+        assert "400" in raised.value.message
+        assert raised.value.error_code == ErrorCodes.RESOURCE_UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_other_upstream_failures_pass_through(self, cc_manager, mock_client):
+        mock_client.get_cost_control_filter_values.side_effect = ReveniumAPIError(
+            "Server error", status_code=500
+        )
+
+        with pytest.raises(ReveniumAPIError):
+            await cc_manager.list_filter_values({})
+
+    @pytest.mark.asyncio
+    async def test_an_unexpected_shape_is_flagged_not_rendered_as_zero(self, cc_mgmt, mock_client):
+        mock_client.get_cost_control_filter_values.return_value = {"dimension": "PROVIDER"}
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("list_filter_values", {})
+
+        assert result[0].text.startswith("WARNING: The filter-values endpoint answered")
+
+
+class TestFilterValuesGuidance:
+    """create and update guidance points at list_filter_values."""
+
+    @pytest.mark.asyncio
+    async def test_action_is_supported(self, cc_mgmt):
+        assert "list_filter_values" in await cc_mgmt._get_supported_actions()
+
+    @pytest.mark.asyncio
+    async def test_capabilities_document_the_action_and_its_dimension(self, cc_mgmt):
+        caps = await cc_mgmt._get_tool_capabilities()
+        documented = {name: params for cap in caps for name, params in cap.parameters.items()}
+
+        assert set(documented["list_filter_values"]) == {"dimension"}
+        assert "list_filter_values" in documented["create"]["control_data"]
+        assert "list_filter_values" in documented["update"]["control_data"]
+
+    @pytest.mark.asyncio
+    async def test_get_capabilities_text_names_the_action(self, cc_mgmt):
+        result = await cc_mgmt.handle_action("get_capabilities", {})
+
+        assert '"list_filter_values"' in result[0].text
+        assert json.dumps(FILTER_VALUES_NOTE) in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_get_examples_shows_the_lookup_and_a_provider_filter(self, cc_mgmt):
+        result = await cc_mgmt.handle_action("get_examples", {})
+
+        payload = json.loads(result[0].text.split("\n", 1)[1])
+        assert payload["examples"]["list_filter_values"] == {"action": "list_filter_values"}
+        provider_row = payload["examples"]["filter_one_provider"]["control_data"]["filters"][0]
+        assert provider_row["dimension"] == "PROVIDER"
+        assert FILTER_VALUES_NOTE in payload["filter_notes"]
+
+    @pytest.mark.asyncio
+    async def test_filter_row_schema_points_at_the_lookup(self, cc_mgmt):
+        schema = await cc_mgmt._get_input_schema()
+        row = schema["properties"]["control_data"]["properties"]["filters"]["items"]
+
+        assert "list_filter_values" in row["properties"]["dimension"]["description"]
+        assert "list_filter_values" in schema["properties"]["dimension"]["description"]
+
+
+def _advisory_row(**overrides):
+    """A notify-only row shaped like the one dev returned on 2026-10-22."""
+    row = {
+        "ruleId": 9001,
+        "name": "Per-person monthly budget",
+        "action": "NOTIFY",
+        "source": "ANOMALY",
+        "groupBy": "SUBSCRIBER",
+        "breached": True,
+        "readingAt": "2026-10-22T13:59:35Z",
+        "groupBreakdown": [],
+    }
+    row.update(overrides)
+    return row
+
+
+class TestGetEnforcementRulesAdvisoryRows:
+    """include_advisory adds the notify-only budgets, which never block."""
+
+    @pytest.mark.asyncio
+    async def test_include_advisory_is_forwarded_when_asked(self, cc_manager, mock_client):
+        mock_client.get_enforcement_rules.return_value = {"rules": []}
+
+        await cc_manager.get_enforcement_rules({"include_advisory": True})
+
+        mock_client.get_enforcement_rules.assert_awaited_once_with(
+            rule_id=None, include_advisory=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_include_advisory_with_rule_id_is_refused_before_the_request(
+        self, cc_manager, mock_client
+    ):
+        with pytest.raises(ToolError) as raised:
+            await cc_manager.get_enforcement_rules(
+                {"include_advisory": True, "rule_id": "cc_123"}
+            )
+
+        assert raised.value.field == "include_advisory"
+        assert "rule_id" in raised.value.message
+        mock_client.get_enforcement_rules.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blank", ["", "   "])
+    async def test_a_blank_rule_id_with_include_advisory_reads_the_whole_team(
+        self, cc_manager, mock_client, blank
+    ):
+        mock_client.get_enforcement_rules.return_value = {"rules": []}
+
+        await cc_manager.get_enforcement_rules({"include_advisory": True, "rule_id": blank})
+
+        mock_client.get_enforcement_rules.assert_awaited_once_with(
+            rule_id=None, include_advisory=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_include_advisory_is_refused(self, cc_manager, mock_client):
+        with pytest.raises(ToolError) as raised:
+            await cc_manager.get_enforcement_rules({"include_advisory": "sometimes"})
+
+        assert raised.value.error_code == ErrorCodes.INVALID_PARAMETER
+        mock_client.get_enforcement_rules.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_breached_advisory_row_is_labelled_notify_only_not_blocking(
+        self, cc_mgmt, mock_client
+    ):
+        mock_client.get_enforcement_rules.return_value = {
+            "rules": [{"ruleId": 42, "name": "Monthly cap", "action": "BLOCK"}, _advisory_row()],
+            "compiledAt": "2026-10-22T00:00:00Z",
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action(
+            "get_enforcement_rules", {"include_advisory": True}
+        )
+        prose = result[0].text.split("\n\n", 1)[0]
+
+        assert "1 rules and 1 notify-only budgets" in prose
+        assert (
+            "- Per-person monthly budget: notify-only, never blocks; "
+            "per-person figures read at 2026-10-22T13:59:35Z"
+        ) in prose
+        assert "2 rules" not in prose
+
+    @pytest.mark.asyncio
+    async def test_several_advisory_rows_read_as_plural_throughout(self, cc_mgmt, mock_client):
+        mock_client.get_enforcement_rules.return_value = {
+            "rules": [_advisory_row(), _advisory_row(ruleId=9002, name="Second budget")],
+            "compiledAt": None,
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action(
+            "get_enforcement_rules", {"include_advisory": True}
+        )
+
+        assert (
+            "2 rows are notify-only budgets (action NOTIFY, source ANOMALY): they alert "
+            "and never block, even when breached, so they are not enforcement rules:"
+        ) in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_the_rendering_reads_the_flag_through_the_same_parser_as_the_request(
+        self, cc_mgmt, mock_client, monkeypatch
+    ):
+        from src.revenium_mcp_server.tools_decomposed import cost_controls_management as module
+
+        monkeypatch.setattr(module, "_include_advisory_requested", lambda arguments: True)
+        mock_client.get_enforcement_rules.return_value = {"rules": [], "compiledAt": None}
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_rules", {"include_advisory": "yes"})
+
+        mock_client.get_enforcement_rules.assert_awaited_once_with(
+            rule_id=None, include_advisory=True
+        )
+        assert "No notify-only budgets on this team." in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_a_budget_sharing_a_cost_controls_id_is_never_named_as_the_blocking_rule(
+        self, cc_mgmt, mock_client
+    ):
+        mock_client.get_enforcement_rules.return_value = {
+            "rules": [
+                {"ruleId": 42, "name": "Engineering monthly cap", "action": "BLOCK"},
+                _advisory_row(ruleId=42, name="Per-person monthly budget"),
+            ],
+            "compiledAt": None,
+            "departmentBudgetBlocks": {"ada@example.com": 42},
+            "departmentBudgetWarnings": {"bo@example.com": 42},
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action(
+            "get_enforcement_rules", {"include_advisory": True}
+        )
+        prose = result[0].text.split("\n\n", 1)[0]
+
+        assert "ada@example.com (Engineering monthly cap)" in prose
+        assert "- Engineering monthly cap: 1 subscriber warned" in prose
+        assert "ada@example.com (Per-person monthly budget)" not in prose
+
+    @pytest.mark.asyncio
+    async def test_an_advisory_row_without_a_reading_says_so(self, cc_mgmt, mock_client):
+        mock_client.get_enforcement_rules.return_value = {
+            "rules": [_advisory_row(readingAt=None)],
+            "compiledAt": None,
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action(
+            "get_enforcement_rules", {"include_advisory": True}
+        )
+
+        assert "no reading yet for the current window" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_asking_for_advisory_rows_and_getting_none_says_there_are_none(
+        self, cc_mgmt, mock_client
+    ):
+        mock_client.get_enforcement_rules.return_value = {
+            "rules": [{"ruleId": 42, "name": "Monthly cap", "action": "BLOCK"}],
+            "compiledAt": None,
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action(
+            "get_enforcement_rules", {"include_advisory": True}
+        )
+
+        assert "No notify-only budgets on this team." in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_the_default_read_says_nothing_about_notify_only_budgets(
+        self, cc_mgmt, mock_client
+    ):
+        mock_client.get_enforcement_rules.return_value = {
+            "rules": [{"ruleId": 42, "name": "Monthly cap", "action": "BLOCK"}],
+            "compiledAt": None,
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("get_enforcement_rules", {})
+
+        assert "notify-only" not in result[0].text
+        assert "(1 rules," in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_payload_is_still_recoverable_after_the_advisory_lines(
+        self, cc_mgmt, mock_client
+    ):
+        payload = {"rules": [_advisory_row()], "compiledAt": None}
+        mock_client.get_enforcement_rules.return_value = payload
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action(
+            "get_enforcement_rules", {"include_advisory": True}
+        )
+
+        assert json.loads(result[0].text.split("\n\n", 1)[1]) == payload
+
+    @pytest.mark.asyncio
+    async def test_schema_and_capability_teach_the_flag_and_its_rule_id_limit(self, cc_mgmt):
+        schema = await cc_mgmt._get_input_schema()
+        caps = await cc_mgmt._get_tool_capabilities()
+        enforcement = next(c for c in caps if "get_enforcement_rules" in c.parameters)
+
+        assert schema["properties"]["include_advisory"]["type"] == "boolean"
+        assert ENFORCEMENT_ADVISORY_ROWS_NOTE in schema["properties"]["include_advisory"]["description"]
+        assert ENFORCEMENT_ADVISORY_ROWS_NOTE in enforcement.limitations
+        hint = enforcement.parameters["get_enforcement_rules"]["include_advisory"]
+        assert "never block" in hint
+        assert "rule_id" in hint

@@ -20,6 +20,20 @@ HOSTED_CALLER = TenantContext(
 )
 
 
+class TestPlaceholderEmailReadsAsUnset:
+
+    def test_email_configured_is_false_for_the_placeholder(self, placeholder_notification_email):
+        """BACK-4743: the onboarding state reads the email through the walk alerts use."""
+        with patch(
+            "src.revenium_mcp_server.onboarding.detection_service.is_config_cached",
+            return_value=False,
+        ):
+            status = OnboardingDetectionService()._get_setup_completion_status(
+                MagicMock(summary={"auto_discovery_works": True})
+            )
+        assert status["email_configured"] is False
+
+
 class TestOnboardingDetectionServiceInit:
 
     def test_keeps_no_verdict_between_calls(self):

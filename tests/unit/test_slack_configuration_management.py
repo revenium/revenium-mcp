@@ -281,6 +281,22 @@ class TestSlackConfigUnknownIdReadsAsNotFound:
             assert stored_default != "RdKdRMz"
 
     @pytest.mark.asyncio
+    async def test_an_undecodable_id_says_not_found(self, config_tool, mock_client):
+        mock_client.get_slack_configuration_by_id = AsyncMock(
+            side_effect=ReveniumAPIError(
+                "Invalid Slack Configuration ID",
+                status_code=400,
+                response_data={"error_data": {"error": "Failed to decode hashed Id: [typo]"}},
+            )
+        )
+        with patch.object(config_tool, "get_client", return_value=mock_client):
+            with pytest.raises(ToolError) as exc_info:
+                await config_tool.handle_action("get_configuration", {"config_id": "typo"})
+
+        assert exc_info.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert "not found or is not in your organization" in exc_info.value.message
+
+    @pytest.mark.asyncio
     async def test_stale_default_id_says_not_found(self, config_tool, mock_client):
         mock_client.get_slack_configuration_by_id = AsyncMock(
             side_effect=ReveniumAPIError("HTTP 403: Access Denied", status_code=403)

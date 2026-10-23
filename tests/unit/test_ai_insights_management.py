@@ -1425,3 +1425,95 @@ async def test_list_runs_refusal_reaches_the_caller_with_the_field_detail(monkey
     assert "status" in caller_text
     assert "BOGUS" in caller_text
     assert "running, completed, partial, failed, cancelled" in caller_text
+
+
+async def _trigger_run_periods(period_start, period_end):
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    trigger = AsyncMock(return_value={"runId": "r1", "status": "running"})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.trigger_recommendation_run",
+        new=trigger,
+    ):
+        await AIInsightsManagement().handle_action(
+            "trigger_run", {"period_start": period_start, "period_end": period_end}
+        )
+    sent = trigger.await_args.kwargs
+    return sent["period_start"], sent["period_end"]
+
+
+@pytest.mark.asyncio
+async def test_trigger_run_period_end_given_as_a_day_covers_that_whole_day():
+    """BACK-4734: the platform reads a bare day as its first instant, dropping the last day."""
+    sent = await _trigger_run_periods("2026-01-01", "2026-01-31")
+
+    assert sent == ("2026-01-01T00:00:00.000Z", "2026-01-31T23:59:59.999Z")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("period_start", "period_end"), [
+    ("2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z"),
+    ("2026-01-01T06:00:00+02:00", "2026-01-31T18:30:00-05:00"),
+])
+async def test_trigger_run_sends_a_full_timestamp_unchanged(period_start, period_end):
+    sent = await _trigger_run_periods(period_start, period_end)
+
+    assert sent == (period_start, period_end)
+
+
+@pytest.mark.asyncio
+async def test_trigger_run_refuses_two_days_more_than_ninety_days_apart_before_the_call():
+    """BACK-4734: both whole days are now sent, so 2026-01-01..2026-04-01 is 91 days, past the platform's cap."""
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    trigger = AsyncMock(return_value={"runId": "r1", "status": "running"})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.trigger_recommendation_run",
+        new=trigger,
+    ), pytest.raises(ToolError) as exc:
+        await AIInsightsManagement().handle_action(
+            "trigger_run", {"period_start": "2026-01-01", "period_end": "2026-04-01"}
+        )
+
+    trigger.assert_not_awaited()
+    assert exc.value.field == "period_end"
+    assert "91 days" in exc.value.message
+    assert any("2026-03-31" in suggestion for suggestion in exc.value.suggestions)
+
+
+@pytest.mark.asyncio
+async def test_trigger_run_sends_two_days_ninety_days_apart_both_included():
+    sent = await _trigger_run_periods("2026-01-01", "2026-03-31")
+
+    assert sent == ("2026-01-01T00:00:00.000Z", "2026-03-31T23:59:59.999Z")
+
+
+@pytest.mark.asyncio
+async def test_trigger_run_accepts_single_digit_month_and_day_as_whole_days():
+    """2026-1-1 passes the day check, so the 90-day span check must read it the same way."""
+    sent = await _trigger_run_periods("2026-1-1", "2026-1-31")
+
+    assert sent == ("2026-01-01T00:00:00.000Z", "2026-01-31T23:59:59.999Z")
+
+
+@pytest.mark.asyncio
+async def test_trigger_run_refuses_single_digit_days_more_than_ninety_days_apart():
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    trigger = AsyncMock(return_value={"runId": "r1", "status": "running"})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.trigger_recommendation_run",
+        new=trigger,
+    ), pytest.raises(ToolError) as exc:
+        await AIInsightsManagement().handle_action(
+            "trigger_run", {"period_start": "2026-1-1", "period_end": "2026-4-1"}
+        )
+
+    trigger.assert_not_awaited()
+    assert "91 days" in exc.value.message

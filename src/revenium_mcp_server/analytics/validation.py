@@ -200,6 +200,8 @@ _FILTER_OPTION_NAMES = (
 )
 _MAX_NAMES = 100
 _MAX_NAME_LENGTH = 255
+# Texts an assistant sends for "no value"; the platform would read each as a name
+_PLACEHOLDER_NAMES = frozenset({"none", "null"})
 
 
 def filter_names(
@@ -234,6 +236,15 @@ def filter_names(
                 field=field,
                 suggestions=[f"Pass each value for '{key}' as a string"],
             )
+        if item.strip().lower() in _PLACEHOLDER_NAMES:
+            raise ValidationError(
+                f"{field} has the value {item!r}, which names nothing; the platform "
+                "would read it as a name. Nothing was read.",
+                field=field,
+                suggestions=[
+                    f"Pass a real value for '{key}' ({real_values}), or omit the key"
+                ],
+            )
     return list(values)
 
 
@@ -243,13 +254,17 @@ def listed_names(
     real_values: str = _FILTER_OPTION_NAMES,
     *,
     field: Optional[str] = None,
+    split_commas: bool = False,
 ) -> List[str]:
-    """One name or a list of names as a list, refusing an empty, oversized or blank one.
+    """One name or a list of names as a list, refusing an empty, oversized, blank or placeholder one.
 
-    A string is one name and is never split on commas. An empty list would
+    A string is one name unless ``split_commas`` is set, for arguments whose
+    names never hold a comma, such as provider names. An empty list would
     drop the narrowing from the request and answer the unfiltered report.
     """
     field = field or f"filters.{key}"
+    if split_commas and isinstance(value, str) and value.strip():
+        value = [name.strip() for name in value.split(",")]
     values = value if isinstance(value, list) else [value]
     if not values:
         raise ValidationError(
@@ -276,6 +291,38 @@ def listed_names(
     return names
 
 
+def known_names(
+    dimension: str,
+    names: List[str],
+    valid: List[str],
+    window: str,
+    *,
+    field: Optional[str] = None,
+) -> List[str]:
+    """The names in the platform's own spelling, refusing any it does not list for the window.
+
+    ``dimension`` is the ``get_filter_options`` dimension that lists the names;
+    ``field`` names the argument in the refusal and defaults to it. A name the
+    platform does not know is ignored by the narrowed report, which then
+    answers empty buckets that read as no usage.
+    """
+    field = field or dimension
+    by_folded = {name.casefold(): name for name in valid}
+    unknown = [name for name in names if name.casefold() not in by_folded]
+    if unknown:
+        listed = ", ".join(sorted(valid)) if valid else "none"
+        raise ValidationError(
+            f"{field} names {', '.join(repr(name) for name in unknown)}, which the "
+            f"platform does not list for {window}. Nothing was read.",
+            field=field,
+            suggestions=[
+                f"Valid {dimension} for {window}: {listed}",
+                f"get_filter_options(dimension='{dimension}') lists them for any window",
+            ],
+        )
+    return list(dict.fromkeys(by_folded[name.casefold()] for name in names))
+
+
 def tool_costs_report(action: str) -> FilterlessReport:
     return FilterlessReport(
         action, "it lists every row the report has" + _PAGE_CAP, _TOOL_REPORT_FILTERS
@@ -287,8 +334,10 @@ def top_level_narrowing(params: Dict[str, Any]) -> Optional[str]:
     return next((name for name in TOP_LEVEL_NARROWING if params.get(name) is not None), None)
 
 
-# The cost actions read outside the engine, each with the narrowing arguments
-# its handler reads. Every other narrowing argument on them is refused.
+# The cost actions read outside the engine, and the skill reads, whose
+# endpoints declare no provider, model or customer parameter, each with the
+# narrowing arguments its handler reads. Every other narrowing argument on
+# them is refused.
 NARROWING_READ_BY_ACTION: Mapping[str, FrozenSet[str]] = {
     "get_task_costs": frozenset(),
     "get_task_completion": frozenset({"agents"}),
@@ -304,6 +353,8 @@ NARROWING_READ_BY_ACTION: Mapping[str, FrozenSet[str]] = {
     "get_transaction_count": frozenset(),
     "get_coverage_ratio": frozenset({"provider"}),
     "analyze_cost_anomalies": frozenset(),
+    "list_skills": frozenset(),
+    "get_skill": frozenset(),
 }
 
 

@@ -92,3 +92,32 @@ async def test_summary_and_key_report_show_keys_the_same_way(analyzer):
     assert f"{shown}**\n   - Cost: $2,460.00" in report
     assert ANN not in api_key_section
     assert ANN not in report
+
+
+ROLLUP = "Other API keys"
+
+
+@pytest.mark.parametrize("label", [ROLLUP, ROLLUP.upper()])
+def test_the_analytics_rollup_is_shown_unmasked(label):
+    """The roll-up of unnamed keys is a label, not a key value (BACK-4846)."""
+    assert mask_api_key_name(label) == label
+
+
+@pytest.mark.asyncio
+async def test_the_rollup_reads_in_full_in_the_key_report_and_the_summary():
+    client = MagicMock()
+    client.team_id = "team-1"
+    client.get = AsyncMock(return_value=[_bucket({ROLLUP: 522.08, ANN: 10.0})])
+    analyzer = SimpleCostAnalyzer(client)
+    params = {"period": "SEVEN_DAYS", "aggregation": "TOTAL"}
+
+    report = ApiKeyCostsFormatter().format(
+        await analyzer.get_api_key_costs("SEVEN_DAYS", "TOTAL"), params
+    )
+    summary_text = CostSummaryFormatter().format(
+        await analyzer.get_cost_summary("SEVEN_DAYS", "TOTAL"), params
+    )
+
+    assert f"{ROLLUP}**\n   - Cost: $522.08" in report
+    assert f"- {ROLLUP}: $522.08" in summary_text
+    assert "Othe****keys" not in report + summary_text

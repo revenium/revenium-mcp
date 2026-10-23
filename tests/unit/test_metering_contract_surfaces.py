@@ -463,6 +463,24 @@ class TestSupportedProvidersTotal:
         assert "not unsupported" in text
 
     @pytest.mark.asyncio
+    async def test_the_sample_asks_for_and_states_the_platform_page_cap(self):
+        """BACK-4853: the catalog read asks for the 100 rows a page the platform serves and says so."""
+        mm = MeteringManagement()
+        client = make_client()
+        client.get_ai_models = AsyncMock(return_value=self._catalog_response(100, 3749))
+        with patch.object(mm, "get_client", new_callable=AsyncMock, return_value=client):
+            result = await mm.handle_action("get_supported_providers", {})
+
+        assert client.get_ai_models.await_args.kwargs["size"] == 100
+        assert (
+            "(from the first 100 of 3749 models; the platform serves at most 100 models a page)"
+            in result[0].text
+        )
+
+    def test_the_fallback_provider_scan_asks_for_the_platform_page_cap(self):
+        assert metering_management._PROVIDER_CATALOG_PAGE_SIZE == 100
+
+    @pytest.mark.asyncio
     async def test_a_complete_page_is_not_labelled_a_sample(self):
         mm = MeteringManagement()
         client = make_client()
@@ -684,3 +702,61 @@ class TestModelTipsNameRealActions:
             named = set(re.findall(r"`(\w+)\(", text))
             assert named <= supported, named - supported
             assert "get_ai_model" not in text
+
+
+# ===========================================================================
+# BACK-4861 - lookup_recent_transactions reads the size the schema advertises
+# ===========================================================================
+
+
+def _serve_the_size_asked_for(client):
+    async def serve(endpoint, params=None, **_):
+        rows = [
+            {"transactionId": f"tx_{index}", "model": "gpt-4o", "provider": "openai"}
+            for index in range(params["size"])
+        ]
+        return {"_embedded": {"aICompletionMetricResourceList": rows}}
+
+    client.get = AsyncMock(side_effect=serve)
+
+
+class TestRecentTransactionsPageSize:
+    """size, the paging argument the thin schema advertises, sets the page on lookup_recent_transactions."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            pytest.param({"size": 3}, id="top_level_size"),
+            pytest.param({"params": {"size": 3}}, id="size_in_params"),
+            pytest.param({"page_size": 3}, id="page_size"),
+            pytest.param({"page_size": 3, "size": 50}, id="page_size_wins_over_size"),
+        ],
+    )
+    async def test_lookup_recent_transactions_returns_the_size_asked_for(
+        self, in_process_metering, arguments
+    ):
+        _serve_the_size_asked_for(in_process_metering["client"])
+
+        async with Client(in_process_metering["server"]) as mcp_client:
+            result = await mcp_client.call_tool(
+                "manage_metering", {"action": "lookup_recent_transactions", **arguments}
+            )
+
+        text = result.content[0].text
+        sent = in_process_metering["client"].get.await_args.kwargs["params"]
+        assert sent["size"] == 3
+        assert "**Page**: 0 (size: 3)" in text
+        assert "**Found**: 3 transactions" in text
+
+    @pytest.mark.asyncio
+    async def test_schema_says_lookup_recent_reads_size_and_analyze_reads_only_page_size(self):
+        schema = await MeteringManagement()._get_input_schema()
+        description = schema["properties"]["page_size"]["description"]
+
+        assert "only accepted page/sample size" not in description
+        assert (
+            "lookup_recent_transactions also reads `size` when page_size is not sent "
+            "(page_size wins when both are sent)"
+        ) in description
+        assert "analyze_recent_transactions reads only page_size" in description

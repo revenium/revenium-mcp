@@ -450,7 +450,9 @@ PREVIEW_ARGUMENTS: Dict[Tuple[str, str], Dict[str, Any]] = {
             "externalSecret": "vq-secret-123",
         }
     },
-    ("manage_sources", "create"): {"source_data": {"name": "vq", "type": "API"}},
+    ("manage_sources", "create"): {
+        "source_data": {"name": "vq", "type": "API", "ownerId": "owner_vq"}
+    },
     ("manage_sources", "validate"): {"source_data": {"name": "vq", "type": "API"}},
     ("manage_metering_elements", "create"): {
         "element_data": {"name": "vq", "type": "NUMBER"}

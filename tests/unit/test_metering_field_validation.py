@@ -218,6 +218,11 @@ class TestFieldMappingAnalyzer:
         # read-side model_source (the routing layer) already mapped here.
         assert mappings["model_source"] == "modelSource"
 
+    def test_expected_field_mappings_cover_entrypoint(self):
+        """entrypoint is submitted by the tool, so the field-coverage analysis
+        must know its API name or it reports the field permanently missing."""
+        assert self.analyzer.expected_field_mappings["entrypoint"] == "entrypoint"
+
     def test_expected_field_mappings_cover_client_reported_cost(self):
         """clientReportedCost is response-only: the platform writes it when it
         re-rates a transaction against the tenant's rate card. Without the
@@ -1195,3 +1200,66 @@ class TestPromptContextReadBackComparison:
 
     def test_matching_values_report_no_mismatch(self):
         assert FieldMappingAnalyzer()._compare_transaction_values(self.SUBMITTED, dict(self.SUBMITTED)) == []
+
+
+
+# ---------------------------------------------------------------------------
+# BACK-4853 - validate_test_data refuses what the live submit refuses
+# ---------------------------------------------------------------------------
+
+
+class TestValidateTestDataRefusesWhatSubmitRefuses:
+    PAYLOAD = {
+        "model": "gpt-4o",
+        "provider": "openai",
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "duration_ms": 100,
+    }
+
+    @staticmethod
+    def _submit_refusal(payload):
+        from src.revenium_mcp_server.common.error_handling import ToolError
+        from src.revenium_mcp_server.tools_decomposed.metering_management import (
+            MeteringTransactionManager,
+        )
+
+        with pytest.raises(ToolError) as refused:
+            MeteringTransactionManager().reject_what_submit_refuses(payload)
+        return refused.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            pytest.param({"organization_id": "org_1"}, id="organization_id_alias"),
+            pytest.param({"product_id": "prod_1"}, id="product_id_alias"),
+            pytest.param({"transaction_id": "not-a-valid-id"}, id="unrecognized_transaction_id"),
+        ],
+    )
+    async def test_validate_test_data_refuses_the_submit_refusals(self, extra):
+        from src.revenium_mcp_server.tools_decomposed.metering_field_validation import (
+            MeteringFieldValidationManagement,
+        )
+
+        payload = {**self.PAYLOAD, **extra}
+        tool = MeteringFieldValidationManagement()
+        tool.validator.validate_transaction = AsyncMock()
+
+        result = await tool.handle_action("validate_test_data", payload)
+
+        assert self._submit_refusal(payload) in result[0].text
+        tool.validator.validate_transaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_validate_test_data_still_validates_a_clean_payload(self):
+        from src.revenium_mcp_server.tools_decomposed.metering_field_validation import (
+            MeteringFieldValidationManagement,
+        )
+
+        tool = MeteringFieldValidationManagement()
+        tool.validator.validate_transaction = AsyncMock(return_value={"valid": True})
+
+        await tool.handle_action("validate_test_data", dict(self.PAYLOAD))
+
+        tool.validator.validate_transaction.assert_awaited_once()

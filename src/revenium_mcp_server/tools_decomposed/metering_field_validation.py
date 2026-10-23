@@ -612,6 +612,7 @@ class FieldMappingAnalyzer:
             "effort": "effort",
             "model_host": "modelHost",
             "subscriber_email_source": "subscriberEmailSource",
+            "entrypoint": "entrypoint",
             **PROMPT_CONTEXT_SUBMISSION_FIELDS,
             # Note: Subscriber data now passed as subscriber object, not separate fields
             # Model and provider details
@@ -1575,7 +1576,8 @@ class MeteringFieldValidationManagement(ToolBase):
     async def _handle_validate_test_data(
         self, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Validate test data using existing validator."""
+        """Validate test data with the refusals and checks the live submit applies."""
+        self.transaction_manager.reject_what_submit_refuses(arguments)
         validation_result = await self.validator.validate_transaction(arguments)
         return self.format_success_response(
             "Data validation completed", {"validation": validation_result}

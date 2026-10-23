@@ -29,6 +29,7 @@ from ..common.sample_coverage import platform_total
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.ucm_config import log_ucm_status, should_suppress_ucm_warnings
+from ..common.team_reference import with_team_reference_as_team_id
 from ..common.update_configs import UpdateConfigFactory
 from ..config_store import get_config_value
 from ..introspection.metadata import (
@@ -75,8 +76,8 @@ def _with_auto_generated_source_fields(source_data: Dict[str, Any]) -> Dict[str,
     """Return a copy of `source_data` with only the fields the caller left empty filled in.
 
     BACK-4662: every field the caller gave (tags, externalId, externalUsagePlanId, ...)
-    is kept. teamId and ownerId are dropped so SourceManager.create_source fills them
-    from the server's configuration. The caller's dict is never mutated.
+    is kept, teamId and ownerId among them (BACK-4852, BACK-4740); an empty one is
+    filled by SourceManager.create_source. The caller's dict is never mutated.
     """
     merged: Dict[str, Any] = {
         "version": "1.0.0",
@@ -100,13 +101,23 @@ def _with_auto_generated_source_fields(source_data: Dict[str, Any]) -> Dict[str,
         template = _AUTO_SOURCE_DESCRIPTIONS.get(source_type, "Source for {name}")
         merged["description"] = template.format(name=merged.get("name"))
 
-    merged.pop("teamId", None)
-    merged.pop("ownerId", None)
     return merged
 
 
 # Source fields left out of the create log line: they can carry secrets.
-_UNLOGGED_SOURCE_FIELDS = frozenset({"configuration", "authentication", "connection_string", "url"})
+_UNLOGGED_SOURCE_FIELDS = frozenset(
+    {"configuration", "authentication", "connection_string", "url", "resource"}
+)
+
+# The platform's source record has no url and no configuration: it stores the
+# source's URI as `resource` and drops `configuration` (live on dev, 2026-10-20).
+_SOURCE_URL_FIELD = "resource"
+_CONFIGURATION_ONLY_SOURCE_FIELDS = ("authentication", "connection_string")
+# Ownership is left out of the unstored-fields check: the tool fills or folds
+# these itself (configured owner, `team` to `teamId`) and the stored record
+# returns them as `owner` and `team` objects, never as the sent ids, so a
+# comparison against the record would always report them as dropped.
+_SOURCE_OWNERSHIP_FIELDS = frozenset({"teamId", "ownerId", "team", "owner"})
 
 # Source fields the registered manage_sources tool also accepts at the top level.
 _TOP_LEVEL_SOURCE_FIELDS = ("name", "type", "url", "description", "version", "connection_string")
@@ -142,6 +153,135 @@ def _merge_top_level_source_fields(arguments: Dict[str, Any]) -> None:
             merged["url"] = model_endpoint
 
     arguments["source_data"] = merged
+
+
+_UNKNOWN_SOURCE_OWNER_MESSAGE = (
+    "No owner is known for this source, and the platform refuses a source "
+    "without ownerId, so nothing was created. The owner is the signed-in "
+    "caller on the hosted server and REVENIUM_OWNER_ID on a local server; "
+    "neither named a user for this request."
+)
+
+
+def _required_source_owner() -> str:
+    owner_id = get_config_value("REVENIUM_OWNER_ID")
+    if not owner_id:
+        raise ToolError(
+            message=_UNKNOWN_SOURCE_OWNER_MESSAGE,
+            error_code=ErrorCodes.MISSING_PARAMETER,
+            field="ownerId",
+            suggestions=[
+                "Pass ownerId in source_data",
+                "On a local server, set REVENIUM_OWNER_ID to your platform user id",
+                "On the hosted server, sign in again so your user can be found",
+            ],
+        )
+    return owner_id
+
+
+def _refuse_url_naming_another_resource(source_data: Dict[str, Any], outcome: str) -> None:
+    url = source_data.get("url")
+    resource = source_data.get(_SOURCE_URL_FIELD)
+    if _is_empty_source_value("url", url) or _is_empty_source_value("url", resource):
+        return
+    if url != resource:
+        raise create_structured_validation_error(
+            message=(
+                "source_data.url and source_data.resource name different URIs, "
+                f"so nothing was {outcome}"
+            ),
+            field="source_data.url",
+            value=url,
+            suggestions=["Send one URI, as source_data.url or source_data.resource"],
+        )
+
+
+def _checked_source_create_data(source_data: Any) -> Any:
+    """Return a create's source_data with teamId and ownerId set, refusing what the create refuses.
+
+    The preview and the live create both run it, so a preview never approves a body
+    the create refuses.
+    """
+    if not isinstance(source_data, dict):
+        return source_data
+    checked = with_team_reference_as_team_id(source_data, "source_data")
+    _refuse_url_naming_another_resource(checked, outcome="created")
+    if _is_empty_source_value("ownerId", checked.get("ownerId")):
+        checked["ownerId"] = _required_source_owner()
+    return checked
+
+
+def _with_url_as_resource(source_data: Dict[str, Any], outcome: str) -> Dict[str, Any]:
+    """Return a copy of source_data whose url is sent as resource.
+
+    Refuses a url and a resource that name different URIs.
+    """
+    if "url" not in source_data:
+        return dict(source_data)
+    _refuse_url_naming_another_resource(source_data, outcome)
+    folded = {key: value for key, value in source_data.items() if key != "url"}
+    if _is_empty_source_value("url", folded.get(_SOURCE_URL_FIELD)):
+        folded[_SOURCE_URL_FIELD] = source_data["url"]
+    return folded
+
+
+def _caller_source_fields(source_data: Any) -> List[str]:
+    return list(source_data) if isinstance(source_data, dict) else []
+
+
+def _stored_reference_ids(id_list_field: str, stored: Dict[str, Any]) -> Optional[set]:
+    """The ids of the records a write-only `xIds` field links, read from the stored `xs` list."""
+    if not id_list_field.endswith("Ids"):
+        return None
+    references = stored.get(f"{id_list_field[:-3]}s")
+    if not isinstance(references, list):
+        return None
+    return {ref.get("id") if isinstance(ref, dict) else ref for ref in references}
+
+
+def _unlinked_reference_note(
+    field: str, sent_ids: Any, stored_ids: set
+) -> Optional[str]:
+    unlinked = [ref for ref in sent_ids if ref not in stored_ids] if isinstance(sent_ids, list) else []
+    return f"{field} (not linked: {', '.join(map(str, unlinked))})" if unlinked else None
+
+
+def _holds_every_item(stored_value: Any, sent_items: List[Any]) -> bool:
+    return isinstance(stored_value, list) and all(item in stored_value for item in sent_items)
+
+
+def _sources_unstored_field(field: str, sent: Dict[str, Any], stored: Dict[str, Any]) -> Optional[str]:
+    if field in _CONFIGURATION_ONLY_SOURCE_FIELDS:
+        return field
+    body_field = _SOURCE_URL_FIELD if field == "url" else field
+    if body_field not in sent:
+        return None
+    stored_ids = _stored_reference_ids(body_field, stored)
+    if stored_ids is not None:
+        return _unlinked_reference_note(field, sent[body_field], stored_ids)
+    if body_field not in stored:
+        return field
+    sent_value, stored_value = sent[body_field], stored[body_field]
+    scalar_changed = isinstance(sent_value, (str, int, float, bool)) and sent_value != stored_value
+    items_dropped = isinstance(sent_value, list) and not _holds_every_item(stored_value, sent_value)
+    emptied = stored_value in (None, "") and sent_value not in (None, "")
+    if scalar_changed or items_dropped or emptied:
+        return f"{field} (stored as {stored_value!r})"
+    return None
+
+
+def _unstored_source_fields_note(
+    caller_fields: List[str], sent: Dict[str, Any], stored: Any
+) -> str:
+    """Name each field the caller sent that the created source does not hold, or ""."""
+    if not isinstance(stored, dict):
+        return ""
+    unstored = [
+        note
+        for field in sorted(set(caller_fields) - _SOURCE_OWNERSHIP_FIELDS)
+        if (note := _sources_unstored_field(field, sent, stored))
+    ]
+    return f"Not stored by the platform: {', '.join(unstored)}." if unstored else ""
 
 
 class SourceManager:
@@ -217,6 +357,13 @@ class SourceManager:
 
     async def create_source(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Create new source."""
+        stored, _ = await self.create_source_noting_unstored(arguments, caller_fields=[])
+        return stored
+
+    async def create_source_noting_unstored(
+        self, arguments: Dict[str, Any], caller_fields: List[str]
+    ) -> Tuple[Dict[str, Any], str]:
+        """Create the source; return it with a note naming caller fields it does not hold."""
         source_data = arguments.get("source_data")
         if not source_data:
             raise create_structured_missing_parameter_error(
@@ -234,18 +381,13 @@ class SourceManager:
                 },
             )
 
+        source_data = _with_url_as_resource(
+            _checked_source_create_data(source_data), outcome="created"
+        )
+
         # Add required fields from client environment
         if "teamId" not in source_data:
             source_data["teamId"] = self.client.team_id
-        if "ownerId" not in source_data:
-            owner_id = get_config_value("REVENIUM_OWNER_ID")
-            if owner_id:
-                source_data["ownerId"] = owner_id
-            else:
-                # Skip ownerId if not available - let API handle default
-                logger.warning(
-                    "REVENIUM_OWNER_ID not available from configuration store, API will use default owner"
-                )
 
         # Add required API fields that were missing
         if "version" not in source_data:
@@ -258,12 +400,9 @@ class SourceManager:
             source_data["type"] = "API"  # Default type
         self._normalize_source_type(source_data)
 
-        # Handle URL and authentication parameters - move to configuration
+        # authentication and connection_string go to configuration, which the
+        # platform drops; the create answer names them as not stored.
         configuration = source_data.get("configuration", {})
-
-        # Move URL to configuration if provided as top-level field
-        if "url" in source_data and "url" not in configuration:
-            configuration["url"] = source_data.pop("url")
 
         # Move authentication to configuration if provided as top-level field
         if "authentication" in source_data and "authentication" not in configuration:
@@ -286,12 +425,16 @@ class SourceManager:
         logger.info(f"SOURCE DEBUG: Creating source with data: {json.dumps(logged_data, indent=2)}")
 
         result = await self.client.create_source(source_data)
-        return result
+        return result, _unstored_source_fields_note(caller_fields, source_data, result)
 
     def _require_update_arguments(
         self, arguments: Dict[str, Any]
     ) -> Tuple[str, Dict[str, Any]]:
-        """The source id and the changes an update needs, or a refusal naming the missing one."""
+        """The source id and the changes an update sends, or a refusal naming the missing one.
+
+        The changes are a copy of source_data with the type upper-cased and a url
+        sent as resource; the caller's arguments are left as they were.
+        """
         source_id = arguments.get("source_id")
         source_data = arguments.get("source_data")
 
@@ -320,11 +463,14 @@ class SourceManager:
                 },
             )
 
+        if not isinstance(source_data, dict):
+            return source_id, source_data
+        changes = _with_url_as_resource(source_data, outcome="changed")
         # Normalize enum casing client-side so update accepts the same
         # lowercase input that create silently accepts (the backend rejects
         # lowercase on update with a 400; create masks it via .upper()).
-        self._normalize_source_type(source_data)
-        return source_id, source_data
+        self._normalize_source_type(changes)
+        return source_id, changes
 
     async def preview_update(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Read the source and return the body update_source would send, sending nothing."""
@@ -907,7 +1053,9 @@ class SourceManagement(ToolBase):
             elif action == "create":
                 # Enhanced unified create action with auto-generation support
                 _merge_top_level_source_fields(arguments)
-                source_data = arguments.get("source_data", {})
+                source_data = _checked_source_create_data(arguments.get("source_data", {}))
+                arguments["source_data"] = source_data
+                caller_fields = _caller_source_fields(source_data)
                 auto_generate = arguments.get(
                     "auto_generate", True
                 )  # Default to Context7 simple mode
@@ -992,14 +1140,18 @@ class SourceManagement(ToolBase):
                         )
                     ]
 
-                result = await source_manager.create_source(arguments)
+                result, unstored_note = await source_manager.create_source_noting_unstored(
+                    arguments, caller_fields
+                )
                 mode_text = (
                     "with auto-generation" if auto_generate else "with explicit configuration"
                 )
+                unstored_text = f"{unstored_note}\n\n" if unstored_note else ""
                 return [
                     TextContent(
                         type="text",
                         text=f"Source created successfully {mode_text}:\n\n"
+                        + unstored_text
                         + json.dumps(result, indent=2),
                     )
                 ]

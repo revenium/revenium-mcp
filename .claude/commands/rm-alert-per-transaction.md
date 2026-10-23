@@ -12,7 +12,7 @@ Call the manage_alerts tool with exactly these arguments, replacing 5 in both `n
 {"action": "create_threshold_alert", "name": "Transaction Cost Alert - $5", "threshold": 5, "metricType": "COST_PER_TRANSACTION", "period_minutes": 15}
 ```
 
-The alert fires when cost per transaction is greater than the threshold; `create_threshold_alert` always uses the GREATER_THAN operator, and notifies the default email (your own on the hosted server, REVENIUM_DEFAULT_EMAIL locally) unless you add `"email"`.
+The alert fires when cost per transaction is greater than the threshold; `create_threshold_alert` always uses the GREATER_THAN operator, and notifies the default email (your own on the hosted server; locally, the address saved with `system_setup` `update_email`, then REVENIUM_DEFAULT_EMAIL) unless you add `"email"`.
 
 ## Use Case
 Alert when cost per transaction exceeds the threshold amount, checked every 15 minutes. Early warning for unexpectedly expensive transactions.

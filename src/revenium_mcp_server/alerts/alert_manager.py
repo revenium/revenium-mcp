@@ -4,7 +4,6 @@ This module provides management functionality for triggered alerts
 in the Revenium platform.
 """
 
-import math
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -21,6 +20,7 @@ from ..alert_operators import OPERATOR_LABELS, threshold_is_percentage
 from ..analytics_window import CalendarRangeError, utc_instant_bounds
 from ..client import ReveniumAPIError, ReveniumClient
 from ..common.error_handling import ErrorCodes, ToolError
+from ..common.money import render_rounded_amount, render_rounded_dollars
 from ..date_parser import DEFAULT_WINDOW_DAYS, DateRangeParser
 from ..exceptions import AlertNotFoundError, ValidationError
 from ..log_context import sanitize_error_message
@@ -118,41 +118,19 @@ except ImportError:
 
 
 
-_DECIMALS_SHOWN = 6
-_SMALLEST_VALUE_AT_SIX_DECIMALS = 1e-6
-_SIGNIFICANT_DIGITS_BELOW_A_MILLIONTH = 2
-
-
-def _decimals_for(value: float) -> int:
-    """Six, or enough to show the first two significant digits of a smaller value."""
-    magnitude = abs(value)
-    if magnitude == 0 or magnitude >= _SMALLEST_VALUE_AT_SIX_DECIMALS:
-        return _DECIMALS_SHOWN
-    return _SIGNIFICANT_DIGITS_BELOW_A_MILLIONTH - 1 - math.floor(math.log10(magnitude))
-
-
-def _trimmed_decimals(value: float, minimum: int = 0) -> str:
-    """The value's decimals with trailing zeros trimmed, keeping at least ``minimum``."""
-    whole, _, fraction = f"{value:,.{_decimals_for(value)}f}".partition(".")
-    fraction = fraction.rstrip("0").ljust(minimum, "0")
-    return f"{whole}.{fraction}" if fraction else whole
-
-
 def format_alert_value(value: float, metric_type: str, is_percentage: bool = False) -> str:
-    """One alert value in full: a cost metric in dollars, anything else with every digit.
+    """One alert value: a cost metric through render_rounded_dollars (cents from a dollar up,
+    six decimals below); anything else through render_rounded_amount (six decimals, or two
+    significant digits when smaller) with thousands separators.
 
     No K or M shortening: a $1,023.49 overshoot of a $1,000 limit must not
     read 1.0K beside "> 1.0K".
     """
     if "COST" in metric_type and not is_percentage:
-        sign = "-" if value < 0 else ""
-        magnitude = abs(value)
-        if magnitude >= 1:
-            return f"{sign}${magnitude:,.2f}"
-        return f"{sign}${_trimmed_decimals(magnitude, minimum=2)}"
+        return render_rounded_dollars(value)
     if float(value).is_integer():
         return f"{int(value):,}"
-    return _trimmed_decimals(value)
+    return render_rounded_amount(value, min_decimals=0, grouped=True)
 
 
 def _window_line(start: Optional[str], end: Optional[str], note: str = "") -> str:

@@ -6,6 +6,7 @@ This module provides shared validation functions used across the MCP server.
 from typing import Any, Collection, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from ..validators import InputValidator
 from ..exceptions import ValidationError
+from .platform_paging import PLATFORM_MAX_PAGE_SIZE
 
 _SAFE_INT_MAX = 2**53
 # Public alias so per-tool validators share the same ceiling.
@@ -181,7 +182,7 @@ def validate_pagination_params(arguments: Dict[str, Any], action: str) -> Dict[s
     from .error_handling import ToolError, ErrorCodes
 
     out = arguments.copy()
-    bounds = {"page": (0, 10_000), "size": (1, 100)}
+    bounds = {"page": (0, 10_000), "size": (1, PLATFORM_MAX_PAGE_SIZE)}
 
     for name, (min_value, max_value) in bounds.items():
         if name not in out or out[name] is None:

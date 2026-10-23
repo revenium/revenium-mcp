@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
 from src.revenium_mcp_server.tools_decomposed.slack_setup_assistant import SlackSetupAssistant
+from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ToolError, ErrorCodes
 
 
@@ -43,9 +44,14 @@ def _make_client(configs, total=None):
     client.get_slack_configurations = AsyncMock(
         return_value={"content": configs, "totalElements": total}
     )
-    client.get_slack_configuration_by_id = AsyncMock(
-        return_value=configs[0] if configs else {}
-    )
+    by_id = {c["id"]: c for c in configs}
+
+    async def get_by_id(config_id):
+        if config_id not in by_id:
+            raise ReveniumAPIError("HTTP 403: Access Denied", status_code=403)
+        return by_id[config_id]
+
+    client.get_slack_configuration_by_id = AsyncMock(side_effect=get_by_id)
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=None)
     return client
@@ -133,6 +139,51 @@ class TestGuidedSetupDefaultNotFound:
         assert "Available Configurations" in text
 
 
+    @pytest.mark.asyncio
+    async def test_unreadable_default_is_read_once_and_reported_unreadable(self, tool):
+        configs = [{"id": "c1", "name": "Config A", "teamName": "WS-A", "channelName": "gen"}]
+        client = _make_client(configs, total=1)
+        client.get_slack_configuration_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("HTTP 503: Service Unavailable", status_code=503)
+        )
+        with (
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
+            patch(_PATCH_CFG, return_value="c-elsewhere"),
+        ):
+            result = await tool.handle_action("guided_setup", {})
+        text = result[0].text
+        assert client.get_slack_configurations.await_count == 1
+        assert client.get_slack_configuration_by_id.await_count == 1
+        assert "Default Configuration Could Not Be Read" in text
+        assert "Available Configurations" in text
+
+    @pytest.mark.asyncio
+    async def test_missing_default_is_read_once_and_reported_missing(self, tool):
+        configs = [{"id": "c1", "name": "Config A", "teamName": "WS-A", "channelName": "gen"}]
+        client = _make_client(configs, total=1)
+        with (
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
+            patch(_PATCH_CFG, return_value="c-missing"),
+        ):
+            result = await tool.handle_action("guided_setup", {})
+        text = result[0].text
+        assert client.get_slack_configurations.await_count == 1
+        assert client.get_slack_configuration_by_id.await_count == 1
+        assert "Default Configuration Issue" in text
+
+    @pytest.mark.asyncio
+    async def test_no_default_lists_options_from_the_one_page_read(self, tool):
+        configs = [{"id": "c1", "name": "Config A", "teamName": "WS-A", "channelName": "gen"}]
+        client = _make_client(configs, total=1)
+        with (
+            patch.object(tool, "get_client", AsyncMock(return_value=client)),
+            patch(_PATCH_CFG, return_value=None),
+        ):
+            result = await tool.handle_action("guided_setup", {})
+        assert client.get_slack_configurations.await_count == 1
+        assert "select_default_configuration', config_id='c1'" in result[0].text
+
+
 # ---------------------------------------------------------------------------
 # detect_and_recommend: various paths
 # ---------------------------------------------------------------------------
@@ -210,8 +261,8 @@ class TestDetectAndRecommend:
 
 class TestSetupStatusDefaultConfigFetchFailure:
     @pytest.mark.asyncio
-    async def test_default_config_fetch_failure_shows_id_not_found(self, tool):
-        """When get_slack_configuration_by_id raises, setup_status shows ID + 'not found'."""
+    async def test_default_config_fetch_failure_shows_id_as_unreadable(self, tool):
+        """A failed read of the default is reported as unreadable, never as not found."""
         config_fetcher = AsyncMock()
         config_fetcher.get_slack_configurations = AsyncMock(
             return_value={"content": [], "totalElements": 1}
@@ -232,7 +283,10 @@ class TestSetupStatusDefaultConfigFetchFailure:
             result = await tool.handle_action("setup_status", {})
         text = result[0].text
         assert "cfg-broken" in text
-        assert "not found" in text.lower() or "Configuration not found" in text
+        assert "could not be read right now (network error)" in text
+        assert "Configuration not found" not in text
+        assert "**UNKNOWN**" in text
+        assert "COMPLETE" not in text
 
 
 # ---------------------------------------------------------------------------

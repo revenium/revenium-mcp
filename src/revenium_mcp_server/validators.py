@@ -8,7 +8,9 @@ import html
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, NoReturn, Optional, Union
+from functools import lru_cache
+from types import MappingProxyType
+from typing import Any, Dict, List, Mapping, NoReturn, Optional, Union
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -18,6 +20,16 @@ from .exceptions import InvalidInputError, ValidationError
 
 TIME_WINDOW_FORMAT = re.compile(r"^\d+[smhd]$")
 SUB_FIFTEEN_MINUTE_PERIODS = ("ONE_MINUTE", "FIVE_MINUTES", "TEN_MINUTES")
+
+
+@lru_cache(maxsize=1)
+def detection_rule_metrics() -> Mapping[str, str]:
+    """The snake_case name a detection rule uses for each metric the platform has."""
+    # Imported here: the alerts package imports this module while it loads.
+    from .alerts.update_fidelity import platform_metric_types
+
+    return MappingProxyType({metric.lower(): metric for metric in platform_metric_types()})
+
 
 PER_SECOND_METRIC_REPLACEMENTS = {
     "tokens_per_second": "tokens_per_minute",
@@ -69,7 +81,8 @@ def _refuse_per_second_metric(metric: str) -> NoReturn:
     raise create_structured_validation_error(
         message=(
             f"metric '{metric}' is not one the platform measures; it measures "
-            f"throughput per minute, so use '{per_minute}' with a per-minute threshold"
+            f"throughput per minute, so use '{per_minute}' with a per-minute threshold. "
+            f"Valid metrics: {', '.join(detection_rule_metrics())}"
         ),
         field="metric",
         value=metric,
@@ -820,19 +833,7 @@ class InputValidator:
             **{op: op for op in CHANGE_OPERATORS},
         }
 
-        metric_mapping = {
-            # Complete list of valid metrics from MetricType enum
-            "total_cost": "TOTAL_COST",
-            "cost_per_transaction": "COST_PER_TRANSACTION",
-            "tokens_per_minute": "TOKENS_PER_MINUTE",
-            "requests_per_minute": "REQUESTS_PER_MINUTE",
-            "token_count": "TOKEN_COUNT",
-            "input_token_count": "INPUT_TOKEN_COUNT",
-            "output_token_count": "OUTPUT_TOKEN_COUNT",
-            "cached_token_count": "CACHED_TOKEN_COUNT",
-            "error_rate": "ERROR_RATE",
-            "error_count": "ERROR_COUNT",
-        }
+        metric_mapping = detection_rule_metrics()
 
         period_mapping = {
             # Time-based periods (for THRESHOLD alerts). The sub-15-minute
@@ -901,6 +902,8 @@ class InputValidator:
             api_data["groupBy"] = user_data["group_by"]
         if "dataSource" in user_data:
             api_data["dataSource"] = user_data["dataSource"]
+        if "min_sample_count" in user_data:
+            api_data["minSampleCount"] = user_data["min_sample_count"]
 
         # Convert operator - API expects "operatorType" field, not "operator"
         operator = rule.get("operator", ">")

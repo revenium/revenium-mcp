@@ -7,9 +7,11 @@ wants. Every site used to derive those groups by substring — ``"RATE" in metri
 performance, ``"ERROR" in metric`` meant quality — which put ``ERROR_RATE`` in two
 buckets at once and would file ``QUALITY_RATE`` under performance, next to
 ``REQUESTS_PER_MINUTE``, purely because its name ends in ``RATE``. :data:`METRIC_BUCKETS`
-is the explicit mapping that decides instead; :func:`bucket_metrics` falls back to the
-old substring heuristic only for a metric name this build has never heard of, so a
-metric the platform adds tomorrow still appears somewhere rather than vanishing.
+is the explicit mapping that decides instead. :func:`bucket_metrics` falls back to the
+old substring heuristic for a name the mapping does not hold, and that catches only a
+name containing one of the :data:`_FALLBACK_SUBSTRINGS`. Any other new metric
+(``REQUEST_COUNT`` would be one, without its entry below) is dropped from the capability
+output until it gets an explicit entry here.
 
 **Prerequisites.** ``QUALITY_RATE`` is not a metric an agent can enable the way it
 enables a cost alert. The platform evaluates it from job outcome facts, not from AI
@@ -41,9 +43,11 @@ One rule here is not about a metric at all: ``groupBy`` is forwarded to the plat
 verbatim, and the platform's ``GroupBy`` enum has no empty member, so a present-but-blank
 ``groupBy`` is refused on any metric rather than treated as an omission.
 
-No client-side metric enum lives here. The buckets name the metrics this build knows
-about; a metric outside them still reaches the platform, which is the authority on what
-it accepts.
+No metric gate lives here. The one that refuses a metric name on create and update is
+``platform_metric_types`` in ``alerts/update_fidelity.py``, derived from the generated
+``MetricType``. ``TestAlertMetricEnums`` in ``tests/unit/test_openapi_contract.py`` keeps
+that enum equal to the committed snapshot, every bucketed metric one the platform has, and
+every metric ``models.MetricType`` advertises in an explicit bucket here.
 """
 
 from dataclasses import dataclass
@@ -82,6 +86,7 @@ METRIC_BUCKETS: Dict[str, Tuple[str, ...]] = {
     "performance_metrics": (
         "TOKENS_PER_MINUTE",
         "REQUESTS_PER_MINUTE",
+        "REQUEST_COUNT",
     ),
     "quality_metrics": (
         "ERROR_RATE",

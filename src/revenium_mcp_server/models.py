@@ -660,10 +660,12 @@ class AlertType(str, Enum):
 
 
 class MetricType(str, Enum):
-    """Metric type enumeration for Revenium API - User validated metrics only.
+    """The alert metrics the MCP advertises: a curated subset of the platform's metrics.
 
-    These metrics have been validated by users and confirmed to work with the Revenium API.
-    This enum serves as the single source of truth for supported alert metrics.
+    It is not the gate. Create and update accept any name in ``platform_metric_types``
+    (``alerts/update_fidelity.py``), derived from the generated AIAlertMetricType.
+    ``TestAlertMetricEnums`` in ``tests/unit/test_openapi_contract.py`` requires every
+    member here to be a platform metric with an explicit ``METRIC_BUCKETS`` entry.
     """
 
     TOTAL_COST = "TOTAL_COST"
@@ -673,6 +675,7 @@ class MetricType(str, Enum):
     OUTPUT_TOKEN_COUNT = "OUTPUT_TOKEN_COUNT"
     TOKENS_PER_MINUTE = "TOKENS_PER_MINUTE"
     REQUESTS_PER_MINUTE = "REQUESTS_PER_MINUTE"
+    REQUEST_COUNT = "REQUEST_COUNT"
     ERROR_RATE = "ERROR_RATE"
     ERROR_COUNT = "ERROR_COUNT"
     # Evaluated from job outcome facts rather than AI transactions, and only usable

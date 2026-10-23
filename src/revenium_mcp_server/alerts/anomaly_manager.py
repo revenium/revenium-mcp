@@ -12,6 +12,7 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..client import ReveniumAPIError, ReveniumClient
+from ..common.slack_configuration_lookup import slack_configuration_absent
 from ..common.error_handling import (
     ToolError,
     ErrorCodes,
@@ -38,7 +39,11 @@ from ..alert_operators import (
 from .alert_manager import format_alert_value
 from ..validators import InputValidator
 from .anomaly_inventory import read_every_anomaly
-from .notification_recipients import RECIPIENT_FIELDS, update_recipients
+from .notification_recipients import (
+    RECIPIENT_FIELDS,
+    refuse_an_update_that_notifies_nobody,
+    update_recipients,
+)
 from .update_fidelity import (
     ordered_periods_for,
     refuse_platform_rule_breach,
@@ -62,10 +67,10 @@ _REQUIRED_UPDATE_FIELDS = frozenset(
 
 # A null here means no change. AIAnomalyService.update keeps the stored dataSource,
 # isPercentage and minSampleCount when sent null (dev check, 2026-10-18).
-_NO_CHANGE_WHEN_NULL = frozenset(
-    {"dataSource", "isPercentage", "minSampleCount", "is_percentage", "webhook_configurations"}
+_NO_CHANGE_WHEN_BLANK = frozenset(
+    {"isPercentage", "is_percentage", "webhookConfigurations", "webhook_configurations"}
 )
-_NO_CHANGE_WHEN_BLANK = frozenset({"is_percentage", "webhook_configurations"})
+_NO_CHANGE_WHEN_NULL = _NO_CHANGE_WHEN_BLANK | {"dataSource", "minSampleCount"}
 
 
 def _changes_nothing(key: str, value: Any) -> bool:
@@ -73,6 +78,13 @@ def _changes_nothing(key: str, value: Any) -> bool:
     if key in _NO_CHANGE_WHEN_BLANK and isinstance(value, str):
         return not value.strip()
     return value is None and key in _NO_CHANGE_WHEN_NULL
+
+
+_DETECTION_RULE_FLAG_SPELLINGS = (
+    ("is_percentage", "isPercentage"),
+    ("trigger_after_persists_duration", "triggerAfterPersistsDuration"),
+    ("min_sample_count", "minSampleCount"),
+)
 
 
 @dataclass(frozen=True)
@@ -180,20 +192,12 @@ def _is_client_error(error: Exception) -> bool:
     return isinstance(error, ReveniumAPIError) and 400 <= (error.status_code or 0) < 500
 
 
-def _names_a_missing_id(error: ReveniumAPIError) -> bool:
-    if error.status_code == 404:
-        return True
-    return error.status_code == 400 and "failed to decode hashed id" in str(error.response_data).lower()
-
-
 async def _slack_configuration_found(client: ReveniumClient, config_id: str) -> Optional[bool]:
     """True or False when the lookup settles it, None when it fails for another reason."""
     try:
         await client.get_slack_configuration_by_id(config_id)
-    except ReveniumAPIError as lookup_error:
-        return False if _names_a_missing_id(lookup_error) else None
-    except Exception:
-        return None
+    except Exception as lookup_error:
+        return False if slack_configuration_absent(lookup_error) else None
     return True
 
 
@@ -227,6 +231,25 @@ async def _refuse_unknown_slack_configuration(
             "organization's Slack configurations, then retry with one of those ids"
         ),
     )
+
+
+async def put_anomaly(
+    client: ReveniumClient,
+    anomaly_id: str,
+    body: Dict[str, Any],
+    verb: str,
+    blamable: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """PUT an alert body; a refusal over a Slack configuration this organization lacks names it.
+
+    Only the Slack ids in ``blamable`` (the whole body by default) are looked up.
+    """
+    try:
+        updated: Dict[str, Any] = await client.update_anomaly(anomaly_id, body)
+    except Exception as e:
+        await _refuse_unknown_slack_configuration(client, body if blamable is None else blamable, e, verb)
+        raise
+    return updated
 
 
 class AnomalyManager:
@@ -605,8 +628,7 @@ class AnomalyManager:
                 InputValidator.validate_detection_rule(rule)
                 for rule in anomaly_data["detection_rules"]
             ]
-            if "is_percentage" in anomaly_data:
-                validated_data["is_percentage"] = self._percentage_flag(anomaly_data["is_percentage"])
+            validated_data.update(self._detection_rules_flags(anomaly_data))
             validated_data.update(self._detection_rules_notification_targets(anomaly_data))
         elif self._has_direct_api_format(anomaly_data):
             # User provided direct API format - validate and use as-is
@@ -666,6 +688,18 @@ class AnomalyManager:
             targets["slackConfigurations"] = list(dict.fromkeys(slack_configurations))
         return targets
 
+    @classmethod
+    def _detection_rules_flags(cls, anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
+        """The percent flag and persist wait a detection_rules payload names, in either spelling."""
+        flags: Dict[str, Any] = {}
+        for snake, camel in _DETECTION_RULE_FLAG_SPELLINGS:
+            given = [anomaly_data[name] for name in (snake, camel) if anomaly_data.get(name) is not None]
+            if given:
+                flags[snake] = given[0]
+        if "is_percentage" in flags:
+            flags["is_percentage"] = cls._percentage_flag(flags["is_percentage"])
+        return flags
+
     @staticmethod
     def _percentage_flag(value: Any) -> bool:
         if isinstance(value, bool):
@@ -687,7 +721,9 @@ class AnomalyManager:
         """
         # Before the shape check, whose periodDuration list would otherwise answer
         # TEN_MINUTES with an unflagged "invalid value" instead of the period rule.
-        if isinstance(anomaly_data, dict):
+        # A detection_rules payload names its metric only after conversion, so the
+        # rules run on the converted body below instead.
+        if isinstance(anomaly_data, dict) and "detection_rules" not in anomaly_data:
             refuse_platform_rule_breach(anomaly_data)
         validated_data = self.validate_anomaly_payload(anomaly_data)
 
@@ -1028,6 +1064,7 @@ class AnomalyManager:
         merged_data.update(converted_updates)
 
         self._check_update_operator(converted_updates, merged_data)
+        refuse_an_update_that_notifies_nobody(converted_updates, merged_data)
 
         # The platform checks the whole merged alert on every update, stored values included.
         refuse_update_rule_breach(merged_data, current_anomaly, converted_updates)
@@ -1051,11 +1088,9 @@ class AnomalyManager:
         plan = await self.prepare_update(client, anomaly_id, update_data)
         anomaly_id = plan.anomaly_id
 
-        try:
-            updated_anomaly = await client.update_anomaly(anomaly_id, plan.body)
-        except Exception as e:
-            await _refuse_unknown_slack_configuration(client, plan.changes, e, "updated")
-            raise
+        updated_anomaly = await put_anomaly(
+            client, anomaly_id, plan.body, "updated", blamable=plan.changes
+        )
 
         await verify_update_applied(client, anomaly_id, plan.changes, updated_anomaly)
 

@@ -234,7 +234,7 @@ Use `get_examples()` for detailed usage examples and parameter guidance.
 {"action": "get_integration_logs"}
 ```
 
-### Get Recent Logs (Last 200 entries)
+### Get Recent Logs (Last 100 entries)
 ```json
 {"action": "get_recent_logs"}
 ```
@@ -420,17 +420,25 @@ All actions support the same parameters as their original tools for 100% compati
                 name="Log Analysis",
                 description="Internal system logs analysis and search capabilities",
                 parameters={
-                    "get_internal_logs": {"log_type": "str", "size": "int"},
-                    "get_integration_logs": {"size": "int"},
-                    "get_recent_logs": {"size": "int"},
-                    "search_logs": {"search_term": "str", "pages": "int"},
-                    "analyze_operations": {"operation_filter": "str", "status_filter": "str"},
+                    "get_internal_logs": {"page": "int", "size": "int"},
+                    "get_integration_logs": {"page": "int", "size": "int"},
+                    "get_recent_logs": {"log_type": "str", "pages": "int"},
+                    "search_logs": {
+                        "search_term": "str",
+                        "operation_filter": "str",
+                        "status_filter": "str",
+                        "log_type": "str",
+                        "page": "int",
+                        "size": "int",
+                        "search_all_pages": "bool",
+                    },
+                    "analyze_operations": {"log_type": "str", "pages": "int"},
                 },
                 examples=[
-                    "get_recent_logs(size=50)",
-                    "search_logs(search_term='error', pages=3)",
-                    "analyze_operations(status_filter='failed')",
-                    "get_internal_logs(log_type='ai_metering')",
+                    "get_recent_logs(pages=2)",
+                    "search_logs(search_term='error', search_all_pages=True)",
+                    "analyze_operations(log_type='internal', pages=3)",
+                    "get_internal_logs(page=0, size=50)",
                 ],
                 limitations=[
                     "Log retention depends on system configuration",

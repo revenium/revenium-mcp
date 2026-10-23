@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 
 from mcp.types import TextContent
 
+from ..agent_friendly.response_formatting import is_past_last_page, past_last_page_sentence
 from ..common.default_slack_configuration import HOSTED_DEFAULT_LIFETIME_NOTE
 
 
@@ -20,6 +21,15 @@ def format_configurations_list(
     configurations = response.get("content", [])
     total_elements = response.get("totalElements", 0)
     total_pages = response.get("totalPages", 0)
+
+    if not configurations and is_past_last_page(page, total_pages, total_elements):
+        return [
+            TextContent(
+                type="text",
+                text="# Slack Configurations: Page Past the End\n\n"
+                + past_last_page_sentence(page, size, total_pages, total_elements),
+            )
+        ]
 
     if not configurations:
         return [

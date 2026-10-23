@@ -363,7 +363,7 @@ class TestGenerateCostInsights:
         engine = _engine_no_ucm()
         trends = self.FakeCostTrends(total_cost=1234.56)
         insights = await engine._generate_cost_insights(trends, "SEVEN_DAYS")
-        assert any("$1234.56" in i for i in insights)
+        assert any("$1,234.56" in i for i in insights)
 
     @pytest.mark.asyncio
     async def test_zero_cost_no_total_insight(self):

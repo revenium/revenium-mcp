@@ -1712,11 +1712,12 @@ class TestCoverageRatio:
     }
 
     @pytest.mark.asyncio
-    async def test_withheld_aggregate_names_the_connected_row_that_billed_nothing(
+    async def test_reasonless_withheld_aggregate_offers_unbilled_rows_without_the_old_rule(
         self, analytics_tool
     ):
-        """FRONT-3514: VALID, HIGH, thousands billed and metered, yet n/a; the
-        platform withholds the aggregate while any compared row billed 0."""
+        """FRONT-3514 payload from a platform build that sends no reason: the
+        unbilled compared row is offered as a possible cause, BACK-4913 drops
+        the rule that a zero-billing provider withholds the aggregate."""
         text = await self._render(
             analytics_tool,
             self._withheld_report([self._ENTERPRISE_ROW, self._UNBILLED_ROW]),
@@ -1724,14 +1725,15 @@ class TestCoverageRatio:
         assert "- Coverage ratio: n/a\n" in text
         assert (
             "This n/a is NOT zero coverage — no ratio could be computed at all. "
-            "The aggregate ratio was not published." in text
+            "The aggregate ratio was not published. The platform did not say why." in text
         )
+        assert "billed something in it" not in text
+        assert "withhold the aggregate" not in text
         assert (
-            "only when every compared provider (billing credential connected and "
-            "overlapping the window) billed something in it" in text
+            "These compared providers (billing credential connected and overlapping "
+            "the window) billed nothing in it: OpenAI Platform." in text
         )
-        assert "billed nothing in it: OpenAI Platform. Those rows withhold" in text
-        assert "Claude Enterprise. Those rows" not in text
+        assert "Claude Enterprise." not in text.split("billed nothing in it:")[1].split("\n")[0]
         assert "for example, no provider billing" not in text
         assert (
             "- Diagnostic only, not the coverage ratio: metered 7312 divided by billed "
@@ -1746,7 +1748,8 @@ class TestCoverageRatio:
         payload.update(aggregateRatio=0.769, aggregateRatioAvailable=True)
         text = await self._render(analytics_tool, payload)
         assert "Coverage ratio: 76.9%" in text
-        assert "withhold" not in text
+        assert "did not say why" not in text
+        assert "reason" not in text
         assert "Diagnostic only" not in text
         assert "NOT zero coverage" not in text
 
@@ -1762,12 +1765,8 @@ class TestCoverageRatio:
             analytics_tool,
             self._withheld_report([self._ENTERPRISE_ROW, no_overlap, unconnected]),
         )
-        assert "OpenAI Platform. Those rows" not in text
-        assert "Gemini. Those rows" not in text
-        assert (
-            "The platform withheld the aggregate ratio for this window without saying why."
-            in text
-        )
+        assert "billed nothing in it" not in text
+        assert "The aggregate ratio was not published. The platform did not say why.\n" in text
         assert "metered 7300 divided by billed 9492" in text
 
     @pytest.mark.asyncio
@@ -1801,7 +1800,7 @@ class TestCoverageRatio:
             analytics_tool,
             self._withheld_report([], hiddenSpend=2192.0, meteredTotalInComparison=7300.0),
         )
-        assert "without saying why" in text
+        assert "The platform did not say why." in text
         assert (
             "metered 7300 divided by billed 9492 across hidden spend plus metered spend "
             "is 76.9%" in text
@@ -1812,8 +1811,70 @@ class TestCoverageRatio:
         self, analytics_tool
     ):
         text = await self._render(analytics_tool, self._withheld_report([]))
-        assert "without saying why" in text
+        assert "The platform did not say why." in text
         assert "Diagnostic only" not in text
+
+    @pytest.mark.asyncio
+    async def test_platform_reason_and_providers_replace_the_row_heuristic(
+        self, analytics_tool
+    ):
+        """BACK-4913: a payload that names the reason is explained by it."""
+        unbilled = {**self._UNBILLED_ROW, "metered": 5.0}
+        payload = self._withheld_report(
+            [unbilled],
+            aggregateRatioUnavailableReason="NON_POSITIVE_BILLING_TOTAL",
+            aggregateRatioUnavailableProviders=["OPENAI"],
+        )
+        text = await self._render(analytics_tool, payload)
+        assert (
+            "The aggregate ratio was not published. The platform's reason: "
+            "NON_POSITIVE_BILLING_TOTAL. The compared providers billed zero or less in "
+            "total in the window, so the ratio has no billed spend to divide by." in text
+        )
+        assert "- Providers the platform names for it: OPENAI" in text
+        assert "did not say why" not in text
+        assert "billed nothing in it" not in text
+        assert "Diagnostic only" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("state", "reason", "phrase"),
+        [
+            ("NO_INTEGRATION", "NO_BILLING_CREDENTIAL", "No eligible billing credential"),
+            ("VALID", "NO_COMPARABLE_PROVIDERS", "No provider with a billing credential"),
+            ("ZERO_SPEND_PERIOD", "ZERO_SPEND_PERIOD", "There was no spend in the period"),
+        ],
+    )
+    async def test_every_platform_reason_is_spelled_out_even_beside_a_state_note(
+        self, analytics_tool, state, reason, phrase
+    ):
+        payload = {
+            **self._withheld_report([]),
+            "state": state,
+            "aggregateRatioUnavailableReason": reason,
+        }
+        text = await self._render(analytics_tool, payload)
+        assert f"The platform's reason: {reason}. {phrase}" in text
+        assert "Providers the platform names" not in text
+        assert "The state above says why." not in text
+
+    @pytest.mark.asyncio
+    async def test_unknown_platform_reason_is_printed_verbatim(self, analytics_tool):
+        payload = self._withheld_report([], aggregateRatioUnavailableReason="NEW_REASON")
+        text = await self._render(analytics_tool, payload)
+        assert "The aggregate ratio was not published. The platform's reason: NEW_REASON.\n" in text
+
+    @pytest.mark.asyncio
+    async def test_tool_description_drops_the_zero_billing_rule(self, analytics_tool):
+        capabilities_text = (await analytics_tool.handle_action("get_capabilities", {}))[0].text
+        coverage = next(
+            c for c in await analytics_tool._get_tool_capabilities()
+            if "get_coverage_ratio" in c.parameters
+        )
+        metadata = " ".join([coverage.description, *coverage.limitations])
+        assert "billed something in it" not in capabilities_text + metadata
+        assert "the reason the platform gives" in capabilities_text
+        assert "aggregateRatioUnavailableReason" in metadata
 
     _OVER_METERED_ROW = {
         "provider": "ANTHROPIC", "label": "Claude Enterprise", "state": "active",

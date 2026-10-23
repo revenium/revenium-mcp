@@ -7,11 +7,15 @@ guiding users through the complete Slack integration process with smart detectio
 and recommendations.
 """
 
+import math
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
 
+from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
@@ -27,6 +31,7 @@ from ..common.error_handling import (
     create_structured_validation_error,
     format_structured_error,
 )
+from ..common.slack_configuration_lookup import slack_configuration_absent
 from ..endpoint_registry import _resolved_app_base_url
 
 # from ..error_handlers import format_structured_error  # Not available
@@ -38,6 +43,268 @@ from ..onboarding.detection_service import get_onboarding_state
 from ..onboarding.platform_read import read_platform_facts
 from .slack_configuration_management import get_slack_configuration_or_not_found
 from .unified_tool_base import ToolBase
+
+
+RECOMMENDATION_PAGE_SIZE = 20
+
+
+class DefaultState(Enum):
+    NONE_SAVED = "none saved"
+    FOUND = "found"
+    MISSING = "missing"
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class DefaultLookup:
+    """The saved default id, if any, and what reading it found."""
+
+    state: DefaultState
+    default_id: str = ""
+    config: Dict[str, Any] = field(default_factory=dict)
+    read_error: str = ""
+
+    @classmethod
+    def nothing_saved(cls) -> "DefaultLookup":
+        return cls(DefaultState.NONE_SAVED)
+
+    @classmethod
+    def found_as(cls, default_id: str, config: Dict[str, Any]) -> "DefaultLookup":
+        return cls(DefaultState.FOUND, default_id, config=config)
+
+    @classmethod
+    def missing_from_platform(cls, default_id: str) -> "DefaultLookup":
+        return cls(DefaultState.MISSING, default_id)
+
+    @classmethod
+    def unreadable_now(cls, default_id: str, read_error: str) -> "DefaultLookup":
+        return cls(DefaultState.UNREADABLE, default_id, read_error=read_error)
+
+    @property
+    def none_saved(self) -> bool:
+        return self.state is DefaultState.NONE_SAVED
+
+    @property
+    def found(self) -> bool:
+        return self.state is DefaultState.FOUND
+
+    @property
+    def missing(self) -> bool:
+        """A default is saved, but the platform holds no configuration under its id."""
+        return self.state is DefaultState.MISSING
+
+    @property
+    def unreadable(self) -> bool:
+        return self.state is DefaultState.UNREADABLE
+
+    @property
+    def needs_choice(self) -> bool:
+        """No usable default: none is saved, or the saved one is missing."""
+        return self.none_saved or self.missing
+
+
+async def find_default_configuration(
+    client: Any, configurations: List[Dict[str, Any]], default_id: Optional[str]
+) -> DefaultLookup:
+    """The saved default, from the page already read or else by its id.
+
+    The page holds only the first configurations, so a default further down
+    the list is read by id before it is called missing. A failed read is not
+    a missing configuration, so it is reported apart and never hides the list.
+    """
+    if not default_id:
+        return DefaultLookup.nothing_saved()
+    on_page = next((c for c in configurations if c.get("id") == default_id), None)
+    if on_page:
+        return DefaultLookup.found_as(default_id, on_page)
+    try:
+        config = await client.get_slack_configuration_by_id(default_id)
+    except Exception as e:
+        return failed_default_read(default_id, e)
+    return DefaultLookup.found_as(default_id, config)
+
+
+async def find_default_on_page(
+    client: Any, page: Dict[str, Any], default_id: Optional[str]
+) -> DefaultLookup:
+    """The saved default, looked up against a list page that was already read.
+
+    An organization with no configurations holds none under any id, so its
+    saved default is missing without another read.
+    """
+    if default_id and not page.get("totalElements", 0):
+        return DefaultLookup.missing_from_platform(default_id)
+    return await find_default_configuration(client, page.get("content", []), default_id)
+
+
+def failed_default_read(default_id: str, error: Exception) -> DefaultLookup:
+    """Missing when the answer says no readable configuration holds the id, else unreadable."""
+    if slack_configuration_absent(error):
+        return DefaultLookup.missing_from_platform(default_id)
+    logger.warning(f"Could not read the default Slack configuration {default_id}: {error}")
+    return DefaultLookup.unreadable_now(default_id, str(error) or type(error).__name__)
+
+
+def unreadable_default_sentence(default_id: str, read_error: str) -> str:
+    return (
+        f"The default Slack configuration `{default_id}` could not be read right now "
+        f"({read_error}). It may still work: retry "
+        "`slack_management(action='setup_status')` before choosing another default.\n\n"
+    )
+
+
+class SetupState(Enum):
+    NOT_READY = "NOT READY"
+    UNKNOWN = "UNKNOWN"
+    COMPLETE = "COMPLETE"
+    PARTIAL = "PARTIAL"
+    NOT_CONFIGURED = "NOT CONFIGURED"
+
+
+@dataclass(frozen=True)
+class SetupStatus:
+    state: SetupState
+    explanation: str
+
+
+@dataclass(frozen=True)
+class Recommendation:
+    lead: str
+    call: str
+
+
+SETUP_RECOMMENDATIONS = {
+    SetupState.NOT_READY: Recommendation(
+        "**Choose Another Default Configuration:**",
+        "slack_management(action='detect_and_recommend')",
+    ),
+    SetupState.UNKNOWN: Recommendation(
+        "**Retry the Status Check:**", "slack_management(action='setup_status')"
+    ),
+    SetupState.COMPLETE: Recommendation(
+        "**You're all set!** Try creating an alert:",
+        "manage_alerts(action='create_simple', threshold=100, email='you@company.com')",
+    ),
+    SetupState.PARTIAL: Recommendation(
+        "**Set Default Configuration:**", "slack_management(action='detect_and_recommend')"
+    ),
+    SetupState.NOT_CONFIGURED: Recommendation(
+        "**Get Started:**", "slack_management(action='quick_setup')"
+    ),
+}
+
+
+def classify_setup(total_elements: int, lookup: DefaultLookup) -> SetupStatus:
+    """The one setup state the header, details and recommendation all report."""
+    if total_elements == 0:
+        return SetupStatus(
+            SetupState.NOT_CONFIGURED, "No Slack configurations found. Setup required.\n\n"
+        )
+    if lookup.missing:
+        return SetupStatus(
+            SetupState.NOT_READY,
+            "The saved default Slack configuration was not found or is not in your "
+            "organization, so alerts cannot use it. Choose another default.\n\n",
+        )
+    if lookup.unreadable:
+        return SetupStatus(
+            SetupState.UNKNOWN, unreadable_default_sentence(lookup.default_id, lookup.read_error)
+        )
+    if lookup.found:
+        return SetupStatus(
+            SetupState.COMPLETE,
+            "Your Slack integration is fully configured and ready to use!\n\n",
+        )
+    return SetupStatus(
+        SetupState.PARTIAL, "You have Slack configurations but no default is set.\n\n"
+    )
+
+
+def partial_list_note(shown: int, total: int) -> str:
+    """Say a configuration list is cut short, and which pages hold the rest."""
+    if shown >= total:
+        return ""
+    last_page = math.ceil(total / RECOMMENDATION_PAGE_SIZE) - 1
+    through = "" if last_page == 1 else f" through `page={last_page}`"
+    return (
+        f"Showing {shown} of {total} configurations. See the rest with "
+        f"`slack_management(action='list_configurations', page=1, "
+        f"size={RECOMMENDATION_PAGE_SIZE})`{through}.\n\n"
+    )
+
+
+def recommendations_response(
+    response: Dict[str, Any], lookup: DefaultLookup
+) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+    """The detect-and-recommend answer, built from a list page and default lookup already read."""
+    current_default = lookup.default_id
+    configurations = response.get("content", [])
+    total_elements = response.get("totalElements", 0)
+
+    result_text = "# Slack Configuration Detection & Recommendations\n\n"
+    result_text += f"**Found {total_elements} Slack configuration(s)**\n\n"
+
+    if lookup.found:
+        default_config = lookup.config
+        name = default_config.get("name", "Unnamed Configuration")
+        workspace = default_config.get("teamName") or default_config.get("team", {}).get("label", "Unknown Workspace")
+        channel = default_config.get("channelName", "N/A")
+        result_text += "## Current Default Configuration\n"
+        result_text += f"**{name}**\n"
+        result_text += f"- Workspace: {workspace}\n"
+        result_text += f"- Channel: {channel}\n"
+        result_text += f"- ID: `{current_default}`\n\n"
+    elif lookup.unreadable:
+        result_text += "## Default Configuration Could Not Be Read\n"
+        result_text += unreadable_default_sentence(current_default, lookup.read_error)
+    elif lookup.missing:
+        result_text += "## Default Configuration Issue\n"
+        result_text += (
+            f"Default ID `{current_default}` was not found or is not in your organization.\n\n"
+        )
+
+    result_text += "## Available Configurations\n\n"
+    result_text += partial_list_note(len(configurations), total_elements)
+
+    for i, config in enumerate(configurations, 1):
+        config_id = config.get("id", "Unknown")
+        name = config.get("name", "Unnamed Configuration")
+        workspace = config.get("teamName") or config.get("team", {}).get("label", "Unknown Workspace")
+        channel = config.get("channelName", "N/A")
+        created_date = config.get("created", "Unknown")
+
+        is_default = config_id == current_default
+        status_prefix = "DEFAULT" if is_default else ""
+
+        result_text += f"### {i}. {name} {status_prefix}\n"
+        result_text += f"- **Workspace:** {workspace}\n"
+        result_text += f"- **Channel:** {channel}\n"
+        result_text += f"- **Created:** {created_date}\n"
+        result_text += f"- **ID:** `{config_id}`\n"
+        if is_default:
+            result_text += "- **Status:** Current Default\n"
+        result_text += "\n"
+
+    # Provide recommendations
+    result_text += "## Recommendations\n\n"
+
+    if lookup.needs_choice:
+        result_text += "**Set a Default Configuration**\n"
+        result_text += "Choose a configuration to use automatically for new alerts:\n"
+        for i, config in enumerate(configurations, 1):
+            config_id = config.get("id", "Unknown")
+            name = config.get("name", "Unnamed Configuration")
+            result_text += f"- Option {i}: `slack_management(action='select_default_configuration', config_id='{config_id}')` # {name}\n"
+        result_text += "\n"
+
+    result_text += "**Management Actions**\n"
+    result_text += "- View detailed configuration: `slack_management(action='get_configuration', config_id='CONFIG_ID')`\n"
+    result_text += (
+        "- Add new configuration: `slack_management(action='initiate_oauth')`\n"
+    )
+    result_text += "- Check setup status: `slack_management(action='setup_status')`\n"
+
+    return [TextContent(type="text", text=result_text)]
 
 
 class SlackSetupAssistant(ToolBase):
@@ -144,7 +411,9 @@ class SlackSetupAssistant(ToolBase):
         try:
             # Step 1: Detect existing configurations
             client = await self.get_client(ctx=ctx)
-            response = await client.get_slack_configurations(page=0, size=20)
+            response = await client.get_slack_configurations(
+                page=0, size=RECOMMENDATION_PAGE_SIZE
+            )
             configurations = response.get("content", [])
             total_elements = response.get("totalElements", 0)
 
@@ -154,31 +423,23 @@ class SlackSetupAssistant(ToolBase):
                 # Existing configurations found
                 result_text += f"## Found {total_elements} Existing Slack Configuration(s)\n\n"
 
-                # Check if default is already set
-                current_default = get_default_slack_config_id(ctx)
-
-                if current_default:
-                    # Find the default configuration details
-                    default_config = next(
-                        (c for c in configurations if c.get("id") == current_default), None
+                lookup = await find_default_configuration(
+                    client, configurations, get_default_slack_config_id(ctx)
+                )
+                if lookup.found:
+                    default_config = lookup.config
+                    name = default_config.get("name", "Unnamed Configuration")
+                    workspace = default_config.get("teamName") or default_config.get("team", {}).get("label", "Unknown Workspace")
+                    result_text += f"**Current Default:** {name} ({workspace})\n\n"
+                    result_text += (
+                        "Your Slack integration is already set up and ready to use!\n\n"
                     )
-                    if default_config:
-                        name = default_config.get("name", "Unnamed Configuration")
-                        workspace = default_config.get("teamName") or default_config.get("team", {}).get("label", "Unknown Workspace")
-                        result_text += f"**Current Default:** {name} ({workspace})\n\n"
-                        result_text += (
-                            "Your Slack integration is already set up and ready to use!\n\n"
-                        )
-                        result_text += "**What you can do:**\n"
-                        result_text += "- Create alerts with automatic Slack notifications\n"
-                        result_text += "- Change default: `slack_management(action='detect_and_recommend')`\n"
-                        result_text += "- View all configurations: `slack_management(action='list_configurations')`\n"
-                    else:
-                        result_text += "**Default configuration not found.** Let's fix this.\n\n"
-                        return await self._handle_detect_and_recommend(arguments, ctx=ctx)
+                    result_text += "**What you can do:**\n"
+                    result_text += "- Create alerts with automatic Slack notifications\n"
+                    result_text += "- Change default: `slack_management(action='detect_and_recommend')`\n"
+                    result_text += "- View all configurations: `slack_management(action='list_configurations')`\n"
                 else:
-                    result_text += "**No default configuration set.** Let's choose one:\n\n"
-                    return await self._handle_detect_and_recommend(arguments, ctx=ctx)
+                    return recommendations_response(response, lookup)
             else:
                 # No configurations found - guide through OAuth
                 result_text += "## No Slack Configurations Found\n\n"
@@ -222,80 +483,19 @@ class SlackSetupAssistant(ToolBase):
         """Detect existing configurations and provide recommendations."""
         try:
             client = await self.get_client(ctx=ctx)
-            response = await client.get_slack_configurations(page=0, size=20)
+            response = await client.get_slack_configurations(
+                page=0, size=RECOMMENDATION_PAGE_SIZE
+            )
             configurations = response.get("content", [])
             total_elements = response.get("totalElements", 0)
 
             if total_elements == 0:
                 return await self._handle_guided_setup(arguments, ctx=ctx)
 
-            current_default = get_default_slack_config_id(ctx)
-
-            result_text = "# Slack Configuration Detection & Recommendations\n\n"
-            result_text += f"**Found {total_elements} Slack configuration(s)**\n\n"
-
-            # Show current default if set
-            if current_default:
-                default_config = next(
-                    (c for c in configurations if c.get("id") == current_default), None
-                )
-                if default_config:
-                    name = default_config.get("name", "Unnamed Configuration")
-                    workspace = default_config.get("teamName") or default_config.get("team", {}).get("label", "Unknown Workspace")
-                    channel = default_config.get("channelName", "N/A")
-                    result_text += "## Current Default Configuration\n"
-                    result_text += f"**{name}**\n"
-                    result_text += f"- Workspace: {workspace}\n"
-                    result_text += f"- Channel: {channel}\n"
-                    result_text += f"- ID: `{current_default}`\n\n"
-                else:
-                    result_text += "## Default Configuration Issue\n"
-                    result_text += (
-                        f"Default ID `{current_default}` not found in available configurations.\n\n"
-                    )
-
-            # Show all available configurations
-            result_text += "## Available Configurations\n\n"
-
-            for i, config in enumerate(configurations, 1):
-                config_id = config.get("id", "Unknown")
-                name = config.get("name", "Unnamed Configuration")
-                workspace = config.get("teamName") or config.get("team", {}).get("label", "Unknown Workspace")
-                channel = config.get("channelName", "N/A")
-                created_date = config.get("created", "Unknown")
-
-                is_default = config_id == current_default
-                status_prefix = "DEFAULT" if is_default else ""
-
-                result_text += f"### {i}. {name} {status_prefix}\n"
-                result_text += f"- **Workspace:** {workspace}\n"
-                result_text += f"- **Channel:** {channel}\n"
-                result_text += f"- **Created:** {created_date}\n"
-                result_text += f"- **ID:** `{config_id}`\n"
-                if is_default:
-                    result_text += "- **Status:** Current Default\n"
-                result_text += "\n"
-
-            # Provide recommendations
-            result_text += "## Recommendations\n\n"
-
-            if not current_default:
-                result_text += "**Set a Default Configuration**\n"
-                result_text += "Choose a configuration to use automatically for new alerts:\n"
-                for i, config in enumerate(configurations, 1):
-                    config_id = config.get("id", "Unknown")
-                    name = config.get("name", "Unnamed Configuration")
-                    result_text += f"- Option {i}: `slack_management(action='select_default_configuration', config_id='{config_id}')` # {name}\n"
-                result_text += "\n"
-
-            result_text += "**Management Actions**\n"
-            result_text += "- View detailed configuration: `slack_management(action='get_configuration', config_id='CONFIG_ID')`\n"
-            result_text += (
-                "- Add new configuration: `slack_management(action='initiate_oauth')`\n"
+            lookup = await find_default_configuration(
+                client, configurations, get_default_slack_config_id(ctx)
             )
-            result_text += "- Check setup status: `slack_management(action='setup_status')`\n"
-
-            return [TextContent(type="text", text=result_text)]
+            return recommendations_response(response, lookup)
 
         except Exception as e:
             error = ValidationError(
@@ -369,6 +569,8 @@ class SlackSetupAssistant(ToolBase):
 
             return [TextContent(type="text", text=result_text)]
 
+        except ToolError:
+            raise
         except Exception as e:
             error = ValidationError(
                 message=f"Failed to set default Slack configuration {config_id}",
@@ -385,63 +587,47 @@ class SlackSetupAssistant(ToolBase):
         try:
             # Get configuration count
             client = await self.get_client(ctx=ctx)
-            response = await client.get_slack_configurations(page=0, size=1)
+            response = await client.get_slack_configurations(
+                page=0, size=RECOMMENDATION_PAGE_SIZE
+            )
             total_elements = response.get("totalElements", 0)
 
-            # Get default configuration
-            current_default = get_default_slack_config_id(ctx)
+            lookup = await find_default_on_page(
+                client, response, get_default_slack_config_id(ctx)
+            )
+            current_default = lookup.default_id
+            status = classify_setup(total_elements, lookup)
+            recommendation = SETUP_RECOMMENDATIONS[status.state]
 
-            # Get app base URL
             app_base_url = _resolved_app_base_url()
 
             result_text = "# Slack Integration Setup Status\n\n"
+            result_text += f"## Setup Status: **{status.state.value}**\n\n"
+            result_text += status.explanation
 
-            # Overall status
-            if total_elements > 0 and current_default:
-                result_text += "## Setup Status: **COMPLETE**\n\n"
-                result_text += "Your Slack integration is fully configured and ready to use!\n\n"
-            elif total_elements > 0:
-                result_text += "## Setup Status: **PARTIAL**\n\n"
-                result_text += "You have Slack configurations but no default is set.\n\n"
-            else:
-                result_text += "## Setup Status: **NOT CONFIGURED**\n\n"
-                result_text += "No Slack configurations found. Setup required.\n\n"
-
-            # Configuration details
             result_text += "## Configuration Summary\n\n"
             result_text += f"- **Total Configurations:** {total_elements}\n"
             result_text += (
-                f"- **Default Configuration:** {'Set' if current_default else 'Not Set'}\n"
+                f"- **Default Configuration:** {'Not Set' if lookup.none_saved else 'Set'}\n"
             )
             result_text += f"- **App Base URL:** `{app_base_url}`\n\n"
 
-            if current_default:
-                try:
-                    config = await client.get_slack_configuration_by_id(current_default)
-                    name = config.get("name", "Unnamed Configuration")
-                    workspace = config.get("teamName") or config.get("team", {}).get("label", "Unknown Workspace")
-                    result_text += f"- **Default Config Name:** {name}\n"
-                    result_text += f"- **Default Workspace:** {workspace}\n"
-                except Exception:
-                    result_text += (
-                        f"- **Default Config ID:** `{current_default}` (Configuration not found)\n"
-                    )
-                result_text += "\n"
-
-            # Recommendations based on status
-            result_text += "## Recommendations\n\n"
-
-            if total_elements == 0:
-                result_text += "**Get Started:**\n"
-                result_text += "```\nslack_management(action='quick_setup')\n```\n\n"
-            elif not current_default:
-                result_text += "**Set Default Configuration:**\n"
-                result_text += "```\nslack_management(action='detect_and_recommend')\n```\n\n"
-            else:
-                result_text += "**You're all set!** Try creating an alert:\n"
+            if lookup.found:
+                name = lookup.config.get("name", "Unnamed Configuration")
+                workspace = lookup.config.get("teamName") or lookup.config.get("team", {}).get("label", "Unknown Workspace")
+                result_text += f"- **Default Config Name:** {name}\n"
+                result_text += f"- **Default Workspace:** {workspace}\n\n"
+            elif lookup.missing:
                 result_text += (
-                    "```\nmanage_alerts(action='create_simple', threshold=100, email='you@company.com')\n```\n\n"
+                    f"- **Default Config ID:** `{current_default}` (Configuration not found or not in your organization)\n\n"
                 )
+            elif lookup.unreadable:
+                result_text += (
+                    f"- **Default Config ID:** `{current_default}` (Could not be read right now)\n\n"
+                )
+
+            result_text += "## Recommendations\n\n"
+            result_text += f"{recommendation.lead}\n```\n{recommendation.call}\n```\n\n"
 
             result_text += "**Other Actions:**\n"
             result_text += (

@@ -6,7 +6,7 @@ to reduce configuration complexity and improve user experience.
 
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from loguru import logger
 
@@ -14,10 +14,10 @@ from .config_store import get_config_value
 
 
 class SmartDefaultsEngine:
-    """Engine for providing intelligent defaults across all MCP tools with onboarding context."""
+    """Engine for providing intelligent defaults across all MCP tools."""
 
     def __init__(self):
-        """Initialize the smart defaults engine with onboarding support."""
+        """Initialize the smart defaults engine."""
         self.defaults_cache: Dict[str, Any] = {}
         self._load_environment_defaults()
         self._onboarding_context: Optional[Dict[str, Any]] = None
@@ -277,7 +277,7 @@ class SmartDefaultsEngine:
     # ONBOARDING INTEGRATION METHODS
 
     async def set_onboarding_context(self, onboarding_state: Optional[Dict[str, Any]] = None):
-        """Set onboarding context for enhanced defaults.
+        """Record the onboarding state; no default currently reads it (BACK-4969 removed the last reader).
 
         REUSE: Integrates with existing onboarding detection service.
 
@@ -302,236 +302,6 @@ class SmartDefaultsEngine:
             self._onboarding_context = onboarding_state
 
         logger.debug(f"Onboarding context set: {self._onboarding_context is not None}")
-
-    def get_onboarding_enhanced_defaults(
-        self, tool_name: str, action: str, user_data: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Get defaults enhanced with onboarding context.
-
-        Args:
-            tool_name: Name of the MCP tool
-            action: Action being performed
-            user_data: User-provided data
-
-        Returns:
-            Enhanced data with onboarding-aware smart defaults
-        """
-        # Start with standard smart defaults
-        enhanced_data = self.apply_smart_defaults(tool_name, action, user_data)
-
-        # Apply onboarding enhancements if context is available
-        if self._onboarding_context:
-            enhanced_data = self._apply_onboarding_enhancements(tool_name, action, enhanced_data)
-
-        return enhanced_data
-
-    def _apply_onboarding_enhancements(
-        self, tool_name: str, action: str, data: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Apply onboarding-specific enhancements to defaults.
-
-        Args:
-            tool_name: Name of the MCP tool
-            action: Action being performed
-            data: Data with standard defaults applied
-
-        Returns:
-            Data with onboarding enhancements
-        """
-        is_first_time = self._onboarding_context.get("is_first_time", False)
-        setup_completion = self._onboarding_context.get("setup_completion", {})
-
-        # Onboarding-specific enhancements for different tools
-        if tool_name == "manage_alerts" and action == "create" and is_first_time:
-            # For first-time users, create simpler, more educational alerts
-            data = self._enhance_alert_for_onboarding(data)
-
-        elif tool_name == "manage_products" and action == "create" and is_first_time:
-            # For first-time users, create simpler products with better descriptions
-            data = self._enhance_product_for_onboarding(data)
-
-        elif (
-            tool_name in ["welcome_and_setup", "setup_checklist", "verify_email_setup"]
-            and is_first_time
-        ):
-            # For onboarding tools, enhance with personalized context
-            data = self._enhance_onboarding_tool_defaults(tool_name, action, data)
-
-        # Apply email configuration if available and not set
-        if not data.get("notificationAddresses") and setup_completion.get("email_configured"):
-            email = self.env_defaults.get("notification_email")
-            if email and email != "dummy@email.com":
-                data["notificationAddresses"] = [email]
-
-        return data
-
-    def _enhance_alert_for_onboarding(self, alert_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Enhance alert defaults for first-time users.
-
-        Args:
-            alert_data: Standard alert data
-
-        Returns:
-            Enhanced alert data for onboarding
-        """
-        enhanced = alert_data.copy()
-
-        # Make alerts more educational for first-time users
-        if enhanced.get("alertType") == "THRESHOLD":
-            enhanced["description"] = (
-                "🚀 Your First Alert: API Cost Monitor (Created during onboarding)"
-            )
-            enhanced["name"] = enhanced.get("name", "My First API Cost Alert")
-
-            # Set a reasonable threshold for beginners
-            if enhanced.get("detection_rules"):
-                for rule in enhanced["detection_rules"]:
-                    if rule.get("value", 0) > 500:  # If default is too high
-                        rule["value"] = 50  # Set a more reasonable starter threshold
-
-        elif enhanced.get("alertType") == "CUMULATIVE_USAGE":
-            enhanced["description"] = "🎯 Monthly Budget Alert (Perfect for getting started)"
-            enhanced["name"] = enhanced.get("name", "Monthly API Budget Monitor")
-
-        # Add onboarding-friendly notification
-        if not enhanced.get("notificationAddresses"):
-            email = self.env_defaults.get("notification_email")
-            if email and email != "dummy@email.com":
-                enhanced["notificationAddresses"] = [email]
-
-        return enhanced
-
-    def _enhance_product_for_onboarding(self, product_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Enhance product defaults for first-time users.
-
-        Args:
-            product_data: Standard product data
-
-        Returns:
-            Enhanced product data for onboarding
-        """
-        enhanced = product_data.copy()
-
-        # Make products more educational for first-time users
-        if not enhanced.get("description"):
-            enhanced["description"] = "🚀 My First Product (Created during onboarding setup)"
-
-        if not enhanced.get("name"):
-            enhanced["name"] = "Starter Product"
-
-        # Ensure notification email is set for first-time users
-        email = self.env_defaults.get("notification_email")
-        if email and email != "dummy@email.com":
-            enhanced["notification_addresses_on_invoice"] = [email]
-
-        # Make plan more beginner-friendly
-        if enhanced.get("plan") and enhanced["plan"].get("type") == "USAGE":
-            # Simplify usage tiers for beginners
-            enhanced["plan"]["tiers"] = [
-                {"name": "Starter Tier", "starting_from": 0, "up_to": 1000, "unit_amount": "0.01"},
-                {
-                    "name": "Growth Tier",
-                    "starting_from": 1000,
-                    "up_to": None,
-                    "unit_amount": "0.005",
-                },
-            ]
-
-        return enhanced
-
-    def _enhance_onboarding_tool_defaults(
-        self, tool_name: str, action: str, data: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Enhance defaults for onboarding-specific tools.
-
-        Args:
-            tool_name: Name of the onboarding tool
-            action: Action being performed
-            data: Standard data
-
-        Returns:
-            Enhanced data with onboarding context
-        """
-        enhanced = data.copy()
-        setup_completion = self._onboarding_context.get("setup_completion", {})
-
-        # Add personalized context based on setup completion
-        if tool_name == "welcome_and_setup":
-            enhanced["setup_completion_context"] = setup_completion
-            enhanced["personalized_recommendations"] = self._get_personalized_recommendations()
-
-        elif tool_name == "setup_checklist":
-            enhanced["completion_percentage"] = self._calculate_completion_percentage(
-                setup_completion
-            )
-            enhanced["priority_items"] = self._get_priority_setup_items(setup_completion)
-
-        elif tool_name == "verify_email_setup":
-            # Suggest smart email defaults if available
-            if not enhanced.get("suggested_email"):
-                suggested_email = self._get_suggested_email()
-                if suggested_email:
-                    enhanced["suggested_email"] = suggested_email
-
-        return enhanced
-
-    def _get_personalized_recommendations(self) -> List[str]:
-        """Get personalized recommendations based on onboarding context."""
-        if not self._onboarding_context:
-            return []
-
-        setup_completion = self._onboarding_context.get("setup_completion", {})
-        recommendations = []
-
-        if not setup_completion.get("api_key_configured"):
-            recommendations.append("🔑 Configure your API key to unlock full functionality")
-
-        if not setup_completion.get("email_configured"):
-            recommendations.append("📧 Set up email notifications to stay informed about alerts")
-
-        if not setup_completion.get("slack_configured"):
-            recommendations.append("📱 Configure Slack for real-time team notifications")
-
-        if setup_completion.get("api_key_configured") and setup_completion.get("email_configured"):
-            recommendations.append("🎯 Create your first alert to monitor API costs")
-
-        return recommendations
-
-    def _calculate_completion_percentage(self, setup_completion: Dict[str, bool]) -> float:
-        """Calculate setup completion percentage."""
-        if not setup_completion:
-            return 0.0
-
-        total_items = len(setup_completion)
-        completed_items = sum(1 for completed in setup_completion.values() if completed)
-
-        return (completed_items / total_items * 100) if total_items > 0 else 0.0
-
-    def _get_priority_setup_items(self, setup_completion: Dict[str, bool]) -> List[str]:
-        """Get priority setup items based on completion status."""
-        priority_items = []
-
-        if not setup_completion.get("api_key_configured"):
-            priority_items.append("API Key Configuration")
-
-        if not setup_completion.get("team_id_configured"):
-            priority_items.append("Team ID Configuration")
-
-        if not setup_completion.get("email_configured"):
-            priority_items.append("Email Notifications")
-
-        return priority_items
-
-    def _get_suggested_email(self) -> Optional[str]:
-        """Get suggested email address for configuration."""
-        # Try to get from environment or smart defaults
-        email = self.env_defaults.get("notification_email")
-
-        # Don't suggest dummy emails
-        if email and email != "dummy@email.com" and "@" in email:
-            return email
-
-        return None
 
     def get_onboarding_tool_defaults(self, tool_name: str) -> Dict[str, Any]:
         """Get specific defaults for onboarding tools.
@@ -577,5 +347,5 @@ class SmartDefaultsEngine:
         return {}
 
 
-# Global smart defaults instance with onboarding support
+# Global smart defaults instance
 smart_defaults = SmartDefaultsEngine()

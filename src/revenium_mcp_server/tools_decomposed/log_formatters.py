@@ -43,6 +43,32 @@ class PageCoverage(NamedTuple):
             f"results cover {counted(self.pages_read, 'page', 'pages')}"
         )
 
+    def pages_read_of_total(self) -> str:
+        return _of_total(str(self.pages_read), self.platform.total_pages)
+
+    def entries_read_of_total(self) -> str:
+        return _of_total(f"{self.entries_read:,}", self.platform.total_elements, ",")
+
+    @property
+    def entries_not_read(self) -> Optional[int]:
+        if self.platform.total_elements is None:
+            return None
+        return max(self.platform.total_elements - self.entries_read, 0)
+
+    def unread_entries_note(self) -> Optional[str]:
+        """How much of the platform's log the answer read, when some of it was not read."""
+        if not self.entries_not_read:
+            return None
+        pages = (
+            f" ({self.pages_read_of_total()} pages)"
+            if self.platform.total_pages is not None
+            else ""
+        )
+        return (
+            f"Read {self.entries_read_of_total()} entries{pages}; "
+            f"the other {self.entries_not_read:,} were not read"
+        )
+
 
 def _of_total(read: str, total: Optional[int], spec: str = "") -> str:
     return f"{read} of {'an unknown number' if total is None else format(total, spec)}"
@@ -93,15 +119,18 @@ class LogResponseFormatter:
             # A client-side filter narrows the fetched page only; the platform's
             # totals still count every entry, so they are never the filter's totals.
             filtered = any((applied_filters or {}).get(key) for key in CONTENT_FILTER_KEYS)
+            platform = PageInfo.from_envelope(api_response)
             if filtered:
-                platform = PageInfo.from_envelope(api_response)
                 total_elements, total_pages = platform.total_elements, platform.total_pages
                 insights = self._generate_diagnostic_insights(
                     log_entries, operation_counts, status_counts
                 )
             else:
+                page_read = PageCoverage(
+                    pages_read=1, entries_read=len(log_entries), platform=platform
+                )
                 insights = self._generate_diagnostic_insights(
-                    log_entries, operation_counts, status_counts, total_elements, total_pages
+                    log_entries, operation_counts, status_counts, page_read
                 )
 
             # Build response text
@@ -259,8 +288,7 @@ class LogResponseFormatter:
         log_entries: List[Dict[str, Any]],
         operation_counts: Dict[str, int],
         status_counts: Dict[str, int],
-        total_elements: int = 0,
-        total_pages: int = 0,
+        coverage: Optional[PageCoverage] = None,
     ) -> List[str]:
         """Generate diagnostic insights based on log patterns."""
         insights = []
@@ -284,14 +312,9 @@ class LogResponseFormatter:
                     f"{ai_info_count} AI_METRIC_PROCESSING entries with INFO status (new products/organizations created)"
                 )
 
-        # Check for large datasets - USE ACTUAL TOTAL FROM API
-        if total_elements > 100:
-            if total_pages > 1:
-                insights.append(
-                    f"Large dataset available: {total_elements:,} total entries across {total_pages} pages"
-                )
-            else:
-                insights.append(f"Large dataset available: {total_elements:,} total entries")
+        unread = coverage.unread_entries_note() if coverage else None
+        if unread:
+            insights.append(unread)
 
         # Check for email dispatch issues
         email_failures = sum(
@@ -308,25 +331,18 @@ class LogResponseFormatter:
         self,
         all_entries: List[Dict[str, Any]],
         log_type: str,
-        pages_retrieved: int,
+        coverage: PageCoverage,
         applied_filters: Optional[Dict[str, Any]] = None,
-        stop_note: Optional[str] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Format multi-page analysis response."""
+        """Format multi-page analysis response with the pages and entries read out of those that exist."""
         try:
-            # Generate comprehensive summaries
             operation_counts = self._count_operations(all_entries)
             status_counts = self._count_statuses(all_entries)
-            # For multi-page, use the total entries retrieved as the dataset size
-            total_entries_retrieved = len(all_entries)
             insights = self._generate_diagnostic_insights(
-                all_entries,
-                operation_counts,
-                status_counts,
-                total_entries_retrieved,
-                pages_retrieved,
+                all_entries, operation_counts, status_counts, coverage
             )
 
+            stop_note = coverage.failure_note()
             stopped = f"- **Stopped Early**: {stop_note}\n" if stop_note else ""
 
             # Build multi-page response
@@ -334,8 +350,8 @@ class LogResponseFormatter:
 # Multi-Page {log_type.title()} Log Analysis
 
 ## Summary
-- **Total Entries Analyzed**: {len(all_entries):,}
-- **Pages Retrieved**: {pages_retrieved}
+- **Total Entries Analyzed**: {coverage.entries_read_of_total()}
+- **Pages Retrieved**: {coverage.pages_read_of_total()}
 {stopped}- **Log Type**: {log_type}
 """
 
@@ -392,11 +408,8 @@ class LogResponseFormatter:
                 operation_counts[operation] = operation_counts.get(operation, 0) + 1
                 status_counts[status] = status_counts.get(status, 0) + 1
 
-            platform = coverage.platform
-            pages_searched = _of_total(str(coverage.pages_read), platform.total_pages)
-            entries_searched = _of_total(
-                f"{coverage.entries_read:,}", platform.total_elements, ","
-            )
+            pages_searched = coverage.pages_read_of_total()
+            entries_searched = coverage.entries_read_of_total()
 
             # Format response
             response_text = f"""

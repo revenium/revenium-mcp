@@ -163,7 +163,10 @@ class TestFormatLogResponse:
         )
         text = result[0].text
         assert "- **Total Entries**: 78,828" in text
-        assert "Large dataset available: 78,828 total entries across 1577 pages" in text
+        assert (
+            "Read 1 of 78,828 entries (1 of 1577 pages); the other 78,827 were not read" in text
+        )
+        assert "available" not in text.lower()
 
 
 class TestDiagnosticInsights:
@@ -192,19 +195,32 @@ class TestDiagnosticInsights:
         )
         assert any("AI_METRIC_PROCESSING" in i for i in insights)
 
-    def test_large_dataset_insight_multi_page(self, formatter):
-        """Large datasets with multiple pages generate pagination insight."""
-        insights = formatter._generate_diagnostic_insights(
-            [], {}, {}, total_elements=500, total_pages=3
+    def test_unread_entries_insight_states_read_out_of_total(self, formatter):
+        """BACK-4735: the insight says how many entries were read out of how many exist."""
+        coverage = PageCoverage(
+            pages_read=3, entries_read=300, platform=PageInfo(total_pages=1021, total_elements=102057)
         )
-        assert any("500" in i and "3 pages" in i for i in insights)
+        insights = formatter._generate_diagnostic_insights([], {}, {}, coverage)
+        assert insights == [
+            "Read 300 of 102,057 entries (3 of 1021 pages); the other 101,757 were not read"
+        ]
 
-    def test_large_dataset_insight_single_page(self, formatter):
-        """Large single-page dataset generates simpler insight."""
-        insights = formatter._generate_diagnostic_insights(
-            [], {}, {}, total_elements=200, total_pages=1
+    def test_unread_entries_insight_without_a_page_count(self, formatter):
+        coverage = PageCoverage(
+            pages_read=1, entries_read=100, platform=PageInfo(total_elements=250)
         )
-        assert any("200" in i for i in insights)
+        insights = formatter._generate_diagnostic_insights([], {}, {}, coverage)
+        assert insights == ["Read 100 of 250 entries; the other 150 were not read"]
+
+    def test_no_unread_entries_insight_when_everything_was_read_or_the_total_is_unknown(
+        self, formatter
+    ):
+        every_entry = PageCoverage(
+            pages_read=1, entries_read=10, platform=PageInfo(total_pages=1, total_elements=10)
+        )
+        no_total = PageCoverage(pages_read=1, entries_read=10, platform=PageInfo())
+        assert formatter._generate_diagnostic_insights([], {}, {}, every_entry) == []
+        assert formatter._generate_diagnostic_insights([], {}, {}, no_total) == []
 
     def test_email_dispatch_failure_insight(self, formatter):
         """Email dispatch failures generate specific insight."""
@@ -226,8 +242,9 @@ class TestDiagnosticInsights:
             entries,
             {"TEST": 1},
             {"SUCCESS": 1},
-            total_elements=10,
-            total_pages=1,
+            PageCoverage(
+                pages_read=1, entries_read=10, platform=PageInfo(total_pages=1, total_elements=10)
+            ),
         )
         assert insights == []
 
@@ -235,15 +252,37 @@ class TestDiagnosticInsights:
 class TestFormatMultiPageResponse:
     """Test multi-page response formatting."""
 
+    @staticmethod
+    def _read(entries, pages_read, total_pages=None, total_elements=None):
+        return PageCoverage(
+            pages_read=pages_read,
+            entries_read=len(entries),
+            platform=PageInfo(total_pages=total_pages, total_elements=total_elements),
+        )
+
     def test_multi_page_includes_pages_retrieved(self, formatter):
         """Multi-page response includes pages_retrieved count."""
         entries = [
             {"operation": "TEST", "status": "SUCCESS", "created": "2024-01-15T10:00:00Z"},
         ]
-        result = formatter.format_multi_page_response(entries, "internal", 3)
+        result = formatter.format_multi_page_response(entries, "internal", self._read(entries, 3))
         text = result[0].text
-        assert "3" in text
+        assert "- **Pages Retrieved**: 3 of an unknown number" in text
         assert "Multi-Page" in text
+
+    def test_multi_page_says_what_was_read_out_of_what_exists(self, formatter):
+        """BACK-4735: entries and pages read out of the platform total, never 'available'."""
+        entries = [
+            {"operation": "TEST", "status": "SUCCESS", "created": "2024-01-15T10:00:00Z"}
+        ] * 300
+        result = formatter.format_multi_page_response(
+            entries, "internal", self._read(entries, 3, total_pages=1021, total_elements=102057)
+        )
+        text = result[0].text
+        assert "- **Total Entries Analyzed**: 300 of 102,057" in text
+        assert "- **Pages Retrieved**: 3 of 1021" in text
+        assert "Read 300 of 102,057 entries (3 of 1021 pages); the other 101,757 were not read" in text
+        assert "available" not in text.lower()
 
     def test_multi_page_includes_temporal_analysis(self, formatter):
         """Multi-page response includes temporal analysis section."""
@@ -251,14 +290,14 @@ class TestFormatMultiPageResponse:
             {"operation": "TEST", "status": "SUCCESS", "created": "2024-01-15T10:00:00Z"},
             {"operation": "TEST", "status": "SUCCESS", "created": "2024-01-14T10:00:00Z"},
         ]
-        result = formatter.format_multi_page_response(entries, "internal", 2)
+        result = formatter.format_multi_page_response(entries, "internal", self._read(entries, 2))
         assert "Temporal Analysis" in result[0].text
 
     def test_multi_page_with_filters(self, formatter):
         """Multi-page response includes applied filters."""
         entries = [{"operation": "TEST", "status": "SUCCESS", "created": "2024-01-15T10:00:00Z"}]
         result = formatter.format_multi_page_response(
-            entries, "internal", 1, applied_filters={"status_filter": "SUCCESS"}
+            entries, "internal", self._read(entries, 1), applied_filters={"status_filter": "SUCCESS"}
         )
         assert "Applied Filters" in result[0].text
 

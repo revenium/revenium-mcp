@@ -61,7 +61,24 @@ class CalendarRange:
         return f"{self.start.isoformat()} to {self.end.isoformat()} UTC, both days included"
 
 
-AnalyticsWindow = Union[str, CalendarRange]
+@dataclass(frozen=True)
+class InstantRange:
+    """A UTC span from ``start`` to ``end``, both included, read on the analytics API."""
+
+    start: datetime
+    end: datetime
+
+    def iso_bounds(self) -> Tuple[str, str]:
+        return _format_utc_instant(self.start), _format_utc_instant(self.end)
+
+    def __str__(self) -> str:
+        return f"{self.start:%Y-%m-%d %H:%M} to {self.end:%Y-%m-%d %H:%M} UTC"
+
+
+AnalyticsWindow = Union[str, CalendarRange, InstantRange]
+
+# The windows sent as their own bounds, which only the analytics API accepts
+EXPLICIT_RANGE_TYPES = (CalendarRange, InstantRange)
 
 
 def _refuse_more_than_max_days(days: int) -> None:

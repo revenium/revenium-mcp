@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Dict
 
-from ..metric_units import render_dollars
+from ...common.money import render_dollars
 from ..validation import DEFAULT_USER_COST_SOURCES
 
 # Path prefix of the ClickHouse-backed analytics plane. Which plane served a
@@ -87,17 +87,24 @@ _USER_ATTRIBUTION_NOTE = (
 )
 
 
-_UNMASKED_LABELS = frozenset({"Unknown API Key", "ANONYMOUS", "UNCLASSIFIED"})
+# The analytics route's API key report names only the costliest keys and rolls
+# the rest into one group (get_cost_by_api_key in specs/openapi/isotope.json)
+ANALYTICS_API_KEY_ROLLUP_GROUP = "Other API keys"
+
+_UNMASKED_LABELS = frozenset(
+    label.upper()
+    for label in ("Unknown API Key", "ANONYMOUS", "UNCLASSIFIED", ANALYTICS_API_KEY_ROLLUP_GROUP)
+)
 
 
 def mask_api_key_name(api_key_name: str) -> str:
     """How every cost answer shows an API key: its first and last four characters.
 
     A key's group name can be the key value itself, so it is never printed in
-    full. The platform's sentinel labels are placeholders, not secrets, and are
-    shown as they are.
+    full. The platform's sentinel labels and its roll-up of the keys it does
+    not name are placeholders, not secrets, and are shown as they are.
     """
-    if not api_key_name or api_key_name in _UNMASKED_LABELS:
+    if not api_key_name or api_key_name.upper() in _UNMASKED_LABELS:
         return api_key_name
     if len(api_key_name) <= 8:
         return api_key_name[:2] + "****" + api_key_name[-2:]

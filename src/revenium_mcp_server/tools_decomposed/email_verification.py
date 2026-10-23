@@ -4,6 +4,7 @@ This tool provides email configuration and verification guidance using existing
 validation infrastructure from validators.py and config_cache.py update patterns.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
 
@@ -14,7 +15,7 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
-from ..auth.auth_mode import read_auth_mode
+from ..auth.auth_mode import credentials_are_per_request
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
@@ -22,11 +23,174 @@ from ..common.error_handling import (
     create_structured_validation_error,
     format_structured_error,
 )
-from ..config_cache import _default_cache
-from ..config_store import get_config_value
+from ..config_store import (
+    EMAIL_SETTING,
+    SOURCE_CACHE,
+    SOURCE_CALLER,
+    SOURCE_DISCOVERY,
+    SOURCE_ENVIRONMENT,
+    SOURCE_SAVED,
+    configured_default_email,
+    notification_email_with_source,
+)
 from ..introspection.metadata import ToolCapability, ToolType
+from ..saved_notification_email import saved_notification_email
 from ..validators import InputValidator
+from .system_setup_calls import setup_call
 from .unified_tool_base import ToolBase
+
+EXAMPLE_EMAIL = "your@email.com"
+EMAIL_SOURCE_LABELS = {
+    SOURCE_CALLER: "Your Revenium account",
+    SOURCE_SAVED: "Saved with update_email",
+    SOURCE_CACHE: "Configuration cache (.revenium_cache)",
+    SOURCE_ENVIRONMENT: f"Environment variable {EMAIL_SETTING}",
+    SOURCE_DISCOVERY: "Auto-discovered from your Revenium account",
+}
+ADDRESS_SCOPE = (
+    "Alerts you create without an email notify this address; "
+    "existing alerts keep the addresses they were created with."
+)
+WHAT_AN_ADDRESS_RECEIVES = f"## What an Address Would Receive\n\n{ADDRESS_SCOPE}\n"
+
+
+def saved_address_lifetime() -> str:
+    return (
+        f"It is saved in {saved_notification_email.path.resolve()}, "
+        f"ahead of {EMAIL_SETTING}, and stays the default until you save another address "
+        "or delete that file."
+    )
+
+
+def environment_email_overridden(saved_email: str) -> str:
+    environment_email = configured_default_email()
+    if environment_email is None or environment_email.lower() == saved_email.lower():
+        return ""
+    return f"{EMAIL_SETTING} is set to {environment_email}; the saved address is used instead.\n"
+
+
+def per_alert_email_call(email: str = EXAMPLE_EMAIL) -> str:
+    return f"manage_alerts(action='create_simple', threshold=100, email='{email}')"
+
+
+def set_email_step(email: str = EXAMPLE_EMAIL) -> str:
+    """How a caller sets the notification email on this server."""
+    if credentials_are_per_request():
+        return (
+            "Give the address on each alert with the email argument, for example "
+            f"`{per_alert_email_call(email)}`"
+        )
+    return (
+        f"Set the address alerts created without an email go to with "
+        f"`{setup_call('update_email', email=email)}`"
+    )
+
+
+@dataclass(frozen=True)
+class ConfiguredEmail:
+    address: Optional[str]
+    source_label: str
+
+
+def configured_email() -> ConfiguredEmail:
+    """The address alerts created without an email go to and the label of its layer, read in one lookup."""
+    address, source = notification_email_with_source()
+    return ConfiguredEmail(address, EMAIL_SOURCE_LABELS.get(source or "", "Not set"))
+
+
+def set_email_example(heading: str = "##") -> str:
+    """The examples section on setting the notification email this server accepts, at the caller's heading level."""
+    if credentials_are_per_request():
+        return (
+            f"{heading} **Set the Notification Email**\n"
+            f"{set_email_step('alerts@yourcompany.com')}\n"
+            "**Purpose**: This server keeps no notification email for you, "
+            "so each alert names its own"
+        )
+    return (
+        f"{heading} **Update Email Address**\n"
+        "```json\n"
+        '{\n  "action": "update_email",\n  "email": "alerts@yourcompany.com"\n}\n'
+        "```\n"
+        "**Purpose**: Update notification email address for AI spending alerts"
+    )
+
+
+def update_email_capability() -> str:
+    """How the capabilities overview describes update_email on this server."""
+    if credentials_are_per_request():
+        return f"Not available on this server, which keeps no notification email. {set_email_step()}"
+    return "Update notification email address (requires email parameter)"
+
+
+def common_workflows() -> str:
+    """The examples' workflows, naming only calls this server answers."""
+    return f"""## **Common Workflows**
+
+### **Initial Email Setup**
+1. Start with `{setup_call('check_status')}` to see current configuration
+2. Check the format with `{setup_call('validate_email', email=EXAMPLE_EMAIL)}`
+3. {set_email_step()}
+4. Verify with `{setup_call('test_configuration')}` to ensure it works
+
+### **Email Configuration Troubleshooting**
+1. Check `{setup_call('check_status')}` for current state
+2. Use `{setup_call('setup_guidance')}` for configuration help
+3. Test with `{setup_call('validate_email', email=EXAMPLE_EMAIL)}` for format issues
+4. {set_email_step()} if needed
+
+### **Email Address Changes**
+1. Validate new email with `{setup_call('validate_email', email='new@email.com')}`
+2. {set_email_step('new@email.com')}
+3. Test new configuration with `{setup_call('test_configuration')}`
+4. Verify status with `{setup_call('check_status')}`
+"""
+
+
+def fix_address_steps() -> str:
+    """Numbered steps that replace a configured address that is not a valid email."""
+    steps = (
+        f"1. Check a replacement with `{setup_call('validate_email', email=EXAMPLE_EMAIL)}`\n"
+        f"2. {set_email_step()}\n"
+    )
+    if not credentials_are_per_request():
+        steps += (
+            "3. If that says it was not saved, set REVENIUM_DEFAULT_EMAIL in the "
+            "server's environment and restart the server\n"
+        )
+    return steps
+
+
+def invalid_address_verdict(format_error: str) -> str:
+    """The verdict every email reader gives an address that is not a valid email."""
+    return (
+        f"Not a valid email address ({format_error}), "
+        "so notifications cannot be delivered to it"
+    )
+
+
+def fix_address_section() -> str:
+    """The heading and steps that replace an address that is not a valid email."""
+    return "## Fix the Address\n\n" + fix_address_steps()
+
+
+def invalid_address_section(email: ConfiguredEmail, format_error: str, label: str) -> str:
+    """The address, its verdict, its source and the fix steps, under the reader's address label."""
+    return (
+        f"**{label}**: {email.address}\n"
+        f"**Status**: {invalid_address_verdict(format_error)}\n"
+        f"**Source**: {email.source_label}\n\n"
+        + fix_address_section()
+    )
+
+
+def email_format_error(email: str) -> Optional[str]:
+    """Why the address is not a valid email, or None when it is."""
+    try:
+        InputValidator.validate_email(email)
+    except Exception as e:
+        return str(e)
+    return None
 
 
 class EmailVerification(ToolBase):
@@ -131,19 +295,15 @@ class EmailVerification(ToolBase):
         """Handle check_status action - check current email configuration."""
         logger.debug("📧 Checking email configuration status")
 
-        # Get current email configuration using existing infrastructure
-        current_email = get_config_value("REVENIUM_DEFAULT_EMAIL")
-
-        # Build status response
-        status_text = self._build_email_status(current_email)
+        status_text = self._build_email_status(configured_email())
 
         return [TextContent(type="text", text=status_text)]
 
     async def _handle_update_email(self, arguments: Dict[str, Any]) -> List[TextContent]:
         """Handle update_email action - update notification email address."""
-        # BACK-4679: the only store is the server-local configuration cache,
-        # which on the hosted server belongs to no organization.
-        if read_auth_mode() in ("clerk", "api_key"):
+        # BACK-4679: the only store is a server-local file, which on the
+        # hosted server belongs to no organization.
+        if credentials_are_per_request():
             raise ToolError(
                 message=(
                     "Setting a notification email is not available on the hosted server. "
@@ -164,26 +324,20 @@ class EmailVerification(ToolBase):
                 parameter_name="email",
                 action="update email configuration",
                 examples={
-                    "usage": "verify_email_setup(action='update_email', email='user@example.com')",
+                    "usage": setup_call("update_email", email="user@example.com"),
                     "valid_formats": [
                         "user@example.com",
                         "admin@company.org",
                         "notifications@team.co",
                     ],
-                    "system_context": "📧 SYSTEM: Email will be used for alert notifications and system updates",
+                    "system_context": ADDRESS_SCOPE,
                 },
             )
             raise error
 
-        try:
-            # Validate email using existing validation infrastructure
-            validated_email = InputValidator.validate_email(email)
-
-            # Update configuration using existing cache infrastructure
-            success = await self._update_email_configuration(validated_email)
-
-            if success:
-                update_text = f"""# ✅ **Email Configuration Updated**
+        validated_email = self._validated_new_email(email)
+        self._save_email(validated_email)
+        update_text = f"""# ✅ **Email Configuration Updated**
 
 **New Email**: {validated_email}
 **Status**: Successfully configured
@@ -191,38 +345,24 @@ class EmailVerification(ToolBase):
 
 ## 📧 **What This Means**
 
-Your notification email has been updated and will be used for:
-- Alert notifications when thresholds are exceeded
-- System status updates and maintenance notices
-- Important configuration changes
-
+{ADDRESS_SCOPE}
+{saved_address_lifetime()}
+{environment_email_overridden(validated_email)}
 ## 🎯 **Next Steps**
 
-1. **Test Configuration**: Use `test_configuration()` to verify email setup
+1. **Test Configuration**: Use `{setup_call('test_configuration')}` to verify email setup
 2. **Set Up Alerts**: Use `manage_alerts()` to create notification rules
 3. **Configure Slack**: Use `slack_management(action='quick_setup')` for additional notifications
 
-**Tip**: You can check your email status anytime with `check_status()`
+**Tip**: You can check your email status anytime with `{setup_call('check_status')}`
 """
-                return [TextContent(type="text", text=update_text)]
-            else:
-                raise ToolError(
-                    message=f"The notification email {validated_email} was not saved.",
-                    error_code=ErrorCodes.TOOL_ERROR,
-                    field="email",
-                    value=validated_email,
-                    suggestions=[
-                        "This server stores it only in its local configuration cache "
-                        "(.revenium_cache in the server's working directory), and no valid "
-                        "cache exists or it could not be written",
-                        "Set REVENIUM_DEFAULT_EMAIL in the server's environment and restart the server",
-                    ],
-                )
+        return [TextContent(type="text", text=update_text)]
 
-        except ToolError:
-            raise
+    @staticmethod
+    def _validated_new_email(email: Any) -> str:
+        try:
+            return InputValidator.validate_email(email)
         except Exception as e:
-            logger.error(f"Error updating email configuration: {e}")
             raise ToolError(
                 message=f"The notification email {email} was not saved: {e}",
                 error_code=ErrorCodes.VALIDATION_ERROR,
@@ -232,7 +372,27 @@ Your notification email has been updated and will be used for:
                     "Check email format (e.g., user@example.com)",
                     "Ensure email address is valid and accessible",
                     "Try with a different email address",
-                    "Use validate_email() to test format first",
+                    f"Check the format first with {setup_call('validate_email', email=str(email))}",
+                ],
+            ) from e
+
+    @staticmethod
+    def _save_email(validated_email: str) -> None:
+        try:
+            saved_notification_email.save(validated_email)
+        except OSError as e:
+            logger.error(f"Could not save the notification email: {e}")
+            raise ToolError(
+                message=(
+                    f"The notification email {validated_email} was not saved: "
+                    f"{saved_notification_email.path} could not be written ({e.strerror or e})."
+                ),
+                error_code=ErrorCodes.TOOL_ERROR,
+                field="email",
+                value=validated_email,
+                suggestions=[
+                    "Make the server's working directory writable and try again",
+                    f"Or set {EMAIL_SETTING} in the server's environment and restart the server",
                 ],
             ) from e
 
@@ -247,7 +407,7 @@ Your notification email has been updated and will be used for:
                 parameter_name="email",
                 action="validate email format",
                 examples={
-                    "usage": "verify_email_setup(action='validate_email', email='user@example.com')",
+                    "usage": setup_call("validate_email", email="user@example.com"),
                     "test_emails": [
                         "test@example.com",
                         "admin@company.org",
@@ -278,9 +438,9 @@ Your notification email has been updated and will be used for:
 ## 🎯 **Next Steps**
 
 This email address is ready to use! You can:
-1. **Update Configuration**: Use `update_email(email='{validated_email}')` to set it
-2. **Check Current Status**: Use `check_status()` to see current configuration
-3. **Get Setup Guidance**: Use `setup_guidance()` for more recommendations
+1. {set_email_step(validated_email)}
+2. Check the current configuration with `{setup_call("check_status")}`
+3. Get more recommendations with `{setup_call("setup_guidance")}`
 
 **Ready to configure this email for notifications!**
 """
@@ -316,11 +476,7 @@ This email address is ready to use! You can:
         """Handle setup_guidance action - provide email setup guidance."""
         logger.debug("📖 Providing email setup guidance")
 
-        # Get current email status
-        current_email = get_config_value("REVENIUM_DEFAULT_EMAIL")
-
-        # Build guidance response
-        guidance_text = self._build_setup_guidance(current_email)
+        guidance_text = self._build_setup_guidance(configured_email())
 
         return [TextContent(type="text", text=guidance_text)]
 
@@ -328,70 +484,35 @@ This email address is ready to use! You can:
         """Handle test_configuration action - test current email configuration."""
         logger.debug("🧪 Testing email configuration")
 
-        # Get current email configuration
-        current_email = get_config_value("REVENIUM_DEFAULT_EMAIL")
-
-        # Build test results
-        test_text = self._build_configuration_test(current_email)
+        test_text = self._build_configuration_test(configured_email())
 
         return [TextContent(type="text", text=test_text)]
 
-    async def _update_email_configuration(self, validated_email: str) -> bool:
-        """Update email configuration using existing cache infrastructure.
-
-        Args:
-            validated_email: Validated email address
-
-        Returns:
-            True if update was successful
-        """
-        try:
-            # Use existing cache infrastructure to update configuration
-            # This follows the same pattern as other configuration updates
-
-            # Get current cache info
-            from ..config_cache import get_cache_info
-
-            get_cache_info()
-
-            # Update the configuration field
-            # This uses the same pattern as the config_cache system
-            saved = await _default_cache.update_config_field(
-                "REVENIUM_DEFAULT_EMAIL", validated_email
-            )
-
-            if saved:
-                logger.info(f"✅ Email configuration updated to: {validated_email}")
-            return saved
-
-        except Exception as e:
-            logger.error(f"❌ Failed to update email configuration: {e}")
-            return False
-
-    def _build_email_status(self, current_email: Optional[str]) -> str:
+    def _build_email_status(self, email: ConfiguredEmail) -> str:
         """Build email configuration status display."""
+        current_email = email.address
         status = "# 📧 **Email Configuration Status**\n\n"
         status += f"**Checked**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
         if current_email:
+            format_error = email_format_error(current_email)
+            if format_error:
+                status += "## Email Not Valid\n\n"
+                status += invalid_address_section(email, format_error, "Current Email")
+                return status
+
             status += "## ✅ **Email Configured**\n\n"
             status += f"**Current Email**: {current_email}\n"
             status += "**Status**: Active and ready for notifications\n"
-            status += (
-                f"**Source**: {'Environment variable' if current_email else 'Auto-discovered'}\n\n"
-            )
+            status += f"**Source**: {email.source_label}\n\n"
 
-            status += "## 📬 **Notification Types**\n\n"
-            status += "Your email will receive notifications for:\n"
-            status += "- 🚨 Alert threshold breaches\n"
-            status += "- 📊 System status updates\n"
-            status += "- 🔧 Configuration changes\n"
-            status += "- 📈 Performance reports (if enabled)\n\n"
+            status += "## What This Address Receives\n\n"
+            status += f"{ADDRESS_SCOPE}\n\n"
 
             status += "## 🎯 **Available Actions**\n\n"
-            status += "- `update_email(email='new@example.com')` - Change email address\n"
-            status += "- `test_configuration()` - Test current email setup\n"
-            status += "- `setup_guidance()` - Get email setup recommendations\n"
+            status += f"- Use another address: {set_email_step('new@example.com')}\n"
+            status += f"- Test the current email setup: `{setup_call('test_configuration')}`\n"
+            status += f"- Get email setup recommendations: `{setup_call('setup_guidance')}`\n"
 
         else:
             status += "## ⚠️ **Email Not Configured**\n\n"
@@ -399,58 +520,50 @@ This email address is ready to use! You can:
             status += "**Impact**: You won't receive alert notifications\n\n"
 
             status += "## 🚀 **Quick Setup**\n\n"
-            status += "1. **Set Email**: `update_email(email='your@email.com')`\n"
-            status += "2. **Validate First**: `validate_email(email='your@email.com')`\n"
-            status += "3. **Get Guidance**: `setup_guidance()` for detailed help\n\n"
+            status += f"1. Check the address first with `{setup_call('validate_email', email=EXAMPLE_EMAIL)}`\n"
+            status += f"2. {set_email_step()}\n"
+            status += f"3. Get detailed help with `{setup_call('setup_guidance')}`\n\n"
 
-            status += "## 💡 **Why Configure Email?**\n\n"
-            status += "- Get instant notifications when alerts trigger\n"
-            status += "- Stay informed about system status changes\n"
-            status += "- Receive important configuration updates\n"
-            status += "- Enable team collaboration through notifications\n"
+            status += WHAT_AN_ADDRESS_RECEIVES
 
         return status
 
-    def _build_setup_guidance(self, current_email: Optional[str]) -> str:
+    def _build_setup_guidance(self, email: ConfiguredEmail) -> str:
         """Build comprehensive email setup guidance."""
+        current_email = email.address
         guidance = "# 📖 **Email Setup Guidance**\n\n"
         guidance += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
-        if current_email:
+        format_error = email_format_error(current_email) if current_email else None
+        if format_error:
+            guidance += "## Current Configuration\n\n"
+            guidance += invalid_address_section(email, format_error, "Email") + "\n"
+
+        elif current_email:
             guidance += "## ✅ **Current Configuration**\n\n"
             guidance += f"**Email**: {current_email}\n"
-            guidance += "**Status**: Configured and ready\n\n"
+            guidance += "**Status**: Configured and ready\n"
+            guidance += f"**Source**: {email.source_label}\n\n"
 
             guidance += "## 🔧 **Management Options**\n\n"
-            guidance += "### Update Email Address\n"
-            guidance += "```\n"
-            guidance += "verify_email_setup(action='update_email', email='new@example.com')\n"
-            guidance += "```\n\n"
+            guidance += "### Use Another Address\n"
+            guidance += f"{set_email_step('new@example.com')}\n\n"
 
             guidance += "### Test Configuration\n"
-            guidance += "```\n"
-            guidance += "verify_email_setup(action='test_configuration')\n"
-            guidance += "```\n\n"
+            guidance += f"```\n{setup_call('test_configuration')}\n```\n\n"
 
         else:
             guidance += "## 🚀 **Initial Email Setup**\n\n"
             guidance += "### Step 1: Validate Your Email\n"
             guidance += "First, check if your email format is valid:\n"
-            guidance += "```\n"
-            guidance += "verify_email_setup(action='validate_email', email='your@email.com')\n"
-            guidance += "```\n\n"
+            guidance += f"```\n{setup_call('validate_email', email=EXAMPLE_EMAIL)}\n```\n\n"
 
             guidance += "### Step 2: Configure Email\n"
-            guidance += "Once validated, set it as your notification email:\n"
-            guidance += "```\n"
-            guidance += "verify_email_setup(action='update_email', email='your@email.com')\n"
-            guidance += "```\n\n"
+            guidance += f"{set_email_step()}\n\n"
 
             guidance += "### Step 3: Test Setup\n"
             guidance += "Verify everything is working:\n"
-            guidance += "```\n"
-            guidance += "verify_email_setup(action='test_configuration')\n"
-            guidance += "```\n\n"
+            guidance += f"```\n{setup_call('test_configuration')}\n```\n\n"
 
         guidance += "## 📧 **Email Requirements**\n\n"
         guidance += "**Format**: Standard email format (user@domain.com)\n"
@@ -475,19 +588,20 @@ This email address is ready to use! You can:
         guidance += "- **Set up alerts**: Use `manage_alerts()` to create notification rules\n"
         guidance += "- **Configure Slack**: Use `slack_management(action='quick_setup')` for additional channels\n"
         guidance += (
-            "- **Check setup**: Use `setup_checklist()` to verify complete configuration\n\n"
+            f"- **Check setup**: Use `{setup_call('setup_checklist')}` to verify complete configuration\n\n"
         )
 
         guidance += "## 🆘 **Troubleshooting**\n\n"
         guidance += "**Email validation fails**: Check format and try common examples\n"
         guidance += "**Update fails**: Verify system permissions and try again\n"
         guidance += "**Not receiving notifications**: Check spam folder and email filters\n"
-        guidance += "**Need help**: Use `setup_checklist()` for comprehensive status\n"
+        guidance += f"**Need help**: Use `{setup_call('setup_checklist')}` for comprehensive status\n"
 
         return guidance
 
-    def _build_configuration_test(self, current_email: Optional[str]) -> str:
+    def _build_configuration_test(self, email: ConfiguredEmail) -> str:
         """Build email configuration test results."""
+        current_email = email.address
         test = "# 🧪 **Email Configuration Test**\n\n"
         test += f"**Test Run**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
@@ -495,15 +609,11 @@ This email address is ready to use! You can:
             test += "## ✅ **Configuration Found**\n\n"
             test += f"**Email Address**: {current_email}\n"
 
-            # Test email format validation
-            try:
-                validated_email = InputValidator.validate_email(current_email)
-                format_valid = True
+            format_error = email_format_error(current_email)
+            if format_error is None:
                 test += "**Format Validation**: ✅ Valid\n"
-                test += f"**Normalized Form**: {validated_email}\n"
-            except Exception as e:
-                format_valid = False
-                test += f"**Format Validation**: ❌ Invalid - {str(e)}\n"
+            else:
+                test += f"**Format Validation**: ❌ Invalid - {format_error}\n"
 
             test += "\n## 📧 **Email Analysis**\n\n"
 
@@ -514,22 +624,13 @@ This email address is ready to use! You can:
                 test += f"**Domain**: {domain}\n"
                 test += f"**Length**: {len(current_email)} characters\n"
 
-                # Basic domain analysis
-                if "." in domain:
-                    test += "**Domain Format**: ✅ Contains TLD\n"
-                else:
-                    test += "**Domain Format**: ⚠️ Missing TLD\n"
-            else:
-                test += "**Format**: ❌ Missing @ symbol\n"
-
             test += "\n## 🔧 **Configuration Source**\n\n"
-            test += "**Source**: Environment variable or auto-discovery\n"
-            test += "**Storage**: Cached in configuration system\n"
-            test += "**Scope**: Used for all notification types\n\n"
+            test += f"**Source**: {email.source_label}\n"
+            test += f"**Scope**: {ADDRESS_SCOPE}\n\n"
 
             test += "## 🎯 **Test Results Summary**\n\n"
             test += "- **Email Present**: ✅ Yes\n"
-            if format_valid:
+            if format_error is None:
                 test += "- **Format Valid**: ✅ Yes\n"
                 test += "- **Ready for Notifications**: ✅ Yes\n\n"
 
@@ -542,21 +643,8 @@ This email address is ready to use! You can:
                 test += "- **Format Valid**: ❌ No\n"
                 test += "- **Ready for Notifications**: ❌ No\n\n"
 
-                test += "## 🔧 **Fix the Address**\n\n"
-                test += (
-                    "The configured address is not a valid email, "
-                    "so notifications cannot be delivered to it.\n"
-                )
-                test += "1. Check a replacement with `system_setup(action='validate_email', email='your@email.com')`\n"
-                if read_auth_mode() in ("clerk", "api_key"):
-                    # update_email is refused on the hosted server.
-                    test += (
-                        "2. Give the address on each alert with the email argument, for example "
-                        "`manage_alerts(action='create_simple', threshold=100, email='your@email.com')`\n"
-                    )
-                else:
-                    test += "2. Set it with `system_setup(action='update_email', email='your@email.com')`\n"
-                    test += "3. If that says it was not saved, set REVENIUM_DEFAULT_EMAIL in the server's environment and restart the server\n"
+                test += f"**Status**: {invalid_address_verdict(format_error)}\n\n"
+                test += fix_address_section()
 
         else:
             test += "## ❌ **No Email Configuration Found**\n\n"
@@ -564,15 +652,11 @@ This email address is ready to use! You can:
             test += "**Impact**: Alert notifications will not be sent\n\n"
 
             test += "## 🚀 **Required Actions**\n\n"
-            test += "1. **Configure Email**: Use `update_email(email='your@email.com')`\n"
-            test += "2. **Validate First**: Use `validate_email(email='your@email.com')`\n"
-            test += "3. **Get Help**: Use `setup_guidance()` for detailed instructions\n\n"
+            test += f"1. Check the address first with `{setup_call('validate_email', email=EXAMPLE_EMAIL)}`\n"
+            test += f"2. {set_email_step()}\n"
+            test += f"3. Get detailed instructions with `{setup_call('setup_guidance')}`\n\n"
 
-            test += "## 💡 **Why Email Configuration Matters**\n\n"
-            test += "- **Alert Notifications**: Get notified when thresholds are exceeded\n"
-            test += "- **System Updates**: Receive important system status changes\n"
-            test += "- **Team Collaboration**: Enable team-wide notification workflows\n"
-            test += "- **Monitoring**: Stay informed about your API usage and performance\n\n"
+            test += WHAT_AN_ADDRESS_RECEIVES + "\n"
 
             test += "## 🎯 **Test Results Summary**\n\n"
             test += "- **Email Present**: ❌ No\n"
@@ -649,11 +733,11 @@ This email address is ready to use! You can:
     async def _get_quick_start_guide(self) -> List[str]:
         """Get quick start guide."""
         return [
-            "Check current status with check_status()",
-            "Validate email format with validate_email(email='your@email.com')",
-            "Update email with update_email(email='your@email.com')",
-            "Get setup help with setup_guidance()",
-            "Test configuration with test_configuration()",
+            f"Check current status with {setup_call('check_status')}",
+            f"Validate email format with {setup_call('validate_email', email=EXAMPLE_EMAIL)}",
+            set_email_step(),
+            f"Get setup help with {setup_call('setup_guidance')}",
+            f"Test configuration with {setup_call('test_configuration')}",
         ]
 
     async def _get_common_use_cases(self) -> List[str]:
@@ -680,14 +764,7 @@ This email address is ready to use! You can:
 ```
 **Purpose**: Check current email configuration status and validation
 
-## **Update Email Address**
-```json
-{
-  "action": "update_email",
-  "email": "alerts@yourcompany.com"
-}
-```
-**Purpose**: Update notification email address for AI spending alerts
+""" + set_email_example() + """
 
 ## **Validate Email Format**
 ```json
@@ -714,26 +791,7 @@ This email address is ready to use! You can:
 ```
 **Purpose**: Test current email configuration and connectivity
 
-## **Common Workflows**
-
-### **Initial Email Setup**
-1. Start with `check_status()` to see current configuration
-2. Use `validate_email()` to test email format before updating
-3. Use `update_email()` to set notification email address
-4. Verify with `test_configuration()` to ensure it works
-
-### **Email Configuration Troubleshooting**
-1. Check `check_status()` for current state
-2. Use `setup_guidance()` for configuration help
-3. Test with `validate_email()` for format issues
-4. Update with `update_email()` if needed
-
-### **Email Address Changes**
-1. Validate new email with `validate_email(email='new@email.com')`
-2. Update configuration with `update_email(email='new@email.com')`
-3. Test new configuration with `test_configuration()`
-4. Verify status with `check_status()`
-
+""" + common_workflows() + """
 ## **Best Practices**
 - Always validate email format before updating
 - Test configuration after making changes
@@ -757,9 +815,7 @@ Email configuration and verification for notification setup with comprehensive v
    - Check current email configuration status
    - Validation and connectivity verification
 
-2. **update_email** - ✅ **CONFIGURATION**
-   - Update notification email address (requires email parameter)
-   - Automatic validation and format checking
+2. **update_email** - """ + update_email_capability() + """
 
 3. **validate_email** - ✅ **VALIDATION**
    - Validate email format without updating (requires email parameter)
@@ -794,7 +850,7 @@ Email configuration and verification for notification setup with comprehensive v
 - Provides foundation for notification setup workflows
 
 ## **Parameters**
-- **email** (string, optional): Email address for update_email and validate_email actions
+- **email** (string, optional): Email address for the validate_email action, and for update_email where this server keeps one
 - **validate_format** (boolean, optional): Enable format validation
 - **suggest_smart_defaults** (boolean, optional): Provide smart default suggestions
 - **include_setup_guidance** (boolean, optional): Include setup guidance in responses

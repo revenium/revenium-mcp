@@ -748,3 +748,130 @@ async def test_health_body_exposes_no_platform_host(monkeypatch, auth_mode):
     assert resp.status_code == 200
     assert "platform-secret" not in resp.text
     assert "base_url" not in resp.text
+
+
+# ── one platform check per cache period across /ready and /health (BACK-4741) ──
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auth_mode", _HOSTED_MODES)
+async def test_ready_after_a_health_refresh_sends_no_second_head(monkeypatch, auth_mode):
+    from src.revenium_mcp_server import health_endpoints
+
+    _hosted_mode(monkeypatch, auth_mode)
+    stub = _install_platform_stub(
+        monkeypatch, AsyncMock(return_value=httpx.Response(403))
+    )
+
+    async with _asgi_client(_build_mcp()) as client:
+        await client.get("/health")
+        await health_endpoints._refresh_task
+        ready = await client.get("/ready")
+        health = await client.get("/health")
+
+    assert ready.json() == {"status": "ready"}
+    assert health.json()["platform"]["status_code"] == 403
+    assert stub.head.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auth_mode", _HOSTED_MODES)
+async def test_health_after_ready_sends_no_second_head(monkeypatch, auth_mode):
+    _hosted_mode(monkeypatch, auth_mode)
+    stub = _install_platform_stub(
+        monkeypatch, AsyncMock(return_value=httpx.Response(200))
+    )
+
+    async with _asgi_client(_build_mcp()) as client:
+        await client.get("/ready")
+        health = await client.get("/health")
+        await client.get("/ready")
+
+    assert health.json()["platform"]["status_code"] == 200
+    assert stub.head.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ready_waits_on_the_refresh_health_started_instead_of_sending_another(
+    monkeypatch,
+):
+    from src.revenium_mcp_server import health_endpoints
+
+    _hosted_mode(monkeypatch, "api_key")
+    release = asyncio.Event()
+    calls = []
+
+    async def slow_head(*args, **kwargs):
+        calls.append(args)
+        await release.wait()
+        return httpx.Response(204)
+
+    _install_platform_stub(monkeypatch, slow_head)
+
+    async with _asgi_client(_build_mcp()) as client:
+        await client.get("/health")
+        refresh = health_endpoints._refresh_task
+        ready = asyncio.create_task(client.get("/ready"))
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert calls, "the refresh /health started never sent its HEAD"
+        assert not ready.done(), "/ready answered without waiting on the running refresh"
+        assert refresh is not None and not refresh.done()
+        assert health_endpoints._refresh_task is refresh
+        release.set()
+        resp = await asyncio.wait_for(ready, 1.0)
+
+    assert resp.json() == {"status": "ready"}
+    assert len(calls) == 1
+    assert health_endpoints._last_platform_probe.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_kick_refresh_returns_the_running_refresh_instead_of_starting_another(
+    monkeypatch,
+):
+    from src.revenium_mcp_server import health_endpoints
+
+    _hosted_mode(monkeypatch, "api_key")
+    release = asyncio.Event()
+    calls = []
+
+    async def slow_head(*args, **kwargs):
+        calls.append(args)
+        await release.wait()
+        return httpx.Response(200)
+
+    _install_platform_stub(monkeypatch, slow_head)
+
+    tasks = [health_endpoints._kick_refresh() for _ in range(20)]
+    await asyncio.sleep(0)
+    release.set()
+    await health_endpoints._refresh_task
+
+    assert isinstance(tasks[0], asyncio.Task)
+    assert all(task is tasks[0] for task in tasks)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_ready_does_not_cancel_the_shared_refresh(monkeypatch):
+    from src.revenium_mcp_server import health_endpoints
+
+    _hosted_mode(monkeypatch, "api_key")
+    release = asyncio.Event()
+
+    async def slow_head(*args, **kwargs):
+        await release.wait()
+        return httpx.Response(200)
+
+    _install_platform_stub(monkeypatch, slow_head)
+
+    waiter = asyncio.create_task(health_endpoints._shared_platform_probe())
+    await asyncio.sleep(0)
+    waiter.cancel()
+    release.set()
+    result = await health_endpoints._refresh_task
+
+    assert waiter.cancelled()
+    assert result.status_code == 200
+    assert health_endpoints._last_platform_probe is result

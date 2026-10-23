@@ -2053,6 +2053,26 @@ class TestManageCostControlsJsonPreprocessing:
     """Tests for the inner manage_cost_controls closure's dict-param JSON handling."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("sent, expected", [("true", True), ("false", False), (True, True)])
+    async def test_include_advisory_reaches_the_tool_as_a_boolean(self, sent, expected):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
+
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="get_enforcement_rules", include_advisory=sent)
+
+        assert captured_args["include_advisory"] is expected
+
+    @pytest.mark.asyncio
     async def test_valid_json_string_control_data_is_parsed(self):
         """control_data sent as a valid JSON object string is converted to a dict."""
         registry = _make_registry()
@@ -2144,6 +2164,49 @@ class TestManageCostControlsNumericPreprocessing:
 
         assert captured_args["page"] == 2
         assert captured_args["size"] == 5
+
+
+class TestManageCostControlsFilterValuesForwarding:
+    """BACK-4887: list_filter_values and its dimension reach the tool through the closure."""
+
+    @pytest.mark.asyncio
+    async def test_signature_declares_dimension(self):
+        import inspect
+
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
+
+        assert "dimension" in inspect.signature(registered_fn).parameters
+
+    @pytest.mark.asyncio
+    async def test_action_and_dimension_are_forwarded(self):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_cost_controls")
+
+        captured: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured.update(arguments, routed_action=action)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="list_filter_values", dimension="PROVIDER")
+
+        assert captured["routed_action"] == "list_filter_values"
+        assert captured["dimension"] == "PROVIDER"
+
+    @pytest.mark.asyncio
+    async def test_the_closure_tool_class_lists_the_action(self):
+        from src.revenium_mcp_server.tools_decomposed.cost_controls_management import (
+            CostControlsManagement,
+        )
+
+        schema = await CostControlsManagement()._get_input_schema()
+
+        assert "list_filter_values" in schema["properties"]["action"]["enum"]
 
 
 class TestManageCostControlsDepartmentPreviewForwarding:
@@ -2733,6 +2796,35 @@ class TestManageMeteringProvenanceForwarding:
         assert captured_args["effort"] == "high"
         assert "model_host" not in captured_args
         assert "subscriber_email_source" not in captured_args
+
+
+class TestManageMeteringEntrypointForwarding:
+    """BACK-4950: entrypoint is unreachable for MCP clients unless the closure declares it."""
+
+    @staticmethod
+    async def _forwarded_arguments(**arguments):
+        registry = _make_registry()
+        registered_fn = await _get_registered_closure(registry, "_register_manage_metering")
+        captured_args: dict = {}
+
+        async def fake_execution(tool_name, action, arguments, tool_class):
+            captured_args.update(arguments)
+            return [MagicMock()]
+
+        with patch(
+            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
+            new=fake_execution,
+        ):
+            await registered_fn(action="submit_ai_transaction", **arguments)
+        return captured_args
+
+    @pytest.mark.asyncio
+    async def test_entrypoint_is_forwarded_to_execution(self):
+        assert (await self._forwarded_arguments(entrypoint="sdk-py"))["entrypoint"] == "sdk-py"
+
+    @pytest.mark.asyncio
+    async def test_entrypoint_is_omitted_when_absent(self):
+        assert "entrypoint" not in await self._forwarded_arguments(effort="high")
 
 
 class TestSystemDiagnosticsStrictIngestionClosure:
@@ -3849,10 +3941,10 @@ class TestSubscriberCredentialsTopLevelInputs:
     @pytest.mark.asyncio
     async def test_get_business_guidance_uses_its_input(self):
         is_error, text, _ = await self._call(
-            {"action": "get_business_guidance", "scenario": "security_rotation"}
+            {"action": "get_business_guidance", "scenario": "credential_audit"}
         )
         assert not is_error, text
-        assert '"scenario": "security_rotation"' in text
+        assert '"scenario": "credential_audit"' in text
 
     @pytest.mark.asyncio
     async def test_get_onboarding_checklist_uses_its_input(self):
@@ -4041,6 +4133,43 @@ class TestSubscriberCredentialsFieldFolding:
             "subscriberId": "sub_1",
             "externalSecret": "s" * 12,
             "subscriptionIds": ["subs_1"],
+        }
+
+    @pytest.mark.asyncio
+    async def test_update_folds_top_level_name_and_owner_ids(self):
+        is_error, text, captured = await self._call(
+            {
+                "action": "update",
+                "credential_id": "cred_1",
+                "name": "Renamed",
+                "subscriberId": "sub_2",
+                "organizationId": "org_2",
+            }
+        )
+
+        assert not is_error, text
+        assert captured["credential_data"] == {
+            "name": "Renamed",
+            "subscriberId": "sub_2",
+            "organizationId": "org_2",
+        }
+
+    @pytest.mark.asyncio
+    async def test_create_with_credential_data_folds_top_level_owner_ids(self):
+        is_error, text, captured = await self._call(
+            {
+                "action": "create",
+                "credential_data": {"label": "Ops key"},
+                "subscriberId": "sub_1",
+                "organizationId": "org_1",
+            }
+        )
+
+        assert not is_error, text
+        assert captured["credential_data"] == {
+            "label": "Ops key",
+            "subscriberId": "sub_1",
+            "organizationId": "org_1",
         }
 
     @pytest.mark.asyncio

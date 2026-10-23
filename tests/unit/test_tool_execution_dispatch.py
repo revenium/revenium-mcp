@@ -18,10 +18,12 @@ from src.revenium_mcp_server.capability_manager.integration_service import (
     ucm_integration_service,
 )
 from src.revenium_mcp_server.common import tool_execution
+from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import (
     ErrorCodes,
     IntrospectionError,
     ToolError,
+    ToolExecutionError,
     ToolNotFoundError,
 )
 from src.revenium_mcp_server.introspection.integration import (
@@ -296,3 +298,60 @@ async def test_introspection_failures_still_fall_back(monkeypatch, error):
         tool_name="fake_tool", action="list", arguments={}, tool_class=FakeTool
     )
     assert result[0].text == "direct ok"
+
+
+class _CountingClient:
+    """Stands in for ReveniumClient: counts requests and fails each one."""
+
+    def __init__(self, error):
+        self.requests = 0
+        self._error = error
+
+    async def post(self, endpoint, data=None):
+        self.requests += 1
+        raise self._error
+
+
+def _provider_writing_through(client):
+    class WritingTool:
+        def __init__(self, ucm_helper=None):
+            pass
+
+        async def handle_action(self, action, arguments, ctx=None):
+            await client.post("/profitstream/v2/api/products", data={"name": "p"})
+            return [TextContent(type="text", text="created")]
+
+    return WritingTool
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        ReveniumAPIError("Service Unavailable", status_code=503),
+        ReveniumAPIError(
+            "Request failed: the platform did not answer POST /x within 30 seconds (ReadTimeout)"
+        ),
+    ],
+)
+async def test_a_platform_error_reaches_the_caller_after_one_request(monkeypatch, error):
+    """BACK-4841: a platform error (a 5xx or a timeout) ends the call. The action
+    is not run a second time, so a write is not resent and a timeout is waited
+    out once."""
+    client = _CountingClient(error)
+    tool_class = _provider_writing_through(client)
+
+    async def _get_provider(tool_name):
+        return tool_class()
+
+    monkeypatch.setattr(
+        introspection_integration.engine.registry, "get_provider", _get_provider
+    )
+
+    with pytest.raises(ToolExecutionError) as raised:
+        await tool_execution.standardized_tool_execution(
+            tool_name="fake_tool", action="create", arguments={}, tool_class=tool_class
+        )
+    assert client.requests == 1
+    assert error.message in str(raised.value)
+    assert raised.value.__cause__ is error

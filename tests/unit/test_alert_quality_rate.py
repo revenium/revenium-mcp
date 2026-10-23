@@ -25,6 +25,7 @@ from revenium_mcp_server.alert_metrics import (
     METRIC_BUCKETS,
     QUALITY_RATE,
     QUALITY_RATE_METRIC_KEY,
+    bucket_for_metric,
     bucket_metrics,
     check_metric_rules,
 )
@@ -72,6 +73,10 @@ class TestMetricBuckets:
         buckets = bucket_metrics(["SOME_FUTURE_COST_METRIC"])
 
         assert buckets["cost_metrics"] == ["SOME_FUTURE_COST_METRIC"]
+
+    def test_request_count_has_an_explicit_bucket(self):
+        """No fallback substring matches REQUEST_COUNT, so only the mapping keeps it (BACK-4911)."""
+        assert bucket_for_metric("REQUEST_COUNT") == "performance_metrics"
 
 
 class TestAdvertisedCapabilities:

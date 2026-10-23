@@ -26,12 +26,14 @@ from ..common.error_handling import (
 )
 from ..common.formatting import format_page_count_heading
 from ..common.partial_update_handler import PartialUpdateHandler
+from ..common.platform_paging import PLATFORM_MAX_PAGE_SIZE
 from ..common.sample_coverage import (
     describe_sample,
     platform_total,
     reference_id,
     share_of_sample,
 )
+from ..common.team_reference import with_team_reference_as_team_id
 from ..common.update_configs import UpdateConfigFactory
 from ..common.validation import SAFE_INT_MAX, apply_filter_allowlist
 from ..config_store import configured_default_email, get_config_value
@@ -136,8 +138,7 @@ def _sanitize_undefined_sentinels(data: Any) -> Any:
 
 _MAX_SUBSCRIPTIONS_PAGE = 1_000_000
 
-# Upper bound on the size parameter (matches PaginationPerformanceManager.MAXIMUM_LIMIT).
-_MAX_SUBSCRIPTIONS_SIZE = 100
+_MAX_SUBSCRIPTIONS_SIZE = PLATFORM_MAX_PAGE_SIZE
 
 # How many products a name-only create offers when it asks which one to use.
 _QUICK_CREATE_PRODUCT_CHOICES = 5
@@ -302,6 +303,38 @@ def _refuse_missing_invoice_address(subscription_data: Dict[str, Any]) -> NoRetu
         error_code=ErrorCodes.MISSING_PARAMETER,
         field="clientEmailAddress",
     )
+
+
+def _require_subscription_object(
+    subscription_data: Any,
+    *,
+    fields: str,
+    outcome: str,
+    example: str,
+    examples: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not isinstance(subscription_data, dict):
+        raise create_structured_validation_error(
+            message=f"subscription_data must be an object of {fields}, so {outcome}",
+            field="subscription_data",
+            value=subscription_data,
+            suggestions=[f"Pass subscription_data as an object, for example {example}"],
+            examples=examples,
+        )
+
+
+_CREATE_EXAMPLE = "{'name': 'Monthly', 'product_id': 'prod_123', 'clientEmailAddress': 'billing@company.com'}"
+
+
+def _create_subscription_fields(subscription_data: Any) -> Dict[str, Any]:
+    """The create's subscription_data as an object whose team is a teamId, or a refusal."""
+    _require_subscription_object(
+        subscription_data,
+        fields="the subscription's fields",
+        outcome="nothing was created",
+        example=_CREATE_EXAMPLE,
+    )
+    return with_team_reference_as_team_id(subscription_data, "subscription_data")
 
 
 def _default_address_note(address: str) -> str:
@@ -960,8 +993,7 @@ class SubscriptionManager:
                 },
             )
 
-        # REMOVED: Status validation - status field NOT FOUND in actual Revenium API responses
-        # The API does not return or accept a status field for subscription objects
+        subscription_data = _create_subscription_fields(subscription_data)
 
         # Add required API fields that were missing
         if "productId" not in subscription_data and "product_id" in subscription_data:
@@ -1020,17 +1052,13 @@ class SubscriptionManager:
                 },
             )
 
-        if not isinstance(subscription_data, dict):
-            raise create_structured_validation_error(
-                message=(
-                    "subscription_data must be an object of the fields to change, "
-                    "so nothing was changed"
-                ),
-                field="subscription_data",
-                value=subscription_data,
-                suggestions=["Pass subscription_data as an object, for example {'name': 'New name'}"],
-                examples={"updatable_fields": list(_UPDATABLE_FIELDS_HINT)},
-            )
+        _require_subscription_object(
+            subscription_data,
+            fields="the fields to change",
+            outcome="nothing was changed",
+            example="{'name': 'New name'}",
+            examples={"updatable_fields": list(_UPDATABLE_FIELDS_HINT)},
+        )
 
         if "status" in subscription_data:
             raise create_structured_validation_error(
@@ -2579,7 +2607,10 @@ class SubscriptionManagement(ToolBase):
             ]
         elif action == "create":
             # Unified creation action with progressive complexity support
-            subscription_data = arguments.get("subscription_data", {})
+            subscription_data = _create_subscription_fields(
+                arguments.get("subscription_data", {})
+            )
+            arguments = {**arguments, "subscription_data": subscription_data}
             auto_generate = arguments.get("auto_generate", True)  # Default to Context7 simple mode
             dry_run = arguments.get("dry_run", False)
             default_address_note = ""

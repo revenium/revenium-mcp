@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
+from ..client import ReveniumAPIError
 from ..common.error_handling import ToolError
 from ..tools_decomposed.unified_tool_base import ToolBase
 from .engine import introspection_engine
@@ -330,9 +331,9 @@ class IntrospectionIntegration:
             # as a tool-error response (which would trigger the caller's
             # direct-execution fallback).
             raise
-        except ToolError:
-            # Re-raise ToolError exceptions without modification
-            # This preserves helpful error messages with specific suggestions
+        except (ToolError, ReveniumAPIError):
+            # Raised as-is: a text response here would make the caller run the
+            # action a second time, repeating its platform calls.
             raise
         except Exception as e:
             logger.error(f"Error executing tool {tool_name}.{action}: {e}")

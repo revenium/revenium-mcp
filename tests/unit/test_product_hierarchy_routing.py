@@ -44,6 +44,7 @@ class FakeNavigationResult:
     metadata: Dict[str, Any] = None
     error_message: Optional[str] = None
     incomplete: bool = False
+    retryable: bool = True
 
     def __post_init__(self):
         if self.related_entities is None:
@@ -405,6 +406,29 @@ class TestGetSubscriptions:
             await mgr.get_subscriptions({"product_id": "p1"})
         _assert_retryable_walk_failure(exc_info.value)
 
+    @pytest.mark.asyncio
+    async def test_a_search_too_broad_points_at_paging_and_never_at_a_retry(self):
+        """BACK-4736: the same request always gets the same refusal."""
+        mgr = _make_hierarchy_manager()
+        mgr.navigation_service.get_subscriptions_for_product = AsyncMock(
+            return_value=FakeNavigationResult(
+                success=False,
+                incomplete=True,
+                retryable=False,
+                metadata={"search_term": "Prod", "search_limit": 500},
+                error_message="that search matches more than 500 subscriptions",
+            )
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await mgr.get_subscriptions({"product_id": "p1"})
+        suggestions = exc_info.value.suggestions
+        assert not any(s.startswith("Retry the request") for s in suggestions)
+        assert not any("reachable" in s for s in suggestions)
+        assert any(
+            'action="search_subscriptions", product_name="Prod", page=0' in s
+            for s in suggestions
+        )
+
 
 # ===========================================================================
 # ProductHierarchyManager.get_related_credentials
@@ -561,6 +585,49 @@ class TestCreateWithSubscription:
         client.create_subscription.assert_not_awaited()
         client.create_source.assert_not_awaited()
         client.create_metering_element_definition.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_subscription_is_filed_under_the_team_it_names(self):
+        """BACK-4852: the platform files a subscription under teamId and ignores team."""
+        client = _make_client()
+        mgr = _make_hierarchy_manager(client)
+        self._setup_happy_path(mgr, client)
+
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
+            return_value="owner_123",
+        ):
+            await mgr.create_with_subscription(
+                {
+                    "product_data": _valid_product_data(),
+                    "subscription_data": {**_valid_subscription_data(), "team": {"id": "team_named"}},
+                }
+            )
+
+        body = client.create_subscription.call_args[0][0]
+        assert body["teamId"] == "team_named"
+        assert "team" not in body
+
+    @pytest.mark.asyncio
+    async def test_a_subscription_naming_two_teams_is_refused_before_the_product_is_written(self):
+        client = _make_client()
+        mgr = _make_hierarchy_manager(client)
+        self._setup_happy_path(mgr, client)
+
+        with pytest.raises(ToolError) as exc_info:
+            await mgr.create_with_subscription(
+                {
+                    "product_data": _valid_product_data(),
+                    "subscription_data": {
+                        **_valid_subscription_data(),
+                        "team": "team_a",
+                        "teamId": "team_b",
+                    },
+                }
+            )
+
+        assert exc_info.value.field == "subscription_data.teamId"
+        client.create_product.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status_code", [403, 500, None])

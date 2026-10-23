@@ -44,8 +44,11 @@ from ..common.error_handling import (
     create_structured_validation_error,
 )
 from ..common.pagination_performance import validate_pagination_with_performance
+from ..common.platform_paging import PLATFORM_MAX_PAGE_SIZE
 from ..common.partial_update_handler import PartialUpdateHandler
-from ..common.validation import SAFE_INT_MAX, preprocess_boolean_parameters
+from ..common.dry_run_guard import dry_run_requested
+from ..common.team_reference import with_team_reference_as_team_id
+from ..common.validation import SAFE_INT_MAX
 from ..common.ucm_config import log_ucm_status
 from ..common.update_configs import UpdateConfigFactory
 from ..config_store import get_config_value
@@ -54,6 +57,7 @@ from ..hierarchy import (
     get_entity_lookup_service,
     get_hierarchy_navigation_service,
 )
+from ..hierarchy.navigation_service import incomplete_lookup_suggestions
 from ..introspection.metadata import (
     ResourceRelationship,
     ToolCapability,
@@ -67,8 +71,7 @@ from .unified_tool_base import ToolBase
 # Sanity cap on integer page values. Large indices (e.g. 2**31) are almost certainly caller errors; reject them before they reach the API.
 _MAX_PRODUCTS_PAGE = 1_000_000
 
-# Upper bound on the size parameter (matches PaginationPerformanceManager.MAXIMUM_LIMIT).
-_MAX_PRODUCTS_SIZE = 100
+_MAX_PRODUCTS_SIZE = PLATFORM_MAX_PAGE_SIZE
 
 # The only key the list action's `filters` dict understands. The products endpoint
 # ignores query params it does not recognise, so anything forwarded blindly came
@@ -371,16 +374,10 @@ _QUICK_CREATES_WITHOUT_PREVIEW = frozenset({"create_simple", "create_with_subscr
 
 
 def _refuse_dry_run_on_quick_creates(action: str, arguments: Dict[str, Any]) -> None:
-    """Refuse dry_run on a quick create, whose handler would write anyway.
-
-    An unrecognised string counts as a request, so a value the boolean
-    preprocessing does not know fails closed instead of letting the write run.
-    """
-    if action not in _QUICK_CREATES_WITHOUT_PREVIEW:
+    """Refuse dry_run on a quick create, whose handler would write anyway."""
+    if action not in _QUICK_CREATES_WITHOUT_PREVIEW or not dry_run_requested(arguments):
         return
     requested = arguments.get("dry_run")
-    if not preprocess_boolean_parameters({"dry_run": requested}, ["dry_run"])["dry_run"]:
-        return
     raise ToolError(
         message=(
             f"{action} has no preview, so the dry_run request was refused and "
@@ -1049,7 +1046,9 @@ class ProductManager:
                         "is merged field by field into the stored plan, so tiers, period, "
                         "elements and setup fees you leave out are kept; a list you send, "
                         "such as 'tiers', replaces the stored one. An update that would "
-                        "leave the plan with no tiers is refused."
+                        "leave the plan with no tiers is refused, and so is a plan change "
+                        "while a tier has neither unitAmount nor upTo (send unitAmount 0 to "
+                        "keep it flat). An update without 'plan' leaves the stored plan as it is."
                     ),
                     "updatable_fields": [
                         "name",
@@ -1528,137 +1527,6 @@ class ProductEnhancementProcessor:
 
         return await self.client.create_product(product_config)
 
-    async def create_from_description(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Create product from natural language description with enhanced setup fee validation."""
-        description = arguments.get("description") or arguments.get("text", "")
-        if not description:
-            raise create_structured_missing_parameter_error(
-                parameter_name="description or text",
-                action="create product from natural language",
-                examples={
-                    "usage": "create_from_description(description='Premium API access plan with 10000 requests per month for $99')",
-                    "valid_format": "Natural language description including product details and pricing",
-                    "example_descriptions": [
-                        "Premium API access plan with 10000 requests per month for $99",
-                        "Basic subscription tier with limited features for $29 monthly",
-                        "Enterprise plan with unlimited access and support for $299 per month",
-                    ],
-                    "product_lifecycle": "PRODUCT LIFECYCLE: Natural language creation establishes product configuration from description",
-                },
-            )
-
-        if not self.nlp_processor:
-            # Fallback to simple creation
-            product_name = f"Product from description: {description[:30]}..."
-            return await self.create_simple({"name": product_name})
-
-        # Parse the natural language description
-        parsed_result = self.nlp_processor.parse_product_request(description)
-
-        # CRITICAL FIX: If NLP processor returns empty name, generate a meaningful one
-        name = parsed_result.get("name")
-        if not name or name.strip() == "":
-            # Extract meaningful name from description or use fallback
-            import re
-
-            # Try to extract product type keywords
-            description_lower = description.lower()
-            if "chatbot" in description_lower:
-                parsed_result["name"] = "Phase 1B validation chatbot"
-            elif "api" in description_lower:
-                parsed_result["name"] = "API Service"
-            elif "subscription" in description_lower or "plan" in description_lower:
-                parsed_result["name"] = "Subscription Plan"
-            else:
-                # Fallback: use first few meaningful words
-                words = re.findall(r"\b[A-Za-z][A-Za-z]+\b", description)
-                if len(words) >= 2:
-                    parsed_result["name"] = " ".join(words[:3]).title()
-                else:
-                    parsed_result["name"] = "Custom Product"
-
-        # Ensure plan name is also populated
-        if "plan" in parsed_result and (
-            not parsed_result["plan"].get("name") or parsed_result["plan"]["name"].strip() == ""
-        ):
-            parsed_result["plan"]["name"] = f"{parsed_result['name']} Plan"
-
-        # Enhanced setup fee validation and processing
-        if "setupFees" in parsed_result and parsed_result["setupFees"]:
-            setup_fee_data = parsed_result["setupFees"][0]  # Get first setup fee
-            validation_result = self._validate_setup_fee_configuration(setup_fee_data)
-
-            if not validation_result["valid"]:
-                # If setup fee validation fails, provide helpful error with suggestions
-                suggestions = self._generate_setup_fee_suggestions(description)
-                error_message = (
-                    f"Setup fee validation failed: {'; '.join(validation_result['errors'])}"
-                )
-                if validation_result["warnings"]:
-                    error_message += f" Warnings: {'; '.join(validation_result['warnings'])}"
-
-                raise create_structured_validation_error(
-                    message=error_message,
-                    field="setupFees",
-                    value=setup_fee_data,
-                    suggestions=suggestions[:3]
-                    + [
-                        "Use get_examples() to see valid setup fee configurations",
-                        "Check setup fee type and amount formatting",
-                        "Verify setup fee business logic requirements",
-                    ],
-                    examples={
-                        "valid_setup_fees": [
-                            {"name": "Setup Fee", "type": "SUBSCRIPTION", "flatAmount": 50.00},
-                            {
-                                "name": "Customer Setup",
-                                "type": "ORGANIZATION",
-                                "flatAmount": 100.00,
-                            },
-                        ],
-                        "setup_fee_types": [
-                            "SUBSCRIPTION (per subscription)",
-                            "ORGANIZATION (per customer)",
-                        ],
-                        "business_logic": "Setup fees are charged once based on type",
-                        "product_lifecycle": "PRODUCT LIFECYCLE: Setup fees affect initial billing and customer onboarding",
-                        "migration_notice": "UPDATED: Use 'flatAmount' instead of 'amount', 'currency' field no longer used",
-                    },
-                )
-
-            # Use enhanced setup fee data
-            parsed_result["setupFees"][0] = validation_result["enhanced_data"]
-
-            # Add validation warnings to parsing guidance
-            if validation_result["warnings"]:
-                if "_parsing_guidance" not in parsed_result:
-                    parsed_result["_parsing_guidance"] = {}
-                parsed_result["_parsing_guidance"]["setup_fee_warnings"] = validation_result[
-                    "warnings"
-                ]
-
-        # Remove internal guidance fields
-        product_data = {k: v for k, v in parsed_result.items() if not k.startswith("_")}
-
-        # Add required fields
-        product_data["teamId"] = self.client.team_id
-        owner_id = get_config_value("REVENIUM_OWNER_ID")
-        if owner_id:
-            product_data["ownerId"] = owner_id
-        _apply_draft_defaults(product_data)
-
-        # Create the product
-        result = await self.client.create_product(product_data)
-
-        # Add setup fee validation info to result for agent feedback
-        if "setupFees" in product_data and validation_result.get("warnings"):
-            result["_setup_fee_validation"] = {
-                "warnings": validation_result["warnings"],
-                "suggestions": self._generate_setup_fee_suggestions(description),
-            }
-
-        return result
-
     async def get_templates(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get product templates."""
         if not self.template_library:
@@ -2118,13 +1986,7 @@ class ProductEnhancementProcessor:
         }
 
 
-_INCOMPLETE_WALK_SUGGESTIONS = [
-    "Retry the request; one page of subscriptions failed to load",
-    "If it keeps failing, check that the Revenium API is reachable",
-]
-
-
-def _raise_if_walk_incomplete(
+def _raise_if_lookup_incomplete(
     navigation_result: Any, message: str, field: str, value: str
 ) -> None:
     if navigation_result.incomplete is True:
@@ -2133,7 +1995,7 @@ def _raise_if_walk_incomplete(
             error_code=ErrorCodes.API_ERROR,
             field=field,
             value=value,
-            suggestions=list(_INCOMPLETE_WALK_SUGGESTIONS),
+            suggestions=incomplete_lookup_suggestions(navigation_result),
         )
 
 
@@ -2168,7 +2030,7 @@ class ProductHierarchyManager:
 
         if not navigation_result.success:
             message = f"Failed to get subscriptions for product {product_id}: {navigation_result.error_message}"
-            _raise_if_walk_incomplete(navigation_result, message, "product_id", product_id)
+            _raise_if_lookup_incomplete(navigation_result, message, "product_id", product_id)
             raise ToolError(
                 message=message,
                 error_code=ErrorCodes.RESOURCE_NOT_FOUND,
@@ -2213,7 +2075,7 @@ class ProductHierarchyManager:
 
         if not navigation_result.success:
             message = f"Failed to get hierarchy for product {product_id}: {navigation_result.error_message}"
-            _raise_if_walk_incomplete(navigation_result, message, "product_id", product_id)
+            _raise_if_lookup_incomplete(navigation_result, message, "product_id", product_id)
             raise ToolError(
                 message=message,
                 error_code=ErrorCodes.RESOURCE_NOT_FOUND,
@@ -2446,6 +2308,7 @@ class ProductHierarchyManager:
 
         # Validate required fields
         self._validate_required_fields(product_data, subscription_data)
+        subscription_data = with_team_reference_as_team_id(subscription_data, "subscription_data")
 
         # Validate plan.name specifically (common source of confusion)
         if "plan" in product_data and isinstance(product_data["plan"], dict):

@@ -830,6 +830,27 @@ async def test_an_unknown_slack_configuration_is_named_instead_of_the_alert():
 
 
 @pytest.mark.asyncio
+async def test_a_slack_lookup_answered_403_refuses_create_and_update_as_not_found():
+    """BACK-4679: that endpoint answers 403 for an id it does not hold, as setup_status reads it."""
+    forbidden = ReveniumAPIError("HTTP 403: Access Denied", 403, {"error_data": "Access Denied"})
+    platform = SlackCheckingPlatform([threshold_alert("a1", periodDuration="DAILY")], lookup_error=forbidden)
+    tools = _tools(platform)
+
+    created = await _outcome(tools.handle_action("create_cumulative_usage_alert", dict(BUDGET_WITH_SLACK)))
+    updated = await _outcome(
+        tools.handle_action("update", {"anomaly_id": "a1", "slack_config_id": UNKNOWN_SLACK})
+    )
+
+    for result, verb in ((created, "created"), (updated, "updated")):
+        assert result[0] is True
+        assert f"Slack configuration {UNKNOWN_SLACK} was not found in this organization" in result[1]
+        assert f"nothing was {verb}" in result[1]
+        assert "Anomaly ID" not in result[1]
+    assert platform.slack_lookups == [UNKNOWN_SLACK, UNKNOWN_SLACK]
+    assert platform.created_bodies == [] and platform.updated_bodies == []
+
+
+@pytest.mark.asyncio
 async def test_a_refused_update_that_sends_no_slack_configuration_keeps_the_platform_error():
     """BACK-4803: a stored Slack id the update never sends is not blamed for its refusal."""
     platform = SlackCheckingPlatform(

@@ -7,6 +7,7 @@ import pytest
 from src.revenium_mcp_server.alerts.update_fidelity import (
     UNVERIFIED_UPDATE_FIELDS,
     platform_rule_breach,
+    unapplied_fields,
 )
 from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.tools_decomposed.alert_management import (
@@ -17,6 +18,16 @@ from tests.unit.anomaly_platform_fake import FakeAnomalyPlatform, answer, thresh
 
 NEW = "finance@example.com"
 MODEL_FILTER = [{"dimension": "MODEL", "operator": "IS", "value": "gpt-4o"}]
+
+
+_QUALITY_RATE_RULE = {
+    "rule_type": "THRESHOLD",
+    "metric": "quality_rate",
+    "operator": "<",
+    "value": 80,
+    "time_window": "1h",
+}
+_TASK_TYPE_FILTER = {"field": "task_type", "operator": "is", "value": "code_review"}
 
 
 def _tools_over(platform: FakeAnomalyPlatform) -> AlertManagement:
@@ -277,6 +288,27 @@ class TestAFieldTheAnswerOmitsIsReadBack:
         await _tools_over(platform).handle_action("update", {"anomaly_id": "a1", "name": "Renamed"})
 
         assert platform.read_ids == ["a1"]
+
+
+def _model_filter_with_value(value):
+    return {"filters": [{"dimension": "MODEL", "operator": "IS", "value": value}]}
+
+
+@pytest.mark.parametrize(
+    ("sent", "stored"), [("", None), (None, "")], ids=["blank-sent-null-stored", "null-sent-blank-stored"]
+)
+def test_a_blank_filter_value_and_a_missing_one_read_back_as_different(sent, stored):
+    differences = unapplied_fields(
+        _model_filter_with_value(sent), _model_filter_with_value(stored)
+    )
+
+    assert len(differences) == 1
+    assert differences[0].startswith("filters (sent")
+
+
+@pytest.mark.parametrize("value", ["", None, "gpt-4o"])
+def test_a_filter_value_stored_as_sent_reads_back_as_applied(value):
+    assert unapplied_fields(_model_filter_with_value(value), _model_filter_with_value(value)) == []
 
 
 FLAT_FIELD_SAMPLES = {
@@ -1159,3 +1191,133 @@ class TestABulkCallWhereNothingSucceededIsAnError:
         assert flagged is False
         assert "g1 (no name)" in text
         assert "None" not in text
+
+
+REQUEST_COUNT = "REQUEST_COUNT"
+
+
+@pytest.mark.asyncio
+class TestRequestCountIsAMetricThePlatformHas:
+    """BACK-4911: the platform added REQUEST_COUNT to AIAlertMetricType, so the MCP passes it through."""
+
+    @pytest.mark.usefixtures("alert_owner_email")
+    async def test_a_request_count_alert_is_created(self, platform, tools):
+        alert = {
+            "name": "Request volume",
+            "alertType": "THRESHOLD",
+            "metricType": REQUEST_COUNT,
+            "operatorType": "GREATER_THAN",
+            "threshold": 1000,
+            "periodDuration": "DAILY",
+        }
+
+        flagged, text = await answer(tools.handle_action("create", {"anomaly_data": alert}))
+
+        assert flagged is False, text
+        assert platform.created_bodies[-1]["metricType"] == REQUEST_COUNT
+
+    @pytest.mark.usefixtures("alert_owner_email")
+    @pytest.mark.parametrize(
+        "metric", ["request_count", "image_count", "duration", "tokens_per_request"]
+    )
+    async def test_a_detection_rule_naming_a_newer_metric_is_created(self, platform, tools, metric):
+        """BACK-4965: detection_rules accept every metric the plain metricType does."""
+        rule = {
+            "rule_type": "THRESHOLD",
+            "metric": metric,
+            "operator": ">",
+            "value": 1000,
+            "time_window": "1h",
+        }
+
+        flagged, text = await answer(
+            tools.handle_action(
+                "create", {"anomaly_data": {"name": "Rule volume", "detection_rules": [rule]}}
+            )
+        )
+
+        assert flagged is False, text
+        assert platform.created_bodies[-1]["metricType"] == metric.upper()
+
+    @pytest.mark.usefixtures("alert_owner_email")
+    @pytest.mark.parametrize("action", ["create", "validate"])
+    @pytest.mark.parametrize("spelling", ["minSampleCount", "min_sample_count"])
+    async def test_a_quality_rate_detection_rule_keeps_its_sample_floor(
+        self, platform, tools, action, spelling
+    ):
+        """BACK-4965 review: the floor is checked against the converted metric and sent."""
+        alert = {
+            "name": "Review quality",
+            "detection_rules": [_QUALITY_RATE_RULE],
+            "filters": [_TASK_TYPE_FILTER],
+            spelling: 100,
+        }
+
+        flagged, text = await answer(tools.handle_action(action, {"anomaly_data": alert}))
+
+        assert flagged is False, text
+        if action == "create":
+            sent = platform.created_bodies[-1]
+            assert sent["metricType"] == "QUALITY_RATE"
+            assert sent["minSampleCount"] == 100
+        else:
+            assert '"valid": true' in text
+
+    @pytest.mark.usefixtures("alert_owner_email")
+    async def test_a_sample_floor_on_a_non_quality_detection_rule_is_refused(self, platform, tools):
+        rule = {**_QUALITY_RATE_RULE, "metric": "request_count"}
+        alert = {"name": "Volume", "detection_rules": [rule], "minSampleCount": 100}
+
+        flagged, text = await answer(tools.handle_action("create", {"anomaly_data": alert}))
+
+        assert flagged is True
+        assert "minSampleCount applies to QUALITY_RATE alerts only" in text
+        assert "REQUEST_COUNT" in text
+        assert platform.created_bodies == []
+
+    @pytest.mark.usefixtures("alert_owner_email")
+    async def test_a_sample_floor_below_one_on_a_quality_detection_rule_is_refused(self, platform, tools):
+        alert = {
+            "name": "Review quality",
+            "detection_rules": [_QUALITY_RATE_RULE],
+            "filters": [_TASK_TYPE_FILTER],
+            "minSampleCount": 0,
+        }
+
+        flagged, text = await answer(tools.handle_action("create", {"anomaly_data": alert}))
+
+        assert flagged is True
+        assert "at least 1" in text
+        assert platform.created_bodies == []
+
+    async def test_an_alert_moved_to_request_count_is_updated(self, platform, tools):
+        flagged, text = await answer(
+            tools.handle_action(
+                "update", {"anomaly_id": "a1", "anomaly_data": {"metricType": REQUEST_COUNT}}
+            )
+        )
+
+        assert flagged is False, text
+        assert _sent_body(platform)["metricType"] == REQUEST_COUNT
+        assert platform.store["a1"]["metricType"] == REQUEST_COUNT
+
+    @pytest.mark.parametrize("action, stored_enabled", [("enable", False), ("disable", True)])
+    async def test_a_stored_request_count_alert_can_be_switched(self, action, stored_enabled):
+        platform = FakeAnomalyPlatform(
+            [threshold_alert("q1", metricType=REQUEST_COUNT, enabled=stored_enabled)]
+        )
+
+        flagged, text = await answer(
+            _tools_over(platform).handle_action(action, {"anomaly_id": "q1"})
+        )
+
+        assert flagged is False, text
+        assert platform.store["q1"]["enabled"] is (not stored_enabled)
+
+    async def test_request_count_is_advertised_beside_requests_per_minute(self):
+        from src.revenium_mcp_server.schema.alert_schema import get_alert_metrics_capabilities
+
+        metrics = await get_alert_metrics_capabilities(None)
+
+        assert REQUEST_COUNT in metrics["performance_metrics"]
+        assert "REQUESTS_PER_MINUTE" in metrics["performance_metrics"]

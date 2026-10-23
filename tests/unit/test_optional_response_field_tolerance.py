@@ -161,29 +161,6 @@ class TestCreateSimpleSourceAssignment:
 
 
 # ===========================================================================
-# Pick-first-default source assignment (create_from_description, NLP path)
-# ===========================================================================
-
-
-class TestCreateFromDescriptionSourceAssignment:
-    @pytest.mark.asyncio
-    async def test_attaches_no_source_even_when_one_exists(self):
-        client = _product_client()
-        client._extract_embedded_data.return_value = [{"name": "no-id"}, {"id": "src_2"}]
-        nlp = MagicMock()
-        nlp.parse_product_request.return_value = {
-            "name": "My Product",
-            "plan": {"name": "Plan", "currency": "USD"},
-        }
-        proc = _make_enh_processor(client, nlp_processor=nlp)
-        with patch(_GET_CONFIG, return_value=None):
-            await proc.create_from_description({"description": "a product"})
-        sent = client.create_product.call_args[0][0]
-        assert "sourceIds" not in sent
-        assert client.get_sources.await_count == 0
-
-
-# ===========================================================================
 # create_with_subscription — sources (empty-branch raises) and elements
 # (empty-branch falls back)
 # ===========================================================================

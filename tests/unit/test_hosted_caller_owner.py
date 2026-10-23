@@ -375,3 +375,38 @@ def test_a_profile_with_an_email_key_and_no_email_shaped_label_keeps_the_email()
     assert email_from_user_profile({"label": "Alice", "email": "alice@org.test"}) == "alice@org.test"
     assert email_from_user_profile({"label": "alice@org.test"}) == "alice@org.test"
     assert email_from_user_profile({"label": "Alice"}) is None
+
+
+@pytest.mark.asyncio
+async def test_a_source_create_with_no_known_owner_is_refused_before_anything_is_sent(
+    monkeypatch,
+):
+    """BACK-4740: the platform answers HTTP 400 for a source without ownerId."""
+    from src.revenium_mcp_server.common.error_handling import ToolError
+
+    monkeypatch.setenv("AUTH_MODE", "clerk")
+    monkeypatch.setenv("REVENIUM_OWNER_ID", "usr_server_operator")
+    http = _users_me_client(httpx.Response(503))
+    client = MagicMock(team_id="team_clerk")
+    client.create_source = AsyncMock(return_value={"id": "src_new"})
+    refusals = []
+
+    async def call_next(_context):
+        try:
+            await SourceManager(client).create_source(
+                {"source_data": {"name": "Src", "type": "API"}}
+            )
+        except ToolError as error:
+            refusals.append(error)
+
+    access = MagicMock(claims=_clerk_claims("user_clerk_sub"), token="clerk.jwt.value")
+    middleware = TenantContextMiddleware(ClerkTenantResolver(), CallerProfileLookup())
+    with patch(f"{_LOOKUP}.get_shared_http_client", return_value=http), patch(
+        "src.revenium_mcp_server.auth.claims_middleware.get_access_token", return_value=access
+    ):
+        await middleware.on_call_tool(MagicMock(), call_next)
+
+    assert len(refusals) == 1
+    assert refusals[0].field == "ownerId"
+    assert "nothing was created" in refusals[0].message
+    client.create_source.assert_not_called()

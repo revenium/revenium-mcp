@@ -11,7 +11,6 @@ This tool provides business analytics capabilities including:
 import json
 import math
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -42,14 +41,19 @@ from ..analytics.enhanced_spike_analyzer import (
     EnhancedSpikeAnalyzer,
     ANALYTICS_API_KEY_CAP,
     ANALYTICS_API_KEY_ROLLUP_GROUP,
+    TEMPORAL_ANALYSIS_ENDPOINT_KEYS,
+    describe_comparison,
+    describe_comparison_without_cost,
     describe_part,
+    describe_unclassified,
     detection_span_groups,
     spans_for_entity_type,
 )
-from ..analytics.metric_units import (
-    format_comparison_value,
-    format_metric_result,
+from ..analytics.metric_units import format_comparison_value, format_metric_result
+from ..common.money import (
+    is_finite_number,
     render_dollars,
+    render_rounded_amount,
     render_usd,
 )
 from ..analytics.formatters.base_formatter import COST_SOURCE_RULE
@@ -65,10 +69,15 @@ from ..analytics.simple_cost_analyzer import (
     summary_part_time_limit_text,
 )
 from ..analytics.response_formatter import ResponseFormatter
-from ..analytics.statistical_anomaly_detector import format_bucket_start
+from ..analytics.statistical_anomaly_detector import (
+    DIMENSION_ENTITY_TYPES,
+    ENTITY_TYPE_NOUNS,
+    format_bucket_start,
+)
 from ..analytics.validation import (
     AnalyticsValidator,
     ValidationError,
+    known_names,
     listed_names,
     unread_narrowing_refusal,
 )
@@ -125,7 +134,10 @@ SKILL_ONLY_PERIOD_VALUES = ("NINETY_DAYS", "SIX_MONTHS")
 
 # Entities listed per type in the anomaly answer's New Entities section
 NEW_ENTITY_LIST_CAP = 25
-_DETECTION_NOUNS = {"providers": "provider", "agents": "agent", "api_keys": "API key"}
+_DETECTION_NOUNS = {
+    dimension: ENTITY_TYPE_NOUNS[entity_type]
+    for dimension, entity_type in DIMENSION_ENTITY_TYPES.items()
+}
 #: get_coverage_ratio takes its own lower-case window names.
 COVERAGE_PERIOD_VALUES = ("24h", "7d", "30d", "90d", "custom")
 
@@ -657,7 +669,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
    - period picks a rolling comparison window (24h, 7d, 30d, 90d; default 30d); start_date/end_date pick a calendar range instead, and both together are refused unless period is custom; optional provider filter
    - the dates are yyyy-MM-dd calendar days (the whole UTC day, both ends included) or ISO-8601 instants with Z or an offset; the header names the UTC days read
    - A null coverage ratio is NOT zero coverage: state carries NO_INTEGRATION / ZERO_SPEND_PERIOD / DATA_UNAVAILABLE
-   - A VALID report can still withhold the aggregate: the platform publishes it only when every compared provider (billing credential connected and overlapping the window) billed something in it, so the report names the compared rows that billed nothing and prints metered over billed across the compared rows as a labelled diagnostic, never as the coverage ratio
+   - A VALID report can still withhold the aggregate: the report names the reason the platform gives (no billing credential, no comparable provider, a compared billed total of zero or less, or no spend in the period) and the providers it lists; when an older platform sends no reason, it names the compared rows that billed nothing and prints metered over billed across the compared rows as a labelled diagnostic, never as the coverage ratio
    - With provider set, only a billing credential of exactly that provider is matched on the current
      platform: provider=ANTHROPIC answers NO_INTEGRATION when the only Anthropic credential is a Claude
      Enterprise connection, while the call without provider shows the Anthropic row with it counted
@@ -1106,7 +1118,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 **Purpose**: Token usage broken down by token type over time
 **Parameters**:
 - `period` (optional, defaults to SEVEN_DAYS)
-- `providers` (optional): list of providers to restrict the breakdown to
+- `providers` (optional): list of providers to restrict the breakdown to, or one text of comma-separated names; each must be a name get_filter_options(dimension='providers') lists for the window, or the call is refused with the valid names
 
 ### get_team_costs
 ```json
@@ -1160,7 +1172,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
   "states": ["FINALIZED"]
 }
 ```
-**Purpose**: List invoices with a compact per-entry line (number, state, pay status, total amount + currency code, period). Amounts are numeric-honest: a missing/non-numeric total renders `n/a`, never a fabricated `0`. Every row of the page is printed, and the answer ends with the page, the total and the page and size to pass next (repeat the same filters).
+**Purpose**: List invoices with a compact per-entry line (number, state, pay status, total amount + currency code, period). Amounts are numeric-honest: a missing/non-numeric total renders `n/a`, never a fabricated `0`. A billed amount prints as charged, rounded to six decimals (two significant digits when smaller), so a cost an analytics report shows as $0.23 can read 0.232 USD here. Every row of the page is printed, and the answer ends with the page, the total and the page and size to pass next (repeat the same filters).
 **Parameters** (all optional): `page`, `size`, `invoice_number`, `start_date`, `end_date`, `pay_states`, `states`, `starting_amount`, `ending_amount`
 
 ### list_refunds
@@ -1439,16 +1451,16 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 - `period` (required): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
 - `sensitivity` (optional): conservative, normal, aggressive (default: normal)
 - `min_impact_threshold` (optional): Minimum dollar impact to report (default: 10.0)
-- `include_dimensions` (optional): ["providers", "agents", "api_keys"] - analyze specific dimensions (default: ["providers"])
+- `include_dimensions` (optional): ["providers", "agents", "api_keys"] - analyze specific dimensions (default: ["providers"]); one name or a comma-separated text such as "providers,agents" is read as a list
 - `detect_new_entities` (optional): Enable new cost source detection (default: false)
 - `min_new_entity_threshold` (optional): Minimum cost threshold for new entity detection (default: 0.0)
 
 **New Entity Detection (Phase 1)**:
 - Supported dimensions: providers, agents, api_keys (models and customers excluded - no time-series endpoints)
-- Detects entities with cost in the recent part of the window and none (new) or little (activated) in the baseline
-- The baseline is a share of the buckets the platform returned: the first 2/7 for SEVEN_DAYS, 7/30 for THIRTY_DAYS, 1/12 (one month) for TWELVE_MONTHS
-- Short windows (HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS) read seven days (SEVEN_DAYS) for detection; the anomalies keep the requested window
-- The answer names the recent and baseline spans, says when nothing new appeared, and says why when detection could not run
+- Detects entities with cost in the window (the recent part) and none (new) or little (activated) in the comparison period (the baseline)
+- The comparison period is the period of the same length just before the window: the 7 days before a SEVEN_DAYS window, the 30 days before THIRTY_DAYS, the 12 months before TWELVE_MONTHS
+- A shorter window (HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS) is compared with the 7 days before it, so an agent idle overnight or over a weekend is not called new
+- The answer names the comparison period it used, the recent and baseline spans, says when nothing new appeared, and says why when detection could not run
 - With min_new_entity_threshold the answer names the threshold, both when nothing reached it and when it limited the list
 - New and activated sources are counted apart in the summary
 - On the analytics route only the """ + str(ANALYTICS_API_KEY_CAP) + """ costliest API keys are named; the """ + ANALYTICS_API_KEY_ROLLUP_GROUP + """ group is not compared, and the answer says so
@@ -2535,17 +2547,21 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
             ) from None
 
     @staticmethod
-    def _pack_names(arguments: Dict[str, Any], name: str) -> Optional[List[str]]:
+    def _pack_names(
+        arguments: Dict[str, Any], name: str, **naming: Any
+    ) -> Optional[List[str]]:
         """The names a report is narrowed to, as a list, or None when the argument is absent.
 
+        ``naming`` passes ``real_values`` and ``split_commas`` on to ``listed_names``.
+
         Raises:
-            ToolError: If the argument is empty, blank or not a name, before any read
+            ToolError: If the argument is empty, blank, a placeholder or not a name, before any read
         """
         value = arguments.get(name)
         if value is None:
             return None
         try:
-            return listed_names(name, value, field=name)
+            return listed_names(name, value, field=name, **naming)
         except ValidationError as error:
             raise create_structured_validation_error(
                 message=error.message,
@@ -2695,12 +2711,14 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
     async def _handle_get_token_breakdown(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Token breakdown by type over time, optionally filtered by providers."""
+        """Token breakdown by type over time, optionally filtered by providers the platform lists."""
         period = self._pack_window(arguments)
-        providers = self._pack_names(arguments, "providers")
+        providers = self._pack_names(arguments, "providers", split_commas=True)
         try:
             client = await self.get_client(ctx=ctx)
             analyzer = SimpleCostAnalyzer(client)
+            if providers:
+                providers = await self._listed_providers(analyzer, providers, period)
             buckets = await analyzer.get_token_breakdown(period, providers=providers)
             text = self._render_timeseries_buckets(
                 buckets, title="Token Breakdown by Type", period=period
@@ -2714,6 +2732,26 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
                 self._analytics_pack_error("Token Breakdown by Type", e),
                 error_code=ErrorCodes.API_ERROR,
             )
+
+    @staticmethod
+    async def _listed_providers(
+        analyzer: SimpleCostAnalyzer, providers: List[str], period: AnalyticsWindow
+    ) -> List[str]:
+        """The providers in the platform's spelling, or a refusal naming the ones it does not list.
+
+        Raises:
+            ToolError: If a provider is not in get_filter_options for the window
+        """
+        valid = await analyzer.get_analytics_filter_options("providers", period)
+        try:
+            return known_names("providers", providers, valid, str(period))
+        except ValidationError as error:
+            raise create_structured_validation_error(
+                message=error.message,
+                field=error.field,
+                value=providers,
+                suggestions=error.suggestions,
+            ) from None
 
     async def _handle_get_team_costs(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -3047,24 +3085,18 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 
     @staticmethod
     def _render_billing_amount(amount: Any, currency: Any) -> str:
-        """Render a billed or refunded amount with its currency code.
+        """A billed, refunded or charged amount with its currency code, through render_rounded_amount.
 
-        Whole cents print with two decimals (``125.5`` -> ``"125.50 USD"``);
-        a sub-cent amount keeps its digits (``0.004`` -> ``"0.004 USD"``)
-        rather than rounding to a fabricated ``0.00``. A missing, null or
-        non-numeric amount renders ``n/a``, never ``0``.
+        Whole cents print with two decimals (``125.5`` -> ``"125.50 USD"``),
+        a fraction of a cent keeps its digits (``0.004`` -> ``"0.004 USD"``)
+        and a repeating amount stops at six decimals (``"0.534667 USD"``).
+        A missing, null or non-numeric amount renders ``n/a``, never ``0``.
         """
-        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        if not is_finite_number(amount):
             return "n/a"
-        if not math.isfinite(amount):
-            return "n/a"
-        # Rounds to 15 significant digits: drops the binary noise a sum leaves
-        # (0.23200000000000004 -> 0.232) but would also round an amount that
-        # genuinely carries 16 or 17; pads to two decimals only when no digit is lost.
-        exact = Decimal(format(amount, ".15g"))
-        exponent = exact.as_tuple().exponent
-        text = format(exact, ".2f" if isinstance(exponent, int) and exponent >= -2 else "f")
-        return BusinessAnalyticsManagement._with_currency_code(text, currency)
+        return BusinessAnalyticsManagement._with_currency_code(
+            render_rounded_amount(amount), currency
+        )
 
     @staticmethod
     def _render_resource_label(value: Any) -> str:
@@ -5498,6 +5530,23 @@ No usage recorded for '{skill_id}' in the requested period ({requested}), or the
     _COVERAGE_NOT_ZERO_LEAD: ClassVar[str] = (
         "This n/a is NOT zero coverage — no ratio could be computed at all."
     )
+    _COVERAGE_UNAVAILABLE_REASON_NOTES: ClassVar[Dict[str, str]] = {
+        "NO_BILLING_CREDENTIAL": (
+            "No eligible billing credential is connected, so there is no billed spend "
+            "to compare metered spend against."
+        ),
+        "NO_COMPARABLE_PROVIDERS": (
+            "No provider with a billing credential has billing records overlapping the "
+            "window, so no provider could be compared."
+        ),
+        "NON_POSITIVE_BILLING_TOTAL": (
+            "The compared providers billed zero or less in total in the window, so the "
+            "ratio has no billed spend to divide by."
+        ),
+        "ZERO_SPEND_PERIOD": (
+            "There was no spend in the period, so there is nothing to compare."
+        ),
+    }
     _COVERAGE_AGGREGATE_SCOPE_NOTE: ClassVar[str] = (
         "- The ratio is Revenium-metered spend divided by billed spend. It counts only "
         "providers with a billing credential."
@@ -5731,12 +5780,36 @@ No usage recorded for '{skill_id}' in the requested period ({requested}), or the
         metered_total = self._coverage_amount_or_zero(metered)
         return (metered_total, hidden_total + metered_total)
 
-    def _render_withheld_aggregate_lines(self, report: Dict[str, Any]) -> List[str]:
-        """Explain a null aggregate the state does not explain, from the rows.
+    def _render_unavailable_aggregate_lines(
+        self, report: Dict[str, Any], state_text: str
+    ) -> List[str]:
+        reason = report.get("aggregateRatioUnavailableReason")
+        if isinstance(reason, str) and reason:
+            return self._render_platform_reason_lines(report, reason)
+        if state_text in self._COVERAGE_STATE_NOTES:
+            return ["", f"{self._COVERAGE_NOT_ZERO_LEAD} The state above says why."]
+        return self._render_unexplained_aggregate_lines(report)
 
-        hypercurrent CoverageRatioService publishes aggregateRatio only when every
-        compared provider billed something in the window (BACK-4619), while
-        hiddenSpend and meteredTotalInComparison are still published.
+    def _render_platform_reason_lines(self, report: Dict[str, Any], reason: str) -> List[str]:
+        reason_note = self._COVERAGE_UNAVAILABLE_REASON_NOTES.get(reason, "")
+        lines = [
+            "",
+            f"{self._COVERAGE_NOT_ZERO_LEAD} The aggregate ratio was not published. "
+            f"The platform's reason: {reason}. {reason_note}".rstrip(),
+        ]
+        providers = report.get("aggregateRatioUnavailableProviders")
+        if isinstance(providers, list):
+            names = [str(name) for name in providers if name]
+            if names:
+                lines.append(f"- Providers the platform names for it: {', '.join(names)}")
+        return lines
+
+    def _render_unexplained_aggregate_lines(self, report: Dict[str, Any]) -> List[str]:
+        """Fallback for payloads without aggregateRatioUnavailableReason.
+
+        Older platform builds withheld the aggregate while any compared provider
+        billed nothing (BACK-4619); the current contract no longer does, so the
+        unbilled rows are offered as a possible cause, never as the rule.
         """
         compared_rows = self._coverage_compared_rows(report)
         unbilled_names = [
@@ -5744,15 +5817,12 @@ No usage recorded for '{skill_id}' in the requested period ({requested}), or the
             for row in compared_rows
             if self._coverage_amount_or_zero(row.get("billing")) == 0
         ]
+        why = "The platform did not say why."
         if unbilled_names:
-            why = (
-                "The platform publishes the aggregate ratio only when every compared "
-                "provider (billing credential connected and overlapping the window) "
-                "billed something in it, and these compared providers billed nothing "
-                f"in it: {', '.join(unbilled_names)}. Those rows withhold the aggregate."
+            why += (
+                " These compared providers (billing credential connected and "
+                f"overlapping the window) billed nothing in it: {', '.join(unbilled_names)}."
             )
-        else:
-            why = "The platform withheld the aggregate ratio for this window without saying why."
         lines = [
             "",
             f"{self._COVERAGE_NOT_ZERO_LEAD} The aggregate ratio was not published. {why}",
@@ -6025,17 +6095,7 @@ No usage recorded for '{skill_id}' in the requested period ({requested}), or the
                 )
                 lines.append(self._COVERAGE_OUTSIDE_COMPARISON_NOTE)
             if aggregate_ratio == "n/a":
-                # Said only when it applies, so it reads as an explanation of this
-                # report rather than boilerplate the caller learns to skip.
-                # Live dev evidence: state can be VALID while the ratio is null,
-                # so only point at the state when it actually explains.
-                if state_text in self._COVERAGE_STATE_NOTES:
-                    lines.extend([
-                        "",
-                        f"{self._COVERAGE_NOT_ZERO_LEAD} The state above says why.",
-                    ])
-                else:
-                    lines.extend(self._render_withheld_aggregate_lines(report))
+                lines.extend(self._render_unavailable_aggregate_lines(report, state_text))
 
             lines.extend(self._render_metered_basis_lines(report.get("meteredBasis")))
 
@@ -6948,13 +7008,15 @@ If you're seeing this error, please report it as it indicates a reliability issu
             f"**Total anomalies detected:** {total}",
         ]
         if "time_groups_analyzed" in result:
-            summary_bits.append(f"**Time groups analyzed:** {result['time_groups_analyzed']}")
+            summary_bits.append(
+                f"**Time groups analyzed for anomalies:** {result['time_groups_analyzed']}"
+            )
         elif "time_groups_by_dimension" in result:
             per_dimension = ", ".join(
                 f"{dimension} {count}"
                 for dimension, count in result["time_groups_by_dimension"].items()
             )
-            summary_bits.append(f"**Time groups analyzed:** {per_dimension}")
+            summary_bits.append(f"**Time groups analyzed for anomalies:** {per_dimension}")
         lines.append(" · ".join(summary_bits))
         lines.append("")
 
@@ -7059,7 +7121,8 @@ If you're seeing this error, please report it as it indicates a reliability issu
         ne_by_type = result.get("new_entities_by_type") or {}
         for entity_type, data in ne_by_type.items():
             entities = data.get("entities", [])
-            lines.append(f"### {entity_type.replace('_', ' ').title()} ({data.get('count', 0)})")
+            noun = ENTITY_TYPE_NOUNS.get(entity_type, entity_type.replace("_", " "))
+            lines.append(f"### {noun[:1].upper()}{noun[1:]} ({data.get('count', 0)})")
             lines.append("")
             if data.get("summary"):
                 lines.append(data["summary"])
@@ -7072,6 +7135,29 @@ If you're seeing this error, please report it as it indicates a reliability issu
             lines.append("")
 
     @staticmethod
+    def _nothing_found(
+        dimensions: List[str], detection: Dict[str, Any], threshold: float, shown_threshold: str
+    ) -> str:
+        """The nothing-found clause, limited to the sources whose comparison history is known."""
+        nouns = [_DETECTION_NOUNS.get(name, name) for name in dimensions]
+        named = nouns[0] if len(nouns) == 1 else f"{', '.join(nouns[:-1])} or {nouns[-1]}"
+        nothing = (
+            f"No new or activated {named} reached {shown_threshold}"
+            if threshold > 0
+            else f"No new {named} appeared"
+        )
+        unclassified: Dict[str, int] = detection.get("unclassified") or {}
+        partly_known = [
+            f"{_DETECTION_NOUNS.get(name, name)}s" for name in dimensions if unclassified.get(name)
+        ]
+        if not partly_known:
+            return nothing
+        return (
+            f"{nothing}, counting only the {' and '.join(partly_known)} "
+            "whose comparison history is known,"
+        )
+
+    @staticmethod
     def _render_detection_window(detection: Dict[str, Any], lines: List[str]) -> None:
         status = detection.get("status")
         if status == "not_run":
@@ -7079,20 +7165,19 @@ If you're seeing this error, please report it as it indicates a reliability issu
         else:
             threshold = detection.get("min_new_entity_threshold") or 0
             shown_threshold = BaseFormattingUtilities.format_currency(threshold)
+            lines.append(describe_comparison(detection))
+            lines.append("")
+            without_cost = describe_comparison_without_cost(detection)
+            if without_cost:
+                lines.append(without_cost)
+                lines.append("")
             sentences = []
             for dimensions, spans in detection_span_groups(detection):
                 recent = describe_part(spans, "recent")
                 baseline = describe_part(spans, "baseline")
                 if status == "none":
-                    nouns = [_DETECTION_NOUNS.get(name, name) for name in dimensions]
-                    named = (
-                        nouns[0] if len(nouns) == 1
-                        else f"{', '.join(nouns[:-1])} or {nouns[-1]}"
-                    )
-                    nothing = (
-                        f"No new or activated {named} reached {shown_threshold}"
-                        if threshold > 0
-                        else f"No new {named} appeared"
+                    nothing = BusinessAnalyticsManagement._nothing_found(
+                        dimensions, detection, threshold, shown_threshold
                     )
                     sentences.append(
                         f"{nothing} in the recent part, {recent}, "
@@ -7110,6 +7195,10 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 )
             sentences.append("Spans are the buckets the platform returned.")
             lines.append(" ".join(sentences))
+            unclassified = describe_unclassified(detection)
+            if unclassified:
+                lines.append("")
+                lines.append(unclassified)
         lines.append("")
         not_read: Dict[str, str] = detection.get("dimensions_not_read") or {}
         if not_read and detection.get("dimensions_examined"):
@@ -7134,33 +7223,37 @@ If you're seeing this error, please report it as it indicates a reliability issu
             lines.append(f"Partly read for new-entity detection: {partly}")
             lines.append("")
 
-    @staticmethod
-    def _new_entity_line(entity: Dict[str, Any], spans: Dict[str, Any]) -> str:
+    @classmethod
+    def _new_entity_line(cls, entity: Dict[str, Any], spans: Dict[str, Any]) -> str:
         name = entity.get("entity_name", "-")
         cost = entity.get("total_cost_impact", 0) or 0
         active = entity.get("periods_active", 0)
-        if not spans.get("baseline"):
+        if not spans.get("recent"):
             return f"- **{name}**: {render_dollars(cost)} impact, active in {active} bucket(s)"
-        baseline = spans["baseline"]
-        with_time = not spans.get("buckets_start_at_midnight", True)
-        start = format_bucket_start(baseline["start"], with_time)
-        end = format_bucket_start(baseline["end"], with_time)
-        baseline_range = start if baseline["buckets"] == 1 else f"{start} to {end}"
-        if entity.get("introduction_type") == "activation":
-            kind = "activated"
-            without_cost = entity.get("baseline_buckets_without_cost")
-            quiet = (
-                f"no cost in {without_cost} of {baseline['buckets']} baseline buckets "
-                f"from {baseline_range}"
-            )
-        else:
-            kind = "new"
-            quiet = f"no cost from {baseline_range}"
+        kind, quiet = cls._comparison_note(entity, spans)
         return (
             f"- **{name}** ({kind}): {render_dollars(cost)} in the recent part, active in {active} of "
             f"{spans['recent']['buckets']} recent buckets, first active "
             f"{entity.get('first_active_date')}; {quiet}"
         )
+
+    @staticmethod
+    def _comparison_note(entity: Dict[str, Any], spans: Dict[str, Any]) -> Tuple[str, str]:
+        """Whether the entity is new or activated, and what the comparison period held for it."""
+        baseline = spans.get("baseline")
+        if not baseline:
+            return "new", "the comparison period returned no bucket"
+        with_time = not spans.get("buckets_start_at_midnight", True)
+        start = format_bucket_start(baseline["start"], with_time)
+        end = format_bucket_start(baseline["end"], with_time)
+        baseline_range = start if baseline["buckets"] == 1 else f"{start} to {end}"
+        if entity.get("introduction_type") == "activation":
+            without_cost = entity.get("baseline_buckets_without_cost")
+            return "activated", (
+                f"no cost in {without_cost} of {baseline['buckets']} baseline buckets "
+                f"from {baseline_range}"
+            )
+        return "new", f"no cost from {baseline_range}"
 
     async def _handle_analyze_cost_anomalies(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -7182,6 +7275,12 @@ If you're seeing this error, please report it as it indicates a reliability issu
             action="analyze_cost_anomalies",
             minimum=0.0,
         )
+        include_dimensions = self._pack_names(
+            arguments,
+            "include_dimensions",
+            real_values=f"one of {', '.join(TEMPORAL_ANALYSIS_ENDPOINT_KEYS)}",
+            split_commas=True,
+        ) or ["providers"]
 
         try:
             logger.info("Processing analyze_cost_anomalies request")
@@ -7193,7 +7292,6 @@ If you're seeing this error, please report it as it indicates a reliability issu
             period = arguments.get("period")
             sensitivity = arguments.get("sensitivity", "normal")
             min_impact_threshold = arguments.get("min_impact_threshold", 10.0)
-            include_dimensions = arguments.get("include_dimensions", ["providers"])
             detect_new_entities = arguments.get("detect_new_entities", False)
             min_new_entity_threshold = arguments.get("min_new_entity_threshold", 0.0)
 
@@ -7451,7 +7549,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 "providers": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Provider names restricting the token-type breakdown on get_token_breakdown",
+                    "description": "Provider names restricting the token-type breakdown on get_token_breakdown, as a list or one comma-separated text; each must be a name get_filter_options lists for the window",
                 },
                 "agents": {
                     "type": "array",
@@ -7475,11 +7573,11 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 "include_dimensions": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Dimensions analyze_cost_anomalies collects series for: providers (default), models, customers, api_keys, agents. New-entity detection covers providers, agents and api_keys only",
+                    "description": "Dimensions analyze_cost_anomalies collects series for: providers (default), models, customers, api_keys, agents. One name or a comma-separated text is read as a list. New-entity detection covers providers, agents and api_keys only",
                 },
                 "detect_new_entities": {
                     "type": "boolean",
-                    "description": "Report cost sources new in the recent part (no cost in the baseline) or activated (no cost in at least half of the baseline buckets) on analyze_cost_anomalies (default false)",
+                    "description": "Report cost sources new in the window (no cost in the comparison period, the same length just before it and at least 7 days) or activated (no cost in at least half of its buckets) on analyze_cost_anomalies (default false)",
                 },
                 "min_new_entity_threshold": {
                     "type": "number",
@@ -8146,6 +8244,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "A date is a yyyy-MM-dd UTC day (both ends included) or an ISO-8601 instant with Z or an offset",
                     "The team is the one your credentials resolve to; you do not pass one",
                     "A null aggregateRatio is not zero coverage — read state before concluding anything",
+                    "A null aggregateRatio on a VALID report carries the platform's reason (aggregateRatioUnavailableReason) and the providers behind it; a compared provider that billed nothing no longer withholds it",
                     "With provider set only a credential of exactly that provider is matched: a Claude Enterprise connection answers NO_INTEGRATION for provider=ANTHROPIC, and the call without provider shows its row",
                     "trend is a percentage-point delta, not a percentage: 0.0 pp means unchanged, null means no prior period",
                     "A per-provider ratio is that provider's Revenium-metered spend divided by its own billed spend (metered-to-billed coverage)",

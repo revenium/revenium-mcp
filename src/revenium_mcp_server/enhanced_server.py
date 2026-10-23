@@ -47,6 +47,7 @@ from .version import get_package_version
 # Centralized AUTH_MODE parser — also re-exported here so existing callers
 # of _read_auth_mode() in this module continue to work without change.
 from .auth.auth_mode import read_auth_mode as _read_auth_mode  # noqa: F401
+from .auth.auth_mode import credentials_are_per_request
 from .transport_mode import (
     read_http_host,
     read_http_port,
@@ -221,6 +222,89 @@ def configure_startup_logging(startup_verbose: bool) -> None:
     )
 
 
+_INTROSPECTION_PERFORMANCE_LINE = "  - View performance metrics and usage analytics\n"
+_ENHANCEMENT_PERFORMANCE_LINE = "- Performance metrics tracking and analysis\n"
+_PERFORMANCE_MONITORING_SECTION = """### Performance Monitoring
+- Real-time execution metrics collection
+- Success rate tracking and analysis
+- Response time monitoring and optimization
+- Tool health validation and reporting
+
+"""
+_PERFORMANCE_PASSAGES = (
+    _INTROSPECTION_PERFORMANCE_LINE,
+    _ENHANCEMENT_PERFORMANCE_LINE,
+    _PERFORMANCE_MONITORING_SECTION,
+)
+
+
+def _instructions(with_performance: bool) -> str:
+    introspection_performance, enhancement_performance, performance_monitoring = (
+        _PERFORMANCE_PASSAGES if with_performance else ("",) * len(_PERFORMANCE_PASSAGES)
+    )
+    return f"""
+# Enhanced Revenium Platform API MCP Server
+
+This enhanced MCP server provides comprehensive tools for managing Revenium platform resources
+with advanced introspection and metadata capabilities.
+
+## Available Tools
+
+### Core Management Tools
+- **manage_products**: Comprehensive product management operations
+- **manage_subscriptions**: Complete subscription lifecycle management
+- **manage_sources**: Source configuration and management
+- **manage_customers**: Customer lifecycle management (Users, Subscribers, Organizations, Teams)
+- **manage_alerts**: AI anomaly detection and alert management
+- **manage_workflows**: Cross-tool workflow guidance for complex operations
+- **manage_metering**: AI transaction metering and usage tracking for billing and analytics
+- **manage_metering_elements**: Comprehensive metering element definition management with CRUD operations, templates, and analytics
+- **manage_subscriber_credentials**: Subscriber credentials management with CRUD operations, field validation, and NLP support
+
+### Enhanced Introspection Tools
+- **tool_introspection**: Comprehensive tool metadata and dependency analysis
+  - Discover tool capabilities and relationships
+{introspection_performance}  - Analyze dependency graphs and detect circular dependencies
+  - Get agent-friendly tool summaries and quick start guides
+
+## Key Enhancements
+
+### Tool Introspection
+- Real-time tool discovery and metadata collection
+{enhancement_performance}- Dependency relationship mapping and validation
+- Usage pattern analysis and recommendations
+
+### Agent-Friendly Features
+- Comprehensive tool summaries and quick start guides
+- Working examples and templates for all operations
+- Intelligent error handling with actionable suggestions
+- Smart defaults for rapid configuration
+
+{performance_monitoring}## Authentication
+Set REVENIUM_API_KEY environment variable with your Revenium API key.
+
+## Quick Start with Introspection
+1. Use `tool_introspection(action="list_tools")` to see all available tools
+2. Use `tool_introspection(action="get_tool_metadata", tool_name="...")` for detailed tool info
+3. Use `tool_introspection(action="get_all_metadata")` for comprehensive tool information
+"""
+
+
+_SELF_HOSTED_INSTRUCTIONS = _instructions(with_performance=True)
+_HOSTED_INSTRUCTIONS = _instructions(with_performance=False)
+
+
+def server_instructions() -> str:
+    """The server's description for clients, without performance tracking when hosted.
+
+    BACK-4689 hides the per-tool counters on a hosted server, since they mix
+    every organization's calls, so the description must not promise them there.
+    """
+    if credentials_are_per_request():
+        return _HOSTED_INSTRUCTIONS
+    return _SELF_HOSTED_INSTRUCTIONS
+
+
 def create_enhanced_server(auth: Optional[Any] = None) -> FastMCP:
     """Create and configure the enhanced MCP server.
 
@@ -262,60 +346,7 @@ def create_enhanced_server(auth: Optional[Any] = None) -> FastMCP:
         # revision are unaffected — honoring the hint is opt-in on the client side.
         cache_ttl=MCP_CACHE_HINT_TTL_SECONDS,
         cache_scope=MCP_CACHE_HINT_SCOPE,
-        instructions="""
-# Enhanced Revenium Platform API MCP Server
-
-This enhanced MCP server provides comprehensive tools for managing Revenium platform resources
-with advanced introspection and metadata capabilities.
-
-## Available Tools
-
-### Core Management Tools
-- **manage_products**: Comprehensive product management operations
-- **manage_subscriptions**: Complete subscription lifecycle management
-- **manage_sources**: Source configuration and management
-- **manage_customers**: Customer lifecycle management (Users, Subscribers, Organizations, Teams)
-- **manage_alerts**: AI anomaly detection and alert management
-- **manage_workflows**: Cross-tool workflow guidance for complex operations
-- **manage_metering**: AI transaction metering and usage tracking for billing and analytics
-- **manage_metering_elements**: Comprehensive metering element definition management with CRUD operations, templates, and analytics
-- **manage_subscriber_credentials**: Subscriber credentials management with CRUD operations, field validation, and NLP support
-
-### Enhanced Introspection Tools
-- **tool_introspection**: Comprehensive tool metadata and dependency analysis
-  - Discover tool capabilities and relationships
-  - View performance metrics and usage analytics
-  - Analyze dependency graphs and detect circular dependencies
-  - Get agent-friendly tool summaries and quick start guides
-
-## Key Enhancements
-
-### Tool Introspection
-- Real-time tool discovery and metadata collection
-- Performance metrics tracking and analysis
-- Dependency relationship mapping and validation
-- Usage pattern analysis and recommendations
-
-### Agent-Friendly Features
-- Comprehensive tool summaries and quick start guides
-- Working examples and templates for all operations
-- Intelligent error handling with actionable suggestions
-- Smart defaults for rapid configuration
-
-### Performance Monitoring
-- Real-time execution metrics collection
-- Success rate tracking and analysis
-- Response time monitoring and optimization
-- Tool health validation and reporting
-
-## Authentication
-Set REVENIUM_API_KEY environment variable with your Revenium API key.
-
-## Quick Start with Introspection
-1. Use `tool_introspection(action="list_tools")` to see all available tools
-2. Use `tool_introspection(action="get_tool_metadata", tool_name="...")` for detailed tool info
-3. Use `tool_introspection(action="get_all_metadata")` for comprehensive tool information
-""",
+        instructions=server_instructions(),
     )
 
     # BACK-1312: translate Pydantic ValidationError raised by FastMCP's

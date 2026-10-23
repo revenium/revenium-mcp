@@ -17,7 +17,7 @@ test_simple_cost_analyzer.py:
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.revenium_mcp_server.analytics.simple_cost_analyzer import SimpleCostAnalyzer
+from src.revenium_mcp_server.analytics.simple_cost_analyzer import RankedCosts, SimpleCostAnalyzer
 
 
 # ---------------------------------------------------------------------------
@@ -572,11 +572,11 @@ class TestGetCostSummary:
         api_key_data = [{"api_key": "key-1", "cost": 200.0, "percentage": 100.0}]
         agent_data = [{"agent": "bot-1", "cost": 100.0, "percentage": 100.0}]
 
-        with patch.object(analyzer, "get_provider_costs", new=AsyncMock(return_value=provider_data)), \
-             patch.object(analyzer, "get_model_costs", new=AsyncMock(return_value=model_data)), \
-             patch.object(analyzer, "get_customer_costs", new=AsyncMock(return_value=customer_data)), \
-             patch.object(analyzer, "get_api_key_costs", new=AsyncMock(return_value=api_key_data)), \
-             patch.object(analyzer, "get_agent_costs", new=AsyncMock(return_value=agent_data)):
+        with patch.object(analyzer, "get_provider_costs", new=AsyncMock(return_value=RankedCosts(provider_data))), \
+             patch.object(analyzer, "get_model_costs", new=AsyncMock(return_value=RankedCosts(model_data))), \
+             patch.object(analyzer, "get_customer_costs", new=AsyncMock(return_value=RankedCosts(customer_data))), \
+             patch.object(analyzer, "get_api_key_costs", new=AsyncMock(return_value=RankedCosts(api_key_data))), \
+             patch.object(analyzer, "get_agent_costs", new=AsyncMock(return_value=RankedCosts(agent_data))):
 
             result = await analyzer.get_cost_summary("LAST_30_DAYS", "TOTAL")
 
@@ -595,11 +595,11 @@ class TestGetCostSummary:
             {"provider": "Azure", "cost": 400.0, "percentage": 40.0},
         ]
 
-        with patch.object(analyzer, "get_provider_costs", new=AsyncMock(return_value=provider_data)), \
-             patch.object(analyzer, "get_model_costs", new=AsyncMock(return_value=[])), \
-             patch.object(analyzer, "get_customer_costs", new=AsyncMock(return_value=[])), \
-             patch.object(analyzer, "get_api_key_costs", new=AsyncMock(return_value=[])), \
-             patch.object(analyzer, "get_agent_costs", new=AsyncMock(return_value=[])):
+        with patch.object(analyzer, "get_provider_costs", new=AsyncMock(return_value=RankedCosts(provider_data))), \
+             patch.object(analyzer, "get_model_costs", new=AsyncMock(return_value=RankedCosts([]))), \
+             patch.object(analyzer, "get_customer_costs", new=AsyncMock(return_value=RankedCosts([]))), \
+             patch.object(analyzer, "get_api_key_costs", new=AsyncMock(return_value=RankedCosts([]))), \
+             patch.object(analyzer, "get_agent_costs", new=AsyncMock(return_value=RankedCosts([]))):
 
             result = await analyzer.get_cost_summary("LAST_30_DAYS", "TOTAL")
 
@@ -613,11 +613,11 @@ class TestGetCostSummary:
             for i in range(5)
         ]
 
-        with patch.object(analyzer, "get_provider_costs", new=AsyncMock(return_value=five_providers)), \
-             patch.object(analyzer, "get_model_costs", new=AsyncMock(return_value=[])), \
-             patch.object(analyzer, "get_customer_costs", new=AsyncMock(return_value=[])), \
-             patch.object(analyzer, "get_api_key_costs", new=AsyncMock(return_value=[])), \
-             patch.object(analyzer, "get_agent_costs", new=AsyncMock(return_value=[])):
+        with patch.object(analyzer, "get_provider_costs", new=AsyncMock(return_value=RankedCosts(five_providers))), \
+             patch.object(analyzer, "get_model_costs", new=AsyncMock(return_value=RankedCosts([]))), \
+             patch.object(analyzer, "get_customer_costs", new=AsyncMock(return_value=RankedCosts([]))), \
+             patch.object(analyzer, "get_api_key_costs", new=AsyncMock(return_value=RankedCosts([]))), \
+             patch.object(analyzer, "get_agent_costs", new=AsyncMock(return_value=RankedCosts([]))):
 
             result = await analyzer.get_cost_summary("LAST_30_DAYS", "TOTAL")
 
@@ -625,11 +625,11 @@ class TestGetCostSummary:
 
     async def test_period_and_aggregation_preserved(self):
         analyzer = _make_analyzer()
-        with patch.object(analyzer, "get_provider_costs", new=AsyncMock(return_value=[])), \
-             patch.object(analyzer, "get_model_costs", new=AsyncMock(return_value=[])), \
-             patch.object(analyzer, "get_customer_costs", new=AsyncMock(return_value=[])), \
-             patch.object(analyzer, "get_api_key_costs", new=AsyncMock(return_value=[])), \
-             patch.object(analyzer, "get_agent_costs", new=AsyncMock(return_value=[])):
+        with patch.object(analyzer, "get_provider_costs", new=AsyncMock(return_value=RankedCosts([]))), \
+             patch.object(analyzer, "get_model_costs", new=AsyncMock(return_value=RankedCosts([]))), \
+             patch.object(analyzer, "get_customer_costs", new=AsyncMock(return_value=RankedCosts([]))), \
+             patch.object(analyzer, "get_api_key_costs", new=AsyncMock(return_value=RankedCosts([]))), \
+             patch.object(analyzer, "get_agent_costs", new=AsyncMock(return_value=RankedCosts([]))):
 
             result = await analyzer.get_cost_summary("LAST_7_DAYS", "WEEKLY")
 
@@ -647,7 +647,7 @@ class TestGetCostSummary:
             "get_agent_costs": [{"agent": "bot-1", "cost": 100.0}],
         }
         mocks = {
-            name: overrides.get(name) or AsyncMock(return_value=value)
+            name: overrides.get(name) or AsyncMock(return_value=RankedCosts(value))
             for name, value in rows.items()
         }
         for name, mock in mocks.items():
@@ -692,7 +692,7 @@ class TestGetCostSummary:
                 if len(started) == 5:
                     all_started.set()
                 await all_started.wait()
-                return []
+                return RankedCosts([])
 
             return AsyncMock(side_effect=read)
 
@@ -786,11 +786,11 @@ class TestGetCostSummary:
         agent_data = [{"agent": "a1", "cost": 100.0, "percentage": 100.0}]
         provider_data = [{"provider": "p1", "cost": 400.0, "percentage": 100.0}]
 
-        with patch.object(analyzer, "get_provider_costs", new=AsyncMock(return_value=provider_data)), \
-             patch.object(analyzer, "get_model_costs", new=AsyncMock(return_value=model_data)), \
-             patch.object(analyzer, "get_customer_costs", new=AsyncMock(return_value=customer_data)), \
-             patch.object(analyzer, "get_api_key_costs", new=AsyncMock(return_value=api_key_data)), \
-             patch.object(analyzer, "get_agent_costs", new=AsyncMock(return_value=agent_data)):
+        with patch.object(analyzer, "get_provider_costs", new=AsyncMock(return_value=RankedCosts(provider_data))), \
+             patch.object(analyzer, "get_model_costs", new=AsyncMock(return_value=RankedCosts(model_data))), \
+             patch.object(analyzer, "get_customer_costs", new=AsyncMock(return_value=RankedCosts(customer_data))), \
+             patch.object(analyzer, "get_api_key_costs", new=AsyncMock(return_value=RankedCosts(api_key_data))), \
+             patch.object(analyzer, "get_agent_costs", new=AsyncMock(return_value=RankedCosts(agent_data))):
 
             result = await analyzer.get_cost_summary("LAST_30_DAYS", "TOTAL")
 

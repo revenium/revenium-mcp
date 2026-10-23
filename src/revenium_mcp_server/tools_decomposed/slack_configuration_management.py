@@ -20,6 +20,7 @@ from ..common.default_slack_configuration import (
     is_local_server,
     set_default_slack_config_id,
 )
+from ..common.slack_configuration_lookup import slack_configuration_absent
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
@@ -47,16 +48,15 @@ async def get_slack_configuration_or_not_found(
 ) -> Dict[str, Any]:
     """Read one Slack configuration, naming a missing id as not found.
 
-    BACK-4679: the platform answers 403 for an id that does not exist as well
-    as for one in another organization, and a bare "HTTP 403: Access Denied"
-    reads as a permissions problem. Both fold into one named not-found, the
-    same mapping as subscription_management's get_subscription. Any other
-    error is re-raised unchanged.
+    A bare "HTTP 403: Access Denied" reads as a permissions problem, so every
+    answer slack_configuration_absent counts as absent folds into one named
+    not-found, the same mapping as subscription_management's get_subscription.
+    Any other error is re-raised unchanged.
     """
     try:
         return await client.get_slack_configuration_by_id(config_id)
     except ReveniumAPIError as e:
-        if e.status_code in (403, 404):
+        if slack_configuration_absent(e):
             raise ToolError(
                 message=(
                     f"Slack configuration {config_id} was not found "

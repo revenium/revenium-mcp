@@ -131,7 +131,6 @@ class CredentialDryRunValidator:
                     "externalId",
                     "externalSecret",
                 ],
-                "update": ["label", "externalId"],  # Minimum required for updates
             },
             "field_constraints": {
                 "label": {"min_length": 3, "max_length": 100},
@@ -142,10 +141,6 @@ class CredentialDryRunValidator:
             "business_rules": {
                 "billing_critical_fields": ["subscriberId", "organizationId", "subscriptionIds"],
                 "security_sensitive_fields": ["externalSecret"],
-                "immutable_fields": [
-                    "subscriberId",
-                    "organizationId",
-                ],  # Cannot be changed after creation
             },
         }
 
@@ -182,69 +177,6 @@ class CredentialDryRunValidator:
 
         return DryRunResult(
             operation="create",
-            valid=not any(
-                issue.severity in [ValidationSeverity.ERROR, ValidationSeverity.CRITICAL]
-                for issue in validation_issues
-            ),
-            validation_issues=validation_issues,
-            billing_impact=billing_impact,
-            preview_data=preview_data,
-            confidence_score=confidence_score,
-            next_steps=next_steps,
-        )
-
-    async def validate_update_operation(
-        self, credential_id: str, credential_data: Dict[str, Any]
-    ) -> DryRunResult:
-        """Validate credential update operation."""
-        logger.info(f"Performing dry run validation for credential update: {credential_id}")
-
-        validation_issues = []
-
-        # Get current credential data
-        try:
-            current_credential = await self.client.get_credential_by_id(credential_id)
-            preview_data = current_credential.copy()
-            preview_data.update(credential_data)
-        except Exception:
-            validation_issues.append(
-                ValidationIssue(
-                    severity=ValidationSeverity.CRITICAL,
-                    field="credential_id",
-                    message=f"Credential not found: {credential_id}",
-                    suggestion="Verify the credential ID exists and is accessible",
-                    business_impact="Cannot update non-existent credential",
-                )
-            )
-            preview_data = credential_data.copy()
-
-        # Validate field constraints
-        validation_issues.extend(await self._validate_field_constraints(credential_data))
-
-        # Check for immutable field changes
-        validation_issues.extend(
-            await self._check_immutable_fields(current_credential, credential_data)
-        )
-
-        # Check for conflicts
-        validation_issues.extend(await self._check_update_conflicts(credential_id, credential_data))
-
-        # Analyze billing impact
-        billing_impact = await self._analyze_billing_impact(
-            "update", credential_data, current_credential
-        )
-
-        # Calculate confidence score
-        confidence_score = self._calculate_confidence_score(validation_issues)
-
-        # Generate next steps
-        next_steps = self._generate_next_steps("update", validation_issues, billing_impact)
-
-        # SECURITY: Mask sensitive fields in preview_data before returning
-        preview_data = obfuscate_credential_data(preview_data)
-
-        return DryRunResult(
-            operation="update",
             valid=not any(
                 issue.severity in [ValidationSeverity.ERROR, ValidationSeverity.CRITICAL]
                 for issue in validation_issues
@@ -338,40 +270,6 @@ class CredentialDryRunValidator:
                 "credential instead of creating a new one"
             )
         ]
-
-    async def _check_update_conflicts(
-        self, credential_id: str, credential_data: Dict[str, Any]
-    ) -> List[ValidationIssue]:
-        """Check for conflicts during credential updates."""
-        if "externalId" not in credential_data:
-            return []
-        return [
-            _unchecked_external_id_issue(
-                "Duplicate external IDs can cause authentication conflicts"
-            )
-        ]
-
-    async def _check_immutable_fields(
-        self, current_credential: Dict[str, Any], update_data: Dict[str, Any]
-    ) -> List[ValidationIssue]:
-        """Check for changes to immutable fields."""
-        issues = []
-        immutable_fields = self.validation_rules["business_rules"]["immutable_fields"]
-
-        for field in immutable_fields:
-            if field in update_data and field in current_credential:
-                if update_data[field] != current_credential[field]:
-                    issues.append(
-                        ValidationIssue(
-                            severity=ValidationSeverity.ERROR,
-                            field=field,
-                            message=f"Field '{field}' cannot be changed after creation",
-                            suggestion=f"Remove '{field}' from update data or create a new credential",
-                            business_impact="Changing immutable fields can break billing and organizational relationships",
-                        )
-                    )
-
-        return issues
 
     async def _validate_business_relationships(
         self, credential_data: Dict[str, Any]
@@ -506,10 +404,6 @@ class CredentialDryRunValidator:
             if operation == "create":
                 next_steps.append(
                     "✅ Ready to create credential - use create() without dry_run parameter"
-                )
-            elif operation == "update":
-                next_steps.append(
-                    "✅ Ready to update credential - use update() without dry_run parameter"
                 )
 
         return next_steps

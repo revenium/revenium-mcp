@@ -5,11 +5,13 @@ from typing import Any, Dict, List, Optional, Set
 
 from loguru import logger
 
-# The platform clamps any larger page size to 100 (spring.data.web.pageable.max-page-size
-# in hypercurrent's api application.properties), so asking for more only hides the clamp.
-ANOMALY_PAGE_SIZE = 100
+from ..common.platform_paging import PLATFORM_MAX_PAGE_SIZE
 
-# Bounds one account-wide action to 100,000 alerts; past that it reports partial coverage.
+# The platform clamps a larger page to this size, so asking for more only hides the clamp.
+ANOMALY_PAGE_SIZE = PLATFORM_MAX_PAGE_SIZE
+
+# Bounds one account-wide action to MAX_ANOMALY_PAGES * ANOMALY_PAGE_SIZE alerts; past
+# that it reports partial coverage.
 MAX_ANOMALY_PAGES = 1000
 
 # A stable order keeps rows from shifting between pages while the action reads them.

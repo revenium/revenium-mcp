@@ -20,7 +20,7 @@ from ..common.error_handling import (
     create_structured_validation_error,
     format_structured_error,
 )
-from ..config_store import get_config_value
+from ..config_store import default_notification_email, get_config_value
 from ..introspection.metadata import ToolCapability, ToolType
 from ..onboarding.detection_service import (
     RESTORE_PLATFORM_ACCESS_RECOMMENDATION,
@@ -33,6 +33,7 @@ from ..onboarding.env_validation import (
     validate_environment_variables,
 )
 from ..onboarding.platform_read import INGESTION_PATHWAYS, read_platform_facts
+from .email_verification import set_email_step
 from .unified_tool_base import ToolBase
 
 
@@ -412,14 +413,13 @@ Comprehensive setup status verification and configuration guidance for Revenium 
         # Recommended configuration
         checklist += "## **Recommended Configuration**\n\n"
 
-        email_set = bool(get_config_value("REVENIUM_DEFAULT_EMAIL"))
-        checklist += f"{'[OK]' if email_set else '[ ]'} **Email Notifications**\n"
-        if email_set:
-            email_value = get_config_value("REVENIUM_DEFAULT_EMAIL") or "SET"
+        email_value = default_notification_email()
+        checklist += f"{'[OK]' if email_value else '[ ]'} **Email Notifications**\n"
+        if email_value:
             checklist += f"   - Status: Configured ({email_value})\n"
         else:
             checklist += "   - Status: Not configured\n"
-            checklist += "   - Action: Use verify_email_setup() to configure notifications\n"
+            checklist += f"   - Action: {set_email_step()}\n"
         checklist += "\n"
 
         slack_configured = slack_status.get("configured")
@@ -494,10 +494,10 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             checklist += "1. API connectivity was not verified\n"
             checklist += "2. Run system_diagnostics(action='system_health') to see why\n"
             checklist += "3. Run setup_checklist() again to verify\n"
-        elif not email_set or slack_configured is not True:
+        elif not email_value or slack_configured is not True:
             checklist += "## **Recommended Next Steps**\n\n"
             step_num = 1
-            if not email_set:
+            if not email_value:
                 checklist += f"{step_num}. Set up email notifications for alerts\n"
                 step_num += 1
             if slack_configured is False:
@@ -587,8 +587,9 @@ Comprehensive setup status verification and configuration guidance for Revenium 
         optional += f"**Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
 
         # Email configuration
-        email_set = bool(get_config_value("REVENIUM_DEFAULT_EMAIL"))
-        email_value = get_config_value("REVENIUM_DEFAULT_EMAIL") or "NOT SET"
+        email_address = default_notification_email()
+        email_set = email_address is not None
+        email_value = email_address or "NOT SET"
 
         optional += f"## {'[OK]' if email_set else '❌'} **Email Notifications**\n"
         optional += "**Purpose**: Receive alert notifications via email\n"
@@ -596,7 +597,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
         if email_set:
             optional += "**Benefit**: [OK] You'll receive email notifications for alerts\n"
         else:
-            optional += "**Action**: Use verify_email_setup() to configure\n"
+            optional += f"**Action**: {set_email_step()}\n"
             optional += "**Benefit**: Get notified of important alerts and system events\n"
         optional += "\n"
 
@@ -914,7 +915,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
                 {
                     "title": "Set Up Email Notifications",
                     "description": "Configure your notification email address",
-                    "action": "Use verify_email_setup() tool",
+                    "action": set_email_step(),
                     "impact": "High - Important for alert notifications",
                 }
             )

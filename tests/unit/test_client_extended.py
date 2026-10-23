@@ -943,6 +943,20 @@ class TestCostControlsAPIMethods:
             == "/profitstream/v2/api/ai/enforcement-rules/team_abc"
         )
 
+    @pytest.mark.asyncio
+    async def test_get_enforcement_rules_sends_include_only_when_asked(self):
+        await self.client.get_enforcement_rules()
+        assert "include" not in self.client.get.call_args.kwargs["params"]
+
+        await self.client.get_enforcement_rules(include_advisory=True)
+        assert self.client.get.call_args.kwargs["params"] == {"include": "advisory"}
+
+    @pytest.mark.asyncio
+    async def test_get_enforcement_rules_refuses_include_advisory_with_rule_id(self):
+        with pytest.raises(ValueError, match="drop rule_id"):
+            await self.client.get_enforcement_rules(rule_id="cc_1", include_advisory=True)
+        self.client.get.assert_not_called()
+
 
 # ===========================================================================
 # BACK-2374 — budget portfolio / progress read methods (AIAnomalyProgressController)

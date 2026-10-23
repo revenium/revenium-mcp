@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from src.revenium_mcp_server.tools_decomposed.business_analytics_management import (
     BusinessAnalyticsManagement,
 )
-from src.revenium_mcp_server.analytics.metric_units import format_metric_result, render_usd
+from src.revenium_mcp_server.analytics.metric_units import format_metric_result
+from src.revenium_mcp_server.common.money import render_usd
 from src.revenium_mcp_server.analytics.simple_cost_analyzer import PackRows
 
 _MOD = "src.revenium_mcp_server.tools_decomposed.business_analytics_management"

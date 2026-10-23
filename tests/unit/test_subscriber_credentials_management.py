@@ -8,7 +8,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from mcp.types import TextContent
 
-from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 
 
 @pytest.fixture
@@ -468,3 +468,127 @@ class TestCredentialsHierarchyIncompleteWalk:
         with pytest.raises(ToolError) as exc_info:
             await manager.get_product_details({"credential_id": "cred_abc"})
         self._assert_retryable_walk_failure(exc_info.value)
+
+
+class TestCreateOfAnExistingExternalId:
+    """The platform answers a create whose external ID exists with the old credential."""
+
+    SENT = {
+        "label": "New Key",
+        "subscriberId": "sub_1",
+        "organizationId": "org_1",
+        "externalId": "ext_key",
+        "externalSecret": "secret123",
+    }
+
+    @staticmethod
+    async def _create(cred_tool, platform_answer):
+        cred_tool.client.team_id = "team_1"
+        cred_tool.client.create_credential = AsyncMock(return_value=platform_answer)
+        result = await cred_tool.handle_action(
+            "create", {"credential_data": dict(TestCreateOfAnExistingExternalId.SENT)}
+        )
+        return result[0].text
+
+    @pytest.mark.asyncio
+    async def test_a_returned_existing_credential_is_refused_as_nothing_created(
+        self, cred_tool
+    ):
+        with pytest.raises(ToolError) as exc:
+            await self._create(
+                cred_tool,
+                {
+                    "id": "old_1",
+                    "label": "Old Key",
+                    "subscriber": {"id": "sub_1"},
+                    "organization": {"id": "org_1"},
+                },
+            )
+
+        assert exc.value.error_code == ErrorCodes.RESOURCE_CONFLICT
+        assert "already existed" in exc.value.message
+        assert "old_1" in exc.value.message
+        assert "nothing was created" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_returned_credential_of_another_subscriber_is_refused_as_existing(
+        self, cred_tool
+    ):
+        with pytest.raises(ToolError) as exc:
+            await self._create(
+                cred_tool,
+                {"id": "old_2", "label": "New Key", "subscriber": {"id": "sub_other"}},
+            )
+
+        assert "already existed" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_true_create_is_reported_as_created(self, cred_tool):
+        text = await self._create(
+            cred_tool,
+            {
+                "id": "new_1",
+                "label": "New Key",
+                "subscriber": {"id": "sub_1"},
+                "organization": {"id": "org_1"},
+            },
+        )
+        assert "Credential create completed successfully" in text
+        assert "already existed" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_true_create_whose_label_became_its_name_is_reported_as_created(
+        self, cred_tool
+    ):
+        cred_tool.client.team_id = "team_1"
+        cred_tool.client.create_credential = AsyncMock(
+            return_value={
+                "id": "new_2",
+                "label": "Billing Key",
+                "subscriber": {"id": "sub_1"},
+                "organization": {"id": "org_1"},
+            }
+        )
+        result = await cred_tool.handle_action(
+            "create", {"credential_data": {**self.SENT, "name": "Billing Key"}}
+        )
+
+        assert "Credential create completed successfully" in result[0].text
+        assert "already existed" not in result[0].text
+
+
+class TestCreatePreviewHeading:
+    """BACK-4738: a dry run is a preview, never headed as a completed create."""
+
+    @staticmethod
+    async def _preview(cred_tool, credential_data):
+        cred_tool.client.get_subscriber_by_id = AsyncMock(return_value={"id": "sub_1"})
+        cred_tool.client.create_credential = AsyncMock()
+        result = await cred_tool.handle_action(
+            "create", {"credential_data": credential_data, "dry_run": True}
+        )
+        cred_tool.client.create_credential.assert_not_called()
+        return result[0].text
+
+    @pytest.mark.asyncio
+    async def test_a_valid_preview_is_headed_as_a_valid_preview(self, cred_tool):
+        text = await self._preview(
+            cred_tool,
+            {
+                "label": "New Key",
+                "subscriberId": "sub_1",
+                "organizationId": "org_1",
+                "externalId": "ext_key",
+                "externalSecret": "secret123",
+            },
+        )
+        assert text.startswith("**Credential create preview (dry run): valid; nothing was created**")
+        assert "completed successfully" not in text
+
+    @pytest.mark.asyncio
+    async def test_an_invalid_preview_is_headed_as_not_valid(self, cred_tool):
+        text = await self._preview(cred_tool, {"label": "New Key"})
+        assert text.startswith(
+            "**Credential create preview (dry run): not valid; nothing was created**"
+        )
+        assert "completed successfully" not in text

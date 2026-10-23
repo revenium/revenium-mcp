@@ -15,14 +15,15 @@ from typing import Any, Dict, Tuple
 
 from loguru import logger
 
+from .platform_paging import PLATFORM_MAX_PAGE_SIZE
+
 # Performance monitoring removed - infrastructure monitoring handled externally
 
 
 class PaginationPerformanceManager:
     """Manages pagination performance with graduated warnings and monitoring."""
 
-    # The platform serves at most 100 rows per page and silently clamps larger sizes to 100.
-    MAXIMUM_LIMIT = 100
+    MAXIMUM_LIMIT = PLATFORM_MAX_PAGE_SIZE
 
     # Performance tier thresholds
     OPTIMAL_THRESHOLD = 25

@@ -1180,6 +1180,24 @@ class TestDepartmentGroupPreview:
         assert result == payload
 
 
+class TestCostControlFilterValues:
+    """The accepted cost-control filter values client method (BACK-4887)."""
+
+    @pytest.mark.asyncio
+    async def test_reads_the_filter_values_endpoint_for_the_team(self, mock_env_vars):
+        client = ReveniumClient()
+        payload = {"dimension": "PROVIDER", "values": []}
+
+        with patch.object(client, "get", new_callable=AsyncMock, return_value=payload) as mock_get:
+            result = await client.get_cost_control_filter_values()
+
+        assert result == payload
+        assert mock_get.call_args[0][0] == "/profitstream/v2/api/ai/filter-values"
+        params = mock_get.call_args[1]["params"]
+        assert params["dimension"] == "PROVIDER"
+        assert params["teamId"] == client.team_id
+
+
 class TestDepartments:
     """Test the department lookup client method (BACK-2767)."""
 

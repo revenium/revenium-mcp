@@ -23,7 +23,7 @@ from ..common.error_handling import (
     create_structured_validation_error,
     format_structured_error,
 )
-from ..config_store import get_config_value
+from ..config_store import default_notification_email
 from ..introspection.metadata import ToolCapability, ToolType
 from ..onboarding.detection_service import get_onboarding_state
 from ..onboarding.env_validation import (
@@ -35,6 +35,7 @@ from ..onboarding.platform_read import (
     read_platform_facts,
     reads_with_sign_in,
 )
+from .email_verification import set_email_step
 from .unified_tool_base import ToolBase
 
 
@@ -530,10 +531,10 @@ Some configuration items need your attention to ensure optimal functionality.
         # Optional but recommended
         checklist += "## [ ] **Recommended Setup**\n\n"
 
-        email_set = bool(get_config_value("REVENIUM_DEFAULT_EMAIL"))
+        email_set = default_notification_email() is not None
         slack_set = onboarding_state.setup_completion.get("slack_configured")
 
-        checklist += f"{'[OK]' if email_set else '[ ]'} **Email Notifications**: {'Configured' if email_set else 'Use verify_email_setup() to configure'}\n"
+        checklist += f"{'[OK]' if email_set else '[ ]'} **Email Notifications**: {'Configured' if email_set else set_email_step()}\n"
         if slack_set is None:
             checklist += "[?] **Slack Integration**: Could not check Slack on the platform\n\n"
         elif slack_set:
@@ -793,7 +794,7 @@ Slack notifications provide instant alerts when:
                     "priority": 2,
                     "title": "Set Up Email Notifications",
                     "description": "Configure your notification email address",
-                    "action": "Use verify_email_setup() tool",
+                    "action": set_email_step(),
                     "urgency": " Recommended",
                 }
             )

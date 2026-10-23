@@ -67,7 +67,18 @@ _DISPATCH_COST_ACTIONS = {
     "get_transaction_count": None,
     "get_coverage_ratio": "provider",
     "analyze_cost_anomalies": None,
+    "list_skills": None,
+    "get_skill": None,
 }
+
+_LISTED_PROVIDERS = ["openai", "Anthropic"]
+
+
+def _listed_providers(monkeypatch, listed=_LISTED_PROVIDERS):
+    """The providers get_filter_options lists for the window."""
+    options = AsyncMock(return_value=list(listed))
+    monkeypatch.setattr(SimpleCostAnalyzer, "get_analytics_filter_options", options)
+    return options
 
 _BLANK_NAME_VALUES = ["", "  ", [], [""], ["openai", " "], [1], [None]]
 
@@ -261,6 +272,7 @@ class TestDispatchCostActionsRefuseNarrowingTheyDoNotRead:
     async def test_applied_narrowing_still_reaches_the_analyzer(
         self, tool, monkeypatch, action, method, name, value
     ):
+        _listed_providers(monkeypatch)
         read = AsyncMock(return_value=PackRows([]))
         monkeypatch.setattr(SimpleCostAnalyzer, method, read)
 
@@ -288,6 +300,7 @@ class TestDispatchCostActionsRefuseNarrowingTheyDoNotRead:
     async def test_a_plain_provider_name_reaches_the_breakdown_as_a_list(
         self, tool, monkeypatch
     ):
+        _listed_providers(monkeypatch)
         read = AsyncMock(return_value=PackRows([]))
         monkeypatch.setattr(SimpleCostAnalyzer, "get_token_breakdown", read)
 
@@ -296,15 +309,69 @@ class TestDispatchCostActionsRefuseNarrowingTheyDoNotRead:
         assert read.await_args.kwargs["providers"] == ["openai"]
 
     @pytest.mark.asyncio
-    async def test_a_comma_in_a_provider_name_is_kept_as_one_name(self, tool, monkeypatch):
+    @pytest.mark.parametrize(
+        "providers",
+        ["openai,anthropic", "openai, anthropic", ["openai", "anthropic"], ["OpenAI", "ANTHROPIC"]],
+        ids=["comma_joined", "comma_and_space", "list", "other_spelling"],
+    )
+    async def test_several_providers_reach_the_breakdown_in_the_platforms_spelling(
+        self, tool, monkeypatch, providers
+    ):
+        """A comma-joined text is several names, each checked against the platform (BACK-4838)."""
+        options = _listed_providers(monkeypatch)
         read = AsyncMock(return_value=PackRows([]))
         monkeypatch.setattr(SimpleCostAnalyzer, "get_token_breakdown", read)
 
-        await _text(
-            tool, "get_token_breakdown", {"period": "SEVEN_DAYS", "providers": "openai,anthropic"}
-        )
+        await _text(tool, "get_token_breakdown", {"period": "SEVEN_DAYS", "providers": providers})
 
-        assert read.await_args.kwargs["providers"] == ["openai,anthropic"]
+        assert read.await_args.kwargs["providers"] == ["openai", "Anthropic"]
+        assert options.await_args.args[:2] == ("providers", "SEVEN_DAYS")
+
+    @pytest.mark.asyncio
+    async def test_a_provider_the_platform_does_not_list_is_refused_with_the_valid_names(
+        self, tool, monkeypatch
+    ):
+        _listed_providers(monkeypatch)
+        read = AsyncMock(return_value=PackRows([]))
+        monkeypatch.setattr(SimpleCostAnalyzer, "get_token_breakdown", read)
+
+        with pytest.raises(ToolError) as refusal:
+            await tool.handle_action(
+                "get_token_breakdown", {"period": "SEVEN_DAYS", "providers": "openai,made-up"}
+            )
+
+        read.assert_not_awaited()
+        assert refusal.value.field == "providers"
+        assert "'made-up'" in refusal.value.message
+        assert "'openai'" not in refusal.value.message
+        assert "Nothing was read" in refusal.value.message
+        assert "Anthropic, openai" in str(refusal.value.suggestions)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("placeholder", ["None", "NULL", "none", ["None"], ["openai", "NULL"]])
+    async def test_a_placeholder_provider_is_refused_before_any_read(
+        self, tool, placeholder
+    ):
+        with pytest.raises(ToolError) as refusal:
+            await tool.handle_action(
+                "get_token_breakdown", {"period": "SEVEN_DAYS", "providers": placeholder}
+            )
+
+        tool.get_client.assert_not_awaited()
+        assert refusal.value.field == "providers"
+        assert "names nothing" in refusal.value.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action, extra", [("list_skills", {}), ("get_skill", {"skill_id": "JMwX9g4"})])
+    @pytest.mark.parametrize("name, value", [("provider", "openai"), ("providers", ["openai"])])
+    async def test_the_skill_reads_refuse_a_provider_they_cannot_apply(
+        self, tool, action, extra, name, value
+    ):
+        """The skills endpoints declare no provider parameter (BACK-4838)."""
+        text = await _refusal(tool.handle_action(action, {**extra, name: value}))
+
+        tool.get_client.assert_not_awaited()
+        assert f"{action} does not apply {name}" in text
 
 
 async def _call_registered_tool(monkeypatch, httpserver, tmp_path, arguments):

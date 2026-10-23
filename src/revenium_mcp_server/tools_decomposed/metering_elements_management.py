@@ -95,6 +95,13 @@ def source_assignment_unsupported_error() -> ToolError:
     )
 
 
+def _templates_overview_line() -> str:
+    """The capabilities line naming the templates create_from_template offers."""
+    names = [f"`{name}`" for name in MeteringElementsManager().element_templates]
+    listed = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+    return f"- **Configuration templates**: {len(names)} templates, {listed}"
+
+
 class MeteringElementsManager:
     """Internal manager for metering elements operations."""
 
@@ -900,7 +907,7 @@ class MeteringElementsManagement(ToolBase):
 - **Billing component definitions** that specify what metrics to track for customer pricing
 - **Usage measurement schemas** that define data types, units, and default values for billing
 - **Product pricing building blocks** that connect customer usage to subscription costs
-- **Configuration templates**: three shipping templates, `shippingCost`, `shippingWeight` and `shippingContainerId`
+""" + _templates_overview_line() + """
 
 ### **Key Concepts**
 - **Elements** define billing metrics (API calls, data transfer, compute hours, etc.)
@@ -1178,7 +1185,7 @@ delete(element_id="elem_123")                     # Remove element
                 "for usage-based pricing in customer subscriptions and products.\n\n"
                 "**Key Features:**\n"
                 "• **CRUD Operations**: Create, read, update, delete metering element definitions\n"
-                f"• **Template Support**: {len(MeteringElementsManager().element_templates)} predefined shipping templates (get_templates)\n"
+                f"• **Template Support**: {len(MeteringElementsManager().element_templates)} predefined templates (get_templates)\n"
                 "• **Validation**: Comprehensive data validation and error handling\n"
                 "• **Dynamic IDs**: Always use list() first to get real IDs - never hardcode\n\n"
                 "**Use Cases**: Product pricing setup, subscription billing, usage tracking definitions\n\n"

@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-from .analytics_window import AnalyticsWindow, CalendarRange
+from .analytics_window import EXPLICIT_RANGE_TYPES, AnalyticsWindow
 from .config_store import get_config_value
 from .constants import DEFAULT_BASE_URL
 
@@ -412,13 +412,13 @@ def _should_use_new_path(
 ) -> bool:
     """Return True if this endpoint should route to its new path for ``period``.
 
-    A calendar range routes to the new path whenever one exists, because the
-    legacy API takes only a named period; a named period follows ``force_new``
+    A calendar or instant range routes to the new path whenever one exists,
+    because the legacy API takes only a named period; a named period follows ``force_new``
     or the deployment flag.
     """
     if config.new_path is None:
         return False
-    return config.force_new or _use_new_api() or isinstance(period, CalendarRange)
+    return config.force_new or _use_new_api() or isinstance(period, EXPLICIT_RANGE_TYPES)
 
 
 def _is_refused_without_new_api(
@@ -601,7 +601,7 @@ def window_bounds(period: AnalyticsWindow) -> Tuple[str, str]:
     from .analytics_parameters import TimePeriod
     from .date_parser import period_to_date_range
 
-    if isinstance(period, CalendarRange):
+    if isinstance(period, EXPLICIT_RANGE_TYPES):
         return period.iso_bounds()
     try:
         time_period = TimePeriod(period)
@@ -644,8 +644,8 @@ def resolve_analytics_request(
             caller-typed id: an API key naming any other team is refused with 403.
             Sent as teamId on both paths; omitted from new-API calls when empty.
         period: Period string (e.g. 'SEVEN_DAYS') — converted to ISO 8601 dates
-            for new API calls — or a CalendarRange, sent as its own bounds. A
-            CalendarRange routes to the new path whenever the endpoint has one,
+            for new API calls — or a CalendarRange or InstantRange, sent as its own
+            bounds. Such a range routes to the new path whenever the endpoint has one,
             flag or not, because the legacy API takes period names only; an
             endpoint with no new path raises CalendarRangeNeedsNewApiError.
         extra_old_params: Additional params merged into old-API calls only
@@ -681,7 +681,7 @@ def resolve_analytics_request(
         )
 
     # ── Legacy profitstream API ────────────────────────────────────────────
-    if isinstance(period, CalendarRange):
+    if isinstance(period, EXPLICIT_RANGE_TYPES):
         raise CalendarRangeNeedsNewApiError(
             f"start_date/end_date need the analytics API, and {key!r} has no analytics-API "
             "route; its legacy route accepts only a named period. Pass period instead."

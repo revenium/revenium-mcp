@@ -30,8 +30,9 @@ PER_SECOND_COUNTERPARTS = {
 }
 
 
-_NUMBER = r"(?<![\w.,-])(\d+(?:,\d{3})*(?:\.\d+)?)(?!\d|[.,]\d)"
-_AMOUNT = r"(?<![\w.,-])(\d+(?:,\d{3})*(?:\.\d+)?|\.\d+)(?!\d|[.,]\d)"
+_EXPONENT = r"(?:e[+-]?\d+)?"
+_NUMBER = rf"(?<![\w.,-])(\d+(?:,\d{{3}})*(?:\.\d+)?{_EXPONENT})(?!\d|[.,]\d)"
+_AMOUNT = rf"(?<![\w.,-])((?:\d+(?:,\d{{3}})*(?:\.\d+)?|\.\d+){_EXPONENT})(?!\d|[.,]\d)"
 _NOT_A_WINDOW = (
     r"(?![\s-]*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|h|days?|d|weeks?|wks?|months?)\b)"
 )
@@ -50,6 +51,8 @@ _MULTIPLIER = re.compile(rf"\s*({_MULTIPLIER_WORDS})\b", re.IGNORECASE)
 _PERCENT_SUFFIX = r"\s*(?:%|(?:percent|pct)\b)"
 _PERCENT_AFTER_NUMBER = re.compile(_PERCENT_SUFFIX, re.IGNORECASE)
 
+
+_MONEY_METRICS = frozenset({"TOTAL_COST", "COST_PER_TRANSACTION"})
 
 _STANDS_APART = r"(?!\w|-(?!dollar))"
 # Must stay the last deciding pattern so money, percent, comparison and count words keep priority.
@@ -141,7 +144,7 @@ def threshold_in_text(text: str) -> Optional[NumberInText]:
 
 
 def _plain_number(value: float) -> str:
-    return str(int(value)) if value.is_integer() else str(value)
+    return str(int(value)) if float(value).is_integer() else str(value)
 
 
 def refuse_an_undecided_threshold(text: str) -> None:
@@ -224,10 +227,10 @@ class AlertSemanticProcessor:
             # Additional mappings for cumulative usage - FIXED: Use uppercase API format
             "token usage": "TOKEN_COUNT",
             "usage": "TOKEN_COUNT",
-            "api calls": "REQUESTS_PER_SECOND",  # FIXED: Use proper metric for API calls
-            "api call": "REQUESTS_PER_SECOND",  # FIXED: Use proper metric for API calls
-            "requests": "REQUESTS_PER_SECOND",  # FIXED: Use proper metric for requests
-            "calls": "REQUESTS_PER_SECOND",  # FIXED: Use proper metric for calls
+            "api calls": "REQUESTS_PER_MINUTE",
+            "api call": "REQUESTS_PER_MINUTE",
+            "requests": "REQUESTS_PER_MINUTE",
+            "calls": "REQUESTS_PER_MINUTE",
             "quarterly costs": "TOTAL_COST",
             "monthly costs": "TOTAL_COST",
             "weekly costs": "TOTAL_COST",
@@ -872,10 +875,14 @@ class AlertSemanticProcessor:
             }.get(alert_data["operator"], alert_data["operator"])
 
             threshold = alert_data["threshold"]
+            if isinstance(threshold, (int, float)):
+                threshold = _plain_number(threshold)
             if alert_data.get("is_percentage"):
                 parts.append(f"{op_text} {threshold}%")
-            else:
+            elif alert_data.get("metric") in _MONEY_METRICS:
                 parts.append(f"{op_text} ${threshold}")
+            else:
+                parts.append(f"{op_text} {threshold}")
 
         # Add filter context
         if alert_data.get("filters"):

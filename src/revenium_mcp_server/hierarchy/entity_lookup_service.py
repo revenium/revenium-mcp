@@ -15,6 +15,18 @@ from loguru import logger
 from ..client import ReveniumClient
 
 
+class EntityPageError(Exception):
+    """A page of entities could not be read, so the entity list would be incomplete."""
+
+    def __init__(self, entity_type: str, page: int, cause: Exception):
+        super().__init__(
+            f"Could not read {entity_type} page {page} ({cause}); the {entity_type} "
+            "list is incomplete, so nothing was matched against it. Retry the request."
+        )
+        self.entity_type = entity_type
+        self.page = page
+
+
 class IDValidator:
     """Validator for distinguishing between object IDs and human-readable names."""
 
@@ -519,6 +531,17 @@ class EntityLookupService:
             await self._cache_result(cache_key, result)
             return result
 
+        except EntityPageError as e:
+            return LookupResult(
+                success=False,
+                entity_type=entity_type,
+                query=identifier,
+                strategy_used=strategy,
+                matches=[],
+                confidence_scores=[],
+                metadata={"incomplete": True},
+                error_message=str(e),
+            )
         except Exception as e:
             logger.error(
                 f"Error resolving {entity_type} {identifier} with strategy {strategy}: {e}"
@@ -618,6 +641,8 @@ class EntityLookupService:
                         error_message=f"{entity_type.title()} with ID {identifier} not found",
                     )
 
+            except EntityPageError:
+                raise
             except Exception as e:
                 logger.error(f"Error looking up {entity_type} by ID {identifier}: {e}")
 
@@ -645,6 +670,8 @@ class EntityLookupService:
                     error_message=f"ID lookup error: {str(e)}",
                 )
 
+        except EntityPageError:
+            raise
         except Exception as e:
             logger.error(f"Error in ID lookup for {entity_type} {identifier}: {e}")
             return LookupResult(
@@ -770,6 +797,8 @@ class EntityLookupService:
                 metadata={"total_entities_searched": len(entities), "fuzzy_threshold": 0.3},
             )
 
+        except EntityPageError:
+            raise
         except Exception as e:
             logger.error(f"Error in fuzzy lookup for {entity_type} {identifier}: {e}")
             return LookupResult(
@@ -821,6 +850,8 @@ class EntityLookupService:
                         result.strategy_used = f"auto({strategy})"
                         result.metadata["classification"] = classification
                         return result
+                except EntityPageError:
+                    raise
                 except Exception as e:
                     logger.warning(
                         f"Auto strategy {strategy} failed for {entity_type} {identifier}: {e}"
@@ -834,6 +865,8 @@ class EntityLookupService:
                     result.strategy_used = "auto(fuzzy)"
                     result.metadata["classification"] = classification
                     return result
+            except EntityPageError:
+                raise
             except Exception as e:
                 logger.warning(f"Auto fuzzy strategy failed for {entity_type} {identifier}: {e}")
 
@@ -849,6 +882,8 @@ class EntityLookupService:
                 error_message=f"No matches found using any strategy (tried: {', '.join(strategies_to_try)}, fuzzy)",
             )
 
+        except EntityPageError:
+            raise
         except Exception as e:
             logger.error(f"Error in auto strategy for {entity_type} {identifier}: {e}")
             return LookupResult(
@@ -918,6 +953,8 @@ class EntityLookupService:
                 metadata={"search_field": search_field, "exact_match": True},
             )
 
+        except EntityPageError:
+            raise
         except Exception as e:
             logger.error(
                 f"Error in search lookup for {entity_type} {identifier} by {field_type}: {e}"
@@ -934,51 +971,32 @@ class EntityLookupService:
             )
 
     async def _get_all_entities(self, entity_type: str) -> List[Dict[str, Any]]:
-        """Get all entities of a specific type."""
-        try:
-            entity_config = self.entity_types.get(entity_type)
-            if not entity_config:
-                return []
+        """Get all entities of a specific type.
 
-            api_method = entity_config["api_method"]
-
-            # Get all entities with pagination
-            all_entities = []
-            page = 0
-            page_size = 50
-
-            while True:
-                try:
-                    if api_method == "get_products":
-                        response = await self.client.get_products(page=page, size=page_size)
-                    elif api_method == "get_subscriptions":
-                        response = await self.client.get_subscriptions(page=page, size=page_size)
-                    elif api_method == "get_credentials":
-                        response = await self.client.get_credentials(page=page, size=page_size)
-                    elif api_method == "get_subscribers":
-                        response = await self.client.get_subscribers(page=page, size=page_size)
-                    elif api_method == "get_organizations":
-                        response = await self.client.get_organizations(page=page, size=page_size)
-                    else:
-                        break
-
-                    page_entities = self.client._extract_embedded_data(response)
-                    all_entities.extend(page_entities)
-
-                    # Check if we have more pages
-                    if len(page_entities) < page_size:
-                        break
-                    page += 1
-
-                except Exception as e:
-                    logger.error(f"Error fetching {entity_type} page {page}: {e}")
-                    break
-
-            return all_entities
-
-        except Exception as e:
-            logger.error(f"Error getting all entities for {entity_type}: {e}")
+        Raises:
+            EntityPageError: a page could not be read, so the list would be
+                incomplete; no partial list is returned.
+        """
+        entity_config = self.entity_types.get(entity_type)
+        if not entity_config:
             return []
+        fetch_page = getattr(self.client, str(entity_config["api_method"]))
+
+        all_entities: List[Dict[str, Any]] = []
+        page = 0
+        page_size = 50
+        while True:
+            try:
+                response = await fetch_page(page=page, size=page_size)
+                page_entities = self.client._extract_embedded_data(response)
+            except Exception as e:
+                logger.error(f"Error fetching {entity_type} page {page}: {e}")
+                raise EntityPageError(entity_type, page, e) from e
+
+            all_entities.extend(page_entities)
+            if len(page_entities) < page_size:
+                return all_entities
+            page += 1
 
     async def clear_cache(self) -> None:
         """Clear all cached data."""

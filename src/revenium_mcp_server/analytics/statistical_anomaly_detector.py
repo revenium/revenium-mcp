@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from loguru import logger
 
+from ..common.money import render_dollars
 from ..models import NewEntityIntroduction
 
 # Sensitivity thresholds as specified in PRD
@@ -21,18 +22,8 @@ SENSITIVITY_THRESHOLDS = {
     "aggressive": 1.5,  # 1.5 standard deviations (86.6% confidence)
 }
 
-# Share of the returned buckets that forms the baseline for new entity detection.
-# The platform picks the bucket size per period and route (half-day, six-hour,
-# daily, monthly), so the split is a share of the buckets, never a day count.
-BASELINE_SHARE = {
-    "SEVEN_DAYS": 2 / 7,
-    "THIRTY_DAYS": 7 / 30,
-    "TWELVE_MONTHS": 1 / 12,
-}
-MIN_DETECTION_BUCKETS = 2
-
-# How a cost source entered the recent part: no baseline cost at all, or none
-# in at least half of the baseline buckets
+# How a cost source entered the window: no cost in the comparison period at all,
+# or none in at least half of its buckets
 NEW_ENTITY = "new_entity"
 ACTIVATION = "activation"
 
@@ -43,6 +34,13 @@ DIMENSION_ENTITY_TYPES = {
     "providers": "provider",
     "agents": "agent",
     "api_keys": "api_key",
+}
+
+# How an answer names one entity of each type
+ENTITY_TYPE_NOUNS = {
+    "provider": "provider",
+    "agent": "agent",
+    "api_key": "API key",
 }
 
 # Default entity type thresholds (all zero for maximum sensitivity)
@@ -237,55 +235,41 @@ class StatisticalAnomalyDetector:
             percentage_above_normal=percentage_above_normal,
         )
 
-    def baseline_bucket_count(self, period: str, bucket_count: int) -> int:
-        """How many of the first buckets form the baseline; the rest are the recent part.
-
-        Raises:
-            ValueError: When the period has no baseline share or too few buckets came back
-        """
-        if period not in BASELINE_SHARE:
-            raise ValueError(
-                f"{period} has no baseline for new-entity detection "
-                f"(supported: {', '.join(BASELINE_SHARE)})"
-            )
-        if bucket_count < MIN_DETECTION_BUCKETS:
-            noun = "bucket" if bucket_count == 1 else "buckets"
-            raise ValueError(
-                f"the report returned {bucket_count} {noun}, and at least "
-                f"{MIN_DETECTION_BUCKETS} are needed to compare a baseline with a recent part"
-            )
-        share = round(bucket_count * BASELINE_SHARE[period])
-        return max(1, min(bucket_count - 1, share))
-
     def detect_new_cost_sources(
         self,
-        series: DetectionSeries,
-        bucket_starts: Sequence[datetime],
+        window: DetectionSeries,
+        window_starts: Sequence[datetime],
+        comparison: DetectionSeries,
+        comparison_bucket_count: int,
         period: str,
         min_new_entity_threshold: float = 0.0,
     ) -> List[NewEntityIntroduction]:
-        """Entities with cost in the recent part and none (new) or little (activated) in the baseline.
+        """Entities with cost in the window and none (new) or little (activated) in the comparison period.
 
         Args:
-            series: Dense cost series per (dimension, name), aligned to bucket_starts
-            bucket_starts: Every bucket's start, oldest first
-            period: Analysis period whose baseline share applies
-            min_new_entity_threshold: Minimum recent cost to report an entity
+            window: Dense cost series per (dimension, name), aligned to window_starts
+            window_starts: Every window bucket's start, oldest first
+            comparison: Dense cost series per (dimension, name) over the comparison period
+            comparison_bucket_count: How many buckets the comparison period returned
+            period: The requested period, which names the bucket type
+            min_new_entity_threshold: Minimum window cost to report an entity
 
         Raises:
-            ValueError: When the period has no baseline share or too few buckets came back
+            ValueError: When the window returned no bucket
         """
-        baseline_count = self.baseline_bucket_count(period, len(bucket_starts))
-        recent_starts = list(bucket_starts[baseline_count:])
+        if not window_starts:
+            raise ValueError(
+                "the report returned no bucket for the window, so nothing could be compared"
+            )
         period_type = "monthly" if period == "TWELVE_MONTHS" else "bucket"
         introduction_period = describe_span(
-            bucket_span(recent_starts), not starts_at_midnight(bucket_starts)
+            bucket_span(window_starts), not starts_at_midnight(window_starts)
         )
 
         found = []
-        for (dimension, entity_name), costs in series.items():
-            baseline = costs[:baseline_count]
-            recent = costs[baseline_count:]
+        for key, recent in window.items():
+            dimension, entity_name = key
+            baseline = comparison.get(key) or [0.0] * comparison_bucket_count
             introduction_type = self._introduction_type(
                 baseline, recent, min_new_entity_threshold
             )
@@ -300,7 +284,7 @@ class StatisticalAnomalyDetector:
                     entity_type=DIMENSION_ENTITY_TYPES.get(dimension, "provider"),
                     introduction_period=introduction_period,
                     first_appearance_index=first_index,
-                    first_active_date=recent_starts[first_index].strftime("%Y-%m-%d"),
+                    first_active_date=window_starts[first_index].strftime("%Y-%m-%d"),
                     periods_active=len(active),
                     period_type=period_type,
                     total_cost_impact=recent_total,
@@ -309,7 +293,7 @@ class StatisticalAnomalyDetector:
                     cost_periods=recent,
                     baseline_buckets_without_cost=sum(1 for cost in baseline if cost == 0),
                     context=(
-                        f"Newly active cost source detected with ${recent_total:.2f} "
+                        f"Newly active cost source detected with {render_dollars(recent_total)} "
                         "total cost impact"
                     ),
                 )
@@ -319,12 +303,17 @@ class StatisticalAnomalyDetector:
         return found
 
     @staticmethod
+    def reaches_threshold(recent: Sequence[float], min_threshold: float) -> bool:
+        """Whether a window series has cost and at least ``min_threshold`` of it."""
+        recent_total = sum(recent)
+        return recent_total > 0 and recent_total >= min_threshold
+
+    @staticmethod
     def _introduction_type(
         baseline: List[float], recent: List[float], min_threshold: float
     ) -> Optional[str]:
-        """'new_entity' when the baseline has no cost, 'activation' when it is mostly without cost."""
-        recent_total = sum(recent)
-        if recent_total <= 0 or recent_total < min_threshold:
+        """'new_entity' when the comparison period has no cost, 'activation' when it is mostly without cost."""
+        if not StatisticalAnomalyDetector.reaches_threshold(recent, min_threshold):
             return None
         zero_buckets = sum(1 for cost in baseline if cost == 0)
         if zero_buckets == len(baseline):

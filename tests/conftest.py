@@ -97,11 +97,31 @@ def forget_saved_configuration(monkeypatch, empty_cache_file) -> None:
             monkeypatch.setattr(module._default_cache, "cache_file", empty_cache_file)
 
 
+SAVED_EMAIL_MODULES = (
+    "src.revenium_mcp_server.saved_notification_email",
+    "revenium_mcp_server.saved_notification_email",
+)
+
+
+def forget_saved_notification_email(monkeypatch, saved_email_file) -> None:
+    """Point the address update_email saves at a file of this test's own.
+
+    The saved address sits in the working directory and outranks the
+    environment, so a developer's address, or one another test saved, would
+    otherwise reach the test.
+    """
+    for module_name in SAVED_EMAIL_MODULES:
+        module = sys.modules.get(module_name)
+        if module is not None:
+            monkeypatch.setattr(module.saved_notification_email, "path", saved_email_file)
+
+
 @pytest.fixture(autouse=True)
-def _no_saved_configuration(monkeypatch, tmp_path_factory):
+def _no_saved_configuration(monkeypatch, tmp_path_factory, tmp_path):
     if not live_network_opted_in():
         empty_cache_file = tmp_path_factory.getbasetemp() / "no-saved-configuration"
         forget_saved_configuration(monkeypatch, empty_cache_file)
+        forget_saved_notification_email(monkeypatch, tmp_path / "saved-notification-email")
 
 
 LOCKOUT_GATE_MODULES = (

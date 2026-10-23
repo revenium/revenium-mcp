@@ -38,6 +38,65 @@ from pydantic import (
 )
 
 
+class Method(StrEnum):
+    POST = 'POST'
+
+
+class CsvImport(BaseModel):
+    method: Method
+    url: AnyUrl
+
+
+class Method1(StrEnum):
+    GET = 'GET'
+
+
+class ListDepartments(BaseModel):
+    method: Method1
+    url: AnyUrl
+
+
+class Setup(BaseModel):
+    """
+    The platform API calls that import departments from a CSV file and list them, as absolute URLs on the platform API's host, not this one. Each takes a platform API key. Null when this deployment does not know that host.
+    """
+
+    csvImport: CsvImport
+    listDepartments: ListDepartments
+
+
+class Status(StrEnum):
+    """
+    READY: spend is grouped by department. NO_DEPARTMENTS: the team has no departments, items is empty. NO_ASSIGNMENTS: departments exist but nobody is assigned to one, items is empty. USAGE_UNASSIGNED: none of the usage this request covers (the period, narrowed by any filter) is from someone assigned to a department, items holds only the "No department assigned" group. DATA_NOT_LOADED: none of this team's calls are in this environment yet, either because its copy of the call data is still loading or because the team has sent none; items is empty and is not a $0 answer.
+    """
+
+    READY = 'READY'
+    NO_DEPARTMENTS = 'NO_DEPARTMENTS'
+    NO_ASSIGNMENTS = 'NO_ASSIGNMENTS'
+    USAGE_UNASSIGNED = 'USAGE_UNASSIGNED'
+    DATA_NOT_LOADED = 'DATA_NOT_LOADED'
+
+
+class DepartmentSetup(BaseModel):
+    message: Optional[str] = Field(
+        ...,
+        description='A sentence to show a person when status is not READY; null when it is. For NO_DEPARTMENTS it is "Departments are not set up yet. Set them up in Settings > Departments.", the same words the app shows.',
+    )
+    setup: Optional[Setup] = Field(
+        ...,
+        description="The platform API calls that import departments from a CSV file and list them, as absolute URLs on the platform API's host, not this one. Each takes a platform API key. Null when this deployment does not know that host.",
+    )
+    setupUrl: AnyUrl = Field(
+        ...,
+        description='Absolute link to Settings > Departments on the same host as this request, where departments are imported from a CSV file or created. Show it with the message.',
+        examples=['https://app.revenium.ai/settings/departments'],
+    )
+    status: Status = Field(
+        ...,
+        description='READY: spend is grouped by department. NO_DEPARTMENTS: the team has no departments, items is empty. NO_ASSIGNMENTS: departments exist but nobody is assigned to one, items is empty. USAGE_UNASSIGNED: none of the usage this request covers (the period, narrowed by any filter) is from someone assigned to a department, items holds only the "No department assigned" group. DATA_NOT_LOADED: none of this team\'s calls are in this environment yet, either because its copy of the call data is still loading or because the team has sent none; items is empty and is not a $0 answer.',
+    )
+
+
 class MetricType(StrEnum):
     """
     Accepted for compatibility. This endpoint ignores it.
@@ -445,7 +504,7 @@ class ApiV2AnalyticsCostByAgentGetParametersQuery(BaseModel):
     )
     costSource: Optional[list[CostSourceEnum]] = Field(
         None,
-        description="Count only cost from these sources: revenium_metered (usage metered by the Revenium SDK) or provider_billing (cost reported by your AI provider's billing). Omit it to count both. Repeat the parameter to pass several values.",
+        description="Count only cost from these sources: revenium_metered (usage metered by the Revenium SDK, shown as Metered) or provider_billing (cost reported by your AI provider's billing, shown as Billed, or Invoiced on the Providers pages). Say Metered or Billed, never the raw value. Omit it to count both. Repeat the parameter to pass several values.",
     )
     teamId: Optional[str] = Field(
         None,
@@ -751,6 +810,192 @@ class ApiV2AnalyticsCostByApiKeyGetResponse6(BaseModel):
     type: str
 
 
+class CostSource(StrEnum):
+    coding_assistant = 'coding_assistant'
+    revenium_metered = 'revenium_metered'
+    provider_billing = 'provider_billing'
+
+
+class ApiV2AnalyticsCostByDepartmentAggregatedGetParametersQuery(BaseModel):
+    startDate: Optional[AwareDatetime] = Field(
+        None,
+        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
+        examples=['2024-01-01T00:00:00.000Z'],
+    )
+    endDate: Optional[AwareDatetime] = Field(
+        None,
+        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
+        examples=['2024-01-31T23:59:59.000Z'],
+    )
+    metricType: Optional[MetricType2] = Field(
+        None,
+        description='How the values in each group are combined: sum, avg, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to sum.',
+    )
+    page: Optional[conint(ge=0)] = Field(
+        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
+    )
+    size: Optional[conint(le=100, gt=0)] = Field(
+        20,
+        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
+    )
+    costSources: Optional[list[CostSource]] = Field(
+        ['coding_assistant'],
+        description="Which cost to count: coding_assistant (coding assistant seats and usage, shown as Assistants on the AI by Employee page), revenium_metered (usage metered by the Revenium SDK, shown as Direct on that page; the Metered total elsewhere also includes coding assistants) or provider_billing (cost reported by your AI provider's billing, shown as Billed, or Invoiced on the Providers pages). Defaults to coding_assistant only. Say Assistants, Direct or Billed, never the raw value. Repeat the parameter to pass several values.",
+    )
+    agents: Optional[list[str]] = Field(
+        None,
+        description='Keep only these agents, by name. Repeat the parameter to pass several values.',
+    )
+    providers: Optional[list[str]] = Field(
+        None,
+        description='Keep only these providers, by name. Repeat the parameter to pass several values.',
+    )
+    models: Optional[list[str]] = Field(
+        None,
+        description='Keep only these models, by name. Repeat the parameter to pass several values.',
+    )
+    users: Optional[list[str]] = Field(
+        None,
+        description='Keep only these users, by email. Repeat the parameter to pass several values.',
+    )
+    teamId: Optional[str] = Field(
+        None,
+        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
+    )
+
+
+class Metric3(BaseModel):
+    created: AwareDatetime = Field(
+        ..., description='When the entry was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(..., description='Identifier of this entry, new on every call.')
+    label: str = Field(..., description='Name of the group the figure belongs to.')
+    links: Optional[dict[str, Links]] = Field(
+        None,
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    metricResult: float = Field(
+        ...,
+        description='Depends on metricType. COST_METRIC_BY_DEPARTMENT and COST_METRIC_BY_DEPARTMENT_WITH_SUBDEPARTMENTS: cost in USD. REQUEST_METRIC_BY_DEPARTMENT and its WITH_SUBDEPARTMENTS twin: number of requests. TOKEN_METRIC_BY_DEPARTMENT and its twin: number of tokens.',
+    )
+    metricType: str = Field(
+        ...,
+        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
+    )
+    resourceType: str = Field(..., description='Always metric.')
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Item3(BaseModel):
+    departmentId: str = Field(
+        ...,
+        description='The department, as a hashid: the value team-medians takes as department. "unassigned" for spend with no department at the time.',
+    )
+    groupName: str = Field(
+        ...,
+        description='The group the figures belong to, such as an agent or model name.',
+    )
+    metrics: list[Metric3]
+    parentDepartmentId: Optional[str] = Field(
+        ...,
+        description='The parent department, as a hashid. Null at a root and for "unassigned".',
+    )
+
+
+class FieldEmbedded3(BaseModel):
+    items: list[Item3] = Field(
+        ..., description='One item per group over the whole date range.'
+    )
+
+
+class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse(BaseModel):
+    field_embedded: FieldEmbedded3 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks1] = Field(
+        ...,
+        alias='_links',
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    created: AwareDatetime = Field(
+        ..., description='When the response was produced, ISO 8601 in UTC.'
+    )
+    departmentSetup: DepartmentSetup
+    id: str = Field(
+        ..., description='Identifier of the response type, the same on every call.'
+    )
+    label: str = Field(..., description='Human-readable name of the figure returned.')
+    page: Optional[Page] = Field(
+        None, description='Where this page sits among all pages of `_embedded.items`.'
+    )
+    period: Period1 = Field(..., description='The date range the response covers.')
+    resourceType: str = Field(
+        ..., description='Kind of response, for example metric_timeseries.'
+    )
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Code24(StrEnum):
+    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
+
+
+class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse1(BaseModel):
+    code: Code24
+    message: str
+
+
+class Code25(StrEnum):
+    VALIDATION_ERROR = 'VALIDATION_ERROR'
+
+
+class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse2(BaseModel):
+    code: Code25
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code26(StrEnum):
+    UNAUTHORIZED = 'UNAUTHORIZED'
+
+
+class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse3(BaseModel):
+    code: Code26
+    message: str
+
+
+class Code27(StrEnum):
+    FORBIDDEN = 'FORBIDDEN'
+    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
+
+
+class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse4(BaseModel):
+    code: Code27
+    message: str
+
+
+class Code28(StrEnum):
+    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
+
+
+class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse5(BaseModel):
+    code: Code28
+    message: str
+
+
+class Code29(StrEnum):
+    INTERNAL_ERROR = 'INTERNAL_ERROR'
+
+
+class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse6(BaseModel):
+    code: Code29
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
 class ApiV2AnalyticsCostByModelGetParametersQuery(BaseModel):
     startDate: Optional[AwareDatetime] = Field(
         None,
@@ -787,7 +1032,7 @@ class ApiV2AnalyticsCostByModelGetParametersQuery(BaseModel):
     )
 
 
-class Metric3(BaseModel):
+class Metric4(BaseModel):
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -814,10 +1059,10 @@ class Group2(BaseModel):
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric3]
+    metrics: list[Metric4]
 
 
-class Item3(BaseModel):
+class Item4(BaseModel):
     endTimestamp: AwareDatetime = Field(
         ..., description='End of the time bucket, ISO 8601 in UTC.'
     )
@@ -829,164 +1074,13 @@ class Item3(BaseModel):
     )
 
 
-class FieldEmbedded3(BaseModel):
-    items: list[Item3] = Field(
+class FieldEmbedded4(BaseModel):
+    items: list[Item4] = Field(
         ..., description='One item per time bucket, oldest first.'
     )
 
 
 class ApiV2AnalyticsCostByModelGetResponse(BaseModel):
-    field_embedded: FieldEmbedded3 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks1] = Field(
-        ...,
-        alias='_links',
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    created: AwareDatetime = Field(
-        ..., description='When the response was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(
-        ..., description='Identifier of the response type, the same on every call.'
-    )
-    label: str = Field(..., description='Human-readable name of the figure returned.')
-    page: Optional[Page] = Field(
-        None, description='Where this page sits among all pages of `_embedded.items`.'
-    )
-    period: Period1 = Field(..., description='The date range the response covers.')
-    resourceType: str = Field(
-        ..., description='Kind of response, for example metric_timeseries.'
-    )
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Code24(StrEnum):
-    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
-
-
-class ApiV2AnalyticsCostByModelGetResponse1(BaseModel):
-    code: Code24
-    message: str
-
-
-class Code25(StrEnum):
-    VALIDATION_ERROR = 'VALIDATION_ERROR'
-
-
-class ApiV2AnalyticsCostByModelGetResponse2(BaseModel):
-    code: Code25
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class Code26(StrEnum):
-    UNAUTHORIZED = 'UNAUTHORIZED'
-
-
-class ApiV2AnalyticsCostByModelGetResponse3(BaseModel):
-    code: Code26
-    message: str
-
-
-class Code27(StrEnum):
-    FORBIDDEN = 'FORBIDDEN'
-    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
-
-
-class ApiV2AnalyticsCostByModelGetResponse4(BaseModel):
-    code: Code27
-    message: str
-
-
-class Code28(StrEnum):
-    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
-
-
-class ApiV2AnalyticsCostByModelGetResponse5(BaseModel):
-    code: Code28
-    message: str
-
-
-class Code29(StrEnum):
-    INTERNAL_ERROR = 'INTERNAL_ERROR'
-
-
-class ApiV2AnalyticsCostByModelGetResponse6(BaseModel):
-    code: Code29
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class ApiV2AnalyticsCostByModelAggregatedGetParametersQuery(BaseModel):
-    startDate: Optional[AwareDatetime] = Field(
-        None,
-        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
-        examples=['2024-01-01T00:00:00.000Z'],
-    )
-    endDate: Optional[AwareDatetime] = Field(
-        None,
-        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
-        examples=['2024-01-31T23:59:59.000Z'],
-    )
-    metricType: Optional[MetricType2] = Field(
-        None,
-        description='How the values in each group are combined: sum, avg, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to sum.',
-    )
-    page: Optional[conint(ge=0)] = Field(
-        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
-    )
-    size: Optional[conint(le=100, gt=0)] = Field(
-        20,
-        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
-    )
-    teamId: Optional[str] = Field(
-        None,
-        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
-    )
-
-
-class Metric4(BaseModel):
-    created: AwareDatetime = Field(
-        ..., description='When the entry was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(..., description='Identifier of this entry, new on every call.')
-    label: str = Field(..., description='Name of the group the figure belongs to.')
-    links: Optional[dict[str, Links]] = Field(
-        None,
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    metricResult: float = Field(
-        ...,
-        description='Cost in USD, combined across calls as the metricType query parameter says. The default sum is the total cost.',
-    )
-    metricType: str = Field(
-        ...,
-        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
-    )
-    resourceType: str = Field(..., description='Always metric.')
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Item4(BaseModel):
-    groupName: str = Field(
-        ...,
-        description='The group the figures belong to, such as an agent or model name.',
-    )
-    metrics: list[Metric4]
-
-
-class FieldEmbedded4(BaseModel):
-    items: list[Item4] = Field(
-        ..., description='One item per group over the whole date range.'
-    )
-
-
-class ApiV2AnalyticsCostByModelAggregatedGetResponse(BaseModel):
     field_embedded: FieldEmbedded4 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
@@ -1014,7 +1108,7 @@ class Code30(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsCostByModelAggregatedGetResponse1(BaseModel):
+class ApiV2AnalyticsCostByModelGetResponse1(BaseModel):
     code: Code30
     message: str
 
@@ -1023,7 +1117,7 @@ class Code31(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsCostByModelAggregatedGetResponse2(BaseModel):
+class ApiV2AnalyticsCostByModelGetResponse2(BaseModel):
     code: Code31
     detail: str
     instance: Optional[str] = None
@@ -1036,7 +1130,7 @@ class Code32(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsCostByModelAggregatedGetResponse3(BaseModel):
+class ApiV2AnalyticsCostByModelGetResponse3(BaseModel):
     code: Code32
     message: str
 
@@ -1046,7 +1140,7 @@ class Code33(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsCostByModelAggregatedGetResponse4(BaseModel):
+class ApiV2AnalyticsCostByModelGetResponse4(BaseModel):
     code: Code33
     message: str
 
@@ -1055,7 +1149,7 @@ class Code34(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsCostByModelAggregatedGetResponse5(BaseModel):
+class ApiV2AnalyticsCostByModelGetResponse5(BaseModel):
     code: Code34
     message: str
 
@@ -1064,7 +1158,7 @@ class Code35(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsCostByModelAggregatedGetResponse6(BaseModel):
+class ApiV2AnalyticsCostByModelGetResponse6(BaseModel):
     code: Code35
     detail: str
     instance: Optional[str] = None
@@ -1073,7 +1167,7 @@ class ApiV2AnalyticsCostByModelAggregatedGetResponse6(BaseModel):
     type: str
 
 
-class ApiV2AnalyticsCostByOrganizationGetParametersQuery(BaseModel):
+class ApiV2AnalyticsCostByModelAggregatedGetParametersQuery(BaseModel):
     startDate: Optional[AwareDatetime] = Field(
         None,
         description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
@@ -1123,7 +1217,7 @@ class Metric5(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Group3(BaseModel):
+class Item5(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
@@ -1131,25 +1225,13 @@ class Group3(BaseModel):
     metrics: list[Metric5]
 
 
-class Item5(BaseModel):
-    endTimestamp: AwareDatetime = Field(
-        ..., description='End of the time bucket, ISO 8601 in UTC.'
-    )
-    groups: list[Group3] = Field(
-        ..., description='One entry per group, every group in every bucket.'
-    )
-    startTimestamp: AwareDatetime = Field(
-        ..., description='Start of the time bucket, ISO 8601 in UTC.'
-    )
-
-
 class FieldEmbedded5(BaseModel):
     items: list[Item5] = Field(
-        ..., description='One item per time bucket, oldest first.'
+        ..., description='One item per group over the whole date range.'
     )
 
 
-class ApiV2AnalyticsCostByOrganizationGetResponse(BaseModel):
+class ApiV2AnalyticsCostByModelAggregatedGetResponse(BaseModel):
     field_embedded: FieldEmbedded5 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
@@ -1177,7 +1259,7 @@ class Code36(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsCostByOrganizationGetResponse1(BaseModel):
+class ApiV2AnalyticsCostByModelAggregatedGetResponse1(BaseModel):
     code: Code36
     message: str
 
@@ -1186,7 +1268,7 @@ class Code37(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsCostByOrganizationGetResponse2(BaseModel):
+class ApiV2AnalyticsCostByModelAggregatedGetResponse2(BaseModel):
     code: Code37
     detail: str
     instance: Optional[str] = None
@@ -1199,7 +1281,7 @@ class Code38(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsCostByOrganizationGetResponse3(BaseModel):
+class ApiV2AnalyticsCostByModelAggregatedGetResponse3(BaseModel):
     code: Code38
     message: str
 
@@ -1209,7 +1291,7 @@ class Code39(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsCostByOrganizationGetResponse4(BaseModel):
+class ApiV2AnalyticsCostByModelAggregatedGetResponse4(BaseModel):
     code: Code39
     message: str
 
@@ -1218,7 +1300,7 @@ class Code40(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsCostByOrganizationGetResponse5(BaseModel):
+class ApiV2AnalyticsCostByModelAggregatedGetResponse5(BaseModel):
     code: Code40
     message: str
 
@@ -1227,7 +1309,7 @@ class Code41(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsCostByOrganizationGetResponse6(BaseModel):
+class ApiV2AnalyticsCostByModelAggregatedGetResponse6(BaseModel):
     code: Code41
     detail: str
     instance: Optional[str] = None
@@ -1236,7 +1318,7 @@ class ApiV2AnalyticsCostByOrganizationGetResponse6(BaseModel):
     type: str
 
 
-class ApiV2AnalyticsCostByOrganizationAggregatedGetParametersQuery(BaseModel):
+class ApiV2AnalyticsCostByOrganizationGetParametersQuery(BaseModel):
     startDate: Optional[AwareDatetime] = Field(
         None,
         description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
@@ -1286,7 +1368,7 @@ class Metric6(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item6(BaseModel):
+class Group3(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
@@ -1294,13 +1376,25 @@ class Item6(BaseModel):
     metrics: list[Metric6]
 
 
-class FieldEmbedded6(BaseModel):
-    items: list[Item6] = Field(
-        ..., description='One item per group over the whole date range.'
+class Item6(BaseModel):
+    endTimestamp: AwareDatetime = Field(
+        ..., description='End of the time bucket, ISO 8601 in UTC.'
+    )
+    groups: list[Group3] = Field(
+        ..., description='One entry per group, every group in every bucket.'
+    )
+    startTimestamp: AwareDatetime = Field(
+        ..., description='Start of the time bucket, ISO 8601 in UTC.'
     )
 
 
-class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse(BaseModel):
+class FieldEmbedded6(BaseModel):
+    items: list[Item6] = Field(
+        ..., description='One item per time bucket, oldest first.'
+    )
+
+
+class ApiV2AnalyticsCostByOrganizationGetResponse(BaseModel):
     field_embedded: FieldEmbedded6 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
@@ -1328,7 +1422,7 @@ class Code42(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse1(BaseModel):
+class ApiV2AnalyticsCostByOrganizationGetResponse1(BaseModel):
     code: Code42
     message: str
 
@@ -1337,7 +1431,7 @@ class Code43(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse2(BaseModel):
+class ApiV2AnalyticsCostByOrganizationGetResponse2(BaseModel):
     code: Code43
     detail: str
     instance: Optional[str] = None
@@ -1350,7 +1444,7 @@ class Code44(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse3(BaseModel):
+class ApiV2AnalyticsCostByOrganizationGetResponse3(BaseModel):
     code: Code44
     message: str
 
@@ -1360,7 +1454,7 @@ class Code45(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse4(BaseModel):
+class ApiV2AnalyticsCostByOrganizationGetResponse4(BaseModel):
     code: Code45
     message: str
 
@@ -1369,7 +1463,7 @@ class Code46(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse5(BaseModel):
+class ApiV2AnalyticsCostByOrganizationGetResponse5(BaseModel):
     code: Code46
     message: str
 
@@ -1378,8 +1472,159 @@ class Code47(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse6(BaseModel):
+class ApiV2AnalyticsCostByOrganizationGetResponse6(BaseModel):
     code: Code47
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class ApiV2AnalyticsCostByOrganizationAggregatedGetParametersQuery(BaseModel):
+    startDate: Optional[AwareDatetime] = Field(
+        None,
+        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
+        examples=['2024-01-01T00:00:00.000Z'],
+    )
+    endDate: Optional[AwareDatetime] = Field(
+        None,
+        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
+        examples=['2024-01-31T23:59:59.000Z'],
+    )
+    metricType: Optional[MetricType2] = Field(
+        None,
+        description='How the values in each group are combined: sum, avg, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to sum.',
+    )
+    page: Optional[conint(ge=0)] = Field(
+        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
+    )
+    size: Optional[conint(le=100, gt=0)] = Field(
+        20,
+        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
+    )
+    teamId: Optional[str] = Field(
+        None,
+        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
+    )
+
+
+class Metric7(BaseModel):
+    created: AwareDatetime = Field(
+        ..., description='When the entry was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(..., description='Identifier of this entry, new on every call.')
+    label: str = Field(..., description='Name of the group the figure belongs to.')
+    links: Optional[dict[str, Links]] = Field(
+        None,
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    metricResult: float = Field(
+        ...,
+        description='Cost in USD, combined across calls as the metricType query parameter says. The default sum is the total cost.',
+    )
+    metricType: str = Field(
+        ...,
+        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
+    )
+    resourceType: str = Field(..., description='Always metric.')
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Item7(BaseModel):
+    groupName: str = Field(
+        ...,
+        description='The group the figures belong to, such as an agent or model name.',
+    )
+    metrics: list[Metric7]
+
+
+class FieldEmbedded7(BaseModel):
+    items: list[Item7] = Field(
+        ..., description='One item per group over the whole date range.'
+    )
+
+
+class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse(BaseModel):
+    field_embedded: FieldEmbedded7 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks1] = Field(
+        ...,
+        alias='_links',
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    created: AwareDatetime = Field(
+        ..., description='When the response was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(
+        ..., description='Identifier of the response type, the same on every call.'
+    )
+    label: str = Field(..., description='Human-readable name of the figure returned.')
+    page: Optional[Page] = Field(
+        None, description='Where this page sits among all pages of `_embedded.items`.'
+    )
+    period: Period1 = Field(..., description='The date range the response covers.')
+    resourceType: str = Field(
+        ..., description='Kind of response, for example metric_timeseries.'
+    )
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Code48(StrEnum):
+    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
+
+
+class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse1(BaseModel):
+    code: Code48
+    message: str
+
+
+class Code49(StrEnum):
+    VALIDATION_ERROR = 'VALIDATION_ERROR'
+
+
+class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse2(BaseModel):
+    code: Code49
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code50(StrEnum):
+    UNAUTHORIZED = 'UNAUTHORIZED'
+
+
+class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse3(BaseModel):
+    code: Code50
+    message: str
+
+
+class Code51(StrEnum):
+    FORBIDDEN = 'FORBIDDEN'
+    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
+
+
+class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse4(BaseModel):
+    code: Code51
+    message: str
+
+
+class Code52(StrEnum):
+    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
+
+
+class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse5(BaseModel):
+    code: Code52
+    message: str
+
+
+class Code53(StrEnum):
+    INTERNAL_ERROR = 'INTERNAL_ERROR'
+
+
+class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse6(BaseModel):
+    code: Code53
     detail: str
     instance: Optional[str] = None
     status: float
@@ -1415,7 +1660,7 @@ class ApiV2AnalyticsCostByProductGetParametersQuery(BaseModel):
     )
     costSource: Optional[list[CostSourceEnum]] = Field(
         None,
-        description="Count only cost from these sources: revenium_metered (usage metered by the Revenium SDK) or provider_billing (cost reported by your AI provider's billing). Omit it to count both. Repeat the parameter to pass several values.",
+        description="Count only cost from these sources: revenium_metered (usage metered by the Revenium SDK, shown as Metered) or provider_billing (cost reported by your AI provider's billing, shown as Billed, or Invoiced on the Providers pages). Say Metered or Billed, never the raw value. Omit it to count both. Repeat the parameter to pass several values.",
     )
     teamId: Optional[str] = Field(
         None,
@@ -1423,7 +1668,7 @@ class ApiV2AnalyticsCostByProductGetParametersQuery(BaseModel):
     )
 
 
-class Metric7(BaseModel):
+class Metric8(BaseModel):
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -1450,10 +1695,10 @@ class Group4(BaseModel):
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric7]
+    metrics: list[Metric8]
 
 
-class Item7(BaseModel):
+class Item8(BaseModel):
     endTimestamp: AwareDatetime = Field(
         ..., description='End of the time bucket, ISO 8601 in UTC.'
     )
@@ -1465,14 +1710,14 @@ class Item7(BaseModel):
     )
 
 
-class FieldEmbedded7(BaseModel):
-    items: list[Item7] = Field(
+class FieldEmbedded8(BaseModel):
+    items: list[Item8] = Field(
         ..., description='One item per time bucket, oldest first.'
     )
 
 
 class ApiV2AnalyticsCostByProductGetResponse(BaseModel):
-    field_embedded: FieldEmbedded7 = Field(..., alias='_embedded')
+    field_embedded: FieldEmbedded8 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
         alias='_links',
@@ -1495,21 +1740,21 @@ class ApiV2AnalyticsCostByProductGetResponse(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code48(StrEnum):
+class Code54(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByProductGetResponse1(BaseModel):
-    code: Code48
+    code: Code54
     message: str
 
 
-class Code49(StrEnum):
+class Code55(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByProductGetResponse2(BaseModel):
-    code: Code49
+    code: Code55
     detail: str
     instance: Optional[str] = None
     status: float
@@ -1517,40 +1762,40 @@ class ApiV2AnalyticsCostByProductGetResponse2(BaseModel):
     type: str
 
 
-class Code50(StrEnum):
+class Code56(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByProductGetResponse3(BaseModel):
-    code: Code50
+    code: Code56
     message: str
 
 
-class Code51(StrEnum):
+class Code57(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByProductGetResponse4(BaseModel):
-    code: Code51
+    code: Code57
     message: str
 
 
-class Code52(StrEnum):
+class Code58(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByProductGetResponse5(BaseModel):
-    code: Code52
+    code: Code58
     message: str
 
 
-class Code53(StrEnum):
+class Code59(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByProductGetResponse6(BaseModel):
-    code: Code53
+    code: Code59
     detail: str
     instance: Optional[str] = None
     status: float
@@ -1582,7 +1827,7 @@ class ApiV2AnalyticsCostByProductAggregatedGetParametersQuery(BaseModel):
     )
     costSource: Optional[list[CostSourceEnum]] = Field(
         None,
-        description="Count only cost from these sources: revenium_metered (usage metered by the Revenium SDK) or provider_billing (cost reported by your AI provider's billing). Omit it to count both. Repeat the parameter to pass several values.",
+        description="Count only cost from these sources: revenium_metered (usage metered by the Revenium SDK, shown as Metered) or provider_billing (cost reported by your AI provider's billing, shown as Billed, or Invoiced on the Providers pages). Say Metered or Billed, never the raw value. Omit it to count both. Repeat the parameter to pass several values.",
     )
     teamId: Optional[str] = Field(
         None,
@@ -1590,7 +1835,7 @@ class ApiV2AnalyticsCostByProductAggregatedGetParametersQuery(BaseModel):
     )
 
 
-class Metric8(BaseModel):
+class Metric9(BaseModel):
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -1612,158 +1857,7 @@ class Metric8(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item8(BaseModel):
-    groupName: str = Field(
-        ...,
-        description='The group the figures belong to, such as an agent or model name.',
-    )
-    metrics: list[Metric8]
-
-
-class FieldEmbedded8(BaseModel):
-    items: list[Item8] = Field(
-        ..., description='One item per group over the whole date range.'
-    )
-
-
-class ApiV2AnalyticsCostByProductAggregatedGetResponse(BaseModel):
-    field_embedded: FieldEmbedded8 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks1] = Field(
-        ...,
-        alias='_links',
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    created: AwareDatetime = Field(
-        ..., description='When the response was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(
-        ..., description='Identifier of the response type, the same on every call.'
-    )
-    label: str = Field(..., description='Human-readable name of the figure returned.')
-    page: Optional[Page] = Field(
-        None, description='Where this page sits among all pages of `_embedded.items`.'
-    )
-    period: Period1 = Field(..., description='The date range the response covers.')
-    resourceType: str = Field(
-        ..., description='Kind of response, for example metric_timeseries.'
-    )
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Code54(StrEnum):
-    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
-
-
-class ApiV2AnalyticsCostByProductAggregatedGetResponse1(BaseModel):
-    code: Code54
-    message: str
-
-
-class Code55(StrEnum):
-    VALIDATION_ERROR = 'VALIDATION_ERROR'
-
-
-class ApiV2AnalyticsCostByProductAggregatedGetResponse2(BaseModel):
-    code: Code55
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class Code56(StrEnum):
-    UNAUTHORIZED = 'UNAUTHORIZED'
-
-
-class ApiV2AnalyticsCostByProductAggregatedGetResponse3(BaseModel):
-    code: Code56
-    message: str
-
-
-class Code57(StrEnum):
-    FORBIDDEN = 'FORBIDDEN'
-    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
-
-
-class ApiV2AnalyticsCostByProductAggregatedGetResponse4(BaseModel):
-    code: Code57
-    message: str
-
-
-class Code58(StrEnum):
-    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
-
-
-class ApiV2AnalyticsCostByProductAggregatedGetResponse5(BaseModel):
-    code: Code58
-    message: str
-
-
-class Code59(StrEnum):
-    INTERNAL_ERROR = 'INTERNAL_ERROR'
-
-
-class ApiV2AnalyticsCostByProductAggregatedGetResponse6(BaseModel):
-    code: Code59
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class ApiV2AnalyticsCostByProviderGetParametersQuery(BaseModel):
-    startDate: Optional[AwareDatetime] = Field(
-        None,
-        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
-        examples=['2024-01-01T00:00:00.000Z'],
-    )
-    endDate: Optional[AwareDatetime] = Field(
-        None,
-        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
-        examples=['2024-01-31T23:59:59.000Z'],
-    )
-    metricType: Optional[MetricType2] = Field(
-        None,
-        description='How the values in each group are combined: sum, avg, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to sum.',
-    )
-    page: Optional[conint(ge=0)] = Field(
-        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
-    )
-    size: Optional[conint(le=100, gt=0)] = Field(
-        20,
-        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
-    )
-    teamId: Optional[str] = Field(
-        None,
-        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
-    )
-
-
-class Metric9(BaseModel):
-    created: AwareDatetime = Field(
-        ..., description='When the entry was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(..., description='Identifier of this entry, new on every call.')
-    label: str = Field(..., description='Name of the group the figure belongs to.')
-    links: Optional[dict[str, Links]] = Field(
-        None,
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    metricResult: float = Field(
-        ...,
-        description='Cost in USD, combined across calls as the metricType query parameter says. The default sum is the total cost.',
-    )
-    metricType: str = Field(
-        ...,
-        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
-    )
-    resourceType: str = Field(..., description='Always metric.')
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Group5(BaseModel):
+class Item9(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
@@ -1771,25 +1865,13 @@ class Group5(BaseModel):
     metrics: list[Metric9]
 
 
-class Item9(BaseModel):
-    endTimestamp: AwareDatetime = Field(
-        ..., description='End of the time bucket, ISO 8601 in UTC.'
-    )
-    groups: list[Group5] = Field(
-        ..., description='One entry per group, every group in every bucket.'
-    )
-    startTimestamp: AwareDatetime = Field(
-        ..., description='Start of the time bucket, ISO 8601 in UTC.'
-    )
-
-
 class FieldEmbedded9(BaseModel):
     items: list[Item9] = Field(
-        ..., description='One item per time bucket, oldest first.'
+        ..., description='One item per group over the whole date range.'
     )
 
 
-class ApiV2AnalyticsCostByProviderGetResponse(BaseModel):
+class ApiV2AnalyticsCostByProductAggregatedGetResponse(BaseModel):
     field_embedded: FieldEmbedded9 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
@@ -1817,7 +1899,7 @@ class Code60(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsCostByProviderGetResponse1(BaseModel):
+class ApiV2AnalyticsCostByProductAggregatedGetResponse1(BaseModel):
     code: Code60
     message: str
 
@@ -1826,7 +1908,7 @@ class Code61(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsCostByProviderGetResponse2(BaseModel):
+class ApiV2AnalyticsCostByProductAggregatedGetResponse2(BaseModel):
     code: Code61
     detail: str
     instance: Optional[str] = None
@@ -1839,7 +1921,7 @@ class Code62(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsCostByProviderGetResponse3(BaseModel):
+class ApiV2AnalyticsCostByProductAggregatedGetResponse3(BaseModel):
     code: Code62
     message: str
 
@@ -1849,7 +1931,7 @@ class Code63(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsCostByProviderGetResponse4(BaseModel):
+class ApiV2AnalyticsCostByProductAggregatedGetResponse4(BaseModel):
     code: Code63
     message: str
 
@@ -1858,7 +1940,7 @@ class Code64(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsCostByProviderGetResponse5(BaseModel):
+class ApiV2AnalyticsCostByProductAggregatedGetResponse5(BaseModel):
     code: Code64
     message: str
 
@@ -1867,7 +1949,7 @@ class Code65(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsCostByProviderGetResponse6(BaseModel):
+class ApiV2AnalyticsCostByProductAggregatedGetResponse6(BaseModel):
     code: Code65
     detail: str
     instance: Optional[str] = None
@@ -1876,7 +1958,7 @@ class ApiV2AnalyticsCostByProviderGetResponse6(BaseModel):
     type: str
 
 
-class ApiV2AnalyticsCostByProviderAggregatedGetParametersQuery(BaseModel):
+class ApiV2AnalyticsCostByProviderGetParametersQuery(BaseModel):
     startDate: Optional[AwareDatetime] = Field(
         None,
         description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
@@ -1926,7 +2008,7 @@ class Metric10(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item10(BaseModel):
+class Group5(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
@@ -1934,13 +2016,25 @@ class Item10(BaseModel):
     metrics: list[Metric10]
 
 
-class FieldEmbedded10(BaseModel):
-    items: list[Item10] = Field(
-        ..., description='One item per group over the whole date range.'
+class Item10(BaseModel):
+    endTimestamp: AwareDatetime = Field(
+        ..., description='End of the time bucket, ISO 8601 in UTC.'
+    )
+    groups: list[Group5] = Field(
+        ..., description='One entry per group, every group in every bucket.'
+    )
+    startTimestamp: AwareDatetime = Field(
+        ..., description='Start of the time bucket, ISO 8601 in UTC.'
     )
 
 
-class ApiV2AnalyticsCostByProviderAggregatedGetResponse(BaseModel):
+class FieldEmbedded10(BaseModel):
+    items: list[Item10] = Field(
+        ..., description='One item per time bucket, oldest first.'
+    )
+
+
+class ApiV2AnalyticsCostByProviderGetResponse(BaseModel):
     field_embedded: FieldEmbedded10 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
@@ -1968,7 +2062,7 @@ class Code66(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsCostByProviderAggregatedGetResponse1(BaseModel):
+class ApiV2AnalyticsCostByProviderGetResponse1(BaseModel):
     code: Code66
     message: str
 
@@ -1977,7 +2071,7 @@ class Code67(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsCostByProviderAggregatedGetResponse2(BaseModel):
+class ApiV2AnalyticsCostByProviderGetResponse2(BaseModel):
     code: Code67
     detail: str
     instance: Optional[str] = None
@@ -1990,7 +2084,7 @@ class Code68(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsCostByProviderAggregatedGetResponse3(BaseModel):
+class ApiV2AnalyticsCostByProviderGetResponse3(BaseModel):
     code: Code68
     message: str
 
@@ -2000,7 +2094,7 @@ class Code69(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsCostByProviderAggregatedGetResponse4(BaseModel):
+class ApiV2AnalyticsCostByProviderGetResponse4(BaseModel):
     code: Code69
     message: str
 
@@ -2009,7 +2103,7 @@ class Code70(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsCostByProviderAggregatedGetResponse5(BaseModel):
+class ApiV2AnalyticsCostByProviderGetResponse5(BaseModel):
     code: Code70
     message: str
 
@@ -2018,8 +2112,159 @@ class Code71(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsCostByProviderAggregatedGetResponse6(BaseModel):
+class ApiV2AnalyticsCostByProviderGetResponse6(BaseModel):
     code: Code71
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class ApiV2AnalyticsCostByProviderAggregatedGetParametersQuery(BaseModel):
+    startDate: Optional[AwareDatetime] = Field(
+        None,
+        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
+        examples=['2024-01-01T00:00:00.000Z'],
+    )
+    endDate: Optional[AwareDatetime] = Field(
+        None,
+        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
+        examples=['2024-01-31T23:59:59.000Z'],
+    )
+    metricType: Optional[MetricType2] = Field(
+        None,
+        description='How the values in each group are combined: sum, avg, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to sum.',
+    )
+    page: Optional[conint(ge=0)] = Field(
+        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
+    )
+    size: Optional[conint(le=100, gt=0)] = Field(
+        20,
+        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
+    )
+    teamId: Optional[str] = Field(
+        None,
+        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
+    )
+
+
+class Metric11(BaseModel):
+    created: AwareDatetime = Field(
+        ..., description='When the entry was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(..., description='Identifier of this entry, new on every call.')
+    label: str = Field(..., description='Name of the group the figure belongs to.')
+    links: Optional[dict[str, Links]] = Field(
+        None,
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    metricResult: float = Field(
+        ...,
+        description='Cost in USD, combined across calls as the metricType query parameter says. The default sum is the total cost.',
+    )
+    metricType: str = Field(
+        ...,
+        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
+    )
+    resourceType: str = Field(..., description='Always metric.')
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Item11(BaseModel):
+    groupName: str = Field(
+        ...,
+        description='The group the figures belong to, such as an agent or model name.',
+    )
+    metrics: list[Metric11]
+
+
+class FieldEmbedded11(BaseModel):
+    items: list[Item11] = Field(
+        ..., description='One item per group over the whole date range.'
+    )
+
+
+class ApiV2AnalyticsCostByProviderAggregatedGetResponse(BaseModel):
+    field_embedded: FieldEmbedded11 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks1] = Field(
+        ...,
+        alias='_links',
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    created: AwareDatetime = Field(
+        ..., description='When the response was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(
+        ..., description='Identifier of the response type, the same on every call.'
+    )
+    label: str = Field(..., description='Human-readable name of the figure returned.')
+    page: Optional[Page] = Field(
+        None, description='Where this page sits among all pages of `_embedded.items`.'
+    )
+    period: Period1 = Field(..., description='The date range the response covers.')
+    resourceType: str = Field(
+        ..., description='Kind of response, for example metric_timeseries.'
+    )
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Code72(StrEnum):
+    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
+
+
+class ApiV2AnalyticsCostByProviderAggregatedGetResponse1(BaseModel):
+    code: Code72
+    message: str
+
+
+class Code73(StrEnum):
+    VALIDATION_ERROR = 'VALIDATION_ERROR'
+
+
+class ApiV2AnalyticsCostByProviderAggregatedGetResponse2(BaseModel):
+    code: Code73
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code74(StrEnum):
+    UNAUTHORIZED = 'UNAUTHORIZED'
+
+
+class ApiV2AnalyticsCostByProviderAggregatedGetResponse3(BaseModel):
+    code: Code74
+    message: str
+
+
+class Code75(StrEnum):
+    FORBIDDEN = 'FORBIDDEN'
+    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
+
+
+class ApiV2AnalyticsCostByProviderAggregatedGetResponse4(BaseModel):
+    code: Code75
+    message: str
+
+
+class Code76(StrEnum):
+    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
+
+
+class ApiV2AnalyticsCostByProviderAggregatedGetResponse5(BaseModel):
+    code: Code76
+    message: str
+
+
+class Code77(StrEnum):
+    INTERNAL_ERROR = 'INTERNAL_ERROR'
+
+
+class ApiV2AnalyticsCostByProviderAggregatedGetResponse6(BaseModel):
+    code: Code77
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2051,7 +2296,7 @@ class ApiV2AnalyticsCostByTaskGetParametersQuery(BaseModel):
     )
     costSource: Optional[list[CostSourceEnum]] = Field(
         None,
-        description="Count only cost from these sources: revenium_metered (usage metered by the Revenium SDK) or provider_billing (cost reported by your AI provider's billing). Omit it to count both. Repeat the parameter to pass several values.",
+        description="Count only cost from these sources: revenium_metered (usage metered by the Revenium SDK, shown as Metered) or provider_billing (cost reported by your AI provider's billing, shown as Billed, or Invoiced on the Providers pages). Say Metered or Billed, never the raw value. Omit it to count both. Repeat the parameter to pass several values.",
     )
     teamId: Optional[str] = Field(
         None,
@@ -2059,7 +2304,7 @@ class ApiV2AnalyticsCostByTaskGetParametersQuery(BaseModel):
     )
 
 
-class Metric11(BaseModel):
+class Metric12(BaseModel):
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -2086,10 +2331,10 @@ class Group6(BaseModel):
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric11]
+    metrics: list[Metric12]
 
 
-class Item11(BaseModel):
+class Item12(BaseModel):
     endTimestamp: AwareDatetime = Field(
         ..., description='End of the time bucket, ISO 8601 in UTC.'
     )
@@ -2101,14 +2346,14 @@ class Item11(BaseModel):
     )
 
 
-class FieldEmbedded11(BaseModel):
-    items: list[Item11] = Field(
+class FieldEmbedded12(BaseModel):
+    items: list[Item12] = Field(
         ..., description='One item per time bucket, oldest first.'
     )
 
 
 class ApiV2AnalyticsCostByTaskGetResponse(BaseModel):
-    field_embedded: FieldEmbedded11 = Field(..., alias='_embedded')
+    field_embedded: FieldEmbedded12 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
         alias='_links',
@@ -2131,21 +2376,21 @@ class ApiV2AnalyticsCostByTaskGetResponse(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code72(StrEnum):
+class Code78(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByTaskGetResponse1(BaseModel):
-    code: Code72
+    code: Code78
     message: str
 
 
-class Code73(StrEnum):
+class Code79(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByTaskGetResponse2(BaseModel):
-    code: Code73
+    code: Code79
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2153,40 +2398,40 @@ class ApiV2AnalyticsCostByTaskGetResponse2(BaseModel):
     type: str
 
 
-class Code74(StrEnum):
+class Code80(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByTaskGetResponse3(BaseModel):
-    code: Code74
+    code: Code80
     message: str
 
 
-class Code75(StrEnum):
+class Code81(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByTaskGetResponse4(BaseModel):
-    code: Code75
+    code: Code81
     message: str
 
 
-class Code76(StrEnum):
+class Code82(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByTaskGetResponse5(BaseModel):
-    code: Code76
+    code: Code82
     message: str
 
 
-class Code77(StrEnum):
+class Code83(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByTaskGetResponse6(BaseModel):
-    code: Code77
+    code: Code83
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2218,7 +2463,7 @@ class ApiV2AnalyticsCostByTaskAggregatedGetParametersQuery(BaseModel):
     )
     costSource: Optional[list[CostSourceEnum]] = Field(
         None,
-        description="Count only cost from these sources: revenium_metered (usage metered by the Revenium SDK) or provider_billing (cost reported by your AI provider's billing). Omit it to count both. Repeat the parameter to pass several values.",
+        description="Count only cost from these sources: revenium_metered (usage metered by the Revenium SDK, shown as Metered) or provider_billing (cost reported by your AI provider's billing, shown as Billed, or Invoiced on the Providers pages). Say Metered or Billed, never the raw value. Omit it to count both. Repeat the parameter to pass several values.",
     )
     teamId: Optional[str] = Field(
         None,
@@ -2226,7 +2471,7 @@ class ApiV2AnalyticsCostByTaskAggregatedGetParametersQuery(BaseModel):
     )
 
 
-class Metric12(BaseModel):
+class Metric13(BaseModel):
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -2248,22 +2493,22 @@ class Metric12(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item12(BaseModel):
+class Item13(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric12]
+    metrics: list[Metric13]
 
 
-class FieldEmbedded12(BaseModel):
-    items: list[Item12] = Field(
+class FieldEmbedded13(BaseModel):
+    items: list[Item13] = Field(
         ..., description='One item per group over the whole date range.'
     )
 
 
 class ApiV2AnalyticsCostByTaskAggregatedGetResponse(BaseModel):
-    field_embedded: FieldEmbedded12 = Field(..., alias='_embedded')
+    field_embedded: FieldEmbedded13 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
         alias='_links',
@@ -2286,21 +2531,21 @@ class ApiV2AnalyticsCostByTaskAggregatedGetResponse(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code78(StrEnum):
+class Code84(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByTaskAggregatedGetResponse1(BaseModel):
-    code: Code78
+    code: Code84
     message: str
 
 
-class Code79(StrEnum):
+class Code85(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByTaskAggregatedGetResponse2(BaseModel):
-    code: Code79
+    code: Code85
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2308,40 +2553,40 @@ class ApiV2AnalyticsCostByTaskAggregatedGetResponse2(BaseModel):
     type: str
 
 
-class Code80(StrEnum):
+class Code86(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByTaskAggregatedGetResponse3(BaseModel):
-    code: Code80
+    code: Code86
     message: str
 
 
-class Code81(StrEnum):
+class Code87(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByTaskAggregatedGetResponse4(BaseModel):
-    code: Code81
+    code: Code87
     message: str
 
 
-class Code82(StrEnum):
+class Code88(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByTaskAggregatedGetResponse5(BaseModel):
-    code: Code82
+    code: Code88
     message: str
 
 
-class Code83(StrEnum):
+class Code89(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByTaskAggregatedGetResponse6(BaseModel):
-    code: Code83
+    code: Code89
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2377,7 +2622,7 @@ class ApiV2AnalyticsCostByTeamGetParametersQuery(BaseModel):
     )
 
 
-class Metric13(BaseModel):
+class Metric14(BaseModel):
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -2404,186 +2649,6 @@ class Group7(BaseModel):
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric13]
-
-
-class Item13(BaseModel):
-    endTimestamp: AwareDatetime = Field(
-        ..., description='End of the time bucket, ISO 8601 in UTC.'
-    )
-    groups: list[Group7] = Field(
-        ..., description='One entry per group, every group in every bucket.'
-    )
-    startTimestamp: AwareDatetime = Field(
-        ..., description='Start of the time bucket, ISO 8601 in UTC.'
-    )
-
-
-class FieldEmbedded13(BaseModel):
-    items: list[Item13] = Field(
-        ..., description='One item per time bucket, oldest first.'
-    )
-
-
-class ApiV2AnalyticsCostByTeamGetResponse(BaseModel):
-    field_embedded: FieldEmbedded13 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks1] = Field(
-        ...,
-        alias='_links',
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    created: AwareDatetime = Field(
-        ..., description='When the response was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(
-        ..., description='Identifier of the response type, the same on every call.'
-    )
-    label: str = Field(..., description='Human-readable name of the figure returned.')
-    page: Optional[Page] = Field(
-        None, description='Where this page sits among all pages of `_embedded.items`.'
-    )
-    period: Period1 = Field(..., description='The date range the response covers.')
-    resourceType: str = Field(
-        ..., description='Kind of response, for example metric_timeseries.'
-    )
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Code84(StrEnum):
-    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
-
-
-class ApiV2AnalyticsCostByTeamGetResponse1(BaseModel):
-    code: Code84
-    message: str
-
-
-class Code85(StrEnum):
-    VALIDATION_ERROR = 'VALIDATION_ERROR'
-
-
-class ApiV2AnalyticsCostByTeamGetResponse2(BaseModel):
-    code: Code85
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class Code86(StrEnum):
-    UNAUTHORIZED = 'UNAUTHORIZED'
-
-
-class ApiV2AnalyticsCostByTeamGetResponse3(BaseModel):
-    code: Code86
-    message: str
-
-
-class Code87(StrEnum):
-    FORBIDDEN = 'FORBIDDEN'
-    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
-
-
-class ApiV2AnalyticsCostByTeamGetResponse4(BaseModel):
-    code: Code87
-    message: str
-
-
-class Code88(StrEnum):
-    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
-
-
-class ApiV2AnalyticsCostByTeamGetResponse5(BaseModel):
-    code: Code88
-    message: str
-
-
-class Code89(StrEnum):
-    INTERNAL_ERROR = 'INTERNAL_ERROR'
-
-
-class ApiV2AnalyticsCostByTeamGetResponse6(BaseModel):
-    code: Code89
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class MetricType15(StrEnum):
-    """
-    Accepted for compatibility. This endpoint ignores it.
-    """
-
-    sum = 'sum'
-    avg = 'avg'
-    max = 'max'
-    min = 'min'
-    count = 'count'
-    median = 'median'
-    p50 = 'p50'
-    p90 = 'p90'
-    p95 = 'p95'
-    p99 = 'p99'
-
-
-class ApiV2AnalyticsCostByToolGetParametersQuery(BaseModel):
-    startDate: Optional[AwareDatetime] = Field(
-        None,
-        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
-        examples=['2024-01-01T00:00:00.000Z'],
-    )
-    endDate: Optional[AwareDatetime] = Field(
-        None,
-        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
-        examples=['2024-01-31T23:59:59.000Z'],
-    )
-    metricType: Optional[MetricType15] = Field(
-        None, description='Accepted for compatibility. This endpoint ignores it.'
-    )
-    page: Optional[conint(ge=0)] = Field(
-        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
-    )
-    size: Optional[conint(le=100, gt=0)] = Field(
-        20,
-        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
-    )
-    toolIds: Optional[list[str]] = Field(
-        None,
-        description='Keep only these tools, by tool ID. Repeat the parameter to pass several values.',
-    )
-    teamId: Optional[str] = Field(
-        None,
-        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
-    )
-
-
-class Metric14(BaseModel):
-    created: AwareDatetime = Field(
-        ..., description='When the entry was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(..., description='Identifier of this entry, new on every call.')
-    label: str = Field(..., description='Name of the group the figure belongs to.')
-    links: Optional[dict[str, Links]] = Field(
-        None,
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    metricResult: float = Field(..., description='Cost in USD.')
-    metricType: str = Field(
-        ...,
-        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
-    )
-    resourceType: str = Field(..., description='Always metric.')
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Group8(BaseModel):
-    groupName: str = Field(
-        ...,
-        description='The group the figures belong to, such as an agent or model name.',
-    )
     metrics: list[Metric14]
 
 
@@ -2591,7 +2656,7 @@ class Item14(BaseModel):
     endTimestamp: AwareDatetime = Field(
         ..., description='End of the time bucket, ISO 8601 in UTC.'
     )
-    groups: list[Group8] = Field(
+    groups: list[Group7] = Field(
         ..., description='One entry per group, every group in every bucket.'
     )
     startTimestamp: AwareDatetime = Field(
@@ -2605,7 +2670,7 @@ class FieldEmbedded14(BaseModel):
     )
 
 
-class ApiV2AnalyticsCostByToolGetResponse(BaseModel):
+class ApiV2AnalyticsCostByTeamGetResponse(BaseModel):
     field_embedded: FieldEmbedded14 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
@@ -2633,7 +2698,7 @@ class Code90(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsCostByToolGetResponse1(BaseModel):
+class ApiV2AnalyticsCostByTeamGetResponse1(BaseModel):
     code: Code90
     message: str
 
@@ -2642,7 +2707,7 @@ class Code91(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsCostByToolGetResponse2(BaseModel):
+class ApiV2AnalyticsCostByTeamGetResponse2(BaseModel):
     code: Code91
     detail: str
     instance: Optional[str] = None
@@ -2655,7 +2720,7 @@ class Code92(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsCostByToolGetResponse3(BaseModel):
+class ApiV2AnalyticsCostByTeamGetResponse3(BaseModel):
     code: Code92
     message: str
 
@@ -2665,7 +2730,7 @@ class Code93(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsCostByToolGetResponse4(BaseModel):
+class ApiV2AnalyticsCostByTeamGetResponse4(BaseModel):
     code: Code93
     message: str
 
@@ -2674,7 +2739,7 @@ class Code94(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsCostByToolGetResponse5(BaseModel):
+class ApiV2AnalyticsCostByTeamGetResponse5(BaseModel):
     code: Code94
     message: str
 
@@ -2683,7 +2748,7 @@ class Code95(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsCostByToolGetResponse6(BaseModel):
+class ApiV2AnalyticsCostByTeamGetResponse6(BaseModel):
     code: Code95
     detail: str
     instance: Optional[str] = None
@@ -2692,7 +2757,24 @@ class ApiV2AnalyticsCostByToolGetResponse6(BaseModel):
     type: str
 
 
-class ApiV2AnalyticsCostByToolAgentGetParametersQuery(BaseModel):
+class MetricType16(StrEnum):
+    """
+    Accepted for compatibility. This endpoint ignores it.
+    """
+
+    sum = 'sum'
+    avg = 'avg'
+    max = 'max'
+    min = 'min'
+    count = 'count'
+    median = 'median'
+    p50 = 'p50'
+    p90 = 'p90'
+    p95 = 'p95'
+    p99 = 'p99'
+
+
+class ApiV2AnalyticsCostByToolGetParametersQuery(BaseModel):
     startDate: Optional[AwareDatetime] = Field(
         None,
         description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
@@ -2703,7 +2785,7 @@ class ApiV2AnalyticsCostByToolAgentGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType15] = Field(
+    metricType: Optional[MetricType16] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
@@ -2712,6 +2794,10 @@ class ApiV2AnalyticsCostByToolAgentGetParametersQuery(BaseModel):
     size: Optional[conint(le=100, gt=0)] = Field(
         20,
         description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
+    )
+    toolIds: Optional[list[str]] = Field(
+        None,
+        description='Keep only these tools, by tool ID. Repeat the parameter to pass several values.',
     )
     teamId: Optional[str] = Field(
         None,
@@ -2738,7 +2824,7 @@ class Metric15(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item15(BaseModel):
+class Group8(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
@@ -2746,13 +2832,25 @@ class Item15(BaseModel):
     metrics: list[Metric15]
 
 
-class FieldEmbedded15(BaseModel):
-    items: list[Item15] = Field(
-        ..., description='One item per group over the whole date range.'
+class Item15(BaseModel):
+    endTimestamp: AwareDatetime = Field(
+        ..., description='End of the time bucket, ISO 8601 in UTC.'
+    )
+    groups: list[Group8] = Field(
+        ..., description='One entry per group, every group in every bucket.'
+    )
+    startTimestamp: AwareDatetime = Field(
+        ..., description='Start of the time bucket, ISO 8601 in UTC.'
     )
 
 
-class ApiV2AnalyticsCostByToolAgentGetResponse(BaseModel):
+class FieldEmbedded15(BaseModel):
+    items: list[Item15] = Field(
+        ..., description='One item per time bucket, oldest first.'
+    )
+
+
+class ApiV2AnalyticsCostByToolGetResponse(BaseModel):
     field_embedded: FieldEmbedded15 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
@@ -2780,7 +2878,7 @@ class Code96(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsCostByToolAgentGetResponse1(BaseModel):
+class ApiV2AnalyticsCostByToolGetResponse1(BaseModel):
     code: Code96
     message: str
 
@@ -2789,7 +2887,7 @@ class Code97(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsCostByToolAgentGetResponse2(BaseModel):
+class ApiV2AnalyticsCostByToolGetResponse2(BaseModel):
     code: Code97
     detail: str
     instance: Optional[str] = None
@@ -2802,7 +2900,7 @@ class Code98(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsCostByToolAgentGetResponse3(BaseModel):
+class ApiV2AnalyticsCostByToolGetResponse3(BaseModel):
     code: Code98
     message: str
 
@@ -2812,7 +2910,7 @@ class Code99(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsCostByToolAgentGetResponse4(BaseModel):
+class ApiV2AnalyticsCostByToolGetResponse4(BaseModel):
     code: Code99
     message: str
 
@@ -2821,7 +2919,7 @@ class Code100(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsCostByToolAgentGetResponse5(BaseModel):
+class ApiV2AnalyticsCostByToolGetResponse5(BaseModel):
     code: Code100
     message: str
 
@@ -2830,7 +2928,7 @@ class Code101(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsCostByToolAgentGetResponse6(BaseModel):
+class ApiV2AnalyticsCostByToolGetResponse6(BaseModel):
     code: Code101
     detail: str
     instance: Optional[str] = None
@@ -2839,7 +2937,7 @@ class ApiV2AnalyticsCostByToolAgentGetResponse6(BaseModel):
     type: str
 
 
-class ApiV2AnalyticsCostByToolAggregatedGetParametersQuery(BaseModel):
+class ApiV2AnalyticsCostByToolAgentGetParametersQuery(BaseModel):
     startDate: Optional[AwareDatetime] = Field(
         None,
         description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
@@ -2850,7 +2948,7 @@ class ApiV2AnalyticsCostByToolAggregatedGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType15] = Field(
+    metricType: Optional[MetricType16] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
@@ -2899,7 +2997,7 @@ class FieldEmbedded16(BaseModel):
     )
 
 
-class ApiV2AnalyticsCostByToolAggregatedGetResponse(BaseModel):
+class ApiV2AnalyticsCostByToolAgentGetResponse(BaseModel):
     field_embedded: FieldEmbedded16 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
@@ -2927,7 +3025,7 @@ class Code102(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsCostByToolAggregatedGetResponse1(BaseModel):
+class ApiV2AnalyticsCostByToolAgentGetResponse1(BaseModel):
     code: Code102
     message: str
 
@@ -2936,7 +3034,7 @@ class Code103(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsCostByToolAggregatedGetResponse2(BaseModel):
+class ApiV2AnalyticsCostByToolAgentGetResponse2(BaseModel):
     code: Code103
     detail: str
     instance: Optional[str] = None
@@ -2949,7 +3047,7 @@ class Code104(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsCostByToolAggregatedGetResponse3(BaseModel):
+class ApiV2AnalyticsCostByToolAgentGetResponse3(BaseModel):
     code: Code104
     message: str
 
@@ -2959,7 +3057,7 @@ class Code105(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsCostByToolAggregatedGetResponse4(BaseModel):
+class ApiV2AnalyticsCostByToolAgentGetResponse4(BaseModel):
     code: Code105
     message: str
 
@@ -2968,7 +3066,7 @@ class Code106(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsCostByToolAggregatedGetResponse5(BaseModel):
+class ApiV2AnalyticsCostByToolAgentGetResponse5(BaseModel):
     code: Code106
     message: str
 
@@ -2977,7 +3075,7 @@ class Code107(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsCostByToolAggregatedGetResponse6(BaseModel):
+class ApiV2AnalyticsCostByToolAgentGetResponse6(BaseModel):
     code: Code107
     detail: str
     instance: Optional[str] = None
@@ -2986,7 +3084,7 @@ class ApiV2AnalyticsCostByToolAggregatedGetResponse6(BaseModel):
     type: str
 
 
-class ApiV2AnalyticsCostByToolProviderGetParametersQuery(BaseModel):
+class ApiV2AnalyticsCostByToolAggregatedGetParametersQuery(BaseModel):
     startDate: Optional[AwareDatetime] = Field(
         None,
         description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
@@ -2997,7 +3095,7 @@ class ApiV2AnalyticsCostByToolProviderGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType15] = Field(
+    metricType: Optional[MetricType16] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
@@ -3006,10 +3104,6 @@ class ApiV2AnalyticsCostByToolProviderGetParametersQuery(BaseModel):
     size: Optional[conint(le=100, gt=0)] = Field(
         20,
         description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
-    )
-    providers: Optional[list[str]] = Field(
-        None,
-        description='Keep only these tool providers, by name. Repeat the parameter to pass several values.',
     )
     teamId: Optional[str] = Field(
         None,
@@ -3036,7 +3130,7 @@ class Metric17(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Group9(BaseModel):
+class Item17(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
@@ -3044,25 +3138,13 @@ class Group9(BaseModel):
     metrics: list[Metric17]
 
 
-class Item17(BaseModel):
-    endTimestamp: AwareDatetime = Field(
-        ..., description='End of the time bucket, ISO 8601 in UTC.'
-    )
-    groups: list[Group9] = Field(
-        ..., description='One entry per group, every group in every bucket.'
-    )
-    startTimestamp: AwareDatetime = Field(
-        ..., description='Start of the time bucket, ISO 8601 in UTC.'
-    )
-
-
 class FieldEmbedded17(BaseModel):
     items: list[Item17] = Field(
-        ..., description='One item per time bucket, oldest first.'
+        ..., description='One item per group over the whole date range.'
     )
 
 
-class ApiV2AnalyticsCostByToolProviderGetResponse(BaseModel):
+class ApiV2AnalyticsCostByToolAggregatedGetResponse(BaseModel):
     field_embedded: FieldEmbedded17 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
@@ -3090,7 +3172,7 @@ class Code108(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsCostByToolProviderGetResponse1(BaseModel):
+class ApiV2AnalyticsCostByToolAggregatedGetResponse1(BaseModel):
     code: Code108
     message: str
 
@@ -3099,7 +3181,7 @@ class Code109(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsCostByToolProviderGetResponse2(BaseModel):
+class ApiV2AnalyticsCostByToolAggregatedGetResponse2(BaseModel):
     code: Code109
     detail: str
     instance: Optional[str] = None
@@ -3112,7 +3194,7 @@ class Code110(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsCostByToolProviderGetResponse3(BaseModel):
+class ApiV2AnalyticsCostByToolAggregatedGetResponse3(BaseModel):
     code: Code110
     message: str
 
@@ -3122,7 +3204,7 @@ class Code111(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsCostByToolProviderGetResponse4(BaseModel):
+class ApiV2AnalyticsCostByToolAggregatedGetResponse4(BaseModel):
     code: Code111
     message: str
 
@@ -3131,7 +3213,7 @@ class Code112(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsCostByToolProviderGetResponse5(BaseModel):
+class ApiV2AnalyticsCostByToolAggregatedGetResponse5(BaseModel):
     code: Code112
     message: str
 
@@ -3140,7 +3222,7 @@ class Code113(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsCostByToolProviderGetResponse6(BaseModel):
+class ApiV2AnalyticsCostByToolAggregatedGetResponse6(BaseModel):
     code: Code113
     detail: str
     instance: Optional[str] = None
@@ -3149,7 +3231,7 @@ class ApiV2AnalyticsCostByToolProviderGetResponse6(BaseModel):
     type: str
 
 
-class ApiV2AnalyticsCostByToolProviderAggregatedGetParametersQuery(BaseModel):
+class ApiV2AnalyticsCostByToolProviderGetParametersQuery(BaseModel):
     startDate: Optional[AwareDatetime] = Field(
         None,
         description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
@@ -3160,7 +3242,7 @@ class ApiV2AnalyticsCostByToolProviderAggregatedGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType15] = Field(
+    metricType: Optional[MetricType16] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
@@ -3169,6 +3251,10 @@ class ApiV2AnalyticsCostByToolProviderAggregatedGetParametersQuery(BaseModel):
     size: Optional[conint(le=100, gt=0)] = Field(
         20,
         description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
+    )
+    providers: Optional[list[str]] = Field(
+        None,
+        description='Keep only these tool providers, by name. Repeat the parameter to pass several values.',
     )
     teamId: Optional[str] = Field(
         None,
@@ -3195,7 +3281,7 @@ class Metric18(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item18(BaseModel):
+class Group9(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
@@ -3203,13 +3289,25 @@ class Item18(BaseModel):
     metrics: list[Metric18]
 
 
-class FieldEmbedded18(BaseModel):
-    items: list[Item18] = Field(
-        ..., description='One item per group over the whole date range.'
+class Item18(BaseModel):
+    endTimestamp: AwareDatetime = Field(
+        ..., description='End of the time bucket, ISO 8601 in UTC.'
+    )
+    groups: list[Group9] = Field(
+        ..., description='One entry per group, every group in every bucket.'
+    )
+    startTimestamp: AwareDatetime = Field(
+        ..., description='Start of the time bucket, ISO 8601 in UTC.'
     )
 
 
-class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse(BaseModel):
+class FieldEmbedded18(BaseModel):
+    items: list[Item18] = Field(
+        ..., description='One item per time bucket, oldest first.'
+    )
+
+
+class ApiV2AnalyticsCostByToolProviderGetResponse(BaseModel):
     field_embedded: FieldEmbedded18 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
@@ -3237,7 +3335,7 @@ class Code114(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse1(BaseModel):
+class ApiV2AnalyticsCostByToolProviderGetResponse1(BaseModel):
     code: Code114
     message: str
 
@@ -3246,7 +3344,7 @@ class Code115(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse2(BaseModel):
+class ApiV2AnalyticsCostByToolProviderGetResponse2(BaseModel):
     code: Code115
     detail: str
     instance: Optional[str] = None
@@ -3259,7 +3357,7 @@ class Code116(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse3(BaseModel):
+class ApiV2AnalyticsCostByToolProviderGetResponse3(BaseModel):
     code: Code116
     message: str
 
@@ -3269,7 +3367,7 @@ class Code117(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse4(BaseModel):
+class ApiV2AnalyticsCostByToolProviderGetResponse4(BaseModel):
     code: Code117
     message: str
 
@@ -3278,7 +3376,7 @@ class Code118(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse5(BaseModel):
+class ApiV2AnalyticsCostByToolProviderGetResponse5(BaseModel):
     code: Code118
     message: str
 
@@ -3287,7 +3385,7 @@ class Code119(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse6(BaseModel):
+class ApiV2AnalyticsCostByToolProviderGetResponse6(BaseModel):
     code: Code119
     detail: str
     instance: Optional[str] = None
@@ -3296,13 +3394,7 @@ class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse6(BaseModel):
     type: str
 
 
-class CostSource(StrEnum):
-    coding_assistant = 'coding_assistant'
-    revenium_metered = 'revenium_metered'
-    provider_billing = 'provider_billing'
-
-
-class ApiV2AnalyticsCostByUserAggregatedGetParametersQuery(BaseModel):
+class ApiV2AnalyticsCostByToolProviderAggregatedGetParametersQuery(BaseModel):
     startDate: Optional[AwareDatetime] = Field(
         None,
         description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
@@ -3313,7 +3405,7 @@ class ApiV2AnalyticsCostByUserAggregatedGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType15] = Field(
+    metricType: Optional[MetricType16] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
@@ -3322,26 +3414,6 @@ class ApiV2AnalyticsCostByUserAggregatedGetParametersQuery(BaseModel):
     size: Optional[conint(le=100, gt=0)] = Field(
         20,
         description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
-    )
-    costSources: Optional[list[CostSource]] = Field(
-        ['coding_assistant'],
-        description="Which cost to count: coding_assistant (coding assistant seats and usage), revenium_metered (usage metered by the Revenium SDK) or provider_billing (cost reported by your AI provider's billing). Defaults to coding_assistant only. Repeat the parameter to pass several values.",
-    )
-    agents: Optional[list[str]] = Field(
-        None,
-        description='Keep only these agents, by name. Repeat the parameter to pass several values.',
-    )
-    providers: Optional[list[str]] = Field(
-        None,
-        description='Keep only these providers, by name. Repeat the parameter to pass several values.',
-    )
-    models: Optional[list[str]] = Field(
-        None,
-        description='Keep only these models, by name. Repeat the parameter to pass several values.',
-    )
-    users: Optional[list[str]] = Field(
-        None,
-        description='Keep only these users, by subscriber email. Repeat the parameter to pass several values.',
     )
     teamId: Optional[str] = Field(
         None,
@@ -3359,10 +3431,7 @@ class Metric19(BaseModel):
         None,
         description='Links to this request and to related requests, keyed by relation.',
     )
-    metricResult: float = Field(
-        ...,
-        description='Depends on metricType. COST_METRIC_BY_USER: cost in USD. REQUEST_METRIC_BY_USER: number of requests. TOKEN_METRIC_BY_USER: number of tokens.',
-    )
+    metricResult: float = Field(..., description='Cost in USD.')
     metricType: str = Field(
         ...,
         description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
@@ -3385,7 +3454,7 @@ class FieldEmbedded19(BaseModel):
     )
 
 
-class ApiV2AnalyticsCostByUserAggregatedGetResponse(BaseModel):
+class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse(BaseModel):
     field_embedded: FieldEmbedded19 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
@@ -3413,7 +3482,7 @@ class Code120(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsCostByUserAggregatedGetResponse1(BaseModel):
+class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse1(BaseModel):
     code: Code120
     message: str
 
@@ -3422,7 +3491,7 @@ class Code121(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsCostByUserAggregatedGetResponse2(BaseModel):
+class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse2(BaseModel):
     code: Code121
     detail: str
     instance: Optional[str] = None
@@ -3435,7 +3504,7 @@ class Code122(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsCostByUserAggregatedGetResponse3(BaseModel):
+class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse3(BaseModel):
     code: Code122
     message: str
 
@@ -3445,7 +3514,7 @@ class Code123(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsCostByUserAggregatedGetResponse4(BaseModel):
+class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse4(BaseModel):
     code: Code123
     message: str
 
@@ -3454,7 +3523,7 @@ class Code124(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsCostByUserAggregatedGetResponse5(BaseModel):
+class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse5(BaseModel):
     code: Code124
     message: str
 
@@ -3463,7 +3532,7 @@ class Code125(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsCostByUserAggregatedGetResponse6(BaseModel):
+class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse6(BaseModel):
     code: Code125
     detail: str
     instance: Optional[str] = None
@@ -3472,24 +3541,7 @@ class ApiV2AnalyticsCostByUserAggregatedGetResponse6(BaseModel):
     type: str
 
 
-class MetricType21(StrEnum):
-    """
-    How the values in each group are combined: sum, avg, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to sum.
-    """
-
-    sum = 'sum'
-    avg = 'avg'
-    max = 'max'
-    min = 'min'
-    count = 'count'
-    median = 'median'
-    p50 = 'p50'
-    p90 = 'p90'
-    p95 = 'p95'
-    p99 = 'p99'
-
-
-class ApiV2AnalyticsCostByVendorGetParametersQuery(BaseModel):
+class ApiV2AnalyticsCostByUserAggregatedGetParametersQuery(BaseModel):
     startDate: Optional[AwareDatetime] = Field(
         None,
         description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
@@ -3500,9 +3552,8 @@ class ApiV2AnalyticsCostByVendorGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType21] = Field(
-        None,
-        description='How the values in each group are combined: sum, avg, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to sum.',
+    metricType: Optional[MetricType16] = Field(
+        None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
         0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
@@ -3510,6 +3561,26 @@ class ApiV2AnalyticsCostByVendorGetParametersQuery(BaseModel):
     size: Optional[conint(le=100, gt=0)] = Field(
         20,
         description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
+    )
+    costSources: Optional[list[CostSource]] = Field(
+        ['coding_assistant'],
+        description="Which cost to count: coding_assistant (coding assistant seats and usage, shown as Assistants on the AI by Employee page), revenium_metered (usage metered by the Revenium SDK, shown as Direct on that page; the Metered total elsewhere also includes coding assistants) or provider_billing (cost reported by your AI provider's billing, shown as Billed, or Invoiced on the Providers pages). Defaults to coding_assistant only. Say Assistants, Direct or Billed, never the raw value. Repeat the parameter to pass several values.",
+    )
+    agents: Optional[list[str]] = Field(
+        None,
+        description='Keep only these agents, by name. Repeat the parameter to pass several values.',
+    )
+    providers: Optional[list[str]] = Field(
+        None,
+        description='Keep only these providers, by name. Repeat the parameter to pass several values.',
+    )
+    models: Optional[list[str]] = Field(
+        None,
+        description='Keep only these models, by name. Repeat the parameter to pass several values.',
+    )
+    users: Optional[list[str]] = Field(
+        None,
+        description='Keep only these users, by email. Repeat the parameter to pass several values.',
     )
     teamId: Optional[str] = Field(
         None,
@@ -3529,7 +3600,7 @@ class Metric20(BaseModel):
     )
     metricResult: float = Field(
         ...,
-        description='Cost in USD, combined across calls as the metricType query parameter says. The default sum is the total cost.',
+        description='Depends on metricType. COST_METRIC_BY_USER: cost in USD. REQUEST_METRIC_BY_USER: number of requests. TOKEN_METRIC_BY_USER: number of tokens.',
     )
     metricType: str = Field(
         ...,
@@ -3553,7 +3624,7 @@ class FieldEmbedded20(BaseModel):
     )
 
 
-class ApiV2AnalyticsCostByVendorGetResponse(BaseModel):
+class ApiV2AnalyticsCostByUserAggregatedGetResponse(BaseModel):
     field_embedded: FieldEmbedded20 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
@@ -3581,7 +3652,7 @@ class Code126(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsCostByVendorGetResponse1(BaseModel):
+class ApiV2AnalyticsCostByUserAggregatedGetResponse1(BaseModel):
     code: Code126
     message: str
 
@@ -3590,7 +3661,7 @@ class Code127(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsCostByVendorGetResponse2(BaseModel):
+class ApiV2AnalyticsCostByUserAggregatedGetResponse2(BaseModel):
     code: Code127
     detail: str
     instance: Optional[str] = None
@@ -3603,7 +3674,7 @@ class Code128(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsCostByVendorGetResponse3(BaseModel):
+class ApiV2AnalyticsCostByUserAggregatedGetResponse3(BaseModel):
     code: Code128
     message: str
 
@@ -3613,7 +3684,7 @@ class Code129(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsCostByVendorGetResponse4(BaseModel):
+class ApiV2AnalyticsCostByUserAggregatedGetResponse4(BaseModel):
     code: Code129
     message: str
 
@@ -3622,7 +3693,7 @@ class Code130(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsCostByVendorGetResponse5(BaseModel):
+class ApiV2AnalyticsCostByUserAggregatedGetResponse5(BaseModel):
     code: Code130
     message: str
 
@@ -3631,7 +3702,7 @@ class Code131(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsCostByVendorGetResponse6(BaseModel):
+class ApiV2AnalyticsCostByUserAggregatedGetResponse6(BaseModel):
     code: Code131
     detail: str
     instance: Optional[str] = None
@@ -3642,7 +3713,7 @@ class ApiV2AnalyticsCostByVendorGetResponse6(BaseModel):
 
 class MetricType22(StrEnum):
     """
-    Accepted for compatibility. This endpoint ignores it.
+    How the values in each group are combined: sum, avg, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to sum.
     """
 
     sum = 'sum'
@@ -3657,7 +3728,7 @@ class MetricType22(StrEnum):
     p99 = 'p99'
 
 
-class ApiV2AnalyticsFilterOptionsToolsGetParametersQuery(BaseModel):
+class ApiV2AnalyticsCostByVendorGetParametersQuery(BaseModel):
     startDate: Optional[AwareDatetime] = Field(
         None,
         description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
@@ -3669,15 +3740,15 @@ class ApiV2AnalyticsFilterOptionsToolsGetParametersQuery(BaseModel):
         examples=['2024-01-31T23:59:59.000Z'],
     )
     metricType: Optional[MetricType22] = Field(
-        None, description='Accepted for compatibility. This endpoint ignores it.'
+        None,
+        description='How the values in each group are combined: sum, avg, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to sum.',
     )
     page: Optional[conint(ge=0)] = Field(
-        0,
-        description='Accepted for compatibility. This endpoint does not page its results and ignores it.',
+        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
     )
     size: Optional[conint(le=100, gt=0)] = Field(
         20,
-        description='Accepted for compatibility. This endpoint does not page its results and ignores it.',
+        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
     )
     teamId: Optional[str] = Field(
         None,
@@ -3685,11 +3756,43 @@ class ApiV2AnalyticsFilterOptionsToolsGetParametersQuery(BaseModel):
     )
 
 
+class Metric21(BaseModel):
+    created: AwareDatetime = Field(
+        ..., description='When the entry was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(..., description='Identifier of this entry, new on every call.')
+    label: str = Field(..., description='Name of the group the figure belongs to.')
+    links: Optional[dict[str, Links]] = Field(
+        None,
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    metricResult: float = Field(
+        ...,
+        description='Cost in USD, combined across calls as the metricType query parameter says. The default sum is the total cost.',
+    )
+    metricType: str = Field(
+        ...,
+        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
+    )
+    resourceType: str = Field(..., description='Always metric.')
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Item21(BaseModel):
+    groupName: str = Field(
+        ...,
+        description='The group the figures belong to, such as an agent or model name.',
+    )
+    metrics: list[Metric21]
+
+
 class FieldEmbedded21(BaseModel):
-    items: list[str] = Field(..., description='Every distinct value.')
+    items: list[Item21] = Field(
+        ..., description='One item per group over the whole date range.'
+    )
 
 
-class ApiV2AnalyticsFilterOptionsToolsGetResponse(BaseModel):
+class ApiV2AnalyticsCostByVendorGetResponse(BaseModel):
     field_embedded: FieldEmbedded21 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
         ...,
@@ -3717,7 +3820,7 @@ class Code132(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsFilterOptionsToolsGetResponse1(BaseModel):
+class ApiV2AnalyticsCostByVendorGetResponse1(BaseModel):
     code: Code132
     message: str
 
@@ -3726,7 +3829,7 @@ class Code133(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsFilterOptionsToolsGetResponse2(BaseModel):
+class ApiV2AnalyticsCostByVendorGetResponse2(BaseModel):
     code: Code133
     detail: str
     instance: Optional[str] = None
@@ -3739,7 +3842,7 @@ class Code134(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsFilterOptionsToolsGetResponse3(BaseModel):
+class ApiV2AnalyticsCostByVendorGetResponse3(BaseModel):
     code: Code134
     message: str
 
@@ -3749,7 +3852,7 @@ class Code135(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsFilterOptionsToolsGetResponse4(BaseModel):
+class ApiV2AnalyticsCostByVendorGetResponse4(BaseModel):
     code: Code135
     message: str
 
@@ -3758,7 +3861,7 @@ class Code136(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsFilterOptionsToolsGetResponse5(BaseModel):
+class ApiV2AnalyticsCostByVendorGetResponse5(BaseModel):
     code: Code136
     message: str
 
@@ -3767,8 +3870,144 @@ class Code137(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsFilterOptionsToolsGetResponse6(BaseModel):
+class ApiV2AnalyticsCostByVendorGetResponse6(BaseModel):
     code: Code137
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class MetricType23(StrEnum):
+    """
+    Accepted for compatibility. This endpoint ignores it.
+    """
+
+    sum = 'sum'
+    avg = 'avg'
+    max = 'max'
+    min = 'min'
+    count = 'count'
+    median = 'median'
+    p50 = 'p50'
+    p90 = 'p90'
+    p95 = 'p95'
+    p99 = 'p99'
+
+
+class ApiV2AnalyticsFilterOptionsToolsGetParametersQuery(BaseModel):
+    startDate: Optional[AwareDatetime] = Field(
+        None,
+        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
+        examples=['2024-01-01T00:00:00.000Z'],
+    )
+    endDate: Optional[AwareDatetime] = Field(
+        None,
+        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
+        examples=['2024-01-31T23:59:59.000Z'],
+    )
+    metricType: Optional[MetricType23] = Field(
+        None, description='Accepted for compatibility. This endpoint ignores it.'
+    )
+    page: Optional[conint(ge=0)] = Field(
+        0,
+        description='Accepted for compatibility. This endpoint does not page its results and ignores it.',
+    )
+    size: Optional[conint(le=100, gt=0)] = Field(
+        20,
+        description='Accepted for compatibility. This endpoint does not page its results and ignores it.',
+    )
+    teamId: Optional[str] = Field(
+        None,
+        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
+    )
+
+
+class FieldEmbedded22(BaseModel):
+    items: list[str] = Field(..., description='Every distinct value.')
+
+
+class ApiV2AnalyticsFilterOptionsToolsGetResponse(BaseModel):
+    field_embedded: FieldEmbedded22 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks1] = Field(
+        ...,
+        alias='_links',
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    created: AwareDatetime = Field(
+        ..., description='When the response was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(
+        ..., description='Identifier of the response type, the same on every call.'
+    )
+    label: str = Field(..., description='Human-readable name of the figure returned.')
+    page: Optional[Page] = Field(
+        None, description='Where this page sits among all pages of `_embedded.items`.'
+    )
+    period: Period1 = Field(..., description='The date range the response covers.')
+    resourceType: str = Field(
+        ..., description='Kind of response, for example metric_timeseries.'
+    )
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Code138(StrEnum):
+    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
+
+
+class ApiV2AnalyticsFilterOptionsToolsGetResponse1(BaseModel):
+    code: Code138
+    message: str
+
+
+class Code139(StrEnum):
+    VALIDATION_ERROR = 'VALIDATION_ERROR'
+
+
+class ApiV2AnalyticsFilterOptionsToolsGetResponse2(BaseModel):
+    code: Code139
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code140(StrEnum):
+    UNAUTHORIZED = 'UNAUTHORIZED'
+
+
+class ApiV2AnalyticsFilterOptionsToolsGetResponse3(BaseModel):
+    code: Code140
+    message: str
+
+
+class Code141(StrEnum):
+    FORBIDDEN = 'FORBIDDEN'
+    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
+
+
+class ApiV2AnalyticsFilterOptionsToolsGetResponse4(BaseModel):
+    code: Code141
+    message: str
+
+
+class Code142(StrEnum):
+    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
+
+
+class ApiV2AnalyticsFilterOptionsToolsGetResponse5(BaseModel):
+    code: Code142
+    message: str
+
+
+class Code143(StrEnum):
+    INTERNAL_ERROR = 'INTERNAL_ERROR'
+
+
+class ApiV2AnalyticsFilterOptionsToolsGetResponse6(BaseModel):
+    code: Code143
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3787,7 +4026,7 @@ class ApiV2AnalyticsJobsRoiSummaryGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType22] = Field(
+    metricType: Optional[MetricType23] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     jobType: Optional[str] = Field(
@@ -3800,7 +4039,7 @@ class ApiV2AnalyticsJobsRoiSummaryGetParametersQuery(BaseModel):
     )
 
 
-class FieldLinks23(BaseModel):
+class FieldLinks24(BaseModel):
     """
     Link to this request.
     """
@@ -3876,7 +4115,7 @@ class ByJobTypeItem(BaseModel):
     )
 
 
-class Period23(BaseModel):
+class Period24(BaseModel):
     """
     The date range the response covers.
     """
@@ -3903,7 +4142,7 @@ class Summary(BaseModel):
 
 
 class ApiV2AnalyticsJobsRoiSummaryGetResponse(BaseModel):
-    field_links: FieldLinks23 = Field(
+    field_links: FieldLinks24 = Field(
         ..., alias='_links', description='Link to this request.'
     )
     byJobType: list[ByJobTypeItem] = Field(
@@ -3913,26 +4152,26 @@ class ApiV2AnalyticsJobsRoiSummaryGetResponse(BaseModel):
         ..., description='Identifier of the response type, the same on every call.'
     )
     label: str = Field(..., description='Human-readable name of the figure returned.')
-    period: Period23 = Field(..., description='The date range the response covers.')
+    period: Period24 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(..., description='Kind of response.')
     summary: Summary = Field(..., description='Totals across all job types.')
 
 
-class Code138(StrEnum):
+class Code144(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsJobsRoiSummaryGetResponse1(BaseModel):
-    code: Code138
+    code: Code144
     message: str
 
 
-class Code139(StrEnum):
+class Code145(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsJobsRoiSummaryGetResponse2(BaseModel):
-    code: Code139
+    code: Code145
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3940,40 +4179,40 @@ class ApiV2AnalyticsJobsRoiSummaryGetResponse2(BaseModel):
     type: str
 
 
-class Code140(StrEnum):
+class Code146(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsJobsRoiSummaryGetResponse3(BaseModel):
-    code: Code140
+    code: Code146
     message: str
 
 
-class Code141(StrEnum):
+class Code147(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsJobsRoiSummaryGetResponse4(BaseModel):
-    code: Code141
+    code: Code147
     message: str
 
 
-class Code142(StrEnum):
+class Code148(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsJobsRoiSummaryGetResponse5(BaseModel):
-    code: Code142
+    code: Code148
     message: str
 
 
-class Code143(StrEnum):
+class Code149(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsJobsRoiSummaryGetResponse6(BaseModel):
-    code: Code143
+    code: Code149
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3992,174 +4231,7 @@ class ApiV2AnalyticsProfitMarginPerCustomerGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType22] = Field(
-        None, description='Accepted for compatibility. This endpoint ignores it.'
-    )
-    page: Optional[conint(ge=0)] = Field(
-        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
-    )
-    size: Optional[conint(le=100, gt=0)] = Field(
-        20,
-        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
-    )
-    teamId: Optional[str] = Field(
-        None,
-        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
-    )
-
-
-class Metric21(BaseModel):
-    created: AwareDatetime = Field(
-        ..., description='When the entry was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(..., description='Identifier of this entry, new on every call.')
-    label: str = Field(..., description='Name of the group the figure belongs to.')
-    links: Optional[dict[str, Links]] = Field(
-        None,
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    metricResult: float = Field(
-        ...,
-        description='Profit margin in percent: revenue minus cost, divided by revenue, times 100. 0 when the customer has no revenue.',
-    )
-    metricType: str = Field(
-        ...,
-        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
-    )
-    resourceType: str = Field(..., description='Always metric.')
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Item21(BaseModel):
-    groupName: str = Field(
-        ...,
-        description='The group the figures belong to, such as an agent or model name.',
-    )
-    metrics: list[Metric21]
-
-
-class FieldEmbedded22(BaseModel):
-    items: list[Item21] = Field(
-        ..., description='One item per group over the whole date range.'
-    )
-
-
-class FieldLinks24(BaseModel):
-    href: str = Field(..., description='URL of the related request.')
-
-
-class Period24(BaseModel):
-    """
-    The date range the response covers.
-    """
-
-    end: AwareDatetime = Field(
-        ..., description='End of the date range, ISO 8601 in UTC.'
-    )
-    start: AwareDatetime = Field(
-        ..., description='Start of the date range, ISO 8601 in UTC.'
-    )
-
-
-class ApiV2AnalyticsProfitMarginPerCustomerGetResponse(BaseModel):
-    field_embedded: FieldEmbedded22 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
-        ...,
-        alias='_links',
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    created: AwareDatetime = Field(
-        ..., description='When the response was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(
-        ..., description='Identifier of the response type, the same on every call.'
-    )
-    label: str = Field(..., description='Human-readable name of the figure returned.')
-    page: Optional[Page] = Field(
-        None, description='Where this page sits among all pages of `_embedded.items`.'
-    )
-    period: Period24 = Field(..., description='The date range the response covers.')
-    resourceType: str = Field(
-        ..., description='Kind of response, for example metric_timeseries.'
-    )
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Code144(StrEnum):
-    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
-
-
-class ApiV2AnalyticsProfitMarginPerCustomerGetResponse1(BaseModel):
-    code: Code144
-    message: str
-
-
-class Code145(StrEnum):
-    VALIDATION_ERROR = 'VALIDATION_ERROR'
-
-
-class ApiV2AnalyticsProfitMarginPerCustomerGetResponse2(BaseModel):
-    code: Code145
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class Code146(StrEnum):
-    UNAUTHORIZED = 'UNAUTHORIZED'
-
-
-class ApiV2AnalyticsProfitMarginPerCustomerGetResponse3(BaseModel):
-    code: Code146
-    message: str
-
-
-class Code147(StrEnum):
-    FORBIDDEN = 'FORBIDDEN'
-    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
-
-
-class ApiV2AnalyticsProfitMarginPerCustomerGetResponse4(BaseModel):
-    code: Code147
-    message: str
-
-
-class Code148(StrEnum):
-    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
-
-
-class ApiV2AnalyticsProfitMarginPerCustomerGetResponse5(BaseModel):
-    code: Code148
-    message: str
-
-
-class Code149(StrEnum):
-    INTERNAL_ERROR = 'INTERNAL_ERROR'
-
-
-class ApiV2AnalyticsProfitMarginPerCustomerGetResponse6(BaseModel):
-    code: Code149
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class ApiV2AnalyticsProfitMarginPerProductGetParametersQuery(BaseModel):
-    startDate: Optional[AwareDatetime] = Field(
-        None,
-        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
-        examples=['2024-01-01T00:00:00.000Z'],
-    )
-    endDate: Optional[AwareDatetime] = Field(
-        None,
-        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
-        examples=['2024-01-31T23:59:59.000Z'],
-    )
-    metricType: Optional[MetricType22] = Field(
+    metricType: Optional[MetricType23] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
@@ -4187,7 +4259,7 @@ class Metric22(BaseModel):
     )
     metricResult: float = Field(
         ...,
-        description='Profit margin in percent: revenue minus cost, divided by revenue, times 100. 0 when the product has no revenue.',
+        description='Profit margin in percent: revenue minus cost, divided by revenue, times 100. 0 when the customer has no revenue.',
     )
     metricType: str = Field(
         ...,
@@ -4211,9 +4283,26 @@ class FieldEmbedded23(BaseModel):
     )
 
 
-class ApiV2AnalyticsProfitMarginPerProductGetResponse(BaseModel):
+class FieldLinks25(BaseModel):
+    href: str = Field(..., description='URL of the related request.')
+
+
+class Period25(BaseModel):
+    """
+    The date range the response covers.
+    """
+
+    end: AwareDatetime = Field(
+        ..., description='End of the date range, ISO 8601 in UTC.'
+    )
+    start: AwareDatetime = Field(
+        ..., description='Start of the date range, ISO 8601 in UTC.'
+    )
+
+
+class ApiV2AnalyticsProfitMarginPerCustomerGetResponse(BaseModel):
     field_embedded: FieldEmbedded23 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
+    field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
         description='Links to this request and to related requests, keyed by relation.',
@@ -4228,7 +4317,7 @@ class ApiV2AnalyticsProfitMarginPerProductGetResponse(BaseModel):
     page: Optional[Page] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period24 = Field(..., description='The date range the response covers.')
+    period: Period25 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
@@ -4239,7 +4328,7 @@ class Code150(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsProfitMarginPerProductGetResponse1(BaseModel):
+class ApiV2AnalyticsProfitMarginPerCustomerGetResponse1(BaseModel):
     code: Code150
     message: str
 
@@ -4248,7 +4337,7 @@ class Code151(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsProfitMarginPerProductGetResponse2(BaseModel):
+class ApiV2AnalyticsProfitMarginPerCustomerGetResponse2(BaseModel):
     code: Code151
     detail: str
     instance: Optional[str] = None
@@ -4261,7 +4350,7 @@ class Code152(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsProfitMarginPerProductGetResponse3(BaseModel):
+class ApiV2AnalyticsProfitMarginPerCustomerGetResponse3(BaseModel):
     code: Code152
     message: str
 
@@ -4271,7 +4360,7 @@ class Code153(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsProfitMarginPerProductGetResponse4(BaseModel):
+class ApiV2AnalyticsProfitMarginPerCustomerGetResponse4(BaseModel):
     code: Code153
     message: str
 
@@ -4280,7 +4369,7 @@ class Code154(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsProfitMarginPerProductGetResponse5(BaseModel):
+class ApiV2AnalyticsProfitMarginPerCustomerGetResponse5(BaseModel):
     code: Code154
     message: str
 
@@ -4289,7 +4378,7 @@ class Code155(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsProfitMarginPerProductGetResponse6(BaseModel):
+class ApiV2AnalyticsProfitMarginPerCustomerGetResponse6(BaseModel):
     code: Code155
     detail: str
     instance: Optional[str] = None
@@ -4298,7 +4387,157 @@ class ApiV2AnalyticsProfitMarginPerProductGetResponse6(BaseModel):
     type: str
 
 
-class MetricType26(StrEnum):
+class ApiV2AnalyticsProfitMarginPerProductGetParametersQuery(BaseModel):
+    startDate: Optional[AwareDatetime] = Field(
+        None,
+        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
+        examples=['2024-01-01T00:00:00.000Z'],
+    )
+    endDate: Optional[AwareDatetime] = Field(
+        None,
+        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
+        examples=['2024-01-31T23:59:59.000Z'],
+    )
+    metricType: Optional[MetricType23] = Field(
+        None, description='Accepted for compatibility. This endpoint ignores it.'
+    )
+    page: Optional[conint(ge=0)] = Field(
+        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
+    )
+    size: Optional[conint(le=100, gt=0)] = Field(
+        20,
+        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
+    )
+    teamId: Optional[str] = Field(
+        None,
+        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
+    )
+
+
+class Metric23(BaseModel):
+    created: AwareDatetime = Field(
+        ..., description='When the entry was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(..., description='Identifier of this entry, new on every call.')
+    label: str = Field(..., description='Name of the group the figure belongs to.')
+    links: Optional[dict[str, Links]] = Field(
+        None,
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    metricResult: float = Field(
+        ...,
+        description='Profit margin in percent: revenue minus cost, divided by revenue, times 100. 0 when the product has no revenue.',
+    )
+    metricType: str = Field(
+        ...,
+        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
+    )
+    resourceType: str = Field(..., description='Always metric.')
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Item23(BaseModel):
+    groupName: str = Field(
+        ...,
+        description='The group the figures belong to, such as an agent or model name.',
+    )
+    metrics: list[Metric23]
+
+
+class FieldEmbedded24(BaseModel):
+    items: list[Item23] = Field(
+        ..., description='One item per group over the whole date range.'
+    )
+
+
+class ApiV2AnalyticsProfitMarginPerProductGetResponse(BaseModel):
+    field_embedded: FieldEmbedded24 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks25] = Field(
+        ...,
+        alias='_links',
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    created: AwareDatetime = Field(
+        ..., description='When the response was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(
+        ..., description='Identifier of the response type, the same on every call.'
+    )
+    label: str = Field(..., description='Human-readable name of the figure returned.')
+    page: Optional[Page] = Field(
+        None, description='Where this page sits among all pages of `_embedded.items`.'
+    )
+    period: Period25 = Field(..., description='The date range the response covers.')
+    resourceType: str = Field(
+        ..., description='Kind of response, for example metric_timeseries.'
+    )
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Code156(StrEnum):
+    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
+
+
+class ApiV2AnalyticsProfitMarginPerProductGetResponse1(BaseModel):
+    code: Code156
+    message: str
+
+
+class Code157(StrEnum):
+    VALIDATION_ERROR = 'VALIDATION_ERROR'
+
+
+class ApiV2AnalyticsProfitMarginPerProductGetResponse2(BaseModel):
+    code: Code157
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code158(StrEnum):
+    UNAUTHORIZED = 'UNAUTHORIZED'
+
+
+class ApiV2AnalyticsProfitMarginPerProductGetResponse3(BaseModel):
+    code: Code158
+    message: str
+
+
+class Code159(StrEnum):
+    FORBIDDEN = 'FORBIDDEN'
+    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
+
+
+class ApiV2AnalyticsProfitMarginPerProductGetResponse4(BaseModel):
+    code: Code159
+    message: str
+
+
+class Code160(StrEnum):
+    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
+
+
+class ApiV2AnalyticsProfitMarginPerProductGetResponse5(BaseModel):
+    code: Code160
+    message: str
+
+
+class Code161(StrEnum):
+    INTERNAL_ERROR = 'INTERNAL_ERROR'
+
+
+class ApiV2AnalyticsProfitMarginPerProductGetResponse6(BaseModel):
+    code: Code161
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class MetricType27(StrEnum):
     """
     How the response times of each group are combined: avg, sum, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to avg.
     """
@@ -4326,158 +4565,7 @@ class ApiV2AnalyticsResponseTimeByModelGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType26] = Field(
-        None,
-        description='How the response times of each group are combined: avg, sum, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to avg.',
-    )
-    page: Optional[conint(ge=0)] = Field(
-        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
-    )
-    size: Optional[conint(le=100, gt=0)] = Field(
-        20,
-        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
-    )
-    teamId: Optional[str] = Field(
-        None,
-        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
-    )
-
-
-class Metric23(BaseModel):
-    created: AwareDatetime = Field(
-        ..., description='When the entry was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(..., description='Identifier of this entry, new on every call.')
-    label: str = Field(..., description='Name of the group the figure belongs to.')
-    links: Optional[dict[str, Links]] = Field(
-        None,
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    metricResult: float = Field(
-        ...,
-        description='Response time of a call in seconds, combined across the model calls as metricType says (average by default).',
-    )
-    metricType: str = Field(
-        ...,
-        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
-    )
-    resourceType: str = Field(..., description='Always metric.')
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Item23(BaseModel):
-    groupName: str = Field(
-        ...,
-        description='The group the figures belong to, such as an agent or model name.',
-    )
-    metrics: list[Metric23]
-
-
-class FieldEmbedded24(BaseModel):
-    items: list[Item23] = Field(
-        ..., description='One item per group over the whole date range.'
-    )
-
-
-class ApiV2AnalyticsResponseTimeByModelGetResponse(BaseModel):
-    field_embedded: FieldEmbedded24 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
-        ...,
-        alias='_links',
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    created: AwareDatetime = Field(
-        ..., description='When the response was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(
-        ..., description='Identifier of the response type, the same on every call.'
-    )
-    label: str = Field(..., description='Human-readable name of the figure returned.')
-    page: Optional[Page] = Field(
-        None, description='Where this page sits among all pages of `_embedded.items`.'
-    )
-    period: Period24 = Field(..., description='The date range the response covers.')
-    resourceType: str = Field(
-        ..., description='Kind of response, for example metric_timeseries.'
-    )
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Code156(StrEnum):
-    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
-
-
-class ApiV2AnalyticsResponseTimeByModelGetResponse1(BaseModel):
-    code: Code156
-    message: str
-
-
-class Code157(StrEnum):
-    VALIDATION_ERROR = 'VALIDATION_ERROR'
-
-
-class ApiV2AnalyticsResponseTimeByModelGetResponse2(BaseModel):
-    code: Code157
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class Code158(StrEnum):
-    UNAUTHORIZED = 'UNAUTHORIZED'
-
-
-class ApiV2AnalyticsResponseTimeByModelGetResponse3(BaseModel):
-    code: Code158
-    message: str
-
-
-class Code159(StrEnum):
-    FORBIDDEN = 'FORBIDDEN'
-    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
-
-
-class ApiV2AnalyticsResponseTimeByModelGetResponse4(BaseModel):
-    code: Code159
-    message: str
-
-
-class Code160(StrEnum):
-    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
-
-
-class ApiV2AnalyticsResponseTimeByModelGetResponse5(BaseModel):
-    code: Code160
-    message: str
-
-
-class Code161(StrEnum):
-    INTERNAL_ERROR = 'INTERNAL_ERROR'
-
-
-class ApiV2AnalyticsResponseTimeByModelGetResponse6(BaseModel):
-    code: Code161
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class ApiV2AnalyticsResponseTimeByVendorGetParametersQuery(BaseModel):
-    startDate: Optional[AwareDatetime] = Field(
-        None,
-        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
-        examples=['2024-01-01T00:00:00.000Z'],
-    )
-    endDate: Optional[AwareDatetime] = Field(
-        None,
-        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
-        examples=['2024-01-31T23:59:59.000Z'],
-    )
-    metricType: Optional[MetricType26] = Field(
+    metricType: Optional[MetricType27] = Field(
         None,
         description='How the response times of each group are combined: avg, sum, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to avg.',
     )
@@ -4506,7 +4594,7 @@ class Metric24(BaseModel):
     )
     metricResult: float = Field(
         ...,
-        description='Response time of a call in seconds, combined across the vendor calls as metricType says (average by default).',
+        description='Response time of a call in seconds, combined across the model calls as metricType says (average by default).',
     )
     metricType: str = Field(
         ...,
@@ -4530,9 +4618,9 @@ class FieldEmbedded25(BaseModel):
     )
 
 
-class ApiV2AnalyticsResponseTimeByVendorGetResponse(BaseModel):
+class ApiV2AnalyticsResponseTimeByModelGetResponse(BaseModel):
     field_embedded: FieldEmbedded25 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
+    field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
         description='Links to this request and to related requests, keyed by relation.',
@@ -4547,7 +4635,7 @@ class ApiV2AnalyticsResponseTimeByVendorGetResponse(BaseModel):
     page: Optional[Page] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period24 = Field(..., description='The date range the response covers.')
+    period: Period25 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
@@ -4558,7 +4646,7 @@ class Code162(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsResponseTimeByVendorGetResponse1(BaseModel):
+class ApiV2AnalyticsResponseTimeByModelGetResponse1(BaseModel):
     code: Code162
     message: str
 
@@ -4567,7 +4655,7 @@ class Code163(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsResponseTimeByVendorGetResponse2(BaseModel):
+class ApiV2AnalyticsResponseTimeByModelGetResponse2(BaseModel):
     code: Code163
     detail: str
     instance: Optional[str] = None
@@ -4580,7 +4668,7 @@ class Code164(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsResponseTimeByVendorGetResponse3(BaseModel):
+class ApiV2AnalyticsResponseTimeByModelGetResponse3(BaseModel):
     code: Code164
     message: str
 
@@ -4590,7 +4678,7 @@ class Code165(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsResponseTimeByVendorGetResponse4(BaseModel):
+class ApiV2AnalyticsResponseTimeByModelGetResponse4(BaseModel):
     code: Code165
     message: str
 
@@ -4599,7 +4687,7 @@ class Code166(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsResponseTimeByVendorGetResponse5(BaseModel):
+class ApiV2AnalyticsResponseTimeByModelGetResponse5(BaseModel):
     code: Code166
     message: str
 
@@ -4608,7 +4696,7 @@ class Code167(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsResponseTimeByVendorGetResponse6(BaseModel):
+class ApiV2AnalyticsResponseTimeByModelGetResponse6(BaseModel):
     code: Code167
     detail: str
     instance: Optional[str] = None
@@ -4617,7 +4705,158 @@ class ApiV2AnalyticsResponseTimeByVendorGetResponse6(BaseModel):
     type: str
 
 
-class MetricType28(StrEnum):
+class ApiV2AnalyticsResponseTimeByVendorGetParametersQuery(BaseModel):
+    startDate: Optional[AwareDatetime] = Field(
+        None,
+        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
+        examples=['2024-01-01T00:00:00.000Z'],
+    )
+    endDate: Optional[AwareDatetime] = Field(
+        None,
+        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
+        examples=['2024-01-31T23:59:59.000Z'],
+    )
+    metricType: Optional[MetricType27] = Field(
+        None,
+        description='How the response times of each group are combined: avg, sum, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to avg.',
+    )
+    page: Optional[conint(ge=0)] = Field(
+        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
+    )
+    size: Optional[conint(le=100, gt=0)] = Field(
+        20,
+        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
+    )
+    teamId: Optional[str] = Field(
+        None,
+        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
+    )
+
+
+class Metric25(BaseModel):
+    created: AwareDatetime = Field(
+        ..., description='When the entry was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(..., description='Identifier of this entry, new on every call.')
+    label: str = Field(..., description='Name of the group the figure belongs to.')
+    links: Optional[dict[str, Links]] = Field(
+        None,
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    metricResult: float = Field(
+        ...,
+        description='Response time of a call in seconds, combined across the vendor calls as metricType says (average by default).',
+    )
+    metricType: str = Field(
+        ...,
+        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
+    )
+    resourceType: str = Field(..., description='Always metric.')
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Item25(BaseModel):
+    groupName: str = Field(
+        ...,
+        description='The group the figures belong to, such as an agent or model name.',
+    )
+    metrics: list[Metric25]
+
+
+class FieldEmbedded26(BaseModel):
+    items: list[Item25] = Field(
+        ..., description='One item per group over the whole date range.'
+    )
+
+
+class ApiV2AnalyticsResponseTimeByVendorGetResponse(BaseModel):
+    field_embedded: FieldEmbedded26 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks25] = Field(
+        ...,
+        alias='_links',
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    created: AwareDatetime = Field(
+        ..., description='When the response was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(
+        ..., description='Identifier of the response type, the same on every call.'
+    )
+    label: str = Field(..., description='Human-readable name of the figure returned.')
+    page: Optional[Page] = Field(
+        None, description='Where this page sits among all pages of `_embedded.items`.'
+    )
+    period: Period25 = Field(..., description='The date range the response covers.')
+    resourceType: str = Field(
+        ..., description='Kind of response, for example metric_timeseries.'
+    )
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Code168(StrEnum):
+    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
+
+
+class ApiV2AnalyticsResponseTimeByVendorGetResponse1(BaseModel):
+    code: Code168
+    message: str
+
+
+class Code169(StrEnum):
+    VALIDATION_ERROR = 'VALIDATION_ERROR'
+
+
+class ApiV2AnalyticsResponseTimeByVendorGetResponse2(BaseModel):
+    code: Code169
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code170(StrEnum):
+    UNAUTHORIZED = 'UNAUTHORIZED'
+
+
+class ApiV2AnalyticsResponseTimeByVendorGetResponse3(BaseModel):
+    code: Code170
+    message: str
+
+
+class Code171(StrEnum):
+    FORBIDDEN = 'FORBIDDEN'
+    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
+
+
+class ApiV2AnalyticsResponseTimeByVendorGetResponse4(BaseModel):
+    code: Code171
+    message: str
+
+
+class Code172(StrEnum):
+    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
+
+
+class ApiV2AnalyticsResponseTimeByVendorGetResponse5(BaseModel):
+    code: Code172
+    message: str
+
+
+class Code173(StrEnum):
+    INTERNAL_ERROR = 'INTERNAL_ERROR'
+
+
+class ApiV2AnalyticsResponseTimeByVendorGetResponse6(BaseModel):
+    code: Code173
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class MetricType29(StrEnum):
     """
     How the values in each group are combined: sum, avg, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to sum.
     """
@@ -4645,157 +4884,7 @@ class ApiV2AnalyticsRevenuePerCustomerGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType28] = Field(
-        None,
-        description='How the values in each group are combined: sum, avg, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to sum.',
-    )
-    page: Optional[conint(ge=0)] = Field(
-        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
-    )
-    size: Optional[conint(le=100, gt=0)] = Field(
-        20,
-        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
-    )
-    teamId: Optional[str] = Field(
-        None,
-        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
-    )
-
-
-class Metric25(BaseModel):
-    created: AwareDatetime = Field(
-        ..., description='When the entry was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(..., description='Identifier of this entry, new on every call.')
-    label: str = Field(..., description='Name of the group the figure belongs to.')
-    links: Optional[dict[str, Links]] = Field(
-        None,
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    metricResult: float = Field(
-        ..., description='Revenue in USD charged for the customer.'
-    )
-    metricType: str = Field(
-        ...,
-        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
-    )
-    resourceType: str = Field(..., description='Always metric.')
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Item25(BaseModel):
-    groupName: str = Field(
-        ...,
-        description='The group the figures belong to, such as an agent or model name.',
-    )
-    metrics: list[Metric25]
-
-
-class FieldEmbedded26(BaseModel):
-    items: list[Item25] = Field(
-        ..., description='One item per group over the whole date range.'
-    )
-
-
-class ApiV2AnalyticsRevenuePerCustomerGetResponse(BaseModel):
-    field_embedded: FieldEmbedded26 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
-        ...,
-        alias='_links',
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    created: AwareDatetime = Field(
-        ..., description='When the response was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(
-        ..., description='Identifier of the response type, the same on every call.'
-    )
-    label: str = Field(..., description='Human-readable name of the figure returned.')
-    page: Optional[Page] = Field(
-        None, description='Where this page sits among all pages of `_embedded.items`.'
-    )
-    period: Period24 = Field(..., description='The date range the response covers.')
-    resourceType: str = Field(
-        ..., description='Kind of response, for example metric_timeseries.'
-    )
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Code168(StrEnum):
-    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
-
-
-class ApiV2AnalyticsRevenuePerCustomerGetResponse1(BaseModel):
-    code: Code168
-    message: str
-
-
-class Code169(StrEnum):
-    VALIDATION_ERROR = 'VALIDATION_ERROR'
-
-
-class ApiV2AnalyticsRevenuePerCustomerGetResponse2(BaseModel):
-    code: Code169
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class Code170(StrEnum):
-    UNAUTHORIZED = 'UNAUTHORIZED'
-
-
-class ApiV2AnalyticsRevenuePerCustomerGetResponse3(BaseModel):
-    code: Code170
-    message: str
-
-
-class Code171(StrEnum):
-    FORBIDDEN = 'FORBIDDEN'
-    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
-
-
-class ApiV2AnalyticsRevenuePerCustomerGetResponse4(BaseModel):
-    code: Code171
-    message: str
-
-
-class Code172(StrEnum):
-    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
-
-
-class ApiV2AnalyticsRevenuePerCustomerGetResponse5(BaseModel):
-    code: Code172
-    message: str
-
-
-class Code173(StrEnum):
-    INTERNAL_ERROR = 'INTERNAL_ERROR'
-
-
-class ApiV2AnalyticsRevenuePerCustomerGetResponse6(BaseModel):
-    code: Code173
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class ApiV2AnalyticsRevenuePerProductGetParametersQuery(BaseModel):
-    startDate: Optional[AwareDatetime] = Field(
-        None,
-        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
-        examples=['2024-01-01T00:00:00.000Z'],
-    )
-    endDate: Optional[AwareDatetime] = Field(
-        None,
-        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
-        examples=['2024-01-31T23:59:59.000Z'],
-    )
-    metricType: Optional[MetricType28] = Field(
+    metricType: Optional[MetricType29] = Field(
         None,
         description='How the values in each group are combined: sum, avg, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to sum.',
     )
@@ -4823,7 +4912,7 @@ class Metric26(BaseModel):
         description='Links to this request and to related requests, keyed by relation.',
     )
     metricResult: float = Field(
-        ..., description='Revenue in USD charged for the product.'
+        ..., description='Revenue in USD charged for the customer.'
     )
     metricType: str = Field(
         ...,
@@ -4847,9 +4936,9 @@ class FieldEmbedded27(BaseModel):
     )
 
 
-class ApiV2AnalyticsRevenuePerProductGetResponse(BaseModel):
+class ApiV2AnalyticsRevenuePerCustomerGetResponse(BaseModel):
     field_embedded: FieldEmbedded27 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
+    field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
         description='Links to this request and to related requests, keyed by relation.',
@@ -4864,7 +4953,7 @@ class ApiV2AnalyticsRevenuePerProductGetResponse(BaseModel):
     page: Optional[Page] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period24 = Field(..., description='The date range the response covers.')
+    period: Period25 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
@@ -4875,7 +4964,7 @@ class Code174(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsRevenuePerProductGetResponse1(BaseModel):
+class ApiV2AnalyticsRevenuePerCustomerGetResponse1(BaseModel):
     code: Code174
     message: str
 
@@ -4884,7 +4973,7 @@ class Code175(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsRevenuePerProductGetResponse2(BaseModel):
+class ApiV2AnalyticsRevenuePerCustomerGetResponse2(BaseModel):
     code: Code175
     detail: str
     instance: Optional[str] = None
@@ -4897,7 +4986,7 @@ class Code176(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsRevenuePerProductGetResponse3(BaseModel):
+class ApiV2AnalyticsRevenuePerCustomerGetResponse3(BaseModel):
     code: Code176
     message: str
 
@@ -4907,7 +4996,7 @@ class Code177(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsRevenuePerProductGetResponse4(BaseModel):
+class ApiV2AnalyticsRevenuePerCustomerGetResponse4(BaseModel):
     code: Code177
     message: str
 
@@ -4916,7 +5005,7 @@ class Code178(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsRevenuePerProductGetResponse5(BaseModel):
+class ApiV2AnalyticsRevenuePerCustomerGetResponse5(BaseModel):
     code: Code178
     message: str
 
@@ -4925,7 +5014,7 @@ class Code179(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsRevenuePerProductGetResponse6(BaseModel):
+class ApiV2AnalyticsRevenuePerCustomerGetResponse6(BaseModel):
     code: Code179
     detail: str
     instance: Optional[str] = None
@@ -4934,7 +5023,157 @@ class ApiV2AnalyticsRevenuePerProductGetResponse6(BaseModel):
     type: str
 
 
-class MetricType30(StrEnum):
+class ApiV2AnalyticsRevenuePerProductGetParametersQuery(BaseModel):
+    startDate: Optional[AwareDatetime] = Field(
+        None,
+        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
+        examples=['2024-01-01T00:00:00.000Z'],
+    )
+    endDate: Optional[AwareDatetime] = Field(
+        None,
+        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
+        examples=['2024-01-31T23:59:59.000Z'],
+    )
+    metricType: Optional[MetricType29] = Field(
+        None,
+        description='How the values in each group are combined: sum, avg, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to sum.',
+    )
+    page: Optional[conint(ge=0)] = Field(
+        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
+    )
+    size: Optional[conint(le=100, gt=0)] = Field(
+        20,
+        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
+    )
+    teamId: Optional[str] = Field(
+        None,
+        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
+    )
+
+
+class Metric27(BaseModel):
+    created: AwareDatetime = Field(
+        ..., description='When the entry was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(..., description='Identifier of this entry, new on every call.')
+    label: str = Field(..., description='Name of the group the figure belongs to.')
+    links: Optional[dict[str, Links]] = Field(
+        None,
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    metricResult: float = Field(
+        ..., description='Revenue in USD charged for the product.'
+    )
+    metricType: str = Field(
+        ...,
+        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
+    )
+    resourceType: str = Field(..., description='Always metric.')
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Item27(BaseModel):
+    groupName: str = Field(
+        ...,
+        description='The group the figures belong to, such as an agent or model name.',
+    )
+    metrics: list[Metric27]
+
+
+class FieldEmbedded28(BaseModel):
+    items: list[Item27] = Field(
+        ..., description='One item per group over the whole date range.'
+    )
+
+
+class ApiV2AnalyticsRevenuePerProductGetResponse(BaseModel):
+    field_embedded: FieldEmbedded28 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks25] = Field(
+        ...,
+        alias='_links',
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    created: AwareDatetime = Field(
+        ..., description='When the response was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(
+        ..., description='Identifier of the response type, the same on every call.'
+    )
+    label: str = Field(..., description='Human-readable name of the figure returned.')
+    page: Optional[Page] = Field(
+        None, description='Where this page sits among all pages of `_embedded.items`.'
+    )
+    period: Period25 = Field(..., description='The date range the response covers.')
+    resourceType: str = Field(
+        ..., description='Kind of response, for example metric_timeseries.'
+    )
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Code180(StrEnum):
+    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
+
+
+class ApiV2AnalyticsRevenuePerProductGetResponse1(BaseModel):
+    code: Code180
+    message: str
+
+
+class Code181(StrEnum):
+    VALIDATION_ERROR = 'VALIDATION_ERROR'
+
+
+class ApiV2AnalyticsRevenuePerProductGetResponse2(BaseModel):
+    code: Code181
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code182(StrEnum):
+    UNAUTHORIZED = 'UNAUTHORIZED'
+
+
+class ApiV2AnalyticsRevenuePerProductGetResponse3(BaseModel):
+    code: Code182
+    message: str
+
+
+class Code183(StrEnum):
+    FORBIDDEN = 'FORBIDDEN'
+    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
+
+
+class ApiV2AnalyticsRevenuePerProductGetResponse4(BaseModel):
+    code: Code183
+    message: str
+
+
+class Code184(StrEnum):
+    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
+
+
+class ApiV2AnalyticsRevenuePerProductGetResponse5(BaseModel):
+    code: Code184
+    message: str
+
+
+class Code185(StrEnum):
+    INTERNAL_ERROR = 'INTERNAL_ERROR'
+
+
+class ApiV2AnalyticsRevenuePerProductGetResponse6(BaseModel):
+    code: Code185
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class MetricType31(StrEnum):
     """
     Accepted for compatibility. This endpoint ignores it.
     """
@@ -4962,172 +5201,7 @@ class ApiV2AnalyticsTaskCompletionGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType30] = Field(
-        None, description='Accepted for compatibility. This endpoint ignores it.'
-    )
-    page: Optional[conint(ge=0)] = Field(
-        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
-    )
-    size: Optional[conint(le=100, gt=0)] = Field(
-        20,
-        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
-    )
-    agents: Optional[list[str]] = Field(
-        None,
-        description='Keep only tasks completed by these agents. Repeat the parameter to pass several values.',
-    )
-    teamId: Optional[str] = Field(
-        None,
-        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
-    )
-
-
-class Metric27(BaseModel):
-    created: AwareDatetime = Field(
-        ..., description='When the entry was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(..., description='Identifier of this entry, new on every call.')
-    label: str = Field(..., description='Name of the group the figure belongs to.')
-    links: Optional[dict[str, Links]] = Field(
-        None,
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    metricResult: float = Field(
-        ..., description='Number of tasks completed in the time bucket.'
-    )
-    metricType: str = Field(
-        ...,
-        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
-    )
-    resourceType: str = Field(..., description='Always metric.')
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Group10(BaseModel):
-    groupName: str = Field(
-        ...,
-        description='The group the figures belong to, such as an agent or model name.',
-    )
-    metrics: list[Metric27]
-
-
-class Item27(BaseModel):
-    endTimestamp: AwareDatetime = Field(
-        ..., description='End of the time bucket, ISO 8601 in UTC.'
-    )
-    groups: list[Group10] = Field(
-        ..., description='One entry per group, every group in every bucket.'
-    )
-    startTimestamp: AwareDatetime = Field(
-        ..., description='Start of the time bucket, ISO 8601 in UTC.'
-    )
-
-
-class FieldEmbedded28(BaseModel):
-    items: list[Item27] = Field(
-        ..., description='One item per time bucket, oldest first.'
-    )
-
-
-class ApiV2AnalyticsTaskCompletionGetResponse(BaseModel):
-    field_embedded: FieldEmbedded28 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
-        ...,
-        alias='_links',
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    created: AwareDatetime = Field(
-        ..., description='When the response was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(
-        ..., description='Identifier of the response type, the same on every call.'
-    )
-    label: str = Field(..., description='Human-readable name of the figure returned.')
-    page: Optional[Page] = Field(
-        None, description='Where this page sits among all pages of `_embedded.items`.'
-    )
-    period: Period24 = Field(..., description='The date range the response covers.')
-    resourceType: str = Field(
-        ..., description='Kind of response, for example metric_timeseries.'
-    )
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Code180(StrEnum):
-    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
-
-
-class ApiV2AnalyticsTaskCompletionGetResponse1(BaseModel):
-    code: Code180
-    message: str
-
-
-class Code181(StrEnum):
-    VALIDATION_ERROR = 'VALIDATION_ERROR'
-
-
-class ApiV2AnalyticsTaskCompletionGetResponse2(BaseModel):
-    code: Code181
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class Code182(StrEnum):
-    UNAUTHORIZED = 'UNAUTHORIZED'
-
-
-class ApiV2AnalyticsTaskCompletionGetResponse3(BaseModel):
-    code: Code182
-    message: str
-
-
-class Code183(StrEnum):
-    FORBIDDEN = 'FORBIDDEN'
-    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
-
-
-class ApiV2AnalyticsTaskCompletionGetResponse4(BaseModel):
-    code: Code183
-    message: str
-
-
-class Code184(StrEnum):
-    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
-
-
-class ApiV2AnalyticsTaskCompletionGetResponse5(BaseModel):
-    code: Code184
-    message: str
-
-
-class Code185(StrEnum):
-    INTERNAL_ERROR = 'INTERNAL_ERROR'
-
-
-class ApiV2AnalyticsTaskCompletionGetResponse6(BaseModel):
-    code: Code185
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class ApiV2AnalyticsTaskCompletionAggregatedGetParametersQuery(BaseModel):
-    startDate: Optional[AwareDatetime] = Field(
-        None,
-        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
-        examples=['2024-01-01T00:00:00.000Z'],
-    )
-    endDate: Optional[AwareDatetime] = Field(
-        None,
-        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
-        examples=['2024-01-31T23:59:59.000Z'],
-    )
-    metricType: Optional[MetricType30] = Field(
+    metricType: Optional[MetricType31] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
@@ -5157,7 +5231,9 @@ class Metric28(BaseModel):
         None,
         description='Links to this request and to related requests, keyed by relation.',
     )
-    metricResult: float = Field(..., description='Number of tasks completed.')
+    metricResult: float = Field(
+        ..., description='Number of tasks completed in the time bucket.'
+    )
     metricType: str = Field(
         ...,
         description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
@@ -5166,7 +5242,7 @@ class Metric28(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item28(BaseModel):
+class Group10(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
@@ -5174,15 +5250,27 @@ class Item28(BaseModel):
     metrics: list[Metric28]
 
 
-class FieldEmbedded29(BaseModel):
-    items: list[Item28] = Field(
-        ..., description='One item per group over the whole date range.'
+class Item28(BaseModel):
+    endTimestamp: AwareDatetime = Field(
+        ..., description='End of the time bucket, ISO 8601 in UTC.'
+    )
+    groups: list[Group10] = Field(
+        ..., description='One entry per group, every group in every bucket.'
+    )
+    startTimestamp: AwareDatetime = Field(
+        ..., description='Start of the time bucket, ISO 8601 in UTC.'
     )
 
 
-class ApiV2AnalyticsTaskCompletionAggregatedGetResponse(BaseModel):
+class FieldEmbedded29(BaseModel):
+    items: list[Item28] = Field(
+        ..., description='One item per time bucket, oldest first.'
+    )
+
+
+class ApiV2AnalyticsTaskCompletionGetResponse(BaseModel):
     field_embedded: FieldEmbedded29 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
+    field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
         description='Links to this request and to related requests, keyed by relation.',
@@ -5197,7 +5285,7 @@ class ApiV2AnalyticsTaskCompletionAggregatedGetResponse(BaseModel):
     page: Optional[Page] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period24 = Field(..., description='The date range the response covers.')
+    period: Period25 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
@@ -5208,7 +5296,7 @@ class Code186(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsTaskCompletionAggregatedGetResponse1(BaseModel):
+class ApiV2AnalyticsTaskCompletionGetResponse1(BaseModel):
     code: Code186
     message: str
 
@@ -5217,7 +5305,7 @@ class Code187(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsTaskCompletionAggregatedGetResponse2(BaseModel):
+class ApiV2AnalyticsTaskCompletionGetResponse2(BaseModel):
     code: Code187
     detail: str
     instance: Optional[str] = None
@@ -5230,7 +5318,7 @@ class Code188(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsTaskCompletionAggregatedGetResponse3(BaseModel):
+class ApiV2AnalyticsTaskCompletionGetResponse3(BaseModel):
     code: Code188
     message: str
 
@@ -5240,7 +5328,7 @@ class Code189(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsTaskCompletionAggregatedGetResponse4(BaseModel):
+class ApiV2AnalyticsTaskCompletionGetResponse4(BaseModel):
     code: Code189
     message: str
 
@@ -5249,7 +5337,7 @@ class Code190(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsTaskCompletionAggregatedGetResponse5(BaseModel):
+class ApiV2AnalyticsTaskCompletionGetResponse5(BaseModel):
     code: Code190
     message: str
 
@@ -5258,7 +5346,7 @@ class Code191(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsTaskCompletionAggregatedGetResponse6(BaseModel):
+class ApiV2AnalyticsTaskCompletionGetResponse6(BaseModel):
     code: Code191
     detail: str
     instance: Optional[str] = None
@@ -5267,7 +5355,158 @@ class ApiV2AnalyticsTaskCompletionAggregatedGetResponse6(BaseModel):
     type: str
 
 
-class MetricType32(StrEnum):
+class ApiV2AnalyticsTaskCompletionAggregatedGetParametersQuery(BaseModel):
+    startDate: Optional[AwareDatetime] = Field(
+        None,
+        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
+        examples=['2024-01-01T00:00:00.000Z'],
+    )
+    endDate: Optional[AwareDatetime] = Field(
+        None,
+        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
+        examples=['2024-01-31T23:59:59.000Z'],
+    )
+    metricType: Optional[MetricType31] = Field(
+        None, description='Accepted for compatibility. This endpoint ignores it.'
+    )
+    page: Optional[conint(ge=0)] = Field(
+        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
+    )
+    size: Optional[conint(le=100, gt=0)] = Field(
+        20,
+        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
+    )
+    agents: Optional[list[str]] = Field(
+        None,
+        description='Keep only tasks completed by these agents. Repeat the parameter to pass several values.',
+    )
+    teamId: Optional[str] = Field(
+        None,
+        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
+    )
+
+
+class Metric29(BaseModel):
+    created: AwareDatetime = Field(
+        ..., description='When the entry was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(..., description='Identifier of this entry, new on every call.')
+    label: str = Field(..., description='Name of the group the figure belongs to.')
+    links: Optional[dict[str, Links]] = Field(
+        None,
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    metricResult: float = Field(..., description='Number of tasks completed.')
+    metricType: str = Field(
+        ...,
+        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
+    )
+    resourceType: str = Field(..., description='Always metric.')
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Item29(BaseModel):
+    groupName: str = Field(
+        ...,
+        description='The group the figures belong to, such as an agent or model name.',
+    )
+    metrics: list[Metric29]
+
+
+class FieldEmbedded30(BaseModel):
+    items: list[Item29] = Field(
+        ..., description='One item per group over the whole date range.'
+    )
+
+
+class ApiV2AnalyticsTaskCompletionAggregatedGetResponse(BaseModel):
+    field_embedded: FieldEmbedded30 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks25] = Field(
+        ...,
+        alias='_links',
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    created: AwareDatetime = Field(
+        ..., description='When the response was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(
+        ..., description='Identifier of the response type, the same on every call.'
+    )
+    label: str = Field(..., description='Human-readable name of the figure returned.')
+    page: Optional[Page] = Field(
+        None, description='Where this page sits among all pages of `_embedded.items`.'
+    )
+    period: Period25 = Field(..., description='The date range the response covers.')
+    resourceType: str = Field(
+        ..., description='Kind of response, for example metric_timeseries.'
+    )
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Code192(StrEnum):
+    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
+
+
+class ApiV2AnalyticsTaskCompletionAggregatedGetResponse1(BaseModel):
+    code: Code192
+    message: str
+
+
+class Code193(StrEnum):
+    VALIDATION_ERROR = 'VALIDATION_ERROR'
+
+
+class ApiV2AnalyticsTaskCompletionAggregatedGetResponse2(BaseModel):
+    code: Code193
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code194(StrEnum):
+    UNAUTHORIZED = 'UNAUTHORIZED'
+
+
+class ApiV2AnalyticsTaskCompletionAggregatedGetResponse3(BaseModel):
+    code: Code194
+    message: str
+
+
+class Code195(StrEnum):
+    FORBIDDEN = 'FORBIDDEN'
+    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
+
+
+class ApiV2AnalyticsTaskCompletionAggregatedGetResponse4(BaseModel):
+    code: Code195
+    message: str
+
+
+class Code196(StrEnum):
+    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
+
+
+class ApiV2AnalyticsTaskCompletionAggregatedGetResponse5(BaseModel):
+    code: Code196
+    message: str
+
+
+class Code197(StrEnum):
+    INTERNAL_ERROR = 'INTERNAL_ERROR'
+
+
+class ApiV2AnalyticsTaskCompletionAggregatedGetResponse6(BaseModel):
+    code: Code197
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class MetricType33(StrEnum):
     """
     How the call durations of each agent are combined: avg, sum, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to avg.
     """
@@ -5295,7 +5534,7 @@ class ApiV2AnalyticsTaskPerformanceByAgentGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType32] = Field(
+    metricType: Optional[MetricType33] = Field(
         None,
         description='How the call durations of each agent are combined: avg, sum, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to avg.',
     )
@@ -5312,7 +5551,7 @@ class ApiV2AnalyticsTaskPerformanceByAgentGetParametersQuery(BaseModel):
     )
 
 
-class Metric29(BaseModel):
+class Metric30(BaseModel):
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -5334,23 +5573,23 @@ class Metric29(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item29(BaseModel):
+class Item30(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric29]
+    metrics: list[Metric30]
 
 
-class FieldEmbedded30(BaseModel):
-    items: list[Item29] = Field(
+class FieldEmbedded31(BaseModel):
+    items: list[Item30] = Field(
         ..., description='One item per group over the whole date range.'
     )
 
 
 class ApiV2AnalyticsTaskPerformanceByAgentGetResponse(BaseModel):
-    field_embedded: FieldEmbedded30 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
+    field_embedded: FieldEmbedded31 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
         description='Links to this request and to related requests, keyed by relation.',
@@ -5365,28 +5604,28 @@ class ApiV2AnalyticsTaskPerformanceByAgentGetResponse(BaseModel):
     page: Optional[Page] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period24 = Field(..., description='The date range the response covers.')
+    period: Period25 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code192(StrEnum):
+class Code198(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTaskPerformanceByAgentGetResponse1(BaseModel):
-    code: Code192
+    code: Code198
     message: str
 
 
-class Code193(StrEnum):
+class Code199(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTaskPerformanceByAgentGetResponse2(BaseModel):
-    code: Code193
+    code: Code199
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5394,40 +5633,40 @@ class ApiV2AnalyticsTaskPerformanceByAgentGetResponse2(BaseModel):
     type: str
 
 
-class Code194(StrEnum):
+class Code200(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTaskPerformanceByAgentGetResponse3(BaseModel):
-    code: Code194
+    code: Code200
     message: str
 
 
-class Code195(StrEnum):
+class Code201(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTaskPerformanceByAgentGetResponse4(BaseModel):
-    code: Code195
+    code: Code201
     message: str
 
 
-class Code196(StrEnum):
+class Code202(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTaskPerformanceByAgentGetResponse5(BaseModel):
-    code: Code196
+    code: Code202
     message: str
 
 
-class Code197(StrEnum):
+class Code203(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTaskPerformanceByAgentGetResponse6(BaseModel):
-    code: Code197
+    code: Code203
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5435,7 +5674,7 @@ class ApiV2AnalyticsTaskPerformanceByAgentGetResponse6(BaseModel):
     type: str
 
 
-class MetricType33(StrEnum):
+class MetricType34(StrEnum):
     """
     Accepted for compatibility. This endpoint ignores it.
     """
@@ -5463,7 +5702,7 @@ class ApiV2AnalyticsTasksCompletedByAgentGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType33] = Field(
+    metricType: Optional[MetricType34] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
@@ -5479,7 +5718,7 @@ class ApiV2AnalyticsTasksCompletedByAgentGetParametersQuery(BaseModel):
     )
 
 
-class Metric30(BaseModel):
+class Metric31(BaseModel):
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -5500,23 +5739,23 @@ class Metric30(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item30(BaseModel):
+class Item31(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric30]
+    metrics: list[Metric31]
 
 
-class FieldEmbedded31(BaseModel):
-    items: list[Item30] = Field(
+class FieldEmbedded32(BaseModel):
+    items: list[Item31] = Field(
         ..., description='One item per group over the whole date range.'
     )
 
 
 class ApiV2AnalyticsTasksCompletedByAgentGetResponse(BaseModel):
-    field_embedded: FieldEmbedded31 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
+    field_embedded: FieldEmbedded32 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
         description='Links to this request and to related requests, keyed by relation.',
@@ -5531,28 +5770,28 @@ class ApiV2AnalyticsTasksCompletedByAgentGetResponse(BaseModel):
     page: Optional[Page] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period24 = Field(..., description='The date range the response covers.')
+    period: Period25 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code198(StrEnum):
+class Code204(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTasksCompletedByAgentGetResponse1(BaseModel):
-    code: Code198
+    code: Code204
     message: str
 
 
-class Code199(StrEnum):
+class Code205(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTasksCompletedByAgentGetResponse2(BaseModel):
-    code: Code199
+    code: Code205
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5560,40 +5799,40 @@ class ApiV2AnalyticsTasksCompletedByAgentGetResponse2(BaseModel):
     type: str
 
 
-class Code200(StrEnum):
+class Code206(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTasksCompletedByAgentGetResponse3(BaseModel):
-    code: Code200
+    code: Code206
     message: str
 
 
-class Code201(StrEnum):
+class Code207(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTasksCompletedByAgentGetResponse4(BaseModel):
-    code: Code201
+    code: Code207
     message: str
 
 
-class Code202(StrEnum):
+class Code208(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTasksCompletedByAgentGetResponse5(BaseModel):
-    code: Code202
+    code: Code208
     message: str
 
 
-class Code203(StrEnum):
+class Code209(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTasksCompletedByAgentGetResponse6(BaseModel):
-    code: Code203
+    code: Code209
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5626,7 +5865,7 @@ class ApiV2AnalyticsTokenBreakdownByTypeGetParametersQuery(BaseModel):
     )
 
 
-class Metric31(BaseModel):
+class Metric32(BaseModel):
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -5650,10 +5889,10 @@ class Group11(BaseModel):
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric31]
+    metrics: list[Metric32]
 
 
-class Item31(BaseModel):
+class Item32(BaseModel):
     endTimestamp: AwareDatetime = Field(
         ..., description='End of the time bucket, ISO 8601 in UTC.'
     )
@@ -5665,15 +5904,15 @@ class Item31(BaseModel):
     )
 
 
-class FieldEmbedded32(BaseModel):
-    items: list[Item31] = Field(
+class FieldEmbedded33(BaseModel):
+    items: list[Item32] = Field(
         ..., description='One item per time bucket, oldest first.'
     )
 
 
 class ApiV2AnalyticsTokenBreakdownByTypeGetResponse(BaseModel):
-    field_embedded: FieldEmbedded32 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
+    field_embedded: FieldEmbedded33 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
         description='Links to this request and to related requests, keyed by relation.',
@@ -5688,28 +5927,28 @@ class ApiV2AnalyticsTokenBreakdownByTypeGetResponse(BaseModel):
     page: Optional[Page] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period24 = Field(..., description='The date range the response covers.')
+    period: Period25 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code204(StrEnum):
+class Code210(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTokenBreakdownByTypeGetResponse1(BaseModel):
-    code: Code204
+    code: Code210
     message: str
 
 
-class Code205(StrEnum):
+class Code211(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTokenBreakdownByTypeGetResponse2(BaseModel):
-    code: Code205
+    code: Code211
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5717,40 +5956,40 @@ class ApiV2AnalyticsTokenBreakdownByTypeGetResponse2(BaseModel):
     type: str
 
 
-class Code206(StrEnum):
+class Code212(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTokenBreakdownByTypeGetResponse3(BaseModel):
-    code: Code206
+    code: Code212
     message: str
 
 
-class Code207(StrEnum):
+class Code213(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTokenBreakdownByTypeGetResponse4(BaseModel):
-    code: Code207
+    code: Code213
     message: str
 
 
-class Code208(StrEnum):
+class Code214(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTokenBreakdownByTypeGetResponse5(BaseModel):
-    code: Code208
+    code: Code214
     message: str
 
 
-class Code209(StrEnum):
+class Code215(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTokenBreakdownByTypeGetResponse6(BaseModel):
-    code: Code209
+    code: Code215
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5769,7 +6008,7 @@ class ApiV2AnalyticsTokenVsToolCostGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType33] = Field(
+    metricType: Optional[MetricType34] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
@@ -5785,7 +6024,7 @@ class ApiV2AnalyticsTokenVsToolCostGetParametersQuery(BaseModel):
     )
 
 
-class Metric32(BaseModel):
+class Metric33(BaseModel):
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -5812,10 +6051,10 @@ class Group12(BaseModel):
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric32]
+    metrics: list[Metric33]
 
 
-class Item32(BaseModel):
+class Item33(BaseModel):
     endTimestamp: AwareDatetime = Field(
         ..., description='End of the time bucket, ISO 8601 in UTC.'
     )
@@ -5827,15 +6066,15 @@ class Item32(BaseModel):
     )
 
 
-class FieldEmbedded33(BaseModel):
-    items: list[Item32] = Field(
+class FieldEmbedded34(BaseModel):
+    items: list[Item33] = Field(
         ..., description='One item per time bucket, oldest first.'
     )
 
 
 class ApiV2AnalyticsTokenVsToolCostGetResponse(BaseModel):
-    field_embedded: FieldEmbedded33 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
+    field_embedded: FieldEmbedded34 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
         description='Links to this request and to related requests, keyed by relation.',
@@ -5850,28 +6089,28 @@ class ApiV2AnalyticsTokenVsToolCostGetResponse(BaseModel):
     page: Optional[Page] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period24 = Field(..., description='The date range the response covers.')
+    period: Period25 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code210(StrEnum):
+class Code216(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTokenVsToolCostGetResponse1(BaseModel):
-    code: Code210
+    code: Code216
     message: str
 
 
-class Code211(StrEnum):
+class Code217(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTokenVsToolCostGetResponse2(BaseModel):
-    code: Code211
+    code: Code217
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5879,40 +6118,40 @@ class ApiV2AnalyticsTokenVsToolCostGetResponse2(BaseModel):
     type: str
 
 
-class Code212(StrEnum):
+class Code218(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTokenVsToolCostGetResponse3(BaseModel):
-    code: Code212
+    code: Code218
     message: str
 
 
-class Code213(StrEnum):
+class Code219(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTokenVsToolCostGetResponse4(BaseModel):
-    code: Code213
+    code: Code219
     message: str
 
 
-class Code214(StrEnum):
+class Code220(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTokenVsToolCostGetResponse5(BaseModel):
-    code: Code214
+    code: Code220
     message: str
 
 
-class Code215(StrEnum):
+class Code221(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTokenVsToolCostGetResponse6(BaseModel):
-    code: Code215
+    code: Code221
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5961,7 +6200,7 @@ class ApiV2AnalyticsTokensPerMinuteGetParametersQuery(BaseModel):
     )
 
 
-class Metric33(BaseModel):
+class Metric34(BaseModel):
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -5988,10 +6227,10 @@ class Group13(BaseModel):
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric33]
+    metrics: list[Metric34]
 
 
-class Item33(BaseModel):
+class Item34(BaseModel):
     endTimestamp: AwareDatetime = Field(
         ..., description='End of the time bucket, ISO 8601 in UTC.'
     )
@@ -6003,15 +6242,15 @@ class Item33(BaseModel):
     )
 
 
-class FieldEmbedded34(BaseModel):
-    items: list[Item33] = Field(
+class FieldEmbedded35(BaseModel):
+    items: list[Item34] = Field(
         ..., description='One item per time bucket, oldest first.'
     )
 
 
 class ApiV2AnalyticsTokensPerMinuteGetResponse(BaseModel):
-    field_embedded: FieldEmbedded34 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
+    field_embedded: FieldEmbedded35 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
         description='Links to this request and to related requests, keyed by relation.',
@@ -6026,28 +6265,28 @@ class ApiV2AnalyticsTokensPerMinuteGetResponse(BaseModel):
     page: Optional[Page] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period24 = Field(..., description='The date range the response covers.')
+    period: Period25 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code216(StrEnum):
+class Code222(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTokensPerMinuteGetResponse1(BaseModel):
-    code: Code216
+    code: Code222
     message: str
 
 
-class Code217(StrEnum):
+class Code223(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTokensPerMinuteGetResponse2(BaseModel):
-    code: Code217
+    code: Code223
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6055,40 +6294,40 @@ class ApiV2AnalyticsTokensPerMinuteGetResponse2(BaseModel):
     type: str
 
 
-class Code218(StrEnum):
+class Code224(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTokensPerMinuteGetResponse3(BaseModel):
-    code: Code218
+    code: Code224
     message: str
 
 
-class Code219(StrEnum):
+class Code225(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTokensPerMinuteGetResponse4(BaseModel):
-    code: Code219
+    code: Code225
     message: str
 
 
-class Code220(StrEnum):
+class Code226(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTokensPerMinuteGetResponse5(BaseModel):
-    code: Code220
+    code: Code226
     message: str
 
 
-class Code221(StrEnum):
+class Code227(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTokensPerMinuteGetResponse6(BaseModel):
-    code: Code221
+    code: Code227
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6107,156 +6346,7 @@ class ApiV2AnalyticsToolLatencyGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType33] = Field(
-        None, description='Accepted for compatibility. This endpoint ignores it.'
-    )
-    page: Optional[conint(ge=0)] = Field(
-        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
-    )
-    size: Optional[conint(le=100, gt=0)] = Field(
-        20,
-        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
-    )
-    teamId: Optional[str] = Field(
-        None,
-        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
-    )
-
-
-class Metric34(BaseModel):
-    created: AwareDatetime = Field(
-        ..., description='When the entry was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(..., description='Identifier of this entry, new on every call.')
-    label: str = Field(..., description='Name of the group the figure belongs to.')
-    links: Optional[dict[str, Links]] = Field(
-        None,
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    metricResult: float = Field(
-        ..., description='Average execution time of the tool in milliseconds.'
-    )
-    metricType: str = Field(
-        ...,
-        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
-    )
-    resourceType: str = Field(..., description='Always metric.')
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Item34(BaseModel):
-    groupName: str = Field(
-        ...,
-        description='The group the figures belong to, such as an agent or model name.',
-    )
-    metrics: list[Metric34]
-
-
-class FieldEmbedded35(BaseModel):
-    items: list[Item34] = Field(
-        ..., description='One item per group over the whole date range.'
-    )
-
-
-class ApiV2AnalyticsToolLatencyGetResponse(BaseModel):
-    field_embedded: FieldEmbedded35 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
-        ...,
-        alias='_links',
-        description='Links to this request and to related requests, keyed by relation.',
-    )
-    created: AwareDatetime = Field(
-        ..., description='When the response was produced, ISO 8601 in UTC.'
-    )
-    id: str = Field(
-        ..., description='Identifier of the response type, the same on every call.'
-    )
-    label: str = Field(..., description='Human-readable name of the figure returned.')
-    page: Optional[Page] = Field(
-        None, description='Where this page sits among all pages of `_embedded.items`.'
-    )
-    period: Period24 = Field(..., description='The date range the response covers.')
-    resourceType: str = Field(
-        ..., description='Kind of response, for example metric_timeseries.'
-    )
-    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
-
-
-class Code222(StrEnum):
-    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
-
-
-class ApiV2AnalyticsToolLatencyGetResponse1(BaseModel):
-    code: Code222
-    message: str
-
-
-class Code223(StrEnum):
-    VALIDATION_ERROR = 'VALIDATION_ERROR'
-
-
-class ApiV2AnalyticsToolLatencyGetResponse2(BaseModel):
-    code: Code223
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class Code224(StrEnum):
-    UNAUTHORIZED = 'UNAUTHORIZED'
-
-
-class ApiV2AnalyticsToolLatencyGetResponse3(BaseModel):
-    code: Code224
-    message: str
-
-
-class Code225(StrEnum):
-    FORBIDDEN = 'FORBIDDEN'
-    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
-
-
-class ApiV2AnalyticsToolLatencyGetResponse4(BaseModel):
-    code: Code225
-    message: str
-
-
-class Code226(StrEnum):
-    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
-
-
-class ApiV2AnalyticsToolLatencyGetResponse5(BaseModel):
-    code: Code226
-    message: str
-
-
-class Code227(StrEnum):
-    INTERNAL_ERROR = 'INTERNAL_ERROR'
-
-
-class ApiV2AnalyticsToolLatencyGetResponse6(BaseModel):
-    code: Code227
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class ApiV2AnalyticsToolSuccessRateGetParametersQuery(BaseModel):
-    startDate: Optional[AwareDatetime] = Field(
-        None,
-        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
-        examples=['2024-01-01T00:00:00.000Z'],
-    )
-    endDate: Optional[AwareDatetime] = Field(
-        None,
-        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
-        examples=['2024-01-31T23:59:59.000Z'],
-    )
-    metricType: Optional[MetricType33] = Field(
+    metricType: Optional[MetricType34] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
@@ -6283,7 +6373,7 @@ class Metric35(BaseModel):
         description='Links to this request and to related requests, keyed by relation.',
     )
     metricResult: float = Field(
-        ..., description='Share of tool calls that succeeded, in percent from 0 to 100.'
+        ..., description='Average execution time of the tool in milliseconds.'
     )
     metricType: str = Field(
         ...,
@@ -6307,9 +6397,9 @@ class FieldEmbedded36(BaseModel):
     )
 
 
-class ApiV2AnalyticsToolSuccessRateGetResponse(BaseModel):
+class ApiV2AnalyticsToolLatencyGetResponse(BaseModel):
     field_embedded: FieldEmbedded36 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
+    field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
         description='Links to this request and to related requests, keyed by relation.',
@@ -6324,7 +6414,7 @@ class ApiV2AnalyticsToolSuccessRateGetResponse(BaseModel):
     page: Optional[Page] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period24 = Field(..., description='The date range the response covers.')
+    period: Period25 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
@@ -6335,7 +6425,7 @@ class Code228(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
-class ApiV2AnalyticsToolSuccessRateGetResponse1(BaseModel):
+class ApiV2AnalyticsToolLatencyGetResponse1(BaseModel):
     code: Code228
     message: str
 
@@ -6344,7 +6434,7 @@ class Code229(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
-class ApiV2AnalyticsToolSuccessRateGetResponse2(BaseModel):
+class ApiV2AnalyticsToolLatencyGetResponse2(BaseModel):
     code: Code229
     detail: str
     instance: Optional[str] = None
@@ -6357,7 +6447,7 @@ class Code230(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
-class ApiV2AnalyticsToolSuccessRateGetResponse3(BaseModel):
+class ApiV2AnalyticsToolLatencyGetResponse3(BaseModel):
     code: Code230
     message: str
 
@@ -6367,7 +6457,7 @@ class Code231(StrEnum):
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
-class ApiV2AnalyticsToolSuccessRateGetResponse4(BaseModel):
+class ApiV2AnalyticsToolLatencyGetResponse4(BaseModel):
     code: Code231
     message: str
 
@@ -6376,7 +6466,7 @@ class Code232(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
-class ApiV2AnalyticsToolSuccessRateGetResponse5(BaseModel):
+class ApiV2AnalyticsToolLatencyGetResponse5(BaseModel):
     code: Code232
     message: str
 
@@ -6385,8 +6475,157 @@ class Code233(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
-class ApiV2AnalyticsToolSuccessRateGetResponse6(BaseModel):
+class ApiV2AnalyticsToolLatencyGetResponse6(BaseModel):
     code: Code233
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class ApiV2AnalyticsToolSuccessRateGetParametersQuery(BaseModel):
+    startDate: Optional[AwareDatetime] = Field(
+        None,
+        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
+        examples=['2024-01-01T00:00:00.000Z'],
+    )
+    endDate: Optional[AwareDatetime] = Field(
+        None,
+        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
+        examples=['2024-01-31T23:59:59.000Z'],
+    )
+    metricType: Optional[MetricType34] = Field(
+        None, description='Accepted for compatibility. This endpoint ignores it.'
+    )
+    page: Optional[conint(ge=0)] = Field(
+        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
+    )
+    size: Optional[conint(le=100, gt=0)] = Field(
+        20,
+        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
+    )
+    teamId: Optional[str] = Field(
+        None,
+        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
+    )
+
+
+class Metric36(BaseModel):
+    created: AwareDatetime = Field(
+        ..., description='When the entry was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(..., description='Identifier of this entry, new on every call.')
+    label: str = Field(..., description='Name of the group the figure belongs to.')
+    links: Optional[dict[str, Links]] = Field(
+        None,
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    metricResult: float = Field(
+        ..., description='Share of tool calls that succeeded, in percent from 0 to 100.'
+    )
+    metricType: str = Field(
+        ...,
+        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
+    )
+    resourceType: str = Field(..., description='Always metric.')
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Item36(BaseModel):
+    groupName: str = Field(
+        ...,
+        description='The group the figures belong to, such as an agent or model name.',
+    )
+    metrics: list[Metric36]
+
+
+class FieldEmbedded37(BaseModel):
+    items: list[Item36] = Field(
+        ..., description='One item per group over the whole date range.'
+    )
+
+
+class ApiV2AnalyticsToolSuccessRateGetResponse(BaseModel):
+    field_embedded: FieldEmbedded37 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks25] = Field(
+        ...,
+        alias='_links',
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    created: AwareDatetime = Field(
+        ..., description='When the response was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(
+        ..., description='Identifier of the response type, the same on every call.'
+    )
+    label: str = Field(..., description='Human-readable name of the figure returned.')
+    page: Optional[Page] = Field(
+        None, description='Where this page sits among all pages of `_embedded.items`.'
+    )
+    period: Period25 = Field(..., description='The date range the response covers.')
+    resourceType: str = Field(
+        ..., description='Kind of response, for example metric_timeseries.'
+    )
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Code234(StrEnum):
+    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
+
+
+class ApiV2AnalyticsToolSuccessRateGetResponse1(BaseModel):
+    code: Code234
+    message: str
+
+
+class Code235(StrEnum):
+    VALIDATION_ERROR = 'VALIDATION_ERROR'
+
+
+class ApiV2AnalyticsToolSuccessRateGetResponse2(BaseModel):
+    code: Code235
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code236(StrEnum):
+    UNAUTHORIZED = 'UNAUTHORIZED'
+
+
+class ApiV2AnalyticsToolSuccessRateGetResponse3(BaseModel):
+    code: Code236
+    message: str
+
+
+class Code237(StrEnum):
+    FORBIDDEN = 'FORBIDDEN'
+    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
+
+
+class ApiV2AnalyticsToolSuccessRateGetResponse4(BaseModel):
+    code: Code237
+    message: str
+
+
+class Code238(StrEnum):
+    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
+
+
+class ApiV2AnalyticsToolSuccessRateGetResponse5(BaseModel):
+    code: Code238
+    message: str
+
+
+class Code239(StrEnum):
+    INTERNAL_ERROR = 'INTERNAL_ERROR'
+
+
+class ApiV2AnalyticsToolSuccessRateGetResponse6(BaseModel):
+    code: Code239
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6416,7 +6655,7 @@ class ApiV2AnalyticsTopMoversGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType33] = Field(
+    metricType: Optional[MetricType34] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
@@ -6448,7 +6687,7 @@ class Trend(StrEnum):
     eliminated = 'eliminated'
 
 
-class Metric36(BaseModel):
+class Metric37(BaseModel):
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -6479,23 +6718,23 @@ class Metric36(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item36(BaseModel):
+class Item37(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric36]
+    metrics: list[Metric37]
 
 
-class FieldEmbedded37(BaseModel):
-    items: list[Item36] = Field(
+class FieldEmbedded38(BaseModel):
+    items: list[Item37] = Field(
         ..., description='One item per group over the whole date range.'
     )
 
 
 class ApiV2AnalyticsTopMoversGetResponse(BaseModel):
-    field_embedded: FieldEmbedded37 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
+    field_embedded: FieldEmbedded38 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
         description='Links to this request and to related requests, keyed by relation.',
@@ -6510,28 +6749,28 @@ class ApiV2AnalyticsTopMoversGetResponse(BaseModel):
     page: Optional[Page] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period24 = Field(..., description='The date range the response covers.')
+    period: Period25 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code234(StrEnum):
+class Code240(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTopMoversGetResponse1(BaseModel):
-    code: Code234
+    code: Code240
     message: str
 
 
-class Code235(StrEnum):
+class Code241(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTopMoversGetResponse2(BaseModel):
-    code: Code235
+    code: Code241
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6539,40 +6778,40 @@ class ApiV2AnalyticsTopMoversGetResponse2(BaseModel):
     type: str
 
 
-class Code236(StrEnum):
+class Code242(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTopMoversGetResponse3(BaseModel):
-    code: Code236
+    code: Code242
     message: str
 
 
-class Code237(StrEnum):
+class Code243(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTopMoversGetResponse4(BaseModel):
-    code: Code237
+    code: Code243
     message: str
 
 
-class Code238(StrEnum):
+class Code244(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTopMoversGetResponse5(BaseModel):
-    code: Code238
+    code: Code244
     message: str
 
 
-class Code239(StrEnum):
+class Code245(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTopMoversGetResponse6(BaseModel):
-    code: Code239
+    code: Code245
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6591,7 +6830,7 @@ class ApiV2AnalyticsTopToolsByCallCountGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType33] = Field(
+    metricType: Optional[MetricType34] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
@@ -6607,7 +6846,7 @@ class ApiV2AnalyticsTopToolsByCallCountGetParametersQuery(BaseModel):
     )
 
 
-class Metric37(BaseModel):
+class Metric38(BaseModel):
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -6626,23 +6865,23 @@ class Metric37(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item37(BaseModel):
+class Item38(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric37]
+    metrics: list[Metric38]
 
 
-class FieldEmbedded38(BaseModel):
-    items: list[Item37] = Field(
+class FieldEmbedded39(BaseModel):
+    items: list[Item38] = Field(
         ..., description='One item per group over the whole date range.'
     )
 
 
 class ApiV2AnalyticsTopToolsByCallCountGetResponse(BaseModel):
-    field_embedded: FieldEmbedded38 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks24] = Field(
+    field_embedded: FieldEmbedded39 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
         description='Links to this request and to related requests, keyed by relation.',
@@ -6657,28 +6896,28 @@ class ApiV2AnalyticsTopToolsByCallCountGetResponse(BaseModel):
     page: Optional[Page] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period24 = Field(..., description='The date range the response covers.')
+    period: Period25 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code240(StrEnum):
+class Code246(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTopToolsByCallCountGetResponse1(BaseModel):
-    code: Code240
+    code: Code246
     message: str
 
 
-class Code241(StrEnum):
+class Code247(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTopToolsByCallCountGetResponse2(BaseModel):
-    code: Code241
+    code: Code247
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6686,40 +6925,40 @@ class ApiV2AnalyticsTopToolsByCallCountGetResponse2(BaseModel):
     type: str
 
 
-class Code242(StrEnum):
+class Code248(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTopToolsByCallCountGetResponse3(BaseModel):
-    code: Code242
+    code: Code248
     message: str
 
 
-class Code243(StrEnum):
+class Code249(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTopToolsByCallCountGetResponse4(BaseModel):
-    code: Code243
+    code: Code249
     message: str
 
 
-class Code244(StrEnum):
+class Code250(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTopToolsByCallCountGetResponse5(BaseModel):
-    code: Code244
+    code: Code250
     message: str
 
 
-class Code245(StrEnum):
+class Code251(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTopToolsByCallCountGetResponse6(BaseModel):
-    code: Code245
+    code: Code251
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6738,7 +6977,7 @@ class ApiV2AnalyticsTraceCostDistributionGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType33] = Field(
+    metricType: Optional[MetricType34] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
@@ -6759,7 +6998,7 @@ class ApiV2AnalyticsTraceCostDistributionGetParametersQuery(BaseModel):
     )
 
 
-class FieldLinks41(BaseModel):
+class FieldLinks42(BaseModel):
     """
     Link to this request.
     """
@@ -6779,7 +7018,7 @@ class DataPoint(BaseModel):
     transactionId: str = Field(..., description='Identifier of the trace.')
 
 
-class Period41(BaseModel):
+class Period42(BaseModel):
     """
     The date range the response covers.
     """
@@ -6815,7 +7054,7 @@ class Summary1(BaseModel):
 
 
 class ApiV2AnalyticsTraceCostDistributionGetResponse(BaseModel):
-    field_links: FieldLinks41 = Field(
+    field_links: FieldLinks42 = Field(
         ..., alias='_links', description='Link to this request.'
     )
     dataPoints: list[DataPoint] = Field(
@@ -6826,28 +7065,28 @@ class ApiV2AnalyticsTraceCostDistributionGetResponse(BaseModel):
         ..., description='Identifier of the response type, the same on every call.'
     )
     label: str = Field(..., description='Human-readable name of the figure returned.')
-    period: Period41 = Field(..., description='The date range the response covers.')
+    period: Period42 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(..., description='Kind of response.')
     summary: Summary1 = Field(
         ..., description='Statistics over the traces in dataPoints.'
     )
 
 
-class Code246(StrEnum):
+class Code252(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTraceCostDistributionGetResponse1(BaseModel):
-    code: Code246
+    code: Code252
     message: str
 
 
-class Code247(StrEnum):
+class Code253(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTraceCostDistributionGetResponse2(BaseModel):
-    code: Code247
+    code: Code253
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6855,40 +7094,40 @@ class ApiV2AnalyticsTraceCostDistributionGetResponse2(BaseModel):
     type: str
 
 
-class Code248(StrEnum):
+class Code254(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTraceCostDistributionGetResponse3(BaseModel):
-    code: Code248
+    code: Code254
     message: str
 
 
-class Code249(StrEnum):
+class Code255(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTraceCostDistributionGetResponse4(BaseModel):
-    code: Code249
+    code: Code255
     message: str
 
 
-class Code250(StrEnum):
+class Code256(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTraceCostDistributionGetResponse5(BaseModel):
-    code: Code250
+    code: Code256
     message: str
 
 
-class Code251(StrEnum):
+class Code257(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTraceCostDistributionGetResponse6(BaseModel):
-    code: Code251
+    code: Code257
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6907,7 +7146,7 @@ class ApiV2AnalyticsTransactionCountByTeamGetParametersQuery(BaseModel):
         description='End of the date range, ISO 8601 in UTC. Defaults to now.',
         examples=['2024-01-31T23:59:59.000Z'],
     )
-    metricType: Optional[MetricType33] = Field(
+    metricType: Optional[MetricType34] = Field(
         None, description='Accepted for compatibility. This endpoint ignores it.'
     )
     page: Optional[conint(ge=0)] = Field(
@@ -6923,7 +7162,7 @@ class ApiV2AnalyticsTransactionCountByTeamGetParametersQuery(BaseModel):
     )
 
 
-class Metric38(BaseModel):
+class Metric39(BaseModel):
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -6942,25 +7181,25 @@ class Metric38(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item38(BaseModel):
+class Item39(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric38]
+    metrics: list[Metric39]
 
 
-class FieldEmbedded39(BaseModel):
-    items: list[Item38] = Field(
+class FieldEmbedded40(BaseModel):
+    items: list[Item39] = Field(
         ..., description='One item per group over the whole date range.'
     )
 
 
-class FieldLinks42(BaseModel):
+class FieldLinks43(BaseModel):
     href: str = Field(..., description='URL of the related request.')
 
 
-class Period42(BaseModel):
+class Period43(BaseModel):
     """
     The date range the response covers.
     """
@@ -6974,8 +7213,8 @@ class Period42(BaseModel):
 
 
 class ApiV2AnalyticsTransactionCountByTeamGetResponse(BaseModel):
-    field_embedded: FieldEmbedded39 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks42] = Field(
+    field_embedded: FieldEmbedded40 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks43] = Field(
         ...,
         alias='_links',
         description='Links to this request and to related requests, keyed by relation.',
@@ -6990,28 +7229,28 @@ class ApiV2AnalyticsTransactionCountByTeamGetResponse(BaseModel):
     page: Optional[Page] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period42 = Field(..., description='The date range the response covers.')
+    period: Period43 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code252(StrEnum):
+class Code258(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTransactionCountByTeamGetResponse1(BaseModel):
-    code: Code252
+    code: Code258
     message: str
 
 
-class Code253(StrEnum):
+class Code259(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTransactionCountByTeamGetResponse2(BaseModel):
-    code: Code253
+    code: Code259
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7019,40 +7258,40 @@ class ApiV2AnalyticsTransactionCountByTeamGetResponse2(BaseModel):
     type: str
 
 
-class Code254(StrEnum):
+class Code260(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTransactionCountByTeamGetResponse3(BaseModel):
-    code: Code254
+    code: Code260
     message: str
 
 
-class Code255(StrEnum):
+class Code261(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTransactionCountByTeamGetResponse4(BaseModel):
-    code: Code255
+    code: Code261
     message: str
 
 
-class Code256(StrEnum):
+class Code262(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTransactionCountByTeamGetResponse5(BaseModel):
-    code: Code256
+    code: Code262
     message: str
 
 
-class Code257(StrEnum):
+class Code263(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTransactionCountByTeamGetResponse6(BaseModel):
-    code: Code257
+    code: Code263
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7153,22 +7392,22 @@ class ApiV2InsightsFeedbackPostResponse(BaseModel):
     runId: str = Field(..., description='The run the recommendation belongs to.')
 
 
-class Code258(StrEnum):
+class Code264(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2InsightsFeedbackPostResponse1(BaseModel):
-    code: Code258
+    code: Code264
     message: str
 
 
-class Code259(StrEnum):
+class Code265(StrEnum):
     INVALID_IDEMPOTENCY_KEY = 'INVALID_IDEMPOTENCY_KEY'
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2InsightsFeedbackPostResponse2(BaseModel):
-    code: Code259
+    code: Code265
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7176,31 +7415,31 @@ class ApiV2InsightsFeedbackPostResponse2(BaseModel):
     type: str
 
 
-class Code260(StrEnum):
+class Code266(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2InsightsFeedbackPostResponse3(BaseModel):
-    code: Code260
+    code: Code266
     message: str
 
 
-class Code261(StrEnum):
+class Code267(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2InsightsFeedbackPostResponse4(BaseModel):
-    code: Code261
+    code: Code267
     message: str
 
 
-class Code262(StrEnum):
+class Code268(StrEnum):
     NOT_FOUND = 'NOT_FOUND'
 
 
 class ApiV2InsightsFeedbackPostResponse5(BaseModel):
-    code: Code262
+    code: Code268
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7208,13 +7447,13 @@ class ApiV2InsightsFeedbackPostResponse5(BaseModel):
     type: str
 
 
-class Code263(StrEnum):
+class Code269(StrEnum):
     IDEMPOTENCY_KEY_CONFLICT = 'IDEMPOTENCY_KEY_CONFLICT'
     IDEMPOTENCY_REQUEST_IN_PROGRESS = 'IDEMPOTENCY_REQUEST_IN_PROGRESS'
 
 
 class ApiV2InsightsFeedbackPostResponse6(BaseModel):
-    code: Code263
+    code: Code269
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7222,12 +7461,12 @@ class ApiV2InsightsFeedbackPostResponse6(BaseModel):
     type: str
 
 
-class Code264(StrEnum):
+class Code270(StrEnum):
     RATE_LIMITED = 'RATE_LIMITED'
 
 
 class ApiV2InsightsFeedbackPostResponse7(BaseModel):
-    code: Code264
+    code: Code270
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7235,21 +7474,21 @@ class ApiV2InsightsFeedbackPostResponse7(BaseModel):
     type: str
 
 
-class Code265(StrEnum):
+class Code271(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2InsightsFeedbackPostResponse8(BaseModel):
-    code: Code265
+    code: Code271
     message: str
 
 
-class Code266(StrEnum):
+class Code272(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2InsightsFeedbackPostResponse9(BaseModel):
-    code: Code266
+    code: Code272
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7257,12 +7496,12 @@ class ApiV2InsightsFeedbackPostResponse9(BaseModel):
     type: str
 
 
-class Code267(StrEnum):
+class Code273(StrEnum):
     IDEMPOTENCY_BACKEND_UNAVAILABLE = 'IDEMPOTENCY_BACKEND_UNAVAILABLE'
 
 
 class ApiV2InsightsFeedbackPostResponse10(BaseModel):
-    code: Code267
+    code: Code273
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7298,21 +7537,21 @@ class ApiV2InsightsInvestigatorsGetResponse(
     root: list[ApiV2InsightsInvestigatorsGetResponseItem]
 
 
-class Code268(StrEnum):
+class Code274(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2InsightsInvestigatorsGetResponse1(BaseModel):
-    code: Code268
+    code: Code274
     message: str
 
 
-class Code269(StrEnum):
+class Code275(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2InsightsInvestigatorsGetResponse2(BaseModel):
-    code: Code269
+    code: Code275
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7320,31 +7559,31 @@ class ApiV2InsightsInvestigatorsGetResponse2(BaseModel):
     type: str
 
 
-class Code270(StrEnum):
+class Code276(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2InsightsInvestigatorsGetResponse3(BaseModel):
-    code: Code270
+    code: Code276
     message: str
 
 
-class Code271(StrEnum):
+class Code277(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2InsightsInvestigatorsGetResponse4(BaseModel):
-    code: Code271
+    code: Code277
     message: str
 
 
-class Code272(StrEnum):
+class Code278(StrEnum):
     RATE_LIMITED = 'RATE_LIMITED'
 
 
 class ApiV2InsightsInvestigatorsGetResponse5(BaseModel):
-    code: Code272
+    code: Code278
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7352,21 +7591,21 @@ class ApiV2InsightsInvestigatorsGetResponse5(BaseModel):
     type: str
 
 
-class Code273(StrEnum):
+class Code279(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2InsightsInvestigatorsGetResponse6(BaseModel):
-    code: Code273
+    code: Code279
     message: str
 
 
-class Code274(StrEnum):
+class Code280(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2InsightsInvestigatorsGetResponse7(BaseModel):
-    code: Code274
+    code: Code280
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7374,7 +7613,7 @@ class ApiV2InsightsInvestigatorsGetResponse7(BaseModel):
     type: str
 
 
-class Status(StrEnum):
+class Status1(StrEnum):
     """
     Keep only runs with this status: `running`, `completed`, `partial`, `failed` or `cancelled`.
     """
@@ -7406,7 +7645,7 @@ class ApiV2InsightsRunsGetParametersQuery(BaseModel):
         None,
         description='Pagination cursor. Pass the `next_cursor` from the previous response to get the next page.',
     )
-    status: Optional[Status] = Field(
+    status: Optional[Status1] = Field(
         None,
         description='Keep only runs with this status: `running`, `completed`, `partial`, `failed` or `cancelled`.',
     )
@@ -7467,21 +7706,21 @@ class ApiV2InsightsRunsGetResponse(BaseModel):
     )
 
 
-class Code275(StrEnum):
+class Code281(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2InsightsRunsGetResponse1(BaseModel):
-    code: Code275
+    code: Code281
     message: str
 
 
-class Code276(StrEnum):
+class Code282(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2InsightsRunsGetResponse2(BaseModel):
-    code: Code276
+    code: Code282
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7489,31 +7728,31 @@ class ApiV2InsightsRunsGetResponse2(BaseModel):
     type: str
 
 
-class Code277(StrEnum):
+class Code283(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2InsightsRunsGetResponse3(BaseModel):
-    code: Code277
+    code: Code283
     message: str
 
 
-class Code278(StrEnum):
+class Code284(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2InsightsRunsGetResponse4(BaseModel):
-    code: Code278
+    code: Code284
     message: str
 
 
-class Code279(StrEnum):
+class Code285(StrEnum):
     RATE_LIMITED = 'RATE_LIMITED'
 
 
 class ApiV2InsightsRunsGetResponse5(BaseModel):
-    code: Code279
+    code: Code285
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7521,21 +7760,21 @@ class ApiV2InsightsRunsGetResponse5(BaseModel):
     type: str
 
 
-class Code280(StrEnum):
+class Code286(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2InsightsRunsGetResponse6(BaseModel):
-    code: Code280
+    code: Code286
     message: str
 
 
-class Code281(StrEnum):
+class Code287(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2InsightsRunsGetResponse7(BaseModel):
-    code: Code281
+    code: Code287
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7598,7 +7837,7 @@ class ApiV2InsightsRunsPostRequest(BaseModel):
     )
 
 
-class Status1(StrEnum):
+class Status2(StrEnum):
     """
     Status of the run when the request was accepted. Normally `running`.
     """
@@ -7614,99 +7853,28 @@ class ApiV2InsightsRunsPostResponse(BaseModel):
         ...,
         description='ID of the new run. Use it to poll GET /api/v2/insights/runs/{runId}.',
     )
-    status: Status1 = Field(
+    status: Status2 = Field(
         ...,
         description='Status of the run when the request was accepted. Normally `running`.',
     )
 
 
-class Code282(StrEnum):
+class Code288(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2InsightsRunsPostResponse1(BaseModel):
-    code: Code282
+    code: Code288
     message: str
 
 
-class Code283(StrEnum):
+class Code289(StrEnum):
     INVALID_IDEMPOTENCY_KEY = 'INVALID_IDEMPOTENCY_KEY'
     INVALID_INPUT = 'INVALID_INPUT'
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2InsightsRunsPostResponse2(BaseModel):
-    code: Code283
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class Code284(StrEnum):
-    UNAUTHORIZED = 'UNAUTHORIZED'
-
-
-class ApiV2InsightsRunsPostResponse3(BaseModel):
-    code: Code284
-    message: str
-
-
-class Code285(StrEnum):
-    FORBIDDEN = 'FORBIDDEN'
-    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
-
-
-class ApiV2InsightsRunsPostResponse4(BaseModel):
-    code: Code285
-    message: str
-
-
-class Code286(StrEnum):
-    IDEMPOTENCY_KEY_CONFLICT = 'IDEMPOTENCY_KEY_CONFLICT'
-    IDEMPOTENCY_REQUEST_IN_PROGRESS = 'IDEMPOTENCY_REQUEST_IN_PROGRESS'
-    RUN_IN_PROGRESS = 'RUN_IN_PROGRESS'
-
-
-class ApiV2InsightsRunsPostResponse5(BaseModel):
-    code: Code286
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class Code287(StrEnum):
-    RATE_LIMITED = 'RATE_LIMITED'
-
-
-class ApiV2InsightsRunsPostResponse6(BaseModel):
-    code: Code287
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class Code288(StrEnum):
-    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
-
-
-class ApiV2InsightsRunsPostResponse7(BaseModel):
-    code: Code288
-    message: str
-
-
-class Code289(StrEnum):
-    ANALYSIS_UNAVAILABLE = 'ANALYSIS_UNAVAILABLE'
-    INTERNAL_ERROR = 'INTERNAL_ERROR'
-    MISSING_CONFIG = 'MISSING_CONFIG'
-
-
-class ApiV2InsightsRunsPostResponse8(BaseModel):
     code: Code289
     detail: str
     instance: Optional[str] = None
@@ -7716,11 +7884,82 @@ class ApiV2InsightsRunsPostResponse8(BaseModel):
 
 
 class Code290(StrEnum):
+    UNAUTHORIZED = 'UNAUTHORIZED'
+
+
+class ApiV2InsightsRunsPostResponse3(BaseModel):
+    code: Code290
+    message: str
+
+
+class Code291(StrEnum):
+    FORBIDDEN = 'FORBIDDEN'
+    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
+
+
+class ApiV2InsightsRunsPostResponse4(BaseModel):
+    code: Code291
+    message: str
+
+
+class Code292(StrEnum):
+    IDEMPOTENCY_KEY_CONFLICT = 'IDEMPOTENCY_KEY_CONFLICT'
+    IDEMPOTENCY_REQUEST_IN_PROGRESS = 'IDEMPOTENCY_REQUEST_IN_PROGRESS'
+    RUN_IN_PROGRESS = 'RUN_IN_PROGRESS'
+
+
+class ApiV2InsightsRunsPostResponse5(BaseModel):
+    code: Code292
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code293(StrEnum):
+    RATE_LIMITED = 'RATE_LIMITED'
+
+
+class ApiV2InsightsRunsPostResponse6(BaseModel):
+    code: Code293
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code294(StrEnum):
+    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
+
+
+class ApiV2InsightsRunsPostResponse7(BaseModel):
+    code: Code294
+    message: str
+
+
+class Code295(StrEnum):
+    ANALYSIS_UNAVAILABLE = 'ANALYSIS_UNAVAILABLE'
+    INTERNAL_ERROR = 'INTERNAL_ERROR'
+    MISSING_CONFIG = 'MISSING_CONFIG'
+
+
+class ApiV2InsightsRunsPostResponse8(BaseModel):
+    code: Code295
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code296(StrEnum):
     IDEMPOTENCY_BACKEND_UNAVAILABLE = 'IDEMPOTENCY_BACKEND_UNAVAILABLE'
 
 
 class ApiV2InsightsRunsPostResponse9(BaseModel):
-    code: Code290
+    code: Code296
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7973,7 +8212,7 @@ class RecommendationsSummaryItem(BaseModel):
     title: str = Field(..., description='Short title of the recommendation.')
 
 
-class Status2(StrEnum):
+class Status3(StrEnum):
     """
     Run status. `running`: analysis is in progress. `completed`: every investigator finished. `partial`: the run finished but some investigators failed (see `failedInvestigators`). `failed`: the run did not produce results. `cancelled`: the run was stopped before it finished.
     """
@@ -8091,7 +8330,7 @@ class ApiV2InsightsRunsRunIdGetResponse(BaseModel):
     recommendationsSummary: Optional[list[RecommendationsSummaryItem]] = Field(
         None, description='Slim mode only: a short list of the recommendations, ranked.'
     )
-    status: Status2 = Field(
+    status: Status3 = Field(
         ...,
         description='Run status. `running`: analysis is in progress. `completed`: every investigator finished. `partial`: the run finished but some investigators failed (see `failedInvestigators`). `failed`: the run did not produce results. `cancelled`: the run was stopped before it finished.',
     )
@@ -8117,88 +8356,88 @@ class ApiV2InsightsRunsRunIdGetResponse(BaseModel):
     )
 
 
-class Code291(StrEnum):
+class Code297(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2InsightsRunsRunIdGetResponse1(BaseModel):
-    code: Code291
-    message: str
-
-
-class Code292(StrEnum):
-    VALIDATION_ERROR = 'VALIDATION_ERROR'
-
-
-class ApiV2InsightsRunsRunIdGetResponse2(BaseModel):
-    code: Code292
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class Code293(StrEnum):
-    UNAUTHORIZED = 'UNAUTHORIZED'
-
-
-class ApiV2InsightsRunsRunIdGetResponse3(BaseModel):
-    code: Code293
-    message: str
-
-
-class Code294(StrEnum):
-    FORBIDDEN = 'FORBIDDEN'
-    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
-
-
-class ApiV2InsightsRunsRunIdGetResponse4(BaseModel):
-    code: Code294
-    message: str
-
-
-class Code295(StrEnum):
-    NOT_FOUND = 'NOT_FOUND'
-
-
-class ApiV2InsightsRunsRunIdGetResponse5(BaseModel):
-    code: Code295
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class Code296(StrEnum):
-    RATE_LIMITED = 'RATE_LIMITED'
-
-
-class ApiV2InsightsRunsRunIdGetResponse6(BaseModel):
-    code: Code296
-    detail: str
-    instance: Optional[str] = None
-    status: float
-    title: str
-    type: str
-
-
-class Code297(StrEnum):
-    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
-
-
-class ApiV2InsightsRunsRunIdGetResponse7(BaseModel):
     code: Code297
     message: str
 
 
 class Code298(StrEnum):
+    VALIDATION_ERROR = 'VALIDATION_ERROR'
+
+
+class ApiV2InsightsRunsRunIdGetResponse2(BaseModel):
+    code: Code298
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code299(StrEnum):
+    UNAUTHORIZED = 'UNAUTHORIZED'
+
+
+class ApiV2InsightsRunsRunIdGetResponse3(BaseModel):
+    code: Code299
+    message: str
+
+
+class Code300(StrEnum):
+    FORBIDDEN = 'FORBIDDEN'
+    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
+
+
+class ApiV2InsightsRunsRunIdGetResponse4(BaseModel):
+    code: Code300
+    message: str
+
+
+class Code301(StrEnum):
+    NOT_FOUND = 'NOT_FOUND'
+
+
+class ApiV2InsightsRunsRunIdGetResponse5(BaseModel):
+    code: Code301
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code302(StrEnum):
+    RATE_LIMITED = 'RATE_LIMITED'
+
+
+class ApiV2InsightsRunsRunIdGetResponse6(BaseModel):
+    code: Code302
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code303(StrEnum):
+    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
+
+
+class ApiV2InsightsRunsRunIdGetResponse7(BaseModel):
+    code: Code303
+    message: str
+
+
+class Code304(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2InsightsRunsRunIdGetResponse8(BaseModel):
-    code: Code298
+    code: Code304
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8262,21 +8501,21 @@ class ApiV2InsightsRunsRunIdFeedbackGetResponse(
     root: list[ApiV2InsightsRunsRunIdFeedbackGetResponseItem]
 
 
-class Code299(StrEnum):
+class Code305(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2InsightsRunsRunIdFeedbackGetResponse1(BaseModel):
-    code: Code299
+    code: Code305
     message: str
 
 
-class Code300(StrEnum):
+class Code306(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2InsightsRunsRunIdFeedbackGetResponse2(BaseModel):
-    code: Code300
+    code: Code306
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8284,31 +8523,31 @@ class ApiV2InsightsRunsRunIdFeedbackGetResponse2(BaseModel):
     type: str
 
 
-class Code301(StrEnum):
+class Code307(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2InsightsRunsRunIdFeedbackGetResponse3(BaseModel):
-    code: Code301
+    code: Code307
     message: str
 
 
-class Code302(StrEnum):
+class Code308(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2InsightsRunsRunIdFeedbackGetResponse4(BaseModel):
-    code: Code302
+    code: Code308
     message: str
 
 
-class Code303(StrEnum):
+class Code309(StrEnum):
     RATE_LIMITED = 'RATE_LIMITED'
 
 
 class ApiV2InsightsRunsRunIdFeedbackGetResponse5(BaseModel):
-    code: Code303
+    code: Code309
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8316,21 +8555,21 @@ class ApiV2InsightsRunsRunIdFeedbackGetResponse5(BaseModel):
     type: str
 
 
-class Code304(StrEnum):
+class Code310(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2InsightsRunsRunIdFeedbackGetResponse6(BaseModel):
-    code: Code304
+    code: Code310
     message: str
 
 
-class Code305(StrEnum):
+class Code311(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2InsightsRunsRunIdFeedbackGetResponse7(BaseModel):
-    code: Code305
+    code: Code311
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8362,21 +8601,21 @@ class ApiV2StatusConnectionGetResponse(BaseModel):
     )
 
 
-class Code306(StrEnum):
+class Code312(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2StatusConnectionGetResponse1(BaseModel):
-    code: Code306
+    code: Code312
     message: str
 
 
-class Code307(StrEnum):
+class Code313(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2StatusConnectionGetResponse2(BaseModel):
-    code: Code307
+    code: Code313
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8384,40 +8623,40 @@ class ApiV2StatusConnectionGetResponse2(BaseModel):
     type: str
 
 
-class Code308(StrEnum):
+class Code314(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2StatusConnectionGetResponse3(BaseModel):
-    code: Code308
+    code: Code314
     message: str
 
 
-class Code309(StrEnum):
+class Code315(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2StatusConnectionGetResponse4(BaseModel):
-    code: Code309
+    code: Code315
     message: str
 
 
-class Code310(StrEnum):
+class Code316(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2StatusConnectionGetResponse5(BaseModel):
-    code: Code310
+    code: Code316
     message: str
 
 
-class Code311(StrEnum):
+class Code317(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2StatusConnectionGetResponse6(BaseModel):
-    code: Code311
+    code: Code317
     detail: str
     instance: Optional[str] = None
     status: float

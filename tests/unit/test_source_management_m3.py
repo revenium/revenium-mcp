@@ -31,6 +31,16 @@ from src.revenium_mcp_server.introspection.metadata import DependencyType
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def configured_owner():
+    """The owner a local server is configured with; a test without one patches it away."""
+    with patch(
+        "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value",
+        return_value="owner_test",
+    ):
+        yield
+
+
 def _make_client(team_id="team_xyz"):
     client = MagicMock()
     client.team_id = team_id
@@ -110,26 +120,27 @@ class TestSourceManagerCreateBranches:
         )
 
         data = mock_client.create_source.call_args[0][0]
-        assert data["configuration"]["timeout"] == 30
-        assert data["configuration"]["url"] == "https://existing.example.com"
+        assert data["configuration"] == {"timeout": 30}
+        assert data["resource"] == "https://existing.example.com"
 
     @pytest.mark.asyncio
-    async def test_create_source_skips_owner_id_when_unavailable(
+    async def test_create_source_is_refused_when_no_owner_is_known(
         self, source_manager, mock_client
     ):
-        """ownerId is omitted when REVENIUM_OWNER_ID is not in config."""
+        """BACK-4740: the platform refuses a source without ownerId, so none is sent."""
         mock_client.create_source.return_value = {"id": "new3"}
 
         with patch(
             "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value",
             return_value=None,
         ):
-            await source_manager.create_source(
-                {"source_data": {"name": "No Owner"}}
-            )
+            with pytest.raises(ToolError) as exc:
+                await source_manager.create_source(
+                    {"source_data": {"name": "No Owner"}}
+                )
 
-        data = mock_client.create_source.call_args[0][0]
-        assert "ownerId" not in data
+        assert exc.value.field == "ownerId"
+        mock_client.create_source.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_create_source_does_not_overwrite_existing_team_id(
@@ -167,7 +178,7 @@ class TestSourceManagerCreateBranches:
     async def test_create_source_url_not_in_config_already(
         self, source_manager, mock_client
     ):
-        """URL already inside configuration is not duplicated."""
+        """BACK-4739: a top-level url is sent as resource; a caller's configuration is left as sent."""
         mock_client.create_source.return_value = {"id": "new6"}
 
         await source_manager.create_source(
@@ -181,8 +192,8 @@ class TestSourceManagerCreateBranches:
         )
 
         data = mock_client.create_source.call_args[0][0]
-        # top-level url is NOT moved in because configuration["url"] already exists
         assert data["configuration"]["url"] == "https://already.inside.config"
+        assert data["resource"] == "https://top-level-url"
 
 
 # ===========================================================================
@@ -575,7 +586,7 @@ class TestSourceManagementHandleActionExtended:
 
             with patch(
                 "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value",
-                return_value=None,
+                return_value="owner_test",
             ):
                 result = await source_mgmt.handle_action(
                     "create",
@@ -625,7 +636,7 @@ class TestSourceManagementHandleActionExtended:
 
             with patch(
                 "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value",
-                return_value=None,
+                return_value="owner_test",
             ):
                 result = await source_mgmt.handle_action(
                     "create",
@@ -653,7 +664,7 @@ class TestSourceManagementHandleActionExtended:
 
             with patch(
                 "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value",
-                return_value=None,
+                return_value="owner_test",
             ):
                 result = await source_mgmt.handle_action(
                     "create",
@@ -679,15 +690,11 @@ class TestSourceManagementHandleActionExtended:
             )
             mock_gc.return_value = mock_client
 
-            with patch(
-                "src.revenium_mcp_server.tools_decomposed.source_management.get_config_value",
-                return_value=None,
-            ):
-                with pytest.raises(ToolError) as exc_info:
-                    await source_mgmt.handle_action(
-                        "create",
-                        {"source_data": {"name": "DB Source", "type": "database"}},
-                    )
+            with pytest.raises(ToolError) as exc_info:
+                await source_mgmt.handle_action(
+                    "create",
+                    {"source_data": {"name": "DB Source", "type": "database"}},
+                )
 
         assert "not a valid" in exc_info.value.message
         mock_client.create_source.assert_not_called()

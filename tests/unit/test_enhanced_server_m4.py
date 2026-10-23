@@ -237,6 +237,49 @@ class TestCreateEnhancedServer:
         version = get_package_version()
         assert f"Revenium MCP Server v{version}" == mcp.name
 
+    @pytest.mark.parametrize("auth_mode", ["api_key", "clerk"])
+    def test_hosted_instructions_do_not_promise_performance_tracking(
+        self, monkeypatch, auth_mode
+    ):
+        """BACK-4733: the hosted server hides per-tool performance metrics (BACK-4689)."""
+        from src.revenium_mcp_server.enhanced_server import create_enhanced_server
+
+        monkeypatch.setenv("AUTH_MODE", auth_mode)
+        monkeypatch.setenv("LOG_LEVEL", "ERROR")
+        instructions = create_enhanced_server().instructions
+        assert "tool_introspection" in instructions
+        assert "performance metrics" not in instructions.lower()
+        assert "Performance Monitoring" not in instructions
+        assert "Success rate" not in instructions
+
+    def test_self_hosted_instructions_keep_performance_tracking(self, monkeypatch):
+        from src.revenium_mcp_server.enhanced_server import create_enhanced_server
+
+        monkeypatch.delenv("AUTH_MODE", raising=False)
+        monkeypatch.setenv("LOG_LEVEL", "ERROR")
+        instructions = create_enhanced_server().instructions
+        assert "  - View performance metrics and usage analytics\n" in instructions
+        assert "### Performance Monitoring\n" in instructions
+        assert "- Success rate tracking and analysis\n" in instructions
+
+    def test_hosted_instructions_remove_each_performance_passage_exactly_once(self):
+        """BACK-4733: a passage edited out of step with the text would be left in silently."""
+        from src.revenium_mcp_server import enhanced_server
+
+        full = enhanced_server._SELF_HOSTED_INSTRUCTIONS
+        hosted = enhanced_server._HOSTED_INSTRUCTIONS
+        for passage in enhanced_server._PERFORMANCE_PASSAGES:
+            assert full.count(passage) == 1, passage
+        removed = sum(len(p) for p in enhanced_server._PERFORMANCE_PASSAGES)
+        assert len(hosted) == len(full) - removed
+
+    def test_hosted_instructions_never_mention_performance(self):
+        """BACK-4733: a performance line added outside the shared passages would reach hosted callers."""
+        from src.revenium_mcp_server import enhanced_server
+
+        assert "performance" not in enhanced_server._HOSTED_INSTRUCTIONS.lower()
+        assert "performance" in enhanced_server._SELF_HOSTED_INSTRUCTIONS.lower()
+
     def test_log_level_env_var_determines_log_level(self):
         """When LOG_LEVEL is set to DEBUG, the server is created with a DEBUG-capable logger.
 

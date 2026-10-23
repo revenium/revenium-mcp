@@ -4,7 +4,8 @@ This module implements CostControlsManagement(ToolBase) for the Revenium AI
 Cost Controls API (/v2/api/ai/cost-controls), covering 5 CRUD actions (list,
 get, create, update, delete), 6 read-only enforcement-visibility actions
 (list_enforcement_events and its unpaged summary/history/affected sub-reads,
-get_enforcement_rules and one rule's get_enforcement_rule_roster), plus the
+get_enforcement_rules and one rule's get_enforcement_rule_roster), the
+list_filter_values lookup of the provider values a filter accepts, plus the
 standard introspection actions.
 
 Cost controls are spend guardrails: each pairs a warn threshold and a hard
@@ -160,6 +161,21 @@ ENFORCEMENT_ROSTER_NOTE = (
     "other kind of row."
 )
 
+# Verified on dev 2026-10-22: the notify-only rows include=advisory appends
+# carry this source; cost-control rows carry none.
+ADVISORY_ROW_SOURCE = "ANOMALY"
+
+ENFORCEMENT_ADVISORY_ROWS_NOTE = (
+    "include_advisory=true also returns the team's notify-only per-person "
+    "budgets (alerts), after the cost-control rows, as rows whose action is "
+    f"NOTIFY and whose source is {ADVISORY_ROW_SOURCE}. Such a row never blocks, even when "
+    "breached; its readingAt says when the per-person figures in its "
+    "groupBreakdown were last read, and is absent until the current window has "
+    "a reading. Off by default, so the answer is cost-control rows only. The "
+    "platform ignores it when rule_id is sent, so the two are refused together. "
+    "Notify-only budgets are created and edited with manage_alerts."
+)
+
 
 def _build_enforcement_event_filters(
     arguments: Dict[str, Any], extra: Optional[Dict[str, str]] = None
@@ -275,6 +291,22 @@ FILTER_IN_OPERATOR_NOTE = (
     "validated server-side."
 )
 
+FILTER_VALUES_DIMENSION = "PROVIDER"
+
+FILTER_VALUES_NOTE = (
+    "list_filter_values lists the PROVIDER values a cost-control filter accepts: "
+    "vendor groups first (each covering the provider labels in its covers list), "
+    "then every provider label the team recorded in the last 90 days. Saving an "
+    "IS, IS_NOT or IN filter with a new PROVIDER value outside that list is "
+    "refused upstream with a 400, so read it before writing a provider filter. "
+    "PROVIDER is the only dimension the platform lists."
+)
+
+FILTER_VALUES_NOT_OFFERED_NOTE = (
+    "This platform does not offer the list of accepted filter values yet. "
+    "create and update still refuse an unknown PROVIDER value with their own 400."
+)
+
 
 def _coerce_parent_department_id(raw: Any) -> int:
     """Return ``raw`` as the whole number the preview endpoint expects.
@@ -320,7 +352,9 @@ def _rule_names_by_id(result: Any) -> Dict[str, Any]:
 
     Both department summaries resolve rule ids the same way, and the keys are
     stringified because the id maps' values and ``ruleId`` are not guaranteed
-    to share a JSON type.
+    to share a JSON type. Notify-only rows are skipped: their ``ruleId`` is an
+    alert's id, which can equal a cost control's, and only a cost control can
+    block or warn anyone.
     """
     rule_names: Dict[str, Any] = {}
     if not isinstance(result, dict):
@@ -328,7 +362,11 @@ def _rule_names_by_id(result: Any) -> Dict[str, Any]:
     rules = result.get("rules")
     if isinstance(rules, list):
         for rule in rules:
-            if isinstance(rule, dict) and rule.get("ruleId") is not None:
+            if (
+                isinstance(rule, dict)
+                and rule.get("ruleId") is not None
+                and rule.get("source") != ADVISORY_ROW_SOURCE
+            ):
                 rule_names[str(rule["ruleId"])] = rule.get("name")
     return rule_names
 
@@ -465,6 +503,82 @@ def _summarize_department_blocks(result: Any) -> Optional[str]:
         f"{len(blocks)} {subject} currently blocked by a department budget: "
         f"{listing}. This listing contains subscriber email addresses."
     )
+
+
+def _narrowing_rule_id(arguments: Dict[str, Any]) -> Optional[Any]:
+    """Return the rule_id that narrows the read, or None for a blank one.
+
+    The registry passes a blank string through, and a blank id narrows
+    nothing, so both the advisory guard and the request treat it as absent.
+    """
+    rule_id = arguments.get("rule_id")
+    if isinstance(rule_id, str) and not rule_id.strip():
+        return None
+    return rule_id
+
+
+def _include_advisory_requested(arguments: Dict[str, Any]) -> bool:
+    """Read ``include_advisory`` as a strict boolean, refusing anything else.
+
+    The registry has already turned the usual string spellings into booleans,
+    so a value still not boolean here is one the caller cannot have meant.
+    """
+    raw = arguments.get("include_advisory")
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    raise ToolError(
+        message=f"include_advisory must be true or false, got {raw!r}",
+        error_code=ErrorCodes.INVALID_PARAMETER,
+        field="include_advisory",
+        value=raw,
+        suggestions=["get_enforcement_rules(include_advisory=true)"],
+    )
+
+
+def _advisory_rows(result: Any) -> List[Dict[str, Any]]:
+    """Return the notify-only rows (``source`` ANOMALY) of a compiled ruleset."""
+    if not isinstance(result, dict) or not isinstance(result.get("rules"), list):
+        return []
+    return [
+        rule
+        for rule in result["rules"]
+        if isinstance(rule, dict) and rule.get("source") == ADVISORY_ROW_SOURCE
+    ]
+
+
+def _summarize_advisory_rows(result: Any, requested: bool) -> Optional[str]:
+    """Name each notify-only row as one that never blocks, with its readingAt.
+
+    A NOTIFY row carries the same breached and groupBreakdown fields a BLOCK
+    rule does, so without this line a reader counts it as spend being stopped.
+    Returns None when no advisory row came back and none was asked for, so the
+    default read renders as it always has.
+    """
+    advisory = _advisory_rows(result)
+    if not advisory:
+        return "No notify-only budgets on this team." if requested else None
+
+    lines: List[str] = []
+    for row in advisory:
+        label = row.get("name") or f"rule {row.get('ruleId')}"
+        reading_at = row.get("readingAt")
+        reading = (
+            f"per-person figures read at {reading_at}"
+            if reading_at
+            else "no reading yet for the current window"
+        )
+        lines.append(f"- {label}: notify-only, never blocks; {reading}")
+
+    if len(advisory) == 1:
+        subject = "row is a notify-only budget"
+        verdict = "it alerts and never blocks, even when breached, so it is not an enforcement rule"
+    else:
+        subject = "rows are notify-only budgets"
+        verdict = "they alert and never block, even when breached, so they are not enforcement rules"
+    header = f"{len(advisory)} {subject} (action NOTIFY, source {ADVISORY_ROW_SOURCE}): {verdict}:"
+    return "\n".join([header] + lines)
 
 
 class CostControlsManager:
@@ -646,6 +760,7 @@ class CostControlsManager:
             "enforcement_events": events,
             "pagination": page_info,
             "total_found": len(events),
+            "total_records": platform_total(page_info),
             "page": page,
         }
 
@@ -750,8 +865,68 @@ class CostControlsManager:
         ``departmentBudgetWarnings`` on tenants with department budgets;
         ``_summarize_department_blocks`` and ``_summarize_department_warnings`` are
         what turn them into readable prose at the action boundary.
+
+        ``include_advisory`` adds the notify-only budgets
+        (``ENFORCEMENT_ADVISORY_ROWS_NOTE``). It is refused beside ``rule_id``
+        because the platform drops advisory rows on a narrowed read, and an
+        answer without them would read as a team that has none.
         """
-        return await self.client.get_enforcement_rules(rule_id=arguments.get("rule_id"))
+        rule_id = _narrowing_rule_id(arguments)
+        include_advisory = _include_advisory_requested(arguments)
+        if include_advisory and rule_id:
+            raise ToolError(
+                message=(
+                    "include_advisory cannot be combined with rule_id: the platform "
+                    "returns notify-only budgets only on the whole-team read"
+                ),
+                error_code=ErrorCodes.INVALID_PARAMETER,
+                field="include_advisory",
+                value=True,
+                suggestions=[
+                    "get_enforcement_rules(include_advisory=true) to list every rule "
+                    "and notify-only budget",
+                    "get_enforcement_rules(rule_id='cc_123') to read one cost-control rule",
+                ],
+            )
+        return await self.client.get_enforcement_rules(
+            rule_id=rule_id, include_advisory=include_advisory
+        )
+
+    async def list_filter_values(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """List the values a cost-control filter accepts (``FILTER_VALUES_NOTE``)."""
+        dimension = str(arguments.get("dimension") or FILTER_VALUES_DIMENSION).strip().upper()
+        if dimension != FILTER_VALUES_DIMENSION:
+            raise ToolError(
+                message=(
+                    f"list_filter_values lists {FILTER_VALUES_DIMENSION} only; "
+                    f"{dimension} is not listed"
+                ),
+                error_code=ErrorCodes.INVALID_VALUE,
+                field="dimension",
+                value=dimension,
+                suggestions=[
+                    f"Call list_filter_values(dimension='{FILTER_VALUES_DIMENSION}') "
+                    "or omit dimension.",
+                    "Other dimensions are not listed; the server validates their values on save.",
+                ],
+            )
+        try:
+            return await self.client.get_cost_control_filter_values(dimension)
+        except ReveniumAPIError as e:
+            # A platform released before the endpoint answers 404 for the
+            # unmapped route; the caller needs to know the save still validates.
+            if e.status_code == 404:
+                raise ToolError(
+                    message=FILTER_VALUES_NOT_OFFERED_NOTE,
+                    error_code=ErrorCodes.RESOURCE_UNAVAILABLE,
+                    field="action",
+                    value="list_filter_values",
+                    suggestions=[
+                        "Write the provider filter with create or update and read the "
+                        "400 message if the value is refused.",
+                    ],
+                )
+            raise
 
     async def preview_department_group(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Preview the departments under a parent before creating a DEPARTMENT rule.
@@ -842,13 +1017,14 @@ class CostControlsManager:
 class CostControlsManagement(ToolBase):
     """Consolidated AI cost-controls management MCP tool.
 
-    Exposes the Revenium AI Cost Controls API with 15 actions:
+    Exposes the Revenium AI Cost Controls API with 16 actions:
     - 5 CRUD: list, get, create, update, delete
     - 6 enforcement visibility: list_enforcement_events,
       get_enforcement_events_summary, get_enforcement_events_history,
       get_enforcement_events_affected, get_enforcement_rules,
       get_enforcement_rule_roster
     - 1 department scoping: preview_department_group
+    - 1 filter lookup: list_filter_values
     - 3 introspection: get_capabilities, get_examples, get_tool_metadata
     """
 
@@ -868,10 +1044,11 @@ class CostControlsManagement(ToolBase):
         "bucketed over time with get_enforcement_events_history and reduced to who "
         "they name with get_enforcement_events_affected; get_enforcement_rule_roster "
         "pages one grouped rule's people or departments against its cap. "
+        "list_filter_values lists the PROVIDER values a provider filter accepts. "
         "Key actions: list, get, create, update, delete, list_enforcement_events, "
         "get_enforcement_events_summary, get_enforcement_events_history, "
         "get_enforcement_events_affected, get_enforcement_rules, "
-        "get_enforcement_rule_roster, preview_department_group. "
+        "get_enforcement_rule_roster, preview_department_group, list_filter_values. "
         "Use get_capabilities for full action list."
     )
     business_category = "Core Business Management Tools"
@@ -984,6 +1161,8 @@ class CostControlsManagement(ToolBase):
                                         "description": (
                                             "Spend dimension the filter matches on, e.g. DEPARTMENT for a "
                                             "department. Free string — the server validates. "
+                                            + FILTER_VALUES_NOTE
+                                            + " "
                                             + DEPARTMENT_DIMENSION_SCOPE_NOTE
                                             + " "
                                             + deprecated_aliases_note("DEPARTMENT")
@@ -1061,6 +1240,12 @@ class CostControlsManagement(ToolBase):
                         "Cost-control (rule) ID. Optional on the enforcement-event "
                         "actions and on get_enforcement_rules (which narrows to that "
                         "one compiled rule); REQUIRED for get_enforcement_rule_roster."
+                    ),
+                },
+                "include_advisory": {
+                    "type": "boolean",
+                    "description": (
+                        "Optional on get_enforcement_rules. " + ENFORCEMENT_ADVISORY_ROWS_NOTE
                     ),
                 },
                 "since": {
@@ -1181,7 +1366,9 @@ class CostControlsManagement(ToolBase):
                     "description": (
                         "Roster grouping guard for get_enforcement_rule_roster: SUBSCRIBER "
                         "or DEPARTMENT. A dimension that disagrees with the rule's own "
-                        "grouping is refused rather than answered with the other kind of row."
+                        "grouping is refused rather than answered with the other kind of row. "
+                        "For list_filter_values it is the filter dimension to list, "
+                        "defaulting to PROVIDER, the only one the platform lists."
                     ),
                 },
                 "page": {
@@ -1227,6 +1414,8 @@ class CostControlsManagement(ToolBase):
             "get_enforcement_rule_roster",
             # Department scoping
             "preview_department_group",
+            # Filter lookup
+            "list_filter_values",
             # Introspection
             "get_capabilities",
             "get_examples",
@@ -1249,7 +1438,8 @@ class CostControlsManagement(ToolBase):
                         "control_data": (
                             "dict (required: name, metricType, hardLimit, windowType, action; "
                             "optional: description, warnThreshold, shadowMode, enabled, groupBy, "
-                            "filters, notificationChannelIds, notificationEmails)"
+                            "filters, notificationChannelIds, notificationEmails). "
+                            "Read accepted PROVIDER filter values with list_filter_values first"
                         )
                     },
                     "update": {
@@ -1257,6 +1447,7 @@ class CostControlsManagement(ToolBase):
                         "control_data": (
                             "dict (partial — PATCH sends the given fields as-is). "
                             "notificationEmails: " + NOTIFICATION_EMAILS_PATCH_NOTE
+                            + " Read accepted PROVIDER filter values with list_filter_values first."
                         ),
                     },
                     "delete": {"control_id": "str"},
@@ -1275,6 +1466,24 @@ class CostControlsManagement(ToolBase):
                     "shadowMode evaluates and logs a control without applying its enforcement action",
                     "A filter row carries either value or values, never both: "
                     + FILTER_IN_OPERATOR_NOTE,
+                    FILTER_VALUES_NOTE,
+                ],
+            ),
+            ToolCapability(
+                name="Filter Values",
+                description=FILTER_VALUES_NOTE,
+                parameters={
+                    "list_filter_values": {
+                        "dimension": "str (optional, PROVIDER - the default and the only one listed)",
+                    },
+                },
+                examples=[
+                    "list_filter_values()",
+                    "create(control_data={'name': 'Anthropic cap', 'metricType': 'TOTAL_COST', 'hardLimit': 500, 'windowType': 'MONTHLY', 'action': 'BLOCK', 'filters': [{'dimension': 'PROVIDER', 'operator': 'IS', 'value': 'Anthropic'}]})",
+                ],
+                limitations=[
+                    "Read-only; never called implicitly by create or update",
+                    FILTER_VALUES_NOT_OFFERED_NOTE,
                 ],
             ),
             ToolCapability(
@@ -1325,6 +1534,10 @@ class CostControlsManagement(ToolBase):
                     },
                     "get_enforcement_rules": {
                         "rule_id": "str (optional, narrows the compiled set to one rule)",
+                        "include_advisory": (
+                            "bool (optional, also return the notify-only budgets, which "
+                            "never block; ignored upstream with rule_id, so refused with it)"
+                        ),
                     },
                     "get_enforcement_rule_roster": {
                         "rule_id": "str (required)",
@@ -1347,6 +1560,7 @@ class CostControlsManagement(ToolBase):
                     "get_enforcement_events_affected(rule_id='cc_123', affected_search='data')",
                     "get_enforcement_rules()",
                     "get_enforcement_rules(rule_id='cc_123')",
+                    "get_enforcement_rules(include_advisory=true)",
                     "get_enforcement_rule_roster(rule_id='cc_123', band='BLOCKED', sort='PERCENT')",
                 ],
                 limitations=[
@@ -1359,6 +1573,7 @@ class CostControlsManagement(ToolBase):
                     "get_enforcement_rules(rule_id=...) answers an id no rule carries with an "
                     "empty rules list rather than a 404, so an empty narrowed read means "
                     "'no compiled rule with this id', never 'this team has no rules'",
+                    ENFORCEMENT_ADVISORY_ROWS_NOTE,
                     "get_enforcement_rules output includes subscriber email addresses when "
                     "department budgets are blocking anyone (see this capability's description)",
                     "departmentBudgetBlocks is absent on tenants without department budgets; the "
@@ -1486,6 +1701,10 @@ class CostControlsManagement(ToolBase):
                             "action": "get_enforcement_rules",
                             "rule_id": "cc_123",
                         },
+                        "get_enforcement_rules_with_notify_only_budgets": {
+                            "action": "get_enforcement_rules",
+                            "include_advisory": True,
+                        },
                         "get_enforcement_rule_roster": {
                             "action": "get_enforcement_rule_roster",
                             "rule_id": "cc_123",
@@ -1542,8 +1761,22 @@ class CostControlsManagement(ToolBase):
                             "action": "preview_department_group",
                             "parent_department_id": 173,
                         },
+                        "list_filter_values": {"action": "list_filter_values"},
+                        "filter_one_provider": {
+                            "action": "create",
+                            "control_data": {
+                                "name": "Anthropic cap",
+                                "metricType": "TOTAL_COST",
+                                "hardLimit": 500,
+                                "windowType": "MONTHLY",
+                                "action": "BLOCK",
+                                "filters": [
+                                    {"dimension": "PROVIDER", "operator": "IS", "value": "Anthropic"}
+                                ],
+                            },
+                        },
                     },
-                    "filter_notes": [FILTER_IN_OPERATOR_NOTE],
+                    "filter_notes": [FILTER_IN_OPERATOR_NOTE, FILTER_VALUES_NOTE],
                     "enforcement_notes": [
                         ENFORCEMENT_EVENT_ROW_FIELDS_NOTE,
                         ENFORCEMENT_GROUP_PAIR_NOTE,
@@ -1617,10 +1850,14 @@ class CostControlsManagement(ToolBase):
                 return [
                     TextContent(
                         type="text",
-                        text=(
-                            f"Found {result['total_found']} enforcement events "
-                            f"(page {result.get('page', 0) + 1}):\n\n" + json.dumps(result, indent=2)
-                        ),
+                        text=format_page_count_heading(
+                            "enforcement events",
+                            result["total_found"],
+                            result["pagination"],
+                            result["page"],
+                        )
+                        + "\n\n"
+                        + json.dumps(result, indent=2),
                     )
                 ]
 
@@ -1676,7 +1913,7 @@ class CostControlsManagement(ToolBase):
             elif action == "get_enforcement_rules":
                 result = await manager.get_enforcement_rules(arguments)
                 rules = result.get("rules", []) if isinstance(result, dict) else []
-                requested_rule_id = arguments.get("rule_id")
+                requested_rule_id = _narrowing_rule_id(arguments)
                 if requested_rule_id and not rules:
                     # Upstream answers an unknown ruleId with 200 and an empty
                     # list; rendering that as "0 rules" would read as a team
@@ -1693,8 +1930,14 @@ class CostControlsManagement(ToolBase):
                         )
                     ]
                 scope = f" for rule {requested_rule_id}" if requested_rule_id else ""
+                advisory_count = len(_advisory_rows(result))
+                counted = (
+                    f"{len(rules) - advisory_count} rules and {advisory_count} notify-only budgets"
+                    if advisory_count
+                    else f"{len(rules)} rules"
+                )
                 header = (
-                    f"Compiled enforcement rules{scope} ({len(rules)} rules, "
+                    f"Compiled enforcement rules{scope} ({counted}, "
                     f"compiledAt={result.get('compiledAt') if isinstance(result, dict) else None}):"
                 )
                 # Extra lines, never a blank one: callers (and tests) split the
@@ -1708,6 +1951,11 @@ class CostControlsManagement(ToolBase):
                 warnings_summary = _summarize_department_warnings(result)
                 if warnings_summary:
                     header = f"{header}\n{warnings_summary}"
+                advisory_summary = _summarize_advisory_rows(
+                    result, requested=_include_advisory_requested(arguments)
+                )
+                if advisory_summary:
+                    header = f"{header}\n{advisory_summary}"
                 return [
                     TextContent(
                         type="text",
@@ -1743,6 +1991,10 @@ class CostControlsManagement(ToolBase):
                         ),
                     )
                 ]
+
+            elif action == "list_filter_values":
+                result = await manager.list_filter_values(arguments)
+                return [TextContent(type="text", text=self._filter_values_text(result))]
 
             else:
                 supported = await self._get_supported_actions()
@@ -1825,6 +2077,29 @@ class CostControlsManagement(ToolBase):
             f"{shown} affected person/object row(s) shown (filtered by "
             f"{', '.join(active_selectors)}); total matching before the level/mode "
             f"filter: {total}. {cap_note}"
+        )
+
+    @staticmethod
+    def _filter_values_text(result: Any) -> str:
+        """Render the accepted values as one line each, then the payload."""
+        payload = result if isinstance(result, dict) else {}
+        values = payload.get("values")
+        if not isinstance(values, list):
+            return (
+                "WARNING: The filter-values endpoint answered with an unexpected shape "
+                "(expected an object with a values list).\n\n" + json.dumps(result, indent=2)
+            )
+        lines = [
+            f"- {entry.get('value')}: covers {', '.join(map(str, entry.get('covers') or []))}"
+            if isinstance(entry, dict)
+            else f"- {entry}"
+            for entry in values
+        ]
+        return (
+            f"{len(values)} accepted {payload.get('dimension')} filter value(s). {FILTER_VALUES_NOTE}\n"
+            + "\n".join(lines)
+            + "\n\n"
+            + json.dumps(result, indent=2)
         )
 
     @staticmethod

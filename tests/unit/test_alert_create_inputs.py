@@ -332,6 +332,18 @@ class TestBooleanThresholdThroughTheRegisteredTool:
         assert platform.created_bodies == []
 
     @pytest.mark.parametrize("flag", [True, False], ids=["true", "false"])
+    async def test_a_boolean_threshold_is_refused_for_a_simple_alert(self, flag):
+        platform = FakeAnomalyPlatform()
+
+        result = await self._call_registered(
+            platform, {"action": "create_simple", **_threshold_alert_at(flag)}
+        )
+
+        assert result.is_error
+        assert "threshold must be a number" in result.content[0].text
+        assert platform.created_bodies == []
+
+    @pytest.mark.parametrize("flag", [True, False], ids=["true", "false"])
     async def test_a_boolean_threshold_is_refused_for_a_budget_alert(self, flag):
         platform = FakeAnomalyPlatform()
 
@@ -383,10 +395,11 @@ class TestNullAndEmptyUpdateInputs:
         assert platform.updated_bodies == []
 
     @pytest.mark.parametrize("cleared", [None, ""], ids=["null", "blank"])
-    async def test_a_null_webhook_list_changes_nothing(self, cleared):
+    @pytest.mark.parametrize("spelling", ["webhook_configurations", "webhookConfigurations"])
+    async def test_a_null_webhook_list_changes_nothing(self, spelling, cleared):
         platform = FakeAnomalyPlatform([threshold_alert("a1", webhookConfigurations=["wh-1"])])
 
-        dry, live = await self._preview_and_update(platform, {"webhook_configurations": cleared})
+        dry, live = await self._preview_and_update(platform, {spelling: cleared})
 
         assert dry[0] is False
         assert "webhookConfigurations" not in dry[1]
@@ -397,10 +410,11 @@ class TestNullAndEmptyUpdateInputs:
 
     @pytest.mark.parametrize("cleared", [None, ""], ids=["null", "blank"])
     @pytest.mark.parametrize("stored_flag", [True, False])
-    async def test_a_null_percent_flag_keeps_the_stored_flag(self, stored_flag, cleared):
+    @pytest.mark.parametrize("spelling", ["is_percentage", "isPercentage"])
+    async def test_a_null_percent_flag_keeps_the_stored_flag(self, spelling, stored_flag, cleared):
         platform = FakeAnomalyPlatform([threshold_alert("a1", isPercentage=stored_flag)])
 
-        dry, live = await self._preview_and_update(platform, {"is_percentage": cleared})
+        dry, live = await self._preview_and_update(platform, {spelling: cleared})
 
         assert dry[0] is False
         assert "isPercentage" not in dry[1]

@@ -14,6 +14,7 @@ from src.revenium_mcp_server.analytics.validation import (
     ConfigurationError,
     DataProcessingError,
     ValidationError,
+    known_names,
 )
 
 
@@ -517,3 +518,28 @@ class TestFilterValidationHardening:
         with pytest.raises(ValidationError) as exc_info:
             getattr(validator, method)({"period": "SEVEN_DAYS", "filters": filters})
         assert exc_info.value.field == "filters"
+
+
+class TestKnownNames:
+    def test_a_filters_field_still_points_get_filter_options_at_its_dimension(self):
+        """The refusal names the argument as given and the dimension get_filter_options takes."""
+        with pytest.raises(ValidationError) as refusal:
+            known_names(
+                "providers", ["acme"], ["OpenAI"], "SEVEN_DAYS", field="filters.providers"
+            )
+
+        assert refusal.value.field == "filters.providers"
+        assert refusal.value.message.startswith("filters.providers names 'acme'")
+        assert "get_filter_options(dimension='providers') lists them for any window" in (
+            refusal.value.suggestions
+        )
+
+    def test_the_field_defaults_to_the_dimension(self):
+        with pytest.raises(ValidationError) as refusal:
+            known_names("providers", ["acme"], ["OpenAI"], "SEVEN_DAYS")
+
+        assert refusal.value.field == "providers"
+        assert "Valid providers for SEVEN_DAYS: OpenAI" in refusal.value.suggestions
+
+    def test_a_listed_name_comes_back_in_the_platforms_spelling(self):
+        assert known_names("providers", ["openai"], ["OpenAI"], "SEVEN_DAYS") == ["OpenAI"]

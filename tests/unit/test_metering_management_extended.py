@@ -2297,3 +2297,63 @@ class TestJavascriptGuideNamesThePackage:
         assert "Node.js Packages" not in text
         assert "REVENIUM_METERING_API_KEY" in text
         assert "REVENIUM_API_KEY=" not in text
+
+
+class TestBlankProvenanceFieldRefusedOnEveryPath:
+    """BACK-4968: a blank model_host or subscriber_email_source is refused
+    before sending, with the same reason on the sync fast path and the async
+    pipeline; the metering API answers a blank with 400."""
+
+    BLANK_FIELDS = ["model_host", "subscriber_email_source"]
+    BLANK_VALUES = ["", "   "]
+
+    @pytest.mark.parametrize("blank", BLANK_VALUES)
+    @pytest.mark.parametrize("field", BLANK_FIELDS)
+    def test_fast_path_refuses_blank_field(self, field, blank):
+        verdict, messages = TestOptionalStringViolationLogsAreValueFree._warnings_for(
+            {**VALID_TX, field: blank}
+        )
+        assert verdict is False
+        assert f"Rejected {field}: Cannot be empty" in messages
+
+    @pytest.mark.parametrize("blank", BLANK_VALUES)
+    @pytest.mark.parametrize("field", BLANK_FIELDS)
+    @pytest.mark.asyncio
+    async def test_pipeline_refuses_blank_field_before_sending(self, field, blank):
+        mgmt, client = _make_mgmt_with_client()
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.metering_management.response_cache"
+        ) as rc:
+            rc.clear_request_cache = MagicMock()
+            rc.get_cached_response = AsyncMock(return_value=None)
+            rc.set_cached_response = AsyncMock()
+            with pytest.raises(ToolError) as exc_info:
+                await mgmt.handle_action("submit_ai_transaction", {**VALID_TX, field: blank})
+        assert f"• {field}: Cannot be empty" in str(exc_info.value.message)
+        client.post.assert_not_called()
+
+
+class TestEffortRefusalOnlyForEffort:
+    """BACK-4968: the submit pre-flight's effort refusal fires for an effort
+    problem only, with its text unchanged."""
+
+    _submit = TestSubmitCompletionProvenanceFields._submit
+    _payload_from = staticmethod(TestSubmitCompletionProvenanceFields._payload_from)
+
+    @pytest.mark.asyncio
+    async def test_malformed_effort_refusal_text_is_unchanged(self):
+        mgmt, client = _make_mgmt_with_client()
+        with pytest.raises(ToolError) as exc_info:
+            await self._submit(mgmt, {**VALID_TX, "effort": "very high"})
+        assert exc_info.value.message == "Invalid effort: 'very high' must match ^[A-Za-z0-9_-]+$"
+        client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_email_source_finding_is_never_reported_as_an_effort_refusal(self):
+        mgmt, client = _make_mgmt_with_client()
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.metering_management._email_source_shape_errors",
+            return_value=["• subscriber_email_source: looks like an email address"],
+        ):
+            await self._submit(mgmt, {**VALID_TX, "effort": "high", "subscriber_email_source": "jwt"})
+        assert self._payload_from(client)["effort"] == "high"
