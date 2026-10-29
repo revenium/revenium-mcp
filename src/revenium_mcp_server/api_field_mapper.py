@@ -38,7 +38,6 @@ class APIFieldMapper:
         "free_trial_duration_days": "trialPeriodCount",  # FIXED: Alternative field name
         "trial_duration": "trialPeriodCount",  # FIXED: Trial duration
         "trial_duration_days": "trialPeriodCount",  # FIXED: Trial duration in days
-        "trial_period": "trialPeriod",  # Trial period type (DAY, WEEK, MONTH)
         "notify_customer_before_trial_end": "notifyClientTrialAboutToExpire",  # FIXED: Trial notification
         # Invoicing & Payment fields
         "invoices_issued": "invoicesIssued",  # When invoices are issued
@@ -56,6 +55,10 @@ class APIFieldMapper:
         "flat_amount": "flatAmount",
         "name": "name",  # Keep as-is
     }
+
+    INTERNAL_TIER_FIELDS = {api: internal for internal, api in TIER_FIELD_MAPPING.items()}
+
+    RATING_AGGREGATION_KEYS = ("ratingAggregations", "rating_aggregations")
 
     RATING_AGGREGATION_FIELD_MAPPING = {
         "type": "aggregationType",
@@ -124,6 +127,37 @@ class APIFieldMapper:
             mapped[api_field] = value
 
         return mapped
+
+    @staticmethod
+    def map_tier_fields_to_internal(tier_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Map tier fields from API format to the internal snake_case names."""
+        return {
+            APIFieldMapper.INTERNAL_TIER_FIELDS.get(field, field): value
+            for field, value in tier_data.items()
+        }
+
+    @staticmethod
+    def rating_aggregations_of(plan_data: Dict[str, Any]) -> List[Any]:
+        """A plan's rating aggregations under either key spelling, camelCase ones first."""
+        aggregations: List[Any] = []
+        for key in APIFieldMapper.RATING_AGGREGATION_KEYS:
+            value = plan_data.get(key)
+            if isinstance(value, list):
+                aggregations.extend(value)
+        return aggregations
+
+    @staticmethod
+    def with_one_rating_aggregation_key(plan_data: Dict[str, Any]) -> Dict[str, Any]:
+        """The plan with its aggregations under ratingAggregations only, as the platform stores them."""
+        if not any(isinstance(plan_data.get(key), list) for key in APIFieldMapper.RATING_AGGREGATION_KEYS):
+            return plan_data
+        plan = {
+            key: value
+            for key, value in plan_data.items()
+            if key not in APIFieldMapper.RATING_AGGREGATION_KEYS
+        }
+        plan["ratingAggregations"] = APIFieldMapper.rating_aggregations_of(plan_data)
+        return plan
 
     @staticmethod
     def map_rating_aggregation_fields(rating_agg_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -210,19 +244,17 @@ class APIFieldMapper:
         camel_setup_fees: List[Any] = []
         snake_setup_fees: List[Dict[str, Any]] = []
         has_setup_fees = False
+        has_rating_aggregations = False
 
         for internal_field, value in plan_data.items():
-            if internal_field == "setupFees" and isinstance(value, list):
+            if internal_field in APIFieldMapper.RATING_AGGREGATION_KEYS and isinstance(value, list):
+                has_rating_aggregations = True
+            elif internal_field == "setupFees" and isinstance(value, list):
                 camel_setup_fees = list(value)
                 has_setup_fees = True
             elif internal_field == "tiers" and isinstance(value, list):
                 # Map nested tier fields
                 mapped["tiers"] = [APIFieldMapper.map_tier_fields(tier) for tier in value]
-            elif internal_field == "rating_aggregations" and isinstance(value, list):
-                # Map nested rating aggregation fields
-                mapped["ratingAggregations"] = [
-                    APIFieldMapper.map_rating_aggregation_fields(ra) for ra in value
-                ]
             elif internal_field == "setup_fees" and isinstance(value, list):
                 # Map nested setup fee fields
                 snake_setup_fees = [APIFieldMapper.map_setup_fee_fields(sf) for sf in value]
@@ -236,6 +268,11 @@ class APIFieldMapper:
 
         if has_setup_fees:
             mapped["setupFees"] = camel_setup_fees + snake_setup_fees
+        if has_rating_aggregations:
+            mapped["ratingAggregations"] = [
+                APIFieldMapper.map_rating_aggregation_fields(ra)
+                for ra in APIFieldMapper.rating_aggregations_of(plan_data)
+            ]
 
         return mapped
 

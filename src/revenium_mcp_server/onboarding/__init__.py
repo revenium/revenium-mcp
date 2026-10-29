@@ -290,7 +290,7 @@ class OnboardingManager:
             return onboarding_state.recommendations
         except Exception as e:
             logger.error(f"Error getting personalized recommendations: {e}")
-            return ['Use system_setup(action="show_welcome") to get started with configuration']
+            return ['Use get_system_setup(action="show_welcome") to get started with configuration']
 
     async def check_setup_completion(self) -> Dict[str, Any]:
         """Check overall setup completion status.
@@ -328,8 +328,8 @@ class OnboardingManager:
                     if not is_complete
                     else [
                         "Setup is complete! Start using the system.",
-                        "Create your first alert with manage_alerts()",
-                        "Explore products with manage_products()",
+                        "Create your first alert with get_alerts(action='get_examples')",
+                        "Explore products with get_products()",
                     ]
                 ),
             }

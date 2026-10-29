@@ -465,15 +465,15 @@ class TestSetStrictIngestionMode:
     """set_strict_ingestion_mode is a guarded toggle."""
 
     @pytest.mark.asyncio
-    async def test_without_confirm_returns_preview_and_no_call(self, log_tool):
+    async def test_dry_run_returns_preview_and_no_call(self, log_tool):
         client = _ingestion_client()
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True}
+            "set_strict_ingestion_mode", {"enabled": True, "dry_run": True}
         )
         text = result[0].text
-        assert "confirm" in text.lower()
+        assert "dry run" in text.lower()
         assert "reject" in text.lower()
         client.set_strict_ingestion_mode.assert_not_called()
 
@@ -483,7 +483,7 @@ class TestSetStrictIngestionMode:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+            "set_strict_ingestion_mode", {"enabled": True}
         )
         text = result[0].text
         assert "enabled" in text.lower()
@@ -495,25 +495,11 @@ class TestSetStrictIngestionMode:
         log_tool.get_client = AsyncMock(return_value=client)
 
         with pytest.raises(ToolError):
-            await log_tool.handle_action("set_strict_ingestion_mode", {"confirm": True})
+            await log_tool.handle_action("set_strict_ingestion_mode", {})
 
 
 class TestIngestionHardening:
-    """Review hardening: strict confirm, honest state, bounded rendering."""
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("confirm", ["false", "true", 1, "yes"])
-    async def test_non_boolean_confirm_returns_preview(self, log_tool, confirm):
-        """Only the boolean True applies the change — loosely typed MCP
-        arguments (confirm='false', confirm=1) must not bypass the guard."""
-        client = _ingestion_client()
-        log_tool.get_client = AsyncMock(return_value=client)
-
-        result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True, "confirm": confirm}
-        )
-        assert "confirm" in result[0].text.lower()
-        client.set_strict_ingestion_mode.assert_not_called()
+    """Review hardening: honest state, bounded rendering."""
 
     @pytest.mark.asyncio
     async def test_missing_state_in_response_is_not_reported_as_confirmed(self, log_tool):
@@ -523,7 +509,7 @@ class TestIngestionHardening:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+            "set_strict_ingestion_mode", {"enabled": True}
         )
         text = result[0].text
         assert "not confirm" in text.lower() or "verify" in text.lower()
@@ -675,7 +661,7 @@ class TestStrictModeTicketJobsOptIn:
         log_tool.get_client = AsyncMock(return_value=client)
 
         await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+            "set_strict_ingestion_mode", {"enabled": True}
         )
         client.set_strict_ingestion_mode.assert_awaited_once_with(
             True, allow_ticket_jobs=None
@@ -688,7 +674,7 @@ class TestStrictModeTicketJobsOptIn:
 
         await log_tool.handle_action(
             "set_strict_ingestion_mode",
-            {"enabled": True, "allow_ticket_jobs": True, "confirm": True},
+            {"enabled": True, "allow_ticket_jobs": True},
         )
         client.set_strict_ingestion_mode.assert_awaited_once_with(
             True, allow_ticket_jobs=True
@@ -699,14 +685,14 @@ class TestStrictModeTicketJobsOptIn:
         """PR #328 review: the preview must not claim Jobs stop when they will not."""
         # Opting in: Jobs continue.
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True, "allow_ticket_jobs": True}
+            "set_strict_ingestion_mode", {"enabled": True, "allow_ticket_jobs": True, "dry_run": True}
         )
         text = result[0].text
         assert "KEEP being" in text and "STOP being" not in text
 
         # Omitted: depends on the tenant's existing opt-in, left unchanged.
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True}
+            "set_strict_ingestion_mode", {"enabled": True, "dry_run": True}
         )
         text = result[0].text
         assert "EXISTING opt-in" in text and "leaves unchanged" in text
@@ -714,7 +700,7 @@ class TestStrictModeTicketJobsOptIn:
 
         # Explicit false: suppression is certain.
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True, "allow_ticket_jobs": False}
+            "set_strict_ingestion_mode", {"enabled": True, "allow_ticket_jobs": False, "dry_run": True}
         )
         assert "STOP being" in result[0].text
 
@@ -727,7 +713,7 @@ class TestStrictModeTicketJobsOptIn:
         with pytest.raises(ToolError) as excinfo:
             await log_tool.handle_action(
                 "set_strict_ingestion_mode",
-                {"enabled": False, "allow_ticket_jobs": True, "confirm": True},
+                {"enabled": False, "allow_ticket_jobs": True},
             )
         assert excinfo.value.field == "allow_ticket_jobs"
         client.set_strict_ingestion_mode.assert_not_called()
@@ -746,7 +732,7 @@ class TestStrictModeTicketJobsOptIn:
 
         await log_tool.handle_action(
             "set_strict_ingestion_mode",
-            {"enabled": False, "allow_ticket_jobs": False, "confirm": True},
+            {"enabled": False, "allow_ticket_jobs": False},
         )
         client.set_strict_ingestion_mode.assert_awaited_once_with(
             False, allow_ticket_jobs=False
@@ -760,7 +746,7 @@ class TestStrictModeTicketJobsOptIn:
         with pytest.raises(ToolError):
             await log_tool.handle_action(
                 "set_strict_ingestion_mode",
-                {"enabled": True, "allow_ticket_jobs": "yes", "confirm": True},
+                {"enabled": True, "allow_ticket_jobs": "yes"},
             )
         client.set_strict_ingestion_mode.assert_not_called()
 
@@ -772,7 +758,7 @@ class TestStrictModeTicketJobsOptIn:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True}
+            "set_strict_ingestion_mode", {"enabled": True, "dry_run": True}
         )
         text = result[0].text
         assert "ticket" in text.lower()
@@ -786,7 +772,7 @@ class TestStrictModeTicketJobsOptIn:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": False}
+            "set_strict_ingestion_mode", {"enabled": False, "dry_run": True}
         )
         text = result[0].text.lower()
         assert "ticket" in text
@@ -807,7 +793,7 @@ class TestStrictModeTicketJobsOptIn:
 
         result = await log_tool.handle_action(
             "set_strict_ingestion_mode",
-            {"enabled": True, "allow_ticket_jobs": True, "confirm": True},
+            {"enabled": True, "allow_ticket_jobs": True},
         )
         text = result[0].text
         assert "Ticket-grain Jobs" in text
@@ -823,7 +809,7 @@ class TestStrictModeTicketJobsOptIn:
 
         result = await log_tool.handle_action(
             "set_strict_ingestion_mode",
-            {"enabled": True, "allow_ticket_jobs": True, "confirm": True},
+            {"enabled": True, "allow_ticket_jobs": True},
         )
         assert "Ticket-grain Jobs" not in result[0].text
 
@@ -957,7 +943,7 @@ class TestStrictModeReportsAttributionDetailText:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+            "set_strict_ingestion_mode", {"enabled": True}
         )
         text = result[0].text
         assert "**Attribution detail text**: enabled" in text
@@ -972,7 +958,7 @@ class TestStrictModeReportsAttributionDetailText:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+            "set_strict_ingestion_mode", {"enabled": True}
         )
         assert "Attribution detail text" not in result[0].text
 
@@ -987,7 +973,7 @@ class TestStrictModeReportsAttributionDetailText:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+            "set_strict_ingestion_mode", {"enabled": True}
         )
         text = result[0].text
         assert "state not confirmed" in text
@@ -1002,7 +988,7 @@ class TestStrictModeReportsAttributionDetailText:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+            "set_strict_ingestion_mode", {"enabled": True}
         )
         text = result[0].text
         assert "state not confirmed" in text
@@ -1017,32 +1003,21 @@ class TestSetUsageBilling:
 
     Off hides invoices, payment methods, plan and subscription screens and stops
     the platform rating the tenant's usage, which is never rated later. It lands
-    on every user of the tenant at once, so the action is confirm-gated and
+    on every user of the tenant at once, so the action previews with dry_run and
     reports the state the server returned rather than the one that was asked for.
     """
 
     @pytest.mark.asyncio
-    async def test_without_confirm_returns_preview_and_no_call(self, log_tool):
-        client = _ingestion_client()
-        log_tool.get_client = AsyncMock(return_value=client)
-
-        result = await log_tool.handle_action("set_usage_billing", {"enabled": False})
-        text = result[0].text
-        assert "Confirmation Required" in text
-        assert "HIDE the tenant's billing screens" in text
-        client.set_usage_billing.assert_not_called()
-
-    @pytest.mark.parametrize("confirm", ["true", 1, "yes", None])
-    @pytest.mark.asyncio
-    async def test_loosely_typed_confirm_still_previews(self, log_tool, confirm):
-        """A tenant-wide change must not ride a truthy string."""
+    async def test_dry_run_returns_preview_and_no_call(self, log_tool):
         client = _ingestion_client()
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_usage_billing", {"enabled": False, "confirm": confirm}
+            "set_usage_billing", {"enabled": False, "dry_run": True}
         )
-        assert "Confirmation Required" in result[0].text
+        text = result[0].text
+        assert "Dry run" in text
+        assert "HIDE the tenant's billing screens" in text
         client.set_usage_billing.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1051,7 +1026,7 @@ class TestSetUsageBilling:
         client = _ingestion_client()
         log_tool.get_client = AsyncMock(return_value=client)
 
-        result = await log_tool.handle_action("set_usage_billing", {"enabled": False})
+        result = await log_tool.handle_action("set_usage_billing", {"enabled": False, "dry_run": True})
         text = result[0].text
         assert "STOPS being rated" in text
         assert "never rated, even after it is turned back on" in text
@@ -1063,7 +1038,7 @@ class TestSetUsageBilling:
         client = _ingestion_client()
         log_tool.get_client = AsyncMock(return_value=client)
 
-        result = await log_tool.handle_action("set_usage_billing", {"enabled": True})
+        result = await log_tool.handle_action("set_usage_billing", {"enabled": True, "dry_run": True})
         text = result[0].text
         assert "SHOW the tenant's billing screens" in text
         assert "not recovered" in text
@@ -1075,7 +1050,7 @@ class TestSetUsageBilling:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_usage_billing", {"enabled": True, "confirm": True}
+            "set_usage_billing", {"enabled": True}
         )
         text = result[0].text
         client.set_usage_billing.assert_awaited_once_with(True)
@@ -1095,7 +1070,7 @@ class TestSetUsageBilling:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_usage_billing", {"enabled": True, "confirm": True}
+            "set_usage_billing", {"enabled": True}
         )
         assert "**State**: disabled" in result[0].text
 
@@ -1107,7 +1082,7 @@ class TestSetUsageBilling:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_usage_billing", {"enabled": False, "confirm": True}
+            "set_usage_billing", {"enabled": False}
         )
         text = result[0].text
         assert "**State**: disabled" in text
@@ -1120,7 +1095,7 @@ class TestSetUsageBilling:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_usage_billing", {"enabled": True, "confirm": True}
+            "set_usage_billing", {"enabled": True}
         )
         text = result[0].text
         assert "state not confirmed" in text
@@ -1138,7 +1113,7 @@ class TestSetUsageBilling:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_usage_billing", {"enabled": True, "confirm": True}
+            "set_usage_billing", {"enabled": True}
         )
         assert "**Attribution detail text**: disabled" in result[0].text
 
@@ -1148,7 +1123,7 @@ class TestSetUsageBilling:
         log_tool.get_client = AsyncMock(return_value=client)
 
         with pytest.raises(ToolError) as exc:
-            await log_tool.handle_action("set_usage_billing", {"confirm": True})
+            await log_tool.handle_action("set_usage_billing", {})
         assert exc.value.field == "enabled"
         client.set_usage_billing.assert_not_called()
 
@@ -1160,7 +1135,7 @@ class TestSetUsageBilling:
 
         with pytest.raises(ToolError):
             await log_tool.handle_action(
-                "set_usage_billing", {"enabled": value, "confirm": True}
+                "set_usage_billing", {"enabled": value}
             )
         client.set_usage_billing.assert_not_called()
 
@@ -1182,7 +1157,7 @@ class TestTogglesReportUsageBilling:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+            "set_strict_ingestion_mode", {"enabled": True}
         )
         text = result[0].text
         assert "**Usage billing**: disabled" in text
@@ -1197,7 +1172,7 @@ class TestTogglesReportUsageBilling:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+            "set_strict_ingestion_mode", {"enabled": True}
         )
         assert "Usage billing" not in result[0].text
 
@@ -1209,7 +1184,7 @@ class TestTogglesReportUsageBilling:
         log_tool.get_client = AsyncMock(return_value=client)
 
         result = await log_tool.handle_action(
-            "set_strict_ingestion_mode", {"enabled": True, "confirm": True}
+            "set_strict_ingestion_mode", {"enabled": True}
         )
         text = result[0].text
         assert "state not confirmed" in text
@@ -1277,7 +1252,7 @@ _TOGGLES = pytest.mark.parametrize(
     [
         (
             "set_strict_ingestion_mode",
-            {"enabled": True, "confirm": True},
+            {"enabled": True},
             "strict_result",
             "strictIngestionMode",
         ),
@@ -1289,7 +1264,7 @@ _TOGGLES = pytest.mark.parametrize(
         ),
         (
             "set_usage_billing",
-            {"enabled": False, "confirm": True},
+            {"enabled": False},
             "usage_billing_result",
             "usageBillingEnabled",
         ),
@@ -1414,7 +1389,7 @@ class TestSetUsageBillingForbidden:
 
         with pytest.raises(ToolError) as exc:
             await log_tool.handle_action(
-                "set_usage_billing", {"enabled": False, "confirm": True}
+                "set_usage_billing", {"enabled": False}
             )
         err = exc.value
         assert err.error_code == ErrorCodes.API_AUTHORIZATION
@@ -1432,7 +1407,7 @@ class TestSetUsageBillingForbidden:
 
         with pytest.raises(ToolError) as exc:
             await log_tool.handle_action(
-                "set_usage_billing", {"enabled": False, "confirm": True}
+                "set_usage_billing", {"enabled": False}
             )
         assert exc.value.error_code == ErrorCodes.API_ERROR
         assert "Failed to set usage billing" in exc.value.message
@@ -1442,7 +1417,7 @@ class TestSetUsageBillingForbidden:
         client = _ingestion_client()
         log_tool.get_client = AsyncMock(return_value=client)
 
-        result = await log_tool.handle_action("set_usage_billing", {"enabled": False})
+        result = await log_tool.handle_action("set_usage_billing", {"enabled": False, "dry_run": True})
         text = result[0].text
         assert USAGE_BILLING_GATE_NOTE in text
         assert "get_usage_billing()" in text

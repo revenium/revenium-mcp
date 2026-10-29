@@ -16,8 +16,11 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..agent_friendly import UnifiedResponseFormatter
 from ..common.error_handling import (
+    ErrorCodes,
+    ToolError,
     create_structured_validation_error,
-    format_structured_error,
+    raise_refusal,
+    raise_structured_error,
 )
 from ..config_store import get_environment_value
 from ..endpoint_registry import _resolved_app_base_url, _use_new_api, get_endpoint_path
@@ -99,11 +102,14 @@ class DebugAutoDiscovery(ToolBase):
                         },
                     },
                 )
-                return [TextContent(type="text", text=format_structured_error(error))]
+                raise_structured_error(error)
+        except (PermissionError, ToolError):
+            raise
         except Exception as e:
             logger.error(f"Error in debug auto-discovery: {e}")
-            error_text = f"**Debug Auto-Discovery Error**: {str(e)}"
-            return [TextContent(type="text", text=error_text)]
+            raise_refusal(
+                f"**Debug Auto-Discovery Error**: {str(e)}", error_code=ErrorCodes.TOOL_ERROR
+            )
 
     async def _handle_debug(
         self, arguments: Dict[str, Any]
@@ -255,10 +261,14 @@ class DebugAutoDiscovery(ToolBase):
 
             return [TextContent(type="text", text=result_text)]
 
+        except (PermissionError, ToolError):
+            raise
         except Exception as e:
             logger.error(f"Error in debug auto-discovery: {e}")
-            error_text = f"**Diagnostic Error**: {str(e)}\n\nPlease check system configuration and try again."
-            return [TextContent(type="text", text=error_text)]
+            raise_refusal(
+                f"**Diagnostic Error**: {str(e)}\n\nPlease check system configuration and try again.",
+                error_code=ErrorCodes.TOOL_ERROR,
+            )
 
     async def _hosted_debug_report(
         self, caller_settings: Dict[str, Tuple[bool, str]]
@@ -372,7 +382,7 @@ The diagnostic will show:
 
 ## **Integration with Other Tools**
 - Run this before using other Revenium tools if you encounter setup issues
-- Use results to guide configuration of system_setup tool
+- Use results to guide configuration of manage_system_setup tool
 - Provides foundation for configuration_status comprehensive diagnostics
 """
         return [TextContent(type="text", text=examples_text)]

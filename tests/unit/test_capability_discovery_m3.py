@@ -7,8 +7,6 @@ Covers CapabilityDiscovery methods focusing on the missed lines:
 - _discover_traditional_metrics (anomaly/metering paths + empty + fallback)
 - _discover_operators (with/without API data + fallback)
 - _get_models_summary (success + fallback)
-- _discover_billing_periods_from_api (success, empty, fallback)
-- _discover_trial_periods_from_api (success, empty, fallback)
 - _discover_subscription_types_from_api (success, empty, fallback)
 - _discover_currencies_from_api (success, empty, fallback)
 - discover_capabilities routing and error handling
@@ -99,38 +97,29 @@ class TestDiscoverSubscriptionCapabilities:
     @pytest.mark.asyncio
     async def test_api_success_path_uses_discovered_values(self, discovery):
         """When all _discover_*_from_api helpers succeed, use their results."""
-        discovery._discover_billing_periods_from_api = AsyncMock(return_value=["MONTH", "YEAR"])
-        discovery._discover_trial_periods_from_api = AsyncMock(return_value=["DAY"])
         discovery._discover_subscription_types_from_api = AsyncMock(return_value=["monthly"])
         discovery._discover_currencies_from_api = AsyncMock(return_value=["USD"])
 
         result = await discovery._discover_subscription_capabilities()
 
-        assert result["billing_periods"] == ["MONTH", "YEAR"]
-        assert result["trial_periods"] == ["DAY"]
         assert result["subscription_types"] == ["monthly"]
         assert result["currencies"] == ["USD"]
 
     @pytest.mark.asyncio
     async def test_api_failure_uses_fallback(self, discovery):
         """When API discovery fails, fallback values are returned."""
-        discovery._discover_billing_periods_from_api = AsyncMock(side_effect=Exception("api down"))
-        discovery._discover_trial_periods_from_api = AsyncMock(return_value=["DAY"])
-        discovery._discover_subscription_types_from_api = AsyncMock(return_value=["monthly"])
+        discovery._discover_subscription_types_from_api = AsyncMock(side_effect=Exception("api down"))
         discovery._discover_currencies_from_api = AsyncMock(return_value=["USD"])
 
         result = await discovery._discover_subscription_capabilities()
 
-        # Fallback billing periods
-        assert "MONTH" in result["billing_periods"]
+        assert result["subscription_types"] == ["monthly", "quarterly", "yearly"]
         assert "subscription_statuses" in result
         assert "payment_methods" in result
 
     @pytest.mark.asyncio
     async def test_schema_always_present(self, discovery):
         """Schema structure is always returned regardless of API success."""
-        discovery._discover_billing_periods_from_api = AsyncMock(return_value=["MONTH"])
-        discovery._discover_trial_periods_from_api = AsyncMock(return_value=["DAY"])
         discovery._discover_subscription_types_from_api = AsyncMock(return_value=["monthly"])
         discovery._discover_currencies_from_api = AsyncMock(return_value=["USD"])
 
@@ -384,127 +373,6 @@ class TestGetModelsSummary:
         result = await discovery._get_models_summary()
         # No embedded models → total stays 0
         assert result["models"]["total"] == 0
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# _discover_billing_periods_from_api
-# ────────────────────────────────────────────────────────────────────────────
-
-class TestDiscoverBillingPeriodsFromApi:
-    """Test billing period discovery from API."""
-
-    @pytest.mark.asyncio
-    async def test_discovers_from_products_plan_period(self, discovery, mock_client):
-        async def fake_get(endpoint, **kwargs):
-            if "products" in endpoint:
-                return {"data": [{"plan": {"period": "MONTH"}}]}
-            return {"data": []}
-
-        mock_client.get.side_effect = fake_get
-        result = await discovery._discover_billing_periods_from_api()
-        assert "MONTH" in result
-
-    @pytest.mark.asyncio
-    async def test_discovers_from_products_billing_period(self, discovery, mock_client):
-        async def fake_get(endpoint, **kwargs):
-            if "products" in endpoint:
-                return {"data": [{"plan": {"billingPeriod": "QUARTER"}}]}
-            return {"data": []}
-
-        mock_client.get.side_effect = fake_get
-        result = await discovery._discover_billing_periods_from_api()
-        assert "QUARTER" in result
-
-    @pytest.mark.asyncio
-    async def test_discovers_from_subscriptions(self, discovery, mock_client):
-        async def fake_get(endpoint, **kwargs):
-            if "products" in endpoint:
-                return {"data": []}
-            if "subscriptions" in endpoint:
-                return {"data": [{"billingPeriod": "YEAR"}]}
-            return {}
-
-        mock_client.get.side_effect = fake_get
-        result = await discovery._discover_billing_periods_from_api()
-        assert "YEAR" in result
-
-    @pytest.mark.asyncio
-    async def test_raises_when_no_data_discovered(self, discovery, mock_client):
-        mock_client.get.return_value = {"data": []}
-        with pytest.raises(ValueError, match="billing periods"):
-            await discovery._discover_billing_periods_from_api()
-
-    @pytest.mark.asyncio
-    async def test_raises_on_api_error(self, discovery, mock_client):
-        mock_client.get.side_effect = Exception("network")
-        with pytest.raises(ValueError):
-            await discovery._discover_billing_periods_from_api()
-
-    @pytest.mark.asyncio
-    async def test_result_is_sorted(self, discovery, mock_client):
-        async def fake_get(endpoint, **kwargs):
-            if "products" in endpoint:
-                return {"data": [{"plan": {"period": "YEAR"}}, {"plan": {"period": "MONTH"}}]}
-            return {"data": []}
-
-        mock_client.get.side_effect = fake_get
-        result = await discovery._discover_billing_periods_from_api()
-        assert result == sorted(result)
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# _discover_trial_periods_from_api
-# ────────────────────────────────────────────────────────────────────────────
-
-class TestDiscoverTrialPeriodsFromApi:
-    """Test trial period discovery from API."""
-
-    @pytest.mark.asyncio
-    async def test_discovers_from_products_plan_trial_period(self, discovery, mock_client):
-        async def fake_get(endpoint, **kwargs):
-            if "products" in endpoint:
-                return {"data": [{"plan": {"trialPeriod": "DAY"}}]}
-            return {"data": []}
-
-        mock_client.get.side_effect = fake_get
-        result = await discovery._discover_trial_periods_from_api()
-        assert "DAY" in result
-
-    @pytest.mark.asyncio
-    async def test_discovers_from_products_top_level_trial_period(self, discovery, mock_client):
-        async def fake_get(endpoint, **kwargs):
-            if "products" in endpoint:
-                return {"data": [{"trialPeriod": "WEEK"}]}
-            return {"data": []}
-
-        mock_client.get.side_effect = fake_get
-        result = await discovery._discover_trial_periods_from_api()
-        assert "WEEK" in result
-
-    @pytest.mark.asyncio
-    async def test_discovers_from_subscriptions(self, discovery, mock_client):
-        async def fake_get(endpoint, **kwargs):
-            if "products" in endpoint:
-                return {"data": []}
-            if "subscriptions" in endpoint:
-                return {"data": [{"trialPeriod": "MONTH"}]}
-            return {}
-
-        mock_client.get.side_effect = fake_get
-        result = await discovery._discover_trial_periods_from_api()
-        assert "MONTH" in result
-
-    @pytest.mark.asyncio
-    async def test_raises_when_no_data_found(self, discovery, mock_client):
-        mock_client.get.return_value = {"data": []}
-        with pytest.raises(ValueError, match="trial periods"):
-            await discovery._discover_trial_periods_from_api()
-
-    @pytest.mark.asyncio
-    async def test_raises_on_api_error(self, discovery, mock_client):
-        mock_client.get.side_effect = Exception("oops")
-        with pytest.raises(ValueError):
-            await discovery._discover_trial_periods_from_api()
 
 
 # ────────────────────────────────────────────────────────────────────────────

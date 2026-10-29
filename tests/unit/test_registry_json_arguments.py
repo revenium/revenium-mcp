@@ -18,6 +18,8 @@ import pytest
 from fastmcp import Client, FastMCP
 from mcp.types import TextContent
 
+from src.revenium_mcp_server.common.tool_surface import domain_for
+from tests.unit._registered_tool_harness import serving_tool
 from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.common.validation import (
     refuse_arguments_the_action_ignores,
@@ -56,13 +58,13 @@ KNOWN_DECODED_ARGUMENTS = {
     ("manage_workflows", "context"),
     ("manage_workflows", "workflow_data"),
     ("manage_workflows", "step_result"),
-    ("manage_subscriber_credentials", "credential_data"),
-    ("manage_subscriber_credentials", "customer_info"),
+    ("manage_credentials", "credential_data"),
+    ("manage_credentials", "customer_info"),
     ("manage_products", "product_data"),
     ("manage_products", "resource_data"),
     ("manage_customers", "resource_data"),
     ("manage_subscriptions", "subscription_data"),
-    ("manage_metering_elements", "element_data"),
+    ("manage_usage_meters", "element_data"),
     ("manage_metering", "usage_metadata"),
     ("manage_tools", "tool_data"),
     ("manage_tools", "event_data"),
@@ -81,33 +83,33 @@ KNOWN_DECODED_ARGUMENTS = {
     ("manage_customers", "organization_data"),
     ("manage_customers", "subscriber_data"),
     ("manage_customers", "team_data"),
-    ("manage_metering_elements", "overrides"),
+    ("manage_usage_meters", "overrides"),
 }
 
 
 #: The list arguments decoded by the closures' shared list decoding. The
 #: enumeration must find exactly these, so a new one is a deliberate addition.
 SHARED_DECODED_LISTS = {
-    ("business_analytics_management", "include_dimensions"),
-    ("business_analytics_management", "providers"),
-    ("business_analytics_management", "agents"),
-    ("business_analytics_management", "pay_states"),
-    ("business_analytics_management", "states"),
+    ("get_business_analytics", "include_dimensions"),
+    ("get_business_analytics", "providers"),
+    ("get_business_analytics", "agents"),
+    ("get_business_analytics", "pay_states"),
+    ("get_business_analytics", "states"),
     ("manage_customers", "marketplace_names"),
     ("manage_customers", "automation_patterns"),
     ("manage_customers", "excluded_repos"),
     ("manage_customers", "email_addresses"),
     ("manage_customers", "slack_configuration_ids"),
     ("manage_metering", "transaction_ids"),
-    ("manage_subscriber_credentials", "tags"),
-    ("manage_subscriber_credentials", "subscriptionIds"),
+    ("manage_credentials", "tags"),
+    ("manage_credentials", "subscriptionIds"),
 }
 
 TRUNCATED_ARRAY = '["a", '
 
 #: Arguments that only one action reads; every other action refuses them.
 HONOURING_ACTION = {
-    ("manage_metering_elements", "overrides"): "create_from_template",
+    ("manage_usage_meters", "overrides"): "create_from_template",
 }
 
 
@@ -140,7 +142,9 @@ class _Server:
     async def call(self, tool_name, arguments):
         self.captured.clear()
         async with Client(self.mcp) as client:
-            result = await client.call_tool(tool_name, arguments, raise_on_error=False)
+            result = await client.call_tool(
+                serving_tool(tool_name, arguments), arguments, raise_on_error=False
+            )
         text = "\n".join(getattr(part, "text", "") for part in result.content)
         return result.is_error, text, dict(self.captured)
 
@@ -148,6 +152,8 @@ class _Server:
         """Every (tool, argument, kinds, has_params) whose type admits a JSON string."""
         found = []
         for name, tool in sorted(self.tools.items()):
+            if name != domain_for(name).key:
+                continue
             hints = typing.get_type_hints(tool.fn)
             has_params = "params" in hints
             for argument, annotation in sorted(hints.items()):
@@ -448,7 +454,7 @@ class TestArgumentsAnActionIgnoresAreRefused:
         self, server, action
     ):
         is_error, text, captured = await server.call(
-            "manage_metering_elements",
+            "manage_usage_meters",
             {"action": action, "overrides": {"description": "x"}},
         )
 
@@ -722,7 +728,7 @@ class TestArgumentsTheHelpNamesAreAccepted:
     async def test_create_from_template_accepts_overrides(self, overrides):
         is_error, text, captured = await m4._call_through_the_boundary(
             "_register_manage_metering_elements",
-            "manage_metering_elements",
+            "manage_usage_meters",
             {
                 "action": "create_from_template",
                 "template_name": "totalCost",
@@ -748,7 +754,7 @@ class TestArgumentsTheHelpNamesAreAccepted:
         [
             ("manage_customers", "_register_manage_customers", "customer_management.py"),
             (
-                "manage_metering_elements",
+                "manage_usage_meters",
                 "_register_manage_metering_elements",
                 "metering_elements_management.py",
             ),

@@ -31,7 +31,7 @@ from tests.unit._registered_tool_harness import (
     platform_url,
 )
 
-TOOL = "business_analytics_management"
+TOOL = "get_business_analytics"
 SKILL_PATH = "/profitstream/v2/api/skills/zzzzzzz"
 COVERAGE_PATH = "/profitstream/v2/api/billing/coverage"
 INVOICES_PATH = "/profitstream/v2/api/invoices"

@@ -20,6 +20,7 @@ from .error_handling import (
     create_structured_missing_parameter_error,
     create_structured_validation_error,
 )
+from .metadata_format import METADATA_FIELD, refuse_malformed_metadata
 from .recent_writes import RECENT_WRITES, RecentWrites, record_name, writer_scope
 from .update_readback import (
     fields_to_verify,
@@ -138,35 +139,6 @@ class FieldTransformers:
 
 MergedDataCheck = Callable[[Dict[str, Any], Dict[str, Any], Dict[str, Any]], None]
 
-METADATA_FIELD = "metadata"
-METADATA_FORMAT = "name=value pairs separated by commas"
-METADATA_EXAMPLE = "region=eu, tier=gold"
-
-
-def first_malformed_metadata_piece(value: str) -> Optional[str]:
-    """The first comma-separated piece that is not one non-empty name, '=' and a value.
-
-    An empty string has no malformed piece on purpose: the platform keeps an
-    organization's stored metadata on a blank value and clears every key of a source.
-    """
-    if value == "":
-        return None
-    for piece in value.split(","):
-        name, separator, rest = piece.strip().partition("=")
-        if not separator or not name.strip() or "=" in rest:
-            return piece.strip()
-    return None
-
-
-def describe_metadata_piece(piece: str) -> str:
-    """Name a malformed piece in a refusal; an empty one is described, never quoted as ''."""
-    return f"'{piece}'" if piece else "an empty piece next to a comma"
-
-
-def is_name_value_list(value: str) -> bool:
-    """True when every comma-separated piece is exactly one non-empty name, '=' and a value."""
-    return first_malformed_metadata_piece(value) is None
-
 
 class UpdateConfig:
     """Configuration for partial update operations for a specific resource type."""
@@ -186,6 +158,7 @@ class UpdateConfig:
         merged_data_check: Optional[MergedDataCheck] = None,
         accepts_metadata: bool = False,
         kept_when_absent: Optional[List[str]] = None,
+        written_through_aliases: Optional[List[str]] = None,
     ):
         """Initialize update configuration.
 
@@ -211,6 +184,10 @@ class UpdateConfig:
                 resource; when False, caller metadata is refused instead of ignored
             kept_when_absent: Fields the platform keeps as stored when the body
                 omits them; they are sent only when the caller sends them
+            written_through_aliases: Read fields the platform changes only through a
+                request-only field (``credentials`` through ``credentialIds``); their
+                value in each write answer is remembered, so a lagging read is not
+                sent back over it
         """
         self.resource_type = resource_type
         self.get_method = get_method
@@ -225,6 +202,7 @@ class UpdateConfig:
         self.merged_data_check = merged_data_check
         self.accepts_metadata = accepts_metadata
         self.kept_when_absent = kept_when_absent or []
+        self.written_through_aliases = written_through_aliases or []
 
 
 @dataclass(frozen=True)
@@ -302,7 +280,11 @@ class PartialUpdateHandler:
                 self._recent_writes.remember(
                     scope,
                     record,
-                    {**plan.sent_values(), **stored_values(unapplied, result)},
+                    {
+                        **plan.sent_values(),
+                        **stored_values(unapplied, result),
+                        **self._aliased_fields_in_answer(config, result),
+                    },
                     read_before=plan.stored_before,
                 )
                 unapplied_after_read_back, read_back = await self._unapplied_in_read_back(
@@ -421,6 +403,17 @@ class PartialUpdateHandler:
                 ],
             )
         return current_data
+
+    @staticmethod
+    def _aliased_fields_in_answer(config: UpdateConfig, answer: Any) -> Dict[str, Any]:
+        """The fields written through a request-only alias, as the write answer shows them."""
+        if not isinstance(answer, Mapping):
+            return {}
+        return {
+            field: answer[field]
+            for field in config.written_through_aliases
+            if field in answer
+        }
 
     def _unapplied_in_answer(self, plan: _UpdatePlan, answer: Any) -> Dict[str, str]:
         """The caller's fields the write answer shows with other values."""
@@ -621,31 +614,7 @@ class PartialUpdateHandler:
                 value=partial_data[METADATA_FIELD],
                 suggestions=[f"Remove 'metadata' from the {config.resource_type} update"],
             )
-        value = partial_data[METADATA_FIELD]
-        if value is None:
-            return
-        malformed_piece = (
-            first_malformed_metadata_piece(value) if isinstance(value, str) else None
-        )
-        if not isinstance(value, str) or malformed_piece is not None:
-            message = (
-                f"Metadata must be a string of {METADATA_FORMAT}; the platform "
-                "drops any other value without an error"
-            )
-            if malformed_piece is not None:
-                message += (
-                    f". The piece {describe_metadata_piece(malformed_piece)} is not one "
-                    "name=value pair: the platform would answer success but drop it, "
-                    "because a comma always ends a value and a value cannot hold a "
-                    "second '='"
-                )
-            raise create_structured_validation_error(
-                message=message,
-                field=METADATA_FIELD,
-                value=value,
-                suggestions=[f"Send metadata as a string such as '{METADATA_EXAMPLE}'"],
-                examples={METADATA_FIELD: METADATA_EXAMPLE},
-            )
+        refuse_malformed_metadata(partial_data[METADATA_FIELD])
 
     def _prepare_final_payload(
         self,

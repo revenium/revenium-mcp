@@ -2,7 +2,7 @@
 
 Get monthly customer cost breakdown from Revenium.
 
-Use the business_analytics_management tool with these parameters:
+Use the get_business_analytics tool with these parameters:
 - action: "get_customer_costs"
 - period: "THIRTY_DAYS"
 - group: "TOTAL"

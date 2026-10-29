@@ -78,7 +78,7 @@ class _SubscriptionSearchTooBroadError(_IncompleteSubscriptionsError):
             f"found by searching for the product name '{search_term}', and that "
             f"search matches more than {limit} subscriptions. This lookup reads at "
             f"most {limit}, so it gives no answer rather than part of one. Read them "
-            f"page by page with manage_subscriptions(action=\"search_subscriptions\", "
+            f"page by page with get_subscriptions(action=\"search_subscriptions\", "
             f"product_name=\"{search_term}\", page=0) and keep the ones whose "
             f"product id matches.",
             {"search_term": search_term, "search_limit": limit},
@@ -114,7 +114,7 @@ def incomplete_lookup_suggestions(result: NavigationResult) -> List[str]:
         return list(RETRY_INCOMPLETE_LOOKUP_SUGGESTIONS)
     search_term = result.metadata.get("search_term", "")
     return [
-        f'Page through manage_subscriptions(action="search_subscriptions", '
+        f'Page through get_subscriptions(action="search_subscriptions", '
         f'product_name="{search_term}", page=0) and keep the subscriptions whose '
         "product id matches",
         "Retrying gives the same answer: the subscription search matches more "

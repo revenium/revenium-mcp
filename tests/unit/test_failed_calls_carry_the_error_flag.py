@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from fastmcp import FastMCP
 
+from src.revenium_mcp_server.common.tool_surface import domain_for, public_tool_for
 from src.revenium_mcp_server.capability_manager.core import UnifiedCapabilityManager
 from src.revenium_mcp_server.capability_manager.integration_service import (
     ucm_integration_service,
@@ -100,7 +101,7 @@ class TestCallerMessage:
             field="action",
             value="x",
             suggestions=["Use get_capabilities()"],
-            examples={"valid_actions": ACTIONS, "usage": "system_setup(action='list')"},
+            examples={"valid_actions": ACTIONS, "usage": "get_system_setup(action='list')"},
         )
         raised = ToolError(
             message=format_structured_error(built),
@@ -166,9 +167,10 @@ async def _call(monkeypatch, tmp_path, tool, arguments):
     registry = ToolConfigurationRegistry(
         tool_config=ToolConfig.create_for_testing(profile="business")
     )
-    await registry._register_single_tool(mcp, tool)
+    await registry._register_domain(mcp, domain_for(tool))
     middleware = CallerContextMiddleware()
     mcp.add_middleware(middleware)
+    tool = public_tool_for(tool, arguments.get("action", "get_capabilities"))
     result = await RegisteredTools(mcp, middleware).call(tool, arguments)
     return result, answer_text(result)
 
@@ -228,7 +230,7 @@ class TestFiveFailuresCarryTheErrorFlag:
         result, text = await _call(
             monkeypatch,
             tmp_path,
-            "manage_capabilities",
+            "get_capabilities",
             {"action": "get_capabilities", "resource_type": "bogus_type"},
         )
 
@@ -241,11 +243,11 @@ class TestFiveFailuresCarryTheErrorFlag:
         self, monkeypatch, tmp_path
     ):
         result, text = await _call(
-            monkeypatch, tmp_path, "system_setup", {"action": "bogus_action"}
+            monkeypatch, tmp_path, "manage_system_setup", {"action": "bogus_action"}
         )
 
         assert result.is_error is True, text
-        assert "Unknown system setup action: bogus_action" in text
+        assert "Unknown action 'bogus_action'" in text
 
     async def test_search_ai_models_without_query_is_an_error_with_its_usage_example(
         self, monkeypatch, tmp_path

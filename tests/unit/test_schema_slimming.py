@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.tool_configuration.config import ToolConfig
 from src.revenium_mcp_server.tool_configuration.registry import ToolConfigurationRegistry
 from src.revenium_mcp_server.tool_configuration.schema_slimming import (
@@ -349,7 +350,9 @@ class TestSlimToolSchema:
 
 class TestSlimToolDescription:
     def test_heavy_tool_descriptions_point_at_get_capabilities(self):
-        assert DESCRIPTION_SUFFIX in slim_tool_description("manage_metering", "Meter things.")
+        assert DESCRIPTION_SUFFIX.format(read_tool="get_metering") in slim_tool_description(
+            "manage_metering", "Meter things."
+        )
 
     def test_other_tool_descriptions_are_untouched(self):
         assert slim_tool_description("manage_products", "Products.") == "Products."
@@ -369,28 +372,32 @@ class TestSlimToolDescription:
 
 class TestMergeParamsArgument:
     def test_params_fills_in_unset_arguments(self):
-        assert merge_params_argument({"action": "x", "page_size": None}, {"page_size": 2}) == {
-            "action": "x",
-            "page_size": 2,
-        }
+        assert merge_params_argument(
+            {"action": "x", "page_size": None}, {"page_size": 2}, "manage_metering"
+        ) == {"action": "x", "page_size": 2}
 
     def test_named_arguments_win(self):
-        assert merge_params_argument({"page_size": 5}, {"page_size": 2})["page_size"] == 5
+        merged = merge_params_argument({"page_size": 5}, {"page_size": 2}, "manage_metering")
+        assert merged["page_size"] == 5
 
     def test_action_never_comes_from_params(self):
-        assert merge_params_argument({"action": "list"}, {"action": "delete"})["action"] == "list"
+        merged = merge_params_argument({"action": "list"}, {"action": "delete"}, "manage_metering")
+        assert merged["action"] == "list"
 
-    def test_nested_params_key_is_ignored(self):
-        assert PARAMS_PROPERTY not in merge_params_argument({}, {PARAMS_PROPERTY: {"a": 1}})
+    def test_nested_params_key_is_refused_rather_than_dropped(self):
+        with pytest.raises(ToolError, match=f"'{PARAMS_PROPERTY}' inside params"):
+            merge_params_argument({"action": "x"}, {PARAMS_PROPERTY: {"a": 1}}, "manage_metering")
 
-    def test_unknown_names_are_passed_through_for_the_tool_to_reject(self):
-        assert merge_params_argument({}, {"nonsense": 1}) == {"nonsense": 1}
+    def test_undeclared_names_are_refused(self):
+        with pytest.raises(ToolError, match="'nonsense' inside params"):
+            merge_params_argument({"action": "x"}, {"nonsense": 1}, "manage_metering")
 
     def test_missing_params_is_a_no_op(self):
-        assert merge_params_argument({"a": 1}, None) == {"a": 1}
+        assert merge_params_argument({"a": 1}, None, "manage_metering") == {"a": 1}
 
     def test_non_object_params_is_ignored(self):
-        assert merge_params_argument({"a": 1}, "not-an-object") == {"a": 1}  # type: ignore[arg-type]
+        merged = merge_params_argument({"a": 1}, "not-an-object", "manage_metering")
+        assert merged == {"a": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +430,7 @@ class TestApplySchemaSlimming:
         await apply_schema_slimming(mcp, ["manage_metering"])
 
         assert PARAMS_PROPERTY in tool.parameters["properties"]
-        assert DESCRIPTION_SUFFIX in tool.description
+        assert DESCRIPTION_SUFFIX.format(read_tool="get_metering") in tool.description
 
     async def test_a_missing_tool_does_not_abort_the_pass(self):
         tool = _FakeTool(_sample_schema(), "Products.")
@@ -442,10 +449,12 @@ class TestApplySchemaSlimming:
 
 async def _closure_for(method_name: str):
     """Register one tool against a mock FastMCP and return the handler closure."""
-    registry = ToolConfigurationRegistry(tool_config=ToolConfig.create_for_testing())
+    registry = ToolConfigurationRegistry(
+        tool_config=ToolConfig.create_for_testing(profile="business")
+    )
     mcp = MagicMock()
     await getattr(registry, method_name)(mcp)
-    return mcp.tool.return_value.call_args[0][0]
+    return mcp.tool.call_args_list[0][0][0].__wrapped__
 
 
 async def _arguments_from(closure, **kwargs):

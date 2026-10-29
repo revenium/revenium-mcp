@@ -8,7 +8,7 @@ a `did you mean` suggestion when the field is unrecognized.
 """
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -98,7 +98,7 @@ class TestTranslatePydanticError:
             return None
 
         exc = _validation_error(callable_str_only, {"name": 12345})
-        msg = translate_pydantic_error(exc, tool_name="slack_management", accepted_params=["name"])
+        msg = translate_pydantic_error(exc, tool_name="manage_slack", accepted_params=["name"])
 
         assert "'name'" in msg
         assert "string" in msg.lower()
@@ -511,4 +511,39 @@ class TestUnionFieldMessages:
         assert msg.count("'input_tokens'") == 1, f"stacked messages: {msg!r}"
         assert "integer" in msg
         assert "3.7" in msg
+        assert_no_framework_leak(msg)
+
+
+class TestListFieldMessages:
+    """BACK-5094: a list argument sent as another type names the list shape."""
+
+    def test_list_or_string_field_names_the_list_shape_once(self):
+        from src.revenium_mcp_server.middleware.framework_leak_guard import (
+            translate_pydantic_error,
+        )
+
+        def _lookup_tool(transaction_ids: Optional[Union[List[str], str]] = None):
+            return None
+
+        exc = _validation_error(_lookup_tool, {"transaction_ids": 123})
+        msg = translate_pydantic_error(
+            exc, tool_name="get_metering", accepted_params=["transaction_ids"]
+        )
+
+        assert msg.count("'transaction_ids'") == 1, f"stacked messages: {msg!r}"
+        assert "Field 'transaction_ids' must be a list, got int (123)" in msg
+        assert_no_framework_leak(msg)
+
+    def test_list_field_names_the_list_shape(self):
+        from src.revenium_mcp_server.middleware.framework_leak_guard import (
+            translate_pydantic_error,
+        )
+
+        def _list_tool(providers: Optional[List[str]] = None):
+            return None
+
+        exc = _validation_error(_list_tool, {"providers": {"name": "openai"}})
+        msg = translate_pydantic_error(exc, tool_name="get_alerts", accepted_params=["providers"])
+
+        assert "Field 'providers' must be a list, got dict" in msg
         assert_no_framework_leak(msg)

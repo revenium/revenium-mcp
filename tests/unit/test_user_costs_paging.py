@@ -168,19 +168,19 @@ class TestValidation:
 class TestThinDefaults:
     def test_get_user_costs_defaults_to_a_page_of_one_hundred(self):
         arguments = apply_thin_tool_defaults(
-            "business_analytics_management", {"action": "get_user_costs"}
+            "get_business_analytics", {"action": "get_user_costs"}
         )
         assert arguments["size"] == 100
         assert arguments["page"] == 0
 
     def test_other_actions_keep_the_tool_default(self):
         arguments = apply_thin_tool_defaults(
-            "business_analytics_management", {"action": "get_department_costs"}
+            "get_business_analytics", {"action": "get_department_costs"}
         )
         assert arguments["size"] == 20
 
     def test_a_size_the_caller_sent_is_kept(self):
         arguments = apply_thin_tool_defaults(
-            "business_analytics_management", {"action": "get_user_costs", "size": 30}
+            "get_business_analytics", {"action": "get_user_costs", "size": 30}
         )
         assert arguments["size"] == 30

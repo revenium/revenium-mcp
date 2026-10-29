@@ -778,6 +778,11 @@ class TestSubscriptionManagerUpdate:
         spec_path = (
             Path(__file__).resolve().parents[2] / "specs" / "openapi" / "hypercurrent.json"
         )
+        if not spec_path.exists():
+            pytest.skip(
+                "specs/openapi/ is internal-only and not part of the public export "
+                "(see public-allowlist-mcp.txt); the spec check runs in the internal repo"
+            )
         spec = json.loads(spec_path.read_text(encoding="utf-8"))
         properties = spec["components"]["schemas"]["SubscriptionResource_Write"]["properties"]
         writable = {name for name, prop in properties.items() if not prop.get("readOnly")}
@@ -1253,31 +1258,46 @@ class TestSubscriptionsPaginationSafeInteger:
 
 
 class TestSubscriptionDryRunProductParity:
-    """dry_run must reject a nonexistent product_id like live create does —
-    it previously previewed 'ready to create' for a product the backend
-    rejects with 'Couldn't decode'."""
+    """dry_run must reject a nonexistent product_id like live create does, on
+    both create modes. BACK-2249 fixed only auto_generate=False; BACK-5092
+    found the default auto_generate=True preview still approving a product
+    the backend rejects with 'Couldn't decode'."""
+
+    @staticmethod
+    def _missing_product(product_id):
+        """The 400 the platform answers for an id it cannot decode."""
+        return ReveniumAPIError(
+            "Invalid Product ID",
+            status_code=400,
+            response_data={"error_data": f"Failed to decode hashed id: {product_id}"},
+        )
+
+    @staticmethod
+    async def _preview(sub_mgmt, sub_manager, product_id, auto_generate):
+        return await sub_mgmt._handle_crud_actions(
+            "create",
+            {
+                "subscription_data": {
+                    "name": "probe",
+                    "product_id": product_id,
+                    "clientEmailAddress": "a@b.io",
+                },
+                "auto_generate": auto_generate,
+                "dry_run": True,
+            },
+            sub_manager,
+        )
 
     @pytest.mark.asyncio
-    async def test_dry_run_rejects_nonexistent_product(self, sub_mgmt, sub_manager, mock_client):
-        from src.revenium_mcp_server.client import ReveniumAPIError
-
+    @pytest.mark.parametrize("auto_generate", [True, False])
+    async def test_dry_run_rejects_nonexistent_product(
+        self, sub_mgmt, sub_manager, mock_client, auto_generate
+    ):
         mock_client.get_product_by_id = AsyncMock(
-            side_effect=ReveniumAPIError("Couldn't decode: NONEXISTENT_PROD", status_code=400)
+            side_effect=self._missing_product("NONEXISTENT_PROD")
         )
         with pytest.raises(ToolError) as exc:
-            await sub_mgmt._handle_crud_actions(
-                "create",
-                {
-                    "subscription_data": {
-                        "name": "probe",
-                        "product_id": "NONEXISTENT_PROD",
-                        "clientEmailAddress": "a@b.io",
-                    },
-                    "auto_generate": False,
-                    "dry_run": True,
-                },
-                sub_manager,
-            )
+            await self._preview(sub_mgmt, sub_manager, "NONEXISTENT_PROD", auto_generate)
         assert exc.value.field == "product_id"
         assert exc.value.value == "NONEXISTENT_PROD"
         assert exc.value.error_code == ErrorCodes.VALIDATION_ERROR
@@ -1287,42 +1307,70 @@ class TestSubscriptionDryRunProductParity:
         mock_client.get_product_by_id.assert_awaited_once_with("NONEXISTENT_PROD")
 
     @pytest.mark.asyncio
-    async def test_dry_run_accepts_existing_product(self, sub_mgmt, sub_manager, mock_client):
-        mock_client.get_product_by_id = AsyncMock(return_value={"id": "prod_ok", "name": "P"})
-        result = await sub_mgmt._handle_crud_actions(
-            "create",
-            {
-                "subscription_data": {
-                    "name": "probe",
-                    "product_id": "prod_ok",
-                    "clientEmailAddress": "a@b.io",
-                },
-                "auto_generate": False,
-                "dry_run": True,
-            },
-            sub_manager,
-        )
-        assert "Dry Run Preview" in result[0].text
+    async def test_both_modes_refuse_a_nonexistent_product_with_the_same_text(
+        self, sub_mgmt, sub_manager, mock_client
+    ):
+        mock_client.get_product_by_id = AsyncMock(side_effect=self._missing_product("ZZZZZZZ"))
+        messages = []
+        for auto_generate in (True, False):
+            with pytest.raises(ToolError) as exc:
+                await self._preview(sub_mgmt, sub_manager, "ZZZZZZZ", auto_generate)
+            messages.append(exc.value.message)
+        assert messages[0] == messages[1]
 
     @pytest.mark.asyncio
-    async def test_dry_run_lets_unexpected_errors_propagate(self, sub_mgmt, sub_manager, mock_client):
-        """Only API rejections become the dry-run validation message —
+    @pytest.mark.parametrize("auto_generate", [True, False])
+    async def test_dry_run_accepts_existing_product(
+        self, sub_mgmt, sub_manager, mock_client, auto_generate
+    ):
+        mock_client.get_product_by_id = AsyncMock(return_value={"id": "prod_ok", "name": "P"})
+        result = await self._preview(sub_mgmt, sub_manager, "prod_ok", auto_generate)
+        assert "Dry Run Preview" in result[0].text
+        mock_client.get_product_by_id.assert_awaited_once_with("prod_ok")
+        mock_client.create_subscription.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auto_generate", [True, False])
+    async def test_dry_run_refuses_a_product_the_platform_answers_404_for(
+        self, sub_mgmt, sub_manager, mock_client, auto_generate
+    ):
+        mock_client.get_product_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("Product not found", status_code=404)
+        )
+        with pytest.raises(ToolError) as exc:
+            await self._preview(sub_mgmt, sub_manager, "gone", auto_generate)
+        assert exc.value.field == "product_id"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auto_generate", [True, False])
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            ReveniumAPIError("Request failed: GET /products timed out"),
+            ReveniumAPIError("The platform asked to wait 30 seconds", status_code=429),
+            ReveniumAPIError("HTTP 500: upstream", status_code=500),
+        ],
+        ids=["transport", "lockout", "server-error"],
+    )
+    async def test_a_failed_product_read_is_not_reported_as_a_missing_product(
+        self, sub_mgmt, sub_manager, mock_client, auto_generate, failure
+    ):
+        mock_client.get_product_by_id = AsyncMock(side_effect=failure)
+        with pytest.raises(ReveniumAPIError) as exc:
+            await self._preview(sub_mgmt, sub_manager, "prod_ok", auto_generate)
+        assert exc.value is failure
+        mock_client.create_subscription.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auto_generate", [True, False])
+    async def test_dry_run_lets_unexpected_errors_propagate(
+        self, sub_mgmt, sub_manager, mock_client, auto_generate
+    ):
+        """Only API rejections become the dry-run validation message;
         transport/programming errors must not be echoed into user text."""
         mock_client.get_product_by_id = AsyncMock(side_effect=RuntimeError("socket exploded"))
         with pytest.raises(RuntimeError):
-            await sub_mgmt._handle_crud_actions(
-                "create",
-                {
-                    "subscription_data": {
-                        "name": "probe",
-                        "product_id": "prod_x",
-                        "clientEmailAddress": "a@b.io",
-                    },
-                    "auto_generate": False,
-                    "dry_run": True,
-                },
-                sub_manager,
-            )
+            await self._preview(sub_mgmt, sub_manager, "prod_x", auto_generate)
 
     @pytest.mark.asyncio
     async def test_expert_preview_refuses_a_malformed_invoice_address(
@@ -1989,3 +2037,300 @@ class TestSubscriptionCreateTeamAndBodyShape:
         )
 
         assert body["teamId"] == "team_sub"
+
+
+# ===========================================================================
+# BACK-5092 - a create preview is built from the same checks as the live create
+# ===========================================================================
+
+# The audit's "Example 1" payload: name, product and invoice address plus the
+# fields the platform drops on create.
+_UNSTORED_CREATE_FIELDS = {
+    "billing_address": {"street": "123 Business St", "city": "San Francisco", "country": "US"},
+    "description": "Monthly subscription",
+    "metadata": {"customer_tier": "premium"},
+    "payment_method": {"type": "card", "details": {"last_four": "4242"}},
+}
+_UNSTORED_NOTE = "Not stored by the platform: billing_address, description, metadata, payment_method."
+
+
+def _create_arguments(auto_generate, dry_run, **extra_fields):
+    return {
+        "subscription_data": {
+            "name": "mcp-test-sub-ex1",
+            "product_id": "jM7Bz8P",
+            "clientEmailAddress": "mcp-test@example.com",
+            **extra_fields,
+        },
+        "auto_generate": auto_generate,
+        "dry_run": dry_run,
+    }
+
+
+def _previewed_payload(text):
+    return json.loads(text.split("```json\n", 1)[1].split("\n```", 1)[0])
+
+
+def _stored_create_fields():
+    from src.revenium_mcp_server.common.subscription_create_fields import (
+        SUBSCRIPTION_CREATE_UNAPPLIED_DATES,
+    )
+    from src.revenium_mcp_server.tools_decomposed.subscription_management import (
+        _CREATE_ONLY_KEYS,
+        _SUBSCRIPTION_WRITE_FIELDS,
+    )
+
+    return (_SUBSCRIPTION_WRITE_FIELDS | _CREATE_ONLY_KEYS) - set(
+        SUBSCRIPTION_CREATE_UNAPPLIED_DATES
+    )
+
+
+class TestCreatePreviewNamesUnstoredFields:
+    """A preview echoed billing_address, payment_method, metadata and
+    description as if stored; the live create named them as dropped."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auto_generate", [True, False])
+    async def test_preview_names_every_field_the_platform_will_not_store(
+        self, sub_mgmt, sub_manager, auto_generate
+    ):
+        arguments = _create_arguments(auto_generate, True, **_UNSTORED_CREATE_FIELDS)
+
+        result = await sub_mgmt._handle_crud_actions("create", arguments, sub_manager)
+
+        assert _UNSTORED_NOTE in result[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auto_generate", [True, False])
+    async def test_preview_payload_holds_only_fields_the_platform_stores(
+        self, sub_mgmt, sub_manager, auto_generate
+    ):
+        arguments = _create_arguments(auto_generate, True, **_UNSTORED_CREATE_FIELDS)
+
+        result = await sub_mgmt._handle_crud_actions("create", arguments, sub_manager)
+
+        assert set(_previewed_payload(result[0].text)) == {
+            "name",
+            "product_id",
+            "clientEmailAddress",
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auto_generate", [True, False])
+    async def test_preview_and_live_create_name_the_same_unstored_fields(
+        self, sub_mgmt, sub_manager, mock_client, auto_generate
+    ):
+        mock_client.create_subscription = AsyncMock(return_value={"id": "jM7wn6j"})
+        arguments = _create_arguments(auto_generate, True, **_UNSTORED_CREATE_FIELDS)
+
+        preview = await sub_mgmt._handle_crud_actions("create", arguments, sub_manager)
+        live = await sub_mgmt._handle_crud_actions(
+            "create", {**arguments, "dry_run": False}, sub_manager
+        )
+
+        assert _UNSTORED_NOTE in preview[0].text
+        assert _UNSTORED_NOTE in live[0].text
+
+
+class TestCreateRefusesAStartThePlatformSetsItself:
+    """The platform starts a subscription when it is created: a live create
+    with a future start_date or start, or a trialEnd, came back starting at
+    the create time with no trial end, so billing began on the wrong day."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dry_run", [True, False])
+    @pytest.mark.parametrize("auto_generate", [True, False])
+    @pytest.mark.parametrize("field", ["start_date", "start", "trialEnd", "trial_end_date"])
+    async def test_create_refuses_a_requested_start_or_trial_end(
+        self, sub_mgmt, sub_manager, mock_client, field, auto_generate, dry_run
+    ):
+        requested = {field: "2027-01-01T00:00:00Z"}
+        arguments = _create_arguments(auto_generate, dry_run, **requested)
+
+        with pytest.raises(ToolError) as exc:
+            await sub_mgmt._handle_crud_actions("create", arguments, sub_manager)
+
+        assert exc.value.field == field
+        assert exc.value.value == "2027-01-01T00:00:00Z"
+        assert "2027-01-01T00:00:00Z" in exc.value.message
+        assert "Dry Run Preview" not in exc.value.message
+        mock_client.create_subscription.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_null_start_is_not_a_request(self, sub_mgmt, sub_manager, mock_client):
+        result = await sub_mgmt._handle_crud_actions(
+            "create", _create_arguments(True, True, start=None), sub_manager
+        )
+
+        assert "Dry Run Preview" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_validate_refuses_a_requested_start(self, sub_mgmt, mock_client):
+        with patch.object(
+            SubscriptionManagement, "get_client", AsyncMock(return_value=mock_client)
+        ):
+            with pytest.raises(ToolError) as exc:
+                await sub_mgmt.handle_action(
+                    "validate",
+                    _create_arguments(True, True, start_date="2027-01-01T00:00:00Z"),
+                )
+
+        assert exc.value.field == "start_date"
+
+    @pytest.mark.asyncio
+    async def test_create_with_credentials_refuses_a_requested_start(self, mock_client):
+        manager = SubscriptionHierarchyManager(mock_client)
+
+        with pytest.raises(ToolError) as exc:
+            await manager.create_with_credentials(
+                {
+                    "subscription_data": {
+                        "name": "probe",
+                        "product_id": "prod_ok",
+                        "clientEmailAddress": "a@b.io",
+                        "start_date": "2027-01-01T00:00:00Z",
+                    },
+                    "credentials_data": {"label": "k", "externalId": "x", "externalSecret": "y"},
+                }
+            )
+
+        assert exc.value.field == "start_date"
+        mock_client.create_subscription.assert_not_awaited()
+
+
+class TestAdvertisedCreateFieldsAreStored:
+    """get_capabilities listed start_date, billing_address, payment_method and
+    metadata as optional create fields and every template carried them."""
+
+    def test_schema_discovery_capabilities_list_only_stored_fields(self):
+        from src.revenium_mcp_server.schema_discovery import SubscriptionSchemaDiscovery
+
+        schema = SubscriptionSchemaDiscovery().get_subscription_capabilities()["schema"]
+        fields = schema["subscription_data"]
+        advertised = set(fields["required"]) | set(fields["optional"])
+        assert advertised <= _stored_create_fields()
+
+    def test_every_schema_discovery_template_carries_only_stored_fields(self):
+        from src.revenium_mcp_server.schema_discovery import SubscriptionSchemaDiscovery
+
+        examples = SubscriptionSchemaDiscovery().get_subscription_examples()["examples"]
+        assert examples
+        for example in examples:
+            template_fields = set(example["template"])
+            assert template_fields <= _stored_create_fields(), example["example_type"]
+
+    def test_every_fallback_template_carries_only_stored_fields(self):
+        from src.revenium_mcp_server.tools_decomposed.subscription_management import (
+            SubscriptionValidator,
+        )
+
+        validator = SubscriptionValidator()
+        validator.schema_discovery = None
+        examples = validator.get_examples()["examples"]
+        assert examples
+        for example in examples:
+            template_fields = set(example["template"])
+            assert template_fields <= _stored_create_fields(), example["example_type"]
+
+    @pytest.mark.asyncio
+    async def test_ucm_capabilities_list_only_stored_fields(self):
+        from src.revenium_mcp_server.capability_manager.discovery import CapabilityDiscovery
+
+        discovery = CapabilityDiscovery(MagicMock())
+        for helper in (
+            "_discover_subscription_types_from_api",
+            "_discover_currencies_from_api",
+        ):
+            setattr(discovery, helper, AsyncMock(return_value=[]))
+
+        capabilities = await discovery._discover_subscription_capabilities()
+
+        fields = capabilities["schema"]["subscription_data"]
+        advertised = set(fields["required"]) | set(fields["optional"])
+        assert advertised <= _stored_create_fields()
+
+    @pytest.mark.asyncio
+    async def test_capabilities_text_lists_only_stored_optional_fields(self, sub_mgmt):
+        text = await sub_mgmt._build_enhanced_capabilities_text(None)
+
+        section = text.split("## **Optional Fields**", 1)[1].split("\n## ", 1)[0]
+        listed = {line.split("`")[1] for line in section.splitlines() if line.startswith("- `")}
+        assert listed
+        assert listed <= _stored_create_fields()
+
+    @pytest.mark.asyncio
+    async def test_capabilities_text_requires_the_shared_required_fields(self, sub_mgmt):
+        from src.revenium_mcp_server.common.subscription_create_fields import (
+            REQUIRED_SUBSCRIPTION_CREATE_FIELDS,
+        )
+
+        text = await sub_mgmt._build_enhanced_capabilities_text(None)
+
+        section = text.split("## **Required Fields**", 1)[1].split("\n## ", 1)[0]
+        listed = [line.split("`")[1] for line in section.splitlines() if line.startswith("- `")]
+        assert listed == list(REQUIRED_SUBSCRIPTION_CREATE_FIELDS)
+
+    @pytest.mark.asyncio
+    async def test_capabilities_text_names_every_refused_date(self, sub_mgmt):
+        from src.revenium_mcp_server.common.subscription_create_fields import (
+            SUBSCRIPTION_CREATE_UNAPPLIED_DATES,
+        )
+
+        text = await sub_mgmt._build_enhanced_capabilities_text(None)
+
+        rules = text.split("## **Business Rules**", 1)[1].split("\n## ", 1)[0]
+        for field in SUBSCRIPTION_CREATE_UNAPPLIED_DATES:
+            assert f"`{field}`" in rules
+
+    def test_no_field_is_both_offered_and_named_as_unstored(self):
+        from src.revenium_mcp_server.common.subscription_create_fields import (
+            OPTIONAL_SUBSCRIPTION_CREATE_FIELDS,
+            REQUIRED_SUBSCRIPTION_CREATE_FIELDS,
+            SUBSCRIPTION_CREATE_UNAPPLIED_DATES,
+            SUBSCRIPTION_CREATE_UNSTORED_FIELDS,
+        )
+
+        offered = set(REQUIRED_SUBSCRIPTION_CREATE_FIELDS) | set(
+            OPTIONAL_SUBSCRIPTION_CREATE_FIELDS
+        )
+        assert not offered & set(SUBSCRIPTION_CREATE_UNSTORED_FIELDS)
+        assert not offered & set(SUBSCRIPTION_CREATE_UNAPPLIED_DATES)
+
+    @pytest.mark.asyncio
+    async def test_every_surface_states_the_shared_create_rules(self, sub_mgmt):
+        from src.revenium_mcp_server.capability_manager.discovery import CapabilityDiscovery
+        from src.revenium_mcp_server.common.subscription_create_fields import (
+            SUBSCRIPTION_CREATE_RULES,
+            UNAPPLIED_DATES_RULE,
+            UNSTORED_FIELDS_RULE,
+        )
+        from src.revenium_mcp_server.json_schema_validator import JSONSchemaValidator
+        from src.revenium_mcp_server.schema_discovery import SubscriptionSchemaDiscovery
+
+        discovery = CapabilityDiscovery(MagicMock())
+        for helper in (
+            "_discover_subscription_types_from_api",
+            "_discover_currencies_from_api",
+        ):
+            setattr(discovery, helper, AsyncMock(return_value=[]))
+        ucm_rules = (await discovery._discover_subscription_capabilities())["business_rules"]
+        schema = SubscriptionSchemaDiscovery()
+        text = await sub_mgmt._build_enhanced_capabilities_text(None)
+        description = JSONSchemaValidator()._build_subscriptions_schema()["properties"][
+            "subscription_data"
+        ]["description"]
+
+        for rule in SUBSCRIPTION_CREATE_RULES:
+            assert rule in ucm_rules
+            assert rule in schema.get_subscription_capabilities()["business_rules"]
+            assert rule in schema.validation_rules["subscriptions"]["business_rules"]
+            assert f"- {rule}\n" in text
+        assert UNAPPLIED_DATES_RULE in description
+        assert UNSTORED_FIELDS_RULE in description
+
+    def test_json_schema_subscription_data_names_only_stored_fields(self):
+        from src.revenium_mcp_server.json_schema_validator import JSONSchemaValidator
+
+        schema = JSONSchemaValidator()._build_subscriptions_schema()
+        properties = schema["properties"]["subscription_data"]["properties"]
+        assert set(properties) <= _stored_create_fields()

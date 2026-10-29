@@ -246,7 +246,7 @@ async def test_downstream_call_forwards_bearer_jwt(mcp_http_server, mint_jwt, fa
     )
     token = mint_jwt()
     await _call_tool_action(
-        mcp_http_server["base_url"], token, tool="manage_products", action="list"
+        mcp_http_server["base_url"], token, tool="get_products", action="list"
     )
     assert fake_downstream.log, "no downstream request was made"
     req, _ = fake_downstream.log[0]

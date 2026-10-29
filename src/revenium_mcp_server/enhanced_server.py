@@ -24,6 +24,7 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 # Import cacheable-list hint values (SEP-2549) declared on the FastMCP constructor
+from .common.tool_surface import TOOL_DOMAINS, ToolDomain
 from .constants import MCP_CACHE_HINT_SCOPE, MCP_CACHE_HINT_TTL_SECONDS
 
 # Import crash handling
@@ -55,6 +56,8 @@ from .transport_mode import (
     validate_mode_combination,
 )
 from .health_endpoints import register_health_endpoints
+from .http_transport import build_http_middleware, build_uvicorn_config
+from .server_identity import load_server_identity
 
 
 def _check_app_base_url_drift() -> Optional[str]:
@@ -238,6 +241,14 @@ _PERFORMANCE_PASSAGES = (
 )
 
 
+def _tool_surface_line(domain: ToolDomain) -> str:
+    names = " / ".join(f"**{name}**" for name in domain.public_names)
+    return f"- {names}: {domain.title}"
+
+
+_TOOL_SURFACE_LINES = "\n".join(_tool_surface_line(domain) for domain in TOOL_DOMAINS)
+
+
 def _instructions(with_performance: bool) -> str:
     introspection_performance, enhancement_performance, performance_monitoring = (
         _PERFORMANCE_PASSAGES if with_performance else ("",) * len(_PERFORMANCE_PASSAGES)
@@ -250,16 +261,9 @@ with advanced introspection and metadata capabilities.
 
 ## Available Tools
 
-### Core Management Tools
-- **manage_products**: Comprehensive product management operations
-- **manage_subscriptions**: Complete subscription lifecycle management
-- **manage_sources**: Source configuration and management
-- **manage_customers**: Customer lifecycle management (Users, Subscribers, Organizations, Teams)
-- **manage_alerts**: AI anomaly detection and alert management
-- **manage_workflows**: Cross-tool workflow guidance for complex operations
-- **manage_metering**: AI transaction metering and usage tracking for billing and analytics
-- **manage_metering_elements**: Comprehensive metering element definition management with CRUD operations, templates, and analytics
-- **manage_subscriber_credentials**: Subscriber credentials management with CRUD operations, field validation, and NLP support
+### Platform Tools
+Each area has a read-only tool and, when it can change data, a write tool:
+{_TOOL_SURFACE_LINES}
 
 ### Enhanced Introspection Tools
 - **tool_introspection**: Comprehensive tool metadata and dependency analysis
@@ -333,10 +337,13 @@ def create_enhanced_server(auth: Optional[Any] = None) -> FastMCP:
             f"UCM warnings {'enabled' if ucm_warnings_enabled else 'disabled'} (UCM_WARNINGS_ENABLED={ucm_warnings_enabled})"
         )
 
-    # Initialize FastMCP server with version in name
     server_version = get_package_version()
+    identity = load_server_identity()
     mcp = FastMCP(
         name=f"Revenium MCP Server v{server_version}",
+        version=server_version,
+        icons=identity.icons(),
+        website_url=identity.website_url,
         auth=auth,
         # BACK-2471: advertise `ttlMs`/`cacheScope` on cacheable list results so a
         # modern client can skip re-fetching `tools/list` on every session. FastMCP
@@ -697,15 +704,17 @@ async def main() -> None:
     if transport_mode == "http":
         host = read_http_host()
         port = read_http_port()
-        from .auth.rate_limit import build_rate_limit_middleware
+        from .middleware.allowed_origins import build_allowed_origins
 
-        asgi_middleware = build_rate_limit_middleware()
         logger.info("Starting HTTP transport on %s:%s", host, port)
         await mcp.run_async(
             transport="http",
             host=host,
             port=port,
-            middleware=asgi_middleware,
+            middleware=build_http_middleware(),
+            uvicorn_config=build_uvicorn_config(),
+            host_origin_protection="auto",
+            allowed_origins=build_allowed_origins(),
         )
     else:
         # stdio path: current behavior + API-key-warning monkey-patch.

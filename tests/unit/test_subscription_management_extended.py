@@ -1328,7 +1328,7 @@ class TestHandleCrudCreate:
         assert "auto_generate=true" not in exc.value.message
         assert "smart defaults" not in exc.value.message
         assert "asks which product to use" in exc.value.message
-        assert "manage_products(action='list')" in exc.value.message
+        assert "get_products(action='list')" in exc.value.message
         mock_client.create_subscription.assert_not_awaited()
 
     @patch.object(SubscriptionManagement, "get_client", new_callable=AsyncMock)
@@ -1611,7 +1611,7 @@ class TestMetadataProvider:
         self, mock_get_client, sub_management, mock_client
     ):
         """It wrote a subscription and then a credential with no preview and no
-        rollback; the two-step route through manage_subscriber_credentials
+        rollback; the two-step route through manage_credentials
         replaces it."""
         mock_get_client.return_value = mock_client
         actions = await sub_management._get_supported_actions()
@@ -1652,7 +1652,7 @@ class TestMetadataProvider:
             tool_config=ToolConfig.create_for_testing(profile="business")
         )
         await registry._register_manage_subscriptions(mcp)
-        closure = mcp.tool.return_value.call_args[0][0]
+        closure = mcp.tool.call_args_list[0][0][0].__wrapped__
         declared = set(inspect.signature(closure).parameters)
 
         text = (await sub_management._handle_get_capabilities())[0].text

@@ -1953,7 +1953,9 @@ class TestBuildIntegrationCapabilitiesContent:
         ]
         assert not relative, "Python example uses a relative (server-internal) import"
         assert "DEFAULT_BASE_URL" not in block
-        assert 'os.getenv("REVENIUM_BASE_URL", "https://api.revenium.ai")' in block
+        from src.revenium_mcp_server.endpoint_registry import configured_api_base_url
+
+        assert f"os.getenv(\"REVENIUM_BASE_URL\", '{configured_api_base_url()}')" in block
 
 
 # ===========================================================================

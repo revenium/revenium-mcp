@@ -3,53 +3,77 @@
 Defines the tool sets for each profile tier optimized for AI analytics and usage-based billing.
 
 Profile Structure:
-- Starter (7 tools): Essential cost monitoring and alerting
-- Business (20 tools): Complete AI analytics and usage-based billing capabilities (default)
+- Starter (12 tools): Essential cost monitoring and alerting
+- Business (37 tools): Complete AI analytics and usage-based billing capabilities (default)
 
-Note: Enterprise profile removed as it was redundant after infrastructure monitoring tools removal.
+A domain that both reads and changes data is published as a read-only tool and a
+write tool (see ``common/tool_surface.py``); a profile lists both names, and
+leaving the write name out of a custom configuration publishes the domain read-only.
 """
 
 from typing import Dict, Set
 
-# Profile tool definitions as specified in PRD section 6.2
+
 PROFILE_DEFINITIONS: Dict[str, Set[str]] = {
     "starter": {
-        "business_analytics_management",
+        "get_business_analytics",
+        "get_alerts",
         "manage_alerts",
-        "slack_management",
+        "get_slack",
+        "manage_slack",
+        "get_metering",
         "manage_metering",
-        "system_setup",
+        "get_system_setup",
+        "manage_system_setup",
         "system_diagnostics",
+        "manage_system_settings",
         "tool_introspection",
     },
     "business": {
-        # Starter tools (7)
-        "business_analytics_management",
+        # Starter tools (12)
+        "get_business_analytics",
+        "get_alerts",
         "manage_alerts",
-        "slack_management",
+        "get_slack",
+        "manage_slack",
+        "get_metering",
         "manage_metering",
-        "system_setup",
+        "get_system_setup",
+        "manage_system_setup",
         "system_diagnostics",
+        "manage_system_settings",
         "tool_introspection",
-        # Additional business tools (13)
+        # Additional business tools (25)
+        "get_sources",
         "manage_sources",
+        "get_workflows",
         "manage_workflows",
-        "manage_subscriber_credentials",
+        "get_credentials",
+        "manage_credentials",
+        "get_products",
         "manage_products",
+        "get_customers",
         "manage_customers",
+        "get_subscriptions",
         "manage_subscriptions",
-        "manage_metering_elements",
-        "manage_capabilities",
+        "get_usage_meters",
+        "manage_usage_meters",
+        "get_capabilities",
+        "get_jobs",
         "manage_jobs",
+        "get_tools",
         "manage_tools",
+        "get_agents",
         "manage_agents",
+        "get_ai_insights",
         "manage_ai_insights",
+        "get_cost_controls",
         "manage_cost_controls",
     },
 }
 
 # Profile tool counts for validation
-PROFILE_TOOL_COUNTS = {"starter": 7, "business": 20}
+PROFILE_TOOL_COUNTS = {"starter": 12, "business": 37}
 
 
 def validate_profile_definitions() -> bool:

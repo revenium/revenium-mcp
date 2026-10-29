@@ -134,7 +134,7 @@ class SlackPromptingMixin:
                     f"- Type **'later'** to set up Slack later"
                 )
                 prompt_data["recommended_action"] = "setup_slack"
-                prompt_data["fallback_action"] = "slack_management(action='quick_setup')"
+                prompt_data["fallback_action"] = "get_slack(action='quick_setup')"
 
             return prompt_data
 
@@ -275,7 +275,7 @@ class SlackPromptingMixin:
                 f"\n**To select:** Respond with the number (1-{len(configurations)}) or use:\n"
             )
             selection_message += (
-                "`slack_management(action='list_configurations')` for more details"
+                "`get_slack(action='list_configurations')` for more details"
             )
 
             return None, selection_message
@@ -360,7 +360,7 @@ class SlackPromptingMixin:
                     result_text += "Your alert will now be delivered via both email and Slack.\n\n"
                 else:
                     result_text += "⚠️ **Slack setup needed.**\n"
-                    default_action = 'slack_management(action="quick_setup")'
+                    default_action = 'get_slack(action="quick_setup")'
                     fallback_action = prompt_result.get("fallback_action", default_action)
                     result_text += f"Use: `{fallback_action}`\n\n"
             elif intent == "no":
@@ -368,7 +368,7 @@ class SlackPromptingMixin:
                 result_text += "You can add Slack later using the slack configuration tools.\n\n"
             elif intent == "choose":
                 result_text += "🔧 **Configuration selection needed.**\n"
-                result_text += "Use `slack_management(action='list_configurations')` to see options.\n\n"
+                result_text += "Use `get_slack(action='list_configurations')` to see options.\n\n"
             else:
                 result_text += "❓ **Response not understood.**\n"
                 result_text += "Please respond with 'yes', 'no', or 'choose'.\n\n"

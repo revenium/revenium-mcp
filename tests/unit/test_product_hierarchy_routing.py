@@ -854,7 +854,7 @@ class TestCreateWithSubscription:
 
         assert exc_info.value.field == "subscription_data.organizationId"
         assert any(
-            'manage_customers(action="list", resource_type="organizations")' in suggestion
+            'get_customers(action="list", resource_type="organizations")' in suggestion
             for suggestion in exc_info.value.suggestions
         )
         client.get_organizations.assert_not_awaited()
@@ -1193,10 +1193,11 @@ class TestHandleDiscoveryValidationActions:
         )
 
     @pytest.mark.asyncio
-    async def test_unhandled_validation_action_returns_error(self):
+    async def test_unhandled_validation_action_raises(self):
         mgmt = ProductManagement()
-        result = await mgmt._handle_discovery_validation_actions("unknown", {})
-        assert "error" in result[0].text
+        with pytest.raises(ToolError) as refused:
+            await mgmt._handle_discovery_validation_actions("unknown", {})
+        assert refused.value.error_code == "ACTION_NOT_SUPPORTED"
 
 
 # ===========================================================================
@@ -1287,11 +1288,12 @@ class TestHandleHierarchyActions:
         assert 'action="create"' in error.message
 
     @pytest.mark.asyncio
-    async def test_unhandled_hierarchy_action_returns_error(self):
+    async def test_unhandled_hierarchy_action_raises(self):
         mgmt = ProductManagement()
         hm = MagicMock()
-        result = await mgmt._handle_hierarchy_actions("unknown", {}, hm)
-        assert "error" in result[0].text
+        with pytest.raises(ToolError) as refused:
+            await mgmt._handle_hierarchy_actions("unknown", {}, hm)
+        assert refused.value.error_code == "ACTION_NOT_SUPPORTED"
 
 
 # ===========================================================================
@@ -1509,7 +1511,7 @@ class TestFormatCreateWithSubscriptionResponse:
 
         steps = [line for line in text.splitlines() if line.startswith("• Use")]
         assert len(steps) == len(set(steps)), steps
-        assert sum("manage_subscriber_credentials" in step for step in steps) == 1, steps
+        assert sum("manage_credentials" in step for step in steps) == 1, steps
 
 
 # ===========================================================================
@@ -1551,10 +1553,11 @@ class TestHandleFallbackActions:
         assert result[0].text == "summary"
 
     @pytest.mark.asyncio
-    async def test_unhandled_fallback_returns_error(self):
+    async def test_unhandled_fallback_raises(self):
         mgmt = ProductManagement()
-        result = await mgmt._handle_fallback_actions("unknown_agent_action")
-        assert "error" in result[0].text
+        with pytest.raises(ToolError) as refused:
+            await mgmt._handle_fallback_actions("unknown_agent_action")
+        assert refused.value.error_code == "ACTION_NOT_SUPPORTED"
 
 
 class TestHandleActionCreateWithSubscriptionAnswer:

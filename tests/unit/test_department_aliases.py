@@ -58,7 +58,7 @@ class TestArgumentAliases:
 
     def test_department_spelling_wins_over_its_alias(self):
         _, arguments = resolve_department_aliases(
-            "business_analytics_management",
+            "get_business_analytics",
             "get_pr_health",
             {"department_id": 5, "org_unit_id": 9},
         )
@@ -171,7 +171,7 @@ def _registry() -> ToolConfigurationRegistry:
 async def _closure(method_name: str):
     mcp = MagicMock()
     await getattr(_registry(), method_name)(mcp)
-    return mcp.tool.return_value.call_args[0][0]
+    return mcp.tool.call_args_list[0][0][0].__wrapped__
 
 
 class TestRegistryClosuresAcceptBothSpellings:
@@ -231,7 +231,7 @@ class TestNoOrgUnitWireNameIsSent:
 _TOOL_CLASSES = {
     "manage_customers": ("customer_management", "CustomerManagement"),
     "manage_cost_controls": ("cost_controls_management", "CostControlsManagement"),
-    "business_analytics_management": (
+    "get_business_analytics": (
         "business_analytics_management",
         "BusinessAnalyticsManagement",
     ),
@@ -270,7 +270,7 @@ class TestClientsCanSeeTheDeprecatedAliases:
                 ("list_org_units", "delete_org_unit_person", "clear_org_unit_assignment"),
             ),
             ("manage_cost_controls", ("preview_org_unit_group", "parent_org_unit_id")),
-            ("business_analytics_management", ("org_unit_id",)),
+            ("get_business_analytics", ("org_unit_id",)),
             ("manage_ai_insights", ("filter_org_unit_id",)),
         ],
     )
@@ -297,8 +297,9 @@ class TestClientsCanSeeTheDeprecatedAliases:
     @pytest.mark.parametrize(
         "tool_name,alias",
         [
-            ("manage_customers", "list_org_units -> list_departments"),
-            ("manage_cost_controls", "preview_org_unit_group -> preview_department_group"),
+            ("get_customers", "list_org_units -> list_departments"),
+            ("manage_customers", "delete_org_unit_person -> delete_department_person"),
+            ("get_cost_controls", "preview_org_unit_group -> preview_department_group"),
         ],
     )
     async def test_advertised_action_names_its_aliases(self, tool_name, alias):
@@ -310,7 +311,7 @@ class TestClientsCanSeeTheDeprecatedAliases:
     @pytest.mark.parametrize(
         "tool_name,alias",
         [
-            ("business_analytics_management", "org_unit_id"),
+            ("get_business_analytics", "org_unit_id"),
             ("manage_ai_insights", "filter_org_unit_id"),
         ],
     )

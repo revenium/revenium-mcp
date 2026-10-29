@@ -5,6 +5,9 @@ module. Covers CRUD (list, get, create, update, delete), discovery
 (list_discovered), and the introspection actions.
 """
 
+from typing import Any, Dict
+
+import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,7 +19,8 @@ from src.revenium_mcp_server.tools_decomposed.agent_management import (
     SquadManager,
     INLINE_LIST_CAP,
 )
-from src.revenium_mcp_server.client import ReveniumAPIError
+from src.revenium_mcp_server.auth import AuthConfig
+from src.revenium_mcp_server.client import ReveniumAPIError, ReveniumClient
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from mcp.types import TextContent
 from tests.unit._helpers_list_heading import LIST_HEADING_CASES, heading_and_body, rows
@@ -481,12 +485,17 @@ class TestAgentManagementActions:
         assert "telemetryKey" in result[0].text
 
     @pytest.mark.asyncio
-    async def test_unknown_action_lists_supported(self, agent_mgmt):
-        """BACK-2937: an unknown action raises so the envelope carries isError."""
+    async def test_unknown_action_is_refused_on_the_action_field(self, agent_mgmt):
+        """BACK-2937: an unknown action raises so the envelope carries isError.
+
+        The list of valid actions is added for the public tool the caller used
+        (tests/unit/test_split_tool_guidance.py), not by the class.
+        """
         with pytest.raises(ToolError) as exc_info:
             await agent_mgmt.handle_action("bogus_action", {})
-        assert "Unknown action" in exc_info.value.message
-        assert "list_discovered" in exc_info.value.message
+        assert "Unknown action 'bogus_action'" in exc_info.value.message
+        assert exc_info.value.field == "action"
+        assert exc_info.value.value == "bogus_action"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("page_info, row_count, page, heading, total", LIST_HEADING_CASES)
@@ -762,13 +771,6 @@ class TestSquadManagerGetSquad:
         assert len(result["rendered_agents"]) <= INLINE_LIST_CAP
         assert "more" in result["rendered"].lower()
 
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("status", [400, 403, 404])
-    async def test_get_squad_not_found_is_structured(self, squad_manager, mock_client, status):
-        mock_client.get_squad_detail.side_effect = ReveniumAPIError("boom", status_code=status)
-        with pytest.raises(ToolError) as exc_info:
-            await squad_manager.get_squad({"squad_id": "sq_missing"})
-        assert exc_info.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
 
     @pytest.mark.asyncio
     async def test_get_squad_500_propagates(self, squad_manager, mock_client):
@@ -830,19 +832,178 @@ class TestSquadManagerTimeline:
         overflow = result["events_overflow"]
         assert "10 more events" in overflow
 
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("status", [400, 403, 404])
-    async def test_timeline_not_found_is_structured(self, squad_manager, mock_client, status):
-        mock_client.get_squad_timeline.side_effect = ReveniumAPIError("boom", status_code=status)
-        with pytest.raises(ToolError) as exc_info:
-            await squad_manager.get_squad_timeline({"squad_id": "sq_missing"})
-        assert exc_info.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
 
     @pytest.mark.asyncio
     async def test_timeline_500_propagates(self, squad_manager, mock_client):
         mock_client.get_squad_timeline.side_effect = ReveniumAPIError("down", status_code=500)
         with pytest.raises(ReveniumAPIError):
             await squad_manager.get_squad_timeline({"squad_id": "sq_1"})
+
+
+class TestSquadLookupUpstreamErrors:
+    """get_squad / get_squad_timeline report the platform's status truthfully (BACK-5088).
+
+    Audit 20261027-161521-79162 saw "Squad not found" for every id because any
+    400/403/404 was folded into not-found, hiding the platform's real answer.
+    """
+
+    @pytest.fixture(params=[
+        ("get_squad", "get_squad_detail"),
+        ("get_squad_timeline", "get_squad_timeline"),
+    ], ids=["get_squad", "get_squad_timeline"])
+    def lookup(self, request, squad_manager, mock_client):
+        action, client_method = request.param
+        return action, getattr(squad_manager, action), getattr(mock_client, client_method)
+
+    @staticmethod
+    def _platform_error(status: int, message: str) -> ReveniumAPIError:
+        """Shaped like ReveniumClient._request's generic branch."""
+        return ReveniumAPIError(
+            f"HTTP {status}: {message}",
+            status_code=status,
+            response_data={"error_data": {"status": status, "message": message}},
+        )
+
+    @pytest.mark.asyncio
+    async def test_upstream_404_is_squad_not_found(self, lookup):
+        _, call, upstream = lookup
+        upstream.side_effect = self._platform_error(404, "Squad not found: l31VND")
+        with pytest.raises(ToolError) as exc_info:
+            await call({"squad_id": "l31VND"})
+        assert exc_info.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert "Squad not found" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_upstream_400_reports_platform_refusal(self, lookup):
+        action, call, upstream = lookup
+        upstream.side_effect = self._platform_error(400, "Invalid value for period: LAST_YEAR")
+        with pytest.raises(ToolError) as exc_info:
+            await call({"squad_id": "l31VND", "period": "LAST_YEAR"})
+        error = exc_info.value
+        assert error.error_code == ErrorCodes.API_ERROR
+        assert "not found" not in error.message.lower()
+        assert "HTTP 400" in error.message
+        assert "Invalid value for period: LAST_YEAR" in error.message
+        assert action in error.message
+        assert "'l31VND'" in error.message
+
+    @pytest.mark.asyncio
+    async def test_upstream_403_reports_platform_refusal(self, lookup):
+        action, call, upstream = lookup
+        upstream.side_effect = self._platform_error(403, "Access Denied")
+        with pytest.raises(ToolError) as exc_info:
+            await call({"squad_id": "l31VND"})
+        error = exc_info.value
+        assert error.error_code == ErrorCodes.API_AUTHORIZATION
+        assert "not found" not in error.message.lower()
+        assert "HTTP 403: Access Denied." in error.message
+        assert error.message.count("HTTP 403") == 1
+        assert action in error.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [400, 403, 404])
+    async def test_every_mapped_status_names_the_run_id_source(self, lookup, status):
+        _, call, upstream = lookup
+        upstream.side_effect = self._platform_error(status, "refused")
+        with pytest.raises(ToolError) as exc_info:
+            await call({"squad_id": "l31VND"})
+        hints = " ".join(exc_info.value.suggestions)
+        assert "get_agents(action='list_squad_executions')" in hints
+
+    @pytest.mark.asyncio
+    async def test_upstream_401_is_not_relabelled(self, lookup):
+        _, call, upstream = lookup
+        upstream.side_effect = self._platform_error(401, "Unauthorized")
+        with pytest.raises(ReveniumAPIError):
+            await call({"squad_id": "l31VND"})
+
+    @pytest.mark.asyncio
+    async def test_refusal_reaches_the_caller_through_handle_action(self, agent_mgmt, mock_client):
+        mock_client.get_squad_detail.side_effect = self._platform_error(400, "Bad squadId")
+        agent_mgmt.get_client = AsyncMock(return_value=mock_client)
+        with pytest.raises(ToolError) as exc_info:
+            await agent_mgmt.handle_action("get_squad", {"squad_id": "l31VND"})
+        assert "HTTP 400" in exc_info.value.message
+
+
+@pytest.fixture
+def squad_wire():
+    """A real ReveniumClient whose transport answers every request with one canned error."""
+    client = ReveniumClient(
+        auth_config=AuthConfig(
+            api_key="test_key_12345",
+            team_id="team_abc",
+            base_url="https://api.test.revenium.ai",
+            timeout=10.0,
+        )
+    )
+    answer: Dict[str, Any] = {}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(answer["status"], json=answer["body"])
+
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+
+    def answering(status: int, body: Dict[str, Any]) -> SquadManager:
+        answer.update(status=status, body=body)
+        return SquadManager(client)
+
+    return answering
+
+
+class TestSquadLookupThroughTheClient:
+    """The refusal carries the platform's own text, whatever _request made of it (BACK-5088)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["get_squad", "get_squad_timeline"])
+    async def test_a_hashed_id_400_reaches_the_caller_as_the_platform_sent_it(self, squad_wire, action):
+        manager = squad_wire(400, {"status": 400, "message": "Failed to decode hashed Id: [team_abc]"})
+        with pytest.raises(ToolError) as exc_info:
+            await getattr(manager, action)({"squad_id": "go-bughunt-squad"})
+        message = exc_info.value.message
+        assert "HTTP 400: Failed to decode hashed Id: [team_abc]." in message
+        assert "does not exist" not in message
+        assert "Invalid Resource ID" not in message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["get_squad", "get_squad_timeline"])
+    async def test_a_plain_403_names_the_status_once(self, squad_wire, action):
+        manager = squad_wire(403, {"status": 403, "error": "Forbidden", "message": "Access Denied"})
+        with pytest.raises(ToolError) as exc_info:
+            await getattr(manager, action)({"squad_id": "go-bughunt-squad"})
+        assert exc_info.value.error_code == ErrorCodes.API_AUTHORIZATION
+        assert "HTTP 403: Access Denied." in exc_info.value.message
+        assert exc_info.value.message.count("HTTP 403") == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["get_squad", "get_squad_timeline"])
+    async def test_a_404_is_squad_not_found(self, squad_wire, action):
+        manager = squad_wire(404, {"status": 404, "message": "Squad not found"})
+        with pytest.raises(ToolError) as exc_info:
+            await getattr(manager, action)({"squad_id": "go-bughunt-squad"})
+        assert exc_info.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+
+
+class TestSquadIdSchema:
+    """The squad_id description says which id each squad action takes (BACK-5088)."""
+
+    @pytest.mark.asyncio
+    async def test_squad_id_description_names_the_id_per_action(self, agent_mgmt):
+        schema = await agent_mgmt._get_input_schema()
+        description = schema["properties"]["squad_id"]["description"]
+        assert "get_squad" in description
+        assert "get_squad_timeline" in description
+        assert "list_squad_executions" in description
+        assert "list_squads" in description
+        assert "run id" in description
+
+    @pytest.mark.asyncio
+    async def test_capability_parameters_name_the_id_per_action(self, agent_mgmt):
+        caps = await agent_mgmt._get_tool_capabilities()
+        squad_cap = next(c for c in caps if "squad" in c.name.lower())
+        assert "list_squads" in squad_cap.parameters["list_squad_executions"]["squad_id"]
+        for action in ("get_squad", "get_squad_timeline"):
+            assert "list_squad_executions" in squad_cap.parameters[action]["squad_id"]
 
 
 # ===========================================================================

@@ -50,9 +50,13 @@ from ..alerts.update_fidelity import (
     PROVIDER_ALERT_TYPES,
     PROVIDER_FILTER_DIMENSIONS,
     PROVIDER_METRICS,
+    THRESHOLD_FLOOR_REFUSAL,
     platform_periods_for,
+    refuse_negative_threshold,
     refuse_stored_alert_rule_breach,
+    refuse_unsupported_alert_fields,
     stored_alert_refusal,
+    unsupported_alert_fields_note,
 )
 from ..client import ReveniumAPIError, ReveniumClient
 from ..common.default_slack_configuration import get_default_slack_config_id
@@ -764,6 +768,11 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
         # Default to anomalies for backward compatibility
         return "anomalies"
 
+    @staticmethod
+    def _without_routing_prose(arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Arguments minus the query that semantic routing read as a question, not a rule name."""
+        return {key: value for key, value in arguments.items() if key != "query"}
+
     # ============================================================================
     # CORE BUSINESS LOGIC METHODS (from alert_tools.py)
     # ============================================================================
@@ -774,15 +783,17 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
         """Handle list operations for both anomalies and alerts with semantic detection."""
         # Use semantic detection if resource_type not explicitly specified
         resource_type = arguments.get("resource_type")
+        rule_arguments = arguments
         if not resource_type:
             resource_type = self._detect_semantic_intent(arguments)
+            rule_arguments = self._without_routing_prose(arguments)
             logger.info(f"Semantic detection determined resource_type='{resource_type}'")
 
         logger.info(f"Alert Management: _handle_list called with resource_type='{resource_type}'")
 
         if resource_type == "anomalies":
             logger.info("Routing to anomaly operations for list")
-            return await self._handle_anomaly_operations(client, "list", arguments)
+            return await self._handle_anomaly_operations(client, "list", rule_arguments)
         elif resource_type == "alerts":
             logger.info("Routing to alert operations for list")
             # BACK-1270 (item #5): reject malformed page/size at the tool boundary
@@ -1018,7 +1029,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                 examples={
                     "valid_resource_types": ["anomalies", "alerts"],
                     "query_alerts": 'query(resource_type="alerts", query="show high cost alerts")',
-                    "query_anomalies": 'query(resource_type="anomalies", filters={"enabled": True})',
+                    "query_anomalies": 'query(resource_type="anomalies", query="budget")',
                 },
             )
 
@@ -1088,9 +1099,11 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
         """Assemble the effective anomaly payload from nested + flat arguments.
 
         Single assembly source for the live create path AND dry-run, so the
-        preview always sees exactly what a live create would send. The period floor
-        and the other create checks run after it, in AnomalyManager.prepare_create.
+        preview always sees exactly what a live create would send. A flat field the
+        platform's alert does not have is refused here; the period floor and the other
+        create checks run after it, in AnomalyManager.prepare_create.
         """
+        refuse_unsupported_alert_fields(arguments, "created")
         anomaly_data = arguments.get("anomaly_data")
         # The MCP signature and the get_examples payloads document these
         # alert fields as flat top-level kwargs, so callers routinely pass
@@ -1114,7 +1127,6 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
             "isPercentage",
             "enabled",
             "description",
-            "tags",
             "period",
             "periodDuration",
             "triggerAfterPersistsDuration",
@@ -1275,9 +1287,7 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
             arguments = validate_pagination_params(arguments, action="list_anomalies")
             page = arguments.get("page", 0)
             size = arguments.get("size", 20)
-            filters = apply_filter_allowlist(
-                arguments.get("filters"), _ANOMALY_FILTER_MAP, action="list anomalies"
-            )
+            filters = self._rule_search_filters(arguments, action="list anomalies")
 
             # Validate pagination with performance guidance
             validate_pagination_with_performance(page, size, "Alert Management")
@@ -1353,30 +1363,15 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
             return await self.anomaly_manager.delete_anomaly(client, anomaly_id)
 
         elif action == "clear_all":
-            confirm = arguments.get("confirm")
-            if confirm is not True:
-                return [
-                    TextContent(
-                        type="text",
-                        text="**Confirmation Required**: This will delete ALL anomalies\n\n"
-                        "**To proceed**: Use `clear_all(confirm=True)`\n\n"
-                        "**WARNING**: This action will:\n"
-                        "• Delete every anomaly in your account\n"
-                        "• Stop ALL alert monitoring\n"
-                        "• Cannot be undone\n\n"
-                        "**Alternative**: Delete specific anomalies using `delete(anomaly_id='...')`",
-                    )
-                ]
             return await self.anomaly_manager.clear_all_anomalies(client)
 
         elif action == "query":
             arguments = validate_pagination_params(arguments, action="query_anomalies")
-            filters = apply_filter_allowlist(
-                arguments.get("filters"), _ANOMALY_FILTER_MAP, action="query anomalies"
-            )
-            # Use list with filters for query functionality
             return await self.anomaly_manager.list_anomalies(
-                client, arguments.get("page", 0), arguments.get("size", 20), filters
+                client,
+                arguments.get("page", 0),
+                arguments.get("size", 20),
+                self._rule_search_filters(arguments, action="query anomalies"),
             )
 
         else:
@@ -1402,6 +1397,25 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                 },
             )
             raise_structured_error(error)
+
+    @staticmethod
+    def _rule_search_filters(arguments: Dict[str, Any], action: str) -> Dict[str, Any]:
+        """Filters a rule list or query sends, its top-level query as the platform's name search."""
+        filters = apply_filter_allowlist(
+            arguments.get("filters"), _ANOMALY_FILTER_MAP, action=action
+        )
+        query = arguments.get("query")
+        if not query:
+            return filters
+        named = filters.get("query")
+        if named is not None and named != query:
+            raise_refusal(
+                f"query {query!r} and filters.query {named!r} name two different searches; "
+                "a rule query searches alert rule names once, so send one of them",
+                field="query",
+                value=query,
+            )
+        return {**filters, "query": query}
 
     # ============================================================================
     # ALERT OPERATIONS (from alert_tools.py)
@@ -1495,6 +1509,9 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                 type="text", text=await self._build_enhanced_capabilities_text(ucm_capabilities)
             ),
             *await self.parameter_reference_block(),
+            TextContent(
+                type="text", text=f"## Not alert fields\n\n{unsupported_alert_fields_note()}"
+            ),
         ]
 
     async def _build_enhanced_capabilities_text(
@@ -1943,7 +1960,7 @@ Perfect for budget tracking and quota management.
 
 ## **Quick Creation**
 ```bash
-# Basic budget alert (email optional: defaults to your own email when hosted; locally, the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
+# Basic budget alert (email optional: defaults to your own email when hosted; locally, the address saved with manage_system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
 create_cumulative_usage_alert(
   name="Monthly Budget",
   threshold=5000,
@@ -2150,7 +2167,7 @@ Perfect for real-time monitoring and spike detection.
 
 ## **Quick Creation**
 ```bash
-# Basic alert (email optional: defaults to your own email when hosted; locally, the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
+# Basic alert (email optional: defaults to your own email when hosted; locally, the address saved with manage_system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
 create_threshold_alert(
   name="Cost Spike",
   threshold=100,
@@ -2457,7 +2474,7 @@ update(
 
 ### **Add Slack Notifications**
 ```python
-# First get available Slack configs with: slack_management(action="list_configurations")
+# First get available Slack configs with: get_slack(action="list_configurations")
 update(
     anomaly_id="5jXPdv",
     anomaly_data={"slackConfigurations": ["5jpABv"]}
@@ -2709,10 +2726,10 @@ Complex configurations → create() with anomaly_data
 
 ## **Quick Creation Methods** (Basic Alerts)
 ```bash
-# Basic budget tracking (email optional: defaults to your own email when hosted; locally, the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
+# Basic budget tracking (email optional: defaults to your own email when hosted; locally, the address saved with manage_system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
 create_cumulative_usage_alert(name="Budget", threshold=5000, period="monthly")
 
-# Basic real-time monitoring (email optional: defaults to your own email when hosted; locally, the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
+# Basic real-time monitoring (email optional: defaults to your own email when hosted; locally, the address saved with manage_system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
 create_threshold_alert(name="Cost Spike", threshold=100, period_minutes=15)
 
 # With explicit email
@@ -2763,7 +2780,7 @@ create(resource_type="anomalies", anomaly_data={
   "email": "finance@company.com"
 })
 
-# Natural language (email optional: defaults to your own email when hosted; locally, the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
+# Natural language (email optional: defaults to your own email when hosted; locally, the address saved with manage_system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
 create_from_text(text="Alert when monthly OpenAI spending exceeds $2000")
 ```
 
@@ -2854,7 +2871,7 @@ create(resource_type="anomalies", anomaly_data={
 **Best Practices**:
 1. **Always start with** `get_capabilities()` to understand available options
 2. **Use specific methods** like `create_cumulative_usage_alert()` for clarity
-3. **Email notifications**: Provide the email parameter, or leave it out to notify the signed-in user's own email on the hosted server, or on a local server the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL
+3. **Email notifications**: Provide the email parameter, or leave it out to notify the signed-in user's own email on the hosted server, or on a local server the address saved with manage_system_setup update_email, then REVENIUM_DEFAULT_EMAIL
 4. **Test configurations** with `validate()` before creating alerts
 5. **Monitor alert patterns** with analytics to optimize thresholds
 
@@ -3044,13 +3061,10 @@ create(resource_type="anomalies", anomaly_data={
                 )
                 raise_structured_error(error)
 
-            # Validate threshold is a number, zero or more
             try:
                 if isinstance(threshold, bool):
                     raise TypeError("Threshold must be a number, not true or false")
                 threshold_value = float(threshold)
-                if threshold_value < 0:
-                    raise ValueError("Threshold must be zero or more")
             except (ValueError, TypeError):
                 error = create_structured_validation_error(
                     message=f"Invalid threshold value: {threshold}",
@@ -3069,6 +3083,7 @@ create(resource_type="anomalies", anomaly_data={
                     },
                 )
                 raise_structured_error(error)
+            refuse_negative_threshold(threshold_value)
 
             # Let the API handle metric validation based on UCM capabilities
             if metric_type:
@@ -3214,16 +3229,13 @@ create(resource_type="anomalies", anomaly_data={
                     },
                 )
 
-            # Validate threshold is a number, zero or more
             try:
                 if isinstance(threshold, bool):
                     raise TypeError("Threshold must be a number, not true or false")
                 threshold_value = float(threshold)
-                if threshold_value < 0:
-                    raise ValueError("Threshold must be zero or more")
             except (ValueError, TypeError):
                 raise create_structured_validation_error(
-                    message=f"Invalid threshold value: {threshold}; use a number, zero or more",
+                    message=THRESHOLD_FLOOR_REFUSAL.format(threshold),
                     field="threshold",
                     value=threshold,
                     suggestions=[
@@ -3238,6 +3250,7 @@ create(resource_type="anomalies", anomaly_data={
                         "performance_monitoring": 500.0,
                     },
                 )
+            refuse_negative_threshold(threshold_value)
 
             # Let the API handle metric validation based on UCM capabilities
             if metric_type:
@@ -3881,22 +3894,6 @@ create(resource_type="anomalies", anomaly_data={
         self, client: ReveniumClient, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Enable all anomalies/alerts."""
-        confirm = arguments.get("confirm")
-
-        if confirm is not True:
-            return [
-                TextContent(
-                    type="text",
-                    text="**Confirmation Required**: This will enable ALL alerts in your system\n\n"
-                    "**To proceed**: `enable_all(confirm=True)`\n\n"
-                    "**What this does**:\n"
-                    "• Enables every alert/anomaly in your account\n"
-                    "• All alerts will start triggering notifications\n"
-                    "• This action affects ALL alerts, not just yours\n\n"
-                    "**Alternative**: Use `enable_multiple(anomaly_ids=[...])` for specific alerts",
-                )
-            ]
-
         try:
             return await self._set_every_anomaly_enabled(client, enabled=True)
 
@@ -3929,23 +3926,6 @@ create(resource_type="anomalies", anomaly_data={
         self, client: ReveniumClient, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Disable all anomalies/alerts."""
-        confirm = arguments.get("confirm")
-
-        if confirm is not True:
-            return [
-                TextContent(
-                    type="text",
-                    text="**Confirmation Required**: This will disable ALL alerts in your system\n\n"
-                    "**To proceed**: `disable_all(confirm=True)`\n\n"
-                    "**WARNING**: This action will:\n"
-                    "• Disable every alert/anomaly in your account\n"
-                    "• Stop ALL alert notifications\n"
-                    "• Leave your system unmonitored\n"
-                    "• Affect ALL alerts, not just yours\n\n"
-                    "**Alternative**: Use `disable_multiple(anomaly_ids=[...])` for specific alerts",
-                )
-            ]
-
         try:
             return await self._set_every_anomaly_enabled(client, enabled=False)
 
@@ -4649,7 +4629,7 @@ create(resource_type="anomalies", anomaly_data={
                 },
                 "email": {
                     "type": "string",
-                    "description": "Email for notifications (optional: defaults to the signed-in user's own email on the hosted server; on a local server, the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL)",
+                    "description": "Email for notifications (optional: defaults to the signed-in user's own email on the hosted server; on a local server, the address saved with manage_system_setup update_email, then REVENIUM_DEFAULT_EMAIL)",
                 },
                 "slack_config_id": {
                     "type": "string",
@@ -4688,11 +4668,6 @@ create(resource_type="anomalies", anomaly_data={
                     "anyOf": [{"type": "boolean"}, {"type": "string"}],
                     "description": "Whether the alert actively monitors. Defaults to true on create",
                 },
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Labels attached to the alert for organization and filtering (max 20, each truncated to 50 characters)",
-                },
                 "notificationAddresses": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -4702,10 +4677,6 @@ create(resource_type="anomalies", anomaly_data={
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Slack configuration IDs notified when the alert fires - the list form of the flat slack_config_id parameter",
-                },
-                "confirm": {
-                    "anyOf": [{"type": "boolean"}, {"type": "string"}],
-                    "description": "Explicit confirmation required before a bulk state change runs (clear_all, enable_all, disable_all)",
                 },
                 # Alert management fields
                 "resource_type": {
@@ -4743,7 +4714,7 @@ create(resource_type="anomalies", anomaly_data={
                 # Query and filtering fields
                 "query": {
                     "type": "string",
-                    "description": "Natural language query for searching alerts/anomalies; for search_provider_api_keys, text matched against the key name or id (% and _ are wildcards)",
+                    "description": "Natural language query for searching alerts; with resource_type=anomalies, text matched against the alert rule name; for search_provider_api_keys, text matched against the key name or id (% and _ are wildcards)",
                 },
                 "provider": {
                     "type": "string",

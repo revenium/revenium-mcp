@@ -23,12 +23,9 @@ DEPRECATED_DIMENSION_ALIASES: Mapping[str, str] = {"ORG_UNIT": "DEPARTMENT"}
 
 DIMENSION_ALIAS_TOOLS = frozenset({"manage_cost_controls"})
 ALIASED_ACTIONS_BY_TOOL: Mapping[str, Tuple[str, ...]] = {
-    "manage_customers": (
-        "list_departments",
-        "delete_department_person",
-        "clear_department_assignment",
-    ),
-    "manage_cost_controls": ("preview_department_group",),
+    "get_customers": ("list_departments",),
+    "manage_customers": ("delete_department_person", "clear_department_assignment"),
+    "get_cost_controls": ("preview_department_group",),
 }
 _DIMENSION_ARGUMENTS = ("dimension", "group_by")
 

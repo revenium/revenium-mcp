@@ -19,7 +19,9 @@ from ..auth.auth_mode import read_auth_mode
 from ..auth.config_factory import AuthConfigFactory
 from ..auth.claims_middleware import current_tenant_context
 from ..client import ReveniumClient
+from ..common.called_tool import called_tool_of, presented_name
 from ..common.error_handling import format_error_response
+from ..common.tool_surface import domain_for
 from ..log_context import bind_tenant_context, clear_tenant_context
 from ..introspection.metadata import (
     MetadataProvider,
@@ -153,6 +155,11 @@ class ToolBase(ABC, MetadataProvider):
         # Defer UCM status logging until first use to avoid timing issues
         # UCM integration may not be fully initialized during tool construction
         self._ucm_status_logged = False
+
+    @property
+    def public_tool_name(self) -> str:
+        """The tool name a caller should read: the public tool the current call was sent to."""
+        return presented_name(self.tool_name)
 
     def _verify_ucm_helper(self) -> bool:
         """Verify UCM helper is functional.
@@ -525,6 +532,14 @@ class ToolBase(ABC, MetadataProvider):
         """Get supported actions. Override in subclasses."""
         return []
 
+    async def _get_actions_of_called_tool(self) -> List[str]:
+        """The supported actions the public tool the caller used runs; all of them outside a call."""
+        actions = await self._get_supported_actions()
+        called = called_tool_of(self.tool_name)
+        if called is None:
+            return actions
+        return domain_for(called).actions_served_by(called, actions)
+
     async def parameter_reference_block(
         self, skip: Optional[Sequence[str]] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
@@ -649,11 +664,11 @@ class ToolBase(ABC, MetadataProvider):
 
     async def _get_agent_summary(self) -> str:
         """Get agent summary. Override in subclasses."""
-        return f"Tool: {self.tool_name} - {self.tool_description}"
+        return f"Tool: {self.public_tool_name} - {self.tool_description}"
 
     async def _get_quick_start_guide(self) -> List[str]:
         """Get quick start guide. Override in subclasses."""
-        return [f"Use {self.tool_name} to perform various operations."]
+        return [f"Use {self.public_tool_name} to perform various operations."]
 
     async def _get_common_use_cases(self) -> List[str]:
         """Get common use cases. Override in subclasses."""

@@ -692,8 +692,8 @@ class SourceValidator:
                 ],
                 examples={
                     "initialization": "SourceManagement should be initialized with schema discovery",
-                    "validation_commands": "Get validation rules: manage_sources(action='get_capabilities')",
-                    "validate_config": "Validate configuration: manage_sources(action='validate', source_data={...}, dry_run=True)",
+                    "validation_commands": "Get validation rules: get_sources(action='get_capabilities')",
+                    "validate_config": "Validate configuration: get_sources(action='validate', source_data={...}, dry_run=True)",
                     "integration_context": "INTEGRATION: Schema discovery provides validation to prevent configuration errors",
                 },
             )
@@ -1094,15 +1094,13 @@ class SourceManagement(ToolBase):
                                 for error in validation_result.get("errors", [])
                             ]
                         )
-                        return [
-                            TextContent(
-                                type="text",
-                                text=f"**Validation Failed**\n\n"
-                                f"**Errors Found:**\n{errors_text}\n\n"
-                                f"**Tip**: Use `auto_generate=true` for smart defaults, or fix the errors above.\n\n"
-                                f"**Auto-Generation Mode**: `{{\"action\":\"create\",\"source_data\":{{\"name\":\"{source_data.get('name', 'MyAPI')}\"}},\"auto_generate\":true}}`",
-                            )
-                        ]
+                        raise_refusal(
+                            f"**Validation Failed**\n\n"
+                            f"**Errors Found:**\n{errors_text}\n\n"
+                            f"**Tip**: Use `auto_generate=true` for smart defaults, or fix the errors above.\n\n"
+                            f"**Auto-Generation Mode**: `{{\"action\":\"create\",\"source_data\":{{\"name\":\"{source_data.get('name', 'MyAPI')}\"}},\"auto_generate\":true}}`",
+                            field="source_data",
+                        )
 
                 # Shared dry-run/live guard: the backend only accepts these
                 # source types; dry-run must reject exactly what live rejects.
@@ -1250,16 +1248,15 @@ class SourceManagement(ToolBase):
                 if auto_generate:
                     name = source_data.get("name")
                     if not name:
-                        return [
-                            TextContent(
-                                type="text",
-                                text="**Validation Failed**\n\n"
-                                "**Field**: `name` (required for validation)\n\n"
-                                '**Example**: `{"action":"validate","source_data":{"name":"My API"},"auto_generate":true}` '
-                                'or `{"action":"validate","name":"My API"}`\n\n'
-                                "**Auto-Generation**: Enabled (will auto-generate description, version, type)",
-                            )
-                        ]
+                        raise_refusal(
+                            "**Validation Failed**\n\n"
+                            "**Field**: `name` (required for validation)\n\n"
+                            '**Example**: `{"action":"validate","source_data":{"name":"My API"},"auto_generate":true}` '
+                            'or `{"action":"validate","name":"My API"}`\n\n'
+                            "**Auto-Generation**: Enabled (will auto-generate description, version, type)",
+                            error_code=ErrorCodes.MISSING_PARAMETER,
+                            field="name",
+                        )
 
                     # Same auto-generation as the create action (BACK-4662)
                     source_data = _with_auto_generated_source_fields(source_data)

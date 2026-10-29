@@ -599,7 +599,7 @@ class TestValidateOptionalFields:
         mgr = _mgr()
         args = {**VALID_TX, "retry_number": -1}
         errors = await mgr._validate_optional_fields(args)
-        assert any("retry_number" in e and "non-negative" in e.lower() for e in errors)
+        assert any("retry_number: Must be between 0 and 2147483647, got -1" in e for e in errors)
 
     @pytest.mark.asyncio
     async def test_retry_number_non_convertible(self):

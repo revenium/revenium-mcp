@@ -334,7 +334,7 @@ class TestProcessCustomerProfitability:
 
         The old ``max(1, int(cost / 0.01))`` proxy fabricated counts from
         cost; real volume now comes from the transaction-count-by-team
-        endpoint via business_analytics_management.get_transaction_count.
+        endpoint via get_business_analytics.get_transaction_count.
         """
         data = _make_customer_data("AcmeCorp", cost=1.0, revenue=2.0)
         result = self.processor._process_customer_profitability(data, top_n=10)

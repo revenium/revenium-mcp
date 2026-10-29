@@ -41,7 +41,7 @@ class PlanType(str, Enum):
 
 
 class Currency(str, Enum):
-    """Currency enumeration for Revenium API."""
+    """Plan currencies; TestOneCurrencyList pins these to platform_plan_currencies."""
 
     USD = "USD"
     EUR = "EUR"
@@ -54,27 +54,29 @@ class Currency(str, Enum):
     COP = "COP"
     ARS = "ARS"
     ZMW = "ZMW"
+    ZWG = "ZWG"
 
 
 class BillingPeriod(str, Enum):
-    """Billing period enumeration for Revenium API."""
+    """Plan periods in platform order; test_plan_period_contract pins them to Plan.period."""
 
+    DAY = "DAY"
     MONTH = "MONTH"
     YEAR = "YEAR"
-    QUARTER = "QUARTER"
-    WEEK = "WEEK"
-    DAY = "DAY"
     TEST_MINUTE = "TEST_MINUTE"
     TEST_MINUTE_WITH_SYNTHETIC_METERING = "TEST_MINUTE_WITH_SYNTHETIC_METERING"
     NONE = "NONE"
 
 
 class TrialPeriod(str, Enum):
-    """Trial period enumeration for Revenium API."""
+    """Trial periods in platform order; test_plan_period_contract pins them to Plan.trialPeriod."""
 
     DAY = "DAY"
-    WEEK = "WEEK"
     MONTH = "MONTH"
+    YEAR = "YEAR"
+    TEST_MINUTE = "TEST_MINUTE"
+    TEST_MINUTE_WITH_SYNTHETIC_METERING = "TEST_MINUTE_WITH_SYNTHETIC_METERING"
+    NONE = "NONE"
 
 
 class AggregationType(str, Enum):

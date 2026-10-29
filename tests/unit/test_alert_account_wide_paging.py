@@ -35,7 +35,7 @@ class TestEveryAlertIsReached:
     async def test_disable_all_leaves_none_enabled(self):
         platform = _platform(enabled=True)
 
-        result = await _tools_over(platform).handle_action("disable_all", {"confirm": True})
+        result = await _tools_over(platform).handle_action("disable_all", {})
 
         assert _enabled_count(platform) == 0
         text = result[0].text
@@ -47,7 +47,7 @@ class TestEveryAlertIsReached:
     async def test_enable_all_leaves_none_disabled(self):
         platform = _platform(enabled=False)
 
-        result = await _tools_over(platform).handle_action("enable_all", {"confirm": True})
+        result = await _tools_over(platform).handle_action("enable_all", {})
 
         assert _enabled_count(platform) == ALERT_COUNT
         assert "**Enabled:** 1200" in result[0].text
@@ -55,7 +55,7 @@ class TestEveryAlertIsReached:
     async def test_clear_all_leaves_no_alert(self):
         platform = _platform()
 
-        result = await _tools_over(platform).handle_action("clear_all", {"confirm": True})
+        result = await _tools_over(platform).handle_action("clear_all", {})
 
         assert platform.store == {}
         assert len(platform.deleted_ids) == ALERT_COUNT
@@ -80,7 +80,7 @@ class TestAnActionThatStopsEarlySaysSo:
     async def test_disable_all_reports_how_many_of_the_total_it_covered(self):
         platform = _platform(enabled=True, failing_list_page=2)
 
-        result = await _tools_over(platform).handle_action("disable_all", {"confirm": True})
+        result = await _tools_over(platform).handle_action("disable_all", {})
 
         text = result[0].text
         assert "Complete" not in text
@@ -98,7 +98,7 @@ class TestAnActionThatStopsEarlySaysSo:
     async def test_clear_all_is_not_worded_as_success_when_partial(self):
         platform = _platform(failing_list_page=3)
 
-        result = await _tools_over(platform).handle_action("clear_all", {"confirm": True})
+        result = await _tools_over(platform).handle_action("clear_all", {})
 
         text = result[0].text
         assert "Cleared Successfully" not in text
@@ -107,8 +107,6 @@ class TestAnActionThatStopsEarlySaysSo:
 
 
 ACCOUNT_WIDE_ACTIONS = ["clear_all", "enable_all", "disable_all"]
-NOT_AN_EXPLICIT_YES = ["null", "undefined", "none", "n", "y", "", "maybe", " ", False, "false"]
-EXPLICIT_YES = [True, "true", "yes", " yes ", "1"]
 
 
 async def _registered_manage_alerts(platform: FakeAnomalyPlatform):
@@ -120,7 +118,7 @@ async def _registered_manage_alerts(platform: FakeAnomalyPlatform):
     )
     mcp = MagicMock()
     await registry._register_manage_alerts(mcp)
-    closure = mcp.tool.return_value.call_args[0][0]
+    closure = mcp.tool.call_args_list[0][0][0].__wrapped__
 
     async def pass_through(tool_name, action, arguments, tool_class, **_kwargs):
         tools = tool_class()
@@ -138,37 +136,11 @@ def _two_alerts(action: str) -> FakeAnomalyPlatform:
 
 
 @pytest.mark.asyncio
-class TestAnAccountWideActionNeedsAnExplicitYes:
-    @pytest.mark.parametrize("action", ACCOUNT_WIDE_ACTIONS)
-    @pytest.mark.parametrize(
-        "call",
-        [{"confirm": value} for value in NOT_AN_EXPLICIT_YES]
-        + [{"params": {"confirm": "null"}}, {"params": {"confirm": 1}}],
-        ids=[repr(value) for value in NOT_AN_EXPLICIT_YES] + ["params-null", "params-int-1"],
-    )
-    async def test_a_placeholder_or_unrecognised_confirm_is_held_and_sends_nothing(
-        self, action, call
-    ):
-        platform = _two_alerts(action)
-        enabled_before = {key: alert["enabled"] for key, alert in platform.store.items()}
-        closure, pass_through = await _registered_manage_alerts(platform)
-
-        with patch(
-            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
-            side_effect=pass_through,
-        ):
-            result = await closure(action=action, **call)
-
-        assert "Confirmation Required" in result[0].text
-        assert platform.list_calls == []
-        assert platform.deleted_ids == []
-        assert platform.updated_bodies == []
-        assert platform.read_ids == []
-        assert {key: alert["enabled"] for key, alert in platform.store.items()} == enabled_before
+class TestAnAccountWideActionRunsOnTheWriteTool:
+    """BACK-5047: the client confirms before a destructive tool, so the action takes no confirm."""
 
     @pytest.mark.parametrize("action", ACCOUNT_WIDE_ACTIONS)
-    @pytest.mark.parametrize("confirm", EXPLICIT_YES, ids=repr)
-    async def test_an_explicit_yes_runs_the_action(self, action, confirm):
+    async def test_the_action_runs_without_a_confirm_argument(self, action):
         platform = _two_alerts(action)
         closure, pass_through = await _registered_manage_alerts(platform)
 
@@ -176,10 +148,9 @@ class TestAnAccountWideActionNeedsAnExplicitYes:
             "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
             side_effect=pass_through,
         ):
-            result = await closure(action=action, confirm=confirm)
+            result = await closure(action=action)
 
         text = result[0].text
-        assert "Confirmation Required" not in text
         if action == "clear_all":
             assert platform.store == {}
             assert "**Deleted:** 2 of 2 anomalies" in text
@@ -187,3 +158,10 @@ class TestAnAccountWideActionNeedsAnExplicitYes:
             assert all(alert["enabled"] for alert in platform.store.values())
         else:
             assert not any(alert["enabled"] for alert in platform.store.values())
+
+    async def test_confirm_is_no_longer_an_argument(self):
+        import inspect
+
+        closure, _ = await _registered_manage_alerts(_two_alerts("clear_all"))
+
+        assert "confirm" not in inspect.signature(closure).parameters

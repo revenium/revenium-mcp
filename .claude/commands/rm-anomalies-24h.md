@@ -6,7 +6,7 @@ Detect unusual cost patterns in the last 24 hours from Revenium using enhanced s
 - Example: `/rm-anomalies-24h 50` to detect anomalies over $50
 - If no threshold provided, defaults to $50
 
-Use the business_analytics_management tool with these parameters:
+Use the get_business_analytics tool with these parameters:
 - action: "analyze_cost_anomalies"
 - period: "TWENTY_FOUR_HOURS"
 - min_impact_threshold: [threshold from user input, default 50]

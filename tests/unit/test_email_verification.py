@@ -61,9 +61,10 @@ class TestEmailActionRouting:
     """Test handle_action routes to correct handlers."""
 
     @pytest.mark.asyncio
-    async def test_unknown_action_returns_structured_error(self, email_tool):
-        result = await email_tool.handle_action("nonexistent", {})
-        text = result[0].text.lower()
+    async def test_unknown_action_raises_a_structured_error(self, email_tool):
+        with pytest.raises(ToolError) as refused:
+            await email_tool.handle_action("nonexistent", {})
+        text = refused.value.message.lower()
         assert "unknown" in text or "nonexistent" in text
         assert "check_status" in text or "valid_actions" in text
 
@@ -102,9 +103,10 @@ class TestValidateEmail:
     """Test validate_email action: validates format without updating config."""
 
     @pytest.mark.asyncio
-    async def test_missing_email_returns_error(self, email_tool):
-        result = await email_tool.handle_action("validate_email", {})
-        text = result[0].text.lower()
+    async def test_missing_email_raises(self, email_tool):
+        with pytest.raises(ToolError) as refused:
+            await email_tool.handle_action("validate_email", {})
+        text = refused.value.message.lower()
         assert "email" in text
         assert "required" in text or "missing" in text
 
@@ -413,7 +415,7 @@ class TestHelpMatchesTheHostedToolSet:
         monkeypatch.delenv("AUTH_MODE", raising=False)
         with configured(None):
             result = await email_tool.handle_action("setup_guidance", {})
-        assert "system_setup(action='update_email', email='your@email.com')" in result[0].text
+        assert "manage_system_setup(action='update_email', email='your@email.com')" in result[0].text
 
 
 class TestEmailSourceLabel:
@@ -587,8 +589,8 @@ class TestEveryEmailHelpNamesSystemSetupCalls:
         monkeypatch.delenv("AUTH_MODE", raising=False)
         result = await email_tool.handle_action("update_email", {"email": "ops@company.com"})
         text = result[0].text
-        assert "system_setup(action='test_configuration')" in text
-        assert "system_setup(action='check_status')" in text
+        assert "get_system_setup(action='test_configuration')" in text
+        assert "get_system_setup(action='check_status')" in text
         assert not bare_setup_calls_in(text)
 
     @pytest.mark.asyncio
@@ -599,7 +601,7 @@ class TestEveryEmailHelpNamesSystemSetupCalls:
         with pytest.raises(ToolError) as exc_info:
             await email_tool.handle_action("update_email", {"email": "ops@"})
         suggestions = " ".join(exc_info.value.suggestions or [])
-        assert "system_setup(action='validate_email', email='ops@')" in suggestions
+        assert "get_system_setup(action='validate_email', email='ops@')" in suggestions
         assert "validate_email() to" not in suggestions
 
     @pytest.mark.asyncio
@@ -622,8 +624,8 @@ class TestEveryEmailHelpNamesSystemSetupCalls:
         monkeypatch.delenv("AUTH_MODE", raising=False)
         guide = "\n".join(await email_tool._get_quick_start_guide())
         examples = (await email_tool.handle_action("get_examples", {}))[0].text
-        assert "system_setup(action='update_email', email='your@email.com')" in guide
-        assert "system_setup(action='update_email', email='new@email.com')" in examples
+        assert "manage_system_setup(action='update_email', email='your@email.com')" in guide
+        assert "manage_system_setup(action='update_email', email='new@email.com')" in examples
         for text in (guide, examples):
             assert not bare_setup_calls_in(text)
 
@@ -643,7 +645,7 @@ class TestAnInvalidAddressIsNotPromisedNotifications:
         assert "will receive notifications" not in text
         assert "Notification Types" not in text
         assert "## Fix the Address" in text
-        assert "system_setup(action='validate_email', email='your@email.com')" in text
+        assert "get_system_setup(action='validate_email', email='your@email.com')" in text
 
     @pytest.mark.asyncio
     async def test_a_valid_address_is_described_as_the_default_for_alerts_without_an_email(
@@ -695,7 +697,7 @@ class TestSetupGuidanceJudgesTheAddress:
         assert "Configured and ready" not in text
         assert "Not a valid email address" in text
         assert "## Fix the Address" in text
-        assert "system_setup(action='validate_email', email='your@email.com')" in text
+        assert "get_system_setup(action='validate_email', email='your@email.com')" in text
         assert "**Source**: Configuration cache (.revenium_cache)" in text
 
     @pytest.mark.asyncio
@@ -783,7 +785,7 @@ class TestAlertsUseTheAddressCheckStatusReports:
         status = (await email_tool.handle_action("check_status", {}))[0].text
         assert (
             "2. Set the address alerts created without an email go to with "
-            "`system_setup(action='update_email', email='your@email.com')`"
+            "`manage_system_setup(action='update_email', email='your@email.com')`"
         ) in status
 
 

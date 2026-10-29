@@ -21,7 +21,7 @@ from ..common.error_handling import (
     ErrorCodes,
     ToolError,
     create_structured_validation_error,
-    format_structured_error,
+    raise_structured_error,
 )
 from ..config_store import default_notification_email
 from ..introspection.metadata import ToolCapability, ToolType
@@ -155,7 +155,7 @@ class WelcomeSetup(ToolBase):
                         },
                     },
                 )
-                return [TextContent(type="text", text=format_structured_error(error))]
+                raise_structured_error(error)
 
         except (PermissionError, ToolError):
             raise
@@ -172,7 +172,7 @@ class WelcomeSetup(ToolBase):
                     "Use setup_checklist to see current status",
                 ],
             )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            raise_structured_error(error)
 
     async def _handle_show_welcome(self, arguments: Dict[str, Any]) -> List[TextContent]:
         """Handle show_welcome action - main welcome message and overview."""
@@ -243,7 +243,7 @@ class WelcomeSetup(ToolBase):
                     "purpose": "Prevents accidental setup completion without proper validation",
                 },
             )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            raise_structured_error(error)
 
         client = await self.get_client()
         read = await probe_platform_read(client)
@@ -296,11 +296,11 @@ Try these commands to explore your capabilities:
         ]
         if not credentials_are_per_request():
             first_commands.append(
-                "- `system_setup(action='update_email')` - Configure default email address "
+                "- `manage_system_setup(action='update_email')` - Configure default email address "
                 "to receive AI spending alerts"
             )
         first_commands.append(
-            "- `slack_management(action='setup_status')` - Configure default Slack channel "
+            "- `get_slack(action='setup_status')` - Configure default Slack channel "
             "to receive AI spending alerts"
         )
         return "\n".join(first_commands)
@@ -315,32 +315,32 @@ Try these commands to explore your capabilities:
 
 **show_welcome**
 - Display welcome message and setup overview
-- Usage: `system_setup(action="show_welcome")`
+- Usage: `get_system_setup(action="show_welcome")`
 - Best for: First-time users or getting an overview
 
 **setup_checklist**
 - Show detailed setup completion status
-- Usage: `system_setup(action="setup_checklist")`
+- Usage: `get_system_setup(action="setup_checklist")`
 - Best for: Checking what configuration items are completed
 
 **environment_status**
 - Display all environment variables with status
-- Usage: `system_setup(action="environment_status")`
+- Usage: `get_system_setup(action="environment_status")`
 - Best for: Troubleshooting configuration issues
 
 **next_steps**
 - Get personalized recommendations based on current setup
-- Usage: `system_setup(action="next_steps")`
+- Usage: `get_system_setup(action="next_steps")`
 - Best for: Finding out what to do next
 
 **complete_setup**
 - Confirm setup: checks your organization's data can be read (requires confirmation)
-- Usage: `system_setup(action="complete_setup", confirm_completion=True)`
+- Usage: `get_system_setup(action="complete_setup", confirm_completion=True)`
 - Best for: Finishing the setup process
 
 **help**
 - Show this help message
-- Usage: `system_setup(action="help")`
+- Usage: `get_system_setup(action="help")`
 - Best for: Learning about available actions
 
 ## Getting Started
@@ -394,9 +394,9 @@ Auto-discovery found all your configuration:
 
 Start using your fully configured Revenium MCP server:
 - `tool_introspection()` - Discover all available tools and capabilities
-- `manage_products(action='list')` - View your products
-- `manage_alerts(action='list')` - Check your alerts
-- `manage_metering(action='get_capabilities')` - Explore AI transaction tracking
+- `get_products(action='list')` - View your products
+- `get_alerts(action='list')` - Check your alerts
+- `get_metering(action='get_capabilities')` - Explore AI transaction tracking
 
 **Ready to complete onboarding?** Use `complete_setup()` to finish!
 """
@@ -418,7 +418,7 @@ Auto-discovery found all your required configuration:
                     next_steps_section = """## **Choose Your Path**
 
 **Option 1: Add Slack Notifications (Recommended)**
-- `slack_management(action='quick_setup')` - Set up real-time alerts
+- `get_slack(action='quick_setup')` - Set up real-time alerts
 
 **Option 2: Skip Slack and Finish Setup**
 - `complete_setup()` - Start using Revenium immediately
@@ -492,7 +492,7 @@ Some configuration items need your attention to ensure optimal functionality.
 
         # Next steps
         slack_action = (
-            "- `slack_management(action='quick_setup')` - Set up Slack notifications\n"
+            "- `get_slack(action='quick_setup')` - Set up Slack notifications\n"
             if slack_configured is False
             else ""
         )
@@ -540,7 +540,7 @@ Some configuration items need your attention to ensure optimal functionality.
         elif slack_set:
             checklist += "[OK] **Slack Integration**: Configured on the platform\n\n"
         else:
-            slack_action = 'slack_management(action="quick_setup") to configure'
+            slack_action = 'get_slack(action="quick_setup") to configure'
             checklist += f"[ ] **Slack Integration**: Use {slack_action}\n\n"
 
         # System status
@@ -701,10 +701,10 @@ Some configuration items need your attention to ensure optimal functionality.
 
 Your Revenium MCP server is fully configured. Start using these powerful features:
 
-- ** Product Management**: `manage_products(action='list')` - View and manage your API products
-- **🔔 Alert Management**: `manage_alerts(action='list')` - Monitor usage and set up notifications
-- ** Metering Management**: `manage_metering(action='get_capabilities')` - Track AI transactions
-- ** Customer Management**: `manage_customers(action='list')` - Manage subscribers and organizations
+- ** Product Management**: `get_products(action='list')` - View and manage your API products
+- **🔔 Alert Management**: `get_alerts(action='list')` - Monitor usage and set up notifications
+- ** Metering Management**: `get_metering(action='get_capabilities')` - Track AI transactions
+- ** Customer Management**: `get_customers(action='list')` - Manage subscribers and organizations
 
 ##**Finish Onboarding**
 
@@ -719,7 +719,7 @@ Auto-discovery has configured all required settings automatically.
 
 **Option 1: Add Slack Notifications (Recommended)**
 ```
-slack_management(action='quick_setup')
+get_slack(action='quick_setup')
 ```
 - Get real-time alerts delivered to your team
 - Perfect for mobile monitoring and team collaboration
@@ -805,7 +805,7 @@ Slack notifications provide instant alerts when:
                     "priority": 2,
                     "title": "Configure Slack Integration",
                     "description": "Set up Slack for real-time notifications",
-                    "action": "Use slack_management(action='quick_setup')",
+                    "action": "Use get_slack(action='quick_setup')",
                     "urgency": " Recommended",
                 }
             )
@@ -840,9 +840,9 @@ Slack notifications provide instant alerts when:
             next_steps += "**Congratulations!** Your setup is complete.\n\n"
             next_steps += "## **Ready to Use**\n\n"
             next_steps += "You can now:\n"
-            next_steps += "- Manage products with `manage_products()`\n"
-            next_steps += "- Set up alerts with `manage_alerts()`\n"
-            next_steps += "- Submit metering data with `manage_metering()`\n"
+            next_steps += "- Manage products with `get_products()`\n"
+            next_steps += "- Set up alerts with `get_alerts(action='get_examples')`\n"
+            next_steps += "- Submit metering data with `get_metering()`\n"
             next_steps += "- Explore all capabilities with tool discovery\n\n"
             next_steps += "Use `complete_setup()` to finish onboarding!"
         else:

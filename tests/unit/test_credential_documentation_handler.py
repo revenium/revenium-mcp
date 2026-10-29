@@ -116,7 +116,7 @@ class TestValidateCredentialData:
             tool_config=ToolConfig.create_for_testing(profile="business")
         )
         await registry._register_manage_subscriber_credentials(mcp)
-        closure = mcp.tool.return_value.call_args[0][0]
+        closure = mcp.tool.call_args_list[0][0][0].__wrapped__
         declared = set(inspect.signature(closure).parameters)
 
         with pytest.raises(ToolError) as exc_info:
@@ -224,7 +224,7 @@ class TestGetAgentSummary:
     async def test_returns_complete_structure(self, handler):
         """Agent summary includes all expected keys."""
         result = await handler.get_agent_summary({})
-        assert result["tool_name"] == "manage_subscriber_credentials"
+        assert result["tool_name"] == "manage_credentials"
         assert "quick_start" in result
         assert "key_features" in result
         assert "common_workflows" in result

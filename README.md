@@ -37,8 +37,8 @@ If or when you're ready to turn AI costs into AI revenue, the Revenium MCP will 
 
 ### Profile-Based Tool Selection
 The MCP provides the appropriate tools for each use case depending on your chosen startup profile:
-- **Starter Profile (7 tools):** Cost monitoring, alerts, analytics, AI metering integration
-- **Business Profile (20 tools):** All Starter tools plus product management, customer management, subscriptions, billing, tool registry, AI insights, AI agents and cost controls
+- **Starter Profile (12 tools):** Cost monitoring, alerts, analytics, AI metering integration
+- **Business Profile (37 tools):** All Starter tools plus product management, customer management, subscriptions, billing, tool registry, AI insights, AI agents and cost controls
 
 ## Getting Started
 
@@ -331,21 +331,46 @@ The MCP server supports two profiles to match your use case:
 
 | Profile | Tools | Target Users | Use Cases |
 |---------|-------|--------------|-----------|
-| **Starter** (default) | 7 tools | Cost monitoring & alerts | Cost analysis, AI transaction metering |
-| **Business** | 20 tools | Full platform | Product & subscription management, usage-based billing, comprehensive analytics, tool registry, AI insights, AI agents, cost controls |
+| **Starter** (default) | 12 tools | Cost monitoring & alerts | Cost analysis, AI transaction metering |
+| **Business** | 37 tools | Full platform | Product & subscription management, usage-based billing, comprehensive analytics, tool registry, AI insights, AI agents, cost controls |
+
+Each area of the platform has a read-only tool (`get_...`) and, when it can change data, a separate write tool (`manage_...`). Read-only tools are marked `readOnlyHint` and write tools `destructiveHint`, so your client can run reads freely and ask before a change. Version 0.10.0 renamed the tools; the [changelog](CHANGELOG.md) maps every old name to the new ones.
+
+| Area | Read tool | Write tool | Profile |
+|------|-----------|------------|---------|
+| System Setup | `get_system_setup` | `manage_system_setup` | Starter |
+| Alert Channels (Slack) | `get_slack` | `manage_slack` | Starter |
+| Tool Introspection | `tool_introspection` | - | Starter |
+| Capabilities | `get_capabilities` | - | Business |
+| Guardrails: Alerts | `get_alerts` | `manage_alerts` | Starter |
+| Intelligence | `get_ai_insights` | `manage_ai_insights` | Business |
+| Costs & Revenue | `get_business_analytics` | - | Starter |
+| Logs and Metering | `get_metering` | `manage_metering` | Starter |
+| Customers | `get_customers` | `manage_customers` | Business |
+| Products | `get_products` | `manage_products` | Business |
+| Cost Sources and Revenue Sources | `get_sources` | `manage_sources` | Business |
+| Usage Meters | `get_usage_meters` | `manage_usage_meters` | Business |
+| Subscriptions | `get_subscriptions` | `manage_subscriptions` | Business |
+| Credentials | `get_credentials` | `manage_credentials` | Business |
+| Workflows | `get_workflows` | `manage_workflows` | Business |
+| All Jobs | `get_jobs` | `manage_jobs` | Business |
+| Tool Registry | `get_tools` | `manage_tools` | Business |
+| Agent Squads | `get_agents` | `manage_agents` | Business |
+| Guardrails: Cost Controls | `get_cost_controls` | `manage_cost_controls` | Business |
+| System Diagnostics | `system_diagnostics` | `manage_system_settings` | Starter |
 
 The server uses the **Starter** profile by default. To use the **Business** profile, set the `TOOL_PROFILE` environment variable:
 
 **With uvx and .env file:**
 ```bash
-# Starter Profile (7 tools) - Cost monitoring, alerts, AI metering integration (default)
+# Starter Profile (12 tools) - Cost monitoring, alerts, AI metering integration (default)
 cat > .env << EOF
 REVENIUM_API_KEY=hak_your_api_key_here
 TOOL_PROFILE=starter
 EOF
 uvx revenium-mcp
 
-# Business Profile (20 tools) - Usage-based billing & AI Analytics
+# Business Profile (37 tools) - Usage-based billing & AI Analytics
 cat > .env << EOF
 REVENIUM_API_KEY=hak_your_api_key_here
 TOOL_PROFILE=business

@@ -19,8 +19,11 @@ if TYPE_CHECKING:
 
 from ..auth.claims_middleware import current_tenant_context
 from ..client import ReveniumAPIError
+from .called_tool import called_tool_of
 from .department_aliases import resolve_department_aliases
 from .dry_run_guard import normalise_dry_run, refuse_unsupported_dry_run
+from .split_tool_guidance import HELP_ACTIONS, actions_by_tool_section, sibling_sentence
+from .tool_surface import domain_for
 from ..log_context import bind_tenant_context, clear_tenant_context, sanitize_error_message
 
 
@@ -105,7 +108,7 @@ async def standardized_tool_execution(
 
                 # Performance metrics recording removed - handled by external monitoring
 
-                return result
+                return await _with_actions_by_tool(result, tool_name, action, tool_class)
             else:
                 raise IntrospectionError(
                     f"Introspection returned empty result for {tool_name}",
@@ -169,7 +172,7 @@ async def standardized_tool_execution(
 
                 # Performance metrics recording removed - handled by external monitoring
 
-                return result
+                return await _with_actions_by_tool(result, tool_name, action, tool_class)
 
             except PermissionError:
                 # Fail closed on auth failure from the direct path too.
@@ -232,6 +235,23 @@ def _execution_failure(error: Exception, tool_name: str, action: str) -> Excepti
     )
 
 
+async def _with_actions_by_tool(
+    result: List[Union[TextContent, ImageContent, EmbeddedResource]],
+    tool_name: str,
+    action: str,
+    tool_class: Any,
+) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+    """Open a split tool's help with the actions it runs and the ones its sibling serves."""
+    called = called_tool_of(tool_name)
+    if action not in HELP_ACTIONS or called is None or domain_for(called).write_name is None:
+        return result
+    actions = await _valid_actions(tool_name, tool_class)
+    if not actions:
+        return result
+    section = TextContent(type="text", text=actions_by_tool_section(called, actions))
+    return [section, *result]
+
+
 async def _carry_guidance_to_caller(error: Any, tool_name: str, tool_class: Any) -> None:
     """Put the error's guidance into the one string the framework sends the caller."""
     from .error_handling import caller_message
@@ -239,8 +259,13 @@ async def _carry_guidance_to_caller(error: Any, tool_name: str, tool_class: Any)
     valid_actions = (
         await _valid_actions(tool_name, tool_class) if error.field == "action" else []
     )
+    called = called_tool_of(tool_name)
+    sibling_note = ""
+    if called is not None:
+        valid_actions = domain_for(called).actions_served_by(called, valid_actions)
+        sibling_note = sibling_sentence(called)
     try:
-        text = caller_message(error, valid_actions)
+        text = caller_message(error, valid_actions, sibling_note=sibling_note)
     except Exception as render_error:
         logger.debug(f"Could not render guidance for {tool_name}: {render_error}")
         return

@@ -18,7 +18,7 @@ from ..common.error_handling import (
     ErrorCodes,
     ToolError,
     create_structured_validation_error,
-    format_structured_error,
+    raise_structured_error,
 )
 from ..config_store import default_notification_email, get_config_value
 from ..introspection.metadata import ToolCapability, ToolType
@@ -124,7 +124,7 @@ class SetupChecklist(ToolBase):
                         },
                     },
                 )
-                return [TextContent(type="text", text=format_structured_error(error))]
+                raise_structured_error(error)
 
         except (PermissionError, ToolError):
             raise
@@ -141,7 +141,7 @@ class SetupChecklist(ToolBase):
                     "Use show_checklist to see complete status",
                 ],
             )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            raise_structured_error(error)
 
     async def _handle_show_checklist(
         self, arguments: Dict[str, Any]
@@ -355,7 +355,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             "status": "not_configured",
             "status_text": "Not configured",
             "recommendations": [
-                "Use slack_management(action='quick_setup') to configure Slack",
+                "Use get_slack(action='quick_setup') to configure Slack",
                 "Set up Slack for real-time alert notifications",
                 "Enable team collaboration through Slack integration",
             ],
@@ -429,7 +429,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             checklist += f"   - Status: {slack_status.get('status_text')}\n"
         else:
             checklist += "   - Status: Not configured\n"
-            checklist += "   - Action: Use slack_management(action='quick_setup')\n"
+            checklist += "   - Action: Use get_slack(action='quick_setup')\n"
         checklist += "\n"
 
         # System status
@@ -506,14 +506,14 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             elif slack_configured is None:
                 checklist += f"{step_num}. Slack could not be checked on the platform; run setup_checklist() again to check it\n"
                 step_num += 1
-            checklist += f"{step_num}. Use system_setup(action='setup_checklist') when ready\n"
+            checklist += f"{step_num}. Use get_system_setup(action='setup_checklist') when ready\n"
         else:
             checklist += "## **Setup Complete!**\n\n"
             checklist += "Your Revenium MCP server is fully configured and ready to use!\n\n"
             checklist += "**Next Steps:**\n"
-            checklist += "- Use system_setup(action='setup_checklist') to finish onboarding\n"
-            checklist += "- Start managing products with manage_products()\n"
-            checklist += "- Set up alerts with manage_alerts()\n"
+            checklist += "- Use get_system_setup(action='setup_checklist') to finish onboarding\n"
+            checklist += "- Start managing products with get_products()\n"
+            checklist += "- Set up alerts with get_alerts(action='get_examples')\n"
 
         return checklist
 
@@ -611,7 +611,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
         if slack_configured:
             optional += "**Benefit**: [OK] Real-time Slack notifications enabled\n"
         elif slack_configured is False:
-            optional += "**Action**: Use slack_management(action='quick_setup')\n"
+            optional += "**Action**: Use get_slack(action='quick_setup')\n"
             optional += "**Benefit**: Get instant notifications and enable team collaboration\n"
         optional += "\n"
 
@@ -925,7 +925,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
                 {
                     "title": "Configure Slack Integration",
                     "description": "Set up Slack for real-time notifications",
-                    "action": "Use slack_management(action='quick_setup')",
+                    "action": "Use get_slack(action='quick_setup')",
                     "impact": "High - Enables team collaboration",
                 }
             )
@@ -975,7 +975,7 @@ Comprehensive setup status verification and configuration guidance for Revenium 
             recommendations += self._slack_readiness_line(setup_completion.get("slack_configured"))
             recommendations += "**Next Steps:**\n"
             recommendations += (
-                "- Use system_setup(action='setup_checklist') to finish onboarding\n"
+                "- Use get_system_setup(action='setup_checklist') to finish onboarding\n"
             )
             recommendations += "- Start exploring the full capabilities of your MCP server\n"
 

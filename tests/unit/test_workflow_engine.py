@@ -27,7 +27,7 @@ class TestWorkflowStep:
     def test_creation_with_all_params(self):
         step = WorkflowStep(
             step_id="s2", title="Step 2", description="Second step",
-            tool="manage_sources", action="get",
+            tool="get_sources", action="get",
             required_data=["source_id"],
             optional_data=["filters"],
             dependencies=["s1"],

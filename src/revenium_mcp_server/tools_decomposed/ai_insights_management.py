@@ -7,6 +7,9 @@ Maps RFC 7807 problem-details codes to structured tool errors.
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 from datetime import date, datetime, timedelta
 from typing import (
     TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union, cast,
@@ -28,6 +31,7 @@ from ..common.error_handling import (
     ToolError,
     create_structured_validation_error,
 )
+from ..common.tool_surface import public_tool_for, tool_call
 from ..common.validation import preprocess_boolean_parameters
 from ..introspection.metadata import ToolType
 from .unified_tool_base import ToolBase
@@ -38,7 +42,7 @@ INSIGHT_RUN_MAX_DAYS = 90
 
 # BACK-2757. The department id is an opaque number the agent cannot guess, and
 # the only MCP surface that resolves a department name to it is
-# manage_customers' list_departments (BACK-2767) — so the schema says so rather
+# get_customers' list_departments (BACK-2767) — so the schema says so rather
 # than leaving the caller to invent an id. The feature-flag caveat is repeated
 # here because a caller reaches this filter without ever touching the customers
 # tool, where the 403 is explained.
@@ -46,9 +50,45 @@ DEPARTMENT_FILTER_DESCRIPTION = (
     "Single department id to scope the run to; omit for a "
     "tenant-wide run. A single id string, NOT a list, unlike the neighbouring "
     "filter_agent / filter_product_id arrays. Resolve the id with "
-    "manage_customers(action=list_departments). Departments are gated by the "
+    f"{tool_call('manage_customers', 'list_departments')}. Departments are gated by the "
     "per-tenant org-unit-attribution-enabled feature flag: if that lookup "
     "answers 403 the dimension is unavailable for the tenant."
+)
+
+
+def _is_resumable_runs_cursor(value: Any) -> bool:
+    """True when the platform can resume from this list_runs cursor.
+
+    The platform does not refuse a cursor it cannot read: it silently starts
+    again from the newest run (listRecommendationRuns in isotope's
+    packages/db/src/data_access/recommendation-engine.ts). Its cursor is base64
+    JSON holding the last run's ``created`` UTC instant and ``id``, so that
+    shape is checked here to refuse instead of answering the first page again.
+    """
+    try:
+        position = json.loads(base64.b64decode(value, validate=True))
+    except (binascii.Error, ValueError, TypeError):
+        return False
+    return (
+        isinstance(position, dict)
+        and _is_utc_instant(position.get("created"))
+        and isinstance(position.get("id"), str)
+        and position["id"] != ""
+    )
+
+
+def _is_utc_instant(value: Any) -> bool:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return False
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+LIST_RUNS_CONTINUATION_ADVICE = (
+    "For more runs, pass the next_cursor of a list_runs response back as cursor"
 )
 
 INCLUDE_DESCENDANTS_DESCRIPTION = (
@@ -142,7 +182,9 @@ class AIInsightsManagement(ToolBase):
             action="list_investigators",
         )
 
-    def _validate_max_results(self, arguments: Dict[str, Any]) -> int:
+    def _validate_max_results(
+        self, arguments: Dict[str, Any], more_results_advice: Tuple[str, ...] = (),
+    ) -> int:
         raw = arguments.get("max_results", self.DEFAULT_MAX_RESULTS)
         try:
             value = int(raw)
@@ -169,7 +211,7 @@ class AIInsightsManagement(ToolBase):
                 value=value,
                 suggestions=[
                     f"Pass an integer between 1 and {self.HARD_CAP_MAX_RESULTS}",
-                    "Paginate with repeated calls if you need more results",
+                    *more_results_advice,
                 ],
             )
         return value
@@ -301,31 +343,54 @@ class AIInsightsManagement(ToolBase):
         self,
         client_method: Callable[..., Awaitable[Dict[str, Any]]],
         max_results: int,
+        start_cursor: Optional[str] = None,
         **kwargs: Any,
-    ) -> List[Dict[str, Any]]:
-        """Drain cursor-based pagination up to max_results.
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Drain cursor-based pagination from start_cursor up to max_results.
 
         Stops on next_cursor=None, when collected length reaches max_results,
         or when the backend returns the same cursor we just used (no advance).
-        Each request uses limit=min(BACKEND_PAGE_LIMIT, remaining).
+        Each request uses limit=min(BACKEND_PAGE_LIMIT, remaining). Returns the
+        items and, when max_results stopped the loop while the backend still
+        offered a page, the cursor to continue from.
         """
         collected: List[Dict[str, Any]] = []
-        cursor: Optional[str] = None
+        cursor: Optional[str] = start_cursor
         while len(collected) < max_results:
             remaining = max_results - len(collected)
             page_limit = min(self.BACKEND_PAGE_LIMIT, remaining)
             response = await client_method(limit=page_limit, cursor=cursor, **kwargs)
             page_data = response.get("data", [])
             if not page_data:
-                break
+                return collected, None
             collected.extend(page_data)
             new_cursor = response.get("next_cursor")
             if new_cursor is None:
-                break
+                return collected, None
             if new_cursor == cursor:
-                break  # backend did not advance the cursor
+                return collected, None  # backend did not advance the cursor
             cursor = new_cursor
-        return collected
+        return collected, cursor
+
+    @staticmethod
+    def _runs_resume_cursor(arguments: Dict[str, Any]) -> Optional[str]:
+        cursor = arguments.get("cursor")
+        if cursor is None:
+            return None
+        if not _is_resumable_runs_cursor(cursor):
+            raise create_structured_validation_error(
+                message=(
+                    f"cursor {cursor!r} is not a list_runs next_cursor, so the "
+                    "platform would ignore it and list from the newest run again"
+                ),
+                field="cursor",
+                value=cursor,
+                suggestions=[
+                    "Pass the next_cursor value of a previous list_runs response unchanged",
+                    "Omit cursor to list from the newest run",
+                ],
+            )
+        return cast(str, cursor)
 
     async def _handle_list_runs(
         self,
@@ -333,21 +398,34 @@ class AIInsightsManagement(ToolBase):
         *,
         ctx: Optional["TenantContext"] = None,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        max_results = self._validate_max_results(arguments)
+        max_results = self._validate_max_results(
+            arguments, more_results_advice=(LIST_RUNS_CONTINUATION_ADVICE,),
+        )
         since, until = self._list_runs_window(arguments)
+        resume_cursor = self._runs_resume_cursor(arguments)
         client = await self.get_client(ctx=ctx)
-        runs = await self._autopaginate(
+        runs, next_cursor = await self._autopaginate(
             client.list_recommendation_runs,
             max_results=max_results,
+            start_cursor=resume_cursor,
             status=arguments.get("status"),
             since=since,
             until=until,
             triggered_by=arguments.get("triggered_by"),
         )
+        if not runs and resume_cursor is not None:
+            return self.formatter.format_success_response(
+                message="No further runs beyond the supplied cursor (end of results)",
+                data={"runs": [], "count": 0, "end_of_results": True},
+                action="list_runs",
+            )
+        data: Dict[str, Any] = {"runs": runs, "count": len(runs)}
+        message = f"Retrieved {len(runs)} runs"
+        if next_cursor is not None:
+            data["next_cursor"] = next_cursor
+            message += "; more exist, pass next_cursor back as cursor for the following runs"
         return self.formatter.format_success_response(
-            message=f"Retrieved {len(runs)} runs",
-            data={"runs": runs, "count": len(runs)},
-            action="list_runs",
+            message=message, data=data, action="list_runs",
         )
 
     async def _handle_get_run(
@@ -629,10 +707,10 @@ class AIInsightsManagement(ToolBase):
         self,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         response = self.formatter.format_success_response(
-            message="Capabilities for manage_ai_insights",
+            message=f"Capabilities for {self.public_tool_name}",
             data={
-                "tool_name": self.tool_name,
-                "supported_actions": await self._get_supported_actions(),
+                "tool_name": self.public_tool_name,
+                "supported_actions": await self._get_actions_of_called_tool(),
                 "description": self.tool_description,
                 "default_max_results": self.DEFAULT_MAX_RESULTS,
                 "hard_cap_max_results": self.HARD_CAP_MAX_RESULTS,
@@ -648,19 +726,19 @@ class AIInsightsManagement(ToolBase):
         self,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         examples_md = (
-            "# manage_ai_insights — Usage examples\n\n"
+            f"# {self.public_tool_name} — Usage examples\n\n"
             "## Discover detectors\n"
             "`action=list_investigators` — returns the catalog so you can pass valid IDs "
             "to `exclude_investigator_ids` on trigger_run.\n\n"
-            "## Trigger an analysis run (async)\n"
+            f"## Trigger an analysis run with {public_tool_for(self.tool_name, 'trigger_run')} (async)\n"
             "`action=trigger_run`, `period_start=2026-01-01T00:00:00Z`, "
             "`period_end=2026-01-31T23:59:59Z`. Returns immediately with `runId` and "
             "`status=running`. Poll `get_run` until status is one of "
             "`completed | partial | failed | cancelled`.\n\n"
-            "## Scope a run to one department\n"
+            f"## Scope a run to one department with {public_tool_for(self.tool_name, 'trigger_run')}\n"
             "`action=trigger_run`, `period_start=...`, `period_end=...`, "
             "`filter_department_id=\"173\"` — a string, per the schema; resolve the id with "
-            "`manage_customers(action=list_departments)`; the filter takes a single "
+            f"`{tool_call('manage_customers', 'list_departments')}`; the filter takes a single "
             "id string, not a list. Sub-departments are included by default; pass "
             "`filter_include_descendants=false` for that department alone. "
             "Departments are gated by the per-tenant org-unit-attribution-enabled "
@@ -674,14 +752,16 @@ class AIInsightsManagement(ToolBase):
             "`action=list_runs`, optional `status=completed`, `since=2026-10-01`, "
             "`until=2026-10-14` (both days included, as whole UTC days; an ISO 8601 "
             "time also works and is UTC when it has no zone), `triggered_by=api`, `max_results=200` (auto-paginates up to "
-            f"{AIInsightsManagement.HARD_CAP_MAX_RESULTS}).\n\n"
-            "## Submit feedback\n"
+            f"{AIInsightsManagement.HARD_CAP_MAX_RESULTS}). When more runs exist the "
+            "response carries `next_cursor`; pass it back unchanged as `cursor`, with "
+            "the same filters, for the following runs.\n\n"
+            f"## Submit feedback with {public_tool_for(self.tool_name, 'submit_feedback')}\n"
             "`action=submit_feedback`, `run_id`, `recommendation_id`, "
             "`feedback_action=implemented`, optional `realized_savings`, "
             "`realized_savings_currency` (default USD).\n"
         )
         return self.formatter.format_success_response(
-            message="Usage examples for manage_ai_insights",
+            message=f"Usage examples for {self.public_tool_name}",
             data={"examples_markdown": examples_md},
             action="get_examples",
         )
@@ -690,15 +770,20 @@ class AIInsightsManagement(ToolBase):
         self,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         summary = (
-            "manage_ai_insights wraps Revenium's AI cost-intelligence pipeline. "
-            "Trigger a run (async: returns runId; poll get_run until status!=running), "
-            "then read findings via get_run (defaults to compact slim mode). "
+            f"{self.public_tool_name} covers Revenium's AI cost-intelligence pipeline. "
+            f"Trigger a run with {public_tool_for(self.tool_name, 'trigger_run')} "
+            "(async: returns runId; poll get_run until status!=running), "
+            f"then read findings via get_run on {public_tool_for(self.tool_name, 'get_run')} "
+            "(defaults to compact slim mode). "
             "List endpoints auto-paginate up to a hard cap of "
-            f"{AIInsightsManagement.HARD_CAP_MAX_RESULTS}. "
-            "Submit feedback per recommendation to record outcomes."
+            f"{AIInsightsManagement.HARD_CAP_MAX_RESULTS}; list_runs returns "
+            "next_cursor when more runs exist (pass it back as cursor to continue), "
+            "and list_feedback flags possibly_truncated instead. "
+            f"Submit feedback per recommendation with {public_tool_for(self.tool_name, 'submit_feedback')} "
+            "to record outcomes."
         )
         return self.formatter.format_success_response(
-            message="Agent summary for manage_ai_insights",
+            message=f"Agent summary for {self.public_tool_name}",
             data={"summary": summary},
             action="get_agent_summary",
         )

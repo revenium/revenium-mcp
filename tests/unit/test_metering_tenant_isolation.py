@@ -27,6 +27,7 @@ from src.revenium_mcp_server.tools_decomposed.metering_management import (
     MeteringManagement,
     MeteringTransactionManager,
 )
+from tests.unit._registered_tool_harness import serving_tool
 
 CUSTOMER_A = TenantContext(team_id="TeamAAAA", tenant_id="tenant-a", api_key="key-of-customer-a")
 CUSTOMER_B = TenantContext(team_id="TeamBBBB", tenant_id="tenant-b", api_key="key-of-customer-b")
@@ -99,7 +100,7 @@ async def _signed_in_as(mcp: FastMCP, customer: TenantContext) -> AsyncIterator[
 
 
 async def _text(client: Client, arguments: Dict[str, object]) -> str:
-    result = await client.call_tool("manage_metering", arguments)
+    result = await client.call_tool(serving_tool("manage_metering", arguments), arguments)
     return result.content[0].text
 
 

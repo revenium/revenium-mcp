@@ -278,20 +278,13 @@ class TestHandleActionClearAll:
     """Cover clear_all action."""
 
     @pytest.mark.asyncio
-    async def test_clear_all_without_confirm_returns_warning(self):
-        tools, _ = _make_alert_with_client()
-        result = await tools.handle_action("clear_all", {"resource_type": "anomalies"})
-        text = result[0].text
-        assert "Confirmation Required" in text or "confirm" in text.lower()
-
-    @pytest.mark.asyncio
-    async def test_clear_all_with_confirm_delegates(self):
+    async def test_clear_all_delegates(self):
         tools, _ = _make_alert_with_client()
         tools.anomaly_manager.clear_all_anomalies = AsyncMock(
             return_value=[TextContent(type="text", text="All cleared")]
         )
         result = await tools.handle_action("clear_all", {
-            "resource_type": "anomalies", "confirm": True,
+            "resource_type": "anomalies",
         })
         assert result[0].text == "All cleared"
 
@@ -813,12 +806,6 @@ class TestAnomalyOperationsUpdateInternal:
         assert passed_data["threshold"] == 500
 
     @pytest.mark.asyncio
-    async def test_anomaly_clear_all_without_confirm(self):
-        tools, client = _make_alert_with_client()
-        result = await tools._handle_anomaly_operations(client, "clear_all", {})
-        assert "Confirmation" in result[0].text or "confirm" in result[0].text.lower()
-
-    @pytest.mark.asyncio
     async def test_anomaly_query_uses_list(self):
         tools, client = _make_alert_with_client()
         tools.anomaly_manager.list_anomalies = AsyncMock(
@@ -1212,7 +1199,8 @@ class TestManageAlertsErrorsCarryTheFlag:
             {"action": "create", "anomaly_data": dict(refused)}, client
         )
 
-        assert previewed == created
+        assert previewed[0] == created[0]
+        assert previewed[1].split("': ", 1)[1] == created[1].split("': ", 1)[1]
         assert previewed[0] is True, previewed[1]
         assert "periodDuration" in previewed[1]
         client.create_anomaly.assert_not_awaited()
@@ -1231,7 +1219,7 @@ class TestManageAlertsErrorsCarryTheFlag:
         )
 
         assert is_error, text
-        refusal = text.removeprefix("Error calling tool 'manage_alerts': ")
+        refusal = text.removeprefix("Error calling tool 'get_alerts': ")
         assert refusal.startswith("Window refused: start"), text
         client.get_alerts.assert_not_awaited()
 

@@ -42,7 +42,7 @@ USAGE_UNASSIGNED_NOTE = (
 )
 HASHID_NOTE = (
     "**Department ids**: departmentId and parentDepartmentId are hashids. They are "
-    "not the numeric department ids manage_customers list_departments returns (the "
+    "not the numeric department ids get_customers list_departments returns (the "
     "ids get_pr_health department_id takes): never pass one kind where the other "
     "is expected."
 )

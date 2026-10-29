@@ -334,7 +334,7 @@ class TestGroups:
         assert "departmentId (hashid): k5jYw2" in text
         assert "parentDepartmentId (hashid) k5jYw2" in text
         assert "Parent: none (a top-level department)" in text
-        assert "not the numeric department ids manage_customers list_departments returns" in text
+        assert "not the numeric department ids get_customers list_departments returns" in text
         assert "never pass one kind where the other is expected" in text
 
     @pytest.mark.asyncio

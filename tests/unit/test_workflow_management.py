@@ -91,7 +91,7 @@ class TestHandleActionRouting:
 
         import src.revenium_mcp_server.tools_decomposed.workflow_management as module
 
-        supported = set(await wf_tool._get_supported_actions()) | {"manage_workflows"}
+        supported = set(await wf_tool._get_supported_actions()) | {"manage_workflows", "get_workflows"}
         named = set()
         for node in ast.walk(ast.parse(Path(module.__file__).read_text())):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -132,15 +132,54 @@ class TestHandleActionRouting:
         assert "customer_onboarding" in text
 
     @pytest.mark.asyncio
-    async def test_complete_step_dry_run_returns_preview(self, wf_tool):
-        """complete_step with dry_run=True returns preview text."""
+    async def test_complete_step_dry_run_previews_the_step_and_changes_nothing(self, wf_tool):
+        workflow = await wf_tool.workflow_manager.start_workflow(
+            {
+                "workflow_type": "customer_onboarding",
+                "context": {"customer_email": "t@x.com", "organization_name": "Org"},
+            },
+            LOCAL_TENANT_SCOPE,
+        )
+        before = json.dumps(workflow, sort_keys=True)
+
         result = await wf_tool.handle_action(
             "complete_step",
-            {"workflow_id": "wf_test", "step_result": {"ok": True}, "dry_run": True},
+            {"workflow_id": workflow["id"], "step_result": {"ok": True}, "dry_run": True},
         )
+
         text = result[0].text
         assert "DRY RUN" in text
-        assert "wf_test" in text
+        assert workflow["id"] in text
+        assert "Would complete step 1 of 4" in text
+        assert json.dumps(workflow, sort_keys=True) == before
+
+    @pytest.mark.asyncio
+    async def test_complete_step_dry_run_refuses_an_unknown_workflow_like_the_live_call(
+        self, wf_tool
+    ):
+        arguments = {"workflow_id": "wf_nonexistent_99999", "step_result": {"success": True}}
+        with pytest.raises(ToolError) as live:
+            await wf_tool.handle_action("complete_step", arguments)
+
+        with pytest.raises(ToolError) as preview:
+            await wf_tool.handle_action("complete_step", {**arguments, "dry_run": True})
+
+        assert preview.value.message == live.value.message
+        assert "wf_nonexistent_99999" in preview.value.message
+        assert "not found" in preview.value.message
+
+    @pytest.mark.asyncio
+    async def test_complete_step_dry_run_without_workflow_id_is_refused_like_the_live_call(
+        self, wf_tool
+    ):
+        with pytest.raises(ToolError) as live:
+            await wf_tool.handle_action("complete_step", {"step_result": {}})
+
+        with pytest.raises(ToolError) as preview:
+            await wf_tool.handle_action("complete_step", {"step_result": {}, "dry_run": True})
+
+        assert preview.value.message == live.value.message
+        assert preview.value.field == "workflow_id"
 
     @pytest.mark.asyncio
     async def test_start_dry_run_rejects_invalid_workflow_type(self, wf_tool):

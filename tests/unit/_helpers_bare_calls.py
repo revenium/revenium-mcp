@@ -1,7 +1,7 @@
-"""Calls help must never print bare, because the server only answers them through system_setup (BACK-4743).
+"""Calls help must never print bare, because the server only answers them through manage_system_setup (BACK-4743).
 
 Each entry is the open-paren form, so `update_email(email='your@email.com')`
-matches while `system_setup(action='update_email', ...)` does not.
+matches while `manage_system_setup(action='update_email', ...)` does not.
 """
 
 BARE_SETUP_CALLS = (

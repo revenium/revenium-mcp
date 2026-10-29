@@ -277,6 +277,14 @@ class ReveniumAPIError(Exception):
             and "failed to decode hashed id" in str(self.response_data).lower()
         )
 
+    @property
+    def platform_message(self) -> str:
+        """The platform's own error text, before ``_request`` rewrites it into guidance."""
+        body = self.response_data.get("error_data") if isinstance(self.response_data, dict) else None
+        if body is not None:
+            return _sanitize_error_text(ReveniumClient._format_error_response(body))
+        return self.message.removeprefix(f"HTTP {self.status_code}: ")
+
 
 class OrganizationNameUnresolvedError(ValueError):
     """An organization name the search cannot turn into exactly one id."""
@@ -761,7 +769,8 @@ class ReveniumClient:
             "• Values from a published list are matched regardless of case; check the spelling"
         )
 
-    def _format_error_response(self, error_data: Any) -> str:
+    @staticmethod
+    def _format_error_response(error_data: Any) -> str:
         """Format error response data into a readable string.
 
         Args:
@@ -2064,7 +2073,7 @@ class ReveniumClient:
 
         Args:
             parent_department_id: Raw numeric department id (NOT a hashid) whose
-                descendants are counted. ``manage_customers(action=
+                descendants are counted. ``get_customers(action=
                 'list_departments')`` is the lookup that yields these ids.
 
         Returns:
@@ -5108,7 +5117,7 @@ class ReveniumClient:
             Tool data
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/tools/{tool_id}", params=params))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/tools/{self._quote_path_segment(tool_id)}", params=params))
     async def get_tool_by_tool_id(self, tool_id: str) -> Dict[str, Any]:
         """Get a specific tool by its toolId (team-scoped).
 
@@ -5119,7 +5128,7 @@ class ReveniumClient:
             Tool data
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/tools/by-tool-id/{tool_id}", params=params))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/tools/by-tool-id/{self._quote_path_segment(tool_id)}", params=params))
     async def create_tool(self, tool_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new tool.
 

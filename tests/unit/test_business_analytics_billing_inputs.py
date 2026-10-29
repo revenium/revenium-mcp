@@ -1,7 +1,7 @@
 """What the billing lists and the skill list send, refuse and say (BACK-4697).
 
 The invoice, refund and period-charge lists take a yyyy-MM-dd day like the
-rest of business_analytics_management and send it as the UTC instants the
+rest of get_business_analytics and send it as the UTC instants the
 platform parses; list_invoices sends its amount filters as the whole numbers
 the platform binds them to; and a skill-list page past the last one says so
 instead of reading as an organization with no skills.

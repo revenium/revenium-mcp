@@ -1,6 +1,6 @@
 src/revenium_mcp_server/
-tests/
-scripts/
+/tests/
+/scripts/
 .github/workflows/secret-scan.yml
 pyproject.toml
 .env.example
@@ -19,6 +19,8 @@ DEVELOPMENT.md
 .claude/commands/
 !.claude/commands/mcp-functional-audit.md
 !.claude/commands/mcp-functional-audit/
+# Loads the audit scripts excluded above, so it cannot run in the public mirror.
+!tests/unit/test_audit_skill_scripts.py
 !.claude/commands/mcp-functional-testing*
 !.claude/commands/mcp-test-coverage-matrix.yaml
 public-allowlist-mcp.txt

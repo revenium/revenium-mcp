@@ -32,6 +32,11 @@ from .alert_operators import (
     FILTER_IN_OPERATOR_NOTE,
     FILTER_OPERATORS,
 )
+from .common.subscription_create_fields import (
+    OPTIONAL_SUBSCRIPTION_CREATE_FIELDS,
+    REQUIRED_SUBSCRIPTION_CREATE_FIELDS,
+    SUBSCRIPTION_CREATE_RULES,
+)
 from .product_validators import ProductValidationEngine
 
 #: The subscription template names, in template order; get_examples takes one.
@@ -1302,28 +1307,6 @@ class SubscriptionSchemaDiscovery(SchemaDiscoveryEngine):
         # REMOVED: Subscription status validation - status field NOT FOUND in actual Revenium API responses
         # The API does not return or accept a status field for subscription objects
 
-        # Validate date fields if provided
-        date_fields = ["start_date", "end_date"]
-        for field in date_fields:
-            if field in config_data and config_data[field]:
-                # Basic date format validation (could be enhanced)
-                if not isinstance(config_data[field], str):
-                    validation_result["warnings"].append(
-                        f"Date field '{field}' should be a string in ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"
-                    )
-
-        # Business rule validation
-        if "start_date" in config_data and "end_date" in config_data:
-            if config_data["start_date"] and config_data["end_date"]:
-                # Note: This is a simplified check - in real implementation would parse dates
-                validation_result["suggestions"].append(
-                    {
-                        "type": "info",
-                        "message": "Ensure end_date is after start_date",
-                        "next_steps": ["Validate date order before creation"],
-                    }
-                )
-
         # Add suggestions for improvement
         if validation_result["valid"]:
             validation_result["suggestions"].append(
@@ -1333,7 +1316,6 @@ class SubscriptionSchemaDiscovery(SchemaDiscoveryEngine):
                     "next_steps": [
                         "Use 'create' action to create this subscription",
                         "Ensure the product_id exists and is active",
-                        "Consider setting start_date for future subscriptions",
                     ],
                 }
             )
@@ -1350,59 +1332,25 @@ class SubscriptionSchemaDiscovery(SchemaDiscoveryEngine):
             "currencies": [currency.value for currency in Currency],
             "schema": {
                 "subscription_data": {
-                    "required": ["product_id", "name"],
-                    "optional": [
-                        "description",
-                        "start_date",
-                        "end_date",
-                        "billing_address",
-                        "payment_method",
-                        "trial_end_date",
-                        "metadata",
-                        "tags",
-                    ],
+                    "required": list(REQUIRED_SUBSCRIPTION_CREATE_FIELDS),
+                    "optional": list(OPTIONAL_SUBSCRIPTION_CREATE_FIELDS),
                     # REMOVED: "status" - NOT FOUND in actual API
                     "date_fields": {
-                        "start_date": "Subscription start date (ISO format)",
-                        "end_date": "Subscription end date (ISO format)",
-                        "trial_end_date": "Trial period end date (ISO format)",
-                    },
-                    "billing_info": {
-                        "billing_address": {
-                            "street": "Street address",
-                            "city": "City",
-                            "state": "State/Province",
-                            "postal_code": "Postal/ZIP code",
-                            "country": "Country code (ISO 3166-1)",
-                        },
-                        "payment_method": {
-                            "type": "Payment method type (card, bank_transfer, etc.)",
-                            "details": "Payment method specific details",
-                        },
+                        "expiration": "When the subscription ends (ISO 8601 date-time)",
                     },
                 }
             },
             "field_constraints": {
                 "name": {"min_length": 1, "max_length": 255},
-                "description": {"max_length": 1000},
-                "product_id": {"format": "uuid", "required": True},
-                "dates": {"format": "ISO 8601 (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"},
+                "product_id": {"required": True},
+                "dates": {"format": "ISO 8601 (YYYY-MM-DDTHH:MM:SSZ)"},
             },
             # REMOVED: lifecycle_states - status field NOT FOUND in actual API
-            # The API manages subscription lifecycle through other fields like start/end dates
-            "business_rules": [
-                "Product must exist and be active before creating subscription",
-                "Start date cannot be in the past (unless explicitly allowed)",
-                "End date must be after start date if both are specified",
-                "Trial period is optional and depends on product configuration",
-                "Billing address is required for paid subscriptions",
-                "Payment method is required for non-trial subscriptions",
-                "Subscription name must be unique within the organization",
-            ],
+            "business_rules": list(SUBSCRIPTION_CREATE_RULES),
         }
 
     def _build_subscription_examples(self) -> List[Dict[str, Any]]:
-        """Build comprehensive subscription examples and templates."""
+        """Build subscription create templates holding only fields the create stores."""
         return [
             {
                 "name": "Basic Monthly Subscription",
@@ -1413,122 +1361,45 @@ class SubscriptionSchemaDiscovery(SchemaDiscoveryEngine):
                     "product_id": "prod_12345678-1234-1234-1234-123456789012",
                     "clientEmailAddress": "user@company.com",
                     "name": "Premium Plan Subscription",
-                    "description": "Monthly subscription to Premium Plan",
-                    # REMOVED: "status": "active" - NOT FOUND in actual API
-                    "start_date": "2024-01-01T00:00:00Z",
-                    "billing_address": {
-                        "street": "123 Business St",
-                        "city": "San Francisco",
-                        "state": "CA",
-                        "postal_code": "94105",
-                        "country": "US",
-                    },
-                    "payment_method": {
-                        "type": "card",
-                        "details": {
-                            "last_four": "4242",
-                            "brand": "visa",
-                            "exp_month": 12,
-                            "exp_year": 2025,
-                        },
-                    },
-                    "metadata": {"customer_tier": "premium", "sales_rep": "john.doe@company.com"},
+                    "tags": ["premium"],
                 },
             },
             {
                 "name": "Trial Subscription",
                 "example_type": "trial_period",  # This is example metadata, not an API field
-                "description": "Subscription with trial period",
-                "use_case": "Free trial before paid subscription",
+                "description": "Subscription on a product that offers a trial",
+                "use_case": "Free trial before paid subscription; the platform sets the trial end",
                 "template": {
                     "product_id": "prod_12345678-1234-1234-1234-123456789012",
                     "clientEmailAddress": "trial@company.com",
                     "name": "Enterprise Trial",
-                    "description": "30-day trial of Enterprise features",
-                    # REMOVED: "status": "active" - NOT FOUND in actual API
-                    "start_date": "2024-01-01T00:00:00Z",
-                    "trial_end_date": "2024-01-31T23:59:59Z",
-                    "billing_address": {
-                        "street": "456 Enterprise Ave",
-                        "city": "New York",
-                        "state": "NY",
-                        "postal_code": "10001",
-                        "country": "US",
-                    },
-                    "metadata": {
-                        "trial_type": "enterprise",
-                        "conversion_goal": "full_subscription",
-                    },
+                    "tags": ["trial"],
                 },
             },
             {
                 "name": "Annual Subscription",
                 "example_type": "annual_billing",  # This is example metadata, not an API field
-                "description": "Yearly subscription with discount",
-                "use_case": "Annual billing for cost savings",
+                "description": "Yearly subscription that ends on a set date",
+                "use_case": "Annual billing with a fixed end date",
                 "template": {
                     "product_id": "prod_12345678-1234-1234-1234-123456789012",
                     "clientEmailAddress": "billing@company.com",
                     "name": "Annual Premium Plan",
-                    "description": "Yearly subscription with 20% discount",
-                    # REMOVED: "status": "active" - NOT FOUND in actual API
-                    "start_date": "2024-01-01T00:00:00Z",
-                    "end_date": "2024-12-31T23:59:59Z",
-                    "billing_address": {
-                        "street": "789 Corporate Blvd",
-                        "city": "Austin",
-                        "state": "TX",
-                        "postal_code": "73301",
-                        "country": "US",
-                    },
-                    "payment_method": {
-                        "type": "bank_transfer",
-                        "details": {
-                            "account_type": "business",
-                            "routing_number": "021000021",
-                            "account_last_four": "1234",
-                        },
-                    },
-                    "metadata": {
-                        "billing_cycle": "annual",
-                        "discount_applied": "20_percent_annual",
-                    },
+                    "expiration": "2027-12-31T23:59:59Z",
+                    "tags": ["annual"],
                 },
             },
             {
                 "name": "Enterprise Subscription",
                 "example_type": "enterprise_custom",  # This is example metadata, not an API field
-                "description": "Custom enterprise subscription with special terms",
-                "use_case": "Large organization with custom requirements",
+                "description": "Enterprise subscription with a contract end date",
+                "use_case": "Large organization on a multi-year contract",
                 "template": {
                     "product_id": "prod_12345678-1234-1234-1234-123456789012",
                     "clientEmailAddress": "enterprise@company.com",
                     "name": "Enterprise Custom Plan",
-                    "description": "Custom enterprise subscription with negotiated terms",
-                    # REMOVED: "status": "active" - NOT FOUND in actual API
-                    "start_date": "2024-01-01T00:00:00Z",
-                    "end_date": "2026-12-31T23:59:59Z",
-                    "billing_address": {
-                        "street": "1000 Enterprise Way",
-                        "city": "Seattle",
-                        "state": "WA",
-                        "postal_code": "98101",
-                        "country": "US",
-                    },
-                    "payment_method": {
-                        "type": "invoice",
-                        "details": {
-                            "payment_terms": "net_30",
-                            "po_required": True,
-                            "billing_contact": "billing@enterprise.com",
-                        },
-                    },
-                    "metadata": {
-                        "contract_type": "enterprise",
-                        "account_manager": "enterprise.sales@company.com",
-                        "custom_terms": True,
-                        "volume_discount": "enterprise_tier",
-                    },
+                    "expiration": "2028-12-31T23:59:59Z",
+                    "tags": ["enterprise", "contract"],
                 },
             },
         ]
@@ -1536,22 +1407,12 @@ class SubscriptionSchemaDiscovery(SchemaDiscoveryEngine):
     def _build_subscription_validation_rules(self) -> Dict[str, Any]:
         """Build subscription-specific validation rules."""
         return {
-            "required": ["product_id", "clientEmailAddress", "name"],
-            "optional": [
-                "description",
-                "start_date",
-                "end_date",
-                "billing_address",
-                "payment_method",
-                "trial_end_date",
-                "metadata",
-                "tags",
-            ],
+            "required": list(REQUIRED_SUBSCRIPTION_CREATE_FIELDS),
+            "optional": list(OPTIONAL_SUBSCRIPTION_CREATE_FIELDS),
             # REMOVED: "status" - NOT FOUND in actual API
             "field_validation": {
                 "product_id": {
                     "type": "string",
-                    "format": "uuid",
                     "description": "Must be a valid product ID that exists in the system",
                 },
                 "clientEmailAddress": {
@@ -1565,24 +1426,13 @@ class SubscriptionSchemaDiscovery(SchemaDiscoveryEngine):
                     "max_length": 255,
                     "description": "Subscription name must be unique within organization",
                 },
-                # REMOVED: status validation - NOT FOUND in actual API
-                "dates": {
-                    "format": "ISO 8601",
-                    "examples": ["2024-01-01", "2024-01-01T00:00:00Z"],
-                    "validation": "end_date must be after start_date",
+                "expiration": {
+                    "type": "string",
+                    "format": "ISO 8601 date-time",
+                    "examples": ["2027-12-31T23:59:59Z"],
                 },
             },
-            # REMOVED: conditional_validation with status conditions - status field NOT FOUND in actual API
-            # The API manages subscription lifecycle through other fields like start/end dates and trial_end_date
-            "business_rules": [
-                "Product must exist and be active",
-                "Subscription name must be unique within organization",
-                "Start date cannot be more than 1 year in the future",
-                "End date must be after start date",
-                "Trial period cannot exceed product's maximum trial duration",
-                "Billing address required for paid subscriptions",
-                "Payment method required for non-trial subscriptions",
-            ],
+            "business_rules": list(SUBSCRIPTION_CREATE_RULES),
         }
 
 
@@ -1945,7 +1795,7 @@ class CustomerSchemaDiscovery(SchemaDiscoveryEngine):
                     "emailAddress": "contact@acme.com",
                     "url": "https://acme.com",
                     "currency": "USD",
-                    "metadata": "Founded 2010, Technology company, 150 employees",
+                    "metadata": "founded=2010, industry=technology, employees=150",
                     "types": ["CONSUMER"],
                 },
             },
@@ -1967,7 +1817,7 @@ class CustomerSchemaDiscovery(SchemaDiscoveryEngine):
                     "emailAddress": "enterprise@globaltech.com",
                     "url": "https://globaltech.com",
                     "currency": "USD",
-                    "metadata": "Fortune 500 company, Technology sector, Global operations",
+                    "metadata": "segment=enterprise, industry=technology, region=global",
                     "types": ["CONSUMER"],
                 },
             },

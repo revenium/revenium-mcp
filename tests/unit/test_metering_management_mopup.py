@@ -959,15 +959,16 @@ class TestAIModelHandlers:
         assert "Not Found" in result[0].text
         assert "Unable to retrieve models from API" not in result[0].text
 
-    async def test_validate_model_provider_non_envelope_response(self):
+    async def test_validate_model_provider_non_envelope_response_raises(self):
         """Only a response that is not a search envelope is a retrieval failure."""
         mock_client = MagicMock()
         mock_client.search_ai_models = AsyncMock(return_value=None)
         self._install_mock_client(mock_client)
-        result = await self.mm._handle_validate_model_provider(
-            {"model": "gpt-4o", "provider": "openai"}
-        )
-        assert "Unable to retrieve models from API" in result[0].text
+        with pytest.raises(ToolError) as refused:
+            await self.mm._handle_validate_model_provider(
+                {"model": "gpt-4o", "provider": "openai"}
+            )
+        assert "Unable to retrieve models from API" in refused.value.message
 
     async def test_estimate_cost_missing_params(self):
         """Lines 4419-4434: missing model/provider raises an error."""
@@ -1003,7 +1004,7 @@ class TestAIModelHandlers:
         assert "Cost Estimate" in result[0].text
         assert "$" in result[0].text
 
-    async def test_estimate_cost_model_not_found(self):
+    async def test_estimate_cost_model_not_found_raises(self):
         """Line 4509: model not found for cost estimation."""
         mock_client = MagicMock()
         mock_client.search_ai_models = AsyncMock(return_value={
@@ -1012,20 +1013,23 @@ class TestAIModelHandlers:
             ]}
         })
         self._install_mock_client(mock_client)
-        result = await self.mm._handle_estimate_transaction_cost(
-            {"model": "nonexistent", "provider": "unknown", "input_tokens": 100, "output_tokens": 50}
-        )
-        assert "not found" in result[0].text.lower()
+        with pytest.raises(ToolError) as refused:
+            await self.mm._handle_estimate_transaction_cost(
+                {"model": "nonexistent", "provider": "unknown", "input_tokens": 100, "output_tokens": 50}
+            )
+        assert "`nonexistent` is not in the AI model catalog" in refused.value.message
 
-    async def test_estimate_cost_empty_response(self):
-        """Line 4518: empty API response."""
+    async def test_estimate_cost_envelope_without_models_is_not_in_catalog(self):
+        """An envelope with no _embedded is an empty match, not a retrieval failure."""
         mock_client = MagicMock()
         mock_client.search_ai_models = AsyncMock(return_value={})
         self._install_mock_client(mock_client)
-        result = await self.mm._handle_estimate_transaction_cost(
-            {"model": "gpt-4o", "provider": "openai", "input_tokens": 100, "output_tokens": 50}
-        )
-        assert "failed" in result[0].text.lower()
+        with pytest.raises(ToolError) as refused:
+            await self.mm._handle_estimate_transaction_cost(
+                {"model": "gpt-4o", "provider": "openai", "input_tokens": 100, "output_tokens": 50}
+            )
+        assert "`gpt-4o` is not in the AI model catalog" in refused.value.message
+        assert "failed" not in refused.value.message.lower()
 
 
 # ===========================================================================
@@ -1079,10 +1083,11 @@ class TestGetIntegrationGuide:
     def setup_method(self):
         self.mm = make_mm()
 
-    async def test_java_returns_error(self):
+    async def test_java_raises(self):
         """Line 6790: Java language raises structured error."""
-        result = await self.mm._handle_get_integration_guide({"language": "java"})
-        assert "not supported" in result[0].text.lower() or "Java" in result[0].text
+        with pytest.raises(ToolError) as refused:
+            await self.mm._handle_get_integration_guide({"language": "java"})
+        assert "not supported" in refused.value.message.lower() or "Java" in refused.value.message
 
     async def test_javascript_guide(self):
         """Line 6814: JavaScript guide."""

@@ -15,6 +15,7 @@ from mcp.types import TextContent, ImageContent, EmbeddedResource
 from pydantic import StrictInt
 
 from .config import ToolConfig
+from ..common.tool_surface import TOOL_DOMAINS, ToolDomain
 # Note: PROFILE_DEFINITIONS is used indirectly through ToolConfig.is_tool_enabled()
 # which queries profiles.PROFILE_DEFINITIONS as the single source of truth
 from ..common.validation import (
@@ -28,8 +29,8 @@ from ..tools_decomposed.customer_management import (
     CUSTOMER_DATA_ARGUMENTS,
     CUSTOMER_DATA_READERS,
 )
-from ..tools_decomposed.dynamic_decorators import dynamic_mcp_tool
 from ..tools_decomposed.metering_elements_management import OVERRIDES_READERS
+from .tool_publishing import publish_tools
 from .schema_slimming import (
     apply_schema_slimming,
     apply_thin_tool_defaults,
@@ -37,7 +38,7 @@ from .schema_slimming import (
 )
 
 
-# The individual credential fields manage_subscriber_credentials declares. Create
+# The individual credential fields manage_credentials declares. Create
 # reads them only when credential_data is absent; update reads only
 # credential_data, so the closure folds them in for the other cases.
 CREDENTIAL_FIELD_ARGUMENTS = (
@@ -213,18 +214,6 @@ def _fold_credential_fields(arguments: Dict[str, Any]) -> Optional[Dict[str, Any
     return merged
 
 
-# Tool registration priority order following logical user journey hierarchy
-# This ensures tools are presented to AI agents in the optimal sequence:
-# 1. Setup & Onboarding (first-time user experience)
-# 2. Discovery & Capabilities (tool exploration)
-# 3. Monitoring & Analytics (operational insights)
-# 4. Usage-Based Billing Workflow (logical business sequence)
-# 5. System Diagnostics (troubleshooting - last)
-#
-# NOTE: This list defines ONLY the presentation order. The actual tools available
-# for each profile are defined in PROFILE_DEFINITIONS (profiles.py) as the single
-# source of truth. This registry uses PROFILE_DEFINITIONS to determine which tools
-# to register, then presents them in this priority order.
 # BACK-3090 (raised in review): the JSON-string arguments `manage_jobs` accepts
 # from agent interfaces that cannot send structured values, paired with the
 # guidance each malformed value gets. The wording is caller-facing and unchanged
@@ -239,37 +228,6 @@ MANAGE_JOBS_JSON_ARGUMENTS = (
     ("metrics", "Send it as a proper JSON value."),
 )
 
-TOOL_REGISTRATION_PRIORITY_ORDER = [
-    # Group 1: Setup & Onboarding (First-time user experience)
-    "system_setup",                    # Initial setup and configuration
-    "slack_management",                # Communication setup
-
-    # Group 2: Discovery & Capabilities (Tool exploration)
-    "tool_introspection",              # Tool discovery and metadata
-    "manage_capabilities",             # System capabilities overview
-
-    # Group 3: Monitoring & Analytics (Operational insights)
-    "manage_alerts",                   # Cost monitoring and alerting
-    "manage_ai_insights",              # AI-driven insights and recommendations
-    "business_analytics_management",   # Analytics and reporting
-    "manage_metering",                 # Transaction processing and metering
-
-    # Group 4: Usage-Based Billing Workflow (Logical business sequence)
-    "manage_customers",                # Customer management (start of UBB workflow)
-    "manage_products",                 # Product definition
-    "manage_sources",                  # Data sources configuration
-    "manage_metering_elements",        # Metering configuration
-    "manage_subscriptions",            # Subscription management
-    "manage_subscriber_credentials",   # Billing identity management
-    "manage_workflows",                # Automation and workflows
-    "manage_jobs",                     # Jobs & Outcomes management
-    "manage_tools",                    # Tool Registry management
-    "manage_agents",                   # Agent registry management
-    "manage_cost_controls",            # AI spend guardrails (cost-control CRUD + enforcement visibility)
-
-    # Group 5: System Diagnostics (Troubleshooting - last)
-    "system_diagnostics"               # System health and troubleshooting
-]
 
 
 class ToolConfigurationRegistry:
@@ -277,7 +235,8 @@ class ToolConfigurationRegistry:
 
     Follows the ConditionalToolRegistry pattern from the MCP Tool Architecture Guide.
     Provides dynamic tool registration without code duplication by using the
-    established @mcp.tool() + @dynamic_mcp_tool + standardized_tool_execution pattern.
+    closure + publish_tools + standardized_tool_execution pattern: each closure is
+    published as its domain's read-only tool and, when the domain writes, its write tool.
     """
 
     def __init__(self, tool_config: Optional[ToolConfig] = None):
@@ -302,35 +261,18 @@ class ToolConfigurationRegistry:
         logger.debug(f"Tool configuration registry initialized for profile: {self.tool_config.profile}")
 
     async def register_tools_conditionally(self, mcp: FastMCP) -> None:
-        """Register tools based on configuration profile in priority order.
-
-        Tools are registered following the logical user journey hierarchy defined in
-        TOOL_REGISTRATION_PRIORITY_ORDER, ensuring optimal presentation to AI agents.
+        """Register the enabled public tools of every domain, in ``TOOL_DOMAINS`` order.
 
         Args:
             mcp: FastMCP server instance for tool registration
         """
-        enabled_tools = self.tool_config.get_enabled_tools()
-        logger.info(f"Registering {len(enabled_tools)} tools for profile '{self.tool_config.profile}' in priority order")
+        for domain in TOOL_DOMAINS:
+            if any(self.tool_config.is_tool_enabled(name) for name in domain.public_names):
+                await self._register_domain(mcp, domain)
 
-        # Register tools in priority order, but only if they're enabled for the current profile
-        registered_count = 0
-        for tool_name in TOOL_REGISTRATION_PRIORITY_ORDER:
-            if self.tool_config.is_tool_enabled(tool_name):
-                await self._register_single_tool(mcp, tool_name)
-                registered_count += 1
-
-        # Log any enabled tools that weren't in the priority order (for debugging)
-        priority_set = set(TOOL_REGISTRATION_PRIORITY_ORDER)
-        missing_tools = enabled_tools - priority_set
-        if missing_tools:
-            logger.warning(f"Tools enabled but not in priority order: {missing_tools}")
-            # Register missing tools at the end to ensure they're not lost
-            for tool_name in sorted(missing_tools):
-                await self._register_single_tool(mcp, tool_name)
-                registered_count += 1
-
-        logger.info(f"Successfully registered {registered_count} tools in priority order")
+        logger.info(
+            f"Registered {len(self._registered_tools)} tools for profile '{self.tool_config.profile}'"
+        )
 
         # BACK-3170: the advertised schemas are derived from the closure
         # signatures above, which spell every accepted argument out as an
@@ -338,74 +280,47 @@ class ToolConfigurationRegistry:
         # list agents load on connect carries the shape rather than the noise.
         await apply_schema_slimming(mcp, sorted(self._registered_tools))
 
-    async def _register_single_tool(self, mcp: FastMCP, tool_name: str) -> None:
-        """Register a single tool following architecture guide patterns.
+    def _domain_registrars(self) -> Dict[str, Any]:
+        return {
+            "get_business_analytics": self._register_business_analytics_management,
+            "manage_alerts": self._register_manage_alerts,
+            "manage_ai_insights": self._register_manage_ai_insights,
+            "manage_slack": self._register_slack_management,
+            "manage_metering": self._register_manage_metering,
+            "manage_system_setup": self._register_system_setup,
+            "system_diagnostics": self._register_system_diagnostics,
+            "manage_sources": self._register_manage_sources,
+            "manage_workflows": self._register_manage_workflows,
+            "manage_credentials": self._register_manage_subscriber_credentials,
+            "manage_products": self._register_manage_products,
+            "manage_customers": self._register_manage_customers,
+            "manage_subscriptions": self._register_manage_subscriptions,
+            "manage_usage_meters": self._register_manage_metering_elements,
+            "get_capabilities": self._register_manage_capabilities,
+            "manage_jobs": self._register_manage_jobs,
+            "tool_introspection": self._register_tool_introspection,
+            "manage_tools": self._register_manage_tools,
+            "manage_agents": self._register_manage_agents,
+            "manage_cost_controls": self._register_manage_cost_controls,
+        }
 
-        Args:
-            mcp: FastMCP server instance
-            tool_name: Name of the tool to register
-        """
+    async def _register_domain(self, mcp: FastMCP, domain: ToolDomain) -> None:
+        """Register the enabled public tools of one domain and its introspection metadata."""
         try:
-            # Use dedicated registration functions for each tool
-            if tool_name == "business_analytics_management":
-                await self._register_business_analytics_management(mcp)
-            elif tool_name == "manage_alerts":
-                await self._register_manage_alerts(mcp)
-            elif tool_name == "manage_ai_insights":
-                await self._register_manage_ai_insights(mcp)
-            elif tool_name == "slack_management":
-                await self._register_slack_management(mcp)
-            elif tool_name == "manage_metering":
-                await self._register_manage_metering(mcp)
-            elif tool_name == "system_setup":
-                await self._register_system_setup(mcp)
-            elif tool_name == "system_diagnostics":
-                await self._register_system_diagnostics(mcp)
-
-            elif tool_name == "manage_sources":
-                await self._register_manage_sources(mcp)
-            elif tool_name == "manage_workflows":
-                await self._register_manage_workflows(mcp)
-            elif tool_name == "manage_subscriber_credentials":
-                await self._register_manage_subscriber_credentials(mcp)
-            elif tool_name == "manage_products":
-                await self._register_manage_products(mcp)
-            elif tool_name == "manage_customers":
-                await self._register_manage_customers(mcp)
-            elif tool_name == "manage_subscriptions":
-                await self._register_manage_subscriptions(mcp)
-            elif tool_name == "manage_metering_elements":
-                await self._register_manage_metering_elements(mcp)
-            elif tool_name == "manage_capabilities":
-                await self._register_manage_capabilities(mcp)
-            elif tool_name == "manage_jobs":
-                await self._register_manage_jobs(mcp)
-            elif tool_name == "tool_introspection":
-                await self._register_tool_introspection(mcp)
-            elif tool_name == "manage_tools":
-                await self._register_manage_tools(mcp)
-            elif tool_name == "manage_agents":
-                await self._register_manage_agents(mcp)
-            elif tool_name == "manage_cost_controls":
-                await self._register_manage_cost_controls(mcp)
-            else:
-                logger.warning(f"Unknown tool for registration: {tool_name}")
-                return
-
-            # Register tool metadata for introspection (only for enabled tools)
-            await self._register_tool_metadata(tool_name)
-
-            self._registered_tools.add(tool_name)
-            logger.debug(f"Registered tool: {tool_name}")
-
+            await self._domain_registrars()[domain.key](mcp)
+            await self._register_tool_metadata(domain.key)
+            enabled = {
+                name for name in domain.public_names if self.tool_config.is_tool_enabled(name)
+            }
+            self._registered_tools.update(enabled)
+            logger.debug(f"Registered tools: {sorted(enabled)}")
         except Exception as e:
-            logger.error(f"Failed to register tool {tool_name}: {e}")
+            logger.error(f"Failed to register the {domain.key} tools: {e}")
 
     async def _register_business_analytics_management(self, mcp: FastMCP) -> None:
         """Register business analytics management tool."""
-        @mcp.tool()
-        @dynamic_mcp_tool("business_analytics_management")
-        async def business_analytics_management(
+        @publish_tools(mcp, "get_business_analytics", self.tool_config.is_tool_enabled)
+        async def get_business_analytics(
             action: str = "get_capabilities",
             breakdown_by: Optional[str] = None,
             dimension: Optional[str] = None,
@@ -561,8 +476,8 @@ class ToolConfigurationRegistry:
                 "to_date": to_date,
                 "team_id": team_id
             }
-            arguments = merge_params_argument(arguments, params)
-            arguments = apply_thin_tool_defaults("business_analytics_management", arguments)
+            arguments = merge_params_argument(arguments, params, "get_business_analytics")
+            arguments = apply_thin_tool_defaults("get_business_analytics", arguments)
 
             # NUMERIC PREPROCESSING: Convert string numeric parameters to appropriate types
             numeric_params = {
@@ -602,7 +517,7 @@ class ToolConfigurationRegistry:
 
             # Use standardized execution path
             result = await standardized_tool_execution(
-                tool_name="business_analytics_management",
+                tool_name="get_business_analytics",
                 action=action,
                 arguments=arguments,
                 tool_class=BusinessAnalyticsManagement
@@ -611,8 +526,7 @@ class ToolConfigurationRegistry:
 
     async def _register_manage_alerts(self, mcp: FastMCP) -> None:
         """Register manage alerts tool."""
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_alerts")
+        @publish_tools(mcp, "manage_alerts", self.tool_config.is_tool_enabled)
         async def manage_alerts(
             action: str,
             alert_id: Optional[str] = None,
@@ -632,7 +546,6 @@ class ToolConfigurationRegistry:
             page: Optional[int] = None,
             size: Optional[int] = None,
             dry_run: Optional[Union[bool, str]] = None,
-            confirm: Optional[Union[bool, str]] = None,
             alert_type: Optional[str] = None,
             text: Optional[str] = None,
             query: Optional[str] = None,
@@ -646,6 +559,9 @@ class ToolConfigurationRegistry:
             provider: Optional[str] = None,
             # P2 Enhancement: Direct update parameters for flexible UX
             description: Optional[str] = None,
+            # The platform's alert has no tags. Declared only so the handler refuses
+            # it with that reason, which get_capabilities states: FastMCP answers an
+            # undeclared name with a generic error.
             tags: Optional[List[str]] = None,
             enabled: Optional[Union[bool, str]] = None,
             alertType: Optional[str] = None,
@@ -673,7 +589,6 @@ class ToolConfigurationRegistry:
                 "page": page,
                 "size": size,
                 "dry_run": dry_run,
-                "confirm": confirm,
                 "alert_type": alert_type,
                 "text": text,
                 "query": query,
@@ -694,7 +609,7 @@ class ToolConfigurationRegistry:
                 "slackConfigurations": slackConfigurations,
                 "notificationAddresses": notificationAddresses,
             }
-            arguments = merge_params_argument(arguments, params)
+            arguments = merge_params_argument(arguments, params, "manage_alerts")
 
             # SMART INPUT PREPROCESSING: agent interfaces serialize these two as
             # JSON strings. BACK-3170: decode AFTER the params merge, so a value
@@ -726,7 +641,7 @@ class ToolConfigurationRegistry:
             arguments = preprocess_numeric_parameters(arguments, {'page': int, 'size': int})
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values
-            boolean_params = ["dry_run", "confirm", "enabled", "include_trend", "isPercentage"]
+            boolean_params = ["dry_run", "enabled", "include_trend", "isPercentage"]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
 
             # Remove None values
@@ -747,8 +662,7 @@ class ToolConfigurationRegistry:
 
     async def _register_manage_ai_insights(self, mcp: FastMCP) -> None:
         """Register consolidated AI Insights management tool (BACK-1455)."""
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_ai_insights")
+        @publish_tools(mcp, "manage_ai_insights", self.tool_config.is_tool_enabled)
         async def manage_ai_insights(
             action: str = "get_capabilities",
             run_id: Optional[str] = None,
@@ -815,7 +729,7 @@ class ToolConfigurationRegistry:
                 "realized_savings_currency": realized_savings_currency,
                 "realized_savings_measured_at": realized_savings_measured_at,
             }
-            arguments = merge_params_argument(arguments, params)
+            arguments = merge_params_argument(arguments, params, "manage_ai_insights")
             arguments = apply_thin_tool_defaults("manage_ai_insights", arguments)
             arguments = {k: v for k, v in arguments.items() if v is not None}
 
@@ -831,9 +745,8 @@ class ToolConfigurationRegistry:
 
     async def _register_slack_management(self, mcp: FastMCP) -> None:
         """Register consolidated slack management tool."""
-        @mcp.tool()
-        @dynamic_mcp_tool("slack_management")
-        async def slack_management(
+        @publish_tools(mcp, "manage_slack", self.tool_config.is_tool_enabled)
+        async def manage_slack(
             action: str = "get_capabilities",
             config_id: Optional[str] = None,
             page: int = 0,
@@ -866,7 +779,7 @@ class ToolConfigurationRegistry:
 
             # Use standardized execution path
             result = await standardized_tool_execution(
-                tool_name="slack_management",
+                tool_name="manage_slack",
                 action=action,
                 arguments=arguments,
                 tool_class=SlackManagement
@@ -875,9 +788,8 @@ class ToolConfigurationRegistry:
 
     async def _register_system_setup(self, mcp: FastMCP) -> None:
         """Register consolidated system setup tool."""
-        @mcp.tool()
-        @dynamic_mcp_tool("system_setup")
-        async def system_setup(
+        @publish_tools(mcp, "manage_system_setup", self.tool_config.is_tool_enabled)
+        async def manage_system_setup(
             action: str = "show_welcome",
             show_environment: Optional[Union[bool, str]] = None,
             include_recommendations: Optional[Union[bool, str]] = None,
@@ -918,7 +830,7 @@ class ToolConfigurationRegistry:
 
             # Use standardized execution path
             result = await standardized_tool_execution(
-                tool_name="system_setup",
+                tool_name="manage_system_setup",
                 action=action,
                 arguments=arguments,
                 tool_class=SystemSetup
@@ -927,8 +839,7 @@ class ToolConfigurationRegistry:
 
     async def _register_system_diagnostics(self, mcp: FastMCP) -> None:
         """Register consolidated system diagnostics tool."""
-        @mcp.tool()
-        @dynamic_mcp_tool("system_diagnostics")
+        @publish_tools(mcp, "system_diagnostics", self.tool_config.is_tool_enabled)
         async def system_diagnostics(
             action: str = "system_health",
             format_output: Optional[str] = None,
@@ -948,12 +859,12 @@ class ToolConfigurationRegistry:
             # set_attribution_detail_text, set_usage_billing): the closure
             # signature is this tool's public schema, so their arguments must
             # be declared here for FastMCP to bind them at all. `enabled`
-            # carries the desired state for all three; `confirm` guards the
+            # carries the desired state for all three; `dry_run` previews the
             # strict-ingestion and usage-billing toggles, and
             # `allow_ticket_jobs` is read only by the strict-ingestion one.
             enabled: Optional[Union[bool, str]] = None,
             allow_ticket_jobs: Optional[Union[bool, str]] = None,
-            confirm: Optional[Union[bool, str]] = None
+            dry_run: Optional[Union[bool, str]] = None
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
 
             arguments = {
@@ -973,12 +884,10 @@ class ToolConfigurationRegistry:
                 "error_code": error_code,
                 "enabled": enabled,
                 "allow_ticket_jobs": allow_ticket_jobs,
-                "confirm": confirm
+                "dry_run": dry_run
             }
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values.
-            # "confirm" is deliberately excluded: the guarded toggles apply the change only
-            # for a literal boolean True, so a loosely typed confirm must stay a preview.
             boolean_params = [
                 "include_recommendations", "include_sensitive", "show_detailed_analysis",
                 "search_all_pages", "enabled", "allow_ticket_jobs"
@@ -1003,8 +912,7 @@ class ToolConfigurationRegistry:
 
     async def _register_manage_metering(self, mcp: FastMCP) -> None:
         """Register manage metering tool."""
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_metering")
+        @publish_tools(mcp, "manage_metering", self.tool_config.is_tool_enabled)
         async def manage_metering(
             action: str = "get_capabilities",
             model: Optional[str] = None,
@@ -1268,7 +1176,7 @@ class ToolConfigurationRegistry:
                 # Scope switch for the completions read actions
                 "include_coding_assistants": include_coding_assistants
             }
-            arguments = merge_params_argument(arguments, params)
+            arguments = merge_params_argument(arguments, params, "manage_metering")
             arguments = apply_thin_tool_defaults("manage_metering", arguments)
 
             raw_usage_metadata = arguments.get("usage_metadata")
@@ -1329,8 +1237,7 @@ class ToolConfigurationRegistry:
     # Placeholder methods for business profile tools
     async def _register_manage_sources(self, mcp: FastMCP) -> None:
         """Register manage sources tool."""
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_sources")
+        @publish_tools(mcp, "manage_sources", self.tool_config.is_tool_enabled)
         async def manage_sources(
             action: str = "get_capabilities",
             source_id: Optional[str] = None,
@@ -1405,8 +1312,7 @@ class ToolConfigurationRegistry:
 
     async def _register_manage_workflows(self, mcp: FastMCP) -> None:
         """Register manage workflows tool."""
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_workflows")
+        @publish_tools(mcp, "manage_workflows", self.tool_config.is_tool_enabled)
         async def manage_workflows(
             action: str = "get_capabilities",
             workflow_id: Optional[str] = None,
@@ -1490,9 +1396,8 @@ class ToolConfigurationRegistry:
 
     async def _register_manage_subscriber_credentials(self, mcp: FastMCP) -> None:
         """Register manage subscriber credentials tool."""
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_subscriber_credentials")
-        async def manage_subscriber_credentials(
+        @publish_tools(mcp, "manage_credentials", self.tool_config.is_tool_enabled)
+        async def manage_credentials(
             action: str = "get_capabilities",
             credential_id: Optional[str] = None,
             credential_data: Optional[Union[dict, str]] = None,
@@ -1593,7 +1498,7 @@ class ToolConfigurationRegistry:
 
             # Use standardized execution path
             result = await standardized_tool_execution(
-                tool_name="manage_subscriber_credentials",
+                tool_name="manage_credentials",
                 action=action,
                 arguments=arguments,
                 tool_class=SubscriberCredentialsManagement
@@ -1602,8 +1507,7 @@ class ToolConfigurationRegistry:
 
     async def _register_manage_products(self, mcp: FastMCP) -> None:
         """Register manage products tool."""
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_products")
+        @publish_tools(mcp, "manage_products", self.tool_config.is_tool_enabled)
         async def manage_products(
             action: str = "get_capabilities",
             product_id: Optional[str] = None,
@@ -1718,8 +1622,7 @@ class ToolConfigurationRegistry:
 
     async def _register_manage_customers(self, mcp: FastMCP) -> None:
         """Register manage customers tool."""
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_customers")
+        @publish_tools(mcp, "manage_customers", self.tool_config.is_tool_enabled)
         async def manage_customers(
             action: str = "get_capabilities",
             resource_type: Optional[str] = None,
@@ -1758,7 +1661,6 @@ class ToolConfigurationRegistry:
             domain: Optional[str] = None,
             # Department membership removals (delete_department_person, clear_department_assignment)
             person_id: Optional[Union[int, str]] = None,
-            confirm: Optional[Union[bool, str]] = None,
             page: Union[int, str] = 0,
             size: Union[int, str] = 20,
             filters: Optional[dict] = None,
@@ -1798,7 +1700,6 @@ class ToolConfigurationRegistry:
                 "policy": policy,
                 "domain": domain,
                 "person_id": person_id,
-                "confirm": confirm,
                 "page": page,
                 "size": size,
                 "filters": filters or {},
@@ -1868,8 +1769,6 @@ class ToolConfigurationRegistry:
             arguments = preprocess_numeric_parameters(arguments, numeric_params)
 
             # BOOLEAN PREPROCESSING: Convert string boolean parameters to actual boolean values.
-            # "confirm" is deliberately excluded: the department removals run only for a
-            # literal boolean True, so a loosely typed confirm must stay a preview.
             boolean_params = [
                 "auto_generate", "dry_run", "assisted_only", "digest_enabled", "rotting_alert_enabled"
             ]
@@ -1903,8 +1802,7 @@ class ToolConfigurationRegistry:
 
     async def _register_manage_subscriptions(self, mcp: FastMCP) -> None:
         """Register manage subscriptions tool."""
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_subscriptions")
+        @publish_tools(mcp, "manage_subscriptions", self.tool_config.is_tool_enabled)
         async def manage_subscriptions(
             action: str = "get_capabilities",
             subscription_id: Optional[str] = None,
@@ -1978,9 +1876,8 @@ class ToolConfigurationRegistry:
 
     async def _register_manage_metering_elements(self, mcp: FastMCP) -> None:
         """Register manage metering elements tool."""
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_metering_elements")
-        async def manage_metering_elements(
+        @publish_tools(mcp, "manage_usage_meters", self.tool_config.is_tool_enabled)
+        async def manage_usage_meters(
             action: str = "get_capabilities",
             element_id: Optional[str] = None,
             element_data: Optional[Union[dict, str]] = None,
@@ -2059,7 +1956,7 @@ class ToolConfigurationRegistry:
 
             # Use standardized execution path
             result = await standardized_tool_execution(
-                tool_name="manage_metering_elements",
+                tool_name="manage_usage_meters",
                 action=action,
                 arguments=arguments,
                 tool_class=MeteringElementsManagement
@@ -2068,9 +1965,8 @@ class ToolConfigurationRegistry:
 
     async def _register_manage_capabilities(self, mcp: FastMCP) -> None:
         """Register manage capabilities tool."""
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_capabilities")
-        async def manage_capabilities(
+        @publish_tools(mcp, "get_capabilities", self.tool_config.is_tool_enabled)
+        async def get_capabilities(
             action: str = "get_capabilities",
             capability_name: Optional[str] = None,
             resource_type: Optional[str] = None,
@@ -2093,7 +1989,7 @@ class ToolConfigurationRegistry:
 
             # Use standardized execution path
             result = await standardized_tool_execution(
-                tool_name="manage_capabilities",
+                tool_name="get_capabilities",
                 action=action,
                 arguments=arguments,
                 tool_class=ManageCapabilities
@@ -2112,8 +2008,7 @@ class ToolConfigurationRegistry:
         signature omits is rejected at the MCP boundary before `handle_action`
         runs.
         """
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_jobs")
+        @publish_tools(mcp, "manage_jobs", self.tool_config.is_tool_enabled)
         async def manage_jobs(
             action: str = "get_capabilities",
             job_id: Optional[str] = None,
@@ -2204,8 +2099,7 @@ class ToolConfigurationRegistry:
         """
         _JSONScalar = Union[str, int, float, bool]
 
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_tools")
+        @publish_tools(mcp, "manage_tools", self.tool_config.is_tool_enabled)
         async def manage_tools(
             action: _JSONScalar = "get_capabilities",
             tool_id: Optional[_JSONScalar] = None,
@@ -2222,7 +2116,7 @@ class ToolConfigurationRegistry:
             end_date: Optional[_JSONScalar] = None,
             granularity: Optional[_JSONScalar] = None,
             pricing_model: Optional[_JSONScalar] = None,
-            per_unit_price: Optional[float] = None,
+            per_unit_price: Optional[Union[float, str]] = None,
             tool_type: Optional[_JSONScalar] = None,
             tool_description: Optional[_JSONScalar] = None,
             tool_provider: Optional[_JSONScalar] = None,
@@ -2257,7 +2151,7 @@ class ToolConfigurationRegistry:
             }
             # Merge before filters is defaulted: an empty dict is not None, so a
             # filters value sent inside params would otherwise be dropped.
-            arguments = merge_params_argument(arguments, params)
+            arguments = merge_params_argument(arguments, params, "manage_tools")
 
             arguments = validate_string_params(
                 arguments,
@@ -2325,8 +2219,7 @@ class ToolConfigurationRegistry:
         """
         _JSONScalar = Union[str, int, float, bool]
 
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_agents")
+        @publish_tools(mcp, "manage_agents", self.tool_config.is_tool_enabled)
         async def manage_agents(
             action: _JSONScalar = "get_capabilities",
             agent_id: Optional[_JSONScalar] = None,
@@ -2397,8 +2290,7 @@ class ToolConfigurationRegistry:
         """
         _JSONScalar = Union[str, int, float, bool]
 
-        @mcp.tool()
-        @dynamic_mcp_tool("manage_cost_controls")
+        @publish_tools(mcp, "manage_cost_controls", self.tool_config.is_tool_enabled)
         async def manage_cost_controls(
             action: _JSONScalar = "get_capabilities",
             control_id: Optional[_JSONScalar] = None,
@@ -2512,60 +2404,22 @@ class ToolConfigurationRegistry:
             )
             return result
 
-    async def _register_tool_metadata(self, tool_name: str) -> None:
-        """Register tool metadata with introspection engine.
-
-        Args:
-            tool_name: Name of the tool to register metadata for
-        """
-        # Map tool names to their module and class names
-        tool_mapping = {
-            "business_analytics_management": ("business_analytics_management", "BusinessAnalyticsManagement"),
-            "manage_alerts": ("alert_management", "AlertManagement"),
-            "manage_ai_insights": ("ai_insights_management", "AIInsightsManagement"),
-            "slack_management": ("slack_management", "SlackManagement"),
-            "manage_metering": ("metering_management", "MeteringManagement"),
-            "system_setup": ("system_setup", "SystemSetup"),
-            "system_diagnostics": ("system_diagnostics", "SystemDiagnostics"),
-            "manage_sources": ("source_management", "SourceManagement"),
-            "manage_workflows": ("workflow_management", "WorkflowManagement"),
-            "manage_subscriber_credentials": ("subscriber_credentials_management", "SubscriberCredentialsManagement"),
-            "manage_products": ("product_management", "ProductManagement"),
-            "manage_customers": ("customer_management", "CustomerManagement"),
-            "manage_subscriptions": ("subscription_management", "SubscriptionManagement"),
-            "manage_metering_elements": ("metering_elements_management", "MeteringElementsManagement"),
-            "manage_capabilities": ("manage_capabilities", "ManageCapabilities"),
-            "manage_jobs": ("job_management", "JobManagement"),
-            "manage_tools": ("tool_management", "ToolManagement"),
-            "manage_agents": ("agent_management", "AgentManagement"),
-            "manage_cost_controls": ("cost_controls_management", "CostControlsManagement"),
-            "tool_introspection": None  # Registered separately
-        }
-
-        if tool_name == "tool_introspection":
-            # tool_introspection is registered via add_introspection_tool_to_server
-            # We don't need to register metadata again
+    async def _register_tool_metadata(self, key: str) -> None:
+        """Register a domain's class with the introspection engine under its domain key."""
+        if key == "tool_introspection":
             return
 
-        mapping = tool_mapping.get(tool_name)
-        if not mapping:
-            logger.warning(f"Unknown tool for metadata registration: {tool_name}")
+        from ..introspection.integration import introspection_integration
+        from ..tools_decomposed.tool_registry import _get_tool_class
+
+        tool_class = _get_tool_class(key)
+        if tool_class is None:
+            logger.warning(f"Unknown tool for metadata registration: {key}")
             return
-
-        module_file, class_name = mapping
-
         try:
-            # Dynamically import the tool class
-            import importlib
-            module_name = f"revenium_mcp_server.tools_decomposed.{module_file}"
-            module = importlib.import_module(module_name)
-            tool_class = getattr(module, class_name)
-
-            # Register with introspection
-            from ..introspection.integration import introspection_integration
-            await introspection_integration.register_tool_metadata(tool_name, tool_class)
+            await introspection_integration.register_tool_metadata(key, tool_class)
         except Exception as e:
-            logger.warning(f"Failed to register metadata for {tool_name}: {e}")
+            logger.warning(f"Failed to register metadata for {key}: {e}")
 
     def get_registered_tools(self) -> set:
         """Get set of registered tool names.

@@ -318,6 +318,25 @@ class TestOperationContext:
         summary = get_performance_summary()
         assert "test_type" in summary
 
+    @pytest.mark.asyncio
+    async def test_a_cancelled_async_operation_is_closed_as_a_failure(self):
+        """BACK-5130: a wait_for timeout cancels the operation; it must not stay open."""
+        from src.revenium_mcp_server.logging_config import performance_tracker
+
+        async def _tracked_wait():
+            async with async_operation_context(
+                "cancelled_op", "cancel_type"
+            ) as operation_id:
+                started.append(operation_id)
+                await asyncio.Event().wait()
+
+        started = []
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(_tracked_wait(), timeout=0.01)
+
+        assert started[0] not in performance_tracker.start_times
+        assert performance_tracker.metrics["cancel_type"]["failed_calls"] >= 1
+
 
 class TestHealthMonitor:
     """Test health monitoring functionality."""

@@ -6,6 +6,8 @@ event-metering (meter_event, list_events, record_event, get_events), and analyti
 including per-tool, aggregated, agent, provider, and filter options.
 """
 
+import ast
+import json
 import pathlib
 from datetime import datetime, timedelta
 
@@ -24,6 +26,7 @@ from src.revenium_mcp_server.client import ReveniumAPIError, ReveniumClient
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from mcp.types import TextContent
 from tests.unit._helpers_list_heading import LIST_HEADING_CASES, heading_and_body, rows
+from tests.unit._registered_tool_harness import call_domain_tool
 
 
 # ---------------------------------------------------------------------------
@@ -250,13 +253,13 @@ class TestToolManagerCreate:
 
     @pytest.mark.asyncio
     async def test_create_tool_sends_data(self, tool_manager, mock_client):
-        tool_data = {"name": "New Tool", "type": "api"}
+        tool_data = {"name": "New Tool", "toolType": "REST_API"}
         mock_client.create_tool.return_value = {"id": "t3", **tool_data}
         result = await tool_manager.create_tool({"tool_data": tool_data})
         assert result["name"] == "New Tool"
         # teamId is auto-injected from the client's auth context (see BACK-1095)
         mock_client.create_tool.assert_called_once_with(
-            {"name": "New Tool", "type": "api", "teamId": "test_team_id_456"}
+            {"name": "New Tool", "toolType": "REST_API", "teamId": "test_team_id_456"}
         )
 
     @pytest.mark.asyncio
@@ -588,10 +591,11 @@ class TestToolManagerRecordEvent:
     @pytest.mark.asyncio
     async def test_record_event_sends_data(self, tool_manager, mock_client):
         event_data = {"type": "invocation", "durationMs": 150, "success": True}
+        mock_client.get_tool.return_value = STORED_TOOL
         mock_client.record_tool_event.return_value = {"id": "e1", **event_data}
-        result = await tool_manager.record_event({"tool_id": "t1", "event_data": event_data})
+        result = await tool_manager.record_event({"tool_id": STORED_TOOL["id"], "event_data": event_data})
         assert result["id"] == "e1"
-        mock_client.record_tool_event.assert_called_once_with("t1", event_data)
+        mock_client.record_tool_event.assert_called_once_with(STORED_TOOL["toolId"], event_data)
 
     @pytest.mark.asyncio
     async def test_record_event_missing_tool_id_raises(self, tool_manager):
@@ -609,21 +613,210 @@ class TestToolManagerGetEvents:
 
     @pytest.mark.asyncio
     async def test_get_events_calls_client(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = STORED_TOOL
         mock_client.get_tool_events.return_value = {"events": [{"id": "e1"}]}
-        result = await tool_manager.get_events({"tool_id": "t1", "page": 1, "size": 10})
+        result = await tool_manager.get_events({"tool_id": STORED_TOOL["id"], "page": 1, "size": 10})
         assert "events" in result
-        mock_client.get_tool_events.assert_called_once_with("t1", page=1, size=10)
+        mock_client.get_tool_events.assert_called_once_with(STORED_TOOL["toolId"], page=1, size=10)
 
     @pytest.mark.asyncio
     async def test_get_events_uses_defaults(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = STORED_TOOL
         mock_client.get_tool_events.return_value = {"events": []}
-        await tool_manager.get_events({"tool_id": "t1"})
-        mock_client.get_tool_events.assert_called_once_with("t1", page=0, size=20)
+        await tool_manager.get_events({"tool_id": STORED_TOOL["id"]})
+        mock_client.get_tool_events.assert_called_once_with(STORED_TOOL["toolId"], page=0, size=20)
 
     @pytest.mark.asyncio
     async def test_get_events_missing_tool_id_raises(self, tool_manager):
         with pytest.raises(ToolError):
             await tool_manager.get_events({})
+
+
+# BACK-5127: the metering ingest registers any toolId it has not seen as a new
+# CUSTOM tool, so the registry id returned by create (5jpoM7 in the audit) was
+# forwarded as a toolId, a phantom tool named 5jpoM7 was registered and the
+# event was metered against it at charge 0.0.
+AUDIT_REGISTRY_ID = "5jpoM7"
+AUDIT_TOOL = {**STORED_TOOL, "id": AUDIT_REGISTRY_ID, "toolId": "mcp-test-simple-41b309ea"}
+AUDIT_EVENT = {"durationMs": 150, "success": True, "timestamp": "2026-10-28T15:46:59Z"}
+
+
+def _undecodable_id() -> ReveniumAPIError:
+    return ReveniumAPIError("Invalid Tool ID", status_code=400)
+
+
+def _unknown_tool_id() -> ReveniumAPIError:
+    return ReveniumAPIError("Tool not found with toolId", status_code=404)
+
+
+class TestEventActionsResolveTheRegistryId:
+    """record_event and get_events take the registry id or the toolId and send the toolId."""
+
+    @pytest.mark.asyncio
+    async def test_record_event_sends_the_toolid_of_the_registry_id(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = AUDIT_TOOL
+        await tool_manager.record_event({"tool_id": AUDIT_REGISTRY_ID, "event_data": AUDIT_EVENT})
+        mock_client.get_tool.assert_called_once_with(AUDIT_REGISTRY_ID)
+        mock_client.get_tool_by_tool_id.assert_not_called()
+        mock_client.record_tool_event.assert_called_once_with(AUDIT_TOOL["toolId"], AUDIT_EVENT)
+
+    @pytest.mark.asyncio
+    async def test_record_event_still_takes_a_registered_toolid(self, tool_manager, mock_client):
+        mock_client.get_tool.side_effect = _undecodable_id()
+        mock_client.get_tool_by_tool_id.return_value = AUDIT_TOOL
+        await tool_manager.record_event({"tool_id": AUDIT_TOOL["toolId"], "event_data": AUDIT_EVENT})
+        mock_client.get_tool_by_tool_id.assert_called_once_with(AUDIT_TOOL["toolId"])
+        mock_client.record_tool_event.assert_called_once_with(AUDIT_TOOL["toolId"], AUDIT_EVENT)
+
+    @pytest.mark.parametrize("registry_status", [400, 403, 404])
+    @pytest.mark.asyncio
+    async def test_record_event_refuses_an_unregistered_value_before_metering(
+        self, tool_manager, mock_client, registry_status
+    ):
+        mock_client.get_tool.side_effect = ReveniumAPIError("no such id", status_code=registry_status)
+        mock_client.get_tool_by_tool_id.side_effect = _unknown_tool_id()
+        with pytest.raises(ToolError) as exc:
+            await tool_manager.record_event({"tool_id": "no-such-tool", "event_data": AUDIT_EVENT})
+        mock_client.record_tool_event.assert_not_called()
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert exc.value.field == "tool_id"
+        assert "no-such-tool" in exc.value.message
+        assert "Nothing was recorded" in exc.value.message
+
+    @pytest.mark.parametrize("status", [429, 500, 503])
+    @pytest.mark.asyncio
+    async def test_record_event_lookup_failure_propagates_without_metering(
+        self, tool_manager, mock_client, status
+    ):
+        """A platform failure is not read as "no such tool", which would say to register it again."""
+        original = ReveniumAPIError("platform failure", status_code=status)
+        mock_client.get_tool.side_effect = original
+        with pytest.raises(ReveniumAPIError) as exc:
+            await tool_manager.record_event({"tool_id": AUDIT_REGISTRY_ID, "event_data": AUDIT_EVENT})
+        assert exc.value is original
+        mock_client.get_tool_by_tool_id.assert_not_called()
+        mock_client.record_tool_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_record_event_toolid_lookup_failure_propagates(self, tool_manager, mock_client):
+        original = ReveniumAPIError("platform failure", status_code=500)
+        mock_client.get_tool.side_effect = _undecodable_id()
+        mock_client.get_tool_by_tool_id.side_effect = original
+        with pytest.raises(ReveniumAPIError) as exc:
+            await tool_manager.record_event({"tool_id": AUDIT_TOOL["toolId"], "event_data": AUDIT_EVENT})
+        assert exc.value is original
+        mock_client.record_tool_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_record_event_checks_event_data_before_any_lookup(self, tool_manager, mock_client):
+        with pytest.raises(ToolError):
+            await tool_manager.record_event({"tool_id": AUDIT_REGISTRY_ID})
+        mock_client.get_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_events_reads_the_toolid_of_the_registry_id(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = AUDIT_TOOL
+        await tool_manager.get_events({"tool_id": AUDIT_REGISTRY_ID})
+        mock_client.get_tool_events.assert_called_once_with(AUDIT_TOOL["toolId"], page=0, size=20)
+
+    @pytest.mark.asyncio
+    async def test_get_events_refuses_an_unregistered_value_and_names_list_events(
+        self, tool_manager, mock_client
+    ):
+        mock_client.get_tool.side_effect = _undecodable_id()
+        mock_client.get_tool_by_tool_id.side_effect = _unknown_tool_id()
+        with pytest.raises(ToolError) as exc:
+            await tool_manager.get_events({"tool_id": "retired-tool"})
+        mock_client.get_tool_events.assert_not_called()
+        assert exc.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert any("list_events" in suggestion for suggestion in exc.value.suggestions)
+
+    @pytest.mark.parametrize(
+        "action, arguments, as_given",
+        [
+            ("record_event", {"event_data": AUDIT_EVENT}, "meter_event"),
+            ("get_events", {}, "list_events"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_toolid_with_a_slash_is_refused_with_the_call_that_takes_it_as_given(
+        self, tool_manager, mock_client, action, arguments, as_given
+    ):
+        """The registry has no by-toolId lookup for a '/' (encoded it answers 400, raw it answers 404)."""
+        mock_client.get_tool.side_effect = _undecodable_id()
+        with pytest.raises(ToolError) as exc:
+            await getattr(tool_manager, action)({"tool_id": "github/search", **arguments})
+        mock_client.get_tool_by_tool_id.assert_not_called()
+        mock_client.record_tool_event.assert_not_called()
+        mock_client.get_tool_events.assert_not_called()
+        assert exc.value.error_code == ErrorCodes.VALIDATION_ERROR
+        assert "github/search" in exc.value.message
+        assert any(as_given in suggestion for suggestion in exc.value.suggestions)
+
+    @pytest.mark.asyncio
+    async def test_a_registry_id_lookup_is_tried_before_the_slash_refusal(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = AUDIT_TOOL
+        await tool_manager.record_event({"tool_id": "odd/value", "event_data": AUDIT_EVENT})
+        mock_client.record_tool_event.assert_called_once_with(AUDIT_TOOL["toolId"], AUDIT_EVENT)
+
+    @pytest.mark.parametrize(
+        "method_name, expected",
+        [
+            ("get_tool", "/profitstream/v2/api/tools/a%3Fb%23c"),
+            ("get_tool_by_tool_id", "/profitstream/v2/api/tools/by-tool-id/a%3Fb%23c"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_the_tool_lookups_percent_encode_the_segment(self, method_name, expected):
+        client = ReveniumClient(
+            auth_config=AuthConfig(
+                api_key="test-key-xyz",
+                team_id="team_abc",
+                base_url="https://api.test.revenium.ai",
+                timeout=5.0,
+                max_retries=0,
+            )
+        )
+        client.get = AsyncMock(return_value={})
+        await getattr(client, method_name)("a?b#c")
+        assert client.get.call_args[0][0] == expected
+
+    @pytest.mark.asyncio
+    async def test_the_registered_tool_flags_the_refusal(self, monkeypatch, tmp_path):
+        record = AsyncMock()
+        monkeypatch.setattr(ReveniumClient, "get_tool", AsyncMock(side_effect=_undecodable_id()))
+        monkeypatch.setattr(
+            ReveniumClient, "get_tool_by_tool_id", AsyncMock(side_effect=_unknown_tool_id())
+        )
+        monkeypatch.setattr(ReveniumClient, "record_tool_event", record)
+        result, text = await call_domain_tool(
+            monkeypatch,
+            tmp_path,
+            "manage_tools",
+            {"action": "record_event", "tool_id": "no-such-tool", "event_data": AUDIT_EVENT},
+        )
+        assert result.is_error is True, text
+        assert "No registered tool has the registry id or toolId 'no-such-tool'" in text
+        record.assert_not_called()
+
+
+class TestEventToolIdIsDocumented:
+    """The schema and the examples say which identifier tool_id is for the event actions."""
+
+    @pytest.mark.asyncio
+    async def test_tool_id_description_names_both_identifiers_for_events(self, tool_mgmt):
+        schema = await tool_mgmt._get_input_schema()
+        description = schema["properties"]["tool_id"]["description"]
+        assert "record_event" in description
+        assert "registry id" in description
+        assert "toolId" in description
+
+    @pytest.mark.asyncio
+    async def test_record_event_capability_names_the_identifier(self, tool_mgmt):
+        capabilities = await tool_mgmt._get_tool_capabilities()
+        metering = next(c for c in capabilities if c.name == "Event Metering")
+        assert "registry id" in metering.parameters["record_event"]["tool_id"]
+        assert not any("tool_id='tool_123'" in example for example in metering.examples)
 
 
 # ===========================================================================
@@ -1021,6 +1214,112 @@ class TestToolManagerCreateSimple:
         """create_simple with unknown pricing_model raises ToolError."""
         with pytest.raises(ToolError):
             await tool_manager.create_simple({"tool_name": "X", "pricing_model": "invalid"})
+
+
+_SIMPLE_PRICING_MODELS = ("per_request", "tiered", "flat")
+
+_REFUSED_UNIT_PRICES = [
+    pytest.param(-1, "pricing.elements[0].unitPrice must be >= 0", id="negative"),
+    pytest.param("-0.5", "pricing.elements[0].unitPrice must be >= 0", id="negative_string"),
+    pytest.param("abc", "pricing.elements[0].unitPrice must be a number", id="non_numeric"),
+    pytest.param(True, "pricing.elements[0].unitPrice must be a number", id="boolean"),
+]
+
+
+async def _create_refusal(tool_manager, unit_price) -> str:
+    pricing = {"elements": [{"name": "requests", "unitPrice": unit_price, "aggregationType": "COUNT"}]}
+    with pytest.raises(ToolError) as refused:
+        await tool_manager.create_tool({"tool_data": {"name": "T", "pricing": pricing}})
+    return refused.value.message
+
+
+class TestCreateSimpleValidatesPricing:
+    """BACK-5148: create_simple refuses the prices create refuses, before any request."""
+
+    @pytest.mark.parametrize("pricing_model", _SIMPLE_PRICING_MODELS)
+    @pytest.mark.parametrize("unit_price, reason", _REFUSED_UNIT_PRICES)
+    @pytest.mark.asyncio
+    async def test_refuses_with_the_create_wording(
+        self, tool_manager, mock_client, pricing_model, unit_price, reason
+    ):
+        with pytest.raises(ToolError) as refused:
+            await tool_manager.create_simple(
+                {"tool_name": "T", "pricing_model": pricing_model, "per_unit_price": unit_price}
+            )
+
+        assert refused.value.message == f"Tool pricing validation failed: {reason}"
+        assert refused.value.message == await _create_refusal(tool_manager, unit_price)
+        mock_client.create_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refusal_names_the_argument_the_caller_sent(self, tool_manager):
+        with pytest.raises(ToolError) as refused:
+            await tool_manager.create_simple({"tool_name": "T", "per_unit_price": "abc"})
+
+        assert refused.value.field == "per_unit_price"
+        assert refused.value.value == "abc"
+
+    @pytest.mark.asyncio
+    async def test_refusal_does_not_recommend_create_simple_itself(self, tool_manager):
+        with pytest.raises(ToolError) as refused:
+            await tool_manager.create_simple({"tool_name": "T", "per_unit_price": -1})
+
+        assert not any("create_simple" in s for s in refused.value.suggestions or [])
+
+    @pytest.mark.parametrize("pricing_model", _SIMPLE_PRICING_MODELS)
+    @pytest.mark.asyncio
+    async def test_numeric_string_price_is_stored_as_a_number(
+        self, tool_manager, mock_client, pricing_model
+    ):
+        mock_client.create_tool.return_value = {"id": "t1"}
+
+        await tool_manager.create_simple(
+            {"tool_name": "T", "pricing_model": pricing_model, "per_unit_price": "0.02"}
+        )
+
+        element = mock_client.create_tool.call_args[0][0]["pricing"]["elements"][0]
+        assert element["unitPrice"] == 0.02
+
+    @pytest.mark.parametrize("pricing_model", _SIMPLE_PRICING_MODELS)
+    @pytest.mark.asyncio
+    async def test_zero_price_is_accepted(self, tool_manager, mock_client, pricing_model):
+        mock_client.create_tool.return_value = {"id": "t1"}
+
+        await tool_manager.create_simple(
+            {"tool_name": "T", "pricing_model": pricing_model, "per_unit_price": 0}
+        )
+
+        mock_client.create_tool.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        "unit_price, reason",
+        [
+            pytest.param(-1, "unitPrice must be >= 0", id="negative"),
+            pytest.param("abc", "unitPrice must be a number", id="non_numeric"),
+        ],
+    )
+    @pytest.mark.parametrize("dry_run", [False, True], ids=["live", "dry_run"])
+    @pytest.mark.asyncio
+    async def test_registered_tool_refuses_before_any_request(
+        self, monkeypatch, tmp_path, unit_price, reason, dry_run
+    ):
+        create = AsyncMock()
+        monkeypatch.setattr(ReveniumClient, "create_tool", create)
+        arguments = {
+            "action": "create_simple",
+            "tool_name": "mcp-test-neg",
+            "pricing_model": "per_request",
+            "per_unit_price": unit_price,
+        }
+        if dry_run:
+            arguments["dry_run"] = True
+
+        result, text = await call_domain_tool(monkeypatch, tmp_path, "manage_tools", arguments)
+
+        assert result.is_error is True, text
+        if not dry_run:
+            assert f"Tool pricing validation failed: pricing.elements[0].{reason}" in text
+        create.assert_not_called()
 
 
 class TestToolManagerGetPricingHelp:
@@ -1816,8 +2115,9 @@ class TestAgenticJobIdIsNotGatedClientSide:
     @pytest.mark.asyncio
     async def test_record_event_preserves_the_job_link(self, tool_manager, mock_client):
         event_data = {"durationMs": 150, "agenticJobId": "job_123"}
-        await tool_manager.record_event({"tool_id": "tool_123", "event_data": event_data})
-        mock_client.record_tool_event.assert_called_once_with("tool_123", event_data)
+        mock_client.get_tool.return_value = STORED_TOOL
+        await tool_manager.record_event({"tool_id": STORED_TOOL["id"], "event_data": event_data})
+        mock_client.record_tool_event.assert_called_once_with(STORED_TOOL["toolId"], event_data)
 
     @pytest.mark.asyncio
     async def test_server_rejection_reaches_the_agent(self, tool_manager, mock_client):
@@ -2001,3 +2301,196 @@ class TestAgentBreakdownOverTheWire:
         assert params["endDate"] == "2026-10-15T00:00:00.000Z"
         assert "start_date" not in params and "end_date" not in params
         assert sent["url"] == "https://ai.test.example/api/v2/analytics/agent-tool-breakdown"
+
+
+# ===========================================================================
+# BACK-5083: tool_data keys the Tool Registry does not store are refused
+# ===========================================================================
+
+# Every field a create or update can write, as the vendored platform spec's
+# ToolResource lists them (plan follows pricing; team follows teamId).
+_STORED_TOOL_DATA = {
+    "name": "Vector DB Query",
+    "toolId": "vector-db-query",
+    "toolType": "CUSTOM",
+    "toolProvider": "internal",
+    "description": "Vector database query tool",
+    "enabled": True,
+    "pricing": {
+        "currency": "USD",
+        "elements": [{"name": "requests", "unitPrice": 0.01, "aggregationType": "COUNT"}],
+    },
+    "teamId": "test_team_id_456",
+}
+
+
+def _tool_data_keys_in(call_text: str) -> set:
+    """The tool_data keys of a rendered example call such as create(tool_data={...})."""
+    call = ast.parse(call_text.replace("{...}", "{}"), mode="eval").body
+    tool_data = next(keyword.value for keyword in call.keywords if keyword.arg == "tool_data")
+    return {key.value for key in tool_data.keys}
+
+
+class TestToolDataKeysTheRegistryDoesNotStore:
+    """BACK-5083: an unstored tool_data key was answered "Tool updated" and dropped."""
+
+    @pytest.mark.asyncio
+    async def test_update_refuses_the_snake_case_spelling_and_names_the_stored_one(
+        self, tool_manager, mock_client
+    ):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
+
+        with pytest.raises(ToolError) as excinfo:
+            await tool_manager.update_tool({"tool_id": "5o2NBn", "tool_data": {"tool_provider": "mcp-test-snake"}})
+
+        assert excinfo.value.error_code == ErrorCodes.VALIDATION_ERROR
+        assert "tool_provider" in excinfo.value.message
+        assert "toolProvider" in excinfo.value.message
+        mock_client.get_tool.assert_not_awaited()
+        mock_client.update_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_refuses_an_arbitrary_key_and_sends_nothing(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
+
+        with pytest.raises(ToolError) as excinfo:
+            await tool_manager.update_tool({"tool_id": "5o2NBn", "tool_data": {"colour": "blue"}})
+
+        assert excinfo.value.error_code == ErrorCodes.VALIDATION_ERROR
+        assert "colour" in excinfo.value.message
+        assert "Nothing was sent" in excinfo.value.message
+        mock_client.update_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_stored_field_beside_an_unstored_one_is_not_applied_either(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
+
+        with pytest.raises(ToolError) as excinfo:
+            await tool_manager.update_tool(
+                {"tool_id": "5o2NBn", "tool_data": {"description": "new", "colour": "blue", "tool_type": "HUMAN"}}
+            )
+
+        assert "colour" in excinfo.value.message
+        assert "tool_type" in excinfo.value.message
+        assert "toolType" in excinfo.value.message
+        mock_client.update_tool.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("key", "stored_spelling"),
+        [("tool_provider", "toolProvider"), ("type", "toolType"), ("tool_id", "toolId"), ("colour", None)],
+    )
+    @pytest.mark.asyncio
+    async def test_create_refuses_an_unstored_key_before_any_request(
+        self, tool_manager, mock_client, key, stored_spelling
+    ):
+        with pytest.raises(ToolError) as excinfo:
+            await tool_manager.create_tool({"tool_data": {"name": "T", "toolType": "CUSTOM", key: "x"}})
+
+        assert excinfo.value.error_code == ErrorCodes.VALIDATION_ERROR
+        assert key in excinfo.value.message
+        if stored_spelling:
+            assert stored_spelling in excinfo.value.message
+        mock_client.create_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_accepts_every_stored_field(self, tool_manager, mock_client):
+        mock_client.create_tool.return_value = {"id": "t1"}
+
+        await tool_manager.create_tool({"tool_data": dict(_STORED_TOOL_DATA)})
+
+        mock_client.create_tool.assert_awaited_once_with(_STORED_TOOL_DATA)
+
+    @pytest.mark.asyncio
+    async def test_update_accepts_every_stored_field(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
+
+        await tool_manager.update_tool({"tool_id": "5o2NBn", "tool_data": dict(_STORED_TOOL_DATA)})
+
+        mock_client.update_tool.assert_awaited_once_with("5o2NBn", _STORED_TOOL_DATA)
+
+    def test_every_platform_tool_property_is_either_written_or_set_by_the_platform(self):
+        from src.revenium_mcp_server.tools_decomposed.tool_management import (
+            _PLATFORM_SET_TOOL_FIELDS,
+            _TOOL_WRITE_FIELDS,
+        )
+
+        spec_path = pathlib.Path(__file__).resolve().parents[2] / "specs" / "openapi" / "hypercurrent.json"
+        properties = json.loads(spec_path.read_text())["components"]["schemas"]["ToolResource"]["properties"]
+        read_only = {name for name, schema in properties.items() if schema.get("readOnly")}
+
+        assert set(_TOOL_WRITE_FIELDS) == set(_STORED_TOOL_DATA)
+        assert not set(_TOOL_WRITE_FIELDS) & set(_PLATFORM_SET_TOOL_FIELDS)
+        assert set(_TOOL_WRITE_FIELDS) | set(_PLATFORM_SET_TOOL_FIELDS) == set(properties)
+        assert read_only <= set(_PLATFORM_SET_TOOL_FIELDS)
+
+    @pytest.mark.asyncio
+    async def test_a_get_record_sent_back_with_one_edit_applies_the_edit(self, tool_manager, mock_client):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
+        echoed = {**STORED_TOOL, "description": "edited"}
+
+        await tool_manager.update_tool({"tool_id": "l39KLb", "tool_data": echoed})
+
+        body = mock_client.update_tool.await_args.args[1]
+        assert body["description"] == "edited"
+        assert not {"id", "created", "updated", "label", "_links", "team", "configSource"} & set(body)
+
+    @pytest.mark.parametrize(
+        ("field", "value", "hint"),
+        [("id", "other", None), ("team", {"id": "other_team"}, "teamId"), ("plan", {"id": "p2"}, "pricing")],
+    )
+    @pytest.mark.asyncio
+    async def test_a_changed_platform_set_field_is_refused_and_nothing_is_written(
+        self, tool_manager, mock_client, field, value, hint
+    ):
+        mock_client.get_tool.return_value = dict(STORED_TOOL)
+
+        with pytest.raises(ToolError) as excinfo:
+            await tool_manager.update_tool({"tool_id": "l39KLb", "tool_data": {"name": "x", field: value}})
+
+        assert excinfo.value.error_code == ErrorCodes.VALIDATION_ERROR
+        assert f"{field} (set by the platform" in excinfo.value.message
+        if hint:
+            assert hint in excinfo.value.message
+        assert "did you mean" not in excinfo.value.message
+        mock_client.update_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_refuses_a_platform_set_field_without_a_rename_hint(self, tool_manager, mock_client):
+        with pytest.raises(ToolError) as excinfo:
+            await tool_manager.create_tool({"tool_data": {"name": "T", "toolType": "CUSTOM", "team": {"id": "t"}}})
+
+        assert "team (set by the platform; send teamId" in excinfo.value.message
+        assert "did you mean" not in excinfo.value.message
+        mock_client.create_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_advertised_tool_data_schema_lists_only_accepted_fields(self, tool_mgmt):
+        schema = (await tool_mgmt._get_input_schema())["properties"]["tool_data"]
+
+        assert set(schema["properties"]) == set(_STORED_TOOL_DATA)
+        assert schema["additionalProperties"] is False
+
+    @pytest.mark.parametrize(("method", "arguments"), [("create_tool", {}), ("update_tool", {"tool_id": "t1"})])
+    @pytest.mark.asyncio
+    async def test_missing_parameter_examples_use_only_accepted_fields(self, tool_manager, method, arguments):
+        with pytest.raises(ToolError) as excinfo:
+            await getattr(tool_manager, method)(arguments)
+
+        assert _tool_data_keys_in(excinfo.value.examples["usage"]) <= set(_STORED_TOOL_DATA)
+
+    @pytest.mark.asyncio
+    async def test_capability_examples_use_only_accepted_fields(self, tool_mgmt):
+        crud = next(c for c in await tool_mgmt._get_tool_capabilities() if c.name == "Tool CRUD Operations")
+        tool_data_examples = [example for example in crud.examples if "tool_data=" in example]
+
+        assert any(example.startswith("update(") for example in tool_data_examples)
+        for example in tool_data_examples:
+            assert _tool_data_keys_in(example) <= set(_STORED_TOOL_DATA)
+
+    @pytest.mark.asyncio
+    async def test_get_examples_create_and_update_use_only_accepted_fields(self, tool_mgmt):
+        result = await tool_mgmt.handle_action("get_examples", {})
+        examples = json.loads(result[0].text.split("\n", 1)[1])["examples"]
+
+        for action in ("create", "update"):
+            assert set(examples[action]["tool_data"]) <= set(_STORED_TOOL_DATA)

@@ -5,6 +5,8 @@ Focuses on validation logic, transaction ID matching, timestamp handling, field 
 checks, and handle_action routing — all high-value behavioral paths.
 """
 
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -644,7 +646,7 @@ class TestMeteringManagementHandleAction:
         assert "DRY RUN" in result[0].text
 
     @pytest.mark.asyncio
-    async def test_submit_dry_run_invalid_returns_failure_text(self, mgmt):
+    async def test_submit_dry_run_invalid_raises(self, mgmt):
         with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_gc.return_value = make_client()
             with patch.object(
@@ -658,13 +660,13 @@ class TestMeteringManagementHandleAction:
                     "message": "Missing required field: model",
                 },
             ):
-                result = await mgmt.handle_action(
-                    "submit_ai_transaction",
-                    {"dry_run": True},
-                )
-        assert isinstance(result[0], TextContent)
-        assert "DRY RUN" in result[0].text
-        assert "Validation Failed" in result[0].text or "Errors Found" in result[0].text
+                with pytest.raises(ToolError) as refused:
+                    await mgmt.handle_action(
+                        "submit_ai_transaction",
+                        {"dry_run": True},
+                    )
+        assert "DRY RUN" in refused.value.message
+        assert "Validation Failed" in refused.value.message or "Errors Found" in refused.value.message
 
     @pytest.mark.asyncio
     async def test_get_transaction_status_not_found(self, mgmt):
@@ -870,18 +872,19 @@ class TestValidateModelProviderUsesExactMatch:
         assert "gpt-4o" in text
 
     @pytest.mark.asyncio
-    async def test_a_response_that_is_not_an_envelope_still_reports_retrieval_failure(
+    async def test_a_response_that_is_not_an_envelope_still_raises_the_retrieval_failure(
         self, mgmt
     ):
         """A genuine failure to read the models service keeps the outage message."""
         client = make_client()
         client.search_ai_models = AsyncMock(return_value=None)
         with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
-            result = await mgmt.handle_action(
-                "validate_model_provider", {"model": "gpt-4o", "provider": "openai"}
-            )
+            with pytest.raises(ToolError) as refused:
+                await mgmt.handle_action(
+                    "validate_model_provider", {"model": "gpt-4o", "provider": "openai"}
+                )
 
-        text = result[0].text
+        text = refused.value.message
         assert "Unable to retrieve models from API" in text, text
 
     @pytest.mark.asyncio
@@ -1194,6 +1197,93 @@ class TestValidateModelProviderUsesExactMatch:
         text = result[0].text
         assert "Validation Successful" in text, text
         assert "not in the AI model catalog" not in text
+
+
+class TestLiveSubmitCarriesTheCatalogWarning:
+    """BACK-5130: a live submit of an unpriced pair says so instead of succeeding silently."""
+
+    NOVEL_MODEL = "mcp-test-model-962b0751-9274-41a5-9c6a-6b48a3f3f57c"
+
+    def _payload(self, model, provider="openai"):
+        return {
+            "model": model,
+            "provider": provider,
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "duration_ms": 1000,
+        }
+
+    async def _live_submit(self, client, payload):
+        mgmt = MeteringManagement()
+        mgmt.get_client = AsyncMock(return_value=client)
+        result = await _submit_without_async_validation(mgmt, payload)
+        return result[0].text
+
+    @pytest.mark.asyncio
+    async def test_an_uncatalogued_model_is_submitted_with_the_dry_run_warning(self):
+        client = make_model_catalog_client()
+        text = await self._live_submit(client, self._payload(self.NOVEL_MODEL))
+
+        assert "Transaction Submitted Successfully" in text, text
+        assert f"`{self.NOVEL_MODEL}` is not in the AI model catalog" in text
+        client.post.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_uncatalogued_model_says_the_row_is_stored_at_zero_cost(self):
+        text = await self._live_submit(
+            make_model_catalog_client(), self._payload(self.NOVEL_MODEL)
+        )
+
+        assert "**Stored Unpriced**" in text, text
+        assert "$0.00" in text
+
+    @pytest.mark.asyncio
+    async def test_a_catalogued_model_on_the_wrong_provider_is_also_flagged_unpriced(
+        self,
+    ):
+        text = await self._live_submit(
+            make_model_catalog_client(), self._payload("gpt-4o", provider="anthropic")
+        )
+
+        assert "not for provider `anthropic`" in text, text
+        assert "**Stored Unpriced**" in text
+
+    @pytest.mark.asyncio
+    async def test_a_catalogued_pair_is_submitted_without_a_warning(self):
+        text = await self._live_submit(
+            make_model_catalog_client(), self._payload("gpt-4o")
+        )
+
+        assert "Transaction Submitted Successfully" in text, text
+        assert "Warning" not in text
+        assert "Stored Unpriced" not in text
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_catalog_never_blames_the_model(self):
+        client = make_client()
+        client.search_ai_models = AsyncMock(return_value=None)
+        text = await self._live_submit(client, self._payload(self.NOVEL_MODEL))
+
+        assert "Transaction Submitted Successfully" in text, text
+        assert "Warning" not in text
+        assert "Stored Unpriced" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_slow_catalog_does_not_hold_back_the_confirmation(self):
+        async def _never_answers(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        client = make_client()
+        client.search_ai_models = AsyncMock(side_effect=_never_answers)
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.metering_management"
+            "._LIVE_SUBMIT_CATALOG_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            text = await self._live_submit(client, self._payload(self.NOVEL_MODEL))
+
+        assert "Transaction Submitted Successfully" in text, text
+        assert "Stored Unpriced" not in text
 
 
 # ===========================================================================
@@ -1744,3 +1834,186 @@ class TestValidateEntrypoint:
             manager._validate_transaction_inputs({**VALID_TRANSACTION, "entrypoint": "bad value"})
             is False
         )
+
+
+# ===========================================================================
+# BACK-5149: estimate_transaction_cost looks the model up by its exact name
+# ===========================================================================
+
+GPT5_OPENAI = {
+    "id": "l31YdK",
+    "name": "gpt-5",
+    "provider": "openai",
+    "inputCostPerToken": 0.00000125,
+    "outputCostPerToken": 0.00001,
+}
+GPT5_SUBSTRING_ROWS = [
+    {"id": f"row{i}", "name": f"azure/gpt-5.{i}", "provider": "azure"} for i in range(323)
+]
+HAL_EMPTY_PAGE = {
+    "_links": {"self": {"href": "/v2/api/sources/ai/models"}},
+    "page": {"size": 100, "totalElements": 0, "totalPages": 0, "number": 0},
+}
+
+
+def make_paged_catalog_client(catalog):
+    """Catalog double that pages its substring results, as the platform does.
+
+    Rows are returned in catalog order, so a model listed after `size` other
+    rows that contain its name is only reachable through exactMatch. An empty
+    result carries no `_embedded`, like the platform's HAL envelope.
+    """
+    client = make_client()
+
+    async def _search(query, page=0, size=20, **filters):
+        if filters.get("exactMatch"):
+            matches = [m for m in catalog if m["name"].lower() == query.lower()]
+        else:
+            matches = [m for m in catalog if query.lower() in m["name"].lower()]
+        rows = matches[page * size : (page + 1) * size]
+        return {"_embedded": {"aIModelResourceList": rows}} if rows else HAL_EMPTY_PAGE
+
+    client.search_ai_models = AsyncMock(side_effect=_search)
+    return client
+
+
+async def _estimate_with(client, model, provider):
+    mgmt = MeteringManagement()
+    with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+        return await mgmt.handle_action(
+            "estimate_transaction_cost",
+            {"model": model, "provider": provider, "input_tokens": 1000, "output_tokens": 500},
+        )
+
+
+class TestEstimateTransactionCostUsesExactMatch:
+    @pytest.mark.asyncio
+    async def test_a_model_past_the_first_substring_page_is_estimated(self):
+        client = make_paged_catalog_client([*GPT5_SUBSTRING_ROWS, GPT5_OPENAI])
+
+        result = await _estimate_with(client, "gpt-5", "openai")
+
+        text = result[0].text
+        assert "**Model**: gpt-5 (openai)" in text, text
+        assert "**Total Cost**: **$0.006250**" in text, text
+
+    @pytest.mark.asyncio
+    async def test_the_lookup_asks_for_the_exact_name(self):
+        client = make_paged_catalog_client([GPT5_OPENAI])
+
+        await _estimate_with(client, "gpt-5", "openai")
+
+        client.search_ai_models.assert_called_once_with(
+            query="gpt-5", page=0, size=100, exactMatch=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_model_is_refused_as_not_in_the_catalog(self):
+        client = make_paged_catalog_client([GPT5_OPENAI])
+
+        with pytest.raises(ToolError) as refused:
+            await _estimate_with(client, "gpt-9-nonexistent", "openai")
+
+        message = refused.value.message
+        assert "`gpt-9-nonexistent` is not in the AI model catalog" in message, message
+        assert "API" not in message
+        assert "failed" not in message.lower()
+        assert refused.value.error_code == "RESOURCE_NOT_FOUND"
+
+    @pytest.mark.asyncio
+    async def test_a_name_priced_for_another_provider_names_the_listed_providers(self):
+        client = make_paged_catalog_client([GPT5_OPENAI])
+
+        with pytest.raises(ToolError) as refused:
+            await _estimate_with(client, "gpt-5", "anthropic")
+
+        message = refused.value.message
+        assert "not for provider `anthropic`" in message, message
+        assert "`openai`" in message
+        assert refused.value.error_code == "RESOURCE_NOT_FOUND"
+
+    @pytest.mark.asyncio
+    async def test_a_response_that_is_not_a_search_envelope_is_a_retrieval_failure(self):
+        client = make_client()
+        client.search_ai_models = AsyncMock(return_value=None)
+
+        with pytest.raises(ToolError) as refused:
+            await _estimate_with(client, "gpt-5", "openai")
+
+        assert "Unable to retrieve model pricing" in refused.value.message
+        assert refused.value.error_code == "API_ERROR"
+
+
+    @pytest.mark.parametrize(
+        "envelope",
+        [
+            {"_embedded": {"unexpectedCollection": []}},
+            {"_embedded": {"aIModelResourceList": "not-a-list"}},
+            {"_embedded": "not-a-dict"},
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_an_embedded_block_without_the_model_collection_is_a_retrieval_failure(
+        self, envelope
+    ):
+        client = make_client()
+        client.search_ai_models = AsyncMock(return_value=envelope)
+
+        with pytest.raises(ToolError) as refused:
+            await _estimate_with(client, "gpt-5", "openai")
+
+        assert "Unable to retrieve model pricing" in refused.value.message
+        assert "not in the AI model catalog" not in refused.value.message
+        assert refused.value.error_code == "API_ERROR"
+
+
+# ===========================================================================
+# BACK-5150: retry_number is bounded to the platform's Int range
+# ===========================================================================
+
+INT32_MAX = 2**31 - 1
+
+
+async def _submit_refusal(arguments):
+    """Submit through handle_action with every validator live; return the refusal text."""
+    mgmt = MeteringManagement()
+    client = make_model_catalog_client([
+        {"id": "m", "name": "gpt-4", "provider": "OPENAI", "inputCostPerToken": 0.00003,
+         "outputCostPerToken": 0.00006},
+    ])
+    with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=client):
+        with pytest.raises(ToolError) as refused:
+            await mgmt.handle_action("submit_ai_transaction", arguments)
+    client.post.assert_not_called()
+    return refused.value.message
+
+
+class TestRetryNumberIsBoundedToInt32:
+    @pytest.mark.parametrize("dry_run", [True, False])
+    @pytest.mark.parametrize("retry_number", [INT32_MAX + 1, 2**63])
+    @pytest.mark.asyncio
+    async def test_a_retry_number_above_int32_is_refused_before_any_request(
+        self, dry_run, retry_number
+    ):
+        message = await _submit_refusal(
+            {**VALID_TRANSACTION, "retry_number": retry_number, "dry_run": dry_run}
+        )
+
+        assert f"retry_number: Must be between 0 and {INT32_MAX}, got {retry_number}" in message
+
+    @pytest.mark.parametrize("dry_run", [True, False])
+    @pytest.mark.asyncio
+    async def test_usage_metadata_retry_number_is_bounded_the_same_way(self, dry_run):
+        message = await _submit_refusal(
+            {**VALID_TRANSACTION, "usage_metadata": {"retryNumber": INT32_MAX + 1}, "dry_run": dry_run}
+        )
+
+        assert f"usage_metadata.retryNumber: Must be between 0 and {INT32_MAX}" in message
+
+    @pytest.mark.asyncio
+    async def test_the_int32_maximum_is_accepted(self):
+        errors = await MeteringTransactionManager()._validate_optional_fields(
+            {**VALID_TRANSACTION, "retry_number": INT32_MAX}
+        )
+
+        assert not any("retry_number" in e for e in errors), errors

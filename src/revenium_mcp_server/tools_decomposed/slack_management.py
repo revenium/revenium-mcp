@@ -12,10 +12,7 @@ if TYPE_CHECKING:
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
-from ..common.error_handling import (
-    create_structured_validation_error,
-    raise_structured_error,
-)
+from ..common.error_handling import raise_unknown_action_error
 from ..introspection.metadata import ToolCapability, ToolType
 from .slack_configuration_management import SlackConfigurationManagement
 from .slack_oauth_workflow import SlackOAuthWorkflow
@@ -32,7 +29,7 @@ class SlackManagement(ToolBase):
     - Setup assistance: Intelligent guidance and recommendations
     """
 
-    tool_name: ClassVar[str] = "slack_management"
+    tool_name: ClassVar[str] = "manage_slack"
     tool_description: ClassVar[str] = (
         "Unified Slack integration management combining configuration, OAuth workflow, and setup assistance. Key actions: list_configurations, get_configuration, set_default_configuration, initiate_oauth, guided_setup, quick_setup. Use get_capabilities() for complete action list."
     )
@@ -267,41 +264,8 @@ All actions support the same parameters as their original tools for 100% compati
     async def _handle_unknown_action(
         self, action: str
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Handle unknown actions with helpful guidance."""
-        all_actions = list(self.action_routing.keys()) + ["get_capabilities", "get_examples"]
-
-        error = create_structured_validation_error(
-            field="action",
-            value=action,
-            message=f"Unknown slack management action: {action}",
-            examples={
-                "valid_actions": all_actions,
-                "configuration_actions": [
-                    "list_configurations",
-                    "get_configuration",
-                    "set_default_configuration",
-                    "get_default_configuration",
-                ],
-                "oauth_actions": [
-                    "initiate_oauth",
-                    "refresh_configurations",
-                    "get_oauth_instructions",
-                ],
-                "setup_actions": [
-                    "guided_setup",
-                    "quick_setup",
-                    "setup_status",
-                    "detect_and_recommend",
-                ],
-                "example_usage": {
-                    "guided_setup": "Interactive setup with recommendations",
-                    "list_configurations": "View all available Slack configurations",
-                    "initiate_oauth": "Start OAuth flow for new workspace",
-                },
-            },
-        )
-
-        raise_structured_error(error)
+        """Refuse an action this class does not route; the caller's message lists the valid ones."""
+        raise_unknown_action_error(action)
 
     async def _get_supported_actions(self) -> List[str]:
         """Get all supported actions from consolidated tool."""

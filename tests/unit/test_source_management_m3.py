@@ -600,10 +600,10 @@ class TestSourceManagementHandleActionExtended:
         assert "successfully" in result[0].text.lower()
 
     @pytest.mark.asyncio
-    async def test_create_non_auto_generate_validation_failure_returns_error_text(
+    async def test_create_non_auto_generate_validation_failure_raises_a_tool_error(
         self, source_mgmt
     ):
-        """With auto_generate=False and invalid config, a validation-failed message is returned."""
+        """BACK-5086: with auto_generate=False, invalid config is refused with the error flag set."""
         mock_sd = MagicMock()
         mock_sd.validate_configuration = MagicMock(
             return_value={
@@ -616,13 +616,13 @@ class TestSourceManagementHandleActionExtended:
         with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_gc.return_value = _make_client()
 
-            result = await source_mgmt.handle_action(
-                "create",
-                {"source_data": {"type": "api"}, "auto_generate": False},
-            )
+            with pytest.raises(ToolError) as refused:
+                await source_mgmt.handle_action(
+                    "create",
+                    {"source_data": {"type": "api"}, "auto_generate": False},
+                )
 
-        assert len(result) >= 1
-        assert "validation failed" in result[0].text.lower()
+        assert "validation failed" in refused.value.message.lower()
 
     @pytest.mark.asyncio
     async def test_create_auto_generate_with_stream_type(self, source_mgmt):
@@ -813,20 +813,21 @@ class TestSourceManagementHandleActionExtended:
         assert "source_data" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
-    async def test_validate_action_auto_generate_missing_name_returns_message(
+    async def test_validate_action_auto_generate_missing_name_raises(
         self, source_mgmt
     ):
-        """validate with auto_generate=True but no name returns a validation-failed message."""
+        """BACK-5086: validate with auto_generate=True but no name is refused as a missing parameter."""
         with patch.object(source_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_gc.return_value = _make_client()
 
-            result = await source_mgmt.handle_action(
-                "validate",
-                {"source_data": {"type": "api"}, "auto_generate": True},
-            )
+            with pytest.raises(ToolError) as refused:
+                await source_mgmt.handle_action(
+                    "validate",
+                    {"source_data": {"type": "api"}, "auto_generate": True},
+                )
 
-        assert len(result) >= 1
-        assert "name" in result[0].text.lower()
+        assert "name" in refused.value.message.lower()
+        assert refused.value.error_code == "MISSING_PARAMETER"
 
     @pytest.mark.asyncio
     async def test_validate_action_auto_generate_with_name_calls_validator(self, source_mgmt):

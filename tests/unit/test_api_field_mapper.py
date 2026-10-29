@@ -1,5 +1,8 @@
 """Tests for api_field_mapper.py — field mapping between internal and API formats."""
 
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from src.revenium_mcp_server.api_field_mapper import APIFieldMapper
 
@@ -235,3 +238,55 @@ class TestMapTransactionFields:
         result = APIFieldMapper.map_transaction_fields(data)
         assert result == data
         assert result is not data
+
+
+class TestRatingAggregationPlanKeySpellings:
+    """BACK-5095 (SE-39): ratingAggregations kept snake tier keys, so the price was stored as 0."""
+
+    @staticmethod
+    def _aggregation():
+        return {
+            "name": "agg",
+            "elementDefinitionId": "MrVQzgJ",
+            "aggregationType": "COUNT",
+            "tiers": [{"name": "agg tier", "up_to": None, "unit_amount": "0.001"}],
+        }
+
+    def test_the_camel_plan_key_sends_its_tier_price_under_unit_amount(self):
+        plan = APIFieldMapper.map_plan_fields({"name": "p", "ratingAggregations": [self._aggregation()]})
+
+        assert plan["ratingAggregations"][0]["tiers"] == [
+            {"name": "agg tier", "upTo": None, "unitAmount": "0.001"}
+        ]
+
+    def test_both_plan_key_spellings_send_the_same_body(self):
+        camel = APIFieldMapper.map_plan_fields({"name": "p", "ratingAggregations": [self._aggregation()]})
+        snake = APIFieldMapper.map_plan_fields({"name": "p", "rating_aggregations": [self._aggregation()]})
+
+        assert camel == snake
+        assert "rating_aggregations" not in snake
+
+    def test_both_spellings_in_one_plan_are_combined(self):
+        first = {**self._aggregation(), "name": "camel"}
+        second = {**self._aggregation(), "name": "snake"}
+        plan = APIFieldMapper.map_plan_fields(
+            {"name": "p", "rating_aggregations": [second], "ratingAggregations": [first]}
+        )
+
+        assert [a["name"] for a in plan["ratingAggregations"]] == ["camel", "snake"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("plan_key", ["ratingAggregations", "rating_aggregations"])
+    async def test_the_create_request_carries_the_aggregation_tier_price(self, plan_key):
+        from tests.unit.test_openapi_contract import _client
+
+        client = _client()
+        client.post = AsyncMock(return_value={"id": "p_new"})
+        product = {"name": "P", "version": "1.0.0", "plan": {"name": "p", plan_key: [self._aggregation()]}}
+
+        with patch("src.revenium_mcp_server.client.get_config_value", return_value=None):
+            await client.create_product(product)
+
+        sent_plan = client.post.await_args.kwargs["data"]["plan"]
+        assert sent_plan["ratingAggregations"][0]["tiers"][0]["unitAmount"] == "0.001"
+        assert "unit_amount" not in sent_plan["ratingAggregations"][0]["tiers"][0]

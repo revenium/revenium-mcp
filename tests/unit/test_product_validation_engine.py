@@ -1,5 +1,6 @@
 """Unit tests for product_validation_engine module."""
 
+import pytest
 
 from src.revenium_mcp_server.product_validation_engine import (
     ValidationError,
@@ -410,6 +411,16 @@ class TestVersionFormatValidation:
         version_errs = self._version_errors(result)
         assert len(version_errs) >= 1
         assert "version" in version_errs[0].error.lower()
+
+    @pytest.mark.parametrize("version", [1.0, 2], ids=["float", "int"])
+    def test_version_number_produces_error(self, version):
+        """A JSON number never reads as MAJOR.MINOR.PATCH (BACK-5126)."""
+        result = ProductValidationEngine.validate_product_data(
+            self._product_with_version(version)
+        )
+        version_errs = self._version_errors(result)
+        assert len(version_errs) == 1
+        assert "must be semantic" in version_errs[0].error
 
     def test_version_non_numeric_produces_error(self):
         """'abc' (non-numeric) should produce a ValidationError with field='version'."""

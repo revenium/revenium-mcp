@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from .models import BillingPeriod
+
 
 class ErrorSeverity(str, Enum):
     """Error severity levels."""
@@ -284,7 +286,7 @@ class ProductErrorHandler:
                         business_context="Customers need to know how often they'll be charged",
                         fix_steps=[
                             "Add a 'period' field to your plan",
-                            "Choose from: MONTH, YEAR, WEEK, DAY",
+                            f"Choose from: {', '.join(p.value for p in BillingPeriod)}",
                             "MONTH is most common for SaaS products",
                         ],
                         examples=[

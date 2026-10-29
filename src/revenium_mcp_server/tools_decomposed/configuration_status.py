@@ -25,7 +25,7 @@ from ..common.error_handling import (
     ErrorCodes,
     ToolError,
     create_structured_validation_error,
-    format_structured_error,
+    raise_structured_error,
 )
 from ..config_store import get_config_value
 from ..introspection.metadata import ToolCapability, ToolType
@@ -114,7 +114,7 @@ class ConfigurationStatus(ToolBase):
                         },
                     },
                 )
-                return [TextContent(type="text", text=format_structured_error(error))]
+                raise_structured_error(error)
 
         except (PermissionError, ToolError):
             raise
@@ -131,7 +131,7 @@ class ConfigurationStatus(ToolBase):
                     "Use full_diagnostic for complete status",
                 ],
             )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            raise_structured_error(error)
 
     async def _handle_environment_variables(self, arguments: Dict[str, Any]) -> List[TextContent]:
         """Handle environment_variables action - detailed environment variable analysis."""
@@ -277,7 +277,7 @@ class ConfigurationStatus(ToolBase):
             analysis += "## **Recommendations**\n\n"
             analysis += f"Consider configuring the remaining {total_vars - set_vars} variables for optimal functionality.\n"
             analysis += (
-                "Use `system_setup(action='check_status')` for detailed guidance.\n"
+                "Use `get_system_setup(action='check_status')` for detailed guidance.\n"
             )
 
         return analysis
@@ -377,7 +377,7 @@ class ConfigurationStatus(ToolBase):
             analysis += "- Set REVENIUM_TENANT_ID if known\n"
             analysis += "- Set REVENIUM_OWNER_ID if known\n"
             analysis += "- Configure REVENIUM_DEFAULT_EMAIL for notifications\n"
-            analysis += "- Use `system_setup()` for guided manual setup\n"
+            analysis += "- Use `get_system_setup(action='show_welcome')` for guided manual setup\n"
 
         return analysis
 
@@ -496,21 +496,21 @@ class ConfigurationStatus(ToolBase):
             analysis += "2. Run `system_diagnostics(action='onboarding_status')` again afterwards\n"
         elif completion_percentage < 50:
             analysis += "**Priority Actions**:\n"
-            analysis += "1. Use `system_setup(action='show_welcome')` for guidance\n"
+            analysis += "1. Use `get_system_setup(action='show_welcome')` for guidance\n"
             analysis += "2. Configure essential items with `setup_checklist()`\n"
-            analysis += "3. Check `system_setup(action='check_status')` for details\n"
+            analysis += "3. Check `get_system_setup(action='check_status')` for details\n"
         elif completion_percentage < 80:
             analysis += "**Recommended Actions**:\n"
             analysis += "1. Complete remaining setup items with `setup_checklist()`\n"
             if setup_completion.get("slack_configured") is not True:
                 analysis += "2. Configure optional features like Slack notifications\n"
-                analysis += "3. Use `system_setup(action='setup_checklist')` for guidance\n"
+                analysis += "3. Use `get_system_setup(action='setup_checklist')` for guidance\n"
             else:
-                analysis += "2. Use `system_setup(action='setup_checklist')` for guidance\n"
+                analysis += "2. Use `get_system_setup(action='setup_checklist')` for guidance\n"
         else:
             analysis += "**Final Steps**:\n"
             analysis += "1. Review setup with `setup_checklist()`\n"
-            analysis += "2. Use `system_setup(action='setup_checklist')` to finish\n"
+            analysis += "2. Use `get_system_setup(action='setup_checklist')` to finish\n"
             analysis += "3. Start using the system with confidence!\n"
 
         # Integration status
@@ -693,7 +693,7 @@ class ConfigurationStatus(ToolBase):
                 summary += (
                     "2. Use `system_diagnostics(action='system_health')` for detailed analysis\n"
                 )
-                summary += "3. Follow `system_setup()` for guided resolution\n"
+                summary += "3. Follow `get_system_setup(action='show_welcome')` for guided resolution\n"
             elif api_auth_rejected:
                 summary += (
                     f"1. Wait a moment and retry before replacing {key_name} - "
@@ -703,12 +703,12 @@ class ConfigurationStatus(ToolBase):
                 summary += (
                     "2. Use `system_diagnostics(action='system_health')` for detailed analysis\n"
                 )
-                summary += "3. Follow `system_setup()` for guided resolution\n"
+                summary += "3. Follow `get_system_setup(action='show_welcome')` for guided resolution\n"
             else:
                 summary += (
                     "1. Use `system_diagnostics(action='system_health')` for detailed analysis\n"
                 )
-                summary += "2. Follow `system_setup()` for guided resolution\n"
+                summary += "2. Follow `get_system_setup(action='show_welcome')` for guided resolution\n"
                 summary += "3. Check `setup_checklist()` for specific configuration steps\n"
         else:
             summary += "**Maintenance Actions**:\n"
@@ -725,7 +725,7 @@ class ConfigurationStatus(ToolBase):
             summary += "- Authentication is properly configured\n"
 
             if onboarding_state.is_first_time:
-                summary += "\n**Complete Onboarding**: Use `system_setup(action='setup_checklist')` to finish setup\n"
+                summary += "\n**Complete Onboarding**: Use `get_system_setup(action='setup_checklist')` to finish setup\n"
         else:
             summary += "[NOT READY] System requires configuration before use\n"
             if api_read_forbidden:

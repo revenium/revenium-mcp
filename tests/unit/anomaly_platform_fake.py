@@ -25,6 +25,13 @@ PLATFORM_MAX_PAGE_SIZE = 100
 KEPT_WHEN_NULL = frozenset({"dataSource", "isPercentage", "minSampleCount"})
 
 
+def _name_matches(anomaly: Dict[str, Any], query: Optional[str]) -> bool:
+    """AIAnomalyRepository.searchAIAlertRulesByTeamAndName: a case-blind name contains, blank matches all."""
+    if not query or not query.strip():
+        return True
+    return query.lower() in str(anomaly.get("name", "")).lower()
+
+
 class FakeAnomalyPlatform:
     team_id = "team-1"
 
@@ -43,18 +50,24 @@ class FakeAnomalyPlatform:
         self.created_bodies: List[Dict[str, Any]] = []
         self.updated_bodies: List[Tuple[str, Dict[str, Any]]] = []
         self.list_calls: List[Tuple[int, int]] = []
+        self.list_filters: List[Dict[str, Any]] = []
         self.deleted_ids: List[str] = []
 
     @staticmethod
     def _stored(body: Dict[str, Any]) -> Dict[str, Any]:
         return {key: value for key, value in body.items() if key in PLATFORM_FIELDS}
 
-    async def get_anomalies(self, page: int = 0, size: int = 20, **_filters: Any) -> Dict[str, Any]:
+    async def get_anomalies(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         self.list_calls.append((page, size))
+        self.list_filters.append(dict(filters))
         if page == self.failing_list_page:
             raise RuntimeError("platform timed out")
         size = min(size, PLATFORM_MAX_PAGE_SIZE)
-        ordered = [self.store[key] for key in sorted(self.store)]
+        ordered = [
+            self.store[key]
+            for key in sorted(self.store)
+            if _name_matches(self.store[key], filters.get("query"))
+        ]
         rows = copy.deepcopy(ordered[page * size:(page + 1) * size])
         total = len(ordered)
         return {

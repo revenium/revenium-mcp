@@ -486,6 +486,11 @@ def pairing_example(known_hosts: Dict[str, str]) -> str:
     return ""
 
 
+def configured_api_base_url() -> str:
+    """Return the platform API base URL this deployment talks to."""
+    return (get_config_value("REVENIUM_BASE_URL", None) or DEFAULT_BASE_URL).rstrip("/")
+
+
 def _resolved_app_base_url() -> str:
     """Return the configured new-analytics base URL.
 

@@ -214,7 +214,7 @@ async def test_a_bagged_percentage_string_reaches_the_handler_as_a_boolean():
     registry = ToolConfigurationRegistry(tool_config=ToolConfig.create_for_testing())
     mcp = MagicMock()
     await registry._register_manage_alerts(mcp)
-    closure = mcp.tool.return_value.call_args[0][0]
+    closure = mcp.tool.call_args_list[0][0][0].__wrapped__
 
     with patch(
         "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",

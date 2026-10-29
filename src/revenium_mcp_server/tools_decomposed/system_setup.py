@@ -13,10 +13,7 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..auth.auth_mode import credentials_are_per_request
-from ..common.error_handling import (
-    create_structured_validation_error,
-    raise_structured_error,
-)
+from ..common.error_handling import raise_unknown_action_error
 from ..introspection.metadata import ToolCapability, ToolType
 from .email_verification import (
     EmailVerification,
@@ -117,7 +114,7 @@ class SystemSetup(ToolBase):
     - Email configuration: Email setup and verification
     """
 
-    tool_name: ClassVar[str] = "system_setup"
+    tool_name: ClassVar[str] = "manage_system_setup"
     tool_description: ClassVar[str] = (
         "Unified system setup and onboarding combining welcome guidance, setup checklist, and email verification. Key actions: show_welcome, setup_checklist, check_status, validate_email. Use get_capabilities() for complete action list."
     )
@@ -394,45 +391,8 @@ All actions support the same parameters as their original tools for 100% compati
     async def _handle_unknown_action(
         self, action: str
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Handle unknown actions with helpful guidance."""
-        all_actions = list(self.action_routing.keys()) + ["get_capabilities", "get_examples"]
-
-        error = create_structured_validation_error(
-            field="action",
-            value=action,
-            message=f"Unknown system setup action: {action}",
-            examples={
-                "valid_actions": all_actions,
-                "welcome_actions": [
-                    "show_welcome",
-                    "setup_checklist",
-                    "environment_status",
-                    "next_steps",
-                    "complete_setup",
-                ],
-                "validation_actions": [
-                    "check_requirements",
-                    "check_optional",
-                    "check_system_status",
-                    "get_recommendations",
-                ],
-                "email_actions": [
-                    "check_status",
-                    "update_email",
-                    "validate_email",
-                    "setup_guidance",
-                    "test_configuration",
-                ],
-                "example_usage": {
-                    "show_welcome": "Display welcome message and setup overview",
-                    "setup_checklist": "Show detailed setup completion status",
-                    "check_requirements": "Verify critical configuration items",
-                    "setup_guidance": "Get email configuration instructions",
-                },
-            },
-        )
-
-        raise_structured_error(error)
+        """Refuse an action this class does not route; the caller's message lists the valid ones."""
+        raise_unknown_action_error(action)
 
     async def _get_supported_actions(self) -> List[str]:
         """Get all supported actions from consolidated tool."""

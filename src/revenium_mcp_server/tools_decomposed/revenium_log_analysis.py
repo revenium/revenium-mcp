@@ -777,11 +777,11 @@ No log entries found for analysis. This may be expected for integration logs.
     async def _handle_set_strict_ingestion_mode(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Toggle the tenant's strict ingestion mode, guarded by confirm.
+        """Toggle the tenant's strict ingestion mode.
 
-        Strict mode changes ingestion behavior for the whole tenant, so the
-        toggle requires an explicit confirm=true; without it the handler
-        returns a preview of the consequences and makes no API call.
+        Strict mode changes ingestion behavior for the whole tenant; with
+        dry_run=true the handler returns a preview of the consequences and
+        makes no API call.
 
         The optional allow_ticket_jobs sub-flag decides whether the
         coding-assistant enricher keeps creating ticket-grain Jobs while
@@ -797,7 +797,7 @@ No log entries found for analysis. This may be expected for integration logs.
                 value=enabled,
                 suggestions=[
                     "Pass enabled=true to turn strict mode on, enabled=false to turn it off",
-                    "Add confirm=true to apply the change",
+                    "Add dry_run=true to preview the change without applying it",
                 ],
             )
 
@@ -829,14 +829,12 @@ No log entries found for analysis. This may be expected for integration logs.
                 ],
             )
 
-        # Only the boolean True applies the change — loosely typed MCP
-        # arguments (confirm="false", confirm=1) must not bypass the guard.
-        if arguments.get("confirm") is not True:
+        if arguments.get("dry_run"):
             state = "ENABLE" if enabled else "DISABLE"
             # The ticket-jobs consequence depends on the opt-in actually being
             # sent: claiming Jobs "STOP" when the caller passes
             # allow_ticket_jobs=true (or when omission leaves an existing tenant
-            # opt-in untouched) would make the confirmation preview lie.
+            # opt-in untouched) would make the preview lie.
             if allow_ticket_jobs is True:
                 ticket_jobs_effect = (
                     "Ticket-grain Jobs from the coding-assistant enricher KEEP being "
@@ -881,10 +879,10 @@ No log entries found for analysis. This may be expected for integration logs.
                 TextContent(
                     type="text",
                     text=(
-                        f"**Confirmation Required — {state} strict ingestion mode**\n\n"
+                        f"**Dry run — {state} strict ingestion mode**\n\n"
                         f"This changes ingestion behavior for the entire tenant:\n\n{effect}\n\n"
-                        f"To apply, repeat the call with confirm=true:\n"
-                        f'`set_strict_ingestion_mode(enabled={str(enabled).lower()}{opt_in_arg}, confirm=true)`'
+                        f"Nothing was changed. To apply, repeat the call without dry_run:\n"
+                        f'`set_strict_ingestion_mode(enabled={str(enabled).lower()}{opt_in_arg})`'
                     ),
                 )
             ]
@@ -969,8 +967,8 @@ No log entries found for analysis. This may be expected for integration logs.
         and still records the attribution - the text is stored as null and
         never returned, and the response says the note was suppressed.
 
-        Unlike set_strict_ingestion_mode this action takes no confirm: there is
-        no irreversible consequence to preview. It rejects nothing, deletes
+        Unlike set_strict_ingestion_mode this action has no dry_run preview: there
+        is no irreversible consequence to preview. It rejects nothing, deletes
         nothing (text already stored survives being switched off), leaves
         structured attribution untouched, and the opposite value undoes it in
         one call. The state it reports is the one the server returned, never
@@ -1069,7 +1067,7 @@ No log entries found for analysis. This may be expected for integration logs.
     async def _handle_set_usage_billing(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Switch usage-based billing on or off for the tenant, guarded by confirm.
+        """Switch usage-based billing on or off for the tenant.
 
         Off hides the billing screens (invoices, payment methods, plan and
         subscription screens) and stops the platform rating the tenant's usage:
@@ -1077,7 +1075,7 @@ No log entries found for analysis. This may be expected for integration logs.
         items, while AI metrics are still recorded. Usage that arrives while it
         is off is never rated later. The platform default is on.
 
-        It is confirm-gated because the change lands on every user of the
+        dry_run=true previews it, because the change lands on every user of the
         tenant at once and the usage it leaves unrated cannot be recovered by
         turning it back on. The state reported is the one the server returned,
         never the requested value.
@@ -1092,13 +1090,11 @@ No log entries found for analysis. This may be expected for integration logs.
                 suggestions=[
                     "Pass enabled=true to show the billing screens and rate the tenant's usage",
                     "Pass enabled=false to hide them and stop rating the tenant's usage",
-                    "Add confirm=true to apply the change",
+                    "Add dry_run=true to preview the change without applying it",
                 ],
             )
 
-        # Only the boolean True applies the change — loosely typed MCP
-        # arguments (confirm="false", confirm=1) must not bypass the guard.
-        if arguments.get("confirm") is not True:
+        if arguments.get("dry_run"):
             state = (
                 "SHOW the tenant's billing screens and rate its usage again"
                 if enabled
@@ -1122,12 +1118,12 @@ No log entries found for analysis. This may be expected for integration logs.
                 TextContent(
                     type="text",
                     text=(
-                        f"**Confirmation Required — {state}**\n\n"
+                        f"**Dry run — {state}**\n\n"
                         f"This applies to every user of the tenant:\n\n{effect}\n\n"
                         f"**Who can apply it**: {USAGE_BILLING_GATE_NOTE}\n\n"
                         f"Read the current value first with `get_usage_billing()`. "
-                        f"To apply, repeat the call with confirm=true:\n"
-                        f"`set_usage_billing(enabled={str(enabled).lower()}, confirm=true)`"
+                        f"Nothing was changed. To apply, repeat the call without dry_run:\n"
+                        f"`set_usage_billing(enabled={str(enabled).lower()})`"
                     ),
                 )
             ]

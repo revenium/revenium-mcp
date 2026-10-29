@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from .models import BillingPeriod
+
 
 @dataclass
 class FieldDocumentation:
@@ -365,7 +367,7 @@ class EnhancedProductSchemaDiscovery:
             "tiers": "Volume-based pricing levels within aggregations. Example: first 100 API calls at $0.01 each, next 900 at $0.008 each. Final tier must have up_to: null.",
             "elements": "Additional billable components within a plan, often used for included allowances or base fees in hybrid models.",
             "setup_fees": "One-time charges applied when a customer first subscribes to a product.",
-            "billing_periods": "For SUBSCRIPTION plans: MONTH, YEAR, WEEK, DAY. Determines how often customers are charged.",
+            "billing_periods": f"For SUBSCRIPTION plans: {', '.join(p.value for p in BillingPeriod)}. Determines how often customers are charged.",
             "plan_types": "SUBSCRIPTION = recurring billing at regular intervals (CHARGE deprecated as of 2024)",
             "aggregation_types": "SUM (total amount/volume), COUNT (number of discrete items), MAXIMUM (peak usage), AVERAGE (typical usage), UNIQUE (distinct items), DISTINCT (unique values)",
             "workflow_dependency": "Simple products: Products → Plans → Tiers (no metering needed). Usage-based products: Products → Plans → Rating Aggregations → Metering Elements (metering elements must exist first).",

@@ -6,7 +6,9 @@ and natural language processing for credential operations.
 
 from typing import Any, Dict
 
+from ..common.called_tool import presented_name
 from ..common.error_handling import create_structured_missing_parameter_error
+from ..common.tool_surface import tool_call
 from ..nlp.credential_nlp_processor import CredentialNLPProcessor
 
 
@@ -52,7 +54,7 @@ class CredentialDocumentationHandler:
         result_text += "- `get` - Get specific credential by ID\n\n"
         result_text += ("The two listings answer different questions and can return different "
                         "sets: `list` is scoped to the caller's team, `list_by_organization` to "
-                        "the organization in the request. Use `manage_customers(action='list', "
+                        "the organization in the request. Use `get_customers(action='list', "
                         "resource_type='organizations')` or `resolve_organization_name_to_id` to "
                         "find the organization ID.\n\n")
 
@@ -109,7 +111,7 @@ class CredentialDocumentationHandler:
 
         # Dependencies
         result_text += "## **Dependencies**\n"
-        result_text += ("- `manage_customers` - Required for subscriber and organization "
+        result_text += ("- `get_customers` - Required for subscriber and organization "
                         "lookups\n\n")
 
         # Next Steps
@@ -163,8 +165,8 @@ class CredentialDocumentationHandler:
 
         result_text += "## **Prerequisites**\n"
         result_text += "**REQUIRED**: Get valid IDs first to avoid 404 errors:\n"
-        result_text += "1. List subscribers: `manage_customers(action='list', resource_type='subscribers')`\n"
-        result_text += "2. List organizations: `manage_customers(action='list', resource_type='organizations')`\n"
+        result_text += "1. List subscribers: `get_customers(action='list', resource_type='subscribers')`\n"
+        result_text += "2. List organizations: `get_customers(action='list', resource_type='organizations')`\n"
         result_text += "3. Copy valid subscriberId and organizationId from the results\n\n"
 
         result_text += "## **Basic Operations**\n\n"
@@ -370,14 +372,14 @@ class CredentialDocumentationHandler:
         """Get agent-friendly summary of subscriber credentials management capabilities."""
         return {
             "action": "get_agent_summary",
-            "tool_name": "manage_subscriber_credentials",
+            "tool_name": presented_name("manage_credentials"),
             "description": "Comprehensive subscriber credentials management with CRUD operations and enhanced capabilities",
             "quick_start": {
-                "1_list_credentials": "list() - Get all subscriber credentials",
-                "2_get_credential": "get(credential_id='cred_123') - Get specific credential",
-                "3_create_credential": "create(credential_data={...}) - Create new credential",
-                "4_update_credential": "update(credential_id='cred_123', credential_data={...}) - Update credential",
-                "5_delete_credential": "delete(credential_id='cred_123') - Delete credential",
+                "1_list_credentials": f"{tool_call('manage_credentials', 'list')} - Get all subscriber credentials",
+                "2_get_credential": f"{tool_call('manage_credentials', 'get', credential_id='cred_123')} - Get specific credential",
+                "3_create_credential": f"{tool_call('manage_credentials', 'create')} with credential_data - Create new credential",
+                "4_update_credential": f"{tool_call('manage_credentials', 'update', credential_id='cred_123')} with credential_data - Update credential",
+                "5_delete_credential": f"{tool_call('manage_credentials', 'delete', credential_id='cred_123')} - Delete credential",
             },
             "key_features": [
                 "🔐 Full CRUD operations for subscriber credentials",

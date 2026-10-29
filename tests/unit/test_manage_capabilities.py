@@ -123,10 +123,11 @@ class TestManageCapabilitiesActions:
         assert "INVALID" in text
 
     @pytest.mark.asyncio
-    async def test_verify_capability_missing_params(self, capabilities_tool):
+    async def test_verify_capability_missing_params_raises(self, capabilities_tool):
         """verify_capability with missing params returns error listing them."""
-        result = await capabilities_tool.handle_action("verify_capability", {})
-        text = result[0].text
+        with pytest.raises(ToolError) as refused:
+            await capabilities_tool.handle_action("verify_capability", {})
+        text = refused.value.message
         assert "resource_type" in text
         assert "capability_name" in text
         assert "value" in text

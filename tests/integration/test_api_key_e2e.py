@@ -100,7 +100,7 @@ async def test_missing_auth_header_returns_401(mcp_http_server) -> None:
     """
     resp = await call_mcp_tool_no_auth(
         mcp_http_server["base_url"],
-        tool_name="manage_products",
+        tool_name="get_products",
         arguments={"action": "list"},
     )
     assert resp.status_code == 401, (
@@ -121,7 +121,7 @@ async def test_valid_api_key_dispatches_tool_call(mcp_http_server) -> None:
     resp = await call_mcp_tool(
         mcp_http_server["base_url"],
         _VALID_TOKEN,
-        tool_name="manage_products",
+        tool_name="get_products",
         arguments={"action": "list"},
     )
     assert resp.status_code == 200, (
@@ -168,7 +168,7 @@ async def test_invalid_api_key_returns_401(mcp_http_server) -> None:
     resp = await call_mcp_tool(
         mcp_http_server["base_url"],
         "rev_rk_unknown_garbage_token",
-        tool_name="manage_products",
+        tool_name="get_products",
         arguments={"action": "list"},
     )
     assert resp.status_code == 401, (
@@ -201,7 +201,7 @@ async def test_api_key_identity_resolved_from_users_me(
     resp = await call_mcp_tool(
         mcp_http_server["base_url"],
         _VALID_TOKEN,
-        tool_name="manage_products",
+        tool_name="get_products",
         arguments={"action": "list"},
     )
     assert resp.status_code == 200, (
@@ -234,13 +234,13 @@ async def test_a_platform_lockout_at_sign_in_names_the_wait(mcp_http_server) -> 
     first = await call_mcp_tool(
         mcp_http_server["base_url"],
         _LOCKED_OUT_TOKEN,
-        tool_name="manage_products",
+        tool_name="get_products",
         arguments={"action": "list"},
     )
     second = await call_mcp_tool(
         mcp_http_server["base_url"],
         _LOCKED_OUT_TOKEN,
-        tool_name="manage_products",
+        tool_name="get_products",
         arguments={"action": "list"},
     )
     users_me_calls = [

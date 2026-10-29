@@ -12,6 +12,7 @@ import time
 import uuid
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -37,9 +38,10 @@ from ..client import ReveniumAPIError, ReveniumClient
 from ..agent_friendly import UnifiedResponseFormatter
 from ..auth.tenant_scope import TenantScope, tenant_scope
 from ..common.platform_paging import PLATFORM_MAX_PAGE_SIZE
+from ..common.tool_surface import public_tool_for, tool_call
 from ..common.tenant_scoped_store import TenantScopedStore
 from ..common.validation import validate_pagination_params
-from ..endpoint_registry import get_endpoint_path
+from ..endpoint_registry import configured_api_base_url, get_endpoint_path
 from .unified_tool_base import ToolBase
 from ..common.error_handling import (
     ErrorCodes,
@@ -47,6 +49,7 @@ from ..common.error_handling import (
     api_error_refusal,
     create_structured_validation_error,
     create_structured_missing_parameter_error,
+    raise_refusal,
 )
 
 # Performance monitoring removed - infrastructure monitoring handled externally
@@ -435,6 +438,73 @@ def _format_price_per_1k_tokens(price_per_token: float) -> str:
     return f"{render_exact_dollars(1000 * price_per_token, _PRICE_PER_1K_DECIMALS)} per 1K tokens"
 
 
+def _catalog_providers(entries: List[Dict[str, Any]]) -> List[str]:
+    """The distinct, non-blank providers of catalog rows, in catalog order."""
+    providers: List[str] = []
+    for entry in entries:
+        provider = entry.get("provider") or ""
+        if isinstance(provider, str) and provider.strip() and provider not in providers:
+            providers.append(provider)
+    return providers
+
+
+def _format_cost_estimate(
+    catalog_model: Dict[str, Any], input_tokens: int, output_tokens: int
+) -> str:
+    input_cost_per_token = float(catalog_model.get("inputCostPerToken", 0))
+    output_cost_per_token = float(catalog_model.get("outputCostPerToken", 0))
+    input_cost = input_tokens * input_cost_per_token
+    output_cost = output_tokens * output_cost_per_token
+
+    text = "# 💰 **Transaction Cost Estimate**\n\n"
+    text += f"**Model**: {catalog_model.get('name')} ({catalog_model.get('provider')})\n\n"
+    text += "### **Token Usage**\n"
+    text += f"- **Input Tokens**: {input_tokens:,}\n"
+    text += f"- **Output Tokens**: {output_tokens:,}\n"
+    text += f"- **Total Tokens**: {input_tokens + output_tokens:,}\n\n"
+    text += "### **Cost Breakdown**\n"
+    text += (
+        f"- **Input Cost**: {input_tokens:,} × {_format_price_per_token(input_cost_per_token)}"
+        f" = **{_format_cost(input_cost)}**\n"
+    )
+    text += (
+        f"- **Output Cost**: {output_tokens:,} × {_format_price_per_token(output_cost_per_token)}"
+        f" = **{_format_cost(output_cost)}**\n"
+    )
+    text += f"- **Total Cost**: **{_format_cost(input_cost + output_cost)}**\n\n"
+
+    if input_tokens > 0:
+        text += "### **Reference Rates**\n"
+        text += f"- **Input**: {_format_price_per_1k_tokens(input_cost_per_token)}\n"
+        text += f"- **Output**: {_format_price_per_1k_tokens(output_cost_per_token)}\n\n"
+
+    text += "**💡 Ready to submit**: Use `submit_ai_transaction()` with these parameters"
+    return text
+
+
+def _unpriced_estimate_refusal(
+    tool_name: str, model: str, provider: str, name_matches: List[Dict[str, Any]]
+) -> str:
+    """Why no estimate exists for a pair the catalog read did not price."""
+    if not name_matches:
+        search = tool_call(tool_name, "search_ai_models", query=model)
+        return (
+            f"**Model not in catalog**: {model} ({provider})\n\n"
+            f"`{model}` is not in the AI model catalog for this tenant, so its cost "
+            "cannot be estimated. The catalog was read successfully - this is an "
+            "unknown model name, not a service failure.\n\n"
+            f"**Tip**: Use `{search}` to find the name the catalog uses."
+        )
+    listed = ", ".join(f"`{p}`" for p in sorted(_catalog_providers(name_matches)))
+    validate = tool_call(tool_name, "validate_model_provider", model=model, provider=provider)
+    return (
+        f"**Model/provider not in catalog**: {model} ({provider})\n\n"
+        f"The AI model catalog carries `{model}`, but not for provider `{provider}` - "
+        f"it lists {listed or 'no provider'}. The pair is unpriced, so its cost cannot "
+        f"be estimated.\n\n**Tip**: Use `{validate}` after correcting the provider."
+    )
+
+
 def _format_price_per_token(price: Any) -> str:
     """A catalog price as "$X/token", plain decimals at any magnitude; n/a when the row has none."""
     if isinstance(price, str):
@@ -444,6 +514,21 @@ def _format_price_per_token(price: Any) -> str:
             return "n/a"
     rendered = render_exact_dollars(price, _PRICE_PER_TOKEN_DECIMALS)
     return "n/a" if rendered == "n/a" else f"{rendered}/token"
+
+
+def _ai_model_row(model: Dict[str, Any]) -> str:
+    """One AI catalog listing row: name, per-token prices and the price-pin status.
+
+    BACK-3084: a pinned price does not track the upstream rate card, so a cost
+    figure built on it is only defensible if the pin is visible.
+    """
+    name = model.get("name", "Unknown")
+    input_cost = _format_price_per_token(model.get("inputCostPerToken", "N/A"))
+    output_cost = _format_price_per_token(model.get("outputCostPerToken", "N/A"))
+    return (
+        f"- **{name}** (Input: {input_cost}, Output: {output_cost}, "
+        f"Price pinned: {_format_price_pin(model)})\n"
+    )
 
 
 # The three answers an AI model listing can owe its caller, decided before any
@@ -715,7 +800,7 @@ def _coding_assistant_scope_note(
             "**Scope**: coding-assistant records (Claude Code, Gemini CLI, and similar) "
             "are INCLUDED. Pass include_coding_assistants=false to exclude assistants "
             "billed as seat subscriptions; assistants your team pays API rates for "
-            "(apiRateProviders, readable with manage_customers "
+            "(apiRateProviders, readable with get_customers "
             "get_coding_assistant_billing_settings) stay in the results.\n"
         )
     providers = _coding_assistant_providers_in(returned_rows)
@@ -724,7 +809,7 @@ def _coding_assistant_scope_note(
             "**Scope**: include_coding_assistants=false was sent, but the platform "
             f"returned coding-assistant records from {', '.join(providers)}, because "
             "your team pays API rates for them (apiRateProviders, readable with "
-            "manage_customers get_coding_assistant_billing_settings). They are shown "
+            "get_customers get_coding_assistant_billing_settings). They are shown "
             "as returned. Pass include_coding_assistants=true to include every "
             "coding assistant."
         )
@@ -732,7 +817,7 @@ def _coding_assistant_scope_note(
         note = (
             "**Scope**: coding assistants billed as seat subscriptions are EXCLUDED; "
             "assistants your team pays API rates for (apiRateProviders, readable with "
-            "manage_customers get_coding_assistant_billing_settings) are still included. "
+            "get_customers get_coding_assistant_billing_settings) are still included. "
             "Pass include_coding_assistants=true to include every coding assistant."
         )
     session_providers = _coding_assistant_providers_in(session_rows)
@@ -1030,9 +1115,10 @@ _PROMPT_CONTEXT_STRING_PATTERNS: Dict[str, "re.Pattern[str]"] = {
     "speed": _SHORT_SLUG_PATTERN,
     "subagent_type": _CALL_ORIGIN_PATTERN,
 }
-# promptLength is a Kotlin Int on the platform: a larger count fails
-# deserialization and 400s the submission.
-_PROMPT_LENGTH_MAX = 2**31 - 1
+# promptLength and retryNumber are Kotlin Ints on the platform: a larger value
+# fails deserialization and 400s the submission as "Invalid JSON format". The
+# other integer submission fields are Longs and carry tighter local caps.
+_PLATFORM_INT_MAX = 2**31 - 1
 _PROMPT_CONTEXT_EXAMPLES: Dict[str, Any] = {
     "prompt_id": "0f2b8a54-6c31-4d7e-9a10-b5c7d2e84f63",
     "prompt_length": 412,
@@ -1181,8 +1267,19 @@ def _prompt_length_violation(value: Any) -> Optional[str]:
     """Why `value` is not a non-negative character count, or None."""
     if isinstance(value, bool) or not isinstance(value, int):
         return f"Expected a non-negative integer character count, got {type(value).__name__}"
-    if not 0 <= value <= _PROMPT_LENGTH_MAX:
-        return f"Must be between 0 and {_PROMPT_LENGTH_MAX}, got {value}"
+    if not 0 <= value <= _PLATFORM_INT_MAX:
+        return f"Must be between 0 and {_PLATFORM_INT_MAX}, got {value}"
+    return None
+
+
+def _retry_number_violation(value: Any) -> Optional[str]:
+    """Why `value` is not a retry count the platform can store, or None."""
+    try:
+        retry_number = int(value)
+    except (ValueError, TypeError):
+        return f"Expected integer, got {type(value).__name__}"
+    if not 0 <= retry_number <= _PLATFORM_INT_MAX:
+        return f"Must be between 0 and {_PLATFORM_INT_MAX}, got {retry_number}"
     return None
 
 
@@ -1237,7 +1334,7 @@ def _prompt_context_input_schema() -> Dict[str, Dict[str, Any]]:
     properties["prompt_length"] = {
         "type": "integer",
         "minimum": 0,
-        "maximum": _PROMPT_LENGTH_MAX,
+        "maximum": _PLATFORM_INT_MAX,
         "description": (
             "Character count of the human prompt that caused this call - a count, never the text. "
             f"E.g. {_PROMPT_CONTEXT_EXAMPLES['prompt_length']}. Submission field for submit_ai_transaction."
@@ -1326,6 +1423,39 @@ _LOOKUP_DEFAULT_PAGES = 10
 # Every page filters by transactionId, so a full page costs nothing extra.
 _LOOKUP_DEFAULT_PAGE_SIZE = PLATFORM_MAX_PAGE_SIZE
 _RECENT_DEFAULT_PAGE_SIZE = 20
+
+
+_JSON_TYPE_LABELS = ((bool, "true/false"), ((int, float), "a number"), (dict, "an object"))
+
+
+def _json_type_label(value: Any) -> str:
+    """Name a value's type the way the JSON caller wrote it, not as Python sees it."""
+    for python_types, label in _JSON_TYPE_LABELS:
+        if isinstance(value, python_types):
+            return label
+    return "an unsupported value"
+
+
+def _lookup_ids_from(raw: Any) -> List[str]:
+    """The non-blank string ids in a transaction_ids argument, deduplicated in request order."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        raise create_structured_validation_error(
+            message=(
+                "transaction_ids must be a list of transaction id strings, or one id "
+                f"as a string; got {_json_type_label(raw)}."
+            ),
+            field="transaction_ids",
+            value=_json_type_label(raw),
+            suggestions=[
+                "Send transaction_ids as a list, e.g. transaction_ids=['tx_abc123', 'tx_def456']",
+                "A single id may be sent as a string, e.g. transaction_ids='tx_abc123'",
+            ],
+        )
+    return list(dict.fromkeys(tid for tid in raw if isinstance(tid, str) and tid.strip()))
 
 
 def _lookup_int_setting(arguments: Dict[str, Any], field: str) -> Optional[int]:
@@ -2391,13 +2521,11 @@ The subscriber data structure has been updated. The old individual fields are no
                     retry_number_source = f"usage_metadata.{key}"
                     break
 
-        if retry_number_value is not None:
-            try:
-                int_value = int(retry_number_value)
-                if int_value < 0:
-                    errors.append(f"• {retry_number_source}: Must be non-negative")
-            except (ValueError, TypeError):
-                errors.append(f"• {retry_number_source}: Expected integer, got {type(retry_number_value).__name__}")
+        retry_reason = (
+            None if retry_number_value is None else _retry_number_violation(retry_number_value)
+        )
+        if retry_reason:
+            errors.append(f"• {retry_number_source}: {retry_reason}")
 
         return errors
 
@@ -3584,26 +3712,18 @@ The subscriber data structure has been updated. The old individual fields are no
                 "message": "Transaction not found in this session",
             }
 
-    def _validate_lookup_parameters(self, transaction_ids: List[str]) -> None:
-        """Validate lookup_transactions parameters.
+    def _validate_lookup_parameters(self, raw_transaction_ids: Any) -> List[str]:
+        """Return the ids lookup_transactions searches, or raise a structured refusal.
 
-        Validates that transaction_ids parameter is provided and not empty.
-        Uses structured error messages with helpful examples for batch usage.
-
-        Args:
-            transaction_ids: List of transaction IDs to validate
+        A single id sent as a string is looked up as a one-item list. Blank and
+        non-string entries are dropped and duplicates collapse to their first
+        occurrence, in request order.
 
         Raises:
-            ToolError: If transaction_ids is empty or invalid
+            ToolError: If transaction_ids is not a list or string, is empty, or is too long
         """
-        if transaction_ids:
-            # dict.fromkeys keeps the first occurrence of each id, in request order
-            transaction_ids[:] = list(
-                dict.fromkeys(
-                    tid for tid in transaction_ids if isinstance(tid, str) and tid.strip()
-                )
-            )
-        if len(transaction_ids or []) > _LOOKUP_MAX_IDS:
+        transaction_ids = _lookup_ids_from(raw_transaction_ids)
+        if len(transaction_ids) > _LOOKUP_MAX_IDS:
             raise create_structured_validation_error(
                 message=(
                     f"lookup_transactions takes at most {_LOOKUP_MAX_IDS} transaction ids "
@@ -3629,6 +3749,7 @@ The subscriber data structure has been updated. The old individual fields are no
                     "description": "Unified transaction lookup with automatic optimization",
                 },
             )
+        return transaction_ids
 
     def _check_session_store(
         self, transaction_ids: Optional[List[str]], scope: TenantScope
@@ -3791,8 +3912,7 @@ The subscriber data structure has been updated. The old individual fields are no
         that fit in it. Without it the budget is the pauses `max_retries`
         rounds take.
         """
-        transaction_ids = arguments.get("transaction_ids", [])
-        self._validate_lookup_parameters(transaction_ids)
+        transaction_ids = self._validate_lookup_parameters(arguments.get("transaction_ids"))
 
         adjustments: List[str] = []
         sent_rounds = _lookup_int_setting(arguments, "max_retries")
@@ -4372,6 +4492,34 @@ class MeteringValidator:
             }
 
 
+# The write has already succeeded, so the advisory must not hold its
+# confirmation behind the client's full timeout and retries. Exact-match catalog
+# searches measured 0.15-0.47 s on dev (2026-10-28); 3 s is several times that.
+_LIVE_SUBMIT_CATALOG_TIMEOUT_SECONDS = 3.0
+
+_UNPRICED_SUBMIT_NOTE = (
+    "\n\n**Stored Unpriced**: the platform accepted this transaction but stored "
+    "it with a total cost of $0.00. Every transaction for this model/provider "
+    "pair is stored at $0 until the pair is priced in the AI model catalog."
+)
+
+
+def _submitted_transaction_text(result: Dict[str, Any], unpriced_warning: str) -> str:
+    """Render a live submit's answer, flagging a pair the catalog cannot price."""
+    text = (
+        "✅ **Transaction Submitted Successfully**\n\n"
+        f"**Transaction ID:** `{result['transaction_id']}`\n"
+        f"**Model:** {result['model']}\n"
+        f"**Provider:** {result['provider']}\n"
+        f"**Tokens:** {result['tokens']}\n"
+        f"**Duration:** {result['duration_ms']}ms\n\n"
+        f"**Status:** {result['status']}"
+    )
+    if unpriced_warning:
+        text += unpriced_warning + _UNPRICED_SUBMIT_NOTE
+    return text
+
+
 class MeteringManagement(ToolBase):
     """Consolidated AI metering management tool with comprehensive capabilities."""
 
@@ -4522,28 +4670,22 @@ class MeteringManagement(ToolBase):
                         errors_text = "\n".join(
                             [f"• {error}" for error in validation_result["errors"]]
                         )
-                        return [
-                            TextContent(
-                                type="text",
-                                text="🧪 **DRY RUN MODE - Validation Failed**\n\n"
-                                f"❌ **Errors Found:**\n{errors_text}\n\n"
-                                "**Dry Run:** True (fix errors before actual submission)",
-                            )
-                        ]
+                        raise_refusal(
+                            "🧪 **DRY RUN MODE - Validation Failed**\n\n"
+                            f"❌ **Errors Found:**\n{errors_text}\n\n"
+                            "**Dry Run:** True (fix errors before actual submission)"
+                        )
 
                 result = await self.transaction_manager.submit_transaction(
                     client, arguments, scope, ctx=ctx
                 )
+                catalog_warning = await self._bounded_catalog_advisory(
+                    client, arguments
+                )
                 return [
                     TextContent(
                         type="text",
-                        text="✅ **Transaction Submitted Successfully**\n\n"
-                        f"**Transaction ID:** `{result['transaction_id']}`\n"
-                        f"**Model:** {result['model']}\n"
-                        f"**Provider:** {result['provider']}\n"
-                        f"**Tokens:** {result['tokens']}\n"
-                        f"**Duration:** {result['duration_ms']}ms\n\n"
-                        f"**Status:** {result['status']}",
+                        text=_submitted_transaction_text(result, catalog_warning),
                     )
                 ]
 
@@ -5756,8 +5898,8 @@ get_field_documentation()
             text += "\n\n## **Supported Providers**\n"
             text += "View available AI providers and their supported models:\n\n"
             text += "**Commands:**\n"
-            text += '- List all providers: `manage_metering(action="get_supported_providers")`\n'
-            text += '- Search by provider: `manage_metering(action="search_ai_models", query="anthropic")`\n'
+            text += '- List all providers: `get_metering(action="get_supported_providers")`\n'
+            text += '- Search by provider: `get_metering(action="search_ai_models", query="anthropic")`\n'
 
         # Add UCM-enhanced models if available (condensed)
         if ucm_capabilities and "models" in ucm_capabilities:
@@ -5780,7 +5922,7 @@ get_field_documentation()
             text += "\n\n## **Supported Models**\n"
             text += "View available AI models and their pricing information:\n\n"
             text += "**Commands:**\n"
-            text += '- List all models: `manage_metering(action="list_ai_models")`\n'
+            text += '- List all models: `get_metering(action="list_ai_models")`\n'
 
         text += "\n\n## **Next Steps**\n"
         text += "1. Use `submit_ai_transaction(...)` to track AI usage\n"
@@ -5947,6 +6089,7 @@ validate(model="<model>", provider="<provider>", input_tokens=3000, output_token
 ```bash
 lookup_transactions(transaction_ids=["tx_abc123"])             # Find specific transactions by ID
 lookup_transactions(transaction_ids=["tx_abc123", "tx_def456"]) # Batch lookup by IDs
+lookup_transactions(transaction_ids="tx_abc123")               # One id may also be sent as a plain string
 lookup_recent_transactions()                                   # Browse recent transactions (no IDs needed)
 lookup_recent_transactions(page=1, page_size=10)              # Get specific page of recent transactions
 analyze_recent_transactions()                                  # Field-by-field report on the latest transactions
@@ -6101,7 +6244,7 @@ MCP submits, states how many of them carry a value, with sample values, a breakd
 nested `subscriber` and `subscriber.credential` objects, the fields absent from every record
 and any fields the API returned that this MCP does not expect. Use it to answer "is my
 attribution actually landing?" - it is a data-quality check, not an analytics aggregation
-(use `business_analytics_management` for cost and usage figures).
+(use `get_business_analytics` for cost and usage figures).
 
 ```json
 {
@@ -6122,7 +6265,7 @@ coding-assistant records (Claude Code, Gemini CLI, and similar) by default, matc
 AI insights tool returns, so a check of whether coding-assistant data arrived cannot answer "no"
 for data that landed.
 Pass `include_coding_assistants=false` to exclude assistants billed as seat subscriptions;
-assistants your team pays API rates for (`apiRateProviders`, readable with `manage_customers`
+assistants your team pays API rates for (`apiRateProviders`, readable with `get_customers`
 get_coding_assistant_billing_settings) stay in the results. A lookup by transaction id or
 trace id (`lookup_transactions`, or a `transaction_id` or `trace_id` filter) returns the record
 whatever the flag says. Every response from these actions states which records were in scope.
@@ -6144,6 +6287,7 @@ whatever the flag says. Every response from these actions states which records w
         Integration Support section, technical implementation actions, supported languages,
         integration features, quick start guidance.
         """
+        api_base_url = configured_api_base_url()
         text = """# **API Integration Capabilities**
 
 ## **Integration Support**
@@ -6174,7 +6318,7 @@ Complete technical details for building API integrations with Revenium's AI mete
 # Create .env file with required variables
 cat > .env << EOF
 REVENIUM_API_KEY="your_api_key_here"
-REVENIUM_BASE_URL="https://api.revenium.ai"  # Optional, defaults to production
+REVENIUM_BASE_URL='""" + api_base_url + """'  # Optional
 EOF
 ```
 
@@ -6188,10 +6332,10 @@ from typing import Dict, Any
 class ReveniumMeteringClient:
     def __init__(self):
         self.api_key = os.getenv("REVENIUM_API_KEY")
-        self.base_url = os.getenv("REVENIUM_BASE_URL", "https://api.revenium.ai")
+        self.base_url = os.getenv("REVENIUM_BASE_URL", '""" + api_base_url + """')
 
     async def submit_transaction(self, transaction_data: Dict[str, Any]) -> Dict[str, Any]:
-        # api.revenium.ai uses x-api-key; Bearer is for app.revenium.ai/api/v2
+        # the metering API uses x-api-key; Bearer is for the app host /api/v2
         headers = {
             "x-api-key": self.api_key,
             "Content-Type": "application/json"
@@ -6237,11 +6381,11 @@ const axios = require('axios');
 class ReveniumMeteringClient {
     constructor() {
         this.apiKey = process.env.REVENIUM_API_KEY;
-        this.baseUrl = process.env.REVENIUM_BASE_URL || 'https://api.revenium.ai';
+        this.baseUrl = process.env.REVENIUM_BASE_URL || '""" + api_base_url + """';
     }
 
     async submitTransaction(transactionData) {
-        // api.revenium.ai uses x-api-key; Bearer is for app.revenium.ai/api/v2
+        // the metering API uses x-api-key; Bearer is for the app host /api/v2
         const headers = {
             'x-api-key': this.apiKey,
             'Content-Type': 'application/json'
@@ -6586,21 +6730,7 @@ Use `validate()` before submission."""
 
                 for provider, provider_models in providers.items():
                     text += f"## **{provider}** ({len(provider_models)} models)\n"
-                    for model in provider_models[:5]:  # Show first 5 models per provider
-                        name = model.get("name", "Unknown")
-                        input_cost = model.get("inputCostPerToken", "N/A")
-                        output_cost = model.get("outputCostPerToken", "N/A")
-                        # BACK-3084: a pinned price does not track the upstream
-                        # rate card, so a cost figure built on it is only
-                        # defensible if the pin is visible. Read-only field —
-                        # see _format_price_pin.
-                        text += (
-                            f"- **{name}** (Input: {_format_price_per_token(input_cost)}, "
-                            f"Output: {_format_price_per_token(output_cost)}, "
-                            f"Price pinned: {_format_price_pin(model)})\n"
-                        )
-                    if len(provider_models) > 5:
-                        text += f"- ... and {len(provider_models) - 5} more models\n"
+                    text += "".join(_ai_model_row(model) for model in provider_models)
                     text += "\n"
 
                 text += (
@@ -6837,14 +6967,57 @@ Use `validate()` before submission."""
         except ReveniumAPIError as e:
             raise api_error_refusal(e, "getting supported providers") from e
 
+    async def _bounded_catalog_advisory(
+        self, client: ReveniumClient, arguments: Dict[str, Any]
+    ) -> str:
+        """The catalog advisory for an already-stored transaction, or nothing if it is slow."""
+        try:
+            return await asyncio.wait_for(
+                self._catalog_advisory(client, arguments),
+                timeout=_LIVE_SUBMIT_CATALOG_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.debug("Catalog check after a live submit timed out")
+            return ""
+
+    async def _exact_catalog_entries(
+        self, client: ReveniumClient, model: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Catalog rows whose whole name is `model`, or None when the catalog cannot be read.
+
+        exactMatch makes the platform compare the whole name instead of running
+        a substring search, whose first page can miss a name many others
+        contain (gpt-5 matches hundreds of rows). Only a search envelope with
+        no `_embedded` block is an empty match (the platform's empty HAL page);
+        an `_embedded` block without the model collection is unreadable.
+        """
+        response: Any = await client.search_ai_models(
+            query=model, page=0, size=100, exactMatch=True
+        )
+        if not isinstance(response, dict):
+            return None
+        if _classify_ai_model_envelope(response) == _AI_MODEL_ENVELOPE_ABSENT:
+            return []
+        embedded = response["_embedded"]
+        found = embedded.get("aIModelResourceList") if isinstance(embedded, dict) else None
+        if not isinstance(found, list):
+            return None
+        # `or ""` rather than a get() default: the catalog can carry a row with
+        # an explicit null name, and the default only covers a missing key.
+        return [
+            entry
+            for entry in found
+            if isinstance(entry, dict) and (entry.get("name") or "").lower() == model.lower()
+        ]
+
     async def _catalog_advisory(
         self, client: ReveniumClient, arguments: Dict[str, Any]
     ) -> str:
         """Check a submission payload's model/provider pair against the catalog.
 
-        The single catalog check behind every pre-flight path - the `validate`
-        action and `submit_ai_transaction` with `dry_run` - so the two cannot
-        return different verdicts for the same payload. It answers the same
+        The single catalog check behind the `validate` action and
+        `submit_ai_transaction`, dry run and live, so no two of them can return
+        different verdicts for the same payload. It answers the same
         question `validate_model_provider` answers: is there a catalog entry
         with this model name, and does one of them carry this provider.
 
@@ -6852,38 +7025,24 @@ Use `validate()` before submission."""
         accepts models the catalog has not listed yet - and a catalog that
         cannot be read produces no warning, so an outage is never reported as a
         bad model name. Returns an empty string when there is nothing to say.
+
+        A non-empty return means the pair is unpriced: the live submit appends
+        `_UNPRICED_SUBMIT_NOTE` (stored at $0.00) to it, so only return text
+        for a model/provider pair the catalog cannot price.
         """
         model = arguments.get("model")
         if not isinstance(model, str) or not model.strip():
             return ""
 
         try:
-            response = await client.search_ai_models(
-                query=model, page=0, size=100, exactMatch=True
-            )
+            name_matches = await self._exact_catalog_entries(client, model)
         except Exception as exc:  # pragma: no cover - advisory lookup only
             logger.debug(f"Catalog check for '{model}' failed: {exc}")
             return ""
-
-        # Typed as a dict upstream, but a transport hiccup can still hand back
-        # something else; widen to Any so the shape is actually checked here.
-        envelope: Any = response
-        if not isinstance(envelope, dict):
-            # Not a search envelope: the catalog could not be read. Stay quiet
-            # rather than blame the model name for a service problem.
+        if name_matches is None:
+            # The catalog could not be read. Stay quiet rather than blame the
+            # model name for a service problem.
             return ""
-
-        embedded = envelope.get("_embedded")
-        found = embedded.get("aIModelResourceList") or [] if isinstance(embedded, dict) else []
-        # `or ""` rather than a get() default: the catalog can carry a row with
-        # an explicit null name, and the default only covers a missing key. An
-        # AttributeError here would turn an advisory check into a hard failure
-        # of the whole validate call.
-        name_matches = [
-            entry
-            for entry in found
-            if isinstance(entry, dict) and (entry.get("name") or "").lower() == model.lower()
-        ]
 
         provider = arguments.get("provider")
         provider_text = provider if isinstance(provider, str) and provider.strip() else "<provider>"
@@ -6903,13 +7062,7 @@ Use `validate()` before submission."""
             # No provider to compare - the name is in the catalog, nothing to say.
             return ""
 
-        catalog_providers = []
-        for entry in name_matches:
-            entry_provider = entry.get("provider") or ""
-            if isinstance(entry_provider, str) and entry_provider.strip():
-                if entry_provider not in catalog_providers:
-                    catalog_providers.append(entry_provider)
-
+        catalog_providers = _catalog_providers(name_matches)
         if any(p.lower() == provider.lower() for p in catalog_providers):
             return ""
 
@@ -7013,12 +7166,10 @@ Use `validate()` before submission."""
             # retrieval-failure text belongs to.
             envelope: Any = response
             if not isinstance(envelope, dict):
-                return [
-                    TextContent(
-                        type="text",
-                        text="❌ **Validation failed**\n\nUnable to retrieve models from API for validation.",
-                    )
-                ]
+                raise_refusal(
+                    "❌ **Validation failed**\n\nUnable to retrieve models from API for validation.",
+                    error_code=ErrorCodes.API_ERROR,
+                )
 
             embedded = envelope.get("_embedded")
             models: List[Dict[str, Any]] = []
@@ -7152,71 +7303,33 @@ Use `validate()` before submission."""
                 )
 
             client = await self.get_client(ctx=ctx)
-
-            response = await client.search_ai_models(query=model, page=0, size=100)
-
-            if "_embedded" in response and "aIModelResourceList" in response["_embedded"]:
-                models = response["_embedded"]["aIModelResourceList"]
-
-                target_model = None
-                for api_model in models:
-                    if (
-                        api_model.get("name", "").lower() == model.lower()
-                        and api_model.get("provider", "").lower() == provider.lower()
-                    ):
-                        target_model = api_model
-                        break
-
-                if target_model:
-                    input_cost_per_token = float(target_model.get("inputCostPerToken", 0))
-                    output_cost_per_token = float(target_model.get("outputCostPerToken", 0))
-
-                    input_cost = input_tokens * input_cost_per_token
-                    output_cost = output_tokens * output_cost_per_token
-                    total_cost = input_cost + output_cost
-
-                    text = "# 💰 **Transaction Cost Estimate**\n\n"
-                    text += f"**Model**: {target_model.get('name')} ({target_model.get('provider')})\n\n"
-                    text += "### **Token Usage**\n"
-                    text += f"- **Input Tokens**: {input_tokens:,}\n"
-                    text += f"- **Output Tokens**: {output_tokens:,}\n"
-                    text += f"- **Total Tokens**: {input_tokens + output_tokens:,}\n\n"
-                    text += "### **Cost Breakdown**\n"
-                    text += (
-                        f"- **Input Cost**: {input_tokens:,} × {_format_price_per_token(input_cost_per_token)}"
-                        f" = **{_format_cost(input_cost)}**\n"
-                    )
-                    text += (
-                        f"- **Output Cost**: {output_tokens:,} × {_format_price_per_token(output_cost_per_token)}"
-                        f" = **{_format_cost(output_cost)}**\n"
-                    )
-                    text += f"- **Total Cost**: **{_format_cost(total_cost)}**\n\n"
-
-                    if input_tokens > 0:
-                        text += "### **Reference Rates**\n"
-                        text += f"- **Input**: {_format_price_per_1k_tokens(input_cost_per_token)}\n"
-                        text += f"- **Output**: {_format_price_per_1k_tokens(output_cost_per_token)}\n\n"
-
-                    text += "**💡 Ready to submit**: Use `submit_ai_transaction()` with these parameters"
-
-                    return [TextContent(type="text", text=text)]
-
-                else:
-                    return [
-                        TextContent(
-                            type="text",
-                            text=f"❌ **Model not found**: {model} ({provider})\n\n"
-                            "**Tip**: Use `validate_model_provider()` to check if the model/provider combination exists",
-                        )
-                    ]
-
-            else:
-                return [
-                    TextContent(
-                        type="text",
-                        text="❌ **Cost estimation failed**\n\nUnable to retrieve model pricing from API.",
-                    )
-                ]
+            name_matches = await self._exact_catalog_entries(client, model)
+            if name_matches is None:
+                raise_refusal(
+                    "❌ **Cost estimation failed**\n\nUnable to retrieve model pricing from API.",
+                    error_code=ErrorCodes.API_ERROR,
+                )
+            target_model = next(
+                (
+                    entry
+                    for entry in name_matches
+                    if (entry.get("provider") or "").lower() == provider.lower()
+                ),
+                None,
+            )
+            if target_model is None:
+                raise_refusal(
+                    _unpriced_estimate_refusal(self.tool_name, model, provider, name_matches),
+                    error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+                    field="model",
+                    value=model,
+                )
+            return [
+                TextContent(
+                    type="text",
+                    text=_format_cost_estimate(target_model, input_tokens, output_tokens),
+                )
+            ]
 
         except ReveniumAPIError as e:
             raise api_error_refusal(e, "estimating transaction cost") from e
@@ -7710,6 +7823,7 @@ Use `validate()` before submission."""
         self,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Get Python integration code examples."""
+        api_base_url = configured_api_base_url()
         return [
             TextContent(
                 type="text",
@@ -7729,7 +7843,7 @@ Use `validate()` before submission."""
                 "    \n"
                 "    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):\n"
                 "        self.api_key = api_key or os.getenv('REVENIUM_API_KEY')\n"
-                "        self.base_url = base_url or os.getenv('REVENIUM_BASE_URL', 'https://api.revenium.ai')\n"
+                "        self.base_url = base_url or os.getenv('REVENIUM_BASE_URL', '" + api_base_url + "')\n"
                 "        self.timeout = int(os.getenv('REVENIUM_TIMEOUT', '30'))\n"
                 "        \n"
                 "        if not self.api_key:\n"
@@ -7887,7 +8001,7 @@ Use `validate()` before submission."""
                 "```bash\n"
                 "# .env file\n"
                 "REVENIUM_API_KEY=rev_your_api_key_here\n"
-                "REVENIUM_BASE_URL=https://api.revenium.ai\n"
+                "REVENIUM_BASE_URL=" + api_base_url + "\n"
                 "REVENIUM_TIMEOUT=30\n"
                 "```\n\n"
                 "```bash\n"
@@ -7902,6 +8016,7 @@ Use `validate()` before submission."""
         self,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Get JavaScript integration code examples."""
+        api_base_url = configured_api_base_url()
         return [
             TextContent(
                 type="text",
@@ -7914,7 +8029,7 @@ Use `validate()` before submission."""
                 "class ReveniumMeteringClient {\n"
                 "    constructor(apiKey = null, baseUrl = null) {\n"
                 "        this.apiKey = apiKey || process.env.REVENIUM_API_KEY;\n"
-                "        this.baseUrl = baseUrl || process.env.REVENIUM_BASE_URL || 'https://api.revenium.ai';\n"
+                "        this.baseUrl = baseUrl || process.env.REVENIUM_BASE_URL || '" + api_base_url + "';\n"
                 "        this.timeout = parseInt(process.env.REVENIUM_TIMEOUT || '30000');\n"
                 "        \n"
                 "        if (!this.apiKey) {\n"
@@ -8057,7 +8172,7 @@ Use `validate()` before submission."""
                 "```bash\n"
                 "# .env file\n"
                 "REVENIUM_API_KEY=rev_your_api_key_here\n"
-                "REVENIUM_BASE_URL=https://api.revenium.ai\n"
+                "REVENIUM_BASE_URL=" + api_base_url + "\n"
                 "REVENIUM_TIMEOUT=30000\n"
                 "```\n\n"
                 "```bash\n"
@@ -8072,6 +8187,7 @@ Use `validate()` before submission."""
         self,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Get Java integration code examples."""
+        api_base_url = configured_api_base_url()
         return [
             TextContent(
                 type="text",
@@ -8101,7 +8217,7 @@ Use `validate()` before submission."""
                 '            .orElse(System.getenv("REVENIUM_API_KEY"));\n'
                 "        this.baseUrl = Optional.ofNullable(baseUrl)\n"
                 '            .orElse(Optional.ofNullable(System.getenv("REVENIUM_BASE_URL"))\n'
-                '                .orElse("https://api.revenium.ai"));\n'
+                '                .orElse("' + api_base_url + '"));\n'
                 "        this.timeout = Duration.ofSeconds(\n"
                 '            Integer.parseInt(Optional.ofNullable(System.getenv("REVENIUM_TIMEOUT"))\n'
                 '                .orElse("30")));\n'
@@ -8208,7 +8324,8 @@ Use `validate()` before submission."""
             TextContent(
                 type="text",
                 text="# **AI Transaction Metering Management**\n\n"
-                "The manage_metering tool allows you to submit AI transactions to Revenium for metering, look up previously submitted AI transactions, validate transaction data before submission, and access comprehensive documentation for AI usage tracking and billing.\n\n"
+                f"{self.public_tool_name} looks up previously submitted AI transactions, validates transaction data before submission, and gives the documentation for AI usage tracking and billing. "
+                f"Submitting an AI transaction to Revenium for metering is served by {public_tool_for(self.tool_name, 'submit_ai_transaction')}.\n\n"
                 "## **Capabilities Overview**\n\n"
                 "### **Core Operations**\n"
                 "• **Transaction Submission**: Submit AI usage data with comprehensive metadata for billing and attribution\n"
@@ -8708,10 +8825,11 @@ Use `validate()` before submission."""
                 },
                 # Unified Transaction Lookup Parameters (lookup_transactions)
                 "transaction_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "maxItems": _LOOKUP_MAX_IDS,
-                    "description": f"Array of transaction IDs to lookup - required for lookup_transactions, at most {_LOOKUP_MAX_IDS} per call (split larger batches)",
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string"}, "maxItems": _LOOKUP_MAX_IDS},
+                        {"type": "string"},
+                    ],
+                    "description": f"Array of transaction IDs to lookup - required for lookup_transactions, at most {_LOOKUP_MAX_IDS} per call (split larger batches). A single id may also be sent as a plain string.",
                 },
                 "max_retries": {
                     "type": "integer",
@@ -8977,6 +9095,7 @@ Use `validate()` before submission."""
                 "retry_number": {
                     "type": "integer",
                     "minimum": 0,
+                    "maximum": _PLATFORM_INT_MAX,
                     "description": "Retry attempt number (0 = first attempt, 1 = first retry, etc.).",
                 },
                 "usage_metadata": {
@@ -9017,19 +9136,19 @@ Use `validate()` before submission."""
         self,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get API endpoints action - provides complete API endpoint information."""
+        api_base_url = configured_api_base_url()
         return [
             TextContent(
                 type="text",
                 text="# **Revenium API Endpoints**\n\n"
                 "## **API Configuration**\n\n"
-                "### **Production Environment**\n"
-                "- **Base URL**: `https://api.revenium.ai`\n"
+                "### **Configured Environment**\n"
+                "- **Base URL**: `" + api_base_url + "`\n"
                 "- **Timeout**: 30 seconds (configurable via REVENIUM_TIMEOUT)\n"
                 "- **SSL/TLS**: Required (HTTPS only)\n"
                 "- **Content-Type**: `application/json`\n\n"
                 "### **Custom Configuration**\n"
                 "- **Base URL**: Configurable via `REVENIUM_BASE_URL` environment variable\n"
-                "- **Default**: `https://api.revenium.ai`\n"
                 "- **Use Case**: Custom deployments or specific routing requirements\n\n"
                 "## **AI Metering Endpoints**\n\n"
                 "### **1. Submit AI Transaction**\n"
@@ -9136,13 +9255,13 @@ Use `validate()` before submission."""
                 "# Required\n"
                 "REVENIUM_API_KEY=rev_your_api_key_here\n\n"
                 "# Optional\n"
-                "REVENIUM_BASE_URL=https://api.revenium.ai\n"
+                "REVENIUM_BASE_URL=" + api_base_url + "\n"
                 "REVENIUM_TIMEOUT=30\n"
                 "```\n\n"
                 "### **URL Construction Examples**\n"
                 "```python\n"
                 "import os\n\n"
-                "base_url = os.getenv('REVENIUM_BASE_URL', 'https://api.revenium.ai')\n"
+                "base_url = os.getenv('REVENIUM_BASE_URL', '" + api_base_url + "')\n"
                 "submit_url = f'{base_url}/meter/v2/ai/completions'\n"
                 "verify_url = f'{base_url}/profitstream/v2/api/sources/metrics/ai/completions'\n"
                 "models_url = f'{base_url}/profitstream/v2/api/sources/ai/models'\n"
@@ -9168,6 +9287,7 @@ Use `validate()` before submission."""
         self,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get authentication details action - provides complete authentication specifications."""
+        api_base_url = configured_api_base_url()
         return [
             TextContent(
                 type="text",
@@ -9208,7 +9328,7 @@ Use `validate()` before submission."""
                 "### **Complete Header Example**\n"
                 "```http\n"
                 "POST /meter/v2/ai/completions HTTP/1.1\n"
-                "Host: api.revenium.ai\n"
+                "Host: " + urlparse(api_base_url).netloc + "\n"
                 "Authorization: Bearer rev_abc123def456ghi789jkl012mno345pq\n"
                 "x-api-key: rev_abc123def456ghi789jkl012mno345pq\n"
                 "Content-Type: application/json\n"
@@ -9230,7 +9350,7 @@ Use `validate()` before submission."""
                 "### **Optional Configuration**\n"
                 "```bash\n"
                 "# Custom API base URL (OPTIONAL)\n"
-                "REVENIUM_BASE_URL=https://api.revenium.ai\n\n"
+                "REVENIUM_BASE_URL=" + api_base_url + "\n\n"
                 "# Request timeout in seconds (OPTIONAL)\n"
                 "REVENIUM_TIMEOUT=30\n\n"
                 "# Team ID — required for AI model discovery endpoints\n"
@@ -9379,7 +9499,7 @@ Use `validate()` before submission."""
                 'curl -H "Authorization: Bearer $REVENIUM_API_KEY" \\\n'
                 '     -H "x-api-key: $REVENIUM_API_KEY" \\\n'
                 '     -H "Content-Type: application/json" \\\n'
-                '     "https://api.revenium.ai/profitstream/v2/api/sources/ai/models?teamId=$REVENIUM_TEAM_ID&page=0&size=1"\n'
+                '     "' + api_base_url + '/profitstream/v2/api/sources/ai/models?teamId=$REVENIUM_TEAM_ID&page=0&size=1"\n'
                 "```\n\n"
                 "**Next Steps**: Use `get_response_formats()` to understand API responses\n\n"
                 "**Note**: Authentication requirements are current as of tool version. "
@@ -9691,6 +9811,7 @@ Use `validate()` before submission."""
         self, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get integration config action - provides environment setup guidance."""
+        api_base_url = configured_api_base_url()
         language = arguments.get("language", "python")
         return [
             TextContent(
@@ -9706,7 +9827,7 @@ Use `validate()` before submission."""
                 "### **Optional Environment Variables**\n\n"
                 "**REVENIUM_BASE_URL**\n"
                 "- Description: Custom API base URL\n"
-                "- Default: `https://api.revenium.ai`\n"
+                "- Default: `" + api_base_url + "`\n"
                 "- Use cases: Testing, On-premise deployments\n\n"
                 "**REVENIUM_TIMEOUT**\n"
                 "- Description: Request timeout in seconds\n"
@@ -9717,7 +9838,7 @@ Use `validate()` before submission."""
                 "```bash\n"
                 "# Revenium API Configuration\n"
                 "REVENIUM_API_KEY=rev_your_key_here\n"
-                "REVENIUM_BASE_URL=https://api.revenium.ai\n"
+                "REVENIUM_BASE_URL=" + api_base_url + "\n"
                 "REVENIUM_TIMEOUT=30\n"
                 "```\n\n"
                 "### **Code Example**\n"
@@ -9726,7 +9847,7 @@ Use `validate()` before submission."""
                 "from typing import Optional\n\n"
                 "# Load configuration from environment\n"
                 "api_key = os.getenv('REVENIUM_API_KEY')\n"
-                "base_url = os.getenv('REVENIUM_BASE_URL', 'https://api.revenium.ai')\n"
+                "base_url = os.getenv('REVENIUM_BASE_URL', '" + api_base_url + "')\n"
                 "timeout = int(os.getenv('REVENIUM_TIMEOUT', '30'))\n\n"
                 "if not api_key:\n"
                 "    raise ValueError('REVENIUM_API_KEY environment variable is required')\n\n"
@@ -9861,7 +9982,7 @@ Use `validate()` before submission."""
         if language.lower() == "java":
             from ..common.error_handling import (
                 create_structured_validation_error,
-                format_structured_error,
+                raise_structured_error,
             )
 
             error = create_structured_validation_error(
@@ -9879,7 +10000,7 @@ Use `validate()` before submission."""
                     "supported_languages": ["python", "javascript"],
                 },
             )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            raise_structured_error(error)
 
         # Route to language-specific implementations
         if language.lower() == "javascript":
@@ -9892,6 +10013,7 @@ Use `validate()` before submission."""
         self, use_case: str
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Get Python-specific integration guide."""
+        api_base_url = configured_api_base_url()
         return [
             TextContent(
                 type="text",
@@ -9908,7 +10030,7 @@ Use `validate()` before submission."""
                 "Create `.env` file:\n"
                 "```bash\n"
                 "REVENIUM_API_KEY=rev_your_key_here\n"
-                "REVENIUM_BASE_URL=https://api.revenium.ai\n"
+                "REVENIUM_BASE_URL=" + api_base_url + "\n"
                 "```\n\n"
                 "### **Step 2: Basic Client Implementation**\n\n"
                 "```python\n"
@@ -9921,7 +10043,7 @@ Use `validate()` before submission."""
                 "class ReveniumMeteringClient:\n"
                 "    def __init__(self):\n"
                 "        self.api_key = os.getenv('REVENIUM_API_KEY')\n"
-                "        self.base_url = os.getenv('REVENIUM_BASE_URL', 'https://api.revenium.ai')\n"
+                "        self.base_url = os.getenv('REVENIUM_BASE_URL', '" + api_base_url + "')\n"
                 "        \n"
                 "        if not self.api_key:\n"
                 "            raise ValueError('REVENIUM_API_KEY environment variable required')\n"
@@ -10020,6 +10142,7 @@ Use `validate()` before submission."""
         self, use_case: str
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Get JavaScript/Node.js-specific integration guide with official package references."""
+        api_base_url = configured_api_base_url()
         return [
             TextContent(
                 type="text",
@@ -10045,7 +10168,7 @@ Use `validate()` before submission."""
                 "```bash\n"
                 "# Environment variables read by @revenium/middleware\n"
                 "REVENIUM_METERING_API_KEY=rev_your_key_here\n"
-                "REVENIUM_METERING_BASE_URL=https://api.revenium.ai\n"
+                "REVENIUM_METERING_BASE_URL=" + api_base_url + "\n"
                 "```\n\n"
                 "### **Next Steps**\n\n"
                 "1. **Visit Revenium**: https://app.revenium.ai and review the get connected section\n"

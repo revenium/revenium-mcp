@@ -38,6 +38,7 @@ from fastmcp import FastMCP
 
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ToolError
+from src.revenium_mcp_server.common.tool_surface import domain_for
 from src.revenium_mcp_server.tool_configuration.config import ToolConfig
 from src.revenium_mcp_server.tool_configuration.registry import (
     ToolConfigurationRegistry,
@@ -52,6 +53,7 @@ from tests.unit._registered_tool_harness import (
     answer_text,
     caller_context,
     isolate_server_settings,
+    serving_tool,
 )
 
 TOOLS_DIR = (
@@ -453,7 +455,7 @@ LOCAL_DEAD_PLATFORM = "http://127.0.0.1:9"
 
 # Tools the caller-facing list check does not cover yet, each with the reason.
 ANSWER_CHECK_OUT_OF_SCOPE: Dict[str, str] = {
-    "business_analytics_management": (
+    "get_business_analytics": (
         "returns its refusals as text and dispatches actions it does not "
         "advertise; owned by the analytics lane (PR 489). Drop when that merges."
     ),
@@ -504,8 +506,12 @@ def _business_tools() -> List[str]:
     return sorted(PROFILE_DEFINITIONS["business"])
 
 
+def _class_name(tool: str) -> str:
+    return REGISTERED_TOOL_CLASSES[domain_for(tool).key]
+
+
 def _tool_class(tool: str):
-    class_name = REGISTERED_TOOL_CLASSES[tool]
+    class_name = _class_name(tool)
     module = importlib.import_module(
         "src.revenium_mcp_server.tools_decomposed."
         + MODULE_BY_CLASS[class_name].removesuffix(".py")
@@ -515,6 +521,11 @@ def _tool_class(tool: str):
 
 async def _advertised(tool: str) -> List[str]:
     return list(await _tool_class(tool)(ucm_helper=None)._get_supported_actions())
+
+
+async def _served(tool: str) -> List[str]:
+    """The advertised actions the public tool ``tool`` runs; its sibling serves the rest."""
+    return domain_for(tool).actions_served_by(tool, await _advertised(tool))
 
 
 async def _raised_first_line(tool: str, action: str, arguments: Dict) -> str:
@@ -542,7 +553,7 @@ async def _call_registered(monkeypatch, tmp_path, tool, arguments, auth_mode="en
     registry = ToolConfigurationRegistry(
         tool_config=ToolConfig.create_for_testing(profile="business")
     )
-    await registry._register_single_tool(mcp, tool)
+    await registry._register_domain(mcp, domain_for(tool))
     middleware = CallerContextMiddleware()
     mcp.add_middleware(middleware)
     return await RegisteredTools(mcp, middleware).call(tool, arguments, tenant=tenant)
@@ -562,11 +573,11 @@ class TestEveryRegisteredToolNamesItsActions:
     """
 
     def test_every_business_tool_maps_to_a_tool_class(self):
-        missing = [t for t in _business_tools() if t not in REGISTERED_TOOL_CLASSES]
+        missing = [t for t in _business_tools() if domain_for(t).key not in REGISTERED_TOOL_CLASSES]
         assert not missing
 
     @pytest.mark.parametrize("tool", ANSWER_CHECKED_TOOLS)
-    async def test_unknown_action_is_an_error_that_lists_every_advertised_action(
+    async def test_unknown_action_is_an_error_that_lists_every_action_the_tool_runs(
         self, tool, monkeypatch, tmp_path
     ):
         result = await _call_registered(
@@ -579,7 +590,7 @@ class TestEveryRegisteredToolNamesItsActions:
             tool, UNKNOWN_ACTION, {"action": UNKNOWN_ACTION}
         )
         assert text.splitlines()[0] == f"Error calling tool '{tool}': {first_line}"
-        unnamed = [a for a in await _advertised(tool) if not _times_named(a, text)]
+        unnamed = [a for a in await _served(tool) if not _times_named(a, text)]
         assert not unnamed, f"{tool} answer omits {unnamed}:\n{text}"
         assert text.count("**Valid actions**") <= 1
         assert "Debug Context" not in text
@@ -589,7 +600,7 @@ class TestEveryRegisteredToolNamesItsActions:
     def test_dispatched_actions_are_advertised_or_named_exempt(self, tool):
         if tool in ANSWER_CHECK_OUT_OF_SCOPE:
             pytest.skip(f"{tool}: {ANSWER_CHECK_OUT_OF_SCOPE[tool]}")
-        class_name = REGISTERED_TOOL_CLASSES[tool]
+        class_name = _class_name(tool)
         tree = ast.parse(
             (TOOLS_DIR / MODULE_BY_CLASS[class_name]).read_text(encoding="utf-8")
         )
@@ -606,7 +617,7 @@ class TestEveryRegisteredToolNamesItsActions:
         identifier_shaped = {a for a in dispatched if a.isidentifier()}
         hidden = identifier_shaped - _advertised_action_names(supported_fn)
 
-        assert hidden == set(DISPATCHED_BUT_UNADVERTISED.get(tool, {}))
+        assert hidden == set(DISPATCHED_BUT_UNADVERTISED.get(domain_for(tool).key, {}))
 
     async def test_missing_subscription_id_shows_the_usage_example(
         self, monkeypatch, tmp_path
@@ -621,7 +632,7 @@ class TestEveryRegisteredToolNamesItsActions:
 
         assert result.is_error is True
         assert text.splitlines()[0] == (
-            "Error calling tool 'manage_subscriptions': "
+            "Error calling tool 'get_subscriptions': "
             "Required parameter 'subscription_id' is missing"
         )
         assert "get_billed_amount(subscription_id='sub_123')" in text
@@ -710,8 +721,8 @@ class TestEveryRegisteredToolNamesItsActions:
         text = answer_text(result)
 
         assert result.is_error is True
-        advertised = await _advertised("manage_subscriptions")
-        unnamed = [a for a in advertised if not _times_named(a, text)]
+        served = await _served("manage_subscriptions")
+        unnamed = [a for a in served if not _times_named(a, text)]
         assert not unnamed, text
 
 
@@ -739,10 +750,12 @@ class TestRemovedRoutesGetTheUnknownActionAnswer:
 
         assert result.is_error is True, text
         assert text.splitlines()[0] == (
-            f"Error calling tool '{tool}': Unknown action '{action}' is not supported"
+            f"Error calling tool '{serving_tool(tool, {'action': action})}': "
+            f"Unknown action '{action}' is not supported"
         )
-        unnamed = [a for a in await _advertised(tool) if not _times_named(a, text)]
-        assert not unnamed, f"{tool} answer omits {unnamed}:\n{text}"
+        called = serving_tool(tool, {"action": action})
+        unnamed = [a for a in await _served(called) if not _times_named(a, text)]
+        assert not unnamed, f"{called} answer omits {unnamed}:\n{text}"
 
     async def test_source_create_from_text_writes_nothing(self):
         client = MagicMock()

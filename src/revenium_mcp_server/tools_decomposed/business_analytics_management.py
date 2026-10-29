@@ -231,7 +231,7 @@ class BusinessAnalyticsManagement(ToolBase):
     provider costs, model costs, customer costs, and cost spike investigation.
     """
 
-    tool_name: ClassVar[str] = "business_analytics_management"
+    tool_name: ClassVar[str] = "get_business_analytics"
     tool_description: ClassVar[str] = (
         "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_user_costs, get_department_costs, get_tool_costs, get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider, get_ai_assistant_team_medians, get_transaction_count, get_filter_options, get_unpaid_invoice_totals, get_seat_utilization, list_invoices, list_refunds, list_period_charges, list_skills, get_skill, get_pr_health, get_pr_health_engineers, get_pr_health_prs, get_pr_health_pull_requests, get_pr_health_repositories, get_pr_health_breakdown, get_pr_health_queue, get_pr_health_trend, get_pr_health_follow_through, get_merged_prs, get_coverage_ratio, get_task_costs, get_task_completion, get_task_performance, get_profit_margins, get_top_movers, get_token_breakdown, get_team_costs, get_vendor_costs, get_token_vs_tool_cost, get_trace_cost_distribution, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_filter_options(dimension=...) to discover valid filter values. Use get_examples() for parameter guidance and get_capabilities() for status."
     )
@@ -259,7 +259,7 @@ class BusinessAnalyticsManagement(ToolBase):
         super().__init__(ucm_helper)
 
         # Initialize response formatter for consistent output
-        self.formatter = UnifiedResponseFormatter("business_analytics_management")
+        self.formatter = UnifiedResponseFormatter("get_business_analytics")
 
         logger.info("Business Analytics Management initialized successfully")
         self.ucm_integration: Optional[Any] = None
@@ -626,7 +626,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
    - Drafts are counted separately and excluded; at-risk (rotting, still open) and wasted (closed unmerged) stay separate
    - Requires source (github|gitlab), start_date and end_date; the window must span fewer than 366 days
    - Dollar figures are client-side ESTIMATES (priced count x avgCostPerMergedPr), never billed amounts
-   - Thresholds come from the team settings and are echoed in the report; the same settings also hold the cutoff date, excluded repositories, automation patterns and assisted-only default. Read them with manage_customers get_pr_health_settings and change them with update_pr_health_settings
+   - Thresholds come from the team settings and are echoed in the report; the same settings also hold the cutoff date, excluded repositories, automation patterns and assisted-only default. Read them with get_customers get_pr_health_settings and change them with manage_customers update_pr_health_settings
    - The report lists at most 50 engineers; page through all of them with get_pr_health_engineers
    - Optional department_id narrows every figure to one department (include_descendants=true adds its subtree)
    - The header echoes the cutoff date and excluded repositories the team settings applied, and the date counts start from (countsSince) when the platform sends it
@@ -694,7 +694,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
    - Takes period, group/aggregation and filters (arrays under agents, providers, models, users, costSources); paged with page and size (1 to 100, default 20)
    - Each department shows its own figures and, labelled apart, the figures with every sub-department added; never add the with-sub-departments figures across groups
    - Spend from people with no department when the call was made is the No department assigned group (departmentId unassigned)
-   - departmentId and parentDepartmentId are hashids, not the numeric ids manage_customers list_departments returns; never pass one for the other
+   - departmentId and parentDepartmentId are hashids, not the numeric ids get_customers list_departments returns; never pass one for the other
    - A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED means there is no grouping, never $0 of spend
 
 7. **get_cost_summary**
@@ -992,7 +992,7 @@ metricType (sum, avg, max, min).
 - `filters` (optional): arrays under `agents`, `providers`, `models`, `users` (subscriber emails), `costSources`
   (defaults to `["coding_assistant", "revenium_metered", "provider_billing"]`, as on get_user_costs)
 - `page` (optional, zero-based) and `size` (optional, 1 to 100, default 20)
-**Reading the answer**: department ids are hashids, not the numeric ids manage_customers list_departments
+**Reading the answer**: department ids are hashids, not the numeric ids get_customers list_departments
 returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED means no grouping, not $0.
 
 ### get_transaction_count
@@ -1236,7 +1236,7 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 - `source`: `github` or `gitlab`
 - `start_date` / `end_date`: ISO `yyyy-MM-dd`; the window must span fewer than 366 days and `start_date` must not be after `end_date`
 **Optional**: `department_id` narrows every figure to one department of your organization (404 for any other); `include_descendants=true` adds its descendant departments and needs `department_id`.
-**Scope**: the team your credentials resolve to, which the server sends with the read — you do not pass one. The PR-health settings are team-addressed and live on `manage_customers` (`get_pr_health_settings` / `update_pr_health_settings`): the `agingDays` and `rottingDays` thresholds (the report echoes the pair it used) plus `cutoffDate` and `excludedRepos`, which narrow which pull requests the figures count at all; `automationPatterns`, which put matching pull requests in the automation bucket; and `assistedOnly`, the team's default view for pricing and listing AI-assisted pull requests only (not a filter on what the report counts).
+**Scope**: the team your credentials resolve to, which the server sends with the read — you do not pass one. The PR-health settings are team-addressed and are read with `get_customers` (`get_pr_health_settings`) and changed with `manage_customers` (`update_pr_health_settings`): the `agingDays` and `rottingDays` thresholds (the report echoes the pair it used) plus `cutoffDate` and `excludedRepos`, which narrow which pull requests the figures count at all; `automationPatterns`, which put matching pull requests in the automation bucket; and `assistedOnly`, the team's default view for pricing and listing AI-assisted pull requests only (not a filter on what the report counts).
 **Paging**: the report lists at most 50 engineers. Use `get_pr_health_engineers` for every engineer, `get_pr_health_prs` for one engineer's pull requests and `get_pr_health_pull_requests` for the whole bucketed list.
 **Reading the numbers**:
 - aging and rotting classify by INACTIVITY (days since the PR's last provider-side activity), not by age; `ageDays` and `inactiveDays` are reported separately
@@ -3620,7 +3620,8 @@ No usage recorded for '{skill_id}' in the requested period ({requested}), or the
         "Scope: the team your credentials resolve to, sent with the read; you do not pass "
         "one (the thresholds below, the cutoff date, "
         "excluded repositories, automation patterns and assisted-only default are "
-        "team-addressed and are read/changed with manage_customers get_pr_health_settings)."
+        "team-addressed; read them with get_customers get_pr_health_settings and change them "
+        "with manage_customers update_pr_health_settings)."
     )
     # Every dollar figure below is derived, not billed. Stated on the report itself
     # because avgCostPerMergedPr is an organization average, not a price per pull request.
@@ -7852,7 +7853,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "get_department_costs(period='SEVEN_DAYS', filters={'providers': ['anthropic']}, size=50)",
                 ],
                 limitations=[
-                    "Department ids are hashids, not the numeric ids manage_customers list_departments returns",
+                    "Department ids are hashids, not the numeric ids get_customers list_departments returns",
                     "No departments, no assignments or data not loaded yet means no grouping, never $0",
                     "One row per department for the whole period; per-day department figures are not available",
                 ],

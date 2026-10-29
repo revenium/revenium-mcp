@@ -25,6 +25,7 @@ from src.revenium_mcp_server.tool_configuration.config import ToolConfig
 from src.revenium_mcp_server.tool_configuration.registry import ToolConfigurationRegistry
 from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
 from tests.unit._hosted_callers import as_api_key_caller, hosted_request_path, identity
+from tests.unit._registered_tool_harness import serving_tool
 
 ALICE = identity("usr_alice", "team_a", "tenant_a", "alice@org-a.test")
 NO_EMAIL_CALLER = identity("usr_n", "team_n", "tenant_n", "")
@@ -125,7 +126,7 @@ class StubbedAlerts:
         )
         await registry._register_manage_alerts(mcp)
         async with Client(mcp) as client:
-            return await client.call_tool("manage_alerts", args, raise_on_error=False)
+            return await client.call_tool(serving_tool("manage_alerts", args), args, raise_on_error=False)
 
     async def call_as(
         self, caller: Any, case: str, extra: Optional[Dict[str, Any]] = None
@@ -525,7 +526,7 @@ async def test_create_from_text_sends_the_threshold_next_to_the_money_words(
     assert {field: sent.get(field) for field in expected} == expected
 
 
-LOCAL_DEFAULT_ORDER = "the address saved with system_setup update_email, then REVENIUM_DEFAULT_EMAIL"
+LOCAL_DEFAULT_ORDER = "the address saved with manage_system_setup update_email, then REVENIUM_DEFAULT_EMAIL"
 
 
 @pytest.mark.asyncio

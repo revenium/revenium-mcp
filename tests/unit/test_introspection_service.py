@@ -24,6 +24,7 @@ class TestHandleIntrospectionAction:
     def setup_method(self):
         self.service = ToolIntrospectionService()
         self.service.engine = MagicMock()
+        self.service.engine.registry.get_provider = AsyncMock(return_value=None)
 
     @pytest.mark.asyncio
     async def test_unknown_action_returns_error_response(self):
@@ -57,6 +58,7 @@ class TestHandleListTools:
     @pytest.mark.asyncio
     async def test_no_tools_message(self):
         self.service.engine = MagicMock()
+        self.service.engine.registry.get_provider = AsyncMock(return_value=None)
         self.service.engine.list_tools = AsyncMock(return_value=[])
         result = await self.service._handle_list_tools()
         assert len(result) == 1
@@ -69,6 +71,7 @@ class TestHandleGetToolMetadata:
     def setup_method(self):
         self.service = ToolIntrospectionService()
         self.service.engine = MagicMock()
+        self.service.engine.registry.get_provider = AsyncMock(return_value=None)
 
     @pytest.mark.asyncio
     async def test_missing_tool_name(self):
@@ -78,13 +81,13 @@ class TestHandleGetToolMetadata:
         assert "tool_name" in exc_info.value.message
 
     @pytest.mark.asyncio
-    async def test_tool_not_found(self):
+    async def test_tool_not_found_lists_the_public_names_of_registered_domains(self):
         self.service.engine.get_tool_metadata = AsyncMock(return_value=None)
-        self.service.engine.list_tools = AsyncMock(return_value=["tool_a"])
+        self.service.engine.list_tools = AsyncMock(return_value=["manage_jobs", "tool_introspection"])
         with pytest.raises(ToolError) as exc_info:
             await self.service._handle_get_tool_metadata({"tool_name": "nonexistent"})
-        assert "not found" in exc_info.value.message
-        assert "tool_a" in exc_info.value.message
+        listed = exc_info.value.message.split("**Available tools**: ", 1)[1].split("\n", 1)[0]
+        assert listed.split(", ") == ["tool_introspection", "get_jobs", "manage_jobs"]
 
     @pytest.mark.asyncio
     async def test_formats_metadata(self):
@@ -136,6 +139,36 @@ class TestHandleGetToolMetadata:
         assert "Useful tool" in text
         assert "Step 1" in text
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "public_name,served,refused",
+        [("get_alerts", "list", "delete"), ("manage_alerts", "delete", "list")],
+    )
+    async def test_a_public_tool_shows_only_the_actions_it_serves(
+        self, public_name, served, refused
+    ):
+        metadata = MagicMock()
+        metadata.name = "manage_alerts"
+        metadata.description = "Domain class description"
+        metadata.tool_type = MagicMock(value="management")
+        metadata.capabilities = []
+        metadata.supported_actions = ["list", "get_capabilities", "delete", "create"]
+        metadata.dependencies = []
+        metadata.resource_relationships = []
+        metadata.performance_metrics = None
+        metadata.agent_summary = ""
+        metadata.quick_start_guide = []
+        self.service.engine.get_tool_metadata = AsyncMock(return_value=metadata)
+
+        result = await self.service._handle_get_tool_metadata({"tool_name": public_name})
+        text = result[0].text
+
+        self.service.engine.get_tool_metadata.assert_awaited_once_with("manage_alerts")
+        assert f"**Tool Metadata: {public_name}**" in text
+        actions = text.split("**Supported Actions**: ", 1)[1].split("\n", 1)[0].split(", ")
+        assert served in actions
+        assert refused not in actions
+
 
 class TestUserJourneyOrdering:
     """Test _get_user_journey_ordered_tools ordering logic."""
@@ -144,16 +177,16 @@ class TestUserJourneyOrdering:
         self.service = ToolIntrospectionService()
 
     def test_known_tools_ordered_by_journey(self):
-        tools = ["manage_products", "system_setup", "system_diagnostics", "manage_alerts"]
+        tools = ["manage_products", "manage_system_setup", "system_diagnostics", "manage_alerts"]
         ordered = self.service._get_user_journey_ordered_tools(tools)
-        # system_setup should be first, system_diagnostics last
-        assert ordered[0] == "system_setup"
+        # manage_system_setup should be first, system_diagnostics last
+        assert ordered[0] == "manage_system_setup"
         assert ordered[-1] == "system_diagnostics"
 
     def test_unknown_tools_appended_alphabetically(self):
-        tools = ["zzz_tool", "aaa_tool", "system_setup"]
+        tools = ["zzz_tool", "aaa_tool", "manage_system_setup"]
         ordered = self.service._get_user_journey_ordered_tools(tools)
-        assert ordered[0] == "system_setup"
+        assert ordered[0] == "manage_system_setup"
         assert ordered[1] == "aaa_tool"
         assert ordered[2] == "zzz_tool"
 
@@ -195,6 +228,7 @@ class TestHandleGetExamples:
     def setup_method(self):
         self.service = ToolIntrospectionService()
         self.service.engine = MagicMock()
+        self.service.engine.registry.get_provider = AsyncMock(return_value=None)
 
     @pytest.mark.asyncio
     async def test_no_tools_returns_error(self):
@@ -238,7 +272,7 @@ class TestFilterToolsForProfile:
 
     def test_filter_shows_tools_in_profile(self):
         tool_class = MagicMock()
-        tool_class.tool_name = "system_setup"
+        tool_class.tool_name = "manage_system_setup"
         with patch.object(self.service, "_should_show_tool", return_value=True):
             result = self.service._filter_tools_for_profile([tool_class], "starter")
         assert len(result) == 1
@@ -383,6 +417,7 @@ class TestPerformanceMetricsOnTheHostedServer:
     def setup_method(self):
         self.service = ToolIntrospectionService()
         self.service.engine = MagicMock()
+        self.service.engine.registry.get_provider = AsyncMock(return_value=None)
         self.service.engine.get_tool_metadata = AsyncMock(
             return_value=_metadata_with_two_calls()
         )

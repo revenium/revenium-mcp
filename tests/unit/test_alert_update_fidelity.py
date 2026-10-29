@@ -420,7 +420,7 @@ class TestFlatArgumentsTheSignatureDeclares:
 
     async def test_the_alert_id_alias_and_an_off_dry_run_are_not_refused(self, tools, platform):
         await tools.handle_action(
-            "update", {"alert_id": "a1", "name": "Renamed", "dry_run": False, "confirm": False}
+            "update", {"alert_id": "a1", "name": "Renamed", "dry_run": False}
         )
 
         assert platform.store["a1"]["name"] == "Renamed"
@@ -981,7 +981,7 @@ class TestExplicitNullsInsideAnomalyDataAnswerAlikeOnPreviewAndUpdate:
 
 def _switch_arguments(action, anomaly_id):
     if action.endswith("_all"):
-        return {"confirm": True}
+        return {}
     if action.endswith("_multiple"):
         return {"anomaly_ids": [anomaly_id]}
     return {"anomaly_id": anomaly_id}
@@ -1086,7 +1086,7 @@ class TestEnableDisableAndToggleCheckTheStoredAlert:
                 threshold_alert("a1", enabled=stored_enabled),
             ]
         )
-        arguments = {"confirm": True} if action.endswith("_all") else {"anomaly_ids": ["p1", "a1"]}
+        arguments = {} if action.endswith("_all") else {"anomaly_ids": ["p1", "a1"]}
 
         flagged, text = await answer(_tools_over(platform).handle_action(action, arguments))
 
@@ -1167,7 +1167,7 @@ class TestABulkCallWhereNothingSucceededIsAnError:
         platform.get_anomaly_by_id = AsyncMock(side_effect=RuntimeError("platform timed out"))
 
         flagged, text = await answer(
-            _tools_over(platform).handle_action(action, {"confirm": True})
+            _tools_over(platform).handle_action(action, {})
         )
 
         assert flagged is True
@@ -1176,7 +1176,7 @@ class TestABulkCallWhereNothingSucceededIsAnError:
         assert platform.updated_bodies == []
 
     async def test_enable_all_with_every_alert_already_enabled_is_not_flagged(self, tools):
-        flagged, text = await answer(tools.handle_action("enable_all", {"confirm": True}))
+        flagged, text = await answer(tools.handle_action("enable_all", {}))
 
         assert flagged is False
         assert "**Failed:** 0" in text
@@ -1185,7 +1185,7 @@ class TestABulkCallWhereNothingSucceededIsAnError:
         platform = FakeAnomalyPlatform([threshold_alert("g1", name=None, enabled=False)])
 
         flagged, text = await answer(
-            _tools_over(platform).handle_action("enable_all", {"confirm": True})
+            _tools_over(platform).handle_action("enable_all", {})
         )
 
         assert flagged is False

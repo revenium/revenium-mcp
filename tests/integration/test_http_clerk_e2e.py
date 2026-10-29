@@ -167,7 +167,7 @@ async def test_valid_jwt_dispatches_tool_call(
     resp = await _call_tool(
         mcp_http_server_with_revenium_mock["base_url"],
         token,
-        tool_name="manage_products",
+        tool_name="get_products",
         arguments={"action": "list"},
     )
     assert resp.status_code == 200, (
@@ -204,7 +204,7 @@ async def test_jwt_team_id_propagates_to_revenium_api_request(
     resp = await _call_tool(
         mcp_http_server_with_revenium_mock["base_url"],
         token,
-        tool_name="manage_products",
+        tool_name="get_products",
         arguments={"action": "list"},
     )
     assert resp.status_code == 200, (

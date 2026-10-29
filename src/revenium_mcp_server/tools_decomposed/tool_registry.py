@@ -8,30 +8,27 @@ architecture.
 import logging
 from typing import Any, Dict, List, Optional, Type
 
+from ..common.tool_surface import ToolSide, domain_for, side_of_tool
 from .unified_tool_base import ToolBase
 
 logger = logging.getLogger(__name__)
 
 
 def get_tool_description(tool_name: str) -> str:
-    """Get tool description from tool class registry.
+    """The advertised description of a public tool, or of a domain's read tool for a domain key.
 
     Args:
-        tool_name: Name of the tool to get description for
+        tool_name: Public tool name or domain key
 
     Returns:
         Tool description string, or fallback if not found
     """
     try:
-        tool_class = _get_tool_class(tool_name)
-        if tool_class and hasattr(tool_class, "tool_description"):
-            return tool_class.tool_description
-        else:
-            logger.warning(f"Tool class {tool_name} missing tool_description property")
-            return f"Tool: {tool_name} (description unavailable)"
-    except Exception as e:
-        logger.warning(f"Could not get description for {tool_name}: {e}")
+        domain = domain_for(tool_name)
+    except KeyError:
+        logger.warning(f"Could not get description for {tool_name}: unknown tool")
         return f"Tool: {tool_name} (description unavailable)"
+    return domain.description_for(side_of_tool(tool_name) if tool_name in domain.public_names else ToolSide.READ)
 
 
 def get_tool_business_category(tool_name: str) -> str:
@@ -87,7 +84,10 @@ def _get_tool_class(tool_name: str) -> Optional[Type[ToolBase]]:
         Tool class or None if not found
     """
     tool_registry = _get_tool_registry()
-    return tool_registry.get(tool_name)
+    try:
+        return tool_registry.get(domain_for(tool_name).key)
+    except KeyError:
+        return tool_registry.get(tool_name)
 
 
 def _get_tool_registry() -> Dict[str, Type[ToolBase]]:
@@ -166,7 +166,7 @@ def _get_tool_registry() -> Dict[str, Type[ToolBase]]:
     try:
         from .metering_elements_management import MeteringElementsManagement
 
-        registry["manage_metering_elements"] = MeteringElementsManagement
+        registry["manage_usage_meters"] = MeteringElementsManagement
     except ImportError:
         pass
 
@@ -183,7 +183,7 @@ def _get_tool_registry() -> Dict[str, Type[ToolBase]]:
     try:
         from .business_analytics_management import BusinessAnalyticsManagement
 
-        registry["business_analytics_management"] = BusinessAnalyticsManagement
+        registry["get_business_analytics"] = BusinessAnalyticsManagement
     except ImportError:
         pass
 
@@ -197,14 +197,14 @@ def _get_tool_registry() -> Dict[str, Type[ToolBase]]:
     try:
         from .subscriber_credentials_management import SubscriberCredentialsManagement
 
-        registry["manage_subscriber_credentials"] = SubscriberCredentialsManagement
+        registry["manage_credentials"] = SubscriberCredentialsManagement
     except ImportError:
         pass
 
     try:
         from .manage_capabilities import ManageCapabilities
 
-        registry["manage_capabilities"] = ManageCapabilities
+        registry["get_capabilities"] = ManageCapabilities
     except ImportError:
         pass
 
@@ -242,14 +242,14 @@ def _get_tool_registry() -> Dict[str, Type[ToolBase]]:
     try:
         from .slack_management import SlackManagement
 
-        registry["slack_management"] = SlackManagement
+        registry["manage_slack"] = SlackManagement
     except ImportError:
         pass
 
     try:
         from .system_setup import SystemSetup
 
-        registry["system_setup"] = SystemSetup
+        registry["manage_system_setup"] = SystemSetup
     except ImportError:
         pass
 

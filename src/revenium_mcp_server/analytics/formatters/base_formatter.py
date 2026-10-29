@@ -43,7 +43,7 @@ _NEW_PLANE_CODING_ASSISTANT_NOTE = (
     "a coding-assistant provider or agent (Claude Code, Claude Cowork, Gemini CLI, "
     "Cursor, Codex CLI, GitHub Copilot) is counted only when the team pays API "
     "rates for that assistant (its apiRateProviders, readable with "
-    "manage_customers get_coding_assistant_billing_settings); a call routed "
+    "get_customers get_coding_assistant_billing_settings); a call routed "
     "through a per-call-billed model host such as Bedrock is counted regardless, "
     "and every other coding-assistant call is left out of every cost read. "
     f"{COST_SOURCE_RULE} To check whether individual coding-assistant records "

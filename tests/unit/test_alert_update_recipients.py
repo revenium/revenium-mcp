@@ -178,6 +178,6 @@ async def test_a_single_switch_points_at_the_slack_configurations_not_the_alert_
 ):
     outcome = await _outcome(_tools(platform_factory()).handle_action(action, arguments))
 
-    assert "slack_management(action='list_configurations')" in outcome[1]
+    assert "get_slack(action='list_configurations')" in outcome[1]
     assert "Verify the anomaly_id exists" not in outcome[1]
     assert "ValidationError(" not in outcome[1]

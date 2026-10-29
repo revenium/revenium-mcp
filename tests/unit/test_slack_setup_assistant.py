@@ -53,11 +53,13 @@ class TestSetupAssistantActionRouting:
     """Test that handle_action routes to correct handlers."""
 
     @pytest.mark.asyncio
-    async def test_unknown_action_returns_error_with_valid_actions(self, setup_tool):
-        result = await setup_tool.handle_action("nonexistent_action", {})
-        text = result[0].text
+    async def test_unknown_action_raises_with_valid_actions(self, setup_tool):
+        with pytest.raises(ToolError) as refused:
+            await setup_tool.handle_action("nonexistent_action", {})
+        text = refused.value.message
         assert "nonexistent_action" in text
-        assert "VALIDATION_ERROR" in text or "Unknown" in text
+        assert "Unknown" in text
+        assert refused.value.error_code == "VALIDATION_ERROR"
 
     @pytest.mark.asyncio
     async def test_get_examples_is_substantive(self, setup_tool):
@@ -119,8 +121,8 @@ class TestGuidedSetup:
         assert len(result[0].text) > 20
 
     @pytest.mark.asyncio
-    async def test_guided_setup_handles_api_error_gracefully(self, setup_tool):
-        """API errors should be caught and shown as user-friendly messages."""
+    async def test_guided_setup_api_error_raises_a_tool_error(self, setup_tool):
+        """BACK-5086: an API error raises a flagged TOOL_ERROR with readable text."""
         mock_client = AsyncMock()
         mock_client.get_slack_configurations = AsyncMock(
             side_effect=RuntimeError("Network error")
@@ -128,22 +130,23 @@ class TestGuidedSetup:
         with patch.object(
             setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ):
-            result = await setup_tool.handle_action("guided_setup", {})
-        # Should not raise, should return error text
-        assert "error" in result[0].text.lower() or len(result[0].text) > 20
+            with pytest.raises(ToolError) as refused:
+                await setup_tool.handle_action("guided_setup", {})
+        assert refused.value.error_code == "TOOL_ERROR"
+        assert "Failed to perform guided setup" in refused.value.message
 
 
 class TestSelectDefaultConfiguration:
     """Test select_default_configuration action."""
 
     @pytest.mark.asyncio
-    async def test_missing_config_id_returns_error(self, setup_tool):
-        """Missing config_id triggers a ValidationError internally which is caught
-        by the outer exception handler (the ValidationError ctor gets unexpected kwargs).
-        Either way, the user should see an error response, not an exception."""
-        result = await setup_tool.handle_action("select_default_configuration", {})
-        text = result[0].text
-        assert "TOOL_ERROR" in text or "failed" in text.lower() or "error" in text.lower()
+    async def test_missing_config_id_raises_a_missing_parameter_error(self, setup_tool):
+        """BACK-5086: a missing config_id is refused with the error flag set."""
+        with pytest.raises(ToolError) as refused:
+            await setup_tool.handle_action("select_default_configuration", {})
+        assert refused.value.error_code == "MISSING_PARAMETER"
+        assert refused.value.field == "config_id"
+        assert "Configuration ID is required" in refused.value.message
 
     @pytest.mark.asyncio
     async def test_successful_set_default(self, setup_tool):
@@ -160,7 +163,7 @@ class TestSelectDefaultConfiguration:
         assert "cfg-1" in text
 
     @pytest.mark.asyncio
-    async def test_set_default_api_error_returns_error_text(self, setup_tool):
+    async def test_set_default_api_error_raises_a_tool_error(self, setup_tool):
         mock_client = AsyncMock()
         mock_client.get_slack_configuration_by_id = AsyncMock(
             side_effect=RuntimeError("Not found")
@@ -168,10 +171,12 @@ class TestSelectDefaultConfiguration:
         with patch.object(
             setup_tool, "get_client", AsyncMock(return_value=mock_client)
         ):
-            result = await setup_tool.handle_action(
-                "select_default_configuration", {"config_id": "bad-id"}
-            )
-        assert "error" in result[0].text.lower() or len(result[0].text) > 20
+            with pytest.raises(ToolError) as refused:
+                await setup_tool.handle_action(
+                    "select_default_configuration", {"config_id": "bad-id"}
+                )
+        assert refused.value.error_code == "TOOL_ERROR"
+        assert "Failed to set default Slack configuration bad-id" in refused.value.message
 
     @pytest.mark.asyncio
     async def test_select_default_skips_env_write_when_ctx_set(self, setup_tool):
@@ -282,13 +287,14 @@ class TestHandleActionErrorHandling:
     """Test top-level exception handling in handle_action."""
 
     @pytest.mark.asyncio
-    async def test_exception_in_handler_returns_error_text(self, setup_tool):
-        """Exceptions should be caught and returned as formatted error text."""
+    async def test_exception_in_handler_raises_a_tool_error(self, setup_tool):
+        """BACK-5086: a handler exception raises a flagged TOOL_ERROR."""
         with patch.object(
             setup_tool, "_handle_guided_setup", side_effect=RuntimeError("boom")
         ):
-            result = await setup_tool.handle_action("guided_setup", {})
-        text = result[0].text.lower()
+            with pytest.raises(ToolError) as refused:
+                await setup_tool.handle_action("guided_setup", {})
+        text = refused.value.message.lower()
         assert "failed" in text or "error" in text
 
 
@@ -686,7 +692,7 @@ class TestOneSetupStatePerAnswer:
         assert recommendations.lstrip().startswith(SETUP_RECOMMENDATIONS[expected].lead)
 
 
-_SELECT_OPTION = "slack_management(action='select_default_configuration', config_id='cfg-0')"
+_SELECT_OPTION = "manage_slack(action='select_default_configuration', config_id='cfg-0')"
 
 
 class TestOneWayToSayNoDefault:
@@ -801,7 +807,7 @@ class TestNoConfigurationsOutranksAStaleDefault:
         assert "## Setup Status: **NOT CONFIGURED**" in text
         assert "choose another default" not in text.lower()
         recommendations = text.split("## Recommendations", 1)[1]
-        assert "slack_management(action='quick_setup')" in recommendations
+        assert "get_slack(action='quick_setup')" in recommendations
 
 
 class TestSetupStatusReadsTheDefaultFromItsPage:

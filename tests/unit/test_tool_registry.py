@@ -90,7 +90,7 @@ class TestGetToolRegistry:
         registry = _get_tool_registry()
         # These tools should be registered based on the source code
         assert "manage_alerts" in registry
-        assert "manage_capabilities" in registry
+        assert "get_capabilities" in registry
         assert "tool_introspection" in registry
 
     def test_get_tool_class_for_known_tool(self):
@@ -154,24 +154,20 @@ class TestValidateToolDescriptions:
 
 
 class TestManageAgentsDescription:
-    """manage_agents resolves its real description through the shim."""
+    """manage_agents resolves the description the surface advertises for it."""
 
-    def test_manage_agents_returns_class_description(self):
-        from src.revenium_mcp_server.tools_decomposed.agent_management import (
-            AgentManagement,
-        )
+    def test_manage_agents_returns_the_surface_description(self):
+        from src.revenium_mcp_server.common.tool_surface import DOMAINS_BY_KEY
 
         desc = get_tool_description("manage_agents")
-        assert desc == AgentManagement.tool_description
+        assert desc == DOMAINS_BY_KEY["manage_agents"].write_description
 
 
 class TestManageCostControlsDescription:
-    """manage_cost_controls resolves its real description through the shim."""
+    """get_cost_controls resolves the description the surface advertises for it."""
 
-    def test_manage_cost_controls_returns_class_description(self):
-        from src.revenium_mcp_server.tools_decomposed.cost_controls_management import (
-            CostControlsManagement,
-        )
+    def test_get_cost_controls_returns_the_surface_description(self):
+        from src.revenium_mcp_server.common.tool_surface import DOMAINS_BY_KEY
 
-        desc = get_tool_description("manage_cost_controls")
-        assert desc == CostControlsManagement.tool_description
+        desc = get_tool_description("get_cost_controls")
+        assert desc == DOMAINS_BY_KEY["manage_cost_controls"].read_description

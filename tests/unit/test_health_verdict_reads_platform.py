@@ -216,7 +216,7 @@ async def test_local_server_without_credentials_still_answers(monkeypatch, tmp_p
     tools = await build_registered_tools()
 
     health = await tools.call("system_diagnostics", {"action": "system_health"})
-    status = await tools.call("system_setup", {"action": "check_system_status"})
+    status = await tools.call("manage_system_setup", {"action": "check_system_status"})
 
     assert health.is_error is False
     assert "[NOT READY]" in answer_text(health)
@@ -241,10 +241,10 @@ async def test_hosted_system_status_agrees_with_system_health(
     tenant = caller_context(platform_url(httpserver), **credential)
 
     status = answer_text(await tools.call(
-        "system_setup", {"action": "check_system_status"}, tenant=tenant,
+        "manage_system_setup", {"action": "check_system_status"}, tenant=tenant,
     ))
     checklist = answer_text(await tools.call(
-        "system_setup", {"action": "setup_checklist"}, tenant=tenant,
+        "manage_system_setup", {"action": "setup_checklist"}, tenant=tenant,
     ))
 
     assert "Authentication failed" not in status
@@ -275,7 +275,7 @@ HOSTED_CALLERS = pytest.mark.parametrize(
     [
         ("system_diagnostics", "debug"),
         ("system_diagnostics", "environment_variables"),
-        ("system_setup", "environment_status"),
+        ("manage_system_setup", "environment_status"),
     ],
 )
 async def test_hosted_caller_whose_read_works_is_not_told_its_key_is_missing(
@@ -315,7 +315,7 @@ async def test_hosted_answers_leave_out_the_servers_auto_discovery(
     tenant = caller_context(platform_url(httpserver), **credential)
 
     optional = answer_text(await tools.call(
-        "system_setup", {"action": "check_optional"}, tenant=tenant,
+        "manage_system_setup", {"action": "check_optional"}, tenant=tenant,
     ))
     discovery = answer_text(await tools.call(
         "system_diagnostics", {"action": "auto_discovery"}, tenant=tenant,
@@ -340,7 +340,7 @@ async def test_hosted_complete_setup_does_not_suggest_update_email(
     tools = await build_registered_tools()
 
     result = await tools.call(
-        "system_setup", {"action": "complete_setup", "confirm_completion": True},
+        "manage_system_setup", {"action": "complete_setup", "confirm_completion": True},
         tenant=caller_context(platform_url(httpserver), **credential),
     )
     text = answer_text(result)
@@ -381,7 +381,7 @@ def no_hosted_slack_defaults():
     ("tool", "action"),
     [
         ("system_diagnostics", "environment_variables"),
-        ("system_setup", "environment_status"),
+        ("manage_system_setup", "environment_status"),
     ],
 )
 async def test_hosted_listing_shows_the_organizations_own_slack_default(
@@ -453,7 +453,7 @@ async def test_recommendations_never_call_setup_complete_without_a_read(
     tools = await build_registered_tools()
 
     text = answer_text(await tools.call(
-        "system_setup", {"action": "get_recommendations"}, tenant=tenant,
+        "manage_system_setup", {"action": "get_recommendations"}, tenant=tenant,
     ))
 
     assert "Setup Complete!" not in text
@@ -482,7 +482,7 @@ async def test_recommendations_call_setup_complete_after_a_read(
     tools = await build_registered_tools()
 
     text = answer_text(await tools.call(
-        "system_setup", {"action": "get_recommendations"}, tenant=tenant,
+        "manage_system_setup", {"action": "get_recommendations"}, tenant=tenant,
     ))
 
     assert "Setup Complete!" in text
@@ -492,8 +492,8 @@ async def test_recommendations_call_setup_complete_after_a_read(
 
 ONBOARDING_ANSWERS = [
     ("system_diagnostics", "onboarding_status"),
-    ("system_setup", "show_welcome"),
-    ("system_setup", "get_recommendations"),
+    ("manage_system_setup", "show_welcome"),
+    ("manage_system_setup", "get_recommendations"),
 ]
 
 
@@ -571,7 +571,7 @@ async def test_recommendations_after_a_read_with_slack_unknown_do_not_claim_it(
     tools = await build_registered_tools()
 
     text = answer_text(await tools.call(
-        "system_setup", {"action": "get_recommendations"}, tenant=tenant,
+        "manage_system_setup", {"action": "get_recommendations"}, tenant=tenant,
     ))
 
     assert "Optional features are configured" not in text
@@ -590,7 +590,7 @@ async def test_required_settings_are_not_complete_without_a_read(
     tools = await build_registered_tools()
 
     text = answer_text(await tools.call(
-        "system_setup", {"action": "check_requirements"}, tenant=tenant,
+        "manage_system_setup", {"action": "check_requirements"}, tenant=tenant,
     ))
 
     assert "Requirements Status: COMPLETE" not in text
@@ -617,7 +617,7 @@ async def test_checklists_do_not_call_setup_complete_with_slack_unknown(
     tenant = _caller_for(auth_mode, platform_url(httpserver), monkeypatch)
     tools = await build_registered_tools()
 
-    text = answer_text(await tools.call("system_setup", {"action": action}, tenant=tenant))
+    text = answer_text(await tools.call("manage_system_setup", {"action": action}, tenant=tenant))
 
     assert completion_claim not in text
     assert "Slack could not be checked on the platform" in text
