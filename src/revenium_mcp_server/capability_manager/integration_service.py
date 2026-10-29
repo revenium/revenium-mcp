@@ -147,7 +147,7 @@ class UCMIntegrationService:
             "manage_customers": "customers",
             "manage_alerts": "alerts",
             "manage_sources": "sources",
-            "manage_metering_elements": "metering_elements",
+            "manage_usage_meters": "metering_elements",
         }
 
         for tool_name, tool_instance in tool_instances.items():

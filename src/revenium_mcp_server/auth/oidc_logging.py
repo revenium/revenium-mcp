@@ -1,7 +1,8 @@
 """OIDCProxy subclass that emits structured auth events on token verification.
 
 Also carries our RFC 9207 authorization-response ``iss`` check, which FastMCP
-does not implement (see ``response_iss``).
+does not implement (see ``response_iss``), and the Revenium consent page
+(see ``consent_page``).
 """
 from __future__ import annotations
 
@@ -10,11 +11,17 @@ from typing import Any
 from fastmcp.server.auth.auth import AccessToken
 from fastmcp.server.auth.oauth_proxy.ui import create_error_html
 from fastmcp.server.auth.oidc_proxy import OIDCProxy
+from joserfc.errors import JoseError
 from loguru import logger
+from mcp.server.auth.middleware.client_auth import ClientAuthenticator
+from mcp.shared.auth import OAuthClientInformationFull
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
+from starlette.routing import Route
 
 from .auth_events import emit_auth_event
+from .consent_page import install_consent_page
+from .public_client_revocation import with_public_client_revocation
 from .response_iss import (
     collapse_iss_values,
     ISS_UNVERIFIABLE,
@@ -35,6 +42,7 @@ class AuthLoggingOIDCProxy(OIDCProxy):
     def __init__(self, *, audience: str | None = None, **kwargs: Any) -> None:
         super().__init__(audience=audience, **kwargs)
         self._expected_audience = audience
+        install_consent_page()
 
     def _uses_alternate_verification(self) -> bool:
         """Forward the verified ID token downstream, not the access token.
@@ -125,6 +133,40 @@ class AuthLoggingOIDCProxy(OIDCProxy):
         elif reason:
             logger.debug("RFC 9207 issuer check tolerated the response ({})", reason)
         return await super()._handle_idp_callback(request)
+
+    def get_routes(self, mcp_path: str | None = None) -> list[Route]:
+        return with_public_client_revocation(
+            super().get_routes(mcp_path), self, ClientAuthenticator(self)
+        )
+
+    async def revoke_client_token(
+        self, client: OAuthClientInformationFull, token: str
+    ) -> None:
+        """Revoke a proxy-issued access or refresh token held by ``client``.
+
+        NOTE: Reads FastMCP-internal state (``jwt_issuer`` and
+        ``_jti_mapping_store``). Verified against fastmcp 4.0.10.
+
+        The SDK handler hands ``revoke_token`` the validated upstream identity,
+        whose ``client_id`` is the Clerk application rather than the
+        registered MCP client, so an access token presented to ``/revoke`` was
+        never actually revoked. Deleting the JTI mapping is what makes
+        ``load_access_token`` reject the token from then on.
+        """
+        access_claims = self._proxy_access_token_claims(token)
+        if access_claims is not None:
+            if access_claims.get("client_id") == client.client_id:
+                await self._jti_mapping_store.delete(key=access_claims["jti"])
+            return
+        refresh_token = await self.load_refresh_token(client, token)
+        if refresh_token is not None:
+            await self.revoke_token(refresh_token)
+
+    def _proxy_access_token_claims(self, token: str) -> dict[str, Any] | None:
+        try:
+            return self.jwt_issuer.verify_token(token)
+        except (JoseError, ValueError, KeyError):
+            return None
 
     async def verify_token(self, token: str) -> AccessToken | None:
         result = await super().verify_token(token)

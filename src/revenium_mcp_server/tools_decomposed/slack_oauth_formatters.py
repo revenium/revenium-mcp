@@ -10,6 +10,8 @@ from typing import Any, Dict, List
 
 from mcp.types import TextContent
 
+from ..common.tool_surface import tool_call
+
 
 def format_oauth_initiation_response(
     oauth_url: str, app_base_url: str, return_to: str
@@ -31,7 +33,7 @@ def format_oauth_initiation_response(
     result_text += "1. **Ensure you are logged into Revenium** (see critical requirement above)\n"
     result_text += "2. **Click the link above** or copy the URL to your browser\n"
     result_text += "3. **Authorize Slack** and choose your workspace/channel\n"
-    result_text += "4. **Return here** and check status: `slack_management(action='refresh_configurations')`\n\n"
+    result_text += "4. **Return here** and check status: `get_slack(action='refresh_configurations')`\n\n"
     result_text += f"**Environment**: {app_base_url}\n"
 
     return [TextContent(type="text", text=result_text)]
@@ -43,7 +45,7 @@ def format_oauth_instructions() -> List[TextContent]:
 
     result_text += "## Complete Setup Process\n\n"
     result_text += "### 1. Initiate OAuth\n"
-    result_text += "```\nslack_management(action='initiate_oauth')\n```\n\n"
+    result_text += f"```\n{tool_call('manage_slack', 'initiate_oauth')}\n```\n\n"
 
     result_text += "### 2. Browser Workflow\n"
     result_text += "- **Open the provided link** in your web browser\n"
@@ -54,7 +56,7 @@ def format_oauth_instructions() -> List[TextContent]:
     result_text += "- **Wait for success message** in the Revenium web app\n\n"
 
     result_text += "### 3. Return to MCP\n"
-    result_text += "```\nslack_management(action='refresh_configurations')\n```\n\n"
+    result_text += f"```\n{tool_call('manage_slack', 'refresh_configurations')}\n```\n\n"
 
     result_text += "## Troubleshooting\n\n"
     result_text += "### Common Issues\n\n"
@@ -92,7 +94,7 @@ def format_refresh_configurations_response(
         result_text += "2. **Check the web app** - ensure you saw a success message\n"
         result_text += "3. **Try again** - run this refresh command again\n"
         result_text += (
-            "4. **Start over** - use `slack_management(action='initiate_oauth')` if needed\n\n"
+            "4. **Start over** - use `get_slack(action='initiate_oauth')` if needed\n\n"
         )
         result_text += "**Troubleshooting:**\n"
         result_text += "- Verify OAuth completed successfully in browser\n"
@@ -119,10 +121,10 @@ def format_refresh_configurations_response(
 
         result_text += "## Next Steps\n\n"
         result_text += "**Set a default configuration:**\n"
-        result_text += "```\nslack_management(action='set_default_configuration', config_id='CONFIG_ID')\n```\n\n"
+        result_text += f"```\n{tool_call('manage_slack', 'set_default_configuration', config_id='CONFIG_ID')}\n```\n\n"
 
         result_text += "**View detailed configuration:**\n"
-        result_text += "```\nslack_management(action='get_configuration', config_id='CONFIG_ID')\n```\n\n"
+        result_text += f"```\n{tool_call('manage_slack', 'get_configuration', config_id='CONFIG_ID')}\n```\n\n"
 
         result_text += "**Create alerts with Slack notifications:**\n"
         result_text += "- Use any alert creation tool (they now support Slack automatically)\n"
@@ -145,7 +147,7 @@ def format_check_new_configurations_response(
         result_text += "- Wait 10-30 seconds and try again\n"
         result_text += "- Check the Revenium web app for any error messages\n\n"
         result_text += "**To try OAuth again:**\n"
-        result_text += "```\nslack_management(action='initiate_oauth')\n```\n"
+        result_text += f"```\n{tool_call('manage_slack', 'initiate_oauth')}\n```\n"
     else:
         result_text += f"## Found {total_elements} Configuration(s)\n\n"
 
@@ -169,15 +171,15 @@ def format_check_new_configurations_response(
             result_text += f"- **ID:** `{config_id}`\n\n"
 
             result_text += "**Quick Actions:**\n"
-            result_text += f"- Set as default: `slack_management(action='set_default_configuration', config_id='{config_id}')`\n"
+            result_text += f"- Set as default: `manage_slack(action='set_default_configuration', config_id='{config_id}')`\n"
             result_text += (
-                "- View all: `slack_management(action='list_configurations')`\n"
+                "- View all: `get_slack(action='list_configurations')`\n"
             )
 
         if total_elements > 1:
             result_text += f"\n**Total configurations available:** {total_elements}\n"
             result_text += (
-                "Use `slack_management(action='list_configurations')` to see all.\n"
+                "Use `get_slack(action='list_configurations')` to see all.\n"
             )
 
     return [TextContent(type="text", text=result_text)]
@@ -191,37 +193,37 @@ def get_oauth_examples_text() -> str:
 
 ### 1. Initiate OAuth
 ```python
-slack_management(action="initiate_oauth")
+get_slack(action="initiate_oauth")
 ```
 
 ### 2. Check OAuth Status
 ```python
-slack_management(action="refresh_configurations")
+get_slack(action="refresh_configurations")
 ```
 
 ### 3. Check for New Configurations
 ```python
-slack_management(action="check_new_configurations")
+get_slack(action="check_new_configurations")
 ```
 
 ## Troubleshooting
 
 ### Get Detailed Instructions
 ```python
-slack_management(action="get_oauth_instructions")
+get_slack(action="get_oauth_instructions")
 ```
 
 ## Complete Setup Workflow
 
 ### Step-by-Step Setup
-1. **Start OAuth**: `slack_management(action="initiate_oauth")`
+1. **Start OAuth**: `get_slack(action="initiate_oauth")`
 2. **Complete in browser** (follow the provided link)
-3. **Check status**: `slack_management(action="refresh_configurations")`
-4. **Set default**: Use `slack_management` to set default
+3. **Check status**: `get_slack(action="refresh_configurations")`
+4. **Set default**: Use `manage_slack` to set default
 
 ### Custom Return Page
 ```python
-slack_management(
+get_slack(
     action="initiate_oauth",
     return_to="/custom/page"
 )
@@ -232,10 +234,10 @@ slack_management(
 ### After OAuth Completion
 ```python
 # List new configurations
-slack_management(action="list_configurations")
+get_slack(action="list_configurations")
 
 # Set default configuration
-slack_management(
+manage_slack(
     action="set_default_configuration",
     config_id="new-slack-config-id"
 )
@@ -279,7 +281,7 @@ Comprehensive OAuth workflow management for Slack integrations with guided setup
 5. **Configure**: Refresh configurations and set defaults
 
 ## Integration Points
-- **Configuration Management**: Works with slack_management for setup
+- **Configuration Management**: Works with manage_slack for setup
 - **Alert Management**: Enables Slack notifications in alert creation
 - **Environment Configuration**: Uses REVENIUM_APP_BASE_URL for OAuth URLs (which is set by default to the standard URL)
 

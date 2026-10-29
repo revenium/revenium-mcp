@@ -56,7 +56,7 @@ async def test_confirmed_complete_setup_finishes_on_local_server(
     httpserver.expect_request(SOURCES_PATH).respond_with_json(CONNECTED_SOURCES)
     tools = await build_registered_tools()
 
-    result = await tools.call("system_setup", CONFIRMED)
+    result = await tools.call("manage_system_setup", CONFIRMED)
     text = answer_text(result)
 
     assert result.is_error is False
@@ -77,7 +77,7 @@ async def test_confirmed_complete_setup_finishes_in_api_key_mode(
     tools = await build_registered_tools()
 
     result = await tools.call(
-        "system_setup",
+        "manage_system_setup",
         CONFIRMED,
         tenant=caller_context(platform_url(httpserver), api_key=CALLER_API_KEY),
     )
@@ -102,7 +102,7 @@ async def test_confirmed_complete_setup_names_the_sign_in_in_clerk_mode(
     tools = await build_registered_tools()
 
     result = await tools.call(
-        "system_setup",
+        "manage_system_setup",
         CONFIRMED,
         tenant=caller_context(platform_url(httpserver), clerk_jwt=CALLER_JWT),
     )
@@ -124,12 +124,12 @@ async def test_complete_setup_failure_carries_error_flag(monkeypatch, httpserver
     """
     monkeypatch.chdir(tmp_path)
     isolate_server_settings(monkeypatch, "api_key")
-    await introspection_integration.engine.register_tool("system_setup", SystemSetup())
+    await introspection_integration.engine.register_tool("manage_system_setup", SystemSetup())
     httpserver.expect_request(SOURCES_PATH).respond_with_data("Forbidden", status=403)
     tools = await build_registered_tools()
 
     result = await tools.call(
-        "system_setup",
+        "manage_system_setup",
         CONFIRMED,
         tenant=caller_context(platform_url(httpserver), api_key=CALLER_API_KEY),
     )

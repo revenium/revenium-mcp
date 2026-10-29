@@ -7,7 +7,18 @@ tool with internal composition, following the proven alert/source/customer manag
 import json
 import re
 from datetime import datetime, timezone
-from typing import NoReturn, TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
+from typing import (
+    NoReturn,
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Union,
+    cast,
+)
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -25,8 +36,10 @@ from ..common.error_handling import (
     raise_refusal,
 )
 from ..common.formatting import format_page_count_heading
-from ..common.partial_update_handler import PartialUpdateHandler
+from ..common.partial_update_handler import FieldTransformers, PartialUpdateHandler
 from ..common.platform_paging import PLATFORM_MAX_PAGE_SIZE
+from ..models import BillingPeriod, TrialPeriod
+from ..plan_contract import platform_plan_currencies
 from ..common.sample_coverage import (
     describe_sample,
     platform_total,
@@ -34,7 +47,7 @@ from ..common.sample_coverage import (
     share_of_sample,
 )
 from ..common.team_reference import with_team_reference_as_team_id
-from ..common.update_configs import UpdateConfigFactory
+from ..common.update_configs import SUBSCRIPTION_LINK_IDS, UpdateConfigFactory
 from ..common.validation import SAFE_INT_MAX, apply_filter_allowlist
 from ..config_store import configured_default_email, get_config_value
 from ..exceptions import ValidationError
@@ -50,6 +63,12 @@ from ..introspection.metadata import (
     ToolDependency,
     ToolType,
     UsagePattern,
+)
+from ..common.subscription_create_fields import (
+    OPTIONAL_SUBSCRIPTION_CREATE_FIELDS,
+    REQUIRED_SUBSCRIPTION_CREATE_FIELDS,
+    SUBSCRIPTION_CREATE_RULES,
+    SUBSCRIPTION_CREATE_UNAPPLIED_DATES,
 )
 from ..schema_discovery import SUBSCRIPTION_EXAMPLE_TYPES
 from .unified_tool_base import ToolBase
@@ -334,7 +353,55 @@ def _create_subscription_fields(subscription_data: Any) -> Dict[str, Any]:
         outcome="nothing was created",
         example=_CREATE_EXAMPLE,
     )
+    _refuse_unapplied_start(subscription_data)
     return with_team_reference_as_team_id(subscription_data, "subscription_data")
+
+
+def _refuse_unapplied_start(subscription_data: Any) -> None:
+    """Refuse a create that asks for a start or trial end the platform sets itself."""
+    if not isinstance(subscription_data, dict):
+        return
+    for field in SUBSCRIPTION_CREATE_UNAPPLIED_DATES:
+        requested = subscription_data.get(field)
+        if requested is not None:
+            raise_refusal(
+                "**Requested date not applied**\n\n"
+                f"**Field**: `{field}`\n"
+                f"**Value**: `{requested}`\n\n"
+                "The platform sets a new subscription's start and trial end itself and "
+                "ignores a requested one, so billing would begin when the subscription is "
+                f"created, not on {requested}. Nothing was created.\n\n"
+                f"**Solution**: remove `{field}` to create a subscription that starts now, "
+                "or create it on the day it should start. `expiration` ends a subscription "
+                "on a date.",
+                error_code=ErrorCodes.VALIDATION_ERROR,
+                field=field,
+                value=requested,
+            )
+
+
+async def _refuse_unresolved_product(client: Any, product_id: Any) -> None:
+    """Refuse a preview whose product the platform holds no record of.
+
+    Any other read failure (a timeout, a lockout) says nothing about the
+    product, so it propagates as itself rather than as a missing product.
+    """
+    try:
+        await client.get_product_by_id(product_id)
+    except ReveniumAPIError as exc:
+        if not exc.names_a_missing_id:
+            raise
+        raise_refusal(
+            "**Dry Run Validation Failed**: the live create "
+            "would reject this payload:\n\n"
+            "**Field**: `product_id`\n"
+            f"**Value**: `{product_id}`\n"
+            f"**Problem**: product does not resolve ({exc})\n\n"
+            "**Tip**: Use `get_products(action='list')` to find valid product IDs",
+            error_code=ErrorCodes.VALIDATION_ERROR,
+            field="product_id",
+            value=product_id,
+        )
 
 
 def _default_address_note(address: str) -> str:
@@ -348,16 +415,39 @@ def _default_address_note(address: str) -> str:
 _CREATE_ONLY_KEYS = frozenset({"product_id", "auto_generate", "dry_run"})
 
 
-def _unstored_fields_note(subscription_data: Any) -> str:
-    """Name the caller's fields the platform drops on create, or "" when there are none."""
-    if not isinstance(subscription_data, dict):
-        return ""
-    unstored = sorted(
+def _unstored_fields(subscription_data: Dict[str, Any]) -> List[str]:
+    """The caller's fields the platform drops on create."""
+    return sorted(
         key
         for key in subscription_data
         if key not in _SUBSCRIPTION_WRITE_FIELDS and key not in _CREATE_ONLY_KEYS
     )
+
+
+def _unstored_fields_note(subscription_data: Any) -> str:
+    """Name the caller's fields the platform drops on create, or "" when there are none."""
+    if not isinstance(subscription_data, dict):
+        return ""
+    unstored = _unstored_fields(subscription_data)
     return f"Not stored by the platform: {', '.join(unstored)}." if unstored else ""
+
+
+def _create_preview_text(
+    subscription_data: Dict[str, Any], mode: str, mode_lines: List[str], notes: List[str]
+) -> str:
+    """The dry-run preview of a create: the fields that would be stored, and what would not."""
+    unstored = set(_unstored_fields(subscription_data))
+    stored = {key: value for key, value in subscription_data.items() if key not in unstored}
+    unstored_note = _unstored_fields_note(subscription_data)
+    return (
+        f"**Dry Run Preview - {mode} Mode**\n\n"
+        "**Subscription Data:**\n"
+        f"```json\n{json.dumps(stored, indent=2)}\n```\n\n"
+        + "\n".join(mode_lines)
+        + "\n\n"
+        + "".join(f"{note}\n\n" for note in (*notes, unstored_note) if note)
+        + "**Next Step:** Remove `dry_run: true` to create the subscription"
+    )
 
 
 # BACK-4709: the search inputs, each sent as the platform's one `query` term,
@@ -577,6 +667,40 @@ _NLP_TOKEN_PUNCTUATION = ".,;:!?\"'()[]{}"
 
 _SUPPORTING_DATA_TYPES = ("all", "organizations", "products", "subscribers", "credentials")
 
+_LINKS_KEPT_NOTE = (
+    "Links you do not send are resent as stored, so an update keeps them; "
+    f"send {' or '.join(SUBSCRIPTION_LINK_IDS.values())} to replace them."
+)
+
+
+def _linked_ids(subscription: Mapping[str, Any], read_field: str) -> str:
+    return (
+        ", ".join(FieldTransformers.objects_array_to_ids(subscription.get(read_field)))
+        or "none"
+    )
+
+
+def _links_after_update(answer: Mapping[str, Any]) -> str:
+    """Name the links the platform's answer shows, so a dropped one is visible."""
+    links = "; ".join(
+        f"{read_field}: {_linked_ids(answer, read_field)}"
+        for read_field in SUBSCRIPTION_LINK_IDS
+    )
+    return f"Links after the update: {links}. {_LINKS_KEPT_NOTE}"
+
+
+def _update_preview_text(preview: Mapping[str, Any]) -> str:
+    return (
+        "**DRY RUN MODE - Subscription Update**\n\n"
+        f"**Would update subscription:** {preview['subscription_id']}\n"
+        f"**Changes:** {json.dumps(preview['changes'], indent=2, default=str)}\n\n"
+        f"{_LINKS_KEPT_NOTE}\n\n"
+        "**Body the update would send:**\n"
+        f"{json.dumps(preview['body'], indent=2, default=str)}\n\n"
+        "**Dry Run:** True (no actual update performed)"
+    )
+
+
 _CANCEL_NOT_OFFERED_MESSAGE = (
     "**Cancel is not available**\n\n"
     "The Revenium platform has no cancel operation for subscriptions, so nothing was "
@@ -684,7 +808,7 @@ class SubscriptionManager:
                 "action": "discover_products",
                 "error": f"Failed to discover products: {repr(e)}",
                 "fallback_guidance": [
-                    "Use 'manage_products' tool with action='list' to see available products",
+                    "Use 'get_products' tool with action='list' to see available products",
                     "Ensure products are published before using in subscriptions",
                     "Always specify explicit product_id to avoid billing errors",
                 ],
@@ -1023,8 +1147,11 @@ class SubscriptionManager:
         _sanitize_undefined_sentinels(result)
         return result
 
-    async def update_subscription(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Update existing subscription using PartialUpdateHandler."""
+    @staticmethod
+    def _require_update_arguments(
+        arguments: Dict[str, Any],
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Refuse an update the platform would not store; return the id and the fields to change."""
         subscription_id = arguments.get("subscription_id")
         subscription_data = arguments.get("subscription_data")
 
@@ -1092,15 +1219,30 @@ class SubscriptionManager:
         # A partial update can rewrite the billing identity, so it gets the same check the
         # create paths do. An update that does not touch the field is left alone.
         _normalize_client_email_field(subscription_data)
+        return subscription_id, subscription_data
 
-        # Get update configuration for subscriptions
-        config = self.update_config_factory.get_config("subscriptions")
+    async def preview_update(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Read the subscription and return the body update_subscription would send, sending nothing."""
+        subscription_id, subscription_data = self._require_update_arguments(arguments)
+        body = await self.update_handler.build_update_payload(
+            resource_id=subscription_id,
+            partial_data=subscription_data,
+            config=self.update_config_factory.get_config("subscriptions"),
+            action_context="update subscription",
+        )
+        return {
+            "subscription_id": subscription_id,
+            "changes": subscription_data,
+            "body": body,
+        }
 
-        # Use PartialUpdateHandler for the update operation
+    async def update_subscription(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Update existing subscription using PartialUpdateHandler."""
+        subscription_id, subscription_data = self._require_update_arguments(arguments)
         result = await self.update_handler.update_with_merge(
             resource_id=subscription_id,
             partial_data=subscription_data,
-            config=config,
+            config=self.update_config_factory.get_config("subscriptions"),
             action_context="update subscription",
         )
 
@@ -1593,15 +1735,15 @@ class SubscriptionManager:
                     field="product_id",
                     value=product_id,
                     suggestions=[
-                        "Use manage_products with action='list' to see available products",
+                        "Use get_products with action='list' to see available products",
                         "Create the product first using manage_products with action='create_simple'",
                         "Verify the product_id is correct",
                         "Check for typos in the product ID",
                     ],
                     examples={
-                        "discovery": "manage_products(action='list')",
+                        "discovery": "get_products(action='list')",
                         "creation": "manage_products(action='create_simple', product_data={...})",
-                        "verification": "manage_products(action='get', product_id='prod_123')",
+                        "verification": "get_products(action='get', product_id='prod_123')",
                         "billing_safety": "🔒 BILLING SAFETY: Product must exist before creating subscriptions to prevent billing errors",
                     },
                 )
@@ -1615,14 +1757,14 @@ class SubscriptionManager:
                     suggestions=[
                         "Publish the product first using manage_products with action='update'",
                         "Set published: true in the product configuration",
-                        "A product needs a data source as well as publication to take subscriptions; pick one with manage_sources(action='list')",
+                        "A product needs a data source as well as publication to take subscriptions; pick one with get_sources(action='list')",
                         "Verify the product is ready for subscription creation",
                         "Check product status and configuration",
                     ],
                     examples={
                         "product_status": f"{product.get('name', 'Unknown')} (unpublished)",
                         "publish_command": "manage_products(action='update', product_id='prod_123', product_data={'published': True, 'sourceIds': ['<source id>']})",
-                        "verification": "manage_products(action='get', product_id='prod_123')",
+                        "verification": "get_products(action='get', product_id='prod_123')",
                         "billing_safety": "🔒 BILLING SAFETY: Only published products can be used for subscriptions to prevent billing errors",
                     },
                 )
@@ -2039,48 +2181,25 @@ class SubscriptionValidator:
                 "example_type": "monthly_billing",  # This is example metadata, not an API field
                 "description": "Standard monthly billing subscription",
                 "use_case": "Regular monthly billing for ongoing service",
-                "note": "⚠️ REQUIRED: productId and clientEmailAddress are required fields - use discover_products() to find valid product IDs",
+                "note": "REQUIRED: productId and clientEmailAddress are required fields - use discover_products() to find valid product IDs",
                 "template": {
                     "productId": "prod_123",  # API expects productId
                     "clientEmailAddress": "customer@company.com",  # API expects clientEmailAddress
                     "name": "Monthly Subscription",
-                    "description": "Monthly subscription with standard billing",
-                    "billing_address": {
-                        "street": "123 Main St",
-                        "city": "San Francisco",
-                        "state": "CA",
-                        "postal_code": "94105",
-                        "country": "US",
-                    },
-                    "metadata": {
-                        "billing_frequency": "monthly",  # Descriptive metadata only
-                        "example_type": "standard_monthly",
-                    },
+                    "tags": ["monthly"],
                 },
             },
             "trial": {
                 "name": "Trial Subscription",
                 "example_type": "trial_period",  # This is example metadata, not an API field
-                "description": "Trial subscription with automatic conversion",
+                "description": "Subscription on a product that offers a trial",
                 "use_case": "Allow customers to try service before committing",
-                "note": "✅ TRIAL: trial_end_date field enables trial periods - use validate_product_for_subscription() to ensure product supports trials",
+                "note": "TRIAL: the platform sets the trial end itself, so create refuses trialEnd; use validate_product_for_subscription() to check the product",
                 "template": {
                     "productId": "prod_123",  # API expects productId
                     "clientEmailAddress": "customer@company.com",  # API expects clientEmailAddress
                     "name": "Trial Subscription",
-                    "description": "Trial subscription with 14-day trial period",
-                    "trial_end_date": "2024-12-31T23:59:59Z",  # Proper API field
-                    "billing_address": {
-                        "street": "123 Main St",
-                        "city": "San Francisco",
-                        "state": "CA",
-                        "postal_code": "94105",
-                        "country": "US",
-                    },
-                    "metadata": {
-                        "subscription_category": "trial",  # Descriptive metadata only
-                        "example_type": "trial_period",
-                    },
+                    "tags": ["trial"],
                 },
             },
         }
@@ -2135,8 +2254,8 @@ class SubscriptionValidator:
                 ],
                 examples={
                     "initialization": "SubscriptionManagement should be initialized with schema discovery",
-                    "validation_commands": "Get validation rules: manage_subscriptions(action='get_capabilities')",
-                    "validate_config": "Validate configuration: manage_subscriptions(action='validate', subscription_data={...}, dry_run=True)",
+                    "validation_commands": "Get validation rules: get_subscriptions(action='get_capabilities')",
+                    "validate_config": "Validate configuration: get_subscriptions(action='validate', subscription_data={...}, dry_run=True)",
                     "billing_safety": "🔒 BILLING SAFETY: Schema discovery provides validation to prevent billing errors",
                 },
             )
@@ -2344,6 +2463,7 @@ class SubscriptionHierarchyManager:
         """Create a subscription and credentials together in a coordinated workflow."""
         # Extract and validate input data
         subscription_data, credentials_data = self._extract_credentials_data(arguments)
+        _refuse_unapplied_start(subscription_data)
 
         # Validate hierarchy operation
         await self._validate_credentials_hierarchy(subscription_data, credentials_data)
@@ -2675,21 +2795,19 @@ class SubscriptionManagement(ToolBase):
                 _normalize_client_email_field(enhanced_subscription_data)
 
                 if dry_run:
-                    mode_text = "AUTO-GENERATION"
-                    return [
-                        TextContent(
-                            type="text",
-                            text=f"**🔍 Dry Run Preview - {mode_text} Mode**\n\n"
-                            f"**Subscription Data:**\n"
-                            f"```json\n"
-                            f"{json.dumps(enhanced_subscription_data, indent=2)}\n"
-                            f"```\n\n"
-                            f"**Auto-Generation:** Enabled\n"
-                            f"**Auto-Generated Fields:** {', '.join(auto_filled) or 'none'}\n\n"
-                            + (f"{default_address_note}\n\n" if default_address_note else "")
-                            + "**Next Step:** Remove `dry_run: true` to create the subscription",
-                        )
-                    ]
+                    await _refuse_unresolved_product(
+                        subscription_manager.client, enhanced_subscription_data["product_id"]
+                    )
+                    preview = _create_preview_text(
+                        enhanced_subscription_data,
+                        "AUTO-GENERATION",
+                        [
+                            "**Auto-Generation:** Enabled",
+                            f"**Auto-Generated Fields:** {', '.join(auto_filled) or 'none'}",
+                        ],
+                        [default_address_note],
+                    )
+                    return [TextContent(type="text", text=preview)]
             else:
                 # Expert mode: strict validation, no auto-generation
                 expert_retry = _create_retry_example(
@@ -2704,7 +2822,7 @@ class SubscriptionManagement(ToolBase):
                         "**Solution**: Provide product_id explicitly:\n"
                         f"```json\n{expert_retry}\n```\n\n"
                         "**Tip**: Quick create asks which product to use. It does not pick one. "
-                        "Use `manage_products(action='list')` to find product ids",
+                        "Use `get_products(action='list')` to find product ids",
                         error_code=ErrorCodes.MISSING_PARAMETER,
                         field="product_id",
                     )
@@ -2724,38 +2842,20 @@ class SubscriptionManagement(ToolBase):
 
                 _normalize_client_email_field(subscription_data)
                 if dry_run:
-                    # Parity with live create: the backend rejects a subscription
-                    # whose product does not resolve, so the preview must too.
-                    dry_product_id = subscription_data.get("product_id") or subscription_data.get("productId")
-                    if dry_product_id:
-                        try:
-                            await subscription_manager.client.get_product_by_id(dry_product_id)
-                        except ReveniumAPIError as exc:
-                            raise_refusal(
-                                "**Dry Run Validation Failed**: the live create "
-                                "would reject this payload:\n\n"
-                                "**Field**: `product_id`\n"
-                                f"**Value**: `{dry_product_id}`\n"
-                                f"**Problem**: product does not resolve ({exc})\n\n"
-                                "**Tip**: Use `manage_products(action='list')` to find valid product IDs",
-                                error_code=ErrorCodes.VALIDATION_ERROR,
-                                field="product_id",
-                                value=dry_product_id,
-                            )
-                    mode_text = "EXPLICIT CONFIGURATION"
-                    return [
-                        TextContent(
-                            type="text",
-                            text=f"**🔍 Dry Run Preview - {mode_text} Mode**\n\n"
-                            f"**Subscription Data:**\n"
-                            f"```json\n"
-                            f"{json.dumps(subscription_data, indent=2)}\n"
-                            f"```\n\n"
-                            f"**Auto-Generation:** Disabled\n"
-                            f"**Validation:** Strict (all required fields must be provided)\n\n"
-                            f"**Next Step:** Remove `dry_run: true` to create the subscription",
-                        )
-                    ]
+                    product_id = subscription_data.get("product_id") or subscription_data.get(
+                        "productId"
+                    )
+                    await _refuse_unresolved_product(subscription_manager.client, product_id)
+                    preview = _create_preview_text(
+                        subscription_data,
+                        "EXPLICIT CONFIGURATION",
+                        [
+                            "**Auto-Generation:** Disabled",
+                            "**Validation:** Strict (all required fields must be provided)",
+                        ],
+                        [],
+                    )
+                    return [TextContent(type="text", text=preview)]
 
             # Proceed with actual creation
             result = await subscription_manager.create_subscription(arguments)
@@ -2772,12 +2872,17 @@ class SubscriptionManagement(ToolBase):
                 )
             ]
         elif action == "update":
+            if arguments.get("dry_run"):
+                preview = await subscription_manager.preview_update(arguments)
+                return [TextContent(type="text", text=_update_preview_text(preview))]
             result = await subscription_manager.update_subscription(arguments)
             subscription_id = arguments.get("subscription_id")
             return [
                 TextContent(
                     type="text",
-                    text=f"Subscription {subscription_id} updated successfully:\n\n"
+                    text=f"Subscription {subscription_id} updated successfully. "
+                    + _links_after_update(result)
+                    + "\n\n"
                     + json.dumps(result, indent=2),
                 )
             ]
@@ -2958,6 +3063,7 @@ class SubscriptionManagement(ToolBase):
             )
 
         _normalize_client_email_field(dict(subscription_data))
+        _refuse_unapplied_start(subscription_data)
         dry_run = arguments.get("dry_run", True)
         result = await self.validator.validate_configuration(subscription_data, dry_run)
         return self._format_validation_response(result)
@@ -3057,7 +3163,7 @@ class SubscriptionManagement(ToolBase):
 - `action` - What operation to perform
 - `subscription_id` - For get/update/delete operations
 - `auto_generate` - Enable smart defaults (default: true)
-- `dry_run` - Preview without creating (optional)
+- `dry_run` - Preview a create or an update without writing (optional)
 - `page`, `size` - For list operations
 - `search_query` - Free text for search_subscriptions, discover_products and get_supporting_data
 - `customer_name`, `subscriber_email`, `product_name` - Narrow search_subscriptions
@@ -3114,7 +3220,7 @@ get_credentials(subscription_id="sub_123")               # Find all related cred
 ```
 
 To give a new subscription an API key, create the subscription, then call
-`manage_subscriber_credentials(action="create", ...)` with `subscriptionIds=[<new id>]`."""
+`manage_credentials(action="create", ...)` with `subscriptionIds=[<new id>]`."""
 
         # Add UCM-enhanced billing periods if available
         if ucm_capabilities and "billing_periods" in ucm_capabilities:
@@ -3124,7 +3230,7 @@ To give a new subscription an API key, create the subscription, then call
         else:
             # Fallback to basic billing periods
             text += "\n\n## **Billing Periods**\n"
-            text += "- **MONTH**, **YEAR**, **QUARTER**\n"
+            text += "- " + ", ".join(f"**{period.value}**" for period in BillingPeriod) + "\n"
 
         # Add UCM-enhanced trial periods if available
         if ucm_capabilities and "trial_periods" in ucm_capabilities:
@@ -3134,7 +3240,7 @@ To give a new subscription an API key, create the subscription, then call
         else:
             # Fallback to basic trial periods
             text += "\n\n## **Trial Periods**\n"
-            text += "- **DAY**, **WEEK**, **MONTH**\n"
+            text += "- " + ", ".join(f"**{trial.value}**" for trial in TrialPeriod) + "\n"
 
         # Add UCM-enhanced currencies if available
         if ucm_capabilities and "currencies" in ucm_capabilities:
@@ -3144,14 +3250,15 @@ To give a new subscription an API key, create the subscription, then call
         else:
             # Fallback to basic currencies
             text += "\n\n## **Supported Currencies**\n"
-            text += "- **USD**, **EUR**, **GBP**, **CAD**, **AUD**, **JPY**, **CNY**, **MXN**, **COP**, **ARS**, **ZMW**\n"
+            currencies = ", ".join(f"**{currency}**" for currency in platform_plan_currencies())
+            text += f"- {currencies}\n"
 
         # Add schema information
         schema = ucm_capabilities.get("schema", {}) if ucm_capabilities else {}
         subscription_schema = schema.get("subscription_data", {})
 
         text += "\n\n## **Required Fields**\n"
-        required_fields = subscription_schema.get("required", ["product_id", "clientEmailAddress"])
+        required_fields = subscription_schema.get("required", REQUIRED_SUBSCRIPTION_CREATE_FIELDS)
         for field in required_fields:
             if field == "clientEmailAddress":
                 text += f"- `{field}` (required) - Owner of the subscription who will receive invoices at this address\n"
@@ -3160,17 +3267,7 @@ To give a new subscription an API key, create the subscription, then call
 
         text += "\n\n## **Optional Fields**\n"
         optional_fields = subscription_schema.get(
-            "optional",
-            [
-                "description",
-                "start_date",
-                "end_date",
-                "billing_address",
-                "payment_method",
-                "trial_end_date",
-                "metadata",
-                "tags",
-            ],
+            "optional", OPTIONAL_SUBSCRIPTION_CREATE_FIELDS
         )
         for field in optional_fields:
             text += f"- `{field}` (optional)\n"
@@ -3195,22 +3292,17 @@ To give a new subscription an API key, create the subscription, then call
             text += f"- **{state}**\n"
 
         # Add business rules
-        text += """
-
-## **Business Rules**
-- Product must exist and be active before creating subscription
-- Start date cannot be in the past (unless explicitly allowed)
-- End date must be after start date if both are specified
-- If end date is not specified, the subscription will renew on a recurring basis based on the product's billing period configuration
-- Trial period is optional and depends on product configuration
-- If no payment method is assigned, customers receive invoices and pay manually
-- If payment method is linked to a Revenium stored payment method, customers will be charged automatically via credit card
-    - IMPORTANT NOTE:  payment method integration is not currently supported in the MCP. This must be managed manually within the Revenium application.
+        text += "\n\n## **Business Rules**\n"
+        text += "".join(f"- {rule}\n" for rule in SUBSCRIPTION_CREATE_RULES)
+        text += (
+            """- `expiration` ends a subscription on a date; without it, the subscription renews on a recurring basis based on the product's billing period configuration
+- Payment methods are managed in the Revenium application
 
 ## **Next Steps**
 1. Use `get_examples(example_type='""" + SUBSCRIPTION_EXAMPLE_TYPES[1] + """')` to see a working template
 2. Use `validate(subscription_data={...})` to test configurations
 3. Use `create(subscription_data={...})` to create subscriptions"""
+        )
 
         return text
 
@@ -3230,7 +3322,7 @@ To give a new subscription an API key, create the subscription, then call
         result_text += "- `action` - What operation to perform\n"
         result_text += "- `subscription_id` - For get/update/delete operations\n"
         result_text += "- `auto_generate` - Enable smart defaults (default: true)\n"
-        result_text += "- `dry_run` - Preview without creating (optional)\n"
+        result_text += "- `dry_run` - Preview a create or an update without writing (optional)\n"
         result_text += "- `page`, `size` - For list operations\n\n"
 
         result_text += "## **Subscription Statuses**\n"

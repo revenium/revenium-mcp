@@ -29,9 +29,11 @@ from ..common.error_handling import (
     ErrorCodes,
     ToolError,
     create_structured_validation_error,
-    format_structured_error,
+    raise_refusal,
+    raise_structured_error,
 )
 from ..common.slack_configuration_lookup import slack_configuration_absent
+from ..common.tool_surface import tool_call
 from ..endpoint_registry import _resolved_app_base_url
 
 # from ..error_handlers import format_structured_error  # Not available
@@ -149,7 +151,7 @@ def unreadable_default_sentence(default_id: str, read_error: str) -> str:
     return (
         f"The default Slack configuration `{default_id}` could not be read right now "
         f"({read_error}). It may still work: retry "
-        "`slack_management(action='setup_status')` before choosing another default.\n\n"
+        "`get_slack(action='setup_status')` before choosing another default.\n\n"
     )
 
 
@@ -176,20 +178,20 @@ class Recommendation:
 SETUP_RECOMMENDATIONS = {
     SetupState.NOT_READY: Recommendation(
         "**Choose Another Default Configuration:**",
-        "slack_management(action='detect_and_recommend')",
+        "get_slack(action='detect_and_recommend')",
     ),
     SetupState.UNKNOWN: Recommendation(
-        "**Retry the Status Check:**", "slack_management(action='setup_status')"
+        "**Retry the Status Check:**", "get_slack(action='setup_status')"
     ),
     SetupState.COMPLETE: Recommendation(
         "**You're all set!** Try creating an alert:",
         "manage_alerts(action='create_simple', threshold=100, email='you@company.com')",
     ),
     SetupState.PARTIAL: Recommendation(
-        "**Set Default Configuration:**", "slack_management(action='detect_and_recommend')"
+        "**Set Default Configuration:**", "get_slack(action='detect_and_recommend')"
     ),
     SetupState.NOT_CONFIGURED: Recommendation(
-        "**Get Started:**", "slack_management(action='quick_setup')"
+        "**Get Started:**", "get_slack(action='quick_setup')"
     ),
 }
 
@@ -228,7 +230,7 @@ def partial_list_note(shown: int, total: int) -> str:
     through = "" if last_page == 1 else f" through `page={last_page}`"
     return (
         f"Showing {shown} of {total} configurations. See the rest with "
-        f"`slack_management(action='list_configurations', page=1, "
+        f"`get_slack(action='list_configurations', page=1, "
         f"size={RECOMMENDATION_PAGE_SIZE})`{through}.\n\n"
     )
 
@@ -294,15 +296,15 @@ def recommendations_response(
         for i, config in enumerate(configurations, 1):
             config_id = config.get("id", "Unknown")
             name = config.get("name", "Unnamed Configuration")
-            result_text += f"- Option {i}: `slack_management(action='select_default_configuration', config_id='{config_id}')` # {name}\n"
+            result_text += f"- Option {i}: `manage_slack(action='select_default_configuration', config_id='{config_id}')` # {name}\n"
         result_text += "\n"
 
     result_text += "**Management Actions**\n"
-    result_text += "- View detailed configuration: `slack_management(action='get_configuration', config_id='CONFIG_ID')`\n"
+    result_text += "- View detailed configuration: `get_slack(action='get_configuration', config_id='CONFIG_ID')`\n"
     result_text += (
-        "- Add new configuration: `slack_management(action='initiate_oauth')`\n"
+        "- Add new configuration: `get_slack(action='initiate_oauth')`\n"
     )
-    result_text += "- Check setup status: `slack_management(action='setup_status')`\n"
+    result_text += "- Check setup status: `get_slack(action='setup_status')`\n"
 
     return [TextContent(type="text", text=result_text)]
 
@@ -386,7 +388,7 @@ class SlackSetupAssistant(ToolBase):
                         },
                     },
                 )
-                return [TextContent(type="text", text=format_structured_error(error))]
+                raise_structured_error(error)
 
         except (PermissionError, ToolError):
             raise
@@ -402,7 +404,7 @@ class SlackSetupAssistant(ToolBase):
                     "Use setup_status() to check current configuration",
                 ],
             )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            raise_structured_error(error)
 
     async def _handle_guided_setup(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -436,8 +438,8 @@ class SlackSetupAssistant(ToolBase):
                     )
                     result_text += "**What you can do:**\n"
                     result_text += "- Create alerts with automatic Slack notifications\n"
-                    result_text += "- Change default: `slack_management(action='detect_and_recommend')`\n"
-                    result_text += "- View all configurations: `slack_management(action='list_configurations')`\n"
+                    result_text += "- Change default: `get_slack(action='detect_and_recommend')`\n"
+                    result_text += "- View all configurations: `get_slack(action='list_configurations')`\n"
                 else:
                     return recommendations_response(response, lookup)
             else:
@@ -451,7 +453,7 @@ class SlackSetupAssistant(ToolBase):
 
                 result_text += "## Setup Process\n\n"
                 result_text += "**Step 1:** Start OAuth workflow\n"
-                result_text += "```\nslack_management(action='initiate_oauth')\n```\n\n"
+                result_text += f"```\n{tool_call('manage_slack', 'initiate_oauth')}\n```\n\n"
 
                 result_text += "**Step 2:** Complete authorization in your browser\n"
                 result_text += "- You'll be redirected to Slack to authorize the integration\n"
@@ -459,23 +461,25 @@ class SlackSetupAssistant(ToolBase):
                 result_text += "- Grant the necessary permissions\n\n"
 
                 result_text += "**Step 3:** Return here and refresh\n"
-                result_text += "```\nslack_management(action='refresh_configurations')\n```\n\n"
+                result_text += f"```\n{tool_call('manage_slack', 'refresh_configurations')}\n```\n\n"
 
                 result_text += "**Step 4:** Complete setup\n"
-                result_text += "```\nslack_management(action='guided_setup')\n```\n\n"
+                result_text += f"```\n{tool_call('manage_slack', 'guided_setup')}\n```\n\n"
 
                 result_text += (
                     "**Quick Start:** Use the quick setup action to streamline this process:\n"
                 )
-                result_text += "```\nslack_management(action='quick_setup')\n```\n"
+                result_text += f"```\n{tool_call('manage_slack', 'quick_setup')}\n```\n"
 
             return [TextContent(type="text", text=result_text)]
 
+        except (PermissionError, ToolError):
+            raise
         except Exception as e:
             error = ValidationError(
                 message="Failed to perform guided setup", suggestion=str(e)
             )
-            return [TextContent(type="text", text=error.format_user_message())]
+            raise_refusal(error.format_user_message(), error_code=ErrorCodes.TOOL_ERROR)
 
     async def _handle_detect_and_recommend(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -497,11 +501,13 @@ class SlackSetupAssistant(ToolBase):
             )
             return recommendations_response(response, lookup)
 
+        except (PermissionError, ToolError):
+            raise
         except Exception as e:
             error = ValidationError(
                 message="Failed to detect and recommend configurations", suggestion=str(e)
             )
-            return [TextContent(type="text", text=error.format_user_message())]
+            raise_refusal(error.format_user_message(), error_code=ErrorCodes.TOOL_ERROR)
 
     async def _handle_select_default_configuration(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -514,7 +520,11 @@ class SlackSetupAssistant(ToolBase):
                 field="config_id",
                 suggestion="Provide a config_id parameter to select_default_configuration",
             )
-            return [TextContent(type="text", text=error.format_user_message())]
+            raise_refusal(
+                error.format_user_message(),
+                error_code=ErrorCodes.MISSING_PARAMETER,
+                field="config_id",
+            )
 
         try:
             # Verify the configuration exists
@@ -564,12 +574,12 @@ class SlackSetupAssistant(ToolBase):
                 )
 
             result_text += "**Other useful commands:**\n"
-            result_text += "- Check setup status: `slack_management(action='setup_status')`\n"
-            result_text += "- View all configurations: `slack_management(action='list_configurations')`\n"
+            result_text += "- Check setup status: `get_slack(action='setup_status')`\n"
+            result_text += "- View all configurations: `get_slack(action='list_configurations')`\n"
 
             return [TextContent(type="text", text=result_text)]
 
-        except ToolError:
+        except (PermissionError, ToolError):
             raise
         except Exception as e:
             error = ValidationError(
@@ -578,7 +588,7 @@ class SlackSetupAssistant(ToolBase):
                 value=config_id,
                 suggestion=str(e),
             )
-            return [TextContent(type="text", text=error.format_user_message())]
+            raise_refusal(error.format_user_message(), error_code=ErrorCodes.TOOL_ERROR)
 
     async def _handle_setup_status(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -631,18 +641,20 @@ class SlackSetupAssistant(ToolBase):
 
             result_text += "**Other Actions:**\n"
             result_text += (
-                "- Complete guided setup: `slack_management(action='guided_setup')`\n"
+                "- Complete guided setup: `get_slack(action='guided_setup')`\n"
             )
             result_text += (
-                "- Add new configuration: `slack_management(action='initiate_oauth')`\n"
+                "- Add new configuration: `get_slack(action='initiate_oauth')`\n"
             )
-            result_text += "- View all configurations: `slack_management(action='list_configurations')`\n"
+            result_text += "- View all configurations: `get_slack(action='list_configurations')`\n"
 
             return [TextContent(type="text", text=result_text)]
 
+        except (PermissionError, ToolError):
+            raise
         except Exception as e:
             error = ValidationError(message="Failed to get setup status", suggestion=str(e))
-            return [TextContent(type="text", text=error.format_user_message())]
+            raise_refusal(error.format_user_message(), error_code=ErrorCodes.TOOL_ERROR)
 
     async def _handle_quick_setup(
         self, arguments: Dict[str, Any]
@@ -658,7 +670,7 @@ class SlackSetupAssistant(ToolBase):
             result_text += "## Step 2: Start OAuth Process\n\n"
             result_text += "Start OAuth Process\n"
             result_text += "Click this command to begin:\n"
-            result_text += "```\nslack_management(action='initiate_oauth')\n```\n\n"
+            result_text += f"```\n{tool_call('manage_slack', 'initiate_oauth')}\n```\n\n"
 
             result_text += "## Step 3: User Completes in Browser\n"
             result_text += "- Follow the link that appears\n"
@@ -668,7 +680,7 @@ class SlackSetupAssistant(ToolBase):
 
             result_text += "## Step 4: Finish Setup\n"
             result_text += "Return here and run:\n"
-            result_text += "```\nslack_management(action='guided_setup')\n```\n\n"
+            result_text += f"```\n{tool_call('manage_slack', 'guided_setup')}\n```\n\n"
 
             result_text += "## Why Slack?\n\n"
             result_text += "- **Instant notifications** delivered to your team\n"
@@ -676,11 +688,11 @@ class SlackSetupAssistant(ToolBase):
             result_text += "- **Mobile-friendly** for on-the-go monitoring\n"
             result_text += "- **Team collaboration** on alert responses\n\n"
 
-            result_text += "**Need help?** Use `slack_management(action='setup_status')` to check your progress.\n"
+            result_text += "**Need help?** Use `get_slack(action='setup_status')` to check your progress.\n"
 
             return [TextContent(type="text", text=result_text)]
 
-        except ToolError:
+        except (PermissionError, ToolError):
             # Re-raise ToolError exceptions without modification
             # This preserves helpful error messages with specific suggestions
             raise
@@ -688,7 +700,7 @@ class SlackSetupAssistant(ToolBase):
             error = ValidationError(
                 message="Failed to perform quick setup", suggestion=str(e)
             )
-            return [TextContent(type="text", text=error.format_user_message())]
+            raise_refusal(error.format_user_message(), error_code=ErrorCodes.TOOL_ERROR)
 
     async def _handle_onboarding_setup(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -727,7 +739,7 @@ class SlackSetupAssistant(ToolBase):
                 result_text += "- This ensures OAuth will work properly\n\n"
 
                 result_text += "**Step 2:** Start Slack OAuth\n"
-                result_text += "```\nslack_management(action='initiate_oauth')\n```\n\n"
+                result_text += f"```\n{tool_call('manage_slack', 'initiate_oauth')}\n```\n\n"
 
                 result_text += "**Step 3:** Complete in Browser\n"
                 result_text += "- Click the OAuth link that appears\n"
@@ -736,13 +748,13 @@ class SlackSetupAssistant(ToolBase):
                 result_text += "- Authorize the integration\n\n"
 
                 result_text += "**Step 4:** Finish Setup\n"
-                result_text += "```\nslack_management(action='onboarding_setup')\n```\n\n"
+                result_text += f"```\n{tool_call('manage_slack', 'onboarding_setup')}\n```\n\n"
 
                 if is_first_time:
                     result_text += "## 🎯 **Onboarding Integration**\n\n"
                     result_text += "Once Slack is configured, you can:\n"
-                    result_text += "- Continue with `system_setup(action='setup_checklist')` to see overall progress\n"
-                    result_text += "- Use `system_setup(action='setup_checklist')` for guidance\n"
+                    result_text += "- Continue with `get_system_setup(action='setup_checklist')` to see overall progress\n"
+                    result_text += "- Use `get_system_setup(action='setup_checklist')` for guidance\n"
                     result_text += (
                         "- Create your first alert with automatic Slack notifications\n\n"
                     )
@@ -753,14 +765,14 @@ class SlackSetupAssistant(ToolBase):
                     f"Great! You have {total_elements} Slack configuration(s) available.\n\n"
                 )
                 result_text += "**Choose your default configuration:**\n"
-                result_text += "```\nslack_management(action='detect_and_recommend')\n```\n\n"
+                result_text += f"```\n{tool_call('manage_slack', 'detect_and_recommend')}\n```\n\n"
 
                 if is_first_time:
                     result_text += "## 🎯 **Onboarding Next Steps**\n\n"
                     result_text += "After setting your default:\n"
-                    result_text += "- Check `system_setup(action='setup_checklist')` to see your progress\n"
+                    result_text += "- Check `get_system_setup(action='setup_checklist')` to see your progress\n"
                     result_text += (
-                        "- Use `system_setup(action='setup_checklist')` when ready\n\n"
+                        "- Use `get_system_setup(action='setup_checklist')` when ready\n\n"
                     )
 
             else:
@@ -775,12 +787,12 @@ class SlackSetupAssistant(ToolBase):
                     result_text += "- ✅ Slack notifications ready\n"
                     result_text += "- 🔄 Continue with other setup items\n\n"
                     result_text += "**Next Steps:**\n"
-                    result_text += "- Use `system_setup(action='setup_checklist')` to see remaining items\n"
+                    result_text += "- Use `get_system_setup(action='setup_checklist')` to see remaining items\n"
                     result_text += (
                         "- Try `manage_alerts(action='create_simple', email='you@company.com')` to test Slack\n"
                     )
                     result_text += (
-                        "- Use `system_setup(action='setup_checklist')` when ready\n\n"
+                        "- Use `get_system_setup(action='setup_checklist')` when ready\n\n"
                     )
                 else:
                     result_text += "**Test Your Setup:**\n"
@@ -790,6 +802,8 @@ class SlackSetupAssistant(ToolBase):
 
             return [TextContent(type="text", text=result_text)]
 
+        except (PermissionError, ToolError):
+            raise
         except Exception as e:
             error = ToolError(
                 message="Failed to complete onboarding setup",
@@ -802,7 +816,7 @@ class SlackSetupAssistant(ToolBase):
                     "Verify you're logged into Revenium dashboard",
                 ],
             )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            raise_structured_error(error)
 
     async def _handle_first_time_guidance(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -849,10 +863,10 @@ class SlackSetupAssistant(ToolBase):
                 )
 
                 result_text += "**2. Start the Setup**\n"
-                result_text += "```\nslack_management(action='onboarding_setup')\n```\n\n"
+                result_text += f"```\n{tool_call('manage_slack', 'onboarding_setup')}\n```\n\n"
 
                 result_text += "**3. Alternative Quick Start**\n"
-                result_text += "```\nslack_management(action='quick_setup')\n```\n\n"
+                result_text += f"```\n{tool_call('manage_slack', 'quick_setup')}\n```\n\n"
 
             elif not current_default:
                 result_text += "## ✅ **Configurations Available (Set Default)**\n\n"
@@ -860,7 +874,7 @@ class SlackSetupAssistant(ToolBase):
                     f"Great! You have {total_elements} Slack configuration(s) available.\n\n"
                 )
                 result_text += "**Next Step**: Choose your default configuration:\n"
-                result_text += "```\nslack_management(action='detect_and_recommend')\n```\n\n"
+                result_text += f"```\n{tool_call('manage_slack', 'detect_and_recommend')}\n```\n\n"
 
             else:
                 result_text += "## 🎉 **Setup Complete!**\n\n"
@@ -876,13 +890,13 @@ class SlackSetupAssistant(ToolBase):
             result_text += "## 🔗 **Integration with Onboarding**\n\n"
             result_text += "Once Slack is configured, continue your onboarding journey:\n\n"
             result_text += "**Check Overall Progress**:\n"
-            result_text += "```\nsystem_setup(action='setup_checklist')\n```\n\n"
+            result_text += f"```\n{tool_call('manage_system_setup', 'setup_checklist')}\n```\n\n"
 
             result_text += "**Get Personalized Next Steps**:\n"
-            result_text += "```\nsystem_setup(action='setup_checklist')\n```\n\n"
+            result_text += f"```\n{tool_call('manage_system_setup', 'setup_checklist')}\n```\n\n"
 
             result_text += "**Complete Your Onboarding**:\n"
-            result_text += "```\nsystem_setup(action='setup_checklist')\n```\n\n"
+            result_text += f"```\n{tool_call('manage_system_setup', 'setup_checklist')}\n```\n\n"
 
             # Troubleshooting section
             result_text += "## 🔧 **Troubleshooting Tips**\n\n"
@@ -893,20 +907,22 @@ class SlackSetupAssistant(ToolBase):
 
             result_text += "**Configuration Issues**:\n"
             result_text += (
-                "- Use `slack_management(action='setup_status')` to check current state\n"
+                "- Use `get_slack(action='setup_status')` to check current state\n"
             )
             result_text += "- Verify your Slack workspace permissions\n"
             result_text += "- Contact support if OAuth consistently fails\n\n"
 
             result_text += "**Need Help?**\n"
             result_text += (
-                "- Use `slack_management(action='setup_status')` for current status\n"
+                "- Use `get_slack(action='setup_status')` for current status\n"
             )
-            result_text += "- Try `slack_management(action='get_oauth_instructions')` for detailed OAuth help\n"
-            result_text += "- Check `system_setup(action='setup_checklist')` for overall configuration status\n"
+            result_text += "- Try `get_slack(action='get_oauth_instructions')` for detailed OAuth help\n"
+            result_text += "- Check `get_system_setup(action='setup_checklist')` for overall configuration status\n"
 
             return [TextContent(type="text", text=result_text)]
 
+        except (PermissionError, ToolError):
+            raise
         except Exception as e:
             error = ToolError(
                 message="Failed to provide first-time guidance",
@@ -919,7 +935,7 @@ class SlackSetupAssistant(ToolBase):
                     "Check your API connectivity",
                 ],
             )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            raise_structured_error(error)
 
     # Metadata Provider Implementation
     async def _get_tool_capabilities(self) -> List[ToolCapability]:
@@ -1150,8 +1166,8 @@ Intelligent Slack setup and configuration assistant with comprehensive onboardin
 - **Intelligent Recommendations** - Provides context-aware setup guidance
 
 ## **Integration**
-- Works with `slack_management` for OAuth setup
-- Integrates with `slack_management` for configuration management
+- Works with `manage_slack` for OAuth setup
+- Integrates with `manage_slack` for configuration management
 - Connects with onboarding system for first-time user experience
 - Provides foundation for alert notification setup
 """

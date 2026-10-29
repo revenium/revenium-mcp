@@ -15,6 +15,9 @@ from src.revenium_mcp_server.tools_decomposed.slack_configuration_management imp
     SlackConfigurationManagement,
 )
 from src.revenium_mcp_server.client import ReveniumAPIError
+from src.revenium_mcp_server.common.default_slack_configuration import (
+    get_default_slack_config_id,
+)
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 
 
@@ -126,7 +129,7 @@ class TestSlackConfigListPagingHints:
             result = await config_tool.handle_action(
                 "list_configurations", {"page": 0, "size": 5}
             )
-        assert "slack_management(action='list_configurations', page=1, size=5)" in result[0].text
+        assert "get_slack(action='list_configurations', page=1, size=5)" in result[0].text
 
     @pytest.mark.asyncio
     async def test_list_configurations_previous_hint_carries_requested_size(
@@ -164,13 +167,59 @@ class TestSlackConfigDryRun:
         mock_client.get_slack_configuration_by_id.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_set_default_dry_run(self, config_tool, mock_client):
+    async def test_set_default_dry_run_reads_the_configuration_and_keeps_the_default(
+        self, config_tool, mock_client
+    ):
+        ctx = TenantContext(team_id="team-dry-run", api_key="abcdef1234567890")
         with patch.object(config_tool, "get_client", return_value=mock_client):
             result = await config_tool.handle_action(
-                "set_default_configuration", {"config_id": "cfg-1", "dry_run": True}
+                "set_default_configuration",
+                {"config_id": "cfg-1", "dry_run": True},
+                ctx=ctx,
             )
         assert "Dry-run" in result[0].text
-        mock_client.get_slack_configuration_by_id.assert_not_called()
+        assert "Test Config" in result[0].text
+        mock_client.get_slack_configuration_by_id.assert_awaited_once_with("cfg-1")
+        assert get_default_slack_config_id(ctx) is None
+
+    @pytest.mark.asyncio
+    async def test_set_default_dry_run_refuses_an_unknown_id_like_the_live_call(
+        self, config_tool, mock_client
+    ):
+        ctx = TenantContext(team_id="team-dry-run-missing", api_key="abcdef1234567890")
+        mock_client.get_slack_configuration_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("HTTP 403: Access Denied", status_code=403)
+        )
+        with patch.object(config_tool, "get_client", return_value=mock_client):
+            with pytest.raises(ToolError) as live:
+                await config_tool.handle_action(
+                    "set_default_configuration", {"config_id": "zQ9xK2"}, ctx=ctx
+                )
+            with pytest.raises(ToolError) as preview:
+                await config_tool.handle_action(
+                    "set_default_configuration",
+                    {"config_id": "zQ9xK2", "dry_run": True},
+                    ctx=ctx,
+                )
+
+        assert preview.value.message == live.value.message
+        assert preview.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert get_default_slack_config_id(ctx) is None
+
+    @pytest.mark.asyncio
+    async def test_set_default_dry_run_without_valid_credentials_fails_on_authentication(
+        self, config_tool, mock_client
+    ):
+        mock_client.get_slack_configuration_by_id = AsyncMock(
+            side_effect=ReveniumAPIError("HTTP 401: Unauthorized", status_code=401)
+        )
+        with patch.object(config_tool, "get_client", return_value=mock_client):
+            with pytest.raises(ReveniumAPIError) as exc_info:
+                await config_tool.handle_action(
+                    "set_default_configuration", {"config_id": "cfg-1", "dry_run": True}
+                )
+
+        assert exc_info.value.status_code == 401
 
 
 class TestSlackConfigSetDefault:

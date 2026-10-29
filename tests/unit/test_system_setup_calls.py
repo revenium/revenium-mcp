@@ -5,13 +5,13 @@ from src.revenium_mcp_server.tools_decomposed.system_setup_calls import setup_ca
 
 
 def test_a_call_without_arguments_names_only_the_action():
-    assert setup_call("show_welcome") == "system_setup(action='show_welcome')"
+    assert setup_call("show_welcome") == "get_system_setup(action='show_welcome')"
 
 
 def test_arguments_follow_the_action_in_the_order_given():
     assert (
         setup_call("validate_email", email="ops@company.com", confirm_completion=True)
-        == "system_setup(action='validate_email', email='ops@company.com', confirm_completion=True)"
+        == "get_system_setup(action='validate_email', email='ops@company.com', confirm_completion=True)"
     )
 
 

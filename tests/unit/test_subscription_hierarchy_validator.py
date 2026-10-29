@@ -295,14 +295,15 @@ class TestSubscriptionValidatorGetExamples:
         assert "productId" in template
         assert "clientEmailAddress" in template
 
-    def test_fallback_trial_template_has_trial_end_date(self, validator_no_ucm):
-        """Trial fallback template includes trial_end_date."""
+    def test_fallback_trial_template_asks_for_no_trial_end(self, validator_no_ucm):
+        """BACK-5092: the platform sets the trial end itself, so create refuses one."""
         validator_no_ucm.schema_discovery = None
 
         result = validator_no_ucm.get_examples(example_type="trial")
         template = result["examples"][0]["template"]
 
-        assert "trial_end_date" in template
+        assert "trial_end_date" not in template
+        assert "trialEnd" not in template
 
 
 # ===========================================================================

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
+from ..common.tool_surface import public_tool_for
 from ..agent_friendly import UnifiedResponseFormatter
 from ..api_field_mapper import APIFieldMapper
 from ..client import ReveniumAPIError, ReveniumClient
@@ -52,6 +53,8 @@ from ..common.validation import SAFE_INT_MAX
 from ..common.ucm_config import log_ucm_status
 from ..common.update_configs import UpdateConfigFactory
 from ..config_store import get_config_value
+from ..models import BillingPeriod
+from ..plan_contract import platform_plan_currencies
 from ..hierarchy import (
     get_cross_tier_validator,
     get_entity_lookup_service,
@@ -276,7 +279,7 @@ def _usage_based_quick_create_error(name: str, per_unit_price: Any) -> ToolError
         value="usage_based",
         suggestions=[
             "Follow the 4-step usage-based billing workflow below",
-            "Use manage_metering_elements(action='list') to see existing AI billing elements",
+            "Use get_usage_meters(action='list') to see existing AI billing elements",
             "Copy the elementDefinitionId from existing elements (totalCost, inputTokenCount, etc.)",
             "Create the product using the full create() action with proper ratingAggregations",
             "Only create new metering elements if existing ones don't match your requirements",
@@ -284,7 +287,7 @@ def _usage_based_quick_create_error(name: str, per_unit_price: Any) -> ToolError
         examples={
             "step_1": {
                 "action": "Check existing metering elements",
-                "tool_call": "manage_metering_elements(action='list')",
+                "tool_call": "get_usage_meters(action='list')",
                 "purpose": "See available AI billing elements (totalCost, inputTokenCount, outputTokenCount, etc.)",
             },
             "step_2": {
@@ -301,7 +304,7 @@ def _usage_based_quick_create_error(name: str, per_unit_price: Any) -> ToolError
                 "action": "Create usage-based product with full create() action",
                 "example": {
                     "name": name,
-                    "sourceIds": ["<source id from manage_sources(action='list')>"],
+                    "sourceIds": ["<source id from get_sources(action='list')>"],
                     "plan": {
                         "type": "SUBSCRIPTION",
                         "ratingAggregations": [
@@ -317,7 +320,7 @@ def _usage_based_quick_create_error(name: str, per_unit_price: Any) -> ToolError
                 },
             },
             "workflow_guidance": {
-                "step_1": "Use manage_metering_elements(action='list') to see existing AI billing elements",
+                "step_1": "Use get_usage_meters(action='list') to see existing AI billing elements",
                 "step_2": "Choose appropriate existing element (totalCost, inputTokenCount, outputTokenCount, etc.)",
                 "step_3": "Copy the elementDefinitionId from the list results - IDs are unique per account",
                 "step_4": "Use the copied elementDefinitionId in ratingAggregations",
@@ -364,7 +367,7 @@ def _refuse_inputs_the_action_ignores(action: str, arguments: Dict[str, Any]) ->
                 field=name,
                 value=action,
                 suggestions=[
-                    f"Use manage_products(action=\"{reader}\", ...) to use {name}",
+                    f"Use {public_tool_for('manage_products', reader)}(action=\"{reader}\", ...) to use {name}",
                     f"Or drop {name} from this {action} call",
                 ],
             )
@@ -383,7 +386,7 @@ def _refuse_dry_run_on_quick_creates(action: str, arguments: Dict[str, Any]) -> 
             f"{action} has no preview, so the dry_run request was refused and "
             "nothing was sent or changed. To preview a product, run "
             'manage_products(action="create", product_data={...}, dry_run=True), '
-            'or manage_products(action="get_templates") to see ready-made product shapes. '
+            'or get_products(action="get_templates") to see ready-made product shapes. '
             f"Run {action} without dry_run only after the customer confirms."
         ),
         error_code=ErrorCodes.INVALID_PARAMETER,
@@ -391,7 +394,7 @@ def _refuse_dry_run_on_quick_creates(action: str, arguments: Dict[str, Any]) -> 
         value=requested,
         suggestions=[
             'Preview with manage_products(action="create", product_data={...}, dry_run=True)',
-            'See product shapes with manage_products(action="get_templates")',
+            'See product shapes with get_products(action="get_templates")',
             f"Run {action} without dry_run once the customer confirms",
         ],
     )
@@ -424,7 +427,60 @@ class CreatePayload:
     notes: Tuple[str, ...] = ()
 
 
-_RATING_AGGREGATION_KEYS = ("rating_aggregations", "ratingAggregations")
+def _plan_with_one_aggregation_key(product_data: Dict[str, Any]) -> Dict[str, Any]:
+    """The update with its aggregations under the stored plan's key.
+
+    The update merges the caller's plan over the stored one key by key, so a list
+    under the other spelling would be sent alongside the stored aggregations
+    instead of replacing them.
+    """
+    plan = product_data.get("plan")
+    if not isinstance(plan, dict):
+        return product_data
+    return {**product_data, "plan": APIFieldMapper.with_one_rating_aggregation_key(plan)}
+
+
+def _raise_if_validation_failed(
+    validation_response: Dict[str, Any],
+    suggestions: List[str],
+    examples: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Raise the engine's failed-validation text as a refusal; return when it passed."""
+    if not validation_response.get("isError"):
+        return
+    logger.error(
+        "Product validation failed - deprecated values or invalid fields detected"
+    )
+    raise create_structured_validation_error(
+        message=validation_response["content"][0]["text"],
+        field="product_data",
+        value="validation_failed",
+        suggestions=suggestions,
+        examples=examples,
+    )
+
+
+def _refuse_invalid_update_fields(product_data: Dict[str, Any]) -> None:
+    """Refuse an update field the platform would reject, before the product is read."""
+    from ..product_validation_engine import ProductValidationEngine
+
+    _raise_if_validation_failed(
+        ProductValidationEngine.validate_update_for_mcp(product_data),
+        suggestions=[
+            "Fix each field listed above as its Fix line says",
+            "Or leave those fields out of product_data to change only the others",
+        ],
+    )
+
+
+def _refuse_unsupported_plan_period(product_data: Dict[str, Any]) -> None:
+    """Refuse a plan period the platform would reject, before any lookup or request."""
+    from ..product_validation_engine import ProductValidationEngine
+
+    _raise_if_validation_failed(
+        ProductValidationEngine.validate_plan_period_for_mcp(product_data),
+        suggestions=["Set plan.period to one of the periods listed above"],
+    )
 
 
 def _drop_aggregations_without_an_element(parsed_data: Dict[str, Any]) -> Optional[str]:
@@ -439,7 +495,7 @@ def _drop_aggregations_without_an_element(parsed_data: Dict[str, Any]) -> Option
     if not isinstance(plan, dict):
         return None
     dropped: List[str] = []
-    for key in _RATING_AGGREGATION_KEYS:
+    for key in APIFieldMapper.RATING_AGGREGATION_KEYS:
         aggregations = plan.get(key)
         if not isinstance(aggregations, list):
             continue
@@ -456,7 +512,7 @@ def _drop_aggregations_without_an_element(parsed_data: Dict[str, Any]) -> Option
         f"Usage billing was not set up: the description asks for per-use billing "
         f"({', '.join(dropped)}) but names no metering element, so the product bills "
         f"only its plan tiers. To bill per use, add plan.ratingAggregations entries that "
-        f'each carry an elementDefinitionId from manage_metering_elements(action="list"), '
+        f'each carry an elementDefinitionId from get_usage_meters(action="list"), '
         f'using manage_products(action="update").'
     )
 
@@ -604,7 +660,7 @@ def _missing_subscription_requirements_step(product: Dict[str, Any], product_id:
         f"update(product_id='{product_id}', product_data={{{', '.join(fields)}}})"
     )
     if not has_source:
-        step += ", with a source id from manage_sources(action='list')"
+        step += ", with a source id from get_sources(action='list')"
     return step
 
 
@@ -993,25 +1049,21 @@ class ProductManager:
         logger.info(f"Validating product data for creation: {product_data.get('name', 'Unknown')}")
         validation_response = ProductValidationEngine.validate_for_mcp(product_data)
 
-        if validation_response.get("isError"):
-            logger.error("Product validation failed - deprecated values or invalid fields detected")
-            raise create_structured_validation_error(
-                message=validation_response["content"][0]["text"],
-                field="product_data",
-                value="validation_failed",
-                suggestions=[
-                    "Use get_examples() to see valid product templates",
-                    "Check for deprecated values in your product configuration",
-                    "Verify all required fields are provided",
-                    "Use validate() action to test configuration before creating",
-                ],
-                examples={
-                    "discovery": "get_examples()",
-                    "validation": "validate(product_data={...}, dry_run=True)",
-                    "templates": "get_templates()",
-                    "product_lifecycle": "PRODUCT LIFECYCLE: Validation prevents configuration errors that could affect billing",
-                },
-            )
+        _raise_if_validation_failed(
+            validation_response,
+            suggestions=[
+                "Use get_examples() to see valid product templates",
+                "Check for deprecated values in your product configuration",
+                "Verify all required fields are provided",
+                "Use validate() action to test configuration before creating",
+            ],
+            examples={
+                "discovery": "get_examples()",
+                "validation": "validate(product_data={...}, dry_run=True)",
+                "templates": "get_templates()",
+                "product_lifecycle": "PRODUCT LIFECYCLE: Validation prevents configuration errors that could affect billing",
+            },
+        )
 
         logger.info("Product data validation successful - ready for API call")
         return CreatePayload(body=product_data, notes=tuple(notes))
@@ -1062,7 +1114,8 @@ class ProductManager:
                 },
             )
 
-        return product_id, product_data
+        _refuse_invalid_update_fields(product_data)
+        return product_id, _plan_with_one_aggregation_key(product_data)
 
     async def preview_update(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Read the product and return the body update_product would send, sending nothing."""
@@ -1226,19 +1279,19 @@ class ProductValidator:
                     "prerequisites": {
                         "step_1": {
                             "action": "Verify account has sources",
-                            "tool_call": "manage_sources(action='list')",
+                            "tool_call": "get_sources(action='list')",
                             "purpose": "Ensure at least one source exists for subscription-ready products",
                             "required": True,
                         },
                         "step_2": {
                             "action": "Check available metering elements",
-                            "tool_call": "manage_metering_elements(action='list')",
+                            "tool_call": "get_usage_meters(action='list')",
                             "purpose": "The organization must have a metering element; without one the call is refused before anything is written",
                             "required": True,
                         },
                         "step_3": {
                             "action": "Pick the organization to bill",
-                            "tool_call": "manage_customers(action='list', resource_type='organizations')",
+                            "tool_call": "get_customers(action='list', resource_type='organizations')",
                             "purpose": "Copy its id into subscription_data.organizationId",
                             "required": True,
                         },
@@ -1268,7 +1321,7 @@ class ProductValidator:
                             "name": "Customer AI Analytics Subscription",
                             "description": "Active subscription for AI analytics platform",
                             "clientEmailAddress": "customer@company.com",
-                            "organizationId": "<organization id from manage_customers list>",
+                            "organizationId": "<organization id from get_customers list>",
                         },
                     },
                     "automatic_enhancements": {
@@ -1294,7 +1347,7 @@ class ProductValidator:
                             "error": "No sources available for subscription-ready product creation",
                             "solution": "Create a source first",
                             "tool_call": "manage_sources(action='create', source_data={...})",
-                            "prevention": "Always run prerequisite check: manage_sources(action='list')",
+                            "prevention": "Always run prerequisite check: get_sources(action='list')",
                         },
                         "list_is_empty": {
                             "error": "HTTP 400: Invalid request - {'error': 'List is empty.'}",
@@ -1304,7 +1357,7 @@ class ProductValidator:
                                 "create_with_subscription attaches one; update with sourceIds "
                                 "attaches one to an existing product"
                             ),
-                            "note": "Pick a source id with manage_sources(action='list')",
+                            "note": "Pick a source id with get_sources(action='list')",
                         },
                         "validation_failed": {
                             "error": "Product validation failed - tier structure issues",
@@ -1686,8 +1739,8 @@ class ProductEnhancementProcessor:
             "clarification": f"Basic pricing analysis for: {text}",
             "suggestions": [
                 "Use SUBSCRIPTION plan type (CHARGE is deprecated)",
-                "Specify currency (USD, EUR, GBP, CAD, AUD, JPY, CNY, MXN, COP, ARS, ZMW)",
-                "Define billing period (MONTH, QUARTER, YEAR)",
+                f"Specify currency ({', '.join(platform_plan_currencies())})",
+                f"Define billing period ({', '.join(p.value for p in BillingPeriod)})",
                 "For setup fees, specify type: 'per subscription' or 'per customer'",
             ],
             "guidance": "For complex pricing structures, provide more specific details",
@@ -2209,7 +2262,7 @@ class ProductHierarchyManager:
     async def _organization_metering_element_id(self) -> str:
         """The first metering element of this organization, or a refusal before any write."""
         suggestions = [
-            "List this organization's elements with manage_metering_elements(action='list')",
+            "List this organization's elements with get_usage_meters(action='list')",
             "Or pass plan.ratingAggregations with an elementDefinitionId in product_data",
         ]
         try:
@@ -2263,7 +2316,7 @@ class ProductHierarchyManager:
             field="subscription_data.organizationId",
             value=None,
             suggestions=[
-                'Find the id with manage_customers(action="list", resource_type="organizations")',
+                'Find the id with get_customers(action="list", resource_type="organizations")',
                 'Then pass subscription_data={"organizationId": "<organization id>", ...}',
             ],
         )
@@ -2293,7 +2346,7 @@ class ProductHierarchyManager:
                 field="subscription_data.organizationId",
                 value=organization_id,
                 suggestions=[
-                    'Find the id with manage_customers(action="list", resource_type="organizations")',
+                    'Find the id with get_customers(action="list", resource_type="organizations")',
                     'Then pass subscription_data={"organizationId": "<organization id>", ...}',
                 ],
             ) from e
@@ -2308,6 +2361,7 @@ class ProductHierarchyManager:
 
         # Validate required fields
         self._validate_required_fields(product_data, subscription_data)
+        _refuse_unsupported_plan_period(product_data)
         subscription_data = with_team_reference_as_team_id(subscription_data, "subscription_data")
 
         # Validate plan.name specifically (common source of confusion)
@@ -2445,18 +2499,17 @@ class ProductHierarchyManager:
             product_data["published"] = True
 
         # Add rating aggregation if not present (required for subscription billing)
-        if "plan" in product_data and (
-            "ratingAggregations" not in product_data["plan"]
-            or not product_data["plan"]["ratingAggregations"]
+        if "plan" in product_data and not APIFieldMapper.rating_aggregations_of(
+            product_data["plan"]
         ):
             default_element_id = await self._organization_metering_element_id()
 
             # Remove unlimited tier from plan.tiers to avoid conflict
             if "plan" in product_data and "tiers" in product_data["plan"]:
                 for tier in product_data["plan"]["tiers"]:
-                    if tier.get("up_to") is None:
+                    if APIFieldMapper.map_tier_fields_to_internal(tier).get("up_to") is None:
                         # Make this tier limited to avoid unlimited tier conflict
-                        tier["up_to"] = 1000000  # Large limit instead of unlimited
+                        tier["upTo" if "upTo" in tier else "up_to"] = 1000000
                         logger.info(
                             "Modified plan tier to be limited to avoid unlimited tier conflict"
                         )
@@ -2715,7 +2768,7 @@ class ProductManagement(ToolBase):
             return self._format_delete_success_response(result)
 
         # Return error for unhandled CRUD actions
-        return [TextContent(type="text", text=json.dumps({"error": f"Unhandled CRUD action: {action}"}, indent=2))]
+        return self._handle_unknown_action(action)
 
     async def _handle_create_dry_run(
         self,
@@ -2878,7 +2931,7 @@ class ProductManagement(ToolBase):
             return self._format_validation_response(validation_result)
 
         # Return error for unhandled validation actions
-        return [TextContent(type="text", text=json.dumps({"error": "No validation action specified"}, indent=2))]
+        return self._handle_unknown_action(action)
 
     async def _handle_hierarchy_actions(
         self, action: str, arguments: Dict[str, Any], hierarchy_manager: ProductHierarchyManager
@@ -2909,7 +2962,7 @@ class ProductManagement(ToolBase):
             return await self._format_create_with_subscription_response(result)
 
         # Return error for unhandled hierarchy actions
-        return [TextContent(type="text", text=json.dumps({"error": "No hierarchy action specified"}, indent=2))]
+        return self._handle_unknown_action(action)
 
     @staticmethod
     def _raise_missing_creation_id(
@@ -2922,8 +2975,8 @@ class ProductManagement(ToolBase):
             field="id",
             value={"product_id": product_id, "subscription_id": subscription_id},
             suggestions=[
-                "Verify the product with manage_products(action='list')",
-                "Verify the subscription with manage_subscriptions(action='list')",
+                "Verify the product with get_products(action='list')",
+                "Verify the subscription with get_subscriptions(action='list')",
             ],
         )
 
@@ -2986,7 +3039,7 @@ class ProductManagement(ToolBase):
                 + subscriber_lines
                 + f"{auto_config_text}\n\n"
                 + "**Next Steps:**\n"
-                + "• Use manage_subscriber_credentials to add API keys for the subscription\n"
+                + "• Use manage_credentials to add API keys for the subscription\n"
                 + "• Use 'get_subscriptions' to see all subscriptions for this product",
             )
         ]
@@ -2999,7 +3052,7 @@ class ProductManagement(ToolBase):
             return await self._handle_get_agent_summary()
 
         # Return error for unhandled agent actions
-        return [TextContent(type="text", text=json.dumps({"error": f"Unhandled agent action: {action}"}, indent=2))]
+        return self._handle_unknown_action(action)
 
     def _handle_unknown_action(
         self, action: str
@@ -3254,7 +3307,7 @@ create_simple(name="My AI Product", description="Premium API access")  # With de
 ### **Usage-Based Billing Workflow**
 ```bash
 # Step 1: Check standard AI billing elements (recommended first step)
-manage_metering_elements(action="list")       # See available elements: totalCost, inputTokenCount, etc.
+get_usage_meters(action="list")       # See available elements: totalCost, inputTokenCount, etc.
 
 # Step 2: Choose appropriate existing element OR create new one if needed
 # Common existing elements: totalCost, inputTokenCost, outputTokenCost, inputTokenCount, outputTokenCount
@@ -3263,10 +3316,10 @@ manage_metering_elements(action="list")       # See available elements: totalCos
 # Step 3: Create usage-based product with elementDefinitionId
 create(product_data={
   "name": "AI Usage Product",
-  "sourceIds": ["<source id from manage_sources(action='list')>"],
+  "sourceIds": ["<source id from get_sources(action='list')>"],
   "plan": {
     "ratingAggregations": [{
-      "elementDefinitionId": "COPY_FROM_STEP_1",  # Use actual ID from manage_metering_elements list
+      "elementDefinitionId": "COPY_FROM_STEP_1",  # Use actual ID from get_usage_meters list
       "aggregationType": "SUM",
       "tiers": [{"up_to": null, "unit_amount": "0.01"}]
     }]
@@ -3290,9 +3343,9 @@ create_with_subscription(product_data={...}, subscription_data={...})  # Create 
 ### **Coordinated Product+Subscription Creation**
 ```bash
 # PREREQUISITE: Verify account readiness (REQUIRED)
-manage_sources(action="list")                      # Ensure sources exist (required)
-manage_customers(action="list", resource_type="organizations")  # Pick organizationId (required)
-manage_metering_elements(action="list")            # Ensure a metering element exists (required)
+get_sources(action="list")                      # Ensure sources exist (required)
+get_customers(action="list", resource_type="organizations")  # Pick organizationId (required)
+get_usage_meters(action="list")            # Ensure a metering element exists (required)
 
 # Complete workflow in single operation
 create_with_subscription(
@@ -3335,15 +3388,9 @@ create_with_subscription(
             text += "\n\n## **Plan Types**\n"
             text += "- **SUBSCRIPTION**\n"
 
-        # Add UCM-enhanced currencies if available
-        if ucm_capabilities and "currencies" in ucm_capabilities:
-            text += "\n\n## **Supported Currencies**\n"
-            for currency in ucm_capabilities["currencies"]:
-                text += f"- **{currency}**\n"
-        else:
-            # Fallback to basic currencies
-            text += "\n\n## **Supported Currencies**\n"
-            text += "- **USD**\n- **EUR**\n- **GBP**\n- **CAD**\n- **AUD**\n- **JPY**\n- **CNY**\n- **MXN**\n- **COP**\n- **ARS**\n- **ZMW**\n"
+        text += "\n\n## **Supported Currencies**\n"
+        for currency in platform_plan_currencies():
+            text += f"- **{currency}**\n"
 
         # Add UCM-enhanced billing periods if available
         if ucm_capabilities and "billing_periods" in ucm_capabilities:
@@ -3353,7 +3400,8 @@ create_with_subscription(
         else:
             # Fallback to basic billing periods
             text += "\n\n## **Billing Periods**\n"
-            text += "- **MONTH**\n- **YEAR**\n- **QUARTER**\n- **WEEK**\n- **DAY**\n"
+            for period in BillingPeriod:
+                text += f"- **{period.value}**\n"
 
         # Add payment source documentation (API-verified)
         text += "\n\n## **Supported Payment Sources**\n"
@@ -3449,7 +3497,7 @@ For 7500 API calls with above tiers at $0.01, $0.008, $0.005:
 - ORGANIZATION: Charged once per customer organization (multiple subscriptions within one organization= setup fee charged one time only)
 
 ### Usage-Based Billing Requirements
-- **Metering elements must exist first**: Check existing elements with manage_metering_elements(action="list")
+- **Metering elements must exist first**: Check existing elements with get_usage_meters(action="list")
 - **Leverage existing AI elements**: Use built-in elements (totalCost, inputTokenCount, outputTokenCount, etc.) for most AI use cases, these are automatically metered by Revenium's middleware so they are the most common use cases
 - **elementDefinitionId required**: Must reference valid metering element ID in ratingAggregations
 - **CRITICAL**: Element IDs are unique per account - NEVER hardcode IDs, always lookup from list results
@@ -3739,7 +3787,8 @@ For 7500 API calls with above tiers at $0.01, $0.008, $0.005:
         self,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle get agent summary."""
-        summary_text = """**Agent Summary: manage_products**
+        writes = public_tool_for(self.tool_name, "create")
+        summary_text = f"""**Agent Summary: {self.public_tool_name}**
 
 **Product Management Tool**
 
@@ -3755,9 +3804,9 @@ Comprehensive product lifecycle management for the Revenium platform. Handle cre
 **Quick Start:**
 1. Start with get_capabilities() to understand product types and requirements
 2. Use get_examples() to see working product templates
-3. Validate configurations with validate(product_data={...}, dry_run=True)
-4. Create products with create(product_data={...}) or create_simple(name='...', description='...')
-5. Monitor and manage with list(), get(), update(), and delete() actions
+3. Validate configurations with validate(product_data={{...}}, dry_run=True)
+4. Create products with {writes}: create(product_data={{...}}) or create_simple(name='...', description='...')
+5. Monitor with list() and get(), and change products with update() and delete() on {writes}
 
 **Common Use Cases:**
 • Setting up AI or API metering for new services
@@ -3796,7 +3845,7 @@ Comprehensive product lifecycle management for the Revenium platform. Handle cre
                     "get(product_id='prod_123')",
                     "create(product_data={'name': 'My Product', 'plan': {'type': 'SUBSCRIPTION', 'currency': 'USD'}})",
                     "VALID plan.type: SUBSCRIPTION (CHARGE is deprecated)",
-                    "VALID currencies: USD, EUR, GBP, CAD, AUD",
+                    f"VALID currencies: {', '.join(platform_plan_currencies())}",
                 ],
                 limitations=[
                     "Requires valid API authentication",

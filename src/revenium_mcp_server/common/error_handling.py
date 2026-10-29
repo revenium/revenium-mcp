@@ -328,7 +328,9 @@ def _names_action(action: str, text: str) -> bool:
     return re.search(rf"(?<![\w]){re.escape(action)}(?![\w])", text) is not None
 
 
-def caller_message(error: ToolError, valid_actions: Sequence[str] = ()) -> str:
+def caller_message(
+    error: ToolError, valid_actions: Sequence[str] = (), sibling_note: str = ""
+) -> str:
     """The text a caller reads for a raised ``ToolError`` (BACK-4715).
 
     The framework sends the caller only the exception message, so the
@@ -341,7 +343,9 @@ def caller_message(error: ToolError, valid_actions: Sequence[str] = ()) -> str:
 
     Args:
         error: The raised error
-        valid_actions: The actions the tool advertises, when known
+        valid_actions: The actions the called tool runs, when known
+        sibling_note: The sentence naming the tool that serves the other
+            actions of a split domain, added to an unknown-action refusal
 
     Returns:
         The message followed by the guidance it was missing
@@ -357,6 +361,8 @@ def caller_message(error: ToolError, valid_actions: Sequence[str] = ()) -> str:
     sections = []
     if lists_actions and any(not _names_action(a, text) for a in valid_actions):
         sections.append("**Valid actions**: " + ", ".join(valid_actions) + "\n")
+    if lists_actions and sibling_note and sibling_note not in text:
+        sections.append(sibling_note)
 
     suggestions = [
         s
@@ -797,7 +803,7 @@ def _extract_validation_context(error_message: str, status_code: int) -> dict:
                 "examples": [
                     "Valid product ID: 'prod_abc123def456'",
                     "Valid subscription ID: 'sub_xyz789ghi012'",
-                    "Use list() first: manage_products(action='list') to get valid IDs",
+                    "Use list() first: get_products(action='list') to get valid IDs",
                 ],
             }
         )

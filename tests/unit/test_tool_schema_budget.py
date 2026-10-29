@@ -37,7 +37,7 @@ from src.revenium_mcp_server.tool_configuration.schema_slimming import (
 #: get_capabilities text without going through the network.
 THIN_TOOL_CLASSES = {
     "manage_metering": ("metering_management", "MeteringManagement"),
-    "business_analytics_management": (
+    "get_business_analytics": (
         "business_analytics_management",
         "BusinessAnalyticsManagement",
     ),
@@ -47,12 +47,15 @@ THIN_TOOL_CLASSES = {
 }
 
 #: Whole business profile (20 tools). Measured 25,384 chars / 6,043 tokens.
-TOTAL_CHARACTER_BUDGET = 30_000
+# BACK-5047 published each read-and-write domain as two tools sharing one
+# schema, so the 37-tool list measured 46,388 characters against 29,833 for
+# the 20 tools before the split.
+TOTAL_CHARACTER_BUDGET = 52_000
 
 #: The tools BACK-3168 found heaviest, which now advertise the thin shape.
 #: Measured, in characters: see the values each budget sits above.
 PER_TOOL_CHARACTER_BUDGETS = {
-    "business_analytics_management": 2_400,  # measured 2,037
+    "get_business_analytics": 2_400,  # measured 2,037
     "manage_tools": 1_800,  # measured 1,534
     "manage_alerts": 1_800,  # measured 1,518
     "manage_metering": 1_600,  # measured 1,313
@@ -279,18 +282,18 @@ _IGNORED_ARGUMENT_CALLS = [
     ("_register_system_diagnostics", "system_diagnostics", "environment_variables", "format_output", "json"),
     ("_register_system_diagnostics", "system_diagnostics", "system_health", "include_recommendations", True),
     ("_register_system_diagnostics", "system_diagnostics", "debug", "show_detailed_analysis", True),
-    ("_register_system_setup", "system_setup", "show_welcome", "show_environment", True),
-    ("_register_system_setup", "system_setup", "show_welcome", "include_recommendations", True),
-    ("_register_system_setup", "system_setup", "show_welcome", "include_setup_guidance", True),
-    ("_register_system_setup", "system_setup", "setup_checklist", "suggest_smart_defaults", True),
-    ("_register_system_setup", "system_setup", "update_email", "validate_format", True),
-    ("_register_slack_management", "slack_management", "guided_setup", "skip_prompts", True),
+    ("_register_system_setup", "manage_system_setup", "show_welcome", "show_environment", True),
+    ("_register_system_setup", "manage_system_setup", "show_welcome", "include_recommendations", True),
+    ("_register_system_setup", "manage_system_setup", "show_welcome", "include_setup_guidance", True),
+    ("_register_system_setup", "manage_system_setup", "setup_checklist", "suggest_smart_defaults", True),
+    ("_register_system_setup", "manage_system_setup", "update_email", "validate_format", True),
+    ("_register_slack_management", "manage_slack", "guided_setup", "skip_prompts", True),
 ]
 
 _IGNORED_ARGUMENT_TOOL_CLASSES = {
     "system_diagnostics": ("system_diagnostics", "SystemDiagnostics"),
-    "system_setup": ("system_setup", "SystemSetup"),
-    "slack_management": ("slack_management", "SlackManagement"),
+    "manage_system_setup": ("system_setup", "SystemSetup"),
+    "manage_slack": ("slack_management", "SlackManagement"),
 }
 
 

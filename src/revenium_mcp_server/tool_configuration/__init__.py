@@ -15,7 +15,7 @@ Usage:
     )
 
     config = ToolConfig()
-    if config.is_tool_enabled("slack_management"):
+    if config.is_tool_enabled("get_slack"):
         # Register tool
         pass
 """

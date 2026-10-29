@@ -41,11 +41,16 @@ from ..common.error_handling import (
     ErrorCodes,
     ToolError,
     create_structured_missing_parameter_error,
+    raise_refusal,
     raise_unknown_action_error,
 )
 from ..common.formatting import format_page_count_heading
 from ..common.sample_coverage import platform_total
-from ..common.validation import apply_filter_allowlist, validate_pagination_params
+from ..common.validation import (
+    apply_filter_allowlist,
+    refuse_ignored_filter,
+    validate_pagination_params,
+)
 from ..introspection.metadata import (
     ToolCapability,
     ToolType,
@@ -70,15 +75,33 @@ NOTIFICATION_EMAILS_PATCH_NOTE = (
 )
 
 # snake_case filter name -> camelCase query parameter, bounded to what the
-# endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
-# CostControlController.list: @RequestParam query / teamId / type plus a
-# Pageable (page, size, sort). teamId and page/size are set by the client, so
-# what remains is the caller-settable set.
+# endpoint applies. CostControlController.list (hypercurrent origin/develop,
+# re-read 2026-10-28) declares query / teamId / a hidden type plus a Pageable
+# (page, size, sort), and never reads type: dev answered type=BLOCK, NOTIFY and
+# ZZZ_NOT_A_TYPE with the same full list (BACK-5154). teamId and page/size are
+# set by the client, so query and sort are what a caller may set; type is
+# refused in _cost_control_list_filters.
 _COST_CONTROL_FILTER_MAP: Dict[str, str] = {
     "query": "query",
-    "type": "type",
     "sort": "sort",
 }
+
+_COST_CONTROL_TYPE_FILTER_ALTERNATIVE = (
+    "List without the type filter and read each control's `action` field, or "
+    "search by name with filters={'query': '<name>'}."
+)
+
+_COST_CONTROL_FILTERS_DESCRIPTION = (
+    "Optional filters for list. Valid keys: query, sort. 'query' is a server-side "
+    "search on the cost control name. type is refused: the platform returns every "
+    "cost control whatever type is sent. Any other key is rejected rather than "
+    "silently ignored."
+)
+
+_TOP_LEVEL_QUERY_ON_LIST_REFUSAL = (
+    "list does not read the top-level query argument; it is the enforcement-event "
+    "search. Search cost controls by name with filters={'query': '<name>'}."
+)
 
 # snake_case tool argument -> camelCase query parameter shared by the
 # enforcement-events list and its summary, history and affected sub-reads.
@@ -268,7 +291,7 @@ DEPARTMENT_DIMENSION_SCOPE_NOTE = (
 # resources, and this tool has no listing of its own to resolve them.
 DEPARTMENT_ID_SOURCE_NOTE = (
     "DEPARTMENT ids are raw numeric department ids (not hashids); list them with "
-    "manage_customers(action='list_departments')."
+    "get_customers(action='list_departments')."
 )
 
 # Blocked-subscriber lists are unbounded (one entry per blocked person), so the
@@ -581,6 +604,21 @@ def _summarize_advisory_rows(result: Any, requested: bool) -> Optional[str]:
     return "\n".join([header] + lines)
 
 
+def _cost_control_list_filters(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """The query parameters the cost-control list sends for the caller's filters."""
+    if arguments.get("query") is not None:
+        raise_refusal(_TOP_LEVEL_QUERY_ON_LIST_REFUSAL, field="query", value=arguments["query"])
+    refuse_ignored_filter(
+        arguments.get("filters"),
+        "type",
+        listing="Cost controls",
+        instead=_COST_CONTROL_TYPE_FILTER_ALTERNATIVE,
+    )
+    return apply_filter_allowlist(
+        arguments.get("filters"), _COST_CONTROL_FILTER_MAP, action="list_cost_controls"
+    )
+
+
 class CostControlsManager:
     """Internal manager for cost-control CRUD and enforcement-visibility operations."""
 
@@ -593,9 +631,7 @@ class CostControlsManager:
         arguments = validate_pagination_params(arguments, action="list cost controls")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = apply_filter_allowlist(
-            arguments.get("filters"), _COST_CONTROL_FILTER_MAP, action="list_cost_controls"
-        )
+        filters = _cost_control_list_filters(arguments)
         response = await self.client.get_cost_controls(page=page, size=size, **filters)
         controls = self.client._extract_embedded_data(response)
         page_info = self.client._extract_pagination_info(response)
@@ -1386,11 +1422,7 @@ class CostControlsManagement(ToolBase):
                 },
                 "filters": {
                     "type": "object",
-                    "description": (
-                        "Optional filters for list. Valid keys: query, sort, type. "
-                        "'query' is a server-side search on the cost control name. Any "
-                        "other key is rejected rather than silently ignored."
-                    ),
+                    "description": _COST_CONTROL_FILTERS_DESCRIPTION,
                 },
             },
             "required": ["action"],
@@ -1997,11 +2029,8 @@ class CostControlsManagement(ToolBase):
                 return [TextContent(type="text", text=self._filter_values_text(result))]
 
             else:
-                supported = await self._get_supported_actions()
                 # BACK-2937: raise so the envelope carries the error flag.
-                raise_unknown_action_error(
-                    action, hint=f"Supported actions: {', '.join(supported)}"
-                )
+                raise_unknown_action_error(action)
 
         except ToolError as e:
             logger.error(f"Tool error in manage_cost_controls: {e}")

@@ -79,7 +79,7 @@ async def _onboarding_and_checklist(tenant):
         await tools.call("system_diagnostics", {"action": "onboarding_status"}, tenant=tenant)
     )
     checklist = answer_text(
-        await tools.call("system_setup", {"action": "setup_checklist"}, tenant=tenant)
+        await tools.call("manage_system_setup", {"action": "setup_checklist"}, tenant=tenant)
     )
     return onboarding, checklist
 

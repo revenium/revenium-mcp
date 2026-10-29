@@ -354,6 +354,34 @@ def threshold_number(value: Any) -> Optional[float]:
     return None
 
 
+THRESHOLD_FLOOR_REFUSAL = "Invalid threshold value: {}; use a number, zero or more"
+
+
+def refuse_negative_threshold(threshold: Any) -> None:
+    """Refuse a threshold below zero, the floor create_threshold_alert has always applied.
+
+    The platform stores a negative threshold as sent, and a cost rule at -$1.00 fires
+    on every evaluation, so every write path holds the same floor.
+    """
+    number = threshold_number(threshold)
+    if number is None or number >= 0:
+        return
+    raise create_structured_validation_error(
+        message=THRESHOLD_FLOOR_REFUSAL.format(_plain_number(number)),
+        field="threshold",
+        value=threshold,
+        suggestions=[
+            "Provide a numeric threshold value, zero or more",
+            "Use the operator for direction: LESS_THAN fires below the threshold",
+        ],
+    )
+
+
+def _plain_number(number: float) -> str:
+    """A number as a caller writes it, so -1 and -1.0 read the same on every path."""
+    return str(int(number)) if number.is_integer() else str(number)
+
+
 def _check_threshold(alert: Mapping[str, Any], _stored: Any) -> Optional[RuleBreach]:
     if "threshold" not in alert:
         return None
@@ -783,21 +811,49 @@ UNVERIFIED_UPDATE_FIELDS = frozenset(
 )
 
 # The platform's alert has no tags field.
-UNSUPPORTED_UPDATE_FIELDS = ("tags",)
+UNSUPPORTED_ALERT_FIELDS = ("tags",)
 
 
-def refuse_unsupported_update_fields(update_data: Mapping[str, Any]) -> None:
-    """Refuse an update naming a field the platform's alert does not have."""
-    for field in UNSUPPORTED_UPDATE_FIELDS:
-        if update_data.get(field) is not None:
+@dataclass(frozen=True)
+class _AlertWrite:
+    noun: str
+    subject: str
+    verb: str
+
+
+_ALERT_WRITES = {
+    "created": _AlertWrite(noun="create", subject="a create", verb="set"),
+    "updated": _AlertWrite(noun="update", subject="an update", verb="change"),
+}
+
+
+def unsupported_alert_fields_note() -> str:
+    """Name the fields create and update refuse, for get_capabilities."""
+    names = ", ".join(f"`{field}`" for field in UNSUPPORTED_ALERT_FIELDS)
+    return (
+        f"Alerts have no {names} field on the platform, so create and update refuse it "
+        "before anything is sent; put labels in name or description."
+    )
+
+
+def refuse_unsupported_alert_fields(data: Mapping[str, Any], outcome: str) -> None:
+    """Refuse a create or update naming a field the platform's alert does not have.
+
+    ``outcome`` is the past tense of the write, "created" or "updated".
+    """
+    write = _ALERT_WRITES[outcome]
+    for field in UNSUPPORTED_ALERT_FIELDS:
+        if data.get(field) is not None:
             raise create_structured_validation_error(
                 message=(
-                    f"Alerts have no {field} field on the platform, so an update cannot "
-                    f"change {field}. Nothing was updated."
+                    f"Alerts have no {field} field on the platform, so {write.subject} cannot "
+                    f"{write.verb} {field}. Nothing was {outcome}."
                 ),
                 field=field,
-                value=update_data[field],
-                suggestions=[f"Remove {field} from the update; put labels in name or description"],
+                value=data[field],
+                suggestions=[
+                    f"Remove {field} from the {write.noun}; put labels in name or description"
+                ],
             )
 
 

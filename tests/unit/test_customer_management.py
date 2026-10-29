@@ -67,6 +67,7 @@ from src.revenium_mcp_server.tools_decomposed.pr_health_settings_fields import (
 )
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
+from src.revenium_mcp_server.common.metadata_format import malformed_metadata_message
 from src.revenium_mcp_server.common.tool_execution import standardized_tool_execution
 from src.revenium_mcp_server.common.update_configs import UpdateConfigs
 from mcp.types import TextContent
@@ -4736,37 +4737,36 @@ class TestCustomerManagementDepartmentAction:
         assert DEPARTMENT_ID_STRING_NOTE in department_capability.limitations
 
 
-class TestDepartmentRemovalConfirmGate:
-    """BACK-3353: no removal DELETE is sent without a literal confirm=True."""
+class TestDepartmentRemovalDryRun:
+    """BACK-3353, BACK-5047: dry_run previews a removal and sends nothing."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("confirm", [None, False, "true", 1])
-    async def test_unconfirmed_delete_previews_without_calling_the_client(
-        self, department_manager, mock_client, confirm
+    async def test_dry_run_delete_previews_without_calling_the_client(
+        self, department_manager, mock_client
     ):
-        arguments = {"person_id": 97}
-        if confirm is not None:
-            arguments["confirm"] = confirm
+        result = await department_manager.delete_department_person(
+            {"person_id": 97, "dry_run": True}
+        )
 
-        result = await department_manager.delete_department_person(arguments)
-
-        assert result["confirmation_required"] is True
+        assert result["dry_run"] is True
         assert result["effect"] == DEPARTMENT_PERSON_DELETE_NOTE
         assert "deleted" not in result
         mock_client.delete_department_person.assert_not_awaited()
         mock_client.delete_department_person_by_email.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_unconfirmed_clear_previews_without_calling_the_client(
+    async def test_dry_run_clear_previews_without_calling_the_client(
         self, department_manager, mock_client
     ):
-        result = await department_manager.clear_department_assignment({"email": "ash@acme.com"})
+        result = await department_manager.clear_department_assignment(
+            {"email": "ash@acme.com", "dry_run": True}
+        )
 
-        assert result["confirmation_required"] is True
+        assert result["dry_run"] is True
         assert result["effect"] == DEPARTMENT_ASSIGNMENT_CLEAR_NOTE
         mock_client.clear_department_assignment_by_email.assert_not_awaited()
 
-    def test_preview_text_names_the_target_and_the_confirming_call(self):
+    def test_preview_text_names_the_target_and_the_call_that_applies_it(self):
         text = _format_department_removal_text(
             {
                 "action": "delete_department_person",
@@ -4774,22 +4774,22 @@ class TestDepartmentRemovalConfirmGate:
                 "team_id": "jR2kmLs",
                 "person_id": 97,
                 "effect": DEPARTMENT_PERSON_DELETE_NOTE,
-                "confirmation_required": True,
+                "dry_run": True,
             }
         )
 
-        assert "Confirmation Required - Delete directory person 97 in team jR2kmLs" in text
+        assert "Dry run - Delete directory person 97 in team jR2kmLs" in text
         assert "No request was sent" in text
-        assert "`delete_department_person(person_id=97, team_id='jR2kmLs', confirm=true)`" in text
+        assert "`delete_department_person(person_id=97, team_id='jR2kmLs')`" in text
 
 
 class TestDepartmentRemovalConfirmed:
-    """Confirmed removals reach the right client method, scoped by team."""
+    """Removals reach the right client method, scoped by team."""
 
     @pytest.mark.asyncio
     async def test_delete_by_person_id(self, department_manager, mock_client):
         result = await department_manager.delete_department_person(
-            {"person_id": "97", "team_id": " jR2kmLs ", "confirm": True}
+            {"person_id": "97", "team_id": " jR2kmLs "}
         )
 
         mock_client.delete_department_person.assert_awaited_once_with(97, "jR2kmLs")
@@ -4804,7 +4804,7 @@ class TestDepartmentRemovalConfirmed:
         self, department_manager, mock_client
     ):
         result = await department_manager.delete_department_person(
-            {"email": " ash@acme.com ", "confirm": True}
+            {"email": " ash@acme.com "}
         )
 
         mock_client.delete_department_person_by_email.assert_awaited_once_with("ash@acme.com", None)
@@ -4815,7 +4815,7 @@ class TestDepartmentRemovalConfirmed:
     @pytest.mark.asyncio
     async def test_clear_assignment_by_email(self, department_manager, mock_client):
         result = await department_manager.clear_department_assignment(
-            {"email": "ash@acme.com", "team_id": "jR2kmLs", "confirm": True}
+            {"email": "ash@acme.com", "team_id": "jR2kmLs"}
         )
 
         mock_client.clear_department_assignment_by_email.assert_awaited_once_with(
@@ -4851,7 +4851,7 @@ class TestDepartmentRemovalIdentifierValidation:
     async def test_invalid_person_id_names_person_id(self, department_manager, mock_client, person_id):
         with pytest.raises(ToolError) as excinfo:
             await department_manager.delete_department_person(
-                {"person_id": person_id, "confirm": True}
+                {"person_id": person_id}
             )
 
         assert excinfo.value.field == "person_id"
@@ -4860,7 +4860,7 @@ class TestDepartmentRemovalIdentifierValidation:
     @pytest.mark.asyncio
     async def test_missing_identifier_names_person_id(self, department_manager, mock_client):
         with pytest.raises(ToolError) as excinfo:
-            await department_manager.delete_department_person({"confirm": True})
+            await department_manager.delete_department_person({})
 
         assert excinfo.value.field == "person_id"
         mock_client.delete_department_person.assert_not_awaited()
@@ -4870,7 +4870,7 @@ class TestDepartmentRemovalIdentifierValidation:
     async def test_both_identifiers_are_refused(self, department_manager, mock_client):
         with pytest.raises(ToolError) as excinfo:
             await department_manager.delete_department_person(
-                {"person_id": 97, "email": "ash@acme.com", "confirm": True}
+                {"person_id": 97, "email": "ash@acme.com"}
             )
 
         assert excinfo.value.field == "person_id"
@@ -4882,7 +4882,7 @@ class TestDepartmentRemovalIdentifierValidation:
     async def test_clear_rejects_a_missing_or_malformed_email(
         self, department_manager, mock_client, email
     ):
-        arguments = {"confirm": True}
+        arguments = {}
         if email is not None:
             arguments["email"] = email
 
@@ -4898,7 +4898,7 @@ class TestDepartmentRemovalIdentifierValidation:
     async def test_supplied_but_unusable_team_id_is_refused(
         self, department_manager, mock_client, action, team_id
     ):
-        arguments = {"email": "ash@acme.com", "team_id": team_id, "confirm": True}
+        arguments = {"email": "ash@acme.com", "team_id": team_id}
 
         with pytest.raises(ToolError) as excinfo:
             await getattr(department_manager, action)(arguments)
@@ -4910,7 +4910,7 @@ class TestDepartmentRemovalIdentifierValidation:
     @pytest.mark.asyncio
     async def test_none_team_id_falls_back_to_the_ambient_team(self, department_manager, mock_client):
         await department_manager.clear_department_assignment(
-            {"email": "ash@acme.com", "team_id": None, "confirm": True}
+            {"email": "ash@acme.com", "team_id": None}
         )
 
         mock_client.clear_department_assignment_by_email.assert_awaited_once_with(
@@ -4924,7 +4924,7 @@ class TestDepartmentRemovalIdentifierValidation:
         mock_client.get_departments.assert_awaited_once_with(None)
 
     @pytest.mark.asyncio
-    async def test_invalid_identifier_is_refused_even_when_unconfirmed(
+    async def test_invalid_identifier_is_refused_before_any_call(
         self, department_manager
     ):
         with pytest.raises(ToolError) as excinfo:
@@ -4956,7 +4956,7 @@ class TestDepartmentRemovalErrors:
         )
 
         with pytest.raises(ToolError) as excinfo:
-            await department_manager.delete_department_person({"person_id": 97, "confirm": True})
+            await department_manager.delete_department_person({"person_id": 97})
 
         self._assert_names_both_causes(excinfo.value, mock_client, "delete_department_person")
         assert excinfo.value.field == "team_id"
@@ -4970,7 +4970,7 @@ class TestDepartmentRemovalErrors:
 
         with pytest.raises(ToolError) as excinfo:
             await department_manager.clear_department_assignment(
-                {"email": "ash@acme.com", "confirm": True}
+                {"email": "ash@acme.com"}
             )
 
         self._assert_names_both_causes(excinfo.value, mock_client, "clear_department_assignment")
@@ -4991,7 +4991,7 @@ class TestDepartmentRemovalErrors:
         )
 
         with pytest.raises(ToolError) as excinfo:
-            await department_manager.delete_department_person({"person_id": 97, "confirm": True})
+            await department_manager.delete_department_person({"person_id": 97})
 
         assert excinfo.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
         assert excinfo.value.field == "person_id"
@@ -5008,7 +5008,7 @@ class TestDepartmentRemovalErrors:
 
         with pytest.raises(ToolError) as excinfo:
             await department_manager.delete_department_person(
-                {"person_id": 97, "team_id": "jR2kmLs", "confirm": True}
+                {"person_id": 97, "team_id": "jR2kmLs"}
             )
 
         assert excinfo.value.field is None
@@ -5024,7 +5024,7 @@ class TestDepartmentRemovalErrors:
 
         with pytest.raises(ToolError) as excinfo:
             await department_manager.clear_department_assignment(
-                {"email": "ash@acme.com", "team_id": "zzzzzz", "confirm": True}
+                {"email": "ash@acme.com", "team_id": "zzzzzz"}
             )
 
         assert excinfo.value.field == "team_id"
@@ -5038,7 +5038,7 @@ class TestDepartmentRemovalErrors:
 
         with pytest.raises(ToolError) as excinfo:
             await department_manager.delete_department_person(
-                {"email": "ash@acme.com", "confirm": True}
+                {"email": "ash@acme.com"}
             )
 
         assert excinfo.value.field == "email"
@@ -5055,7 +5055,7 @@ class TestDepartmentRemovalErrors:
 
         with pytest.raises(ToolError) as excinfo:
             await department_manager.clear_department_assignment(
-                {"email": "ash@acme.com", "confirm": True}
+                {"email": "ash@acme.com"}
             )
 
         hint = excinfo.value.suggestions[-1]
@@ -5067,28 +5067,28 @@ class TestDepartmentRemovalErrors:
         mock_client.delete_department_person.side_effect = ReveniumAPIError("boom", status_code=500)
 
         with pytest.raises(ReveniumAPIError):
-            await department_manager.delete_department_person({"person_id": 97, "confirm": True})
+            await department_manager.delete_department_person({"person_id": 97})
 
 
 class TestCustomerManagementDepartmentRemovalActions:
     """The removal actions on manage_customers."""
 
     @pytest.mark.asyncio
-    async def test_unconfirmed_action_renders_a_preview_and_sends_nothing(self, customer_mgmt):
+    async def test_dry_run_action_renders_a_preview_and_sends_nothing(self, customer_mgmt):
         with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_client = MagicMock()
             mock_client.delete_department_person = AsyncMock(return_value={})
             mock_gc.return_value = mock_client
 
             result = await customer_mgmt.handle_action(
-                "delete_department_person", {"person_id": 97}
+                "delete_department_person", {"person_id": 97, "dry_run": True}
             )
 
-        assert "Confirmation Required" in result[0].text
+        assert "Dry run" in result[0].text
         mock_client.delete_department_person.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_confirmed_action_is_dispatched(self, customer_mgmt):
+    async def test_action_is_dispatched(self, customer_mgmt):
         with patch.object(customer_mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_client = MagicMock()
             mock_client.clear_department_assignment_by_email = AsyncMock(return_value={})
@@ -5096,7 +5096,7 @@ class TestCustomerManagementDepartmentRemovalActions:
 
             result = await customer_mgmt.handle_action(
                 "clear_department_assignment",
-                {"email": "ash@acme.com", "team_id": "jR2kmLs", "confirm": True},
+                {"email": "ash@acme.com", "team_id": "jR2kmLs"},
             )
 
         mock_client.clear_department_assignment_by_email.assert_awaited_once_with(
@@ -5110,7 +5110,8 @@ class TestCustomerManagementDepartmentRemovalActions:
         schema = await customer_mgmt._get_input_schema()
 
         assert {"delete_department_person", "clear_department_assignment"} <= set(actions)
-        assert {"person_id", "email", "confirm"} <= set(schema["properties"])
+        assert {"person_id", "email"} <= set(schema["properties"])
+        assert "confirm" not in schema["properties"]
 
     @pytest.mark.asyncio
     async def test_unknown_action_lists_the_removals_as_department_actions(self, customer_mgmt):
@@ -5137,11 +5138,13 @@ class TestCustomerManagementDepartmentRemovalActions:
         for ui_only in ("rewriteHistory", "rewriteFrom", "import history", "undo"):
             assert ui_only in DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE, ui_only
 
-    def test_capabilities_text_documents_the_confirm_gate_and_csv_exclusion(self, customer_mgmt):
+    def test_capabilities_text_documents_the_preview_and_csv_exclusion(self, customer_mgmt):
         text = customer_mgmt._format_capabilities_response({})[0].text
 
-        assert "delete_department_person(person_id=97, confirm=true)" in text
-        assert "clear_department_assignment(email='ash@acme.com', confirm=true)" in text
+        assert "delete_department_person(person_id=97)" in text
+        assert "clear_department_assignment(email='ash@acme.com')" in text
+        assert "dry_run=true" in text
+        assert "confirm=true" not in text
         assert DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE in text
 
 
@@ -5647,3 +5650,148 @@ class TestCustomerHelpIsTrue:
 
         assert "subscribers/users" not in role_requirement
         assert "users/subscribers" not in json.dumps(user_example_note)
+
+
+class TestOrganizationCreateChecks:
+    """BACK-5087: create, its preview and validate refuse the same organizations."""
+
+    FREE_TEXT_METADATA_REFUSAL = (
+        "Metadata must be a string of name=value pairs separated by commas; the "
+        "platform drops any other value without an error. The piece 'mcp audit' is "
+        "not one name=value pair: the platform would answer success but drop it, "
+        "because a comma always ends a value and a value cannot hold a second '='"
+    )
+
+    @staticmethod
+    async def _refusal(customer_mgmt, mock_client, action, arguments):
+        with patch.object(
+            customer_mgmt, "get_client", new_callable=AsyncMock, return_value=mock_client
+        ):
+            with pytest.raises(ToolError) as exc:
+                await customer_mgmt.handle_action(action, arguments)
+        return exc.value
+
+    async def _create_refusals(self, customer_mgmt, mock_client, resource_data):
+        refusals = []
+        for dry_run in (False, True):
+            arguments = {
+                "resource_type": "organizations",
+                "resource_data": dict(resource_data),
+                "dry_run": dry_run,
+            }
+            refusals.append(
+                await self._refusal(customer_mgmt, mock_client, "create", arguments)
+            )
+        return refusals
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "resource_data", [{"city": "Austin"}, {"name": "   "}, {"name": None, "city": "Austin"}]
+    )
+    async def test_create_and_preview_refuse_an_organization_without_a_name(
+        self, customer_mgmt, mock_client, resource_data
+    ):
+        live, preview = await self._create_refusals(customer_mgmt, mock_client, resource_data)
+
+        assert live.message == preview.message
+        assert live.error_code == preview.error_code == ErrorCodes.VALIDATION_ERROR
+        assert "name is required to create an organization" in live.message
+        assert live.field == "name"
+        mock_client.create_organization.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_and_preview_refuse_free_text_metadata_with_the_update_wording(
+        self, customer_mgmt, mock_client
+    ):
+        live, preview = await self._create_refusals(
+            customer_mgmt, mock_client, {"name": "Acme", "metadata": "mcp audit"}
+        )
+
+        assert live.message == preview.message == self.FREE_TEXT_METADATA_REFUSAL
+        assert live.field == "metadata"
+        mock_client.create_organization.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_refuses_metadata_that_is_not_a_string(
+        self, customer_mgmt, mock_client
+    ):
+        live, preview = await self._create_refusals(
+            customer_mgmt, mock_client, {"name": "Acme", "metadata": {"region": "eu"}}
+        )
+
+        assert live.message == preview.message
+        assert live.message.startswith("Metadata must be a string of name=value pairs")
+        mock_client.create_organization.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_sends_name_value_metadata_unchanged(self, customer_mgmt, mock_client):
+        mock_client.create_organization.return_value = {
+            "id": "o1",
+            "name": "Acme",
+            "metadata": "region=eu,tier=gold",
+        }
+        with patch.object(
+            customer_mgmt, "get_client", new_callable=AsyncMock, return_value=mock_client
+        ):
+            result = await customer_mgmt.handle_action(
+                "create",
+                {
+                    "resource_type": "organizations",
+                    "resource_data": {"name": "Acme", "metadata": "region=eu, tier=gold"},
+                },
+            )
+
+        sent = mock_client.create_organization.await_args.args[0]
+        assert sent["metadata"] == "region=eu, tier=gold"
+        assert "region=eu,tier=gold" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_create_sends_null_metadata_as_the_empty_default(
+        self, customer_mgmt, mock_client
+    ):
+        mock_client.create_organization.return_value = {"id": "o1", "name": "Acme"}
+        with patch.object(
+            customer_mgmt, "get_client", new_callable=AsyncMock, return_value=mock_client
+        ):
+            await customer_mgmt.handle_action(
+                "create",
+                {
+                    "resource_type": "organizations",
+                    "resource_data": {"name": "Acme", "metadata": None},
+                },
+            )
+
+        assert mock_client.create_organization.await_args.args[0]["metadata"] == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "resource_data",
+        [{"city": "Austin"}, {"name": "Acme", "metadata": "mcp audit"}],
+    )
+    async def test_validate_refuses_what_create_refuses_with_the_same_text(
+        self, customer_mgmt, mock_client, resource_data
+    ):
+        create_refusal, _ = await self._create_refusals(customer_mgmt, mock_client, resource_data)
+        validate_refusal = await self._refusal(
+            customer_mgmt,
+            mock_client,
+            "validate",
+            {"resource_type": "organizations", "resource_data": dict(resource_data)},
+        )
+
+        assert validate_refusal.message == create_refusal.message
+        assert validate_refusal.field == create_refusal.field
+
+    @pytest.mark.parametrize("resource_type", [None, "organizations"])
+    def test_no_organization_example_uses_metadata_that_create_refuses(self, resource_type):
+        examples = CustomerValidator().get_examples(resource_type)["examples"]
+        organization_templates = [
+            example["template"]
+            for example in examples
+            if example.get("resource_type") == "organizations"
+            or example.get("name") == "Create Organization"
+        ]
+
+        assert organization_templates
+        for template in organization_templates:
+            assert malformed_metadata_message(template.get("metadata")) is None, template

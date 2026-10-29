@@ -186,6 +186,7 @@ from ..analytics_window import CalendarRangeError, utc_instant_bounds
 from ..client import ReveniumAPIError, ReveniumClient
 from ..common.error_handling import ErrorCodes, ToolError, raise_unknown_action_error
 from ..common.platform_paging import PLATFORM_MAX_PAGE_SIZE
+from ..common.tool_surface import public_tool_for
 from ..common.validation import apply_filter_allowlist
 from ..introspection.metadata import (
     ResourceRelationship,
@@ -2875,10 +2876,10 @@ class JobManagement(ToolBase):
 
             if action == "get_capabilities":
                 capabilities = {
-                    "tool": self.tool_name,
+                    "tool": self.public_tool_name,
                     "description": self.tool_description,
                     "version": self.tool_version,
-                    "actions": await self._get_supported_actions(),
+                    "actions": await self._get_actions_of_called_tool(),
                     "business_actions": [
                         "list_jobs",
                         "get_job",
@@ -3955,7 +3956,7 @@ class JobManagement(ToolBase):
 
     async def _get_agent_summary(self) -> str:
         """Get agent-friendly summary for job management."""
-        return """**Job Management Tool (manage_jobs)**
+        return f"""**Job Management Tool ({self.public_tool_name})**
 
 Track and analyze job performance in the Revenium Jobs & Outcomes system.
 
@@ -3997,7 +3998,7 @@ Track and analyze job performance in the Revenium Jobs & Outcomes system.
 1. Call get_capabilities() to explore all parameters
 2. Use list_jobs() to find existing jobs
 3. Analyze performance with get_job_roi(), get_conversion_funnel(), or get_roi_summary()
-4. Report results with report_outcome(), and correct them later with amend_outcome()"""
+4. Report results with report_outcome() on {public_tool_for(self.tool_name, "report_outcome")}, and correct them later with amend_outcome()"""
 
     async def _get_quick_start_guide(self) -> List[str]:
         """Get quick start guide for job management."""

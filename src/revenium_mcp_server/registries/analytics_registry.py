@@ -66,7 +66,7 @@ class AnalyticsRegistry(BaseToolRegistry):
 
         # Register tools with metadata
         self._register_tool(
-            "business_analytics_management",
+            "get_business_analytics",
             BusinessAnalyticsManagement,
             {
                 "description": "Comprehensive business analytics with cost analysis and insights",
@@ -86,7 +86,7 @@ class AnalyticsRegistry(BaseToolRegistry):
         )
 
         self._register_tool(
-            "manage_metering_elements",
+            "manage_usage_meters",
             MeteringElementsManagement,
             {
                 "description": "Metering element definitions with validation patterns",
@@ -218,7 +218,7 @@ class AnalyticsRegistry(BaseToolRegistry):
             if action not in allowed_metering_actions:
                 return await self._handle_security_violation("invalid_action", action, tool_name)
             return await self._handle_metering_action(action, arguments)
-        elif tool_name == "manage_metering_elements":
+        elif tool_name == "manage_usage_meters":
             if action not in allowed_metering_elements_actions:
                 return await self._handle_security_violation("invalid_action", action, tool_name)
             return await self._handle_metering_elements_action(action, arguments)
@@ -265,7 +265,7 @@ class AnalyticsRegistry(BaseToolRegistry):
 
         # Execute via standardized tool execution
         return await self._standardized_tool_execution(
-            "business_analytics_management", action, query_params
+            "get_business_analytics", action, query_params
         )
 
     async def _handle_metering_builder_action(
@@ -471,7 +471,7 @@ class AnalyticsRegistry(BaseToolRegistry):
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle metering elements actions."""
         return await self._standardized_tool_execution(
-            "manage_metering_elements", action, arguments
+            "manage_usage_meters", action, arguments
         )
 
     async def _handle_security_violation(
@@ -502,7 +502,7 @@ class AnalyticsRegistry(BaseToolRegistry):
 - get_capabilities, get_examples, get_agent_summary
 
 """
-            elif tool_name == "manage_metering_elements":
+            elif tool_name == "manage_usage_meters":
                 response += """## **Metering Elements - Approved Actions Only**
 - list, get, create, update, delete
 - get_templates, create_from_template
@@ -713,7 +713,7 @@ Use these examples to see sophisticated parameter handling in action!
 
     def get_supported_tools(self) -> List[str]:
         """Get list of analytics tools supported by this registry."""
-        return ["business_analytics_management", "manage_metering", "manage_metering_elements"]
+        return ["get_business_analytics", "manage_metering", "manage_usage_meters"]
 
     async def execute_tool(
         self, tool_name: str, request: Any

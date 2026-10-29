@@ -28,6 +28,7 @@ from src.revenium_mcp_server.tools_decomposed.workflow_management import (
     WorkflowManagement,
     WorkflowManager,
 )
+from tests.unit._registered_tool_harness import serving_tool
 
 CUSTOMER_A = TenantContext(team_id="TeamAAAA", tenant_id="tenant-a", api_key="key-of-customer-a")
 CUSTOMER_B = TenantContext(team_id="TeamBBBB", tenant_id="tenant-b", api_key="key-of-customer-b")
@@ -71,7 +72,7 @@ async def _signed_in_as(mcp: FastMCP, customer: TenantContext) -> AsyncIterator[
 
 
 async def _call(client: Client, arguments: Dict[str, Any]) -> Dict[str, Any]:
-    result = await client.call_tool("manage_workflows", arguments)
+    result = await client.call_tool(serving_tool("manage_workflows", arguments), arguments)
     return json.loads(result.content[0].text)
 
 
@@ -111,7 +112,10 @@ async def test_another_customer_gets_not_found_and_changes_nothing(arguments):
 
     async with _signed_in_as(mcp, CUSTOMER_B) as client:
         with pytest.raises(FastMCPToolError) as raised:
-            await client.call_tool("manage_workflows", {**arguments, "workflow_id": workflow_id})
+            await client.call_tool(
+                serving_tool("manage_workflows", arguments),
+                {**arguments, "workflow_id": workflow_id},
+            )
     assert "not found" in str(raised.value).lower()
     assert "cfo@customer-a.example" not in str(raised.value)
 
@@ -136,7 +140,8 @@ async def test_the_starting_customer_runs_the_whole_workflow():
         )
 
     assert listed["active_workflows"] == [workflow_id]
-    assert step["next_step"]["action"] == "create_organization"
+    assert step["next_step"]["action"] == "create"
+    assert step["next_step"]["tool"] == "manage_customers"
     assert completed["step_completed"] == 1
 
 

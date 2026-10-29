@@ -11,7 +11,7 @@ telemetry keys observed over a period so unregistered ones can be registered.
 """
 
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional, Union
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, NoReturn, Optional, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -28,7 +28,12 @@ from ..common.error_handling import (
 )
 from ..common.formatting import format_page_count_heading
 from ..common.sample_coverage import platform_total
-from ..common.validation import apply_filter_allowlist, validate_pagination_params
+from ..common.tool_surface import tool_call
+from ..common.validation import (
+    apply_filter_allowlist,
+    refuse_ignored_filter,
+    validate_pagination_params,
+)
 from ..introspection.metadata import (
     ToolCapability,
     ToolType,
@@ -55,15 +60,28 @@ AGENT_DESCRIPTION_MAX_CHARS = 1024
 AGENT_METADATA_MAX_BYTES = 8192
 
 # snake_case filter name -> camelCase query parameter, bounded to what the
-# endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
-# AgentController.list: @RequestParam query / teamId / type plus a Pageable
-# (page, size, sort). teamId and page/size are set by the client, so what
-# remains is the caller-settable set.
+# endpoint applies. AgentController.list (hypercurrent origin/develop, re-read
+# 2026-10-28) declares query / teamId / a hidden type plus a Pageable (page,
+# size, sort), and never reads type: dev answered type=API, TELEMETRY and BOGUS
+# with the same full list (BACK-5129). teamId and page/size are set by the
+# client, so query and sort are what a caller may set; type is refused.
 _AGENT_FILTER_MAP: Dict[str, str] = {
     "query": "query",
-    "type": "type",
     "sort": "sort",
 }
+
+_AGENT_TYPE_FILTER_ALTERNATIVE = (
+    "List without the type filter and read each agent's `source` field, or "
+    "search by name with filters={'query': '<name>'}."
+)
+
+_AGENT_FILTERS_DESCRIPTION = (
+    "Optional filters for list. Valid keys: query, sort. 'query' is a server-side "
+    "search: it matches agents whose name contains the term, whose externalId "
+    "equals it, or whose owning organization's name contains it "
+    "(case-insensitive). type is refused: the platform returns every agent "
+    "whatever type is sent. Any other key is rejected rather than silently ignored."
+)
 
 # The squad actions below build their query params from named arguments rather
 # than from a caller-supplied dict, so they need no allowlist — but the names
@@ -73,6 +91,28 @@ _AGENT_FILTER_MAP: Dict[str, str] = {
 # period; list ("(root)") additionally declares squadName and status;
 # getDetail ("/{squadId}") and getTimeline ("/{squadId}/timeline") declare
 # teamId and period only.
+#
+# The same controller's @Parameter docs (re-read 2026-10-27) fix which id each
+# route takes: getDetail and getTimeline take a run id, the squadId value sent
+# in telemetry, which is the id of a list_squad_executions row;
+# listExecutionsBySquad takes the Revenium squad id from listSquads.
+SQUAD_ID_DESCRIPTION = (
+    "Which id depends on the action. list_squad_executions (optional): the squad "
+    "id, i.e. the id of a list_squads row; scopes the list to that squad's runs. "
+    "get_squad and get_squad_timeline (required): a run id, i.e. the id of a "
+    "list_squad_executions row (the squadId value sent in telemetry), not the "
+    "list_squads id."
+)
+
+# Upstream statuses that are the platform refusing the request rather than
+# reporting the squad missing: get_squad also sends teamId and period, so a 400
+# can be a parameter problem and a 403 is a team-access answer.
+_SQUAD_REFUSAL_ERROR_CODES: Dict[int, str] = {
+    400: ErrorCodes.API_ERROR,
+    403: ErrorCodes.API_AUTHORIZATION,
+}
+
+SquadFetch = Callable[..., Awaitable[Dict[str, Any]]]
 
 
 def _format_cost(value: Any) -> str:
@@ -116,6 +156,12 @@ class AgentManager:
         arguments = validate_pagination_params(arguments, action="list agents")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
+        refuse_ignored_filter(
+            arguments.get("filters"),
+            "type",
+            listing="Agents",
+            instead=_AGENT_TYPE_FILTER_ALTERNATIVE,
+        )
         filters = apply_filter_allowlist(
             arguments.get("filters"), _AGENT_FILTER_MAP, action="list_agents"
         )
@@ -304,23 +350,76 @@ class SquadManager:
         self.client = client
 
     @staticmethod
-    def _raise_squad_not_found(squad_id: str) -> NoReturn:
-        """Raise a structured RESOURCE_NOT_FOUND ToolError for a missing squad.
+    def _run_id_suggestions(action: str) -> List[str]:
+        list_runs = tool_call("manage_agents", "list_squad_executions")
+        list_squads = tool_call("manage_agents", "list_squads")
+        return [
+            f"{action} takes a run id: the id of a row from {list_runs}, "
+            "not the squad id from list_squads",
+            f"To list one squad's runs, pass the id from {list_squads} as "
+            "squad_id to list_squad_executions",
+        ]
 
-        Mirrors the agent pattern: single-resource GETs take no input other
-        than the id, so upstream 400/403/404 all mean "no accessible squad for
-        this id" and are folded into one house-standard error. 5xx propagates.
-        """
+    @classmethod
+    def _raise_squad_not_found(cls, action: str, squad_id: str) -> NoReturn:
         raise ToolError(
             message=f"Squad not found for id: {squad_id!r}",
             error_code=ErrorCodes.RESOURCE_NOT_FOUND,
             field="squad_id",
             value=squad_id,
-            suggestions=[
-                "Verify the squad ID exists using list_squads",
-                "Use list_squads to see squads observed in telemetry",
-            ],
+            suggestions=cls._run_id_suggestions(action),
         )
+
+    @classmethod
+    def _raise_platform_refusal(
+        cls, error: ReveniumAPIError, action: str, squad_id: str, error_code: str
+    ) -> NoReturn:
+        raise ToolError(
+            message=(
+                f"The platform refused {action} for squad_id {squad_id!r} with "
+                f"HTTP {error.status_code}: {error.platform_message}. The squad may "
+                "still exist; this is the platform's answer, passed on as received."
+            ),
+            error_code=error_code,
+            field="squad_id",
+            value=squad_id,
+            suggestions=cls._run_id_suggestions(action),
+        )
+
+    @classmethod
+    def _raise_lookup_error(
+        cls, error: ReveniumAPIError, action: str, squad_id: str
+    ) -> NoReturn:
+        if error.status_code == 404:
+            cls._raise_squad_not_found(action, squad_id)
+        refusal_code = _SQUAD_REFUSAL_ERROR_CODES.get(error.status_code or 0)
+        if refusal_code:
+            cls._raise_platform_refusal(error, action, squad_id, refusal_code)
+        raise error
+
+    async def _fetch_run_resource(
+        self, action: str, fetch: SquadFetch, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        squad_id = arguments.get("squad_id")
+        if not squad_id:
+            raise create_structured_missing_parameter_error(
+                parameter_name="squad_id",
+                action=action.replace("_", " "),
+                examples={
+                    "usage": tool_call("manage_agents", action, squad_id="checkout-run-42"),
+                    "valid_format": (
+                        "A run id: the id of a row from "
+                        f"{tool_call('manage_agents', 'list_squad_executions')}"
+                    ),
+                },
+            )
+        filters: Dict[str, Any] = {}
+        if arguments.get("period"):
+            filters["period"] = arguments["period"]
+        try:
+            return await fetch(squad_id, **filters)
+        except ReveniumAPIError as error:
+            self._raise_lookup_error(error, action, squad_id)
 
     @staticmethod
     def _squad_line(squad: Dict[str, Any]) -> str:
@@ -407,28 +506,10 @@ class SquadManager:
         }
 
     async def get_squad(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Get a squad detail resource; cap the agents[] rendering."""
-        squad_id = arguments.get("squad_id")
-        if not squad_id:
-            raise create_structured_missing_parameter_error(
-                parameter_name="squad_id",
-                action="get squad",
-                examples={
-                    "usage": "get_squad(squad_id='sq_123')",
-                    "valid_format": "Squad ID should be a string identifier",
-                },
-            )
-        filters: Dict[str, Any] = {}
-        if arguments.get("period"):
-            filters["period"] = arguments["period"]
-        try:
-            squad = await self.client.get_squad_detail(squad_id, **filters)
-        except ReveniumAPIError as e:
-            # get-by-id has no input other than the id, so 400/403/404 all mean
-            # the id does not resolve to an accessible squad. 5xx propagates.
-            if e.status_code in (400, 403, 404):
-                self._raise_squad_not_found(squad_id)
-            raise
+        """Get a squad run detail resource; cap the agents[] rendering."""
+        squad = await self._fetch_run_resource(
+            "get_squad", self.client.get_squad_detail, arguments
+        )
 
         agents = squad.get("agents") or []
         rendered_agents = [
@@ -465,26 +546,10 @@ class SquadManager:
         }
 
     async def get_squad_timeline(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Get a squad execution timeline; cap the events[] rendering."""
-        squad_id = arguments.get("squad_id")
-        if not squad_id:
-            raise create_structured_missing_parameter_error(
-                parameter_name="squad_id",
-                action="get squad timeline",
-                examples={
-                    "usage": "get_squad_timeline(squad_id='sq_123')",
-                    "valid_format": "Squad ID should be a string identifier",
-                },
-            )
-        filters: Dict[str, Any] = {}
-        if arguments.get("period"):
-            filters["period"] = arguments["period"]
-        try:
-            timeline = await self.client.get_squad_timeline(squad_id, **filters)
-        except ReveniumAPIError as e:
-            if e.status_code in (400, 403, 404):
-                self._raise_squad_not_found(squad_id)
-            raise
+        """Get a squad run timeline; cap the events[] rendering."""
+        timeline = await self._fetch_run_resource(
+            "get_squad_timeline", self.client.get_squad_timeline, arguments
+        )
 
         events = timeline.get("events") or []
         rendered_events = [self._event_line(ev) for ev in events[:INLINE_LIST_CAP]]
@@ -616,10 +681,7 @@ class AgentManagement(ToolBase):
                 },
                 "squad_id": {
                     "type": "string",
-                    "description": (
-                        "Squad identifier. Required for get_squad and get_squad_timeline; "
-                        "optional for list_squad_executions (scopes to one squad's executions)."
-                    ),
+                    "description": SQUAD_ID_DESCRIPTION,
                 },
                 "squad_name": {
                     "type": "string",
@@ -645,13 +707,7 @@ class AgentManagement(ToolBase):
                 },
                 "filters": {
                     "type": "object",
-                    "description": (
-                        "Optional filters for list. Valid keys: query, sort, type. "
-                        "'query' is a server-side search: it matches agents whose name "
-                        "contains the term, whose externalId equals it, or whose owning "
-                        "organization's name contains it (case-insensitive). Any other "
-                        "key is rejected rather than silently ignored."
-                    ),
+                    "description": _AGENT_FILTERS_DESCRIPTION,
                 },
             },
             "required": ["action"],
@@ -688,7 +744,7 @@ class AgentManagement(ToolBase):
                     "list": {
                         "page": "int (optional)",
                         "size": "int (optional)",
-                        "filters": "dict (optional). Supports 'query' for server-side search on name/org (contains) and externalId (equals)",
+                        "filters": f"dict (optional). {_AGENT_FILTERS_DESCRIPTION}",
                     },
                     "get": {"agent_id": "str"},
                     "create": {
@@ -761,7 +817,7 @@ class AgentManagement(ToolBase):
                         "size": "int (optional)",
                     },
                     "list_squad_executions": {
-                        "squad_id": "str (optional; scopes to one squad's executions)",
+                        "squad_id": "str (optional; squad id from list_squads, scopes to its runs)",
                         "squad_name": "str (optional; global filter, ignored with squad_id)",
                         "status": "str (optional; global filter, ignored with squad_id)",
                         "period": "str (optional)",
@@ -769,11 +825,11 @@ class AgentManagement(ToolBase):
                         "size": "int (optional)",
                     },
                     "get_squad": {
-                        "squad_id": "str (required)",
+                        "squad_id": "str (required; run id from list_squad_executions)",
                         "period": "str (optional)",
                     },
                     "get_squad_timeline": {
-                        "squad_id": "str (required)",
+                        "squad_id": "str (required; run id from list_squad_executions)",
                         "period": "str (optional)",
                     },
                 },
@@ -781,8 +837,8 @@ class AgentManagement(ToolBase):
                     "list_squads(period='THIRTY_DAYS')",
                     "list_squad_executions(squad_id='sq_123')",
                     "list_squad_executions(squad_name='checkout', status='COMPLETED')",
-                    "get_squad(squad_id='sq_123')",
-                    "get_squad_timeline(squad_id='sq_123')",
+                    "get_squad(squad_id='checkout-run-42')",
+                    "get_squad_timeline(squad_id='checkout-run-42')",
                 ],
                 limitations=[
                     "Read-only: squads are derived from telemetry, not created via this tool",
@@ -843,10 +899,10 @@ class AgentManagement(ToolBase):
                             "squad_name": "checkout",
                             "status": "COMPLETED",
                         },
-                        "get_squad": {"action": "get_squad", "squad_id": "sq_123"},
+                        "get_squad": {"action": "get_squad", "squad_id": "checkout-run-42"},
                         "get_squad_timeline": {
                             "action": "get_squad_timeline",
-                            "squad_id": "sq_123",
+                            "squad_id": "checkout-run-42",
                         },
                     },
                 }
@@ -961,11 +1017,8 @@ class AgentManagement(ToolBase):
                 return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
             else:
-                supported = await self._get_supported_actions()
                 # BACK-2937: raise so the envelope carries the error flag.
-                raise_unknown_action_error(
-                    action, hint=f"Supported actions: {', '.join(supported)}"
-                )
+                raise_unknown_action_error(action)
 
         except ToolError as e:
             logger.error(f"Tool error in manage_agents: {e}")

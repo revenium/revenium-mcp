@@ -801,11 +801,13 @@ async def test_get_agent_summary_is_concise_and_mentions_polling_pattern():
     assert "poll" in text.lower() or "polling" in text.lower()
 
 
-def test_priority_order_includes_manage_ai_insights():
-    from src.revenium_mcp_server.tool_configuration.registry import (
-        TOOL_REGISTRATION_PRIORITY_ORDER,
+def test_ai_insights_is_published_as_a_read_tool_and_a_write_tool():
+    from src.revenium_mcp_server.common.tool_surface import DOMAINS_BY_KEY
+
+    assert DOMAINS_BY_KEY["manage_ai_insights"].public_names == (
+        "get_ai_insights",
+        "manage_ai_insights",
     )
-    assert "manage_ai_insights" in TOOL_REGISTRATION_PRIORITY_ORDER
 
 
 @pytest.mark.asyncio
@@ -863,8 +865,8 @@ def test_business_profile_includes_manage_ai_insights():
 
 
 @pytest.mark.asyncio
-async def test_register_single_tool_dispatches_to_ai_insights_handler(monkeypatch):
-    """The if/elif chain in _register_single_tool must include manage_ai_insights."""
+async def test_register_domain_dispatches_to_ai_insights_handler(monkeypatch):
+    """_register_domain must reach the manage_ai_insights registration method."""
     from src.revenium_mcp_server.tool_configuration.config import ToolConfig
     from src.revenium_mcp_server.tool_configuration.registry import (
         ToolConfigurationRegistry,
@@ -884,7 +886,9 @@ async def test_register_single_tool_dispatches_to_ai_insights_handler(monkeypatc
     )
 
     from unittest.mock import MagicMock
-    await registry._register_single_tool(MagicMock(), "manage_ai_insights")
+    from src.revenium_mcp_server.common.tool_surface import DOMAINS_BY_KEY
+
+    await registry._register_domain(MagicMock(), DOMAINS_BY_KEY["manage_ai_insights"])
     assert called.get("yes") is True
 
 
@@ -1124,29 +1128,25 @@ async def test_top_level_cost_detector_filter_is_rejected_before_any_run():
 
 
 @pytest.mark.asyncio
-async def test_cost_detector_filter_inside_params_is_dropped_and_the_run_starts(monkeypatch):
-    """The params bag accepts any name, so the key is ignored rather than rejected."""
+async def test_cost_detector_filter_inside_params_is_rejected_before_any_run():
+    """BACK-5151: params is held to the same declared names as the top level."""
     from fastmcp import Client
+    from fastmcp.exceptions import ToolError as FastMCPToolError
 
-    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
-        AIInsightsManagement,
-    )
-
-    captured: dict = {}
-    recording_client = _recording_client(monkeypatch, captured)
     mcp = await _registered_insights_server()
-    with patch.object(
-        AIInsightsManagement, "get_client", new=AsyncMock(return_value=recording_client)
+    mock = AsyncMock(return_value={"runId": "r1", "status": "running"})
+    with patch(
+        "src.revenium_mcp_server.client.ReveniumClient.trigger_recommendation_run",
+        new=mock,
     ):
         async with Client(mcp) as client:
-            result = await client.call_tool("manage_ai_insights", {
-                "action": "trigger_run",
-                "params": {**_RUN_PERIOD, IGNORED_COST_DETECTOR_ARGUMENT: True},
-            })
+            with pytest.raises(FastMCPToolError, match=f"'{IGNORED_COST_DETECTOR_ARGUMENT}' inside params"):
+                await client.call_tool("manage_ai_insights", {
+                    "action": "trigger_run",
+                    "params": {**_RUN_PERIOD, IGNORED_COST_DETECTOR_ARGUMENT: True},
+                })
 
-    assert not result.is_error
-    assert captured["body"]["periodStart"] == _RUN_PERIOD["period_start"]
-    assert IGNORED_COST_DETECTOR_FIELD not in captured["body"]
+    mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1165,7 +1165,7 @@ async def test_slim_false_text_inside_params_reads_the_full_run(monkeypatch):
         AIInsightsManagement, "get_client", new=AsyncMock(return_value=recording_client)
     ):
         async with Client(mcp) as client:
-            result = await client.call_tool("manage_ai_insights", {
+            result = await client.call_tool("get_ai_insights", {
                 "action": "get_run",
                 "params": {"run_id": "r1", "slim": "false"},
             })
@@ -1223,7 +1223,7 @@ async def test_unreadable_slim_text_is_refused_before_any_read(monkeypatch):
     ):
         async with Client(mcp) as client:
             with pytest.raises(FastMCPToolError, match="slim"):
-                await client.call_tool("manage_ai_insights", {
+                await client.call_tool("get_ai_insights", {
                     "action": "get_run",
                     "params": {"run_id": "r1", "slim": "maybe"},
                 })
@@ -1297,7 +1297,7 @@ async def _list_runs_through_the_registered_tool(monkeypatch, params: dict) -> d
     ):
         async with Client(mcp) as client:
             await client.call_tool(
-                "manage_ai_insights", {"action": "list_runs", "params": params}
+                "get_ai_insights", {"action": "list_runs", "params": params}
             )
     return captured["params"]
 

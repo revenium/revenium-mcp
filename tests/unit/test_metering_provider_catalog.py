@@ -12,6 +12,7 @@ strings are still rejected -- the accepted set only ever widens.
 from __future__ import annotations
 
 import pytest
+from src.revenium_mcp_server.common.error_handling import ToolError
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.revenium_mcp_server.tools_decomposed import metering_management as mm
@@ -699,17 +700,18 @@ class TestSubmitActionUsesTheCatalog:
         client.get_ai_models.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_submit_dry_run_rejects_garbage(self):
+    async def test_submit_dry_run_refuses_garbage(self):
         mgmt = MeteringManagement()
         client = _catalog_client()
         with _patch_response_cache(), patch.object(
             mgmt, "get_client", new=AsyncMock(return_value=client)
         ):
-            result = await mgmt.handle_action(
-                "submit_ai_transaction",
-                {**VALID_TX, "provider": GARBAGE_PROVIDER, "dry_run": True},
-            )
-        text = result[0].text
+            with pytest.raises(ToolError) as refused:
+                await mgmt.handle_action(
+                    "submit_ai_transaction",
+                    {**VALID_TX, "provider": GARBAGE_PROVIDER, "dry_run": True},
+                )
+        text = refused.value.message
         assert "get_supported_providers()" in text, text
 
 

@@ -605,12 +605,17 @@ class TestCostControlsManagementActions:
         assert "metricType" in result[0].text
 
     @pytest.mark.asyncio
-    async def test_unknown_action_lists_supported(self, cc_mgmt):
-        """BACK-2937: an unknown action raises so the envelope carries isError."""
+    async def test_unknown_action_is_refused_on_the_action_field(self, cc_mgmt):
+        """BACK-2937: an unknown action raises so the envelope carries isError.
+
+        The list of valid actions is added for the public tool the caller used
+        (tests/unit/test_split_tool_guidance.py), not by the class.
+        """
         with pytest.raises(ToolError) as exc_info:
             await cc_mgmt.handle_action("bogus_action", {})
-        assert "Unknown action" in exc_info.value.message
-        assert "get_enforcement_rules" in exc_info.value.message
+        assert "Unknown action 'bogus_action'" in exc_info.value.message
+        assert exc_info.value.field == "action"
+        assert exc_info.value.value == "bogus_action"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("page_info, row_count, page, heading, total", LIST_HEADING_CASES)

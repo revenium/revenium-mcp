@@ -489,6 +489,36 @@ def apply_filter_allowlist(
     return mapped
 
 
+def refuse_ignored_filter(filters: Any, key: str, *, listing: str, instead: str) -> None:
+    """Refuse a filter key the endpoint binds but never applies.
+
+    Forwarding it returns every row under an answer that reads as filtered,
+    so the key is refused before the read instead.
+
+    Args:
+        filters: The raw ``filters`` value from tool arguments (may be None)
+        key: The filter key the platform ignores
+        listing: What the caller is listing, e.g. "Agents"
+        instead: How the caller can get the answer without that key
+
+    Raises:
+        ToolError: flagged as an error, when ``filters`` carries ``key``.
+    """
+    if not isinstance(filters, Mapping) or key not in filters:
+        return
+
+    # Local import to avoid a circular dependency at module import time.
+    from .error_handling import raise_refusal
+
+    raise_refusal(
+        f"{listing} cannot be filtered by {key}: the platform accepts the {key} "
+        f"parameter but returns every row, so the answer would look filtered when "
+        f"it is not. {instead}",
+        field=f"filters.{key}",
+        value=filters[key],
+    )
+
+
 def refuse_arguments_the_action_ignores(
     action: str,
     arguments: Mapping[str, Any],

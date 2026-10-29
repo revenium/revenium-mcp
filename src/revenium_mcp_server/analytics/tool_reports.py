@@ -1,10 +1,10 @@
 """Reading a tool analytics report: every page of it, for the window it is asked for.
 
-Both ``business_analytics_management`` (the four tool cost actions) and
+Both ``get_business_analytics`` (the four tool cost actions) and
 ``manage_tools`` (its tool analytics actions) read these reports through
 ``read_tool_report``, so they share the paging, the pinned platform default
 and the step from a ``ToolReportWindow`` to startDate/endDate. Each tool parses
-the caller's window itself: ``business_analytics_management`` through
+the caller's window itself: ``get_business_analytics`` through
 ``AnalyticsValidator.validate_window`` (a yyyy-MM-dd ``CalendarRange`` or a
 ``SupportedPeriod``), ``manage_tools`` through ``capped_utc_instant_bounds``
 (yyyy-MM-dd days or ISO-8601 instants, read as ``utc_instant_bounds`` reads

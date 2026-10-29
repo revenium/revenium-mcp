@@ -108,7 +108,7 @@ class TestOnboardingManagerRecommendations:
         ):
             recs = await mgr.get_personalized_recommendations()
         assert len(recs) == 1
-        assert "system_setup(" in recs[0]
+        assert "get_system_setup(" in recs[0]
 
 
 class TestCheckSetupCompletion:

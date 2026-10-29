@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from src.revenium_mcp_server.common.error_handling import ToolError
 from unittest.mock import AsyncMock, patch, MagicMock
 
 
@@ -124,9 +125,10 @@ class TestChecklistActionRouting:
     """Test handle_action routes to correct handlers."""
 
     @pytest.mark.asyncio
-    async def test_unknown_action_returns_error(self, checklist_tool):
-        result = await checklist_tool.handle_action("nonexistent", {})
-        text = result[0].text.lower()
+    async def test_unknown_action_raises(self, checklist_tool):
+        with pytest.raises(ToolError) as refused:
+            await checklist_tool.handle_action("nonexistent", {})
+        text = refused.value.message.lower()
         assert "unknown" in text or "nonexistent" in text
 
     @pytest.mark.asyncio
@@ -549,7 +551,7 @@ class TestSlackSetupStatus:
             else None,
         ):
             result = await checklist_tool.handle_action("check_optional", {})
-        assert "slack_management(action='quick_setup')" in result[0].text
+        assert "get_slack(action='quick_setup')" in result[0].text
 
 
 class TestDataIngestionStatus:
@@ -787,7 +789,7 @@ class TestEmailActionNamesACallTheServerAccepts:
         monkeypatch.delenv("AUTH_MODE", raising=False)
         for text in await self._texts_without_an_email(checklist_tool):
             assert "verify_email_setup(" not in bare_setup_calls_in(text), text
-            assert "system_setup(action='update_email', email='your@email.com')" in text
+            assert "manage_system_setup(action='update_email', email='your@email.com')" in text
 
     @pytest.mark.asyncio
     async def test_hosted_checklist_names_the_alert_email_argument(

@@ -379,7 +379,7 @@ async def _call_registered_tool(monkeypatch, httpserver, tmp_path, arguments):
     isolate_server_settings(monkeypatch, "api_key")
     tenant = caller_context(platform_url(httpserver), api_key=CALLER_API_KEY)
     tools = await build_registered_analytics_tools()
-    result = await tools.call("business_analytics_management", arguments, tenant=tenant)
+    result = await tools.call("get_business_analytics", arguments, tenant=tenant)
     return result, answer_text(result)
 
 

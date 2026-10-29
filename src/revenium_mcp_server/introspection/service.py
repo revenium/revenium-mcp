@@ -4,15 +4,63 @@ This module provides a service interface for tool introspection that can be
 integrated into the MCP server to provide comprehensive tool metadata access.
 """
 
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Set, Tuple, Union
 
+from fastmcp.server.dependencies import get_context
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..auth.auth_mode import credentials_are_per_request
+from ..common.called_tool import serving_call_to
 from ..common.error_handling import ErrorCodes, ToolError, raise_refusal
+from ..common.tool_surface import (
+    ALL_PUBLIC_TOOL_NAMES,
+    DOMAINS_BY_PUBLIC_NAME,
+    domain_for,
+    side_of_tool,
+)
 from .engine import introspection_engine
 from .metadata import HOSTED_PERFORMANCE_METRICS_NOTE
+
+
+def _domain_key(tool_name: str) -> str:
+    """The introspection engine keys a domain's class by its domain key, not each public name."""
+    try:
+        return domain_for(tool_name).key
+    except KeyError:
+        return tool_name
+
+
+def _public_names(key: str) -> tuple:
+    try:
+        return domain_for(key).public_names
+    except KeyError:
+        return (key,)
+
+
+def _public_name(requested: str, registered: str) -> str:
+    return requested if requested in DOMAINS_BY_PUBLIC_NAME else registered
+
+
+def _public_description(public_name: str, class_description: str) -> str:
+    domain = DOMAINS_BY_PUBLIC_NAME.get(public_name)
+    if domain is None:
+        return class_description
+    return domain.description_for(side_of_tool(public_name))
+
+
+def _shared_by(public_name: str) -> str:
+    """A label for domain-wide text shown for one of a split domain's two tools."""
+    names = _public_names(public_name)
+    return f" (shared by {', '.join(names)})" if len(names) > 1 else ""
+
+
+def _actions_served_by(public_name: str, actions: List[str]) -> List[str]:
+    """The actions the named public tool runs; its sibling refuses the rest."""
+    domain = DOMAINS_BY_PUBLIC_NAME.get(public_name)
+    if domain is None:
+        return list(actions)
+    return domain.actions_served_by(public_name, actions)
 
 
 class ToolIntrospectionService:
@@ -81,22 +129,22 @@ class ToolIntrospectionService:
         # Define user journey priority order (matches ToolConfigurationRegistry)
         priority_order = [
             # Group 1: Setup & Onboarding (First-time user experience)
-            "system_setup",  # Initial setup and configuration
-            "slack_management",  # Communication setup
+            "manage_system_setup",  # Initial setup and configuration
+            "manage_slack",  # Communication setup
             # Group 2: Discovery & Capabilities (Tool exploration)
             "tool_introspection",  # Tool discovery and metadata
-            "manage_capabilities",  # System capabilities overview
+            "get_capabilities",  # System capabilities overview
             # Group 3: Monitoring & Analytics (Operational insights)
             "manage_alerts",  # Cost monitoring and alerting
-            "business_analytics_management",  # Analytics and reporting
+            "get_business_analytics",  # Analytics and reporting
             "manage_metering",  # Transaction processing and metering
             # Group 4: Usage-Based Billing Workflow (Logical business sequence)
             "manage_customers",  # Customer management (start of UBB workflow)
             "manage_products",  # Product definition
             "manage_sources",  # Data sources configuration
-            "manage_metering_elements",  # Metering configuration
+            "manage_usage_meters",  # Metering configuration
             "manage_subscriptions",  # Subscription management
-            "manage_subscriber_credentials",  # Billing identity management
+            "manage_credentials",  # Billing identity management
             "manage_workflows",  # Automation and workflows
             "manage_jobs",  # Jobs & Outcomes management
             "manage_tools",  # Tool Registry management
@@ -254,10 +302,10 @@ class ToolIntrospectionService:
         """Format tools within a category with profile annotations."""
         text = ""
         for tool_class in tools_in_category:
-            tool_name = tool_class.tool_name
-            tool_description = get_tool_description(tool_name)
-            profile_annotation = self._get_profile_annotation(tool_name, current_profile)
-            text += f"   - {tool_name}: {tool_description}{profile_annotation}\n"
+            for tool_name in _public_names(tool_class.tool_name):
+                tool_description = get_tool_description(tool_name)
+                profile_annotation = self._get_profile_annotation(tool_name, current_profile)
+                text += f"   - {tool_name}: {tool_description}{profile_annotation}\n"
         return text
 
     def _get_tool_list_footer(self) -> str:
@@ -305,6 +353,30 @@ To get more detailed information about any specific tool, you can ask me about i
 
         return ""
 
+    async def _published_tool_names(self) -> List[str]:
+        """The public tools a caller can call, in surface order."""
+        published = await self._names_on_this_server()
+        return [name for name in ALL_PUBLIC_TOOL_NAMES if name in published]
+
+    async def _names_on_this_server(self) -> Set[str]:
+        """The tools the serving FastMCP lists; outside a request, every name of a registered domain."""
+        try:
+            server = get_context().fastmcp
+        except RuntimeError:
+            registered = set(await self.engine.list_tools())
+            return {name for name in ALL_PUBLIC_TOOL_NAMES if domain_for(name).key in registered}
+        return {tool.name for tool in await server.list_tools()}
+
+    async def _guidance_for(self, public_name: str, metadata: Any) -> Tuple[str, List[str]]:
+        """A domain's agent summary and quick start, rendered for the public tool asked about."""
+        from ..tools_decomposed.unified_tool_base import ToolBase
+
+        provider = await self.engine.registry.get_provider(_domain_key(public_name))
+        if not isinstance(provider, ToolBase) or public_name not in DOMAINS_BY_PUBLIC_NAME:
+            return metadata.agent_summary, metadata.quick_start_guide
+        with serving_call_to(public_name):
+            return await provider._get_agent_summary(), await provider._get_quick_start_guide()
+
     async def _handle_get_tool_metadata(
         self, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
@@ -317,9 +389,9 @@ To get more detailed information about any specific tool, you can ask me about i
                 field="tool_name",
             )
 
-        metadata = await self.engine.get_tool_metadata(tool_name)
+        metadata = await self.engine.get_tool_metadata(_domain_key(tool_name))
         if not metadata:
-            available_tools = await self.engine.list_tools()
+            available_tools = await self._published_tool_names()
             raise_refusal(
                 f"❌ **Error**: Tool '{tool_name}' not found or no metadata available\n\n"
                 f"**Available tools**: {', '.join(available_tools) if available_tools else 'None'}",
@@ -328,22 +400,23 @@ To get more detailed information about any specific tool, you can ask me about i
                 value=tool_name,
             )
 
-        # Format metadata as readable text
-        text = f"**Tool Metadata: {metadata.name}**\n\n"
-        text += f"**Description**: {metadata.description}\n"
+        public_name = _public_name(tool_name, metadata.name)
+        text = f"**Tool Metadata: {public_name}**\n\n"
+        text += f"**Description**: {_public_description(public_name, metadata.description)}\n"
         text += f"**Version**: {metadata.version}\n"
         text += f"**Type**: {metadata.tool_type.value}\n\n"
 
         if metadata.capabilities:
-            text += "**Capabilities**:\n"
+            text += f"**Capabilities** (shared by {', '.join(_public_names(public_name))}):\n"
             for cap in metadata.capabilities:
                 text += f"• **{cap.name}**: {cap.description}\n"
             text += "\n"
         else:
             text += "**Capabilities**: None\n\n"
 
-        if metadata.supported_actions:
-            text += f"**Supported Actions**: {', '.join(metadata.supported_actions)}\n\n"
+        served = _actions_served_by(public_name, metadata.supported_actions)
+        if served:
+            text += f"**Supported Actions**: {', '.join(served)}\n\n"
         else:
             text += "**Supported Actions**: None\n\n"
 
@@ -368,12 +441,14 @@ To get more detailed information about any specific tool, you can ask me about i
             text += f"• Success Rate: {pm.success_rate:.1%}\n"
             text += f"• Avg Response Time: {pm.avg_response_time_ms:.1f}ms\n\n"
 
-        if metadata.agent_summary:
-            text += f"**Agent Summary**:\n{metadata.agent_summary}\n\n"
+        agent_summary, quick_start_guide = await self._guidance_for(public_name, metadata)
+        shared_by = _shared_by(public_name)
+        if agent_summary:
+            text += f"**Agent Summary**{shared_by}:\n{agent_summary}\n\n"
 
-        if metadata.quick_start_guide:
-            text += "**Quick Start Guide**:\n"
-            for i, step in enumerate(metadata.quick_start_guide, 1):
+        if quick_start_guide:
+            text += f"**Quick Start Guide**{shared_by}:\n"
+            for i, step in enumerate(quick_start_guide, 1):
                 text += f"{i}. {step}\n"
 
         return [TextContent(type="text", text=text)]

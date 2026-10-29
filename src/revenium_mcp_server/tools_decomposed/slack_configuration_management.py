@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
+from ..common.tool_surface import tool_call
 from ..agent_friendly import UnifiedResponseFormatter
 from ..client import ReveniumAPIError, ReveniumClient
 from ..common.default_slack_configuration import (
@@ -68,7 +69,7 @@ async def get_slack_configuration_or_not_found(
                 suggestions=[
                     "The platform answers the same way for an id that does not "
                     "exist and for one that belongs to another organization",
-                    "Use slack_management(action='list_configurations') to see "
+                    "Use get_slack(action='list_configurations') to see "
                     "your organization's configuration ids",
                     "If list_configurations shows this id, your role may not be "
                     "allowed to read it",
@@ -216,7 +217,7 @@ class SlackConfigurationManagement(ToolBase):
                 parameter_name="config_id",
                 action=action,
                 examples={
-                    "usage": f"slack_management(action='{action}', config_id='slack-123')",
+                    "usage": tool_call("manage_slack", action, config_id="slack-123"),
                     "valid_format": "Configuration ID should be a string identifier",
                     "example_ids": ["slack-123", "slack-456", "slack-789"],
                 },
@@ -247,14 +248,13 @@ class SlackConfigurationManagement(ToolBase):
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Set a Slack configuration as the default for alerts."""
         config_id = self._validate_config_id(arguments, "set_default_configuration")
+        config = await get_slack_configuration_or_not_found(client, config_id)
 
         if self._is_dry_run(arguments):
+            name = config.get("name", "Unnamed Configuration")
             return self._format_dry_run_response(
-                f"Would set {config_id} as default Slack configuration."
+                f"Would set {config_id} ({name}) as default Slack configuration."
             )
-
-        # Verify configuration exists
-        config = await get_slack_configuration_or_not_found(client, config_id)
 
         set_default_slack_config_id(config_id, ctx)
         return format_default_set_success(config, config_id, hosted=not is_local_server(ctx))
@@ -277,7 +277,7 @@ class SlackConfigurationManagement(ToolBase):
             default_config_id,
             [
                 "Your saved default id no longer resolves; choose a new one with "
-                "slack_management(action='select_default_configuration', config_id=...)"
+                "manage_slack(action='select_default_configuration', config_id=...)"
             ],
         )
         return format_default_configuration(config, default_config_id)

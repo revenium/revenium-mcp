@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
+from ..common.called_tool import presented_name
 from .response_formatting import StandardResponse
 
 
@@ -26,8 +27,13 @@ class UnifiedResponseFormatter:
         Args:
             tool_name: Name of the tool using this formatter
         """
-        self.tool_name = tool_name
+        self._tool_name = tool_name
         self._start_time = None
+
+    @property
+    def tool_name(self) -> str:
+        """The public tool the current call was sent to, or the name this formatter was built with."""
+        return presented_name(self._tool_name)
 
     def start_timing(self):
         """Start timing for response performance measurement."""
@@ -67,7 +73,7 @@ class UnifiedResponseFormatter:
         Returns:
             Standardized list response
         """
-        title = f"{self.tool_name.replace('manage_', '').title()} List"
+        title = f"{self._tool_name.replace('manage_', '').title()} List"
 
         return StandardResponse.create_list_response(
             items=items,
@@ -100,7 +106,7 @@ class UnifiedResponseFormatter:
         Returns:
             Standardized item response
         """
-        title = f"{self.tool_name.replace('manage_', '').title()} Details"
+        title = f"{self._tool_name.replace('manage_', '').title()} Details"
 
         return StandardResponse.create_item_response(
             item=item,

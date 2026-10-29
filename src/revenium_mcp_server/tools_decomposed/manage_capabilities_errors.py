@@ -1,7 +1,7 @@
 """Error handling utilities for manage capabilities tool.
 
 This module provides error creation and formatting functions for the
-manage_capabilities tool, following enterprise Python standards.
+get_capabilities tool, following enterprise Python standards.
 """
 
 from typing import Any, Dict, List
@@ -27,7 +27,7 @@ def create_missing_resource_type_error() -> str:
         parameter_name="resource_type",
         action="get UCM capabilities",
         examples={
-            "usage": "manage_capabilities(action='get_capabilities', resource_type='products')",
+            "usage": "get_capabilities(action='get_capabilities', resource_type='products')",
             "valid_resource_types": [
                 "products",
                 "subscriptions",
@@ -37,8 +37,8 @@ def create_missing_resource_type_error() -> str:
                 "metering_elements",
             ],
             "example_calls": [
-                "manage_capabilities(action='get_capabilities', resource_type='products')",
-                "manage_capabilities(action='get_capabilities', resource_type='alerts')",
+                "get_capabilities(action='get_capabilities', resource_type='products')",
+                "get_capabilities(action='get_capabilities', resource_type='alerts')",
             ],
             "system_context": "🔧 SYSTEM: UCM capabilities provide real-time configuration and validation data",
         },
@@ -75,7 +75,7 @@ def get_verify_params_examples() -> Dict[str, Any]:
         Examples dictionary
     """
     return {
-        "usage": "manage_capabilities(action='verify_capability', resource_type='products', capability_name='currencies', value='USD')",
+        "usage": "get_capabilities(action='verify_capability', resource_type='products', capability_name='currencies', value='USD')",
         "required_parameters": ["resource_type", "capability_name", "value"],
         "system_context": "🔧 SYSTEM: UCM capability verification validates configuration values against API",
     }
@@ -158,14 +158,14 @@ def create_execution_error(exception: Exception) -> str:
     Returns:
         Formatted error message
     """
-    logger.error(f"Error in manage_capabilities: {exception}")
+    logger.error(f"Error in get_capabilities: {exception}")
     examples_data = get_execution_error_examples()
     suggestions = get_execution_error_suggestions()
 
     error = ToolError(
         message=f"UCM capability management failed: {str(exception)}",
         error_code=ErrorCodes.UCM_ERROR,
-        field="manage_capabilities",
+        field="get_capabilities",
         value=str(exception),
         suggestions=suggestions,
         examples=examples_data,

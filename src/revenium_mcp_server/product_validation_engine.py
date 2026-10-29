@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional
 
 from revenium_mcp_server.models import BillingPeriod, PlanType
 
+from .api_field_mapper import APIFieldMapper
+from .plan_contract import platform_plan_currencies
 from .product_validators import ProductValidator
 
 
@@ -172,8 +174,6 @@ class ProductValidationEngine:
         "tier": ["name", "up_to"],  # CORRECTED: starting_from is auto-generated, not user input
     }
 
-    # Period validation uses allow-list derived from BillingPeriod enum in models.py
-
     @classmethod
     def validate_for_mcp(cls, product_data: Dict[str, Any]) -> Dict[str, Any]:
         """Validate product data and return MCP-compatible response.
@@ -191,6 +191,18 @@ class ProductValidationEngine:
         return validation_result.to_mcp_response()
 
     @classmethod
+    def validate_update_for_mcp(cls, changes: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate the fields a partial update sets that need no stored product to check.
+
+        Returns the same MCP-style response as validate_for_mcp, so an update
+        refuses a field with the wording create uses for it.
+        """
+        errors = cls._validate_version_format(changes.get("version"))
+        errors.extend(cls._validate_sent_plan_period(changes))
+        result = ValidationResult(is_valid=not errors, errors=errors, warnings=[])
+        return result.to_mcp_response()
+
+    @classmethod
     def validate_product_data(cls, product_data: Dict[str, Any]) -> ValidationResult:
         """Comprehensive validation of product data.
 
@@ -200,8 +212,9 @@ class ProductValidationEngine:
         Returns:
             ValidationResult with errors and warnings
         """
-        errors = []
+        errors = cls._validate_tier_lists(product_data)
         warnings = []
+        product_data = cls._validation_view(product_data)
 
         # Check required fields
         errors.extend(cls._validate_required_fields(product_data))
@@ -222,6 +235,53 @@ class ProductValidationEngine:
                 warnings.append(error)
 
         return ValidationResult(is_valid=len(errors) == 0, errors=errors, warnings=warnings)
+
+    @staticmethod
+    def _validate_tier_lists(data: Dict[str, Any]) -> List[ValidationError]:
+        """Refuse tiers that are not a list: the view reads them as absent, the request sends them as they are."""
+        plan = data.get("plan")
+        if not isinstance(plan, dict):
+            return []
+        located = [("plan.tiers", plan.get("tiers"))]
+        for key in APIFieldMapper.RATING_AGGREGATION_KEYS:
+            aggregations = plan.get(key)
+            if isinstance(aggregations, list):
+                located += [
+                    (f"plan.{key}[{index}].tiers", aggregation.get("tiers"))
+                    for index, aggregation in enumerate(aggregations)
+                    if isinstance(aggregation, dict)
+                ]
+        return [
+            ValidationError(
+                field,
+                tiers,
+                "Tiers must be a list of tier objects",
+                'Wrap the tier in a list: "tiers": [{"name": "Tier 1", "up_to": null, "unit_amount": "0.01"}]',
+            )
+            for field, tiers in located
+            if tiers is not None and not isinstance(tiers, list)
+        ]
+
+    @staticmethod
+    def _validation_view(data: Dict[str, Any]) -> Dict[str, Any]:
+        """The product in the one shape the checks read, whichever spelling it uses.
+
+        Both aggregation keys are read as ratingAggregations, aggregation fields
+        take the names the request sends, and tier fields the snake names the
+        checks and their messages use, so either spelling passes or fails the
+        same checks the mapped request body would.
+        """
+        plan = data.get("plan")
+        if not isinstance(plan, dict):
+            return data
+        keys = APIFieldMapper.RATING_AGGREGATION_KEYS
+        view = {key: value for key, value in plan.items() if key not in keys}
+        if isinstance(plan.get("tiers"), list):
+            view["tiers"] = [_internal_tier(tier) for tier in plan["tiers"]]
+        aggregations = APIFieldMapper.rating_aggregations_of(plan)
+        if aggregations:
+            view["ratingAggregations"] = [_aggregation_view(agg) for agg in aggregations]
+        return {**data, "plan": view}
 
     @classmethod
     def _validate_required_fields(cls, data: Dict[str, Any]) -> List[ValidationError]:
@@ -344,40 +404,9 @@ class ProductValidationEngine:
                     )
                 )
 
-            # UCM-only validation - let the API handle currency validation
-            currency = plan_data.get("currency")
-            if not currency:
-                errors.append(
-                    ValidationError(
-                        field="plan.currency",
-                        value=currency,
-                        error="Currency is required",
-                        suggestion="Use UCM get_capabilities to see valid currencies",
-                    )
-                )
+            errors.extend(cls._validate_plan_currency(plan_data.get("currency")))
 
-            _allowed_periods = [p.value for p in BillingPeriod]
-            _allowed_periods_str = ", ".join(_allowed_periods)
-            period = plan_data.get("period")
-            if plan_type == "SUBSCRIPTION":
-                if period and period not in _allowed_periods:
-                    errors.append(
-                        ValidationError(
-                            field="plan.period",
-                            value=period,
-                            error=f"Invalid Plan period: {period}; only these values are allowed: {_allowed_periods_str}",
-                            suggestion=f"Use one of the allowed periods: {_allowed_periods_str}",
-                        )
-                    )
-            elif period and period not in _allowed_periods:
-                errors.append(
-                    ValidationError(
-                        field="plan.period",
-                        value=period,
-                        error=f"Invalid Plan period: {period}; only these values are allowed: {_allowed_periods_str}",
-                        suggestion=f"Use one of the allowed periods: {_allowed_periods_str}",
-                    )
-                )
+            errors.extend(cls._validate_plan_period(plan_data.get("period")))
 
         # Payment source validation with supported values
         payment_source = data.get("paymentSource")  # FIXED: Use correct API field name
@@ -413,21 +442,77 @@ class ProductValidationEngine:
                     )
                 )
 
-        # Version format validation - must be MAJOR.MINOR.PATCH (semver)
-        version = data.get("version")
-        if isinstance(version, str):
-            if not ProductValidator.VERSION_PATTERN.match(version):
-                errors.append(
-                    ValidationError(
-                        field="version",
-                        value=version,
-                        error="Version must be semantic (MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-prerelease)",
-                        suggestion='Use format like "1.0.0" or "1.0.0-beta"',
-                        severity="error",
-                    )
-                )
+        errors.extend(cls._validate_version_format(data.get("version")))
 
         return errors
+
+    @staticmethod
+    def _validate_version_format(version: Any) -> List[ValidationError]:
+        """Refuse a version the platform rejects as not MAJOR.MINOR.PATCH.
+
+        A missing version is left to the required-field check. A number is
+        refused too: no number reads as MAJOR.MINOR.PATCH.
+        """
+        if version is None:
+            return []
+        is_text = isinstance(version, str)
+        if is_text and ProductValidator.VERSION_PATTERN.match(version):
+            return []
+        return [
+            ValidationError(
+                field="version",
+                value=version,
+                error="Version must be semantic (MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-prerelease)",
+                suggestion='Use format like "1.0.0" or "1.0.0-beta"',
+                severity="error",
+            )
+        ]
+
+    @classmethod
+    def validate_plan_period_for_mcp(cls, product_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Refuse a plan period the platform would reject, in the MCP response validate_for_mcp uses."""
+        errors = cls._validate_sent_plan_period(product_data)
+        return ValidationResult(is_valid=not errors, errors=errors, warnings=[]).to_mcp_response()
+
+    @classmethod
+    def _validate_sent_plan_period(cls, product_data: Dict[str, Any]) -> List[ValidationError]:
+        plan = product_data.get("plan")
+        return cls._validate_plan_period(plan.get("period")) if isinstance(plan, dict) else []
+
+    @staticmethod
+    def _validate_plan_period(period: Any) -> List[ValidationError]:
+        """Refuse a period the platform would refuse, naming the periods it accepts."""
+        allowed = [member.value for member in BillingPeriod]
+        if not period or period in allowed:
+            return []
+        allowed_text = ", ".join(allowed)
+        return [
+            ValidationError(
+                "plan.period",
+                period,
+                f"Invalid Plan period: {period}; only these values are allowed: {allowed_text}",
+                f"Use one of the allowed periods: {allowed_text}",
+            )
+        ]
+
+    @staticmethod
+    def _validate_plan_currency(currency: Any) -> List[ValidationError]:
+        """Refuse a missing currency, or one the platform would refuse, with its own wording."""
+        allowed = platform_plan_currencies()
+        allowed_text = ", ".join(allowed)
+        suggestion = f"Use one of the allowed currencies: {allowed_text}"
+        if not currency:
+            return [ValidationError("plan.currency", currency, "Currency is required", suggestion)]
+        if currency not in allowed:
+            return [
+                ValidationError(
+                    "plan.currency",
+                    currency,
+                    f"Invalid Currency: {currency}; only these values are allowed: {allowed_text}",
+                    suggestion,
+                )
+            ]
+        return []
 
     @classmethod
     def _validate_field_combinations(cls, data: Dict[str, Any]) -> List[ValidationError]:
@@ -676,7 +761,7 @@ class ProductValidationEngine:
                             error="Products with ratingAggregations require sourceIds field",
                             suggestion=(
                                 "Add 'sourceIds': [<source id>] with a source id from "
-                                "manage_sources(action='list'); usage-based products need "
+                                "get_sources(action='list'); usage-based products need "
                                 "a data source"
                             ),
                             severity="error",
@@ -1064,3 +1149,18 @@ class ProductValidationEngine:
                 "PREVENTED" if validation_result.get("isError") else "FAILED_TO_PREVENT"
             ),
         }
+
+
+def _internal_tier(tier: Any) -> Any:
+    return APIFieldMapper.map_tier_fields_to_internal(tier) if isinstance(tier, dict) else tier
+
+
+def _aggregation_view(aggregation: Any) -> Any:
+    if not isinstance(aggregation, dict):
+        return aggregation
+    fields = {key: value for key, value in aggregation.items() if key != "tiers"}
+    view = APIFieldMapper.map_rating_aggregation_fields(fields)
+    tiers = aggregation.get("tiers")
+    if isinstance(tiers, list):
+        view["tiers"] = [_internal_tier(tier) for tier in tiers]
+    return view

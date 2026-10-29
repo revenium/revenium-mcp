@@ -6,7 +6,7 @@ Check for unexpected cost anomalies AND newly active cost sources in the last 30
 - Example: `/rm-anomalies-30d 50` to detect anomalies over $50
 - If no threshold provided, defaults to $50
 
-Use the business_analytics_management tool with these parameters:
+Use the get_business_analytics tool with these parameters:
 - action: "analyze_cost_anomalies"
 - period: "THIRTY_DAYS"
 - min_impact_threshold: [threshold from user input, default 50]

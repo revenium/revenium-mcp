@@ -5,6 +5,7 @@ and the _handle_debug diagnostic report generation.
 """
 
 import pytest
+from src.revenium_mcp_server.common.error_handling import ToolError
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from src.revenium_mcp_server.onboarding.env_validation import API_AUTH_REJECTED_MESSAGE
@@ -40,22 +41,36 @@ class TestHandleActionRouting:
         assert "debug" in text
 
     @pytest.mark.asyncio
-    async def test_unknown_action_returns_structured_error(self, debug_tool):
+    async def test_unknown_action_raises_a_structured_error(self, debug_tool):
         """Unknown action returns error text listing valid actions."""
-        result = await debug_tool.handle_action("bogus_action", {})
-        text = result[0].text
+        with pytest.raises(ToolError) as refused:
+            await debug_tool.handle_action("bogus_action", {})
+        text = refused.value.message
         assert "bogus_action" in text or "Unknown" in text
         # Should list valid actions
         assert "debug" in text
 
     @pytest.mark.asyncio
-    async def test_handler_exception_returns_error_text(self, debug_tool):
-        """Generic exception in handler returns error text, not a raise."""
+    async def test_handler_exception_raises_a_tool_error(self, debug_tool):
+        """BACK-5086: a generic exception in a handler raises a flagged TOOL_ERROR."""
         debug_tool._handle_debug = AsyncMock(side_effect=RuntimeError("crash"))
-        result = await debug_tool.handle_action("debug", {})
-        text = result[0].text
+        with pytest.raises(ToolError) as refused:
+            await debug_tool.handle_action("debug", {})
+        text = refused.value.message
         assert "Error" in text
         assert "crash" in text
+
+    @pytest.mark.asyncio
+    async def test_a_failure_inside_the_diagnostic_raises_a_tool_error(self, debug_tool):
+        """BACK-5086: the diagnostic's own failure is flagged, not answered as a report."""
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.debug_auto_discovery.get_environment_value",
+            side_effect=RuntimeError("settings unreadable"),
+        ):
+            with pytest.raises(ToolError) as refused:
+                await debug_tool.handle_action("debug", {})
+        assert refused.value.error_code == "TOOL_ERROR"
+        assert "**Diagnostic Error**: settings unreadable" in refused.value.message
 
 
 class TestHandleDebug:

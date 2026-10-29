@@ -689,26 +689,12 @@ class TestHandleEnableAllAnomalies:
     """Tests for _handle_enable_all_anomalies."""
 
     @pytest.mark.asyncio
-    async def test_enable_all_requires_confirmation(self, alert_mgmt, mock_client):
-        """Without confirm=True, returns confirmation prompt."""
-        result = await alert_mgmt._handle_enable_all_anomalies(mock_client, {})
-        text = _text(result)
-        assert "Confirmation Required" in text
-
-    @pytest.mark.asyncio
-    async def test_enable_all_confirm_false(self, alert_mgmt, mock_client):
-        """confirm=False returns confirmation prompt."""
-        result = await alert_mgmt._handle_enable_all_anomalies(mock_client, {"confirm": False})
-        text = _text(result)
-        assert "Confirmation Required" in text
-
-    @pytest.mark.asyncio
     async def test_enable_all_no_anomalies(self, alert_mgmt, mock_client):
         """When no anomalies exist, returns appropriate message."""
         mock_client.get_anomalies.return_value = {}
         mock_client._extract_embedded_data.return_value = []
 
-        result = await alert_mgmt._handle_enable_all_anomalies(mock_client, {"confirm": True})
+        result = await alert_mgmt._handle_enable_all_anomalies(mock_client, {})
         text = _text(result)
         assert "No alerts found" in text
 
@@ -723,7 +709,7 @@ class TestHandleEnableAllAnomalies:
         mock_client.get_anomaly_by_id.return_value = {"id": "2", "name": "Disabled Alert", "enabled": False}
         mock_client.update_anomaly.return_value = {"id": "2", "name": "Disabled Alert", "enabled": True}
 
-        result = await alert_mgmt._handle_enable_all_anomalies(mock_client, {"confirm": True})
+        result = await alert_mgmt._handle_enable_all_anomalies(mock_client, {})
         text = _text(result)
         assert "Already Enabled" in text
         assert "1" in text  # already_enabled count
@@ -739,7 +725,7 @@ class TestHandleEnableAllAnomalies:
         mock_client.get_anomaly_by_id.side_effect = RuntimeError("not found")
 
         flagged, text = await answer(
-            alert_mgmt._handle_enable_all_anomalies(mock_client, {"confirm": True})
+            alert_mgmt._handle_enable_all_anomalies(mock_client, {})
         )
         assert flagged is True
         assert "Failed" in text
@@ -749,7 +735,7 @@ class TestHandleEnableAllAnomalies:
         """API error in get_anomalies is wrapped in ToolError."""
         mock_client.get_anomalies.side_effect = RuntimeError("server error")
         with pytest.raises(ToolError) as exc_info:
-            await alert_mgmt._handle_enable_all_anomalies(mock_client, {"confirm": True})
+            await alert_mgmt._handle_enable_all_anomalies(mock_client, {})
         assert "Failed to enable all" in str(exc_info.value)
 
     @pytest.mark.asyncio
@@ -758,7 +744,7 @@ class TestHandleEnableAllAnomalies:
         original = ToolError(message="auth failed")
         mock_client.get_anomalies.side_effect = original
         with pytest.raises(ToolError) as exc_info:
-            await alert_mgmt._handle_enable_all_anomalies(mock_client, {"confirm": True})
+            await alert_mgmt._handle_enable_all_anomalies(mock_client, {})
         assert exc_info.value is original
 
     @pytest.mark.asyncio
@@ -774,7 +760,7 @@ class TestHandleEnableAllAnomalies:
             {"id": str(i), "name": f"Alert {i}", "enabled": True} for i in range(15)
         ]
 
-        result = await alert_mgmt._handle_enable_all_anomalies(mock_client, {"confirm": True})
+        result = await alert_mgmt._handle_enable_all_anomalies(mock_client, {})
         text = _text(result)
         assert "more" in text
 
@@ -783,20 +769,12 @@ class TestHandleDisableAllAnomalies:
     """Tests for _handle_disable_all_anomalies."""
 
     @pytest.mark.asyncio
-    async def test_disable_all_requires_confirmation(self, alert_mgmt, mock_client):
-        """Without confirm=True, returns confirmation prompt."""
-        result = await alert_mgmt._handle_disable_all_anomalies(mock_client, {})
-        text = _text(result)
-        assert "Confirmation Required" in text
-        assert "WARNING" in text
-
-    @pytest.mark.asyncio
     async def test_disable_all_no_anomalies(self, alert_mgmt, mock_client):
         """When no anomalies exist, returns appropriate message."""
         mock_client.get_anomalies.return_value = {}
         mock_client._extract_embedded_data.return_value = []
 
-        result = await alert_mgmt._handle_disable_all_anomalies(mock_client, {"confirm": True})
+        result = await alert_mgmt._handle_disable_all_anomalies(mock_client, {})
         text = _text(result)
         assert "No alerts found" in text
 
@@ -811,7 +789,7 @@ class TestHandleDisableAllAnomalies:
         mock_client.get_anomaly_by_id.return_value = {"id": "1", "name": "Enabled Alert", "enabled": True}
         mock_client.update_anomaly.return_value = {"id": "1", "name": "Enabled Alert", "enabled": False}
 
-        result = await alert_mgmt._handle_disable_all_anomalies(mock_client, {"confirm": True})
+        result = await alert_mgmt._handle_disable_all_anomalies(mock_client, {})
         text = _text(result)
         assert "Already Disabled" in text
         assert "Disabled:" in text
@@ -826,7 +804,7 @@ class TestHandleDisableAllAnomalies:
         mock_client.get_anomaly_by_id.side_effect = RuntimeError("not found")
 
         flagged, text = await answer(
-            alert_mgmt._handle_disable_all_anomalies(mock_client, {"confirm": True})
+            alert_mgmt._handle_disable_all_anomalies(mock_client, {})
         )
         assert flagged is True
         assert "Failed" in text
@@ -836,7 +814,7 @@ class TestHandleDisableAllAnomalies:
         """API error in get_anomalies is wrapped in ToolError."""
         mock_client.get_anomalies.side_effect = RuntimeError("server error")
         with pytest.raises(ToolError) as exc_info:
-            await alert_mgmt._handle_disable_all_anomalies(mock_client, {"confirm": True})
+            await alert_mgmt._handle_disable_all_anomalies(mock_client, {})
         assert "Failed to disable all" in str(exc_info.value)
 
     @pytest.mark.asyncio
@@ -845,7 +823,7 @@ class TestHandleDisableAllAnomalies:
         original = ToolError(message="auth failed")
         mock_client.get_anomalies.side_effect = original
         with pytest.raises(ToolError) as exc_info:
-            await alert_mgmt._handle_disable_all_anomalies(mock_client, {"confirm": True})
+            await alert_mgmt._handle_disable_all_anomalies(mock_client, {})
         assert exc_info.value is original
 
     @pytest.mark.asyncio
@@ -861,7 +839,7 @@ class TestHandleDisableAllAnomalies:
             {"id": str(i), "name": f"Alert {i}", "enabled": False} for i in range(15)
         ]
 
-        result = await alert_mgmt._handle_disable_all_anomalies(mock_client, {"confirm": True})
+        result = await alert_mgmt._handle_disable_all_anomalies(mock_client, {})
         text = _text(result)
         assert "more" in text
 
@@ -2171,7 +2149,7 @@ ALERT_TOOL_SOURCES = (
     "src/revenium_mcp_server/alerts/anomaly_manager.py",
 )
 # Calls the alert tool's text may name that are not its own actions: other MCP tools.
-OTHER_TOOL_CALLS = frozenset({"slack_management"})
+OTHER_TOOL_CALLS = frozenset({"manage_slack", "get_slack"})
 ACTION_CALL = re.compile(r"\b([a-z][a-z_]*)\(")
 
 

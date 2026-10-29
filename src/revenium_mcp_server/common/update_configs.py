@@ -4,7 +4,8 @@ This module defines the configuration objects used by PartialUpdateHandler
 for each resource type in the Revenium Platform API.
 """
 
-from typing import Any, Dict, List
+from types import MappingProxyType
+from typing import Any, Dict, List, Mapping
 
 from ..api_field_mapper import APIFieldMapper
 from ..client import ReveniumClient
@@ -111,6 +112,13 @@ def refuse_unsendable_plan_change(
     refuse_tier_without_unit_amount_or_bound(current, caller, merged)
 
 
+# BACK-5125: the platform reads a subscription's links back under the first name and
+# writes them only through the write-only second one; a PUT without it unlinks them all.
+SUBSCRIPTION_LINK_IDS: Mapping[str, str] = MappingProxyType(
+    {"credentials": "credentialIds", "namedOrganizations": "namedOrganizationIds"}
+)
+
+
 class UpdateConfigs:
     """Factory class for creating update configurations for different resource types."""
 
@@ -213,8 +221,13 @@ class UpdateConfigs:
                 },
                 "organization": {"organizationId": FieldTransformers.object_to_id},
                 "product": {"productId": FieldTransformers.object_to_id},
+                **{
+                    read_field: {write_field: FieldTransformers.objects_array_to_ids}
+                    for read_field, write_field in SUBSCRIPTION_LINK_IDS.items()
+                },
             },
             derived_field_dependencies={"clientEmailAddress": "subscriberId"},
+            written_through_aliases=list(SUBSCRIPTION_LINK_IDS),
         )
 
     @staticmethod

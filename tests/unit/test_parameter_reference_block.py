@@ -154,7 +154,7 @@ class TestAnalyticsValueListsHaveOneSource:
 
 _THIN_TOOL_CLASSES = {
     "manage_metering": ("metering_management", "MeteringManagement"),
-    "business_analytics_management": (
+    "get_business_analytics": (
         "business_analytics_management",
         "BusinessAnalyticsManagement",
     ),
@@ -174,7 +174,7 @@ _KNOWN_DISOWNED = {
     # Retired aliases: accepted at the top level and answered with a message
     # naming the replacement. dry_run is accepted at the top level and answered
     # with the refusal of the dry-run guard, since no analytics action previews.
-    "business_analytics_management": {"threshold", "breakdown_by", "dry_run"},
+    "get_business_analytics": {"threshold", "breakdown_by", "dry_run"},
 }
 
 

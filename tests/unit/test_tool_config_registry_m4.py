@@ -1,7 +1,7 @@
 """Unit tests for tool_configuration/registry.py (M4 coverage batch).
 
 Targets: ToolConfigurationRegistry initialization, register_tools_conditionally,
-_register_single_tool dispatch, per-tool registration functions (inner closures),
+_register_domain dispatch, per-tool registration functions (inner closures),
 JSON preprocessing branches, get_registered_tools, is_tool_registered,
 _register_tool_metadata, and _register_tool_introspection.
 """
@@ -9,10 +9,12 @@ _register_tool_metadata, and _register_tool_introspection.
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.revenium_mcp_server.tool_configuration.registry import (
-    ToolConfigurationRegistry,
-    TOOL_REGISTRATION_PRIORITY_ORDER,
+from src.revenium_mcp_server.common.tool_surface import (
+    DOMAINS_BY_KEY,
+    TOOL_DOMAINS,
+    public_tool_for,
 )
+from src.revenium_mcp_server.tool_configuration.registry import ToolConfigurationRegistry
 from src.revenium_mcp_server.tool_configuration.config import ToolConfig
 
 
@@ -40,11 +42,12 @@ def _make_mock_mcp() -> MagicMock:
 
 
 async def _get_registered_closure(registry, method_name: str) -> object:
-    """Call a _register_* method and return the inner async function it decorated."""
+    """Call a _register_* method and return the closure both of its published tools run."""
     mcp = _make_mock_mcp()
     register_method = getattr(registry, method_name)
-    await register_method(mcp)
-    return mcp.tool.return_value.call_args[0][0]
+    with patch.object(registry.tool_config, "is_tool_enabled", return_value=True):
+        await register_method(mcp)
+    return mcp.tool.call_args_list[0][0][0].__wrapped__
 
 
 # ---------------------------------------------------------------------------
@@ -77,219 +80,128 @@ class TestToolConfigurationRegistryInit:
 
 
 # ---------------------------------------------------------------------------
-# TOOL_REGISTRATION_PRIORITY_ORDER constant
-# ---------------------------------------------------------------------------
-
-class TestPriorityOrderConstant:
-    def test_contains_all_starter_tools(self):
-        """Every starter-profile tool name appears in the priority order list."""
-        starter_tools = {
-            "system_setup", "slack_management", "tool_introspection",
-            "manage_alerts", "business_analytics_management",
-            "manage_metering", "system_diagnostics",
-        }
-        for tool in starter_tools:
-            assert tool in TOOL_REGISTRATION_PRIORITY_ORDER
-
-    def test_contains_all_business_tools(self):
-        """All business-only tool names appear in the priority order list."""
-        business_tools = {
-            "manage_sources", "manage_workflows", "manage_subscriber_credentials",
-            "manage_products", "manage_customers", "manage_subscriptions",
-            "manage_metering_elements", "manage_capabilities",
-        }
-        for tool in business_tools:
-            assert tool in TOOL_REGISTRATION_PRIORITY_ORDER
-
-    def test_no_duplicates_in_priority_order(self):
-        """Priority order list contains no duplicate entries."""
-        assert len(TOOL_REGISTRATION_PRIORITY_ORDER) == len(set(TOOL_REGISTRATION_PRIORITY_ORDER))
-
-
-# ---------------------------------------------------------------------------
 # register_tools_conditionally
 # ---------------------------------------------------------------------------
 
+def _registered_keys(mock_reg) -> list:
+    return [c.args[1].key for c in mock_reg.call_args_list]
+
+
 class TestRegisterToolsConditionally:
     @pytest.mark.asyncio
-    async def test_starter_registers_exactly_starter_tools(self):
-        """Starter profile registers exactly the 7 starter tools."""
-        registry = _make_registry(profile="starter")
-        mcp = _make_mock_mcp()
-
-        with patch.object(registry, "_register_single_tool", new_callable=AsyncMock) as mock_reg, \
-             patch.object(registry, "_register_tool_metadata", new_callable=AsyncMock):
-            await registry.register_tools_conditionally(mcp)
-
-        registered_names = {c.args[1] for c in mock_reg.call_args_list}
+    async def test_starter_registers_exactly_the_starter_domains(self):
+        """Starter profile registers the domains whose public tools it lists."""
         from src.revenium_mcp_server.tool_configuration.profiles import PROFILE_DEFINITIONS
-        assert registered_names == PROFILE_DEFINITIONS["starter"]
+
+        registry = _make_registry(profile="starter")
+
+        with patch.object(registry, "_register_domain", new_callable=AsyncMock) as mock_reg:
+            await registry.register_tools_conditionally(_make_mock_mcp())
+
+        expected = {
+            domain.key
+            for domain in TOOL_DOMAINS
+            if set(domain.public_names) & PROFILE_DEFINITIONS["starter"]
+        }
+        assert set(_registered_keys(mock_reg)) == expected
 
     @pytest.mark.asyncio
-    async def test_business_registers_exactly_business_tools(self):
-        """Business profile registers exactly the 15 business tools — no more, no less."""
+    async def test_business_registers_every_domain(self):
+        """Business profile registers every domain of the surface."""
         registry = _make_registry(profile="business")
-        mcp = _make_mock_mcp()
 
-        with patch.object(registry, "_register_single_tool", new_callable=AsyncMock) as mock_reg, \
-             patch.object(registry, "_register_tool_metadata", new_callable=AsyncMock):
-            await registry.register_tools_conditionally(mcp)
+        with patch.object(registry, "_register_domain", new_callable=AsyncMock) as mock_reg:
+            await registry.register_tools_conditionally(_make_mock_mcp())
 
-        registered_names = {c.args[1] for c in mock_reg.call_args_list}
-        from src.revenium_mcp_server.tool_configuration.profiles import PROFILE_DEFINITIONS
-        assert registered_names == PROFILE_DEFINITIONS["business"]
+        assert _registered_keys(mock_reg) == [domain.key for domain in TOOL_DOMAINS]
 
     @pytest.mark.asyncio
-    async def test_disabled_tool_is_skipped(self):
-        """A tool disabled via tool_enabled override is never passed to _register_single_tool."""
+    async def test_a_domain_with_every_tool_disabled_is_skipped(self):
+        """A domain whose public tools are all disabled is never registered."""
         registry = _make_registry(
             profile="starter",
-            tool_enabled={"manage_alerts": False},
+            tool_enabled={"get_alerts": False, "manage_alerts": False},
         )
-        mcp = _make_mock_mcp()
 
-        with patch.object(registry, "_register_single_tool", new_callable=AsyncMock) as mock_reg, \
-             patch.object(registry, "_register_tool_metadata", new_callable=AsyncMock):
-            await registry.register_tools_conditionally(mcp)
+        with patch.object(registry, "_register_domain", new_callable=AsyncMock) as mock_reg:
+            await registry.register_tools_conditionally(_make_mock_mcp())
 
-        called_names = [c.args[1] for c in mock_reg.call_args_list]
-        assert "manage_alerts" not in called_names
-
-    @pytest.mark.asyncio
-    async def test_tools_registered_in_priority_order(self):
-        """Tools are registered in the sequence defined by TOOL_REGISTRATION_PRIORITY_ORDER."""
-        registry = _make_registry(profile="starter")
-        mcp = _make_mock_mcp()
-
-        with patch.object(registry, "_register_single_tool", new_callable=AsyncMock) as mock_reg, \
-             patch.object(registry, "_register_tool_metadata", new_callable=AsyncMock):
-            await registry.register_tools_conditionally(mcp)
-
-        call_order = [c.args[1] for c in mock_reg.call_args_list]
-        for i in range(len(call_order) - 1):
-            idx_a = TOOL_REGISTRATION_PRIORITY_ORDER.index(call_order[i])
-            idx_b = TOOL_REGISTRATION_PRIORITY_ORDER.index(call_order[i + 1])
-            assert idx_a < idx_b
-
-    @pytest.mark.asyncio
-    async def test_extra_enabled_tool_not_in_priority_order_still_registered(self):
-        """A tool enabled via override but absent from the priority list is registered at the end."""
-        registry = _make_registry(
-            profile="starter",
-            tool_enabled={"ghost_tool_xyz": True},
-        )
-        mcp = _make_mock_mcp()
-
-        with patch.object(registry, "_register_single_tool", new_callable=AsyncMock) as mock_reg, \
-             patch.object(registry, "_register_tool_metadata", new_callable=AsyncMock):
-            await registry.register_tools_conditionally(mcp)
-
-        called_names = [c.args[1] for c in mock_reg.call_args_list]
-        assert "ghost_tool_xyz" in called_names
-        # It must appear AFTER all priority-ordered tools
-        priority_positions = [
-            called_names.index(n)
-            for n in called_names
-            if n in TOOL_REGISTRATION_PRIORITY_ORDER
-        ]
-        ghost_position = called_names.index("ghost_tool_xyz")
-        if priority_positions:
-            assert ghost_position > max(priority_positions)
+        assert "manage_alerts" not in _registered_keys(mock_reg)
 
 
 # ---------------------------------------------------------------------------
-# _register_single_tool dispatch
+# _register_domain dispatch
 # ---------------------------------------------------------------------------
 
-class TestRegisterSingleToolDispatch:
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("tool_name,method_name", [
-        ("business_analytics_management", "_register_business_analytics_management"),
-        ("manage_alerts",                 "_register_manage_alerts"),
-        ("slack_management",              "_register_slack_management"),
-        ("manage_metering",               "_register_manage_metering"),
-        ("system_setup",                  "_register_system_setup"),
-        ("system_diagnostics",            "_register_system_diagnostics"),
-        ("manage_sources",                "_register_manage_sources"),
-        ("manage_workflows",              "_register_manage_workflows"),
-        ("manage_subscriber_credentials", "_register_manage_subscriber_credentials"),
-        ("manage_products",               "_register_manage_products"),
-        ("manage_customers",              "_register_manage_customers"),
-        ("manage_subscriptions",          "_register_manage_subscriptions"),
-        ("manage_metering_elements",      "_register_manage_metering_elements"),
-        ("manage_capabilities",           "_register_manage_capabilities"),
-        ("tool_introspection",            "_register_tool_introspection"),
-    ])
-    async def test_dispatches_to_correct_method(self, tool_name, method_name):
-        """_register_single_tool calls the dedicated registration method for each known tool."""
+class TestRegisterDomainDispatch:
+    def test_every_domain_has_a_registrar(self):
         registry = _make_registry()
+
+        assert set(registry._domain_registrars()) == set(DOMAINS_BY_KEY)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key,method_name", [
+        ("get_business_analytics", "_register_business_analytics_management"),
+        ("manage_alerts", "_register_manage_alerts"),
+        ("manage_slack", "_register_slack_management"),
+        ("manage_metering", "_register_manage_metering"),
+        ("manage_system_setup", "_register_system_setup"),
+        ("system_diagnostics", "_register_system_diagnostics"),
+        ("manage_sources", "_register_manage_sources"),
+        ("manage_workflows", "_register_manage_workflows"),
+        ("manage_credentials", "_register_manage_subscriber_credentials"),
+        ("manage_products", "_register_manage_products"),
+        ("manage_customers", "_register_manage_customers"),
+        ("manage_subscriptions", "_register_manage_subscriptions"),
+        ("manage_usage_meters", "_register_manage_metering_elements"),
+        ("get_capabilities", "_register_manage_capabilities"),
+        ("tool_introspection", "_register_tool_introspection"),
+    ])
+    async def test_dispatches_to_correct_method(self, key, method_name):
+        """_register_domain calls the dedicated registration method for each domain."""
+        registry = _make_registry(profile="business")
         mcp = _make_mock_mcp()
 
         with patch.object(registry, method_name, new_callable=AsyncMock) as mock_method, \
              patch.object(registry, "_register_tool_metadata", new_callable=AsyncMock):
-            await registry._register_single_tool(mcp, tool_name)
+            await registry._register_domain(mcp, DOMAINS_BY_KEY[key])
             mock_method.assert_called_once_with(mcp)
 
     @pytest.mark.asyncio
-    async def test_unknown_tool_not_added_to_registered_set(self):
-        """An unknown tool name results in no entry added to _registered_tools."""
-        registry = _make_registry()
-        mcp = _make_mock_mcp()
-
-        await registry._register_single_tool(mcp, "totally_unknown_tool")
-
-        assert not registry.is_tool_registered("totally_unknown_tool")
-
-    @pytest.mark.asyncio
-    async def test_known_tool_added_to_registered_set_after_success(self):
-        """After successful dispatch, the tool name is added to _registered_tools."""
-        registry = _make_registry()
-        mcp = _make_mock_mcp()
+    async def test_enabled_public_names_are_recorded_after_success(self):
+        """After successful dispatch, the domain's enabled public tools are recorded."""
+        registry = _make_registry(profile="business")
 
         with patch.object(registry, "_register_system_setup", new_callable=AsyncMock), \
              patch.object(registry, "_register_tool_metadata", new_callable=AsyncMock):
-            await registry._register_single_tool(mcp, "system_setup")
+            await registry._register_domain(_make_mock_mcp(), DOMAINS_BY_KEY["manage_system_setup"])
 
-        assert registry.is_tool_registered("system_setup")
+        assert registry.is_tool_registered("get_system_setup")
+        assert registry.is_tool_registered("manage_system_setup")
 
     @pytest.mark.asyncio
-    async def test_exception_in_method_does_not_propagate(self):
-        """If a registration method raises, _register_single_tool swallows the exception."""
-        registry = _make_registry()
-        mcp = _make_mock_mcp()
+    async def test_exception_in_method_does_not_propagate_or_record(self):
+        """If a registration method raises, _register_domain swallows it and records nothing."""
+        registry = _make_registry(profile="business")
 
         with patch.object(
             registry, "_register_system_setup",
             new_callable=AsyncMock, side_effect=RuntimeError("boom")
         ):
-            # Must not raise
-            await registry._register_single_tool(mcp, "system_setup")
+            await registry._register_domain(_make_mock_mcp(), DOMAINS_BY_KEY["manage_system_setup"])
+
+        assert not registry.is_tool_registered("get_system_setup")
 
     @pytest.mark.asyncio
-    async def test_exception_prevents_tool_added_to_registered_set(self):
-        """If registration raises, the tool is NOT added to _registered_tools."""
-        registry = _make_registry()
-        mcp = _make_mock_mcp()
-
-        with patch.object(
-            registry, "_register_system_setup",
-            new_callable=AsyncMock, side_effect=RuntimeError("boom")
-        ):
-            await registry._register_single_tool(mcp, "system_setup")
-
-        assert not registry.is_tool_registered("system_setup")
-
-    @pytest.mark.asyncio
-    async def test_metadata_registered_for_known_tool(self):
-        """_register_tool_metadata is called with the tool name after dispatch."""
-        registry = _make_registry()
-        mcp = _make_mock_mcp()
+    async def test_metadata_registered_under_the_domain_key(self):
+        """_register_tool_metadata is called with the domain key after dispatch."""
+        registry = _make_registry(profile="business")
 
         with patch.object(registry, "_register_system_setup", new_callable=AsyncMock), \
              patch.object(registry, "_register_tool_metadata", new_callable=AsyncMock) as mock_meta:
-            await registry._register_single_tool(mcp, "system_setup")
+            await registry._register_domain(_make_mock_mcp(), DOMAINS_BY_KEY["manage_system_setup"])
 
-        mock_meta.assert_called_once_with("system_setup")
+        mock_meta.assert_called_once_with("manage_system_setup")
 
 
 # ---------------------------------------------------------------------------
@@ -344,45 +256,38 @@ class TestRegisterToolMetadata:
             assert "unknown_tool_xyz" in warning_msg
 
     @pytest.mark.asyncio
-    async def test_known_tool_invokes_importlib(self):
-        """A known tool triggers importlib to load the tools_decomposed module."""
-        registry = _make_registry()
+    async def test_known_domain_registers_its_class(self):
+        """A known domain key registers its tool class with the introspection engine."""
+        from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
 
+        registry = _make_registry()
         mock_introspection = MagicMock()
         mock_introspection.register_tool_metadata = AsyncMock()
 
-        mock_module = MagicMock()
-        mock_module.AlertManagement = MagicMock()
-
-        import_calls: list = []
-
-        original_import = __import__("importlib").import_module
-
-        def capturing_import(name, *args, **kwargs):
-            import_calls.append(name)
-            if name == "revenium_mcp_server.tools_decomposed.alert_management":
-                return mock_module
-            return original_import(name, *args, **kwargs)
-
-        with patch("importlib.import_module", side_effect=capturing_import), \
-             patch(
-                 "src.revenium_mcp_server.introspection.integration.introspection_integration",
-                 mock_introspection,
-             ):
+        with patch(
+            "src.revenium_mcp_server.introspection.integration.introspection_integration",
+            mock_introspection,
+        ):
             await registry._register_tool_metadata("manage_alerts")
 
-        assert "revenium_mcp_server.tools_decomposed.alert_management" in import_calls
+        mock_introspection.register_tool_metadata.assert_awaited_once_with(
+            "manage_alerts", AlertManagement
+        )
 
     @pytest.mark.asyncio
-    async def test_import_error_logs_warning_not_raises(self):
-        """If importlib.import_module raises ImportError, it is caught as a warning (no propagation)."""
+    async def test_registration_error_logs_warning_not_raises(self):
+        """A failing introspection registration is logged, not propagated."""
         registry = _make_registry()
+        mock_introspection = MagicMock()
+        mock_introspection.register_tool_metadata = AsyncMock(side_effect=RuntimeError("down"))
 
-        with patch("importlib.import_module", side_effect=ImportError("missing")) as mock_import:
-            # Must not raise
+        with patch(
+            "src.revenium_mcp_server.introspection.integration.introspection_integration",
+            mock_introspection,
+        ), patch("src.revenium_mcp_server.tool_configuration.registry.logger") as mock_logger:
             await registry._register_tool_metadata("manage_alerts")
 
-        mock_import.assert_called_once()
+        mock_logger.warning.assert_called()
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +512,7 @@ class TestManageSourcesJsonPreprocessing:
 
 
 # ---------------------------------------------------------------------------
-# business_analytics_management closure — dimension forwarding
+# get_business_analytics closure — dimension forwarding
 # ---------------------------------------------------------------------------
 
 class TestBusinessAnalyticsDimensionForwarding:
@@ -697,7 +602,7 @@ class TestBusinessAnalyticsCalendarRange:
         mcp = FastMCP("front-3434")
         await _make_registry()._register_business_analytics_management(mcp)
         tools = {tool.name: tool for tool in await mcp.list_tools(run_middleware=False)}
-        properties = tools["business_analytics_management"].parameters["properties"]
+        properties = tools["get_business_analytics"].parameters["properties"]
         assert "start_date" in properties
         assert "end_date" in properties
 
@@ -859,7 +764,7 @@ class TestManageWorkflowsJsonPreprocessing:
 
 
 # ---------------------------------------------------------------------------
-# JSON preprocessing — manage_subscriber_credentials (credential_data)
+# JSON preprocessing — manage_credentials (credential_data)
 # ---------------------------------------------------------------------------
 
 class TestManageSubscriberCredentialsJsonPreprocessing:
@@ -1035,11 +940,11 @@ class TestManageProductsCreateSimpleParams:
 
 class TestManageCustomersJsonPreprocessing:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("confirm", [True, "true"])
-    async def test_department_removal_arguments_reach_the_tool_with_confirm_untouched(
-        self, confirm
+    @pytest.mark.parametrize("dry_run", [True, "true"])
+    async def test_department_removal_arguments_reach_the_tool_with_dry_run_as_bool(
+        self, dry_run
     ):
-        """person_id and confirm are bound; a string confirm is not coerced into True."""
+        """person_id and dry_run are bound; a string dry_run arrives as the bool it spells."""
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_manage_customers")
 
@@ -1053,10 +958,10 @@ class TestManageCustomersJsonPreprocessing:
             "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
             new=fake_execution,
         ):
-            await registered_fn(action="delete_department_person", person_id=97, confirm=confirm)
+            await registered_fn(action="delete_department_person", person_id=97, dry_run=dry_run)
 
         assert captured_args["person_id"] == 97
-        assert captured_args["confirm"] is confirm
+        assert captured_args["dry_run"] is True
 
     @pytest.mark.asyncio
     async def test_malformed_resource_data_raises(self):
@@ -1295,7 +1200,7 @@ class TestManageSubscriptionsJsonPreprocessing:
 
 
 # ---------------------------------------------------------------------------
-# JSON preprocessing — manage_metering_elements (element_data)
+# JSON preprocessing — manage_usage_meters (element_data)
 # ---------------------------------------------------------------------------
 
 class TestManageMeteringElementsJsonPreprocessing:
@@ -1426,13 +1331,13 @@ class TestNumericBooleanPreprocessing:
 
 
 # ---------------------------------------------------------------------------
-# system_setup and system_diagnostics closures
+# manage_system_setup and system_diagnostics closures
 # ---------------------------------------------------------------------------
 
 class TestSystemSetupClosure:
     @pytest.mark.asyncio
     async def test_boolean_flags_converted_and_none_stripped(self):
-        """system_setup boolean params are converted and None params are stripped."""
+        """manage_system_setup boolean params are converted and None params are stripped."""
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_system_setup")
 
@@ -1459,7 +1364,7 @@ class TestSystemSetupClosure:
 
     @pytest.mark.asyncio
     async def test_forwarded_to_system_setup_tool(self):
-        """system_setup closure calls standardized_tool_execution with tool_name='system_setup'."""
+        """manage_system_setup closure calls standardized_tool_execution with tool_name='manage_system_setup'."""
         registry = _make_registry()
         registered_fn = await _get_registered_closure(registry, "_register_system_setup")
 
@@ -1475,7 +1380,7 @@ class TestSystemSetupClosure:
         ):
             await registered_fn(action="show_welcome")
 
-        assert captured["tool_name"] == "system_setup"
+        assert captured["tool_name"] == "manage_system_setup"
 
 
 class TestSystemDiagnosticsClosure:
@@ -2830,7 +2735,7 @@ class TestManageMeteringEntrypointForwarding:
 class TestSystemDiagnosticsStrictIngestionClosure:
     """BACK-2770: the closure signature is system_diagnostics' public schema.
 
-    set_strict_ingestion_mode reads enabled/confirm/allow_ticket_jobs out of
+    set_strict_ingestion_mode reads enabled/dry_run/allow_ticket_jobs out of
     the arguments dict, so an undeclared parameter is not merely undocumented
     — FastMCP never binds it and the action cannot be driven at all.
     """
@@ -2843,7 +2748,8 @@ class TestSystemDiagnosticsStrictIngestionClosure:
         fn = await _get_registered_closure(registry, "_register_system_diagnostics")
         params = inspect.signature(fn).parameters
         assert "enabled" in params
-        assert "confirm" in params
+        assert "dry_run" in params
+        assert "confirm" not in params
         assert "allow_ticket_jobs" in params
 
     @pytest.mark.asyncio
@@ -2864,11 +2770,11 @@ class TestSystemDiagnosticsStrictIngestionClosure:
                 action="set_strict_ingestion_mode",
                 enabled=True,
                 allow_ticket_jobs=True,
-                confirm=True,
+                dry_run=True,
             )
         assert captured["enabled"] is True
         assert captured["allow_ticket_jobs"] is True
-        assert captured["confirm"] is True
+        assert captured["dry_run"] is True
 
     @pytest.mark.asyncio
     async def test_omitted_opt_in_is_dropped_from_arguments(self):
@@ -2885,13 +2791,12 @@ class TestSystemDiagnosticsStrictIngestionClosure:
             "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
             new=fake_execution,
         ):
-            await fn(action="set_strict_ingestion_mode", enabled=False, confirm=True)
+            await fn(action="set_strict_ingestion_mode", enabled=False)
         assert "allow_ticket_jobs" not in captured
 
     @pytest.mark.asyncio
-    async def test_string_booleans_are_preprocessed_except_confirm(self):
-        """enabled/allow_ticket_jobs accept loose string booleans; confirm does
-        not, so the handler's literal-True guard keeps its meaning."""
+    async def test_string_booleans_are_preprocessed(self):
+        """enabled/allow_ticket_jobs accept loose string booleans."""
         registry = _make_registry()
         fn = await _get_registered_closure(registry, "_register_system_diagnostics")
         captured: dict = {}
@@ -2908,11 +2813,9 @@ class TestSystemDiagnosticsStrictIngestionClosure:
                 action="set_strict_ingestion_mode",
                 enabled="true",
                 allow_ticket_jobs="true",
-                confirm="true",
             )
         assert captured["enabled"] is True
         assert captured["allow_ticket_jobs"] is True
-        assert captured["confirm"] == "true"
 
     @pytest.mark.asyncio
     async def test_attribution_detail_text_reaches_the_handler(self):
@@ -2936,7 +2839,7 @@ class TestSystemDiagnosticsStrictIngestionClosure:
         assert captured["enabled"] is False
         # The strict-mode-only arguments must not be invented for this action.
         assert "allow_ticket_jobs" not in captured
-        assert "confirm" not in captured
+        assert "dry_run" not in captured
 
     @pytest.mark.asyncio
     async def test_attribution_detail_text_accepts_a_string_boolean(self):
@@ -2959,10 +2862,9 @@ class TestSystemDiagnosticsStrictIngestionClosure:
         assert captured["enabled"] is False
 
     @pytest.mark.asyncio
-    async def test_usage_billing_reaches_the_handler_with_its_confirm(self):
+    async def test_usage_billing_reaches_the_handler_with_its_dry_run(self):
         """BACK-3354: the third tenant toggle rides the same `enabled`, and it
-        is confirm-gated, so both must arrive together - a guard the closure
-        cannot carry is a guard nobody can satisfy."""
+        previews with dry_run, so both must arrive together."""
         registry = _make_registry()
         fn = await _get_registered_closure(registry, "_register_system_diagnostics")
         captured: dict = {}
@@ -2975,32 +2877,12 @@ class TestSystemDiagnosticsStrictIngestionClosure:
             "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
             new=fake_execution,
         ):
-            await fn(action="set_usage_billing", enabled=False, confirm=True)
+            await fn(action="set_usage_billing", enabled=False, dry_run=True)
         assert captured["action"] == "set_usage_billing"
         assert captured["enabled"] is False
-        assert captured["confirm"] is True
+        assert captured["dry_run"] is True
         # The strict-mode-only argument must not be invented for this action.
         assert "allow_ticket_jobs" not in captured
-
-    @pytest.mark.asyncio
-    async def test_usage_billing_confirm_is_not_coerced(self):
-        """`confirm` stays out of the boolean preprocessing, so a loosely typed
-        confirm reaches the handler as itself and is refused there."""
-        registry = _make_registry()
-        fn = await _get_registered_closure(registry, "_register_system_diagnostics")
-        captured: dict = {}
-
-        async def fake_execution(tool_name, action, arguments, tool_class):
-            captured.update(arguments)
-            return [MagicMock()]
-
-        with patch(
-            "src.revenium_mcp_server.common.tool_execution.standardized_tool_execution",
-            new=fake_execution,
-        ):
-            await fn(action="set_usage_billing", enabled="false", confirm="true")
-        assert captured["enabled"] is False
-        assert captured["confirm"] == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -3034,7 +2916,7 @@ class TestPrHealthClosureParameters:
     @pytest.mark.asyncio
     async def test_analytics_signature_declares_get_pr_health_params(self):
         """get_pr_health requires source, start_date and end_date — all three must
-        be bindable through the business_analytics_management schema."""
+        be bindable through the get_business_analytics schema."""
         import inspect
 
         registry = _make_registry(profile="business")
@@ -3316,7 +3198,7 @@ class TestManageToolsClosureParameters:
 
 
 # ---------------------------------------------------------------------------
-# manage_subscriber_credentials closure: both spellings the capability text
+# manage_credentials closure: both spellings the capability text
 # advertises for the organization id must be declared (BACK-2958)
 # ---------------------------------------------------------------------------
 
@@ -3840,6 +3722,7 @@ async def _call_through_the_boundary(
         FrameworkLeakGuardMiddleware,
     )
 
+    tool_name = public_tool_for(tool_name, arguments.get("action", "get_capabilities"))
     mcp = FastMCP(f"{tool_name}-boundary")
     mcp.add_middleware(FrameworkLeakGuardMiddleware())
     await getattr(_make_registry(profile="business"), register_method_name)(mcp)
@@ -3915,7 +3798,7 @@ class TestSubscriberCredentialsTopLevelInputs:
     async def _call(arguments, *, execute=True):
         return await _call_through_the_boundary(
             "_register_manage_subscriber_credentials",
-            "manage_subscriber_credentials",
+            "manage_credentials",
             arguments,
             execute=execute,
         )
@@ -4062,7 +3945,7 @@ class TestSubscriberCredentialsInvalidCustomerInfo:
     async def test_an_invalid_customer_info_is_an_error(self, raw):
         is_error, text, _ = await _call_through_the_boundary(
             "_register_manage_subscriber_credentials",
-            "manage_subscriber_credentials",
+            "manage_credentials",
             {"action": "get_onboarding_checklist", "customer_info": raw},
         )
 
@@ -4078,7 +3961,7 @@ class TestSubscriberCredentialsFieldFolding:
     async def _call(arguments):
         return await _call_through_the_boundary(
             "_register_manage_subscriber_credentials",
-            "manage_subscriber_credentials",
+            "manage_credentials",
             arguments,
         )
 

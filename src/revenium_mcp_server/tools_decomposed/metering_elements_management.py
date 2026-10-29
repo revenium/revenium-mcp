@@ -23,8 +23,13 @@ from ..common.error_handling import (
     raise_refusal,
 )
 from ..common.partial_update_handler import PartialUpdateHandler
+from ..common.tool_surface import public_tool_for
 from ..common.update_configs import UpdateConfigFactory
-from ..common.validation import apply_filter_allowlist, validate_pagination_params
+from ..common.validation import (
+    apply_filter_allowlist,
+    refuse_ignored_filter,
+    validate_pagination_params,
+)
 from ..introspection.metadata import (
     DependencyType,
     ToolCapability,
@@ -32,6 +37,7 @@ from ..introspection.metadata import (
     ToolType,
 )
 from .unified_tool_base import ToolBase
+from .usage_meter_name_conflict import refuse_returned_existing, refuse_taken_name
 
 # snake_case filter name -> camelCase query parameter, bounded to what the
 # endpoint declares. Verified 2026-08-28 against hypercurrent origin/develop
@@ -39,12 +45,19 @@ from .unified_tool_base import ToolBase
 # sourceIds plus a Pageable (page, size, sort). teamId and page/size are set by
 # the client. Notably absent: `name` — the endpoint has no name filter, so a
 # name passed to list was being discarded upstream and the caller got an
-# unfiltered list back.
+# unfiltered list back. `type` is bound but does not narrow the list: on the
+# dev tenant on 2026-10-27 type=STRING and type=NUMBER each returned all 70
+# elements (BACK-5091), so it is refused rather than forwarded.
 _METERING_ELEMENT_FILTER_MAP: Dict[str, str] = {
-    "type": "type",
     "source_ids": "sourceIds",
     "sort": "sort",
 }
+
+_UNHONOURED_TYPE_FILTER = "type"
+
+_CREATE_NAME_FIELD = "element_data.name"
+_TEMPLATE_NAME_FIELD = "template_name"
+_OVERRIDDEN_NAME_FIELD = "overrides.name"
 
 # Module-level — must stay in sync with the canonical Revenium element-type set.
 _ELEMENT_TYPE_DESCRIPTIONS = {
@@ -65,7 +78,7 @@ OVERRIDES_READERS = ("create_from_template",)
 _SOURCE_LINK_GUIDANCE = (
     "Link metering elements to a source through manage_sources: "
     "source_data.meteringElementDefinitionIds REPLACES the source's links, so "
-    "read the source first (manage_sources action='get') and send the IDs already "
+    "read the source first (get_sources action='get') and send the IDs already "
     "in its meteringElementDefinitions[].id together with the new element IDs, "
     "with action='update' (or action='create' for a new source)."
 )
@@ -89,7 +102,7 @@ def source_assignment_unsupported_error() -> ToolError:
         value=SOURCE_ASSIGNMENT_ACTION,
         suggestions=[_SOURCE_LINK_GUIDANCE],
         examples={
-            "read_current_links": 'manage_sources(action="get", source_id="<source id>")',
+            "read_current_links": 'get_sources(action="get", source_id="<source id>")',
             "link_elements": _SOURCE_LINK_EXAMPLE,
         },
     )
@@ -100,6 +113,62 @@ def _templates_overview_line() -> str:
     names = [f"`{name}`" for name in MeteringElementsManager().element_templates]
     listed = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
     return f"- **Configuration templates**: {len(names)} templates, {listed}"
+
+
+def _refuse_type_filter(filters: Any) -> None:
+    """Refuse a type filter, which the platform accepts and then ignores."""
+    refuse_ignored_filter(
+        filters,
+        _UNHONOURED_TYPE_FILTER,
+        listing="Usage meters",
+        instead=(
+            "List without the type filter and read each meter's `type` field, or "
+            "narrow by source with filters={'source_ids': 'src_123'}."
+        ),
+    )
+
+
+def _create_preview(
+    element_data: Dict[str, Any],
+) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+    """The dry-run answer for a create whose element data passed validation."""
+    return [
+        TextContent(
+            type="text",
+            text=f"🧪 **DRY RUN MODE - Element Creation**\n\n"
+            f"✅ **Validation Successful**: Element data is valid and ready for creation\n\n"
+            f"**Would Create:**\n"
+            f"- **Name:** {element_data.get('name', 'N/A')}\n"
+            f"- **Type:** {element_data.get('type', 'N/A')}\n"
+            f"- **Description:** {element_data.get('description', 'N/A')}\n"
+            f"**Dry Run:** True (no actual creation performed)",
+        )
+    ]
+
+
+def _template_name_field(arguments: Dict[str, Any]) -> str:
+    """The argument a create_from_template name came from."""
+    overrides = arguments.get("overrides")
+    if isinstance(overrides, dict) and "name" in overrides:
+        return _OVERRIDDEN_NAME_FIELD
+    return _TEMPLATE_NAME_FIELD
+
+
+def _template_create_preview(
+    template_name: Any, template: Dict[str, Any]
+) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+    """The dry-run answer for a template create whose name no usage meter has."""
+    return [
+        TextContent(
+            type="text",
+            text=f"**DRY RUN MODE - Template Creation**\n\n"
+            f"**Would create element from template:** {template_name}\n"
+            f"- **Name:** {template.get('name', 'N/A')}\n"
+            f"- **Type:** {template.get('type', 'N/A')}\n\n"
+            f"**Dry Run:** True (no actual creation performed)\n\n"
+            f"**Tip:** Use `get_templates()` to see template details",
+        )
+    ]
 
 
 class MeteringElementsManager:
@@ -142,6 +211,7 @@ class MeteringElementsManager:
         arguments = validate_pagination_params(arguments, action="list metering elements")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
+        _refuse_type_filter(arguments.get("filters"))
         filters = apply_filter_allowlist(
             arguments.get("filters"), _METERING_ELEMENT_FILTER_MAP, action="list"
         )
@@ -155,8 +225,7 @@ class MeteringElementsManager:
                 field="name",
                 value=arguments.get("name"),
                 suggestions=[
-                    "Narrow the list with filters={'type': 'NUMBER'} or "
-                    "filters={'source_ids': 'src_123'}",
+                    "Narrow the list with filters={'source_ids': 'src_123'}",
                     "Fetch a known element directly with get(element_id='elem_123')",
                     "List without a name filter and match the name in the results",
                 ],
@@ -292,15 +361,11 @@ class MeteringElementsManager:
         template.update(overrides)
         return template
 
-    async def create_from_template(
-        self, client: ReveniumClient, arguments: Dict[str, Any]
+    async def create_resolved_template(
+        self, client: ReveniumClient, template: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Create metering element from template."""
-        template = self.resolve_template(arguments)
-
-        # Use the client's dedicated method for metering element definitions
-        response = await client.create_metering_element_definition(template)
-        return response
+        """Create the element a resolved template describes."""
+        return await client.create_metering_element_definition(template)
 
     @staticmethod
     def _require_update_arguments(arguments: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -492,7 +557,7 @@ class MeteringElementsValidator:
 class MeteringElementsManagement(ToolBase):
     """Consolidated metering elements management tool with comprehensive capabilities."""
 
-    tool_name = "manage_metering_elements"
+    tool_name = "manage_usage_meters"
     tool_description = "Metering elements ('meters') for usage-based billing. Key actions: list, create, update, delete, get_templates. Use get_capabilities() for complete action list."
     business_category = "Core Business Management Tools"
     tool_type = ToolType.CRUD
@@ -510,7 +575,7 @@ class MeteringElementsManagement(ToolBase):
         # Note: elements_manager will be initialized with client in handle_action
 
     async def _get_input_schema(self) -> Dict[str, Any]:
-        """Context7 single source of truth for manage_metering_elements schema.
+        """Context7 single source of truth for manage_usage_meters schema.
 
         This method defines the user-centric schema that agents discover.
         System fields are handled transparently in the implementation.
@@ -625,58 +690,16 @@ class MeteringElementsManagement(ToolBase):
                     ],
                 )
             elif action == "create":
-                # Handle dry_run mode for create operations
-                dry_run = arguments.get("dry_run", False)
-                if dry_run:
-                    element_data = arguments.get("element_data", {})
-                    validation_result = await self.validator.validate_element(
-                        {"element_data": element_data}
-                    )
-                    if validation_result["valid"]:
-                        return [
-                            TextContent(
-                                type="text",
-                                text=f"🧪 **DRY RUN MODE - Element Creation**\n\n"
-                                f"✅ **Validation Successful**: Element data is valid and ready for creation\n\n"
-                                f"**Would Create:**\n"
-                                f"- **Name:** {element_data.get('name', 'N/A')}\n"
-                                f"- **Type:** {element_data.get('type', 'N/A')}\n"
-                                f"- **Description:** {element_data.get('description', 'N/A')}\n"
-
-                                f"**Dry Run:** True (no actual creation performed)",
-                            )
-                        ]
-                    else:
-                        errors_text = "\n".join(
-                            [f"• {error}" for error in validation_result["errors"]]
-                        )
-                        return [
-                            TextContent(
-                                type="text",
-                                text=f"🧪 **DRY RUN MODE - Validation Failed**\n\n"
-                                f"❌ **Errors Found:**\n{errors_text}\n\n"
-                                f"**Dry Run:** True (fix errors before actual creation)",
-                            )
-                        ]
-
-                # CRITICAL: Always validate element data with UCM before creation
                 element_data = arguments.get("element_data", {})
-                validation_result = await self.validator.validate_element(
-                    {"element_data": element_data}
+                await self._refuse_invalid_element(element_data)
+                existing = await refuse_taken_name(
+                    client, element_data.get("name"), _CREATE_NAME_FIELD
                 )
-
-                # Check if validation failed
-                if not validation_result["valid"]:
-                    errors_text = "\n".join([f"• {error}" for error in validation_result["errors"]])
-                    # BACK-2937: raise so the envelope carries the error flag.
-                    raise_refusal(
-                        f"**Validation Failed**\n\n"
-                        f"**Errors Found:**\n{errors_text}\n\n"
-                        f"Please fix the errors above before creating the metering element.",
-                        field="element_data",
-                    )
+                if arguments.get("dry_run", False):
+                    return _create_preview(element_data)
 
                 result = await elements_manager.create_element(client, arguments)
+                refuse_returned_existing(existing, element_data, result, _CREATE_NAME_FIELD)
                 # Format create response consistently
                 return self.formatter.format_success_response(
                     message=f"Metering element '{result.get('name', 'N/A')}' created successfully",
@@ -688,52 +711,22 @@ class MeteringElementsManagement(ToolBase):
                     action="create",
                 )
             elif action == "create_from_template":
-                # Handle dry_run mode for template creation
-                dry_run = arguments.get("dry_run", False)
-                if dry_run:
-                    # Refuse a missing or unknown template exactly as the real create does
-                    elements_manager.resolve_template(arguments)
-                    template_name = arguments.get("template_name")
-                    return [
-                        TextContent(
-                            type="text",
-                            text=f"**DRY RUN MODE - Template Creation**\n\n"
-                            f"**Would create element from template:** {template_name}\n\n"
-                            f"**Dry Run:** True (no actual creation performed)\n\n"
-                            f"**Tip:** Use `get_templates()` to see template details",
-                        )
-                    ]
+                template = elements_manager.resolve_template(arguments)
+                name_field = _template_name_field(arguments)
+                existing = await refuse_taken_name(client, template.get("name"), name_field)
+                template_name = arguments.get("template_name")
+                if arguments.get("dry_run", False):
+                    return _template_create_preview(template_name, template)
 
-                result = await elements_manager.create_from_template(client, arguments)
-                template_name = arguments.get("template_name", "N/A")
-                element_id = result.get("id")
-                element_name = result.get("name", template_name)
-
-                if result.get("isSystem"):
-                    message = (
-                        f"Existing system metering element '{element_name}' returned — "
-                        f"the template matched a pre-registered system definition, so no new "
-                        f"element was created"
-                    )
-                    next_steps = [
-                        f"Use 'get' action with element_id='{element_id}' to view details",
-                        (
-                            "System elements cannot be modified — choose a different template "
-                            "name (or use 'create' with custom name) to create a user-scoped element"
-                        ),
-                        "Use 'list' action to see all elements",
-                    ]
-                else:
-                    message = f"Metering element created from template '{template_name}'"
-                    next_steps = [
-                        f"Use 'get' action with element_id='{element_id}' to view details",
-                        "Use 'update' action to modify the element",
-                    ]
-
+                result = await elements_manager.create_resolved_template(client, template)
+                refuse_returned_existing(existing, template, result, name_field)
                 return self.formatter.format_success_response(
-                    message=message,
+                    message=f"Metering element created from template '{template_name}'",
                     data=result,
-                    next_steps=next_steps,
+                    next_steps=[
+                        f"Use 'get' action with element_id='{result.get('id')}' to view details",
+                        "Use 'update' action to modify the element",
+                    ],
                     action="create_from_template",
                 )
             elif action == "update":
@@ -856,6 +849,19 @@ class MeteringElementsManagement(ToolBase):
             # Re-raise Exception to be handled by standardized_tool_execution
             raise e
 
+    async def _refuse_invalid_element(self, element_data: Dict[str, Any]) -> None:
+        """Run the create validation; a preview and a live create refuse alike."""
+        validation_result = await self.validator.validate_element({"element_data": element_data})
+        if validation_result["valid"]:
+            return
+        errors_text = "\n".join(f"• {error}" for error in validation_result["errors"])
+        raise_refusal(
+            f"**Validation Failed**\n\n"
+            f"**Errors Found:**\n{errors_text}\n\n"
+            f"Please fix the errors above before creating the metering element.",
+            field="element_data",
+        )
+
     async def _handle_get_capabilities(
         self,
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
@@ -895,11 +901,11 @@ class MeteringElementsManagement(ToolBase):
         self, ucm_capabilities: Optional[Dict[str, Any]]
     ) -> str:
         """Build enhanced capabilities text combining semantic guidance with UCM data."""
-        text = """# **Billing Configuration: Metering Elements Management**
+        text = f"""# **Billing Configuration: Metering Elements Management**
 
 ⚠️ **IMPORTANT DISTINCTION**: This tool manages **billing configuration**, NOT AI transaction tracking.
-- **For AI transaction submission/tracking**: Use `manage_metering` tool
-- **For metering element definitions**: Use this tool (`manage_metering_elements`)
+- **For AI transaction submission/tracking**: Use `manage_metering`, and `get_metering` to look transactions up
+- **For metering element definitions**: Use this tool (`{self.public_tool_name}`), and `{public_tool_for(self.tool_name, "create")}` to change them
 
 ## **METERING ELEMENTS OVERVIEW**
 
@@ -1124,7 +1130,7 @@ delete(element_id="elem_123")                     # Remove element
                 "list()\n"
                 "\n"
                 "# Step 2: Read the source and copy the IDs in meteringElementDefinitions[].id\n"
-                'manage_sources(action="get", source_id="COPIED_SOURCE_ID")\n'
+                'get_sources(action="get", source_id="COPIED_SOURCE_ID")\n'
                 "\n"
                 "# Step 3: Update the source with the existing IDs plus the new ones\n"
                 'manage_sources(action="update", source_id="COPIED_SOURCE_ID", source_data={"meteringElementDefinitionIds": ["EXISTING_ELEMENT_ID", "COPIED_ELEMENT_ID_1"]})\n'
@@ -1159,7 +1165,7 @@ delete(element_id="elem_123")                     # Remove element
                 '# Returns: {"id": "By832y8", "name": "shippingWeight", "type": "NUMBER"}\n'
                 '# ✅ COPY THE REAL ID: "By832y8"\n\n'
                 "# 3. Read the source; copy the IDs in meteringElementDefinitions[].id\n"
-                'manage_sources(action="get", source_id="COPIED_SOURCE_ID")\n'
+                'get_sources(action="get", source_id="COPIED_SOURCE_ID")\n'
                 '# Returns: {"meteringElementDefinitions": [{"id": "Ax71k2q", ...}], ...}\n\n'
                 "# 4. Update the source with the existing IDs plus the new ones\n"
                 "#    (the list REPLACES the source's links)\n"

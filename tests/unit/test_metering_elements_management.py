@@ -21,6 +21,7 @@ from src.revenium_mcp_server.client import ReveniumAPIError, ReveniumClient
 from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.tool_configuration.registry import ToolConfigurationRegistry
 from mcp.types import TextContent
+from tests.unit._registered_tool_harness import call_domain_tool
 
 
 STORED_ELEMENT = {
@@ -30,6 +31,8 @@ STORED_ELEMENT = {
     "type": "NUMBER",
     "label": "tokens",
 }
+
+NO_USAGE_METERS = {"page": {"number": 0, "size": 100, "totalPages": 0, "totalElements": 0}}
 
 PREVIEW_BODY_HEADING = "**Body the update would send:**"
 
@@ -303,11 +306,71 @@ class TestListElements:
         """Allowlisted keys reach the API under their camelCase names."""
         mock_client.get_metering_element_definitions.return_value = {"data": []}
         await manager.list_elements(
-            mock_client, {"filters": {"type": "NUMBER", "source_ids": "src_1"}}
+            mock_client, {"filters": {"source_ids": "src_1", "sort": "name,asc"}}
         )
         mock_client.get_metering_element_definitions.assert_called_once_with(
-            page=0, size=20, type="NUMBER", sourceIds="src_1",
+            page=0, size=20, sourceIds="src_1", sort="name,asc",
         )
+
+
+class TestTypeFilterIsNotOffered:
+    """BACK-5091: the platform accepts type but returns every element.
+
+    A list filtered by type came back with NUMBER and STRING meters alike under
+    a filtered answer, so the server refuses the filter until the platform
+    honours it.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("element_type", ["NUMBER", "STRING"])
+    async def test_a_type_filter_is_refused_before_any_read(
+        self, manager, mock_client, element_type
+    ):
+        with pytest.raises(ToolError) as refused:
+            await manager.list_elements(mock_client, {"filters": {"type": element_type}})
+
+        assert refused.value.field == "filters.type"
+        assert "cannot be filtered by type" in refused.value.message
+        mock_client.get_metering_element_definitions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_tells_the_caller_how_to_narrow_by_type(
+        self, manager, mock_client
+    ):
+        with pytest.raises(ToolError) as refused:
+            await manager.list_elements(mock_client, {"filters": {"type": "STRING"}})
+
+        assert "`type` field" in refused.value.message
+
+    @pytest.mark.asyncio
+    async def test_the_filter_keys_hint_no_longer_lists_type(self, manager, mock_client):
+        with pytest.raises(ToolError) as refused:
+            await manager.list_elements(mock_client, {"filters": {"label": "x"}})
+
+        assert "Valid filter keys for 'list': sort, source_ids" in str(refused.value)
+
+    @pytest.mark.asyncio
+    async def test_the_name_refusal_does_not_recommend_a_type_filter(
+        self, manager, mock_client
+    ):
+        with pytest.raises(ToolError) as refused:
+            await manager.list_elements(mock_client, {"name": "shipping"})
+
+        guidance = " ".join([refused.value.message, *refused.value.suggestions])
+        assert "'type'" not in guidance
+        assert "source_ids" in guidance
+
+    @pytest.mark.asyncio
+    async def test_the_registered_tool_flags_the_refusal(self, monkeypatch, tmp_path):
+        result, text = await call_domain_tool(
+            monkeypatch,
+            tmp_path,
+            "get_usage_meters",
+            {"action": "list", "filters": {"type": "STRING"}},
+        )
+
+        assert result.is_error is True, text
+        assert "cannot be filtered by type" in text
 
 
 # ===========================================================================
@@ -348,18 +411,16 @@ class TestCreateElement:
 
 
 class TestCreateFromTemplate:
-    """MeteringElementsManager.create_from_template — template-based creation."""
+    """MeteringElementsManager.resolve_template and create_resolved_template."""
 
-    @pytest.mark.asyncio
-    async def test_missing_template_name_raises(self, manager, mock_client):
+    def test_missing_template_name_raises(self, manager):
         with pytest.raises(Exception) as exc_info:
-            await manager.create_from_template(mock_client, {})
+            manager.resolve_template({})
         assert "template_name" in str(exc_info.value).lower()
 
-    @pytest.mark.asyncio
-    async def test_unknown_template_raises_validation_error(self, manager, mock_client):
+    def test_unknown_template_raises_validation_error(self, manager):
         with pytest.raises(Exception) as exc_info:
-            await manager.create_from_template(mock_client, {"template_name": "nonexistentTemplate"})
+            manager.resolve_template({"template_name": "nonexistentTemplate"})
         assert "not found" in str(exc_info.value).lower() or "template" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
@@ -369,8 +430,8 @@ class TestCreateFromTemplate:
             "id": "tmpl_elem",
             "name": template_name,
         }
-        result = await manager.create_from_template(
-            mock_client, {"template_name": template_name}
+        result = await manager.create_resolved_template(
+            mock_client, manager.resolve_template({"template_name": template_name})
         )
         assert result["id"] == "tmpl_elem"
         call_args = mock_client.create_metering_element_definition.call_args[0][0]
@@ -380,9 +441,11 @@ class TestCreateFromTemplate:
     async def test_template_overrides_applied(self, manager, mock_client):
         template_name = next(iter(manager.element_templates))
         mock_client.create_metering_element_definition.return_value = {"id": "e3"}
-        await manager.create_from_template(
+        await manager.create_resolved_template(
             mock_client,
-            {"template_name": template_name, "overrides": {"description": "Custom desc"}},
+            manager.resolve_template(
+                {"template_name": template_name, "overrides": {"description": "Custom desc"}}
+            ),
         )
         call_args = mock_client.create_metering_element_definition.call_args[0][0]
         assert call_args["description"] == "Custom desc"
@@ -572,7 +635,7 @@ class TestSourceAssignmentIsNotOffered:
         error = exc_info.value
         assert "REPLACES" in error.message
         assert "meteringElementDefinitions[].id" in error.message
-        assert error.examples["read_current_links"].startswith('manage_sources(action="get"')
+        assert error.examples["read_current_links"].startswith('get_sources(action="get"')
         assert "<existing id" in error.examples["link_elements"]
         assert "<new element id>" in error.examples["link_elements"]
 
@@ -582,7 +645,7 @@ class TestSourceAssignmentThroughAnalyticsRegistry:
     guidance as the tool, not the generic action rejection."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("tool_context", [{"_tool_name": "manage_metering_elements"}, {}])
+    @pytest.mark.parametrize("tool_context", [{"_tool_name": "manage_usage_meters"}, {}])
     async def test_registry_route_raises_the_shared_guidance(self, tool_context):
         from src.revenium_mcp_server.registries.analytics_registry import AnalyticsRegistry
         from src.revenium_mcp_server.tools_decomposed.metering_elements_management import (
@@ -782,7 +845,9 @@ class TestMeteringElementsManagementHandleAction:
     @pytest.mark.asyncio
     async def test_create_dry_run_valid_returns_dry_run_text(self, mgmt):
         with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
-            mock_gc.return_value = MagicMock()
+            mock_gc.return_value = MagicMock(
+                get_metering_element_definitions=AsyncMock(return_value=NO_USAGE_METERS)
+            )
             # Patch validator to return valid
             with patch.object(
                 mgmt.validator,
@@ -801,7 +866,8 @@ class TestMeteringElementsManagementHandleAction:
         assert "DRY RUN" in result[0].text
 
     @pytest.mark.asyncio
-    async def test_create_dry_run_invalid_returns_errors(self, mgmt):
+    async def test_create_dry_run_invalid_raises(self, mgmt):
+        """BACK-5086: an invalid preview refuses, so the error flag is set."""
         with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_gc.return_value = MagicMock()
             with patch.object(
@@ -814,13 +880,13 @@ class TestMeteringElementsManagementHandleAction:
                     "element_data": {},
                 },
             ):
-                result = await mgmt.handle_action(
-                    "create",
-                    {"element_data": {}, "dry_run": True},
-                )
-        assert isinstance(result[0], TextContent)
-        assert "DRY RUN" in result[0].text
-        assert "Validation Failed" in result[0].text or "Errors" in result[0].text
+                with pytest.raises(ToolError) as exc_info:
+                    await mgmt.handle_action(
+                        "create",
+                        {"element_data": {}, "dry_run": True},
+                    )
+        assert "Validation Failed" in exc_info.value.message
+        assert "Missing required field: name" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_create_validation_failure_returns_error_text(self, mgmt):
@@ -871,6 +937,7 @@ class TestMeteringElementsManagementHandleAction:
         template_name = next(iter(MeteringElementsManager().element_templates))
         with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
             mock_client = MagicMock()
+            mock_client.get_metering_element_definitions = AsyncMock(return_value=NO_USAGE_METERS)
             mock_client.create_metering_element_definition = AsyncMock(
                 return_value={"id": "elem_new", "name": template_name, "isSystem": False}
             )
@@ -885,28 +952,27 @@ class TestMeteringElementsManagementHandleAction:
         assert "existing system" not in text.lower()
 
     @pytest.mark.asyncio
-    async def test_create_from_template_existing_system_reports_returned(self, mgmt):
+    async def test_create_from_template_of_an_existing_system_element_is_refused(self, mgmt):
+        """BACK-920, BACK-5147: a template matching a system element creates nothing."""
         template_name = next(iter(MeteringElementsManager().element_templates))
-        with patch.object(mgmt, "get_client", new_callable=AsyncMock) as mock_gc:
-            mock_client = MagicMock()
-            mock_client.create_metering_element_definition = AsyncMock(
-                return_value={
-                    "id": "sys_elem",
-                    "name": template_name,
-                    "isSystem": True,
-                    "created": "2025-12-24",
-                }
-            )
-            mock_gc.return_value = mock_client
-            result = await mgmt.handle_action(
-                "create_from_template",
-                {"template_name": template_name},
-            )
-        text = result[0].text
-        assert "existing system metering element" in text.lower()
-        assert "created from template" not in text.lower()
-        assert "System elements cannot be modified" in text
+        system_element = {
+            "id": "sys_elem",
+            "name": template_name,
+            "isSystem": True,
+            "created": "2025-12-24",
+        }
+        mock_client = MagicMock()
+        mock_client.get_metering_element_definitions = AsyncMock(
+            return_value={"_embedded": {"elements": [system_element]}}
+        )
+        mock_client.create_metering_element_definition = AsyncMock(return_value=system_element)
+        with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(ToolError) as refused:
+                await mgmt.handle_action("create_from_template", {"template_name": template_name})
 
+        assert "already exists as element sys_elem" in refused.value.message
+        assert "system usage meter, which cannot be changed" in refused.value.message
+        mock_client.create_metering_element_definition.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_dry_run_refuses_an_unknown_template_like_the_real_create(self, mgmt):
@@ -1013,7 +1079,7 @@ from tests.unit._helpers_no_framework_leak import assert_no_framework_leak
 
 
 class TestMeteringElementsListPaginationValidation:
-    """BACK-1270 / item #5 — Pydantic leak guard on manage_metering_elements list."""
+    """BACK-1270 / item #5 — Pydantic leak guard on manage_usage_meters list."""
 
     @pytest.mark.asyncio
     async def test_list_rejects_float_size_with_structured_error(
@@ -1064,7 +1130,7 @@ class TestTemplateHintsNameRealTemplates:
         parts = []
         for args in ({}, {"template_name": "nope"}):
             with pytest.raises(ToolError) as exc:
-                await manager.create_from_template(MagicMock(), args)
+                manager.resolve_template(args)
             parts.append(str(exc.value.examples))
         with patch.object(mgmt, "get_client", new_callable=AsyncMock, return_value=MagicMock()):
             with pytest.raises(ToolError) as unknown:

@@ -197,7 +197,7 @@ PR_HEALTH_DIGEST_FIELDS: Tuple[PrHealthDigestField, ...] = (
     PrHealthDigestField(
         "slack_configuration_ids", "slackConfigurationIds", _validate_slack_configuration_ids,
         f"list[str] (optional, at most {PR_HEALTH_DIGEST_MAX_SLACK_CONFIGURATIONS}) - this "
-        "team's Slack channel connection ids (slack_management list_configurations); replaces the stored list, "
+        "team's Slack channel connection ids (get_slack list_configurations); replaces the stored list, "
         "[] clears it",
         {**_STRING_LIST, "maxItems": PR_HEALTH_DIGEST_MAX_SLACK_CONFIGURATIONS},
     ),

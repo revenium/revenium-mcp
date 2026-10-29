@@ -713,7 +713,7 @@ class TestCreateSimple:
 
         error = exc_info.value
         rendered = error.message + repr(error.suggestions) + repr(error.examples)
-        assert "manage_metering_elements(action='list')" in rendered
+        assert "get_usage_meters(action='list')" in rendered
         assert "0.005" in rendered
         client.get_sources.assert_not_awaited()
         client.create_product.assert_not_awaited()

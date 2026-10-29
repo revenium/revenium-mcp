@@ -4,12 +4,26 @@ This module implements ToolManagement(ToolBase) for the Revenium Tool
 Registry API, covering 26 actions: 9 CRUD, 4 event-metering, 10 analytics, 3 introspection.
 """
 
+import difflib
 import json
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, get_args
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    FrozenSet,
+    List,
+    NoReturn,
+    Optional,
+    Tuple,
+    Union,
+    get_args,
+)
 
 if TYPE_CHECKING:
     from ..analytics.tool_reports import ToolReportRead
@@ -21,6 +35,7 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent
 from ..analytics_parameters import TimePeriod
 from ..analytics_window import CALENDAR_RANGE_MAX_DAYS, CalendarRangeError, capped_utc_instant_bounds
 from ..client import ReveniumAPIError, ReveniumClient
+from ..common.tool_surface import public_tool_for
 from ..common.error_handling import (
     ErrorCodes,
     ToolError,
@@ -30,6 +45,7 @@ from ..common.error_handling import (
 )
 from ..common.formatting import format_page_count_heading
 from ..common.sample_coverage import platform_total
+from ..common.tool_surface import tool_call
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..introspection.metadata import (
     ToolCapability,
@@ -232,18 +248,37 @@ def _tool_type_values() -> Tuple[str, ...]:
     )
 
 
-# BACK-2936: ToolResource has no version property (its properties are _links,
-# configSource, created, description, enabled, id, label, name, plan, pricing,
-# resourceType, team, teamId, toolId, toolProvider, toolType, updated), so a
-# version sent on a write was accepted, reported as success and discarded. The
-# field is no longer advertised, and supplying it is refused rather than
-# silently dropped.
-_UNSUPPORTED_TOOL_FIELDS: Dict[str, str] = {
-    "version": (
-        "The platform's tool record has no version field, so a value sent here "
-        "would be accepted and then discarded, and no read would ever return it."
-    ),
+# The ToolResource fields a create or update writes (specs/openapi/hypercurrent.json).
+# The platform ignores any other key without an error, so a misspelled or
+# invented field read as success and changed nothing (BACK-2936 for version,
+# BACK-5083 for the rest).
+_TOOL_WRITE_FIELDS: Tuple[str, ...] = (
+    "name",
+    "toolId",
+    "toolType",
+    "toolProvider",
+    "description",
+    "enabled",
+    "pricing",
+    "teamId",
+)
+# The rest of the record, which the platform sets itself, each with the write
+# that changes it. An update may echo these back unchanged from a get.
+_PLATFORM_SET_TOOL_FIELDS: Dict[str, str] = {
+    "id": "",
+    "label": "send name to change it",
+    "plan": "send pricing to change it",
+    "team": "send teamId to change it",
+    "created": "",
+    "updated": "",
+    "resourceType": "",
+    "configSource": "",
+    "_links": "",
 }
+_NO_VERSION_FIELD_REASON = (
+    "The platform's tool record has no version field, so a value sent here "
+    "would be accepted and then discarded, and no read would ever return it."
+)
 
 
 # BACK-4696: the platform PUT requires name, toolId and toolType, keeps the
@@ -258,20 +293,190 @@ _PARTIAL_UPDATE_NOTE = (
 )
 
 
-def _reject_unsupported_tool_fields(tool_data: Dict[str, Any]) -> None:
-    """Refuse fields the Tool Registry does not store, instead of dropping them."""
-    for field, reason in _UNSUPPORTED_TOOL_FIELDS.items():
-        if field in tool_data:
-            raise create_structured_validation_error(
-                message=f"tool_data.{field} is not supported by the Tool Registry. {reason}",
-                field=f"tool_data.{field}",
-                value=tool_data[field],
-                suggestions=[
-                    f"Remove '{field}' from tool_data and retry",
-                    "Carry the version in the tool name or description if you need to track it",
-                    "Use get_capabilities() to see the fields the tool record actually stores",
-                ],
-            )
+def _folded(key: str) -> str:
+    return key.replace("_", "").replace("-", "").lower()
+
+
+def _stored_spelling(key: str) -> Optional[str]:
+    """The written tool field ``key`` most likely means, or None."""
+    for field in _TOOL_WRITE_FIELDS:
+        if _folded(field) == _folded(key):
+            return field
+    close = difflib.get_close_matches(key, _TOOL_WRITE_FIELDS, n=1, cutoff=0.6)
+    return close[0] if close else None
+
+
+def _refused_key_label(key: str) -> str:
+    if key in _PLATFORM_SET_TOOL_FIELDS:
+        hint = _PLATFORM_SET_TOOL_FIELDS[key]
+        return f"{key} (set by the platform; {hint})" if hint else f"{key} (set by the platform)"
+    spelling = _stored_spelling(key)
+    return f"{key} (did you mean {spelling}?)" if spelling else key
+
+
+def _refused_key_suggestions(refused: List[str]) -> List[str]:
+    renames = [
+        f"Send {spelling} instead of {key}"
+        for key in refused
+        if key not in _PLATFORM_SET_TOOL_FIELDS and (spelling := _stored_spelling(key))
+    ]
+    suggestions = [*renames, f"Remove {', '.join(refused)} from tool_data and retry"]
+    if "version" in refused:
+        suggestions.append("Carry the version in the tool name or description if you need to track it")
+    suggestions.append(f"Use {tool_call('manage_tools', 'get_capabilities')} to see the fields the tool record stores")
+    return suggestions
+
+
+def _refuse_tool_fields(refused: List[str], tool_data: Dict[str, Any]) -> NoReturn:
+    message = (
+        f"The Tool Registry cannot write tool_data {', '.join(_refused_key_label(key) for key in refused)}. "
+        "Nothing was sent: the platform ignores these keys and would have reported success. "
+        f"Fields a create or update writes: {', '.join(_TOOL_WRITE_FIELDS)}."
+    )
+    if "version" in refused:
+        message += f" {_NO_VERSION_FIELD_REASON}"
+    raise create_structured_validation_error(
+        message=message,
+        field=f"tool_data.{refused[0]}",
+        value={key: tool_data[key] for key in refused},
+        suggestions=_refused_key_suggestions(refused),
+        examples={"stored_fields": list(_TOOL_WRITE_FIELDS)},
+    )
+
+
+def _reject_unstored_tool_fields(tool_data: Dict[str, Any], *, echo_allowed: bool = False) -> None:
+    """Refuse every tool_data key a write cannot store, before any request.
+
+    With ``echo_allowed`` the platform-set keys of a get record pass here and
+    are compared with the stored tool by ``_reject_changed_platform_fields``.
+    """
+    accepted = set(_TOOL_WRITE_FIELDS) | (set(_PLATFORM_SET_TOOL_FIELDS) if echo_allowed else set())
+    refused = [key for key in tool_data if key not in accepted]
+    if refused:
+        _refuse_tool_fields(refused, tool_data)
+
+
+def _reject_changed_platform_fields(tool_data: Dict[str, Any], stored: Dict[str, Any]) -> None:
+    """Refuse a platform-set key whose value differs from the stored tool's."""
+    changed = [
+        key for key in tool_data if key in _PLATFORM_SET_TOOL_FIELDS and tool_data[key] != stored.get(key)
+    ]
+    if changed:
+        _refuse_tool_fields(changed, tool_data)
+
+
+# Observed on dev 2026-10-28: the registry GET answers 400 for a value that is
+# not a registry id at all and 403 for an unknown or deleted one; the by-toolId
+# GET answers 404. A 5xx is not read as "no such tool" by the event lookups,
+# because that refusal tells the caller to register the tool again.
+_NO_SUCH_TOOL: FrozenSet[int] = frozenset({403, 404})
+_NOT_A_REGISTRY_ID: FrozenSet[int] = _NO_SUCH_TOOL | {400}
+# BACK-1098: get and get_by_tool_id keep folding a 500 into "Tool not found",
+# the answer the registry gave for a missing id when they were written.
+_TOOL_READ_NOT_FOUND: FrozenSet[int] = _NO_SUCH_TOOL | {500}
+
+
+async def _tool_or_none(
+    lookup: Callable[[str], Awaitable[Dict[str, Any]]],
+    value: str,
+    missing: FrozenSet[int],
+) -> Optional[Dict[str, Any]]:
+    try:
+        return await lookup(value)
+    except ReveniumAPIError as error:
+        if error.status_code in missing:
+            return None
+        raise
+
+
+@dataclass(frozen=True)
+class _EventToolLookup:
+    """What an event action says when the tool_id it was given cannot be resolved."""
+
+    nothing_done: str
+    unregistered_suggestions: Tuple[str, ...]
+    as_given: str
+
+
+_RECORD_LOOKUP = _EventToolLookup(
+    nothing_done=(
+        "Nothing was recorded: the metering endpoint registers an unknown toolId as a new "
+        "tool and meters the event against it."
+    ),
+    unregistered_suggestions=(
+        f"Register the tool first with {tool_call('manage_tools', 'create_simple', tool_name='...')}",
+    ),
+    as_given=(
+        f"{tool_call('manage_tools', 'meter_event', event_data={'toolId': '...'})} records "
+        "against a toolId exactly as given, and registers it as a new tool if it is unknown"
+    ),
+)
+_READ_LOOKUP = _EventToolLookup(
+    nothing_done="No events were read.",
+    unregistered_suggestions=(
+        "Events of a deleted tool stay readable with "
+        f"{tool_call('manage_tools', 'list_events', filters={'tool_id': '...'})}",
+    ),
+    as_given=(
+        f"{tool_call('manage_tools', 'list_events', filters={'tool_id': '...'})} reads the "
+        "events of a toolId exactly as given"
+    ),
+)
+_FIND_THE_ID = f"Find the tool's registry id with {tool_call('manage_tools', 'list')}"
+
+_SIMPLE_PRICING_ELEMENT_NAMES: Dict[str, str] = {
+    "per_request": "requests",
+    "tiered": "requests",
+    "flat": "access",
+}
+
+
+def _pricing_help_suggestion() -> str:
+    return f"Use {tool_call('manage_tools', 'get_pricing_help')} for pricing structure reference"
+
+
+def _simple_pricing(pricing_model: str, unit_price: Any) -> Dict[str, Any]:
+    element = {
+        "name": _SIMPLE_PRICING_ELEMENT_NAMES[pricing_model],
+        "unitPrice": unit_price,
+        "aggregationType": "COUNT",
+    }
+    return {"currency": "USD", "elements": [element]}
+
+
+def _volume_tiers(unit_price: float) -> List[Dict[str, Any]]:
+    return [
+        {"upTo": 1000, "unitPrice": unit_price},
+        {"upTo": 10000, "unitPrice": round(unit_price * 0.8, 6)},
+        {"upTo": None, "unitPrice": round(unit_price * 0.5, 6)},
+    ]
+
+
+def _refuse_unregistered_tool(tool_id: str, lookup: _EventToolLookup) -> NoReturn:
+    raise ToolError(
+        message=f"No registered tool has the registry id or toolId {tool_id!r}. {lookup.nothing_done}",
+        error_code=ErrorCodes.RESOURCE_NOT_FOUND,
+        field="tool_id",
+        value=tool_id,
+        suggestions=[
+            _FIND_THE_ID,
+            *lookup.unregistered_suggestions,
+            "IDs are case-sensitive; copy them verbatim",
+        ],
+    )
+
+
+def _refuse_unresolvable_tool_id(tool_id: str, lookup: _EventToolLookup) -> NoReturn:
+    raise ToolError(
+        message=(
+            f"{tool_id!r} cannot be checked against the Tool Registry: it has no lookup for a "
+            f"toolId containing '/'. {lookup.nothing_done}"
+        ),
+        error_code=ErrorCodes.VALIDATION_ERROR,
+        field="tool_id",
+        value=tool_id,
+        suggestions=[f"{_FIND_THE_ID} and pass that instead", lookup.as_given],
+    )
 
 
 class ToolManager:
@@ -329,17 +534,16 @@ class ToolManager:
                 parameter_name="tool_id",
                 action="get tool",
                 examples={
-                    "usage": "get(tool_id='tool_123')",
+                    "usage": "get(tool_id='X5oon5')",
                     "valid_format": "Tool ID should be a string identifier",
                 },
             )
         try:
             return await self.client.get_tool(tool_id)
         except ReveniumAPIError as e:
-            # Tool Registry returns 500 for missing IDs and 403 for deleted
-            # IDs; both fold into "Tool not found" so callers see consistent
-            # semantics and no cross-tenant existence can be inferred.
-            if e.status_code in (403, 404, 500):
+            # See _TOOL_READ_NOT_FOUND. Folding these into "Tool not found"
+            # also keeps cross-tenant existence from being inferred.
+            if e.status_code in _TOOL_READ_NOT_FOUND:
                 self._raise_tool_not_found(tool_id, lookup="id")
             raise
 
@@ -358,7 +562,7 @@ class ToolManager:
         try:
             return await self.client.get_tool_by_tool_id(tool_id)
         except ReveniumAPIError as e:
-            if e.status_code in (403, 404, 500):
+            if e.status_code in _TOOL_READ_NOT_FOUND:
                 self._raise_tool_not_found(tool_id, lookup="toolId")
             raise
 
@@ -370,23 +574,23 @@ class ToolManager:
                 parameter_name="tool_data",
                 action="create tool",
                 examples={
-                    "usage": "create(tool_data={'name': 'My Tool', 'type': 'api'})",
+                    "usage": tool_call(
+                        "manage_tools",
+                        "create",
+                        tool_data={"name": "My Tool", "toolId": "my-tool", "toolType": "MCP_SERVER"},
+                    ),
                     "required_fields": ["name"],
                 },
             )
-        _reject_unsupported_tool_fields(tool_data)
+        _reject_unstored_tool_fields(tool_data)
         if "pricing" in tool_data:
-            errors = self._validate_tool_pricing(tool_data["pricing"])
-            if errors:
-                raise create_structured_validation_error(
-                    message=f"Tool pricing validation failed: {'; '.join(errors)}",
-                    field="pricing",
-                    value=tool_data["pricing"],
-                    suggestions=[
-                        "Use get_pricing_help action for pricing structure reference",
-                        "Use create_simple action for convenience pricing setup",
-                    ],
-                )
+            self._require_valid_pricing(
+                tool_data["pricing"],
+                [
+                    _pricing_help_suggestion(),
+                    "Use create_simple action for convenience pricing setup",
+                ],
+            )
         # Inject teamId from auth context — server requires it and rejects with HTTP 400
         # otherwise. Mirrors the pattern used by create_simple and customer_management
         # subscriber/team creation. See BACK-1095 (and BACK-911 for the broader pattern).
@@ -401,27 +605,18 @@ class ToolManager:
             raise create_structured_missing_parameter_error(
                 parameter_name="tool_id",
                 action="update tool",
-                examples={"usage": "update(tool_id='tool_123', tool_data={...})"},
+                examples={"usage": "update(tool_id='X5oon5', tool_data={...})"},
             )
         tool_data = arguments.get("tool_data", {})
         if not tool_data:
             raise create_structured_missing_parameter_error(
                 parameter_name="tool_data",
                 action="update tool",
-                examples={"usage": "update(tool_id='tool_123', tool_data={'name': 'Updated Name'})"},
+                examples={"usage": "update(tool_id='X5oon5', tool_data={'name': 'Updated Name'})"},
             )
-        _reject_unsupported_tool_fields(tool_data)
+        _reject_unstored_tool_fields(tool_data, echo_allowed=True)
         if "pricing" in tool_data:
-            errors = self._validate_tool_pricing(tool_data["pricing"])
-            if errors:
-                raise create_structured_validation_error(
-                    message=f"Tool pricing validation failed: {'; '.join(errors)}",
-                    field="pricing",
-                    value=tool_data["pricing"],
-                    suggestions=[
-                        "Use get_pricing_help action for pricing structure reference",
-                    ],
-                )
+            self._require_valid_pricing(tool_data["pricing"], [_pricing_help_suggestion()])
         stored = await self.get_tool({"tool_id": tool_id})
         if not isinstance(stored, dict) or not stored.get("toolId") or not stored.get("toolType"):
             raise ToolError(
@@ -431,8 +626,9 @@ class ToolManager:
                 value=tool_id,
                 suggestions=["Check the id with get or list"],
             )
+        _reject_changed_platform_fields(tool_data, stored)
         body = {field: stored[field] for field in _TOOL_PUT_FIELDS if stored.get(field) is not None}
-        body.update(tool_data)
+        body.update({field: value for field, value in tool_data.items() if field in _TOOL_WRITE_FIELDS})
         body.setdefault("teamId", self.client.team_id)
         return await self.client.update_tool(tool_id, body)
 
@@ -443,7 +639,7 @@ class ToolManager:
             raise create_structured_missing_parameter_error(
                 parameter_name="tool_id",
                 action="delete tool",
-                examples={"usage": "delete(tool_id='tool_123')"},
+                examples={"usage": "delete(tool_id='X5oon5')"},
             )
         return await self.client.delete_tool(tool_id)
 
@@ -562,6 +758,24 @@ class ToolManager:
         """Get average execution duration per tool."""
         return await self.read_tool_report("get_latency", arguments)
 
+    async def _registered_tool_id(self, tool_id: str, lookup: _EventToolLookup) -> str:
+        """The toolId of the registered tool ``tool_id`` names, read as a registry id first.
+
+        The event endpoints key on toolId while get, update and delete take the
+        registry id, and the metering ingest registers any toolId it has not
+        seen as a new tool (BACK-5127), so a value naming no tool is refused.
+        """
+        tool = await _tool_or_none(self.client.get_tool, tool_id, _NOT_A_REGISTRY_ID)
+        if tool is None:
+            if "/" in tool_id:
+                _refuse_unresolvable_tool_id(tool_id, lookup)
+            tool = await _tool_or_none(
+                self.client.get_tool_by_tool_id, tool_id, _NO_SUCH_TOOL
+            )
+        if not tool or not tool.get("toolId"):
+            _refuse_unregistered_tool(tool_id, lookup)
+        return str(tool["toolId"])
+
     async def record_event(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Record an event for a specific tool via per-tool endpoint."""
         tool_id = arguments.get("tool_id")
@@ -569,7 +783,7 @@ class ToolManager:
             raise create_structured_missing_parameter_error(
                 parameter_name="tool_id",
                 action="record tool event",
-                examples={"usage": "record_event(tool_id='tool_123', event_data={...})"},
+                examples={"usage": "record_event(tool_id='X5oon5', event_data={...})"},
             )
         event_data = arguments.get("event_data", {})
         if not event_data:
@@ -577,10 +791,11 @@ class ToolManager:
                 parameter_name="event_data",
                 action="record tool event",
                 examples={
-                    "usage": "record_event(tool_id='tool_123', event_data={'type': 'invocation', 'durationMs': 150})"
+                    "usage": "record_event(tool_id='X5oon5', event_data={'type': 'invocation', 'durationMs': 150})"
                 },
             )
-        return await self.client.record_tool_event(tool_id, event_data)
+        registered = await self._registered_tool_id(tool_id, _RECORD_LOOKUP)
+        return await self.client.record_tool_event(registered, event_data)
 
     async def get_events(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Get events for a specific tool via per-tool endpoint."""
@@ -589,12 +804,13 @@ class ToolManager:
             raise create_structured_missing_parameter_error(
                 parameter_name="tool_id",
                 action="get tool events",
-                examples={"usage": "get_events(tool_id='tool_123', page=0, size=20)"},
+                examples={"usage": "get_events(tool_id='X5oon5', page=0, size=20)"},
             )
         arguments = validate_pagination_params(arguments, action="get tool events")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        return await self.client.get_tool_events(tool_id, page=page, size=size)
+        registered = await self._registered_tool_id(tool_id, _READ_LOOKUP)
+        return await self.client.get_tool_events(registered, page=page, size=size)
 
     async def get_cost_aggregated(self, arguments: Dict[str, Any]) -> "ToolReportRead":
         """Get aggregated cost per tool."""
@@ -641,7 +857,6 @@ class ToolManager:
             )
 
         pricing_model = arguments.get("pricing_model", "per_request")
-        per_unit_price = float(arguments.get("per_unit_price", 0.01))
 
         tool_data = {
             "name": name,
@@ -657,7 +872,7 @@ class ToolManager:
             raise create_structured_validation_error(
                 message=(
                     "tool_version is not supported by the Tool Registry. "
-                    + _UNSUPPORTED_TOOL_FIELDS["version"]
+                    + _NO_VERSION_FIELD_REASON
                 ),
                 field="tool_version",
                 value=arguments.get("tool_version") or arguments.get("version"),
@@ -668,45 +883,16 @@ class ToolManager:
                 ],
             )
 
-        if pricing_model == "per_request":
-            tool_data["pricing"] = {
-                "currency": "USD",
-                "elements": [{
-                    "name": "requests",
-                    "unitPrice": per_unit_price,
-                    "aggregationType": "COUNT",
-                }],
-            }
-        elif pricing_model == "tiered":
-            tool_data["pricing"] = {
-                "currency": "USD",
-                "elements": [{
-                    "name": "requests",
-                    "unitPrice": per_unit_price,
-                    "aggregationType": "COUNT",
-                    "tiers": [
-                        {"upTo": 1000, "unitPrice": per_unit_price},
-                        {"upTo": 10000, "unitPrice": round(per_unit_price * 0.8, 6)},
-                        {"upTo": None, "unitPrice": round(per_unit_price * 0.5, 6)},
-                    ],
-                }],
-            }
-        elif pricing_model == "flat":
-            tool_data["pricing"] = {
-                "currency": "USD",
-                "elements": [{
-                    "name": "access",
-                    "unitPrice": per_unit_price,
-                    "aggregationType": "COUNT",
-                }],
-            }
-        else:
+        if pricing_model not in _SIMPLE_PRICING_ELEMENT_NAMES:
             raise create_structured_validation_error(
                 message=f"Unknown pricing_model '{pricing_model}'",
                 field="pricing_model",
                 value=pricing_model,
                 suggestions=["Use one of: per_request, tiered, flat"],
             )
+        tool_data["pricing"] = self._create_simple_pricing(
+            pricing_model, arguments.get("per_unit_price", 0.01)
+        )
 
         return await self.client.create_tool(tool_data)
 
@@ -786,6 +972,40 @@ class ToolManager:
                 },
             },
         }
+
+    def _create_simple_pricing(self, pricing_model: str, per_unit_price: Any) -> Dict[str, Any]:
+        """The pricing create_simple sends, refusing every price create refuses."""
+        self._require_valid_pricing(
+            _simple_pricing(pricing_model, per_unit_price),
+            [
+                "Pass per_unit_price as a number of 0 or more, e.g. per_unit_price=0.01",
+                _pricing_help_suggestion(),
+            ],
+            field="per_unit_price",
+            value=per_unit_price,
+        )
+        unit_price = float(per_unit_price)
+        pricing = _simple_pricing(pricing_model, unit_price)
+        if pricing_model == "tiered":
+            pricing["elements"][0]["tiers"] = _volume_tiers(unit_price)
+        return pricing
+
+    def _require_valid_pricing(
+        self,
+        pricing: Dict[str, Any],
+        suggestions: List[str],
+        *,
+        field: str = "pricing",
+        value: Any = None,
+    ) -> None:
+        errors = self._validate_tool_pricing(pricing)
+        if errors:
+            raise create_structured_validation_error(
+                message=f"Tool pricing validation failed: {'; '.join(errors)}",
+                field=field,
+                value=pricing if value is None else value,
+                suggestions=suggestions,
+            )
 
     @staticmethod
     def _coerce_decimal(
@@ -919,7 +1139,10 @@ class ToolManagement(ToolBase):
                 "tool_id": {
                     "type": "string",
                     "description": (
-                        "Tool identifier for CRUD and event operations; among the analytics "
+                        "Tool identifier. get, update, replace and delete take the registry id "
+                        "that create and list return; get_by_tool_id takes the team-scoped toolId; "
+                        "record_event and get_events take either and send the tool's toolId, "
+                        "refusing a value that names no registered tool. Among the analytics "
                         "actions only get_cost_breakdown takes it (sent as toolIds)"
                     ),
                 },
@@ -929,7 +1152,11 @@ class ToolManagement(ToolBase):
                 },
                 "tool_data": {
                     "type": "object",
-                    "description": "Tool configuration data for create, update, or replace operations",
+                    "description": (
+                        "Tool configuration data for create, update, or replace operations. "
+                        "Only the fields listed here are stored; a call with any other key sends nothing."
+                    ),
+                    "additionalProperties": False,
                     "properties": {
                         "name": {"type": "string", "description": "Tool name (required for creation)"},
                         "toolId": {"type": "string", "description": "Team-scoped tool identifier"},
@@ -943,6 +1170,7 @@ class ToolManagement(ToolBase):
                         "toolProvider": {"type": "string", "description": "Tool provider (e.g. 'anthropic')"},
                         "description": {"type": "string", "description": "Tool description"},
                         "enabled": {"type": "boolean", "description": "Whether tool is enabled (default: true)"},
+                        "teamId": {"type": "string", "description": "Owning team (default: the authenticated team)"},
                         "pricing": {
                             "type": "object",
                             "description": "Pricing configuration (same tiered structure as product plans). Use get_pricing_help for details.",
@@ -1184,29 +1412,30 @@ class ToolManagement(ToolBase):
                 ),
                 parameters={
                     "list": {"page": "int (optional)", "size": "int (optional)"},
-                    "get": {"tool_id": "str (system UUID)"},
+                    "get": {"tool_id": "str (registry id from create or list)"},
                     "get_by_tool_id": {"tool_id": "str (team-scoped toolId)"},
                     "create": {"tool_data": "dict (required: name, toolType, pricing)"},
                     "create_simple": {"tool_name": "str", "pricing_model": "str", "per_unit_price": "float"},
-                    "update": {"tool_id": "str", "tool_data": "dict (partial update)"},
-                    "replace": {"tool_id": "str", "tool_data": "dict (alias for update; partial update)"},
-                    "delete": {"tool_id": "str (permanent, cannot be undone)"},
+                    "update": {"tool_id": "str (registry id)", "tool_data": "dict (partial update)"},
+                    "replace": {"tool_id": "str (registry id)", "tool_data": "dict (alias for update; partial update)"},
+                    "delete": {"tool_id": "str (registry id; permanent, cannot be undone)"},
                     "search": {"query": "str", "page": "int (optional)", "size": "int (optional)"},
                 },
                 examples=[
                     "list(page=0, size=20)",
-                    "get(tool_id='abc-123')",
+                    "get(tool_id='X5oon5')",
                     "create_simple(tool_name='My API', pricing_model='per_request', per_unit_price=0.005)",
                     "create(tool_data={'name': 'My Tool', 'toolType': 'MCP_SERVER', 'pricing': {...}})",
+                    "update(tool_id='X5oon5', tool_data={'toolProvider': 'internal'})",
                     "search(query='billing')",
-                    "delete(tool_id='tool_123')",
+                    "delete(tool_id='X5oon5')",
                 ],
                 limitations=[
                     "Requires valid API authentication",
                     "Tool names must be unique within the organization",
                     "id is fixed after creation; toolId and toolType can be changed with update "
                     "(a toolId already used in the organization is refused)",
-                    "get uses system UUID; get_by_tool_id uses team-scoped toolId",
+                    "get, update and delete use the registry id; get_by_tool_id uses the team-scoped toolId",
                     _PARTIAL_UPDATE_NOTE,
                     "delete is permanent — the Tool Registry API has no restore endpoint, so a "
                     "deleted tool has to be created again from scratch",
@@ -1227,7 +1456,7 @@ class ToolManagement(ToolBase):
                         )
                     },
                     "record_event": {
-                        "tool_id": "str",
+                        "tool_id": "str (registry id from create or list, or the tool's toolId)",
                         "event_data": (
                             "dict (durationMs, success, timestamp optional; toolId is taken "
                             "from tool_id; agenticJobId optional — links the cost to an "
@@ -1239,8 +1468,8 @@ class ToolManagement(ToolBase):
                     "meter_event(event_data={'toolId': 'tool_123', 'durationMs': 1500, 'success': True})",
                     "meter_event(event_data={'toolId': 'tool_123', 'durationMs': 1500, 'success': True, "
                     "'agenticJobId': 'job-abc-123'})",
-                    "record_event(tool_id='tool_123', event_data={'durationMs': 150, 'success': True})",
-                    "record_event(tool_id='tool_123', event_data={'durationMs': 150, 'agenticJobId': 'job-abc-123'})",
+                    "record_event(tool_id='X5oon5', event_data={'durationMs': 150, 'success': True})",
+                    "record_event(tool_id='X5oon5', event_data={'durationMs': 150, 'agenticJobId': 'job-abc-123'})",
                 ],
                 limitations=[
                     "Events are append-only and cannot be modified after creation",
@@ -1274,22 +1503,22 @@ class ToolManagement(ToolBase):
                         "page": "int (optional)",
                         "size": "int (optional)",
                         "filters": (
-                            "dict (optional, e.g. {'toolId': 'tool_123'}). Supports 'query' for "
+                            "dict (optional, e.g. {'tool_id': 'my-tool'}). Supports 'query' for "
                             "server-side search: exact transaction-ID match for UUID terms, then "
                             "partial match across tool name, tool ID and resource/operation"
                         ),
                     },
                     "get_events": {
-                        "tool_id": "str",
+                        "tool_id": "str (registry id from create or list, or the tool's toolId)",
                         "page": "int (optional)",
                         "size": "int (optional)",
                     },
                 },
                 examples=[
                     "list_events(page=0, size=20)",
-                    "list_events(filters={'toolId': 'tool_123'})",
+                    "list_events(filters={'tool_id': 'my-tool'})",
                     "list_events(filters={'query': 'vector-search'})",
-                    "get_events(tool_id='tool_123', page=0, size=20)",
+                    "get_events(tool_id='X5oon5', page=0, size=20)",
                 ],
                 limitations=[
                     "Read-only by design — creating, updating or deleting a logged usage event is "
@@ -1380,10 +1609,11 @@ class ToolManagement(ToolBase):
 
     async def _get_agent_summary(self) -> str:
         return (
-            "manage_tools is the central tool for registering, configuring, and monitoring tools "
-            "in the Revenium platform. It supports full CRUD on tool registry entries (deletion is "
-            "permanent), event metering for billing, analytics (cost, latency, success rate), and "
-            "pricing model discovery. Analytics are only available once events have been metered. "
+            f"{public_tool_for(self.tool_name, 'list')} and {public_tool_for(self.tool_name, 'create')} "
+            "register, configure and monitor tools in the Revenium platform: the first reads the "
+            "registry, its analytics (cost, latency, success rate) and pricing model discovery; the "
+            "second creates, updates and deletes entries (deletion is permanent) and meters events "
+            "for billing. Analytics are only available once events have been metered. "
             "Start with get_capabilities or list to explore the registry, use create_simple for quick "
             "onboarding, and meter_event to record usage for monetization."
         )
@@ -1399,14 +1629,14 @@ class ToolManagement(ToolBase):
 
     async def _get_troubleshooting_tips(self) -> List[str]:
         return [
-            "Use get_by_tool_id for the team-scoped toolId field; use get for the system UUID",
+            "Use get_by_tool_id for the team-scoped toolId field; use get for the registry id that create and list return",
             "create requires a pricing.elements array; use create_simple for a shortcut",
             "delete is permanent and there is no restore action: confirm the tool_id before deleting, "
             "and re-create the entry with create or create_simple if it was removed by mistake",
             "Analytics return empty results when no events have been metered for the tool",
             "Tool cost that does not attribute to an agentic job was metered without "
             "agenticJobId in event_data; pass the same identifier the job reports on its "
-            "AI completion events (manage_jobs get_job / get_job_roi)",
+            "AI completion events (get_jobs get_job / get_job_roi)",
             "The usage event log is read-only: list_events / get_events read it, meter_event / "
             "record_event add to it, and no action edits or removes a logged event",
             "Ensure tool_data includes 'name' and 'toolType' when using create",
@@ -1432,7 +1662,7 @@ class ToolManagement(ToolBase):
                     "schema": await self._get_input_schema(),
                     "examples": {
                         "list": {"action": "list", "page": 0, "size": 20},
-                        "get": {"action": "get", "tool_id": "tool_123"},
+                        "get": {"action": "get", "tool_id": "X5oon5"},
                         "get_by_tool_id": {"action": "get_by_tool_id", "tool_id": "my-tool-id"},
                         "create": {
                             "action": "create",
@@ -1444,6 +1674,11 @@ class ToolManagement(ToolBase):
                                     "elements": [{"name": "requests", "unitPrice": 0.01, "aggregationType": "COUNT"}],
                                 },
                             },
+                        },
+                        "update": {
+                            "action": "update",
+                            "tool_id": "X5oon5",
+                            "tool_data": {"toolProvider": "internal", "description": "Updated description"},
                         },
                         "create_simple": {
                             "action": "create_simple",
@@ -1464,7 +1699,7 @@ class ToolManagement(ToolBase):
                         "list_events": {"action": "list_events", "page": 0, "size": 20},
                         "record_event": {
                             "action": "record_event",
-                            "tool_id": "tool_123",
+                            "tool_id": "X5oon5",
                             "event_data": {
                                 "type": "invocation",
                                 "durationMs": 150,
@@ -1472,7 +1707,7 @@ class ToolManagement(ToolBase):
                                 "agenticJobId": "job-abc-123",
                             },
                         },
-                        "get_events": {"action": "get_events", "tool_id": "tool_123", "page": 0, "size": 20},
+                        "get_events": {"action": "get_events", "tool_id": "X5oon5", "page": 0, "size": 20},
                         "get_cost_breakdown": {"action": "get_cost_breakdown"},
                         "get_cost_aggregated": {"action": "get_cost_aggregated"},
                         "get_top_tools": {"action": "get_top_tools"},
@@ -1620,11 +1855,8 @@ class ToolManagement(ToolBase):
                 return [TextContent(type="text", text=f"Tool Pricing Guide:\n{json.dumps(result, indent=2)}")]
 
             else:
-                supported = await self._get_supported_actions()
                 # BACK-2937: raise so the envelope carries the error flag.
-                raise_unknown_action_error(
-                    action, hint=f"Supported actions: {', '.join(supported)}"
-                )
+                raise_unknown_action_error(action)
 
         except ToolError as e:
             logger.error(f"Tool error in manage_tools: {e}")

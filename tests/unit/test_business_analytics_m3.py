@@ -854,7 +854,7 @@ class TestMetadataProviderMethods:
 
     @pytest.mark.asyncio
     async def test_tool_name_class_var(self, tool):
-        assert tool.tool_name == "business_analytics_management"
+        assert tool.tool_name == "get_business_analytics"
 
     @pytest.mark.asyncio
     async def test_tool_version_class_var(self, tool):
@@ -2888,7 +2888,7 @@ def frozen_now(monkeypatch):
 
 
 async def _registered_answer(monkeypatch, reports, arguments):
-    """The answer the registered business_analytics_management tool gives, strings and all."""
+    """The answer the registered get_business_analytics tool gives, strings and all."""
     from fastmcp import Client, FastMCP
 
     from src.revenium_mcp_server.config_store import get_config_store
@@ -2911,7 +2911,7 @@ async def _registered_answer(monkeypatch, reports, arguments):
     await registry._register_business_analytics_management(mcp)
     async with Client(mcp) as client:
         result = await client.call_tool(
-            "business_analytics_management", arguments, raise_on_error=False
+            "get_business_analytics", arguments, raise_on_error=False
         )
     return "\n".join(getattr(block, "text", "") for block in result.content)
 

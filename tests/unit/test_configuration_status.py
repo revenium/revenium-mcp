@@ -6,6 +6,7 @@ onboarding status, and system health reports.
 """
 
 import pytest
+from src.revenium_mcp_server.common.error_handling import ToolError
 from unittest.mock import AsyncMock, patch, MagicMock
 from mcp.types import TextContent
 
@@ -60,10 +61,11 @@ class TestHandleActionRouting:
         assert "auto_discovery" in text
 
     @pytest.mark.asyncio
-    async def test_unknown_action_returns_structured_error(self, config_tool):
+    async def test_unknown_action_raises_a_structured_error(self, config_tool):
         """Unknown action returns structured error with list of valid actions."""
-        result = await config_tool.handle_action("nonexistent_action", {})
-        text = result[0].text
+        with pytest.raises(ToolError) as refused:
+            await config_tool.handle_action("nonexistent_action", {})
+        text = refused.value.message
         assert "nonexistent_action" in text or "Unknown" in text
         # Should mention valid actions
         assert "environment_variables" in text
@@ -124,13 +126,14 @@ class TestHandleActionRouting:
         config_tool._handle_system_health.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_handler_exception_returns_error_text(self, config_tool):
-        """Generic exception in handler returns error TextContent, not a raise."""
+    async def test_handler_exception_raises_a_tool_error(self, config_tool):
+        """BACK-5086: a generic exception in a handler raises a flagged TOOL_ERROR."""
         config_tool._handle_environment_variables = AsyncMock(
             side_effect=RuntimeError("boom")
         )
-        result = await config_tool.handle_action("environment_variables", {})
-        text = result[0].text
+        with pytest.raises(ToolError) as refused:
+            await config_tool.handle_action("environment_variables", {})
+        text = refused.value.message
         assert "Failed to execute" in text or "error" in text.lower()
 
 

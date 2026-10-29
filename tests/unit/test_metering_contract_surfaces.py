@@ -740,7 +740,7 @@ class TestRecentTransactionsPageSize:
 
         async with Client(in_process_metering["server"]) as mcp_client:
             result = await mcp_client.call_tool(
-                "manage_metering", {"action": "lookup_recent_transactions", **arguments}
+                "get_metering", {"action": "lookup_recent_transactions", **arguments}
             )
 
         text = result.content[0].text

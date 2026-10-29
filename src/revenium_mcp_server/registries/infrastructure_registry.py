@@ -70,7 +70,7 @@ class InfrastructureRegistry(BaseToolRegistry):
         )
 
         self._register_tool(
-            "manage_capabilities",
+            "get_capabilities",
             ManageCapabilities,
             {
                 "description": "UCM capability management and configuration",
@@ -200,12 +200,12 @@ class InfrastructureRegistry(BaseToolRegistry):
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle capability management actions."""
         # Get the ManageCapabilities tool instance and execute directly
-        tool_instance = await self._get_tool_instance("manage_capabilities")
+        tool_instance = await self._get_tool_instance("get_capabilities")
         if tool_instance:
             return await tool_instance.handle_action(action, arguments)
         else:
             # Fallback to standardized execution
-            return await self._standardized_tool_execution("manage_capabilities", action, arguments)
+            return await self._standardized_tool_execution("get_capabilities", action, arguments)
 
     async def _handle_welcome_action(
         self, action: str, arguments: Dict[str, Any]

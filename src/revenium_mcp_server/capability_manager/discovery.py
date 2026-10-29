@@ -20,6 +20,11 @@ from ..alert_operators import (
     REJECTED_OPERATORS,
 )
 from ..client import ReveniumClient
+from ..common.subscription_create_fields import (
+    OPTIONAL_SUBSCRIPTION_CREATE_FIELDS,
+    REQUIRED_SUBSCRIPTION_CREATE_FIELDS,
+    SUBSCRIPTION_CREATE_RULES,
+)
 from ..constants import (
     API_BURST_LIMIT,
     API_RATE_LIMIT_PER_MINUTE,
@@ -32,13 +37,13 @@ from ..constants import (
 from ..models import (
     AggregationType,
     BillingPeriod,
-    Currency,
     MetricType,
     PaymentSource,
     PlanType,
     RatingAggregationType,
     TrialPeriod,
 )
+from ..plan_contract import platform_plan_currencies
 from ..tool_configuration.profiles import PROFILE_DEFINITIONS, PROFILE_TOOL_COUNTS
 
 logger = logging.getLogger(__name__)
@@ -154,7 +159,7 @@ class CapabilityDiscovery:
         """Discover product-related capabilities."""
         return {
             "plan_types": [plan_type.value for plan_type in PlanType],
-            "currencies": [currency.value for currency in Currency],
+            "currencies": list(platform_plan_currencies()),
             "billing_periods": [period.value for period in BillingPeriod],
             "trial_periods": [trial.value for trial in TrialPeriod],
             "payment_sources": [
@@ -190,7 +195,7 @@ class CapabilityDiscovery:
                 "name": {"type": "string", "min_length": 1, "max_length": 255},
                 "version": {"type": "string", "pattern": r"^\d+\.\d+\.\d+$"},
                 "plan.type": {"enum": [plan_type.value for plan_type in PlanType]},
-                "plan.currency": {"enum": [currency.value for currency in Currency]},
+                "plan.currency": {"enum": list(platform_plan_currencies())},
                 "paymentSource": {"enum": [payment.value for payment in PaymentSource]},
             },
             "payment_source_explanations": {
@@ -203,21 +208,17 @@ class CapabilityDiscovery:
         """Discover subscription-related capabilities from API with fallback."""
         try:
             # Try to discover capabilities from actual API endpoints
-            billing_periods = await self._discover_billing_periods_from_api()
-            trial_periods = await self._discover_trial_periods_from_api()
             subscription_types = await self._discover_subscription_types_from_api()
             currencies = await self._discover_currencies_from_api()
         except Exception as e:
             logger.warning(f"API discovery failed for subscriptions, using fallback: {e}")
             # Provide fallback capabilities when API discovery fails
-            billing_periods = ["MONTH", "QUARTER", "YEAR", "WEEK", "DAY"]
-            trial_periods = ["DAY", "WEEK", "MONTH"]
             subscription_types = ["monthly", "quarterly", "yearly"]
-            currencies = ["USD", "EUR", "GBP", "CAD", "AUD", "JPY"]
+            currencies = list(platform_plan_currencies())
 
         return {
-            "billing_periods": billing_periods,
-            "trial_periods": trial_periods,
+            "billing_periods": [period.value for period in BillingPeriod],
+            "trial_periods": [trial.value for trial in TrialPeriod],
             "subscription_types": subscription_types,
             "currencies": currencies,
             "subscription_statuses": [
@@ -236,17 +237,8 @@ class CapabilityDiscovery:
             ],
             "schema": {
                 "subscription_data": {
-                    "required": ["product_id", "name", "clientEmailAddress"],
-                    "optional": [
-                        "description",
-                        "start_date",
-                        "end_date",
-                        "billing_address",
-                        "payment_method",
-                        "trial_end_date",
-                        "metadata",
-                        "tags",
-                    ],
+                    "required": list(REQUIRED_SUBSCRIPTION_CREATE_FIELDS),
+                    "optional": list(OPTIONAL_SUBSCRIPTION_CREATE_FIELDS),
                 }
             },
             "validation_rules": {
@@ -254,12 +246,7 @@ class CapabilityDiscovery:
                 "name": {"type": "string", "min_length": 1, "max_length": 255},
                 "clientEmailAddress": {"type": "string", "format": "email"},
             },
-            "business_rules": [
-                "Product must exist before subscription creation",
-                "Email address must be valid and unique",
-                "Trial periods require end date specification",
-                "Billing periods must align with product plan settings",
-            ],
+            "business_rules": list(SUBSCRIPTION_CREATE_RULES),
         }
 
     async def _discover_customer_capabilities(self) -> Dict[str, Any]:
@@ -865,86 +852,6 @@ class CapabilityDiscovery:
                     "error": f"Failed to fetch models summary: {str(e)}",
                 },
             }
-
-    async def _discover_billing_periods_from_api(self) -> List[str]:
-        """Discover billing periods from actual API endpoints."""
-        try:
-            periods = set()
-
-            # Try to discover from products endpoint
-            try:
-                response = await self.client.get("products", params={"page": 0, "size": 50})
-                if "data" in response and isinstance(response["data"], list):
-                    for product in response["data"]:
-                        if "plan" in product and "period" in product["plan"]:
-                            periods.add(product["plan"]["period"])
-                        if "plan" in product and "billingPeriod" in product["plan"]:
-                            periods.add(product["plan"]["billingPeriod"])
-            except Exception as e:
-                logger.debug(f"Failed to discover billing periods from products: {e}")
-
-            # Try to discover from subscriptions endpoint
-            try:
-                response = await self.client.get("subscriptions", params={"page": 0, "size": 50})
-                if "data" in response and isinstance(response["data"], list):
-                    for subscription in response["data"]:
-                        if "billingPeriod" in subscription:
-                            periods.add(subscription["billingPeriod"])
-                        if "period" in subscription:
-                            periods.add(subscription["period"])
-            except Exception as e:
-                logger.debug(f"Failed to discover billing periods from subscriptions: {e}")
-
-            if periods:
-                logger.info(f"Discovered {len(periods)} billing periods from API: {periods}")
-                return sorted(list(periods))
-            else:
-                # If no periods discovered, raise error to force proper API integration
-                raise ValueError(
-                    "No billing periods discovered from API - UCM integration required"
-                )
-
-        except Exception as e:
-            logger.error(f"Billing periods discovery failed: {e}")
-            raise ValueError(f"Failed to discover billing periods from API: {str(e)}")
-
-    async def _discover_trial_periods_from_api(self) -> List[str]:
-        """Discover trial periods from actual API endpoints."""
-        try:
-            periods = set()
-
-            # Try to discover from products endpoint
-            try:
-                response = await self.client.get("products", params={"page": 0, "size": 50})
-                if "data" in response and isinstance(response["data"], list):
-                    for product in response["data"]:
-                        if "plan" in product and "trialPeriod" in product["plan"]:
-                            periods.add(product["plan"]["trialPeriod"])
-                        if "trialPeriod" in product:
-                            periods.add(product["trialPeriod"])
-            except Exception as e:
-                logger.debug(f"Failed to discover trial periods from products: {e}")
-
-            # Try to discover from subscriptions endpoint
-            try:
-                response = await self.client.get("subscriptions", params={"page": 0, "size": 50})
-                if "data" in response and isinstance(response["data"], list):
-                    for subscription in response["data"]:
-                        if "trialPeriod" in subscription:
-                            periods.add(subscription["trialPeriod"])
-            except Exception as e:
-                logger.debug(f"Failed to discover trial periods from subscriptions: {e}")
-
-            if periods:
-                logger.info(f"Discovered {len(periods)} trial periods from API: {periods}")
-                return sorted(list(periods))
-            else:
-                # If no periods discovered, raise error to force proper API integration
-                raise ValueError("No trial periods discovered from API - UCM integration required")
-
-        except Exception as e:
-            logger.error(f"Trial periods discovery failed: {e}")
-            raise ValueError(f"Failed to discover trial periods from API: {str(e)}")
 
     async def _discover_subscription_types_from_api(self) -> List[str]:
         """Discover subscription types from actual API endpoints."""

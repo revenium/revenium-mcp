@@ -57,20 +57,20 @@ CAPABILITIES_TEXT = """
    - page/size pagination
 
 5b. **set_strict_ingestion_mode** - ✅ **AVAILABLE**
-   - Toggle the tenant's strict ingestion mode (requires confirm=true)
+   - Toggle the tenant's strict ingestion mode (dry_run=true previews it)
    - Strict mode rejects transactions referencing unknown entities instead of auto-creating them
    - Optional allow_ticket_jobs keeps ticket-grain Job creation on while strict mode is enabled
      (omit it to leave the tenant's current setting unchanged; disabling strict mode clears it)
 
 5c. **set_attribution_detail_text** - ✅ **AVAILABLE**
-   - Turn the tenant's free-text attribution detail on or off (no confirm needed)
+   - Turn the tenant's free-text attribution detail on or off (applies immediately)
    - While off (the platform default) a session attribution carrying a free-text reason
      still records, but the text is stored as null and never returned
    - The flag has no published read-only endpoint, so the tenant toggle responses
      are the only places it is reported
 
 5d. **set_usage_billing** - ✅ **AVAILABLE**
-   - Switch usage-based billing on or off for the tenant (requires confirm=true)
+   - Switch usage-based billing on or off for the tenant (dry_run=true previews it)
    - OFF hides the billing screens (invoices, payment methods, plan and subscription
      screens) AND stops rating the tenant's usage: AI product usage, platform usage and
      /v2/events produce no usage line items. AI metrics are still recorded
@@ -184,11 +184,10 @@ EXAMPLES_TEXT = """
 {
   "action": "set_strict_ingestion_mode",
   "enabled": true,
-  "allow_ticket_jobs": true,
-  "confirm": true
+  "allow_ticket_jobs": true
 }
 ```
-**Purpose**: Toggle strict ingestion mode for the tenant. Without confirm=true the call returns a consequences preview and changes nothing. allow_ticket_jobs is optional: it keeps the coding-assistant enricher creating ticket-grain Jobs under strict mode (platform default is off), omitting it leaves the tenant's current setting unchanged, and it cannot be true while enabled is false. Disabling strict mode clears the opt-in server-side, so it must be re-stated the next time strict mode is enabled.
+**Purpose**: Toggle strict ingestion mode for the tenant. With dry_run=true the call returns a consequences preview and changes nothing. allow_ticket_jobs is optional: it keeps the coding-assistant enricher creating ticket-grain Jobs under strict mode (platform default is off), omitting it leaves the tenant's current setting unchanged, and it cannot be true while enabled is false. Disabling strict mode clears the opt-in server-side, so it must be re-stated the next time strict mode is enabled.
 
 ### set_attribution_detail_text
 ```json
@@ -197,17 +196,16 @@ EXAMPLES_TEXT = """
   "enabled": true
 }
 ```
-**Purpose**: Turn the tenant's free-text attribution detail on or off. With it off (the platform default) a coding-assistant session attribution carrying a free-text reason still succeeds and still records the structured attribution, but the text is stored as null and never returned. Switching it off withholds text already stored; it does not delete it. No confirm is required, and the response reports the state the server returned - which, with the other tenant toggle responses, is the only place the platform reports this flag.
+**Purpose**: Turn the tenant's free-text attribution detail on or off. With it off (the platform default) a coding-assistant session attribution carrying a free-text reason still succeeds and still records the structured attribution, but the text is stored as null and never returned. Switching it off withholds text already stored; it does not delete it. It has no dry_run preview, and the response reports the state the server returned - which, with the other tenant toggle responses, is the only place the platform reports this flag.
 
 ### set_usage_billing
 ```json
 {
   "action": "set_usage_billing",
-  "enabled": false,
-  "confirm": true
+  "enabled": false
 }
 ```
-**Purpose**: Switch usage-based billing on or off for the tenant. Off hides the billing screens (invoices, payment methods, plan and subscription views) and stops rating the tenant's usage: AI product usage, platform usage and /v2/events produce no usage line items, while AI metrics are still recorded. Usage that arrives while it is off is never rated, including after it is turned back on, so the off period leaves a permanent gap in the tenant's usage billing. Subscription charges and tool-event line items are unaffected. It applies to every user of the tenant at once, so without confirm=true the call returns a consequences preview and changes nothing. Only a platform admin or the tenant's own tenant admin may apply it - an organization admin key passes the other tenant toggles but is refused on this one. The platform default is on, and the response reports the state the server returned.
+**Purpose**: Switch usage-based billing on or off for the tenant. Off hides the billing screens (invoices, payment methods, plan and subscription views) and stops rating the tenant's usage: AI product usage, platform usage and /v2/events produce no usage line items, while AI metrics are still recorded. Usage that arrives while it is off is never rated, including after it is turned back on, so the off period leaves a permanent gap in the tenant's usage billing. Subscription charges and tool-event line items are unaffected. It applies to every user of the tenant at once, so with dry_run=true the call returns a consequences preview and changes nothing. Only a platform admin or the tenant's own tenant admin may apply it - an organization admin key passes the other tenant toggles but is refused on this one. The platform default is on, and the response reports the state the server returned.
 
 ### get_usage_billing
 ```json

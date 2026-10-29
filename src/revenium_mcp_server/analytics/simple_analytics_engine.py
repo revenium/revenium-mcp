@@ -732,7 +732,7 @@ analytics cost actions report.
                 "filters.providers on get_user_costs, or the providers argument on "
                 "get_token_breakdown"
             ),
-            "tool-providers": "the provider argument on manage_tools get_cost_by_provider",
+            "tool-providers": "the provider argument on get_tools get_cost_by_provider",
             "users": "filters.users on get_user_costs",
         }
         specific = _GUIDANCE_BY_DIMENSION.get(dimension.replace("-", "_").replace("_", "-"))
@@ -742,7 +742,7 @@ analytics cost actions report.
             f"Use these values in {specific}."
             if specific
             else (
-                f"No cost report filters by {dimension} in business_analytics_management. "
+                f"No cost report filters by {dimension} in get_business_analytics. "
                 "Its cost filters are agents, providers, models, users and costSources on "
                 "get_user_costs and get_department_costs, and costSources on get_agent_costs."
             )

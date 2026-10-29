@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
-from ..common.error_handling import create_structured_validation_error, raise_structured_error
+from ..common.error_handling import raise_unknown_action_error
 from ..introspection.metadata import ToolCapability, ToolType
 from .configuration_status import ConfigurationStatus
 from .debug_auto_discovery import DebugAutoDiscovery
@@ -172,9 +172,9 @@ Unified system diagnostics combining configuration analysis, auto-discovery debu
 
 ### Tenant Ingestion Diagnostics
 - `get_ingestion_failures` - List strict-ingestion rejections (error_code filter, pagination)
-- `set_strict_ingestion_mode` - Toggle strict mode (requires confirm=true; preview otherwise). Optional `allow_ticket_jobs` keeps ticket-grain Job creation on under strict mode; omit it to leave the tenant's current setting unchanged, and note that disabling strict mode clears the opt-in
-- `set_attribution_detail_text` - Turn the tenant's free-text attribution detail on or off (`enabled`, no confirm). While off (the platform default) a coding-assistant session attribution carrying a free-text reason still records, but the text is stored as null and never returned. The flag has no published read-only endpoint: the tenant toggle responses are the only places the platform reports it
-- `set_usage_billing` - Switch usage-based billing on or off for the tenant (`enabled`, requires confirm=true; preview otherwise). Off hides the billing screens and stops rating the tenant's usage (no usage line items for AI product usage, platform usage or /v2/events; AI metrics are still recorded). Usage that arrives while off is never rated later. Default is on. Requires a platform admin or the tenant's own tenant admin - an organization admin key passes the other tenant toggles but not this one
+- `set_strict_ingestion_mode` - Toggle strict mode (`dry_run=true` previews it). Optional `allow_ticket_jobs` keeps ticket-grain Job creation on under strict mode; omit it to leave the tenant's current setting unchanged, and note that disabling strict mode clears the opt-in
+- `set_attribution_detail_text` - Turn the tenant's free-text attribution detail on or off (`enabled`, no preview). While off (the platform default) a coding-assistant session attribution carrying a free-text reason still records, but the text is stored as null and never returned. The flag has no published read-only endpoint: the tenant toggle responses are the only places the platform reports it
+- `set_usage_billing` - Switch usage-based billing on or off for the tenant (`enabled`; `dry_run=true` previews it). Off hides the billing screens and stops rating the tenant's usage (no usage line items for AI product usage, platform usage or /v2/events; AI metrics are still recorded). Usage that arrives while off is never rated later. Default is on. Requires a platform admin or the tenant's own tenant admin - an organization admin key passes the other tenant toggles but not this one
 - `get_usage_billing` - Read the usage-billing flag without a write (tenant stub of `GET /v2/api/users/me`), with the roles on the key's user
 
 ### Meta Actions
@@ -260,21 +260,21 @@ These actions WRITE a tenant-wide setting; everything else in this tool reads.
 
 ### Toggle Strict Ingestion Mode
 ```json
-{"action": "set_strict_ingestion_mode", "enabled": true, "confirm": true}
+{"action": "set_strict_ingestion_mode", "enabled": true}
 ```
-Without `confirm: true` the call returns a consequences preview and changes nothing. Optional `allow_ticket_jobs` keeps ticket-grain Job creation on under strict mode.
+With `dry_run: true` the call returns a consequences preview and changes nothing. Optional `allow_ticket_jobs` keeps ticket-grain Job creation on under strict mode.
 
 ### Toggle Free-Text Attribution Detail
 ```json
 {"action": "set_attribution_detail_text", "enabled": true}
 ```
-Applies immediately (no confirm): it rejects nothing and deletes nothing. While the setting is off - the platform default - a coding-assistant session attribution carrying a free-text reason still succeeds and still records the structured attribution, but the text is stored as null and never returned.
+Applies immediately (no preview): it rejects nothing and deletes nothing. While the setting is off - the platform default - a coding-assistant session attribution carrying a free-text reason still succeeds and still records the structured attribution, but the text is stored as null and never returned.
 
 ### Show or Hide the Billing Screens
 ```json
-{"action": "set_usage_billing", "enabled": false, "confirm": true}
+{"action": "set_usage_billing", "enabled": false}
 ```
-It decides whether the tenant's users can reach invoices, payment methods, plan and subscription screens, and whether the platform rates the tenant's usage. While it is off, AI product usage, platform usage and /v2/events produce no usage line items and are never rated later, even after it is turned back on; AI metrics are still recorded. It lands on every user of the tenant at once, so without `confirm: true` the call returns a consequences preview and changes nothing. Only a platform admin or the tenant's own tenant admin may apply it; an organization admin key passes the other two toggles but is refused here.
+It decides whether the tenant's users can reach invoices, payment methods, plan and subscription screens, and whether the platform rates the tenant's usage. While it is off, AI product usage, platform usage and /v2/events produce no usage line items and are never rated later, even after it is turned back on; AI metrics are still recorded. It lands on every user of the tenant at once, so with `dry_run: true` the call returns a consequences preview and changes nothing. Only a platform admin or the tenant's own tenant admin may apply it; an organization admin key passes the other two toggles but is refused here.
 
 ```json
 {"action": "get_usage_billing"}
@@ -339,39 +339,8 @@ All actions support the same parameters as their original tools for 100% compati
     async def _handle_unknown_action(
         self, action: str
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Handle unknown actions with helpful guidance."""
-        all_actions = list(self.action_routing.keys()) + ["get_capabilities", "get_examples"]
-
-        error = create_structured_validation_error(
-            field="action",
-            value=action,
-            message=f"Unknown system diagnostics action: {action}",
-            examples={
-                "valid_actions": all_actions,
-                "configuration_actions": [
-                    "environment_variables",
-                    "auto_discovery",
-                    "onboarding_status",
-                    "system_health",
-                ],
-                "debug_actions": ["debug"],
-                "log_actions": [
-                    "get_internal_logs",
-                    "get_integration_logs",
-                    "get_recent_logs",
-                    "search_logs",
-                    "analyze_operations",
-                ],
-                "example_usage": {
-                    "environment_variables": "Detailed environment variable analysis",
-                    "debug": "Comprehensive auto-discovery diagnostics",
-                    "get_recent_logs": "Latest log entries for troubleshooting",
-                    "search_logs": "Search historical log data",
-                },
-            },
-        )
-
-        raise_structured_error(error)
+        """Refuse an action this class does not route; the caller's message lists the valid ones."""
+        raise_unknown_action_error(action)
 
     async def _get_supported_actions(self) -> List[str]:
         """Get all supported actions from consolidated tool."""

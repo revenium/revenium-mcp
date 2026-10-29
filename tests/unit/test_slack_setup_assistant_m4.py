@@ -111,10 +111,11 @@ class TestActionRouting:
         assert "Integration with Onboarding" in text
 
     @pytest.mark.asyncio
-    async def test_unknown_action_lists_valid_actions(self, tool):
+    async def test_unknown_action_raises_listing_valid_actions(self, tool):
         """Unknown action text includes at least one valid action name."""
-        result = await tool.handle_action("bogus_action", {})
-        text = result[0].text
+        with pytest.raises(ToolError) as refused:
+            await tool.handle_action("bogus_action", {})
+        text = refused.value.message
         assert "guided_setup" in text or "quick_setup" in text
 
 
@@ -244,15 +245,16 @@ class TestDetectAndRecommend:
         assert "Default Configuration Issue" in text or "not found" in text.lower()
 
     @pytest.mark.asyncio
-    async def test_api_error_returns_error_text(self, tool):
-        """detect_and_recommend API failure returns ValidationError message (not a bare exception)."""
+    async def test_api_error_raises_a_tool_error(self, tool):
+        """BACK-5086: a detect_and_recommend API failure raises a flagged TOOL_ERROR."""
         client = AsyncMock()
         client.get_slack_configurations = AsyncMock(side_effect=RuntimeError("fail"))
         with patch.object(tool, "get_client", AsyncMock(return_value=client)):
-            result = await tool.handle_action("detect_and_recommend", {})
-        text = result[0].text
-        # ValidationError.format_user_message() produces "Failed to detect and recommend" message
-        assert "Failed" in text or "failed to detect" in text.lower()
+            with pytest.raises(ToolError) as refused:
+                await tool.handle_action("detect_and_recommend", {})
+        text = refused.value.message
+        assert refused.value.error_code == "TOOL_ERROR"
+        assert "Failed to detect and recommend" in text
 
 
 # ---------------------------------------------------------------------------
@@ -393,18 +395,19 @@ class TestOnboardingSetup:
         assert "Test Your Setup" in text or "create_simple_alert" in text
 
     @pytest.mark.asyncio
-    async def test_onboarding_setup_api_error_returns_tool_error_text(self, tool):
-        """API error during onboarding_setup returns structured error text."""
+    async def test_onboarding_setup_api_error_raises_a_tool_error(self, tool):
+        """BACK-5086: an API error during onboarding_setup raises a flagged TOOL_ERROR."""
         client = AsyncMock()
         client.get_slack_configurations = AsyncMock(side_effect=RuntimeError("boom"))
         with (
             patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_ONBOARDING, _onboarding_state(True)),
         ):
-            result = await tool.handle_action("onboarding_setup", {})
-        text = result[0].text
-        # Should contain ToolError-formatted output
-        assert "TOOL_ERROR" in text or "Failed" in text
+            with pytest.raises(ToolError) as refused:
+                await tool.handle_action("onboarding_setup", {})
+        text = refused.value.message
+        assert refused.value.error_code == "TOOL_ERROR"
+        assert "Failed to complete onboarding setup" in text
 
 
 # ---------------------------------------------------------------------------
@@ -489,8 +492,8 @@ class TestFirstTimeGuidance:
         assert "Integration with Onboarding" in text
 
     @pytest.mark.asyncio
-    async def test_api_error_returns_tool_error_text(self, tool):
-        """API error in first_time_guidance returns structured TOOL_ERROR text."""
+    async def test_api_error_raises_a_tool_error(self, tool):
+        """BACK-5086: an API error in first_time_guidance raises a flagged TOOL_ERROR."""
         client = AsyncMock()
         client.get_slack_configurations = AsyncMock(side_effect=RuntimeError("network fail"))
         client.__aenter__ = AsyncMock(return_value=client)
@@ -500,9 +503,11 @@ class TestFirstTimeGuidance:
             patch.object(tool, "get_client", AsyncMock(return_value=client)),
             patch(_PATCH_ONBOARDING, AsyncMock(return_value=state)),
         ):
-            result = await tool.handle_action("first_time_guidance", {})
-        text = result[0].text
-        assert "TOOL_ERROR" in text or "Failed" in text
+            with pytest.raises(ToolError) as refused:
+                await tool.handle_action("first_time_guidance", {})
+        text = refused.value.message
+        assert refused.value.error_code == "TOOL_ERROR"
+        assert "Failed to provide first-time guidance" in text
 
 
 # ---------------------------------------------------------------------------
@@ -658,4 +663,4 @@ class TestPrintedExamplesNameRealActions:
 
         assert "`setup_checklist()`" not in text
         assert "\nsetup_checklist()\n" not in text
-        assert "system_setup(action='setup_checklist')" in text
+        assert "get_system_setup(action='setup_checklist')" in text

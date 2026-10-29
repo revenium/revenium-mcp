@@ -45,10 +45,18 @@ from src.revenium_mcp_server.tool_configuration.registry import (
     ToolConfigurationRegistry,
 )
 from src.revenium_mcp_server.tools_decomposed.tool_registry import _get_tool_class
+from src.revenium_mcp_server.tools_decomposed.workflow_management import WorkflowManager
+from src.revenium_mcp_server.auth.tenant_scope import LOCAL_TENANT_SCOPE
 
 REFUSAL_PHRASE = "the dry_run request was refused and nothing was sent or changed"
 assert DRY_RUN_REFUSED == REFUSAL_PHRASE
 WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+EMPTY_LISTS: Dict[str, Any] = {
+    "/profitstream/v2/api/metering-element-definitions": {
+        "page": {"number": 0, "size": 100, "totalPages": 0, "totalElements": 0}
+    },
+}
 
 RECORD: Dict[str, Any] = {
     "id": "x1",
@@ -103,7 +111,8 @@ def platform(monkeypatch) -> PlatformRecorder:
         if threading.get_ident() != test_thread:
             return await real_request(self, method, url, *args, **kwargs)
         recorder.calls.append((method.upper(), str(url)))
-        return httpx.Response(200, json=RECORD, request=httpx.Request(method, url))
+        body = EMPTY_LISTS.get(httpx.URL(str(url)).path, RECORD)
+        return httpx.Response(200, json=body, request=httpx.Request(method, url))
 
     monkeypatch.setattr(httpx.AsyncClient, "request", fake_request)
     return recorder
@@ -129,19 +138,14 @@ async def _execute(tool_name: str, action: str, args: Dict[str, Any], dry_run: A
 
 
 WRITES_WITHOUT_A_PREVIEW = [
-    ("manage_subscriber_credentials", "delete", {"credential_id": "vqCred1"}),
+    ("manage_credentials", "delete", {"credential_id": "vqCred1"}),
     (
-        "manage_subscriber_credentials",
+        "manage_credentials",
         "update",
         {"credential_id": "vqCred1", "credential_data": {"label": "vq"}},
     ),
     ("manage_subscriptions", "delete", {"subscription_id": "vqSub1"}),
     ("manage_subscriptions", "cancel", {"subscription_id": "vqSub2"}),
-    (
-        "manage_subscriptions",
-        "update",
-        {"subscription_id": "vqSub3", "subscription_data": {"label": "vq"}},
-    ),
     ("manage_alerts", "delete", {"anomaly_id": "vqAnom1"}),
     ("manage_alerts", "disable", {"anomaly_id": "vqAnom1"}),
     ("manage_alerts", "enable", {"anomaly_id": "vqAnom1"}),
@@ -219,7 +223,7 @@ async def test_selecting_a_default_slack_configuration_refuses_dry_run_and_chang
     before = get_default_slack_config_id(None)
 
     refusal = await _refusal_of(
-        _execute("slack_management", "select_default_configuration", {"config_id": "vqSlack1"})
+        _execute("manage_slack", "select_default_configuration", {"config_id": "vqSlack1"})
     )
 
     assert refusal and REFUSAL_PHRASE in refusal, (
@@ -255,7 +259,7 @@ async def _call_through_the_boundary(register_method_name, tool_name, arguments)
 async def test_a_refused_preview_reaches_the_caller_with_the_error_flag(platform):
     is_error, text = await _call_through_the_boundary(
         "_register_manage_subscriber_credentials",
-        "manage_subscriber_credentials",
+        "manage_credentials",
         {"action": "delete", "credential_id": "c1", "dry_run": True},
     )
 
@@ -341,7 +345,7 @@ def test_the_guard_refuses_dry_run_in_any_switched_on_spelling(dry_run):
     assert refused.value.field == "dry_run"
     assert refused.value.error_code == "INVALID_PARAMETER"
     assert REFUSAL_PHRASE in refused.value.message
-    assert "manage_subscriptions that preview with dry_run: create, validate" in (
+    assert "manage_subscriptions that preview with dry_run: create, update." in (
         refused.value.message
     )
 
@@ -425,7 +429,11 @@ PREVIEW_ARGUMENTS: Dict[Tuple[str, str], Dict[str, Any]] = {
             "name": "vq",
         },
     },
-    ("manage_subscriber_credentials", "create"): {
+    ("manage_subscriptions", "update"): {
+        "subscription_id": "sub1",
+        "subscription_data": {"name": "vq"},
+    },
+    ("manage_credentials", "create"): {
         "credential_data": {
             "label": "vq credential",
             "subscriberId": "s1",
@@ -441,7 +449,7 @@ PREVIEW_ARGUMENTS: Dict[Tuple[str, str], Dict[str, Any]] = {
     ("manage_subscriptions", "validate"): {
         "subscription_data": {"product_id": "p1", "name": "vq"}
     },
-    ("manage_subscriber_credentials", "validate"): {
+    ("manage_credentials", "validate"): {
         "credential_data": {
             "label": "vq credential",
             "subscriberId": "s1",
@@ -454,10 +462,10 @@ PREVIEW_ARGUMENTS: Dict[Tuple[str, str], Dict[str, Any]] = {
         "source_data": {"name": "vq", "type": "API", "ownerId": "owner_vq"}
     },
     ("manage_sources", "validate"): {"source_data": {"name": "vq", "type": "API"}},
-    ("manage_metering_elements", "create"): {
+    ("manage_usage_meters", "create"): {
         "element_data": {"name": "vq", "type": "NUMBER"}
     },
-    ("manage_metering_elements", "validate"): {
+    ("manage_usage_meters", "validate"): {
         "element_data": {"name": "vq", "type": "NUMBER"}
     },
     ("manage_workflows", "start"): {
@@ -473,22 +481,26 @@ PREVIEW_ARGUMENTS: Dict[Tuple[str, str], Dict[str, Any]] = {
         "source_data": {"name": "vq", "version": "1.0.0", "type": "API", "ownerId": "o1"},
     },
     ("manage_sources", "delete"): {"source_id": "src1"},
-    ("manage_metering_elements", "update"): {
+    ("manage_usage_meters", "update"): {
         "element_id": "el1",
         "element_data": {"name": "vq"},
     },
-    ("manage_metering_elements", "delete"): {"element_id": "el1"},
+    ("manage_usage_meters", "delete"): {"element_id": "el1"},
     ("manage_metering", "submit_ai_transaction"): METERING_TRANSACTION,
     ("manage_metering", "validate"): METERING_TRANSACTION,
-    ("manage_metering_elements", "create_from_template"): {
+    ("manage_usage_meters", "create_from_template"): {
         "template_name": "shippingCost"
     },
     ("manage_workflows", "complete_step"): {
         "workflow_id": "wf1",
         "step_result": {"done": True},
     },
-    ("slack_management", "set_default_configuration"): {"config_id": "vqSlack1"},
-    ("slack_management", "get_configuration"): {"config_id": "vqSlack1"},
+    ("manage_slack", "set_default_configuration"): {"config_id": "vqSlack1"},
+    ("manage_slack", "get_configuration"): {"config_id": "vqSlack1"},
+    ("manage_customers", "delete_department_person"): {"person_id": 97},
+    ("manage_customers", "clear_department_assignment"): {"email": "vq@example.com"},
+    ("manage_system_settings", "set_strict_ingestion_mode"): {"enabled": True},
+    ("manage_system_settings", "set_usage_billing"): {"enabled": False},
 }
 
 FAILED_PREVIEW_MARKERS = (
@@ -506,13 +518,25 @@ ALLOWLISTED_PREVIEWS = sorted(
 )
 
 
+@pytest.fixture
+def previewed_workflow():
+    """complete_step previews only a workflow that exists, as the live call does."""
+    WorkflowManager.active_workflows.put(
+        LOCAL_TENANT_SCOPE,
+        "wf1",
+        {"id": "wf1", "status": "started", "steps": [], "current_step": 0, "completed_steps": []},
+    )
+    yield
+    WorkflowManager.active_workflows.clear()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "tool_name, action",
     ALLOWLISTED_PREVIEWS,
     ids=[f"{tool}-{action}" for tool, action in ALLOWLISTED_PREVIEWS],
 )
-@pytest.mark.usefixtures("alert_owner_email")
+@pytest.mark.usefixtures("alert_owner_email", "previewed_workflow")
 async def test_every_allowlisted_preview_sends_no_write(
     platform, monkeypatch, tool_name, action
 ):
@@ -529,12 +553,13 @@ async def test_every_allowlisted_preview_sends_no_write(
 
 
 WORKING_PREVIEWS = [
-    ("manage_subscriber_credentials", "create", '"dry_run": true'),
+    ("manage_credentials", "create", '"dry_run": true'),
     ("manage_subscriptions", "create", "dry_run: true"),
+    ("manage_subscriptions", "update", "dry run mode - subscription update"),
     ("manage_alerts", "create_simple", "dry run"),
     ("manage_customers", "delete", "dry run mode"),
-    ("manage_metering_elements", "delete", "dry run mode"),
-    ("slack_management", "quick_setup", "quick slack setup"),
+    ("manage_usage_meters", "delete", "dry run mode"),
+    ("manage_slack", "quick_setup", "quick slack setup"),
 ]
 
 
@@ -566,7 +591,7 @@ EMPTY_FLAG_PREVIEWS = [
     ("manage_products", "delete"),
     ("manage_customers", "delete"),
     ("manage_sources", "delete"),
-    ("manage_metering_elements", "delete"),
+    ("manage_usage_meters", "delete"),
 ]
 
 
@@ -719,12 +744,15 @@ async def test_a_handler_sees_the_dry_run_flag_as_a_bool(recording_tool):
 def test_a_nested_dry_run_on_an_action_without_preview_does_not_advise_sending_it_beside_action():
     with pytest.raises(ToolError) as refused:
         refuse_unsupported_dry_run(
-            "manage_subscriptions", "update", {"subscription_data": {"dry_run": True}}
+            "manage_subscriptions", "delete", {"subscription_data": {"dry_run": True}}
         )
 
     message = refused.value.message
-    assert "update has no preview" in message
-    assert "Actions of manage_subscriptions that preview with dry_run: create, validate" in message
+    assert "delete has no preview" in message
+    assert (
+        "Actions of manage_subscriptions that preview with dry_run: create, update."
+        in message
+    )
     assert "next to action" not in message
 
 
@@ -751,7 +779,7 @@ def _data_arguments_declared_by_registered_tools() -> set:
     for node in ast.walk(ast.parse(REGISTRY_FILE.read_text())):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if not any("mcp.tool" in ast.unparse(d) for d in node.decorator_list):
+        if not any("publish_tools" in ast.unparse(d) for d in node.decorator_list):
             continue
         arguments = node.args.args + node.args.kwonlyargs
         names.update(a.arg for a in arguments if a.arg.endswith("_data"))

@@ -2,7 +2,7 @@
 
 Get comprehensive breakdown of the last 7 days spending across all cost dimensions from Revenium.
 
-Use the business_analytics_management tool with these parameters:
+Use the get_business_analytics tool with these parameters:
 - action: "get_cost_summary"
 - period: "SEVEN_DAYS"
 - group: "TOTAL"

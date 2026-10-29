@@ -158,7 +158,7 @@ class TestManageSubscriptionsClosure:
             tool_config=ToolConfig.create_for_testing(profile="business")
         )
         await registry._register_manage_subscriptions(mcp)
-        closure = mcp.tool.return_value.call_args[0][0]
+        closure = mcp.tool.call_args_list[0][0][0].__wrapped__
 
         assert inspect.signature(closure).parameters["size"].default is None
 

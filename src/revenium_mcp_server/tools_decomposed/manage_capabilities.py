@@ -51,7 +51,7 @@ class CapabilityRequest:
 class ManageCapabilities(ToolBase):
     """Manages UCM capabilities with decomposed helper functions."""
 
-    tool_name: ClassVar[str] = "manage_capabilities"
+    tool_name: ClassVar[str] = "get_capabilities"
     tool_description: ClassVar[str] = (
         "Manage unified capabilities across all MCP tools. Key actions: get_capabilities, verify_capability, refresh_capabilities, get_health_status. Use get_examples() for usage guidance and get_capabilities() for system status."
     )
@@ -65,7 +65,7 @@ class ManageCapabilities(ToolBase):
             ucm_helper: UCM integration helper (unused, for compatibility)
         """
         super().__init__()
-        self.formatter = UnifiedResponseFormatter("manage_capabilities")
+        self.formatter = UnifiedResponseFormatter("get_capabilities")
 
     async def handle_action(
         self,
@@ -262,7 +262,11 @@ Get specific capabilities for any resource type:
         """
         missing_params = self._get_missing_verify_params(request)
         if missing_params:
-            return create_missing_verify_params_error(missing_params)
+            raise_refusal(
+                create_missing_verify_params_error(missing_params),
+                field="verify_capability_parameters",
+                value=f"missing: {', '.join(missing_params)}",
+            )
 
         # Type assertions: after validation, these are guaranteed to be non-None
         assert request.resource_type is not None
@@ -385,7 +389,7 @@ Get specific capabilities for any resource type:
             )
 
     async def _get_input_schema(self) -> Dict[str, Any]:
-        """Context7 single source of truth for manage_capabilities schema."""
+        """Context7 single source of truth for get_capabilities schema."""
         return {
             "type": "object",
             "properties": {

@@ -21,7 +21,7 @@ from ..common.error_handling import (
     ToolError,
     create_structured_missing_parameter_error,
     create_structured_validation_error,
-    format_structured_error,
+    raise_structured_error,
 )
 from ..config_store import (
     EMAIL_SETTING,
@@ -272,9 +272,9 @@ class EmailVerification(ToolBase):
                         },
                     },
                 )
-                return [TextContent(type="text", text=format_structured_error(error))]
+                raise_structured_error(error)
 
-        except ToolError:
+        except (PermissionError, ToolError):
             raise
         except Exception as e:
             logger.error(f"Error in verify_email_setup action {action}: {e}")
@@ -289,7 +289,7 @@ class EmailVerification(ToolBase):
                     "Use check_status to see current email configuration",
                 ],
             )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            raise_structured_error(error)
 
     async def _handle_check_status(self, arguments: Dict[str, Any]) -> List[TextContent]:
         """Handle check_status action - check current email configuration."""
@@ -351,8 +351,8 @@ class EmailVerification(ToolBase):
 ## 🎯 **Next Steps**
 
 1. **Test Configuration**: Use `{setup_call('test_configuration')}` to verify email setup
-2. **Set Up Alerts**: Use `manage_alerts()` to create notification rules
-3. **Configure Slack**: Use `slack_management(action='quick_setup')` for additional notifications
+2. **Set Up Alerts**: See `get_alerts(action='get_examples')` for creating notification rules
+3. **Configure Slack**: Use `get_slack(action='quick_setup')` for additional notifications
 
 **Tip**: You can check your email status anytime with `{setup_call('check_status')}`
 """
@@ -415,7 +415,7 @@ class EmailVerification(ToolBase):
                     ],
                 },
             )
-            return [TextContent(type="text", text=format_structured_error(error))]
+            raise_structured_error(error)
 
         try:
             # Validate email using existing validation infrastructure
@@ -585,8 +585,8 @@ This email address is ready to use! You can:
 
         guidance += "## 🔗 **Integration with Other Tools**\n\n"
         guidance += "Once email is configured, you can:\n"
-        guidance += "- **Set up alerts**: Use `manage_alerts()` to create notification rules\n"
-        guidance += "- **Configure Slack**: Use `slack_management(action='quick_setup')` for additional channels\n"
+        guidance += "- **Set up alerts**: See `get_alerts(action='get_examples')` for creating notification rules\n"
+        guidance += "- **Configure Slack**: Use `get_slack(action='quick_setup')` for additional channels\n"
         guidance += (
             f"- **Check setup**: Use `{setup_call('setup_checklist')}` to verify complete configuration\n\n"
         )
@@ -636,9 +636,9 @@ This email address is ready to use! You can:
 
                 test += "## 📬 **Next Steps**\n\n"
                 test += "Your email configuration is ready! You can now:\n"
-                test += "1. Set up alerts with `manage_alerts()`\n"
-                test += "2. Configure Slack with `slack_management(action='quick_setup')`\n"
-                test += "3. Check overall setup with `system_setup(action='setup_checklist')`\n"
+                test += "1. Set up alerts with `get_alerts(action='get_examples')`\n"
+                test += "2. Configure Slack with `get_slack(action='quick_setup')`\n"
+                test += "3. Check overall setup with `get_system_setup(action='setup_checklist')`\n"
             else:
                 test += "- **Format Valid**: ❌ No\n"
                 test += "- **Ready for Notifications**: ❌ No\n\n"

@@ -4,10 +4,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, Mapping
 
 from ..common.error_handling import create_structured_validation_error
-from .update_fidelity import threshold_number
+from .update_fidelity import refuse_unsupported_alert_fields, threshold_number
 
 _DISPATCH_ARGUMENTS = frozenset({"action", "resource_type", "page", "size"})
-_OFF_SWITCHES = frozenset({"dry_run", "confirm"})
+_OFF_SWITCHES = frozenset({"dry_run"})
 
 _SHARED_ARGUMENTS = frozenset(
     {
@@ -81,6 +81,7 @@ ACTION_ARGUMENTS: Dict[str, _ActionArguments] = {
 def refuse_unhonoured_arguments(action: str, arguments: Mapping[str, Any]) -> None:
     """Refuse the call when it carries an argument ``action`` would otherwise drop."""
     contract = ACTION_ARGUMENTS[action]
+    refuse_unsupported_alert_fields(arguments, contract.outcome)
     honoured = contract.accepted | contract.addressing | _DISPATCH_ARGUMENTS
     unhonoured = sorted(
         name

@@ -71,7 +71,7 @@ async def _call_products_list(server) -> None:
     resp = await call_mcp_tool(
         server["base_url"],
         _VALID_TOKEN,
-        tool_name="manage_products",
+        tool_name="get_products",
         arguments={"action": "list"},
     )
     assert resp.status_code == 200, f"status={resp.status_code} body={resp.text!r}"

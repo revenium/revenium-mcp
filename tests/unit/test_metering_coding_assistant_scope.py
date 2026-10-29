@@ -639,7 +639,7 @@ class TestScopeNoteDescribesReturnedRows:
             "**Scope**: coding-assistant records (Claude Code, Gemini CLI, and similar) "
             "are INCLUDED. Pass include_coding_assistants=false to exclude assistants "
             "billed as seat subscriptions; assistants your team pays API rates for "
-            "(apiRateProviders, readable with manage_customers "
+            "(apiRateProviders, readable with get_customers "
             "get_coding_assistant_billing_settings) stay in the results.\n"
         ) in text
         assert "EXCLUDED" not in text

@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 from fastmcp import Client, FastMCP
 from fastmcp.server.middleware import Middleware
 
+from src.revenium_mcp_server.common.tool_surface import domain_for
 from src.revenium_mcp_server.auth import ConfigManager
 from src.revenium_mcp_server.auth.claims_middleware import _current_tenant
 from src.revenium_mcp_server.auth.tenant_context import TenantContext
@@ -70,7 +71,23 @@ class RegisteredTools:
     ):
         self._middleware.tenant = tenant
         async with Client(self._mcp) as client:
-            return await client.call_tool(tool, arguments, raise_on_error=False)
+            return await client.call_tool(
+                serving_tool(tool, arguments), arguments, raise_on_error=False
+            )
+
+
+def serving_tool(tool: str, arguments: Dict[str, Any]) -> str:
+    """The public tool of ``tool``'s domain that serves the call's action.
+
+    A test names the domain once; an action the domain does not advertise
+    stays on the named tool, so its refusal is the one under test.
+    """
+    try:
+        domain = domain_for(tool)
+    except KeyError:
+        return tool
+    side = domain.serving_side(str(arguments.get("action", "get_capabilities")))
+    return tool if side is None else domain.name_for(side)
 
 
 def answer_text(result) -> str:
@@ -130,3 +147,26 @@ def isolate_server_settings(monkeypatch, auth_mode: str) -> None:
             monkeypatch.setenv(name, value)
     if auth_mode != "env":
         monkeypatch.delenv("REVENIUM_API_KEY", raising=False)
+
+
+DEAD_PLATFORM_URL = "http://127.0.0.1:9"
+
+
+async def call_domain_tool(monkeypatch, tmp_path, tool: str, arguments: Dict[str, Any]):
+    """Register ``tool``'s domain alone and call it with no platform behind it.
+
+    Returns the call result and its text, for checks that a call is refused
+    before any platform read.
+    """
+    monkeypatch.chdir(tmp_path)
+    isolate_server_settings(monkeypatch, "env")
+    monkeypatch.setenv("REVENIUM_BASE_URL", DEAD_PLATFORM_URL)
+    mcp = FastMCP("domain-under-test")
+    registry = ToolConfigurationRegistry(
+        tool_config=ToolConfig.create_for_testing(profile="business")
+    )
+    await registry._register_domain(mcp, domain_for(tool))
+    middleware = CallerContextMiddleware()
+    mcp.add_middleware(middleware)
+    result = await RegisteredTools(mcp, middleware).call(tool, arguments)
+    return result, answer_text(result)

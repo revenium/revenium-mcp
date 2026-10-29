@@ -143,7 +143,7 @@ class CredentialsHierarchyManager:
     def __init__(self, client: ReveniumClient):
         """Initialize hierarchy manager with client."""
         self.client = client
-        self.formatter = UnifiedResponseFormatter("manage_subscriber_credentials")
+        self.formatter = UnifiedResponseFormatter("manage_credentials")
         self.navigation_service = get_hierarchy_navigation_service(client)
         self.lookup_service = get_entity_lookup_service(client)
         self.validator = get_cross_tier_validator(client)
@@ -266,7 +266,7 @@ class CredentialsHierarchyManager:
 class SubscriberCredentialsManagement(ToolBase):
     """Enhanced subscriber credentials management with comprehensive business context and capabilities."""
 
-    tool_name: ClassVar[str] = "manage_subscriber_credentials"
+    tool_name: ClassVar[str] = "manage_credentials"
     tool_description: ClassVar[str] = (
         "Subscriber credential management for billing identity. Key actions: list, create, update, delete, validate. Use get_capabilities() for complete action list."
     )
@@ -283,7 +283,7 @@ class SubscriberCredentialsManagement(ToolBase):
         # All production paths that receive a real ctx create a fresh per-request
         # client via get_client(ctx=ctx) and bypass this field.
         self.client: Optional[ReveniumClient] = client
-        self.formatter = UnifiedResponseFormatter("manage_subscriber_credentials")
+        self.formatter = UnifiedResponseFormatter("manage_credentials")
 
         # Initialize enhanced capabilities
         self.nlp_processor = CredentialNLPProcessor()
@@ -296,7 +296,7 @@ class SubscriberCredentialsManagement(ToolBase):
         self.documentation_handler = CredentialDocumentationHandler()
 
     async def _get_input_schema(self) -> Dict[str, Any]:
-        """Context7 single source of truth for manage_subscriber_credentials schema."""
+        """Context7 single source of truth for manage_credentials schema."""
         return {
             "type": "object",
             "properties": {
@@ -479,7 +479,7 @@ class SubscriberCredentialsManagement(ToolBase):
                         value=email,
                         suggestions=[
                             "Check the spelling of the email address",
-                            "List subscribers with manage_customers list(resource_type='subscribers')",
+                            "List subscribers with get_customers list(resource_type='subscribers')",
                         ],
                     )
                 return [TextContent(type="text", text=f"**Resolved Subscriber**\n\n- **Email:** {email}\n- **Subscriber ID:** {subscriber_id}")]
@@ -522,7 +522,7 @@ class SubscriberCredentialsManagement(ToolBase):
                         value=org_name,
                         suggestions=[
                             "Check the spelling; the name must match exactly",
-                            "List organizations with manage_customers list(resource_type='organizations')",
+                            "List organizations with get_customers list(resource_type='organizations')",
                         ],
                     )
                 return [TextContent(type="text", text=f"**Resolved Organization**\n\n- **Name:** {org_name}\n- **Organization ID:** {org_id}")]
@@ -743,7 +743,7 @@ class SubscriberCredentialsManagement(ToolBase):
                     "usage": "list_by_organization(organizationId='OQNBA6J')",
                     "valid_format": "Organization ID should be a string identifier",
                     "how_to_find_it": (
-                        "manage_customers(action='list', resource_type='organizations'), "
+                        "get_customers(action='list', resource_type='organizations'), "
                         "or resolve_organization_name_to_id(name='Acme Inc')"
                     ),
                 },
@@ -860,7 +860,7 @@ class SubscriberCredentialsManagement(ToolBase):
                 value=value,
                 suggestions=[
                     f"Check the spelling of the {record} {key}",
-                    f"List {record}s with manage_customers list(resource_type='{record}s')",
+                    f"List {record}s with get_customers list(resource_type='{record}s')",
                 ],
             )
         return resolved_id

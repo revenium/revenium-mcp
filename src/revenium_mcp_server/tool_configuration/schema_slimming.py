@@ -26,14 +26,17 @@ Two transforms live here:
 
 ``merge_params_argument`` is the runtime half of the ``params`` convention: a
 registration closure folds the bag into the named arguments it built, with the
-named arguments winning.
+named arguments winning, and a name the closure does not declare is refused.
 """
 
 from typing import Any, Dict, FrozenSet, Mapping, Optional, Sequence, Set
 
 from loguru import logger
 
+from ..common.called_tool import presented_name
 from ..common.department_aliases import mark_deprecated_aliases
+from ..common.tool_surface import domain_for
+from ..common.unknown_arguments import refuse_unrecognized_arguments
 from ..constants import USER_COSTS_DEFAULT_PAGE_SIZE
 
 #: Parameters advertised on a thin schema when the tool declares them. These
@@ -58,7 +61,7 @@ COMMON_PARAMETERS: Sequence[str] = ("page", "size", "filters", "dry_run")
 #: tool keeps its full parameter list, merely slimmed.
 THIN_TOOL_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "manage_metering": {},
-    "business_analytics_management": {"page": 0, "size": 20},
+    "get_business_analytics": {"page": 0, "size": 20},
     "manage_alerts": {"page": 0, "size": 20},
     "manage_ai_insights": {},
     "manage_tools": {"page": 0, "size": 20},
@@ -76,7 +79,7 @@ THIN_TOOL_PARAMETERS_WITHOUT_DEFAULT: Dict[str, Sequence[str]] = {
 
 #: Per-action defaults that replace the tool's own default for one action.
 THIN_ACTION_DEFAULTS: Dict[str, Dict[str, Dict[str, Any]]] = {
-    "business_analytics_management": {
+    "get_business_analytics": {
         "get_user_costs": {"size": USER_COSTS_DEFAULT_PAGE_SIZE},
     },
 }
@@ -94,7 +97,7 @@ ACCEPTED_BUT_IGNORED_ARGUMENTS: Dict[str, FrozenSet[str]] = {
             "show_detailed_analysis",
         }
     ),
-    "system_setup": frozenset(
+    "manage_system_setup": frozenset(
         {
             "include_recommendations",
             "include_setup_guidance",
@@ -103,7 +106,7 @@ ACCEPTED_BUT_IGNORED_ARGUMENTS: Dict[str, FrozenSet[str]] = {
             "validate_format",
         }
     ),
-    "slack_management": frozenset({"skip_prompts"}),
+    "manage_slack": frozenset({"skip_prompts"}),
 }
 
 #: The tools whose advertised parameter list is replaced by the thin shape.
@@ -122,8 +125,8 @@ PARAMS_DESCRIPTION = (
 #: Appended to the description of every thin-schema tool so an agent reading
 #: only the tool list knows where the per-action detail went.
 DESCRIPTION_SUFFIX = (
-    "Per-action parameters are documented by get_capabilities and may be "
-    "passed at the top level or inside params."
+    "Per-action parameters are documented by {read_tool}(action='get_capabilities') "
+    "and may be passed at the top level or inside params."
 )
 
 _NULL_BRANCH = {"type": "null"}
@@ -289,30 +292,48 @@ def drop_ignored_arguments(tool_name: str, schema: Mapping[str, Any]) -> Dict[st
     return trimmed
 
 
+def domain_key(tool_name: str) -> str:
+    """The domain key whose tables apply to a public tool name; other names are their own key."""
+    try:
+        return domain_for(tool_name).key
+    except KeyError:
+        return tool_name
+
+
 def slim_tool_schema(tool_name: str, schema: Mapping[str, Any]) -> Dict[str, Any]:
     """Return the schema to advertise for ``tool_name``."""
-    slimmed = drop_ignored_arguments(
-        tool_name, mark_deprecated_aliases(tool_name, slim_schema(schema))
-    )
-    if tool_name in THIN_SCHEMA_TOOLS:
+    key = domain_key(tool_name)
+    slimmed = drop_ignored_arguments(key, mark_deprecated_aliases(tool_name, slim_schema(schema)))
+    if key in THIN_SCHEMA_TOOLS:
         return thin_schema(
             slimmed,
-            THIN_TOOL_DEFAULTS[tool_name],
-            THIN_TOOL_PARAMETERS_WITHOUT_DEFAULT.get(tool_name, ()),
+            THIN_TOOL_DEFAULTS[key],
+            THIN_TOOL_PARAMETERS_WITHOUT_DEFAULT.get(key, ()),
         )
     return slimmed
 
 
+def _description_suffix(tool_name: str) -> str:
+    try:
+        read_tool = domain_for(tool_name).read_name
+    except KeyError:
+        read_tool = tool_name
+    return DESCRIPTION_SUFFIX.format(read_tool=read_tool)
+
+
 def slim_tool_description(tool_name: str, description: Optional[str]) -> Optional[str]:
     """Append the ``params`` pointer to a thin-schema tool's description."""
-    if tool_name not in THIN_SCHEMA_TOOLS or not description:
+    if domain_key(tool_name) not in THIN_SCHEMA_TOOLS or not description:
         return description
-    if DESCRIPTION_SUFFIX in description:
+    suffix = _description_suffix(tool_name)
+    if suffix in description:
         return description
-    return f"{description.rstrip()}\n\n{DESCRIPTION_SUFFIX}"
+    return f"{description.rstrip()}\n\n{suffix}"
 
 
-def merge_params_argument(arguments: Dict[str, Any], params: Any) -> Dict[str, Any]:
+def merge_params_argument(
+    arguments: Dict[str, Any], params: Any, tool_name: str
+) -> Dict[str, Any]:
     """Fold a ``params`` bag into the named arguments a closure built.
 
     Precedence, in one sentence: a top-level argument beats the same name in
@@ -323,6 +344,12 @@ def merge_params_argument(arguments: Dict[str, Any], params: Any) -> Dict[str, A
     ``apply_thin_tool_defaults``; a default left in a closure signature would
     silently outrank the bag.
 
+    ``arguments`` carries one key per name the closure declares, so a bag key
+    outside it is one FastMCP would refuse at the top level. It is refused the
+    same way, before anything is folded, rather than reaching a handler that
+    never reads it (BACK-5151). ``tool_name`` is the closure's domain key; the
+    refusal names the public tool the caller used.
+
     ``params`` is typed loosely because the guard below is the last line of
     defence for a client that sends something other than an object.
     """
@@ -332,9 +359,14 @@ def merge_params_argument(arguments: Dict[str, Any], params: Any) -> Dict[str, A
         logger.warning(f"Ignoring non-object params argument of type {type(params).__name__}")
         return arguments
 
-    for name, value in params.items():
-        if name in ("action", PARAMS_PROPERTY):
-            continue
+    bag = {name: value for name, value in params.items() if name != "action"}
+    refuse_unrecognized_arguments(
+        [name for name in bag if name not in arguments],
+        presented_name(tool_name),
+        list(arguments),
+        container=PARAMS_PROPERTY,
+    )
+    for name, value in bag.items():
         if arguments.get(name) is None:
             arguments[name] = value
     return arguments

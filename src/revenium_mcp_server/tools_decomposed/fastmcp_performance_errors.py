@@ -4,11 +4,6 @@ This module contains all error handling methods for the FastMCP Performance Dash
 Extracted to maintain ≤300 lines per module enterprise standard.
 """
 
-from typing import List, Union
-
-from loguru import logger
-from mcp.types import EmbeddedResource, ImageContent, TextContent
-
 from ..common.error_handling import ErrorCodes, ToolError
 
 
@@ -63,22 +58,3 @@ class FastMCPPerformanceErrors:
             suggestions=FastMCPPerformanceErrors.get_error_suggestions(),
             examples=FastMCPPerformanceErrors.get_error_examples(),
         )
-
-    @staticmethod
-    def handle_dashboard_error(
-        e: Exception,
-    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Handle dashboard generation errors.
-
-        Args:
-            e: Exception that occurred during dashboard generation
-
-        Returns:
-            Formatted error response list
-        """
-        logger.error(f"Error generating FastMCP performance dashboard: {e}")
-        error = FastMCPPerformanceErrors.create_dashboard_error(e)
-        from ..common.error_handling import format_structured_error
-
-        error_text = format_structured_error(error)
-        return [TextContent(type="text", text=error_text)]

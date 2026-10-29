@@ -499,7 +499,7 @@ class TestProductManagerCreate:
                     {"product_data": self._usage_based_product_data()}
                 )
         text = str(exc_info.value.message)
-        assert "manage_sources(action='list')" in text
+        assert "get_sources(action='list')" in text
         assert "QOjOkbW" not in text
         mock_client.create_product.assert_not_awaited()
 
@@ -541,7 +541,7 @@ class TestCreateAnswerStatesWhatWasDone:
         text = self._answer({"id": "p1", "name": "P", "published": True, "sources": []})
         assert 'manage_subscriptions(action="create"' not in text
         assert "'sourceIds'" in text
-        assert "manage_sources(action='list')" in text
+        assert "get_sources(action='list')" in text
 
     def test_published_create_without_a_source_asks_only_for_a_source(self):
         text = self._answer({"id": "p1", "name": "P", "published": True, "sources": []})

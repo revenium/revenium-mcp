@@ -29,7 +29,7 @@ from src.revenium_mcp_server.tool_configuration.config import ToolConfig
 from src.revenium_mcp_server.tool_configuration.registry import ToolConfigurationRegistry
 
 CANARY = "FS-CANARY-SECRET-4637"
-TOOL = "manage_subscriber_credentials"
+TOOL = "manage_credentials"
 INVALID_ARGUMENTS_WARNING = "Invalid arguments for tool"
 
 

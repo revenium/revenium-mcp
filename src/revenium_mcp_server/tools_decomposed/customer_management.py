@@ -30,6 +30,7 @@ from ..common.error_handling import (
 )
 from ..common.department_aliases import deprecated_aliases_note
 from ..common.formatting import format_page_count_heading
+from ..common.metadata_format import refuse_malformed_metadata
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.sample_coverage import (
     describe_sample,
@@ -39,7 +40,12 @@ from ..common.sample_coverage import (
     share_of_sample,
 )
 from ..common.update_configs import UpdateConfigFactory
-from ..common.validation import apply_filter_allowlist, validate_pagination_params
+from ..common.customer_filters import (
+    CUSTOMER_FILTER_MAPS,
+    CUSTOMER_FILTERS_DESCRIPTION,
+    customer_list_filters,
+)
+from ..common.validation import validate_pagination_params
 from ..config_store import get_config_value
 from ..introspection.metadata import (
     DependencyType,
@@ -93,23 +99,6 @@ def customer_data_for(resource_type: Optional[str], arguments: Dict[str, Any]) -
     if explicit_data is not None:
         return explicit_data
     return arguments.get("resource_data")
-
-
-# snake_case filter name -> camelCase query parameter, per customer resource
-# type. Verified 2026-08-28 against hypercurrent origin/develop
-# UserController.list, SubscriberController.list, OrganizationController.list
-# and TeamController.list: each declares query / type plus the tenancy id
-# (teamId for users and subscribers, tenantId for organizations and teams) and
-# a Pageable (page, size, sort). The tenancy id and page/size are set by the
-# client, so what remains is the caller-settable set — identical across the
-# four endpoints today, but kept keyed by resource type so a divergence on one
-# controller can be recorded without touching the others.
-_CUSTOMER_FILTER_MAPS: Dict[str, Dict[str, str]] = {
-    "users": {"query": "query", "type": "type", "sort": "sort"},
-    "subscribers": {"query": "query", "type": "type", "sort": "sort"},
-    "organizations": {"query": "query", "type": "type", "sort": "sort"},
-    "teams": {"query": "query", "type": "type", "sort": "sort"},
-}
 
 
 def _validate_lookup_email(email: Any, action: str) -> str:
@@ -217,7 +206,7 @@ def _refuse_incomplete_person_create(resource_type: str, resource_data: Any) -> 
                 "A subscriber must name the organization it belongs to. Add "
                 "resource_data.organizationIds with one or more organization ids, "
                 'for example {"organizationIds": ["<organization id>"]}. To find '
-                "the id, call manage_customers with action='list' and "
+                "the id, call get_customers with action='list' and "
                 "resource_type='organizations'. The server does not pick an "
                 "organization for you."
             )
@@ -225,6 +214,23 @@ def _refuse_incomplete_person_create(resource_type: str, resource_data: Any) -> 
 
     if groups:
         raise_refusal(" ".join(groups), field=field)
+
+
+def refuse_invalid_organization_create(resource_type: str, resource_data: Any) -> None:
+    """Refuse an organization create the platform would reject or store with its metadata lost.
+
+    Runs before the create, its dry-run preview and validate, so all three refuse the
+    same organization with the same text. Other resource types are left alone.
+    """
+    if resource_type != "organizations" or not isinstance(resource_data, dict):
+        return
+    if not str(resource_data.get("name") or "").strip():
+        raise_refusal(
+            "A name is required to create an organization. Add it as "
+            'resource_data.name, for example {"name": "Acme Corp"}.',
+            field="name",
+        )
+    refuse_malformed_metadata(resource_data.get("metadata"))
 
 
 # Marketplace-settings support -------------------------------------------------
@@ -598,7 +604,7 @@ PR_HEALTH_DIVERGENCE_NOTE = (
 # The settings are not inert - they reshape every count in the report.
 PR_HEALTH_REPORT_NOTE = (
     "These thresholds reshape every figure in the PR-health report; run "
-    "business_analytics_management get_pr_health afterwards to see the new classification "
+    "get_business_analytics get_pr_health afterwards to see the new classification "
     "(the report echoes the thresholds it used)."
 )
 
@@ -1258,7 +1264,7 @@ def _removal_team_id(arguments: Dict[str, Any], action: str) -> Optional[str]:
             "team_id must be a non-empty Revenium team hashid string",
             "Omit team_id entirely to use the ambient team from the auth config",
         ],
-        examples={"usage": f"{action}(team_id='jR2kmLs', confirm=true)"},
+        examples={"usage": f"{action}(team_id='jR2kmLs')"},
     )
 
 
@@ -1277,7 +1283,7 @@ def _validate_person_id(value: Any, action: str) -> int:
             "subscriber hashid",
             f"Or address the person by email instead: {action}(email='ash@acme.com')",
         ],
-        examples={"usage": f"{action}(person_id=97, confirm=true)"},
+        examples={"usage": f"{action}(person_id=97)"},
     )
 
 
@@ -1294,7 +1300,7 @@ def _removal_call_example(result: Dict[str, Any]) -> str:
         else f"email='{result['email']}'"
     )
     team = f", team_id='{result['team_id']}'" if result.get("team_id") else ""
-    return f"{result['action']}({identifier}{team}, confirm=true)"
+    return f"{result['action']}({identifier}{team})"
 
 
 def _raise_department_removal_error(
@@ -1388,11 +1394,11 @@ def _format_department_removal_text(result: Dict[str, Any]) -> str:
     target = _describe_removal_target(result)
     team_id = result.get("team_id")
     scope = f"team {team_id}" if team_id else "the ambient team"
-    if result.get("confirmation_required"):
+    if result.get("dry_run"):
         return (
-            f"**Confirmation Required - {preview_headline.format(target=target)} in {scope}**\n\n"
+            f"**Dry run - {preview_headline.format(target=target)} in {scope}**\n\n"
             f"{result['effect']}\n\n{DEPARTMENT_REMOVAL_BUDGET_NOTE}\n\n"
-            "No request was sent. To apply, repeat the call with confirm=true:\n"
+            "No request was sent. To apply, repeat the call without dry_run:\n"
             f"`{_removal_call_example(result)}`"
         )
     return (
@@ -1454,8 +1460,8 @@ class UserManager(BaseManager):
         arguments = validate_pagination_params(arguments, action="list users")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = apply_filter_allowlist(
-            arguments.get("filters"), _CUSTOMER_FILTER_MAPS["users"], action="list_users"
+        filters = customer_list_filters(
+            arguments.get("filters"), "users", action="list_users"
         )
 
         response = await self.client.get_users(page=page, size=size, **filters)
@@ -1673,8 +1679,8 @@ class SubscriberManager(BaseManager):
         arguments = validate_pagination_params(arguments, action="list subscribers")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = apply_filter_allowlist(
-            arguments.get("filters"), _CUSTOMER_FILTER_MAPS["subscribers"], action="list_subscribers"
+        filters = customer_list_filters(
+            arguments.get("filters"), "subscribers", action="list_subscribers"
         )
 
         response = await self.client.get_subscribers(page=page, size=size, **filters)
@@ -2007,8 +2013,8 @@ class OrganizationManager(BaseManager):
         arguments = validate_pagination_params(arguments, action="list organizations")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = apply_filter_allowlist(
-            arguments.get("filters"), _CUSTOMER_FILTER_MAPS["organizations"], action="list_organizations"
+        filters = customer_list_filters(
+            arguments.get("filters"), "organizations", action="list_organizations"
         )
 
         response = await self.client.get_organizations(page=page, size=size, **filters)
@@ -2105,7 +2111,7 @@ class OrganizationManager(BaseManager):
                 self.client.auth_config.tenant_id or self.client.auth_config.team_id
             )
 
-        if "metadata" not in organization_data:
+        if organization_data.get("metadata") is None:
             # API requires metadata field, even if empty
             organization_data["metadata"] = ""
 
@@ -2187,8 +2193,8 @@ class TeamManager(BaseManager):
         arguments = validate_pagination_params(arguments, action="list teams")
         page = arguments.get("page", 0)
         size = arguments.get("size", 20)
-        filters = apply_filter_allowlist(
-            arguments.get("filters"), _CUSTOMER_FILTER_MAPS["teams"], action="list_teams"
+        filters = customer_list_filters(
+            arguments.get("filters"), "teams", action="list_teams"
         )
 
         response = await self.client.get_teams(page=page, size=size, **filters)
@@ -2960,8 +2966,8 @@ class DepartmentManager(BaseManager):
     """Internal manager for departments and their memberships.
 
     Departments themselves are created and CSV-imported in the Revenium UI; the MCP
-    lists them (BACK-2767) and detaches people from them (BACK-3353), with every
-    detach gated behind an explicit confirm=true.
+    lists them (BACK-2767) and detaches people from them (BACK-3353); a detach
+    with dry_run=true previews what would change and sends nothing.
     """
 
     async def list_departments(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -3038,8 +3044,8 @@ class DepartmentManager(BaseManager):
             action, "department_persons", team_id, DEPARTMENT_PERSON_DELETE_NOTE,
             **({"person_id": person} if isinstance(person, int) else {"email": person}),
         )
-        if arguments.get("confirm") is not True:
-            return {**result, "confirmation_required": True}
+        if arguments.get("dry_run"):
+            return {**result, "dry_run": True}
 
         try:
             if isinstance(person, int):
@@ -3059,8 +3065,8 @@ class DepartmentManager(BaseManager):
             action, "department_assignments", team_id, DEPARTMENT_ASSIGNMENT_CLEAR_NOTE,
             email=email,
         )
-        if arguments.get("confirm") is not True:
-            return {**result, "confirmation_required": True}
+        if arguments.get("dry_run"):
+            return {**result, "dry_run": True}
 
         try:
             await self.client.clear_department_assignment_by_email(email, team_id)
@@ -3083,8 +3089,8 @@ class DepartmentManager(BaseManager):
                 suggestions=[
                     "person_id addresses one directory person exactly; email is resolved "
                     "to a person upstream",
-                    f"{action}(person_id=97, confirm=true) or "
-                    f"{action}(email='ash@acme.com', confirm=true)",
+                    f"{action}(person_id=97) or "
+                    f"{action}(email='ash@acme.com')",
                 ],
             )
         if raw_person_id is not None:
@@ -3094,8 +3100,8 @@ class DepartmentManager(BaseManager):
                 parameter_name="person_id",
                 action=action,
                 examples={
-                    "usage": f"{action}(person_id=97, confirm=true)",
-                    "by_email": f"{action}(email='ash@acme.com', confirm=true)",
+                    "usage": f"{action}(person_id=97)",
+                    "by_email": f"{action}(email='ash@acme.com')",
                 },
             )
         return _validate_lookup_email(raw_email, action)
@@ -3332,12 +3338,13 @@ class CustomerValidator:
                     "Verify API connectivity and authentication",
                 ],
                 examples={
-                    "validation_commands": "Get validation rules: manage_customers(action='get_capabilities')",
-                    "validate_config": "Validate configuration: manage_customers(action='validate', resource_type='organizations', resource_data={...})",
+                    "validation_commands": "Get validation rules: get_customers(action='get_capabilities')",
+                    "validate_config": "Validate configuration: get_customers(action='validate', resource_type='organizations', resource_data={...})",
                     "alternative": "Use API validation during create/update operations",
                 },
             )
 
+        refuse_invalid_organization_create(resource_type, resource_data)
         return self.schema_discovery.validate_customer_configuration(
             resource_data, resource_type, dry_run
         )
@@ -3425,12 +3432,11 @@ class CustomerAnalytics:
         size = arguments.get("size", 100)  # Get more for analysis
         # An unknown resource_type falls through to the branch below, which
         # names it; validating its filters first would bury that message.
-        allowlist = _CUSTOMER_FILTER_MAPS.get(str(resource_type))
         filters = (
-            apply_filter_allowlist(
-                arguments.get("filters"), allowlist, action=f"analyze {resource_type}"
+            customer_list_filters(
+                arguments.get("filters"), str(resource_type), action=f"analyze {resource_type}"
             )
-            if allowlist is not None
+            if str(resource_type) in CUSTOMER_FILTER_MAPS
             else {}
         )
 
@@ -3689,6 +3695,7 @@ class CustomerManagement(ToolBase):
 
                 # Refuse before auto-generation so dry run and live create agree
                 _refuse_incomplete_person_create(resource_type, resource_data)
+                refuse_invalid_organization_create(resource_type, resource_data)
 
                 # PROGRESSIVE COMPLEXITY: Auto-generate missing fields based on mode
                 if auto_generate and resource_data:
@@ -4198,8 +4205,8 @@ class CustomerManagement(ToolBase):
                             "lookup_subscriber": "lookup_subscriber(email='joao@acme.com')",
                             "lookup_user": "lookup_user(email='admin@acme.com')",
                             "list_departments": "list_departments()",
-                            "delete_department_person": "delete_department_person(person_id=97, confirm=true)",
-                            "clear_department_assignment": "clear_department_assignment(email='ash@acme.com', confirm=true)",
+                            "delete_department_person": "delete_department_person(person_id=97)",
+                            "clear_department_assignment": "clear_department_assignment(email='ash@acme.com')",
                             "get_marketplace_settings": "get_marketplace_settings(team_id='jR2kmLs')",
                             "update_marketplace_settings": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'], operation='add')",
                             "get_pr_health_settings": "get_pr_health_settings(team_id='jR2kmLs')",
@@ -4246,7 +4253,8 @@ class CustomerManagement(ToolBase):
         result_text += "- `resource_id` - For get/update/delete operations\n"
         result_text += "- `auto_generate` - Enable smart defaults (default: true)\n"
         result_text += "- `dry_run` - Preview without creating (optional)\n"
-        result_text += "- `page`, `size` - For list operations\n\n"
+        result_text += "- `page`, `size` - For list operations\n"
+        result_text += f"- `filters` - {CUSTOMER_FILTERS_DESCRIPTION}\n\n"
 
         result_text += "## **Resource Types**\n"
         for resource_type in capabilities.get("resource_types", []):
@@ -4379,9 +4387,9 @@ class CustomerManagement(ToolBase):
         result_text += "- `list_departments(team_id='jR2kmLs')` - restrict the listing to one team\n"
         result_text += "- Each department reports `name`, `id`, `parentId`, `path` (materialized ancestor-id path, e.g. `/12/40/173/`) and `source`\n"
         result_text += f"- **Types**: {DEPARTMENT_ID_STRING_NOTE}\n"
-        result_text += "- `delete_department_person(person_id=97, confirm=true)` or `delete_department_person(email='ash@acme.com', confirm=true)` - delete one directory person\n"
-        result_text += "- `clear_department_assignment(email='ash@acme.com', confirm=true)` - end one person's primary assignment, keeping the person\n"
-        result_text += "- **Confirm gate**: without `confirm=true` both removals only preview what would change; no request is sent\n"
+        result_text += "- `delete_department_person(person_id=97)` or `delete_department_person(email='ash@acme.com')` - delete one directory person\n"
+        result_text += "- `clear_department_assignment(email='ash@acme.com')` - end one person's primary assignment, keeping the person\n"
+        result_text += "- **Preview**: with `dry_run=true` both removals only show what would change; no request is sent\n"
         result_text += f"- **Delete**: {DEPARTMENT_PERSON_DELETE_NOTE}\n"
         result_text += f"- **Clear**: {DEPARTMENT_ASSIGNMENT_CLEAR_NOTE}\n"
         result_text += f"- **Budgets**: {DEPARTMENT_REMOVAL_BUDGET_NOTE}\n"
@@ -4731,7 +4739,11 @@ class CustomerManagement(ToolBase):
                 description="Manage users, subscribers, organizations, and teams",
                 parameters={
                     "resource_type": "str (users, subscribers, organizations, teams)",
-                    "list": {"page": "int", "size": "int", "filters": "dict"},
+                    "list": {
+                        "page": "int",
+                        "size": "int",
+                        "filters": f"dict. {CUSTOMER_FILTERS_DESCRIPTION}",
+                    },
                     "get": {
                         "user_id": "str",
                         "subscriber_id": "str",
@@ -4818,7 +4830,7 @@ class CustomerManagement(ToolBase):
                     "the custom automationPatterns and the assistedOnly default view for AI-assisted pull requests; reads also "
                     "echo builtInAutomationPatterns, cutoffDateIsDefault, defaultCountsSince and defaultCutoffDate. "
                     "The thresholds, cutoffDate and excludedRepos reshape the PR-health report, which is read "
-                    "with business_analytics_management get_pr_health."
+                    "with get_business_analytics get_pr_health."
                 ),
                 parameters={
                     "get_pr_health_settings": {"team_id": "str (required)"},
@@ -4970,7 +4982,7 @@ class CustomerManagement(ToolBase):
                     "controls and group previews, and this is the only action that produces "
                     "the id those filters take. Detach a person from their department by "
                     "deleting the directory person or clearing only their assignment; both "
-                    "removals require confirm=true and otherwise return a preview."
+                    "removals take dry_run=true to preview what would change."
                 ),
                 parameters={
                     "list_departments": {
@@ -4980,20 +4992,20 @@ class CustomerManagement(ToolBase):
                         "person_id": "int (numeric directory person id) - or email, not both",
                         "email": "str (resolved to one directory person upstream) - or person_id",
                         "team_id": "str (optional - defaults to the ambient team)",
-                        "confirm": "bool (required true to delete; otherwise a preview)",
+                        "dry_run": "bool (optional - true previews the deletion and sends nothing)",
                     },
                     "clear_department_assignment": {
                         "email": "str (required)",
                         "team_id": "str (optional - defaults to the ambient team)",
-                        "confirm": "bool (required true to clear; otherwise a preview)",
+                        "dry_run": "bool (optional - true previews the change and sends nothing)",
                     },
                 },
                 examples=[
                     "list_departments()",
                     "list_departments(team_id='jR2kmLs')",
-                    "delete_department_person(person_id=97, confirm=true)",
-                    "delete_department_person(email='ash@acme.com', confirm=true)",
-                    "clear_department_assignment(email='ash@acme.com', confirm=true)",
+                    "delete_department_person(person_id=97)",
+                    "delete_department_person(email='ash@acme.com')",
+                    "clear_department_assignment(email='ash@acme.com')",
                 ],
                 limitations=[
                     "Departments themselves are created, renamed and deleted in the Revenium UI, not through this tool",
@@ -5011,7 +5023,10 @@ class CustomerManagement(ToolBase):
                 name="Customer Analytics",
                 description="Analyze customer data",
                 parameters={
-                    "analyze": {"resource_type": "str", "filters": "dict"},
+                    "analyze": {
+                        "resource_type": "str",
+                        "filters": f"dict. {CUSTOMER_FILTERS_DESCRIPTION}",
+                    },
                 },
                 examples=[
                     "analyze(resource_type='users', filters={'query': 'acme'})",
@@ -5187,14 +5202,6 @@ class CustomerManagement(ToolBase):
                         "pass either person_id or email, not both"
                     ),
                 },
-                "confirm": {
-                    "type": "boolean",
-                    "description": (
-                        "Must be true for delete_department_person and "
-                        "clear_department_assignment to send the request; any other "
-                        "value returns a preview of what would be removed"
-                    ),
-                },
                 "policy": {
                     "type": "string",
                     "description": (
@@ -5213,6 +5220,7 @@ class CustomerManagement(ToolBase):
                         "carries a single domain; the add is not a list replacement"
                     ),
                 },
+                "filters": {"type": "object", "description": CUSTOMER_FILTERS_DESCRIPTION},
                 **digest_input_schema_properties(),
                 # Note: ownerId, teamId system-managed for customer resources
                 # Note: resource_type determined from context

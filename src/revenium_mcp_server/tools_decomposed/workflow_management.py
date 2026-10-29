@@ -32,6 +32,7 @@ from ..introspection.metadata import (
 )
 from ..common.tenant_scoped_store import TenantScopedStore
 from .unified_tool_base import ToolBase
+from .workflow_templates import build_workflow_templates, render_step_call, step_context
 
 
 class WorkflowManager:
@@ -49,7 +50,7 @@ class WorkflowManager:
 
     def __init__(self):
         """Initialize workflow manager."""
-        self.workflow_templates = self._build_workflow_templates()
+        self.workflow_templates = build_workflow_templates()
 
     def validate_start_args(self, workflow_type: str, context: Dict[str, Any]) -> None:
         if workflow_type not in self.workflow_templates and workflow_type != "generic":
@@ -95,55 +96,6 @@ class WorkflowManager:
                         "usage": f"start(workflow_type='{workflow_type}', context={{...}})",
                     },
                 )
-
-    def _build_workflow_templates(self) -> Dict[str, Dict[str, Any]]:
-        """Build workflow templates for common operations."""
-        return {
-            "customer_onboarding": {
-                "name": "Customer Onboarding",
-                "description": "Complete customer setup workflow",
-                "steps": [
-                    {"action": "create_organization", "tool": "manage_customers"},
-                    {"action": "create_user", "tool": "manage_customers"},
-                    {"action": "setup_billing", "tool": "manage_subscriptions"},
-                    {"action": "configure_alerts", "tool": "manage_alerts"},
-                ],
-                "required_context": ["customer_email", "organization_name"],
-            },
-            "product_setup": {
-                "name": "Product Setup",
-                "description": "Product creation and configuration workflow",
-                "steps": [
-                    {"action": "create_product", "tool": "manage_products"},
-                    {"action": "configure_pricing", "tool": "manage_products"},
-                    {"action": "setup_metering", "tool": "manage_metering_elements"},
-                    {"action": "test_configuration", "tool": "manage_products"},
-                ],
-                "required_context": ["product_name", "pricing_model"],
-            },
-            "alert_configuration": {
-                "name": "Alert Configuration",
-                "description": "Alert setup and testing workflow",
-                "steps": [
-                    {"action": "create_from_text", "tool": "manage_alerts"},
-                    {"action": "update", "tool": "manage_alerts"},
-                    {"action": "validate", "tool": "manage_alerts"},
-                    {"action": "enable", "tool": "manage_alerts"},
-                ],
-                "required_context": ["alert_type", "metric_name"],
-            },
-            "subscription_setup": {
-                "name": "Subscription Setup",
-                "description": "Complete subscription creation workflow",
-                "steps": [
-                    {"action": "validate_product", "tool": "manage_products"},
-                    {"action": "validate_customer", "tool": "manage_customers"},
-                    {"action": "create_subscription", "tool": "manage_subscriptions"},
-                    {"action": "verify_billing", "tool": "manage_subscriptions"},
-                ],
-                "required_context": ["product_id", "customer_email"],
-            },
-        }
 
     def _owned_workflow(
         self, workflow_id: str, scope: Optional[TenantScope]
@@ -287,28 +239,28 @@ class WorkflowManager:
             return {
                 "workflow_id": workflow_id,
                 "status": "completed",
-                "message": "All workflow steps completed",
-                "next_action": "Use complete_workflow to finalize",
+                "message": "All workflow steps completed; there is nothing left to run",
             }
 
         next_step_info = steps[current_step]
+        context = workflow.get("context", {})
+        template = self.workflow_templates.get(workflow.get("type", ""), {})
+        call = render_step_call(next_step_info, step_context(template, context))
 
         return {
             "workflow_id": workflow_id,
             "current_step": current_step + 1,
             "total_steps": len(steps),
             "next_step": next_step_info,
-            "guidance": f"Execute {next_step_info['action']} using {next_step_info['tool']}",
-            "context": workflow.get("context", {}),
+            "call": call,
+            "guidance": f"{next_step_info['purpose']}: run {call}",
+            "context": context,
         }
 
-    async def complete_step(
-        self, arguments: Dict[str, Any], scope: Optional[TenantScope] = None
+    def _workflow_to_advance(
+        self, arguments: Dict[str, Any], scope: Optional[TenantScope]
     ) -> Dict[str, Any]:
-        """Complete a workflow step."""
         workflow_id = arguments.get("workflow_id")
-        step_result = arguments.get("step_result", {})
-
         if not workflow_id:
             raise create_structured_missing_parameter_error(
                 parameter_name="workflow_id",
@@ -319,29 +271,47 @@ class WorkflowManager:
                     "example_ids": ["wf_123", "customer_onboarding", "product_setup"],
                 },
             )
+        return self._owned_workflow(workflow_id, scope)
 
-        workflow = self._owned_workflow(workflow_id, scope)
+    @staticmethod
+    def _status_after_step(workflow: Dict[str, Any], step_number: int) -> str:
+        if step_number >= len(workflow.get("steps", [])):
+            return "completed"
+        return str(workflow["status"])
 
-        # Record step completion
-        current_step = workflow.get("current_step", 0)
+    async def preview_complete_step(
+        self, arguments: Dict[str, Any], scope: Optional[TenantScope] = None
+    ) -> Dict[str, Any]:
+        """What complete_step would record, after the same checks, without recording it."""
+        workflow = self._workflow_to_advance(arguments, scope)
+        step_number = workflow.get("current_step", 0) + 1
+        return {
+            "workflow_id": workflow["id"],
+            "step_to_complete": step_number,
+            "total_steps": len(workflow.get("steps", [])),
+            "workflow_status_after": self._status_after_step(workflow, step_number),
+            "step_result": arguments.get("step_result", {}),
+        }
+
+    async def complete_step(
+        self, arguments: Dict[str, Any], scope: Optional[TenantScope] = None
+    ) -> Dict[str, Any]:
+        """Complete a workflow step."""
+        workflow = self._workflow_to_advance(arguments, scope)
+        step_number = workflow.get("current_step", 0) + 1
         workflow["completed_steps"].append(
             {
-                "step_number": current_step + 1,
-                "result": step_result,
+                "step_number": step_number,
+                "result": arguments.get("step_result", {}),
                 "completed_at": datetime.now(timezone.utc).isoformat(),
             }
         )
-
-        # Advance to next step
-        workflow["current_step"] = current_step + 1
-
-        # Check if workflow is complete
-        if workflow["current_step"] >= len(workflow.get("steps", [])):
-            workflow["status"] = "completed"
+        workflow["current_step"] = step_number
+        workflow["status"] = self._status_after_step(workflow, step_number)
 
         return {
-            "workflow_id": workflow_id,
-            "step_completed": current_step + 1,
+            "workflow_id": workflow["id"],
+            "step_completed": step_number,
             "workflow_status": workflow["status"],
             "total_completed": len(workflow["completed_steps"]),
         }
@@ -353,6 +323,17 @@ class WorkflowManager:
             "templates": self.workflow_templates,
             "total_templates": len(self.workflow_templates),
         }
+
+
+def _complete_step_preview_text(preview: Dict[str, Any]) -> str:
+    return (
+        "**DRY RUN MODE - Step Completion**\n\n"
+        f"**Would complete step {preview['step_to_complete']} of {preview['total_steps']} "
+        f"for workflow:** {preview['workflow_id']}\n"
+        f"**Workflow status after this step:** {preview['workflow_status_after']}\n"
+        f"**Step Result:** {json.dumps(preview['step_result'], indent=2)}\n\n"
+        "**Dry Run:** True (no step was completed; the workflow is unchanged)"
+    )
 
 
 class WorkflowValidator:
@@ -379,7 +360,7 @@ class WorkflowValidator:
             examples={
                 "get_templates": "get_workflow_templates() to see validation rules",
                 "api_validation": "start(workflow_type='...', context={...}) - API validates automatically",
-                "validation_commands": "Get validation rules: manage_workflows(action='get_capabilities')",
+                "validation_commands": "Get validation rules: get_workflows(action='get_capabilities')",
             },
         )
 
@@ -454,20 +435,11 @@ class WorkflowManagement(ToolBase):
             elif action == "next_step":
                 result = await self.workflow_manager.next_step(arguments, scope)
             elif action == "complete_step":
-                # Handle dry_run mode for step completion
-                dry_run = arguments.get("dry_run", False)
-                if dry_run:
-                    workflow_id = arguments.get("workflow_id")
-                    step_result = arguments.get("step_result", {})
-                    return [
-                        TextContent(
-                            type="text",
-                            text=f"🧪 **DRY RUN MODE - Step Completion**\n\n"
-                            f"✅ **Would complete step for workflow:** {workflow_id}\n"
-                            f"**Step Result:** {json.dumps(step_result, indent=2)}\n\n"
-                            f"**Dry Run:** True (no actual step completion performed)",
-                        )
-                    ]
+                if arguments.get("dry_run", False):
+                    preview = await self.workflow_manager.preview_complete_step(
+                        arguments, scope
+                    )
+                    return [TextContent(type="text", text=_complete_step_preview_text(preview))]
 
                 result = await self.workflow_manager.complete_step(arguments, scope)
             elif action == "get_workflow_templates":
@@ -596,9 +568,9 @@ complete_step(workflow_id="wf_123", step_result={...}) # Complete current step
             text += "\n\n## **Supported Workflow Types**\n"
             text += "View available workflow types and templates:\n\n"
             text += "**Commands:**\n"
-            text += '- Get workflow capabilities: `manage_workflows(action="get_capabilities")`\n'
+            text += '- Get workflow capabilities: `get_workflows(action="get_capabilities")`\n'
             text += (
-                '- Get workflow templates: `manage_workflows(action="get_workflow_templates")`\n'
+                '- Get workflow templates: `get_workflows(action="get_workflow_templates")`\n'
             )
 
         # Add UCM-enhanced templates if available
@@ -614,9 +586,9 @@ complete_step(workflow_id="wf_123", step_result={...}) # Complete current step
             text += "View available workflow templates and their usage:\n\n"
             text += "**Commands:**\n"
             text += (
-                '- Get workflow templates: `manage_workflows(action="get_workflow_templates")`\n'
+                '- Get workflow templates: `get_workflows(action="get_workflow_templates")`\n'
             )
-            text += '- Get workflow capabilities: `manage_workflows(action="get_capabilities")`\n'
+            text += '- Get workflow capabilities: `get_workflows(action="get_capabilities")`\n'
 
         # Add schema information from API validation
         if ucm_capabilities and "schema" in ucm_capabilities:
@@ -706,7 +678,7 @@ complete_step(workflow_id="wf_123", step_result={...}) # Complete current step
                 '  "action": "start",\n'
                 '  "workflow_type": "alert_configuration",\n'
                 '  "context": {\n'
-                '    "alert_type": "threshold",\n'
+                '    "alert_type": "THRESHOLD",\n'
                 '    "metric_name": "TOTAL_COST"\n'
                 "  }\n"
                 "}\n"
@@ -750,8 +722,7 @@ complete_step(workflow_id="wf_123", step_result={...}) # Complete current step
                 '  "workflow_id": "wf_14a2e729",\n'
                 '  "step_result": {\n'
                 '    "success": true,\n'
-                '    "organization_id": "org_abc123",\n'
-                '    "user_id": "user_def456"\n'
+                '    "organization_id": "org_abc123"\n'
                 "  }\n"
                 "}\n"
                 "```\n\n"
@@ -780,22 +751,44 @@ complete_step(workflow_id="wf_123", step_result={...}) # Complete current step
                 "3. **Follow the step-by-step process**: start → next_step → complete_step\n"
                 "4. **Provide all required context fields** for each workflow type\n"
                 "5. **Use `list()` to track active workflows** and their progress\n\n"
-                "## **Complete Workflow Example**\n\n"
-                "```bash\n"
-                "# 1. Start customer onboarding\n"
-                'start(workflow_type="customer_onboarding", context={"customer_email": "new@company.com", "organization_name": "New Corp"})\n'
-                '# Returns: {"id": "wf_abc123", "status": "started", "current_step": 0}\n\n'
-                "# 2. Get next step guidance\n"
-                'next_step(workflow_id="wf_abc123")\n'
-                '# Returns: {"step": "create_organization", "tool": "manage_customers", "guidance": "..."}\n\n'
-                "# 3. Complete the step\n"
-                'complete_step(workflow_id="wf_abc123", step_result={"success": true, "organization_id": "org_xyz"})\n'
-                '# Returns: {"step_completed": true, "next_step": "create_user", "progress": "25%"}\n\n'
-                "# 4. Continue until workflow complete\n"
-                "# Repeat steps 2-3 for each workflow step\n"
-                "```",
+                + self._complete_workflow_example(),
             )
         ]
+
+    def _complete_workflow_example(self) -> str:
+        context = {"customer_email": "new@company.com", "organization_name": "New Corp"}
+        template = self.workflow_manager.workflow_templates["customer_onboarding"]
+        first_step = template["steps"][0]
+        call = render_step_call(first_step, step_context(template, context))
+        next_step_answer = {
+            "current_step": 1,
+            "total_steps": len(template["steps"]),
+            "next_step": first_step,
+            "call": call,
+        }
+        complete_step_answer = {
+            "step_completed": 1,
+            "workflow_status": "started",
+            "total_completed": 1,
+        }
+        return (
+            "## **Complete Workflow Example**\n\n"
+            "1. Start customer onboarding:\n"
+            "```json\n"
+            + json.dumps(
+                {"action": "start", "workflow_type": "customer_onboarding", "context": context},
+                indent=2,
+            )
+            + "\n```\n\n"
+            '2. Ask for the next step with `{"action": "next_step", "workflow_id": "wf_abc123"}`. '
+            "The answer includes:\n"
+            "```json\n" + json.dumps(next_step_answer, indent=2) + "\n```\n\n"
+            f"3. Run the call it names: `{call}`\n\n"
+            '4. Record the result with `{"action": "complete_step", "workflow_id": "wf_abc123", '
+            '"step_result": {"success": true}}`. The answer:\n'
+            "```json\n" + json.dumps(complete_step_answer, indent=2) + "\n```\n\n"
+            "5. Repeat steps 2 to 4 until next_step reports the workflow completed.\n"
+        )
 
     async def _handle_get_agent_summary(
         self,

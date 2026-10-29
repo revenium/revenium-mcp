@@ -1018,7 +1018,7 @@ action="create_simple", workflow_type="customer_onboarding", customer_email="use
     async def handle_manage_metering_elements(
         self, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Handle the manage_metering_elements tool for metering element definition management.
+        """Handle the manage_usage_meters tool for metering element definition management.
 
         This tool provides comprehensive metering element management capabilities including:
         - CRUD Operations: Create, read, update, delete metering element definitions

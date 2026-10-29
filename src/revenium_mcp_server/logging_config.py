@@ -4,6 +4,7 @@ This module provides sophisticated logging capabilities for the Alerts & Anomali
 MCP server, including structured logging, performance tracking, and monitoring.
 """
 
+import asyncio
 import functools
 import inspect
 import os
@@ -418,6 +419,11 @@ async def async_operation_context(
         yield operation_id
         performance_tracker.end_operation(operation_id, success=True)
         logger.debug(f"Completed operation: {operation_name}", operation_id=operation_id)
+    except asyncio.CancelledError:
+        performance_tracker.end_operation(
+            operation_id, success=False, error="cancelled"
+        )
+        raise
     except Exception as e:
         performance_tracker.end_operation(operation_id, success=False, error=str(e))
         logger.error(f"Failed operation: {operation_name}", operation_id=operation_id, error=str(e))

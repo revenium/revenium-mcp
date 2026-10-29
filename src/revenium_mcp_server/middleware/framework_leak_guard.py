@@ -14,7 +14,6 @@ BACK-1312 (audit findings B.1-B.4).
 """
 from __future__ import annotations
 
-import difflib
 import logging
 from typing import Any, Sequence
 
@@ -22,6 +21,10 @@ from fastmcp.exceptions import ToolError
 from fastmcp.exceptions import ValidationError as FastMCPValidationError
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from pydantic import ValidationError
+
+from ..common.split_tool_guidance import sibling_sentence
+from ..common.tool_surface import domain_for
+from ..common.unknown_arguments import unrecognized_parameter_message
 
 logger = logging.getLogger(__name__)
 
@@ -199,17 +202,20 @@ def _format_one_error(
     field = str(loc[0]) if loc else "<unknown>"
 
     if err_type == "unexpected_keyword_argument":
-        suggestion = _suggest_param(field, accepted_params)
-        head = f"Field '{field}' is not a recognized parameter of {tool_name}."
-        if suggestion:
-            return f"{head} Did you mean: {suggestion}?"
-        return head
+        return unrecognized_parameter_message(field, tool_name, accepted_params)
 
     if err_type == "int_from_float":
         value = err.get("input")
         return (
             f"Field '{field}' must be an integer, got {value} (number with fractional part). "
             f"Pass an integer (e.g. {field}=0) or a digit string (e.g. {field}=\"0\")."
+        )
+
+    if err_type == "list_type":
+        value = err.get("input")
+        return (
+            f"Field '{field}' must be a list, got {type(value).__name__} ({value!r}). "
+            f"Pass a list (e.g. {field}=[\"value\"])."
         )
 
     if err_type == "string_type":
@@ -227,34 +233,26 @@ def _format_one_error(
             f"Pass an integer (e.g. {field}=0) or a digit string (e.g. {field}=\"0\")."
         )
 
+    if err_type in ("missing", "missing_argument"):
+        return _missing_field_message(field, tool_name)
+
     return f"Field '{field}' failed validation."
 
 
-def _suggest_param(field: str, accepted_params: Sequence[str]) -> str | None:
-    """Return the closest match in `accepted_params` for `field`, or None.
+def _missing_field_message(field: str, tool_name: str) -> str:
+    head = f"Field '{field}' is required by {tool_name} and was not sent."
+    if field != "action":
+        return head
+    try:
+        domain = domain_for(tool_name)
+    except KeyError:
+        return head
+    if tool_name != domain.write_name:
+        return head
+    actions = sorted(domain.write_actions)
+    example = "create" if "create" in actions else actions[0]
+    return (
+        f"{head} {tool_name} runs: {', '.join(actions)}. For example {tool_name}(action='{example}', ...). "
+        f"{sibling_sentence(tool_name)}"
+    )
 
-    Tiers (first hit wins):
-      1. Suffix or prefix match — `id` → `product_id`, `subscription_id`.
-         Caller used the "core" of a compound name; this is the high-signal case
-         the audit calls out (BACK-1312 finding B.1). When multiple candidates
-         match (e.g. `id` matches `product_id`, `subscription_id`, `customer_id`),
-         all matches are returned comma-joined so the caller is not misled by
-         dict-order chance.
-      2. difflib ratio >= 0.6 — fuzzy similarity for typos.
-    """
-    if not accepted_params:
-        return None
-    accepted = list(accepted_params)
-
-    # Tier 1: collect all suffix/prefix containment matches with separator.
-    tier1 = [
-        cand for cand in accepted
-        if cand != field
-        and (cand.endswith(f"_{field}") or cand.startswith(f"{field}_"))
-    ]
-    if tier1:
-        return ", ".join(tier1) if len(tier1) > 1 else tier1[0]
-
-    # Tier 2: difflib fuzzy match.
-    matches = difflib.get_close_matches(field, accepted, n=1, cutoff=0.6)
-    return matches[0] if matches else None

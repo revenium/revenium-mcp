@@ -74,7 +74,7 @@ class TestGetAppOAuthUrlBaseUrl:
 
 
 class TestInitiateOAuthBaseUrl:
-    """slack_management initiate_oauth."""
+    """manage_slack initiate_oauth."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("env,expected_base_url", ENV_CASES)
@@ -90,7 +90,7 @@ class TestInitiateOAuthBaseUrl:
 
 
 class TestSetupStatusBaseUrl:
-    """slack_management setup_status."""
+    """manage_slack setup_status."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("env,expected_base_url", ENV_CASES)

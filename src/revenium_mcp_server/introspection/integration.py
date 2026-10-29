@@ -11,6 +11,7 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..client import ReveniumAPIError
+from ..common.called_tool import presented_name
 from ..common.error_handling import ToolError
 from ..tools_decomposed.unified_tool_base import ToolBase
 from .engine import introspection_engine
@@ -103,13 +104,13 @@ class IntrospectionIntegration:
         try:
             # Register onboarding tools FIRST to ensure they appear at the top of the list
             try:
-                # Register system_setup (the actual MCP tool name)
+                # Register manage_system_setup (the actual MCP tool name)
                 from ..tools_decomposed.system_setup import SystemSetup
 
-                await self._register_tool_with_ucm(SystemSetup, "System Setup", "system_setup")
-                logger.info("Registered system_setup for introspection")
+                await self._register_tool_with_ucm(SystemSetup, "System Setup", "manage_system_setup")
+                logger.info("Registered manage_system_setup for introspection")
             except Exception as e:
-                logger.error(f"❌ Could not register system_setup for introspection: {e}")
+                logger.error(f"❌ Could not register manage_system_setup for introspection: {e}")
                 # Continue without this tool rather than failing server startup
 
             try:
@@ -125,7 +126,7 @@ class IntrospectionIntegration:
                 # Continue without this tool rather than failing server startup
 
             # Note: verify_email_setup, setup_checklist, and configuration_status are not standalone MCP tools
-            # They are integrated into system_setup and system_diagnostics consolidated tools
+            # They are integrated into manage_system_setup and system_diagnostics consolidated tools
 
             # Register all other tools with standardized UCM integration pattern
             from ..tools_decomposed.alert_management import AlertManagement
@@ -155,7 +156,7 @@ class IntrospectionIntegration:
             await self._register_tool_with_ucm(
                 MeteringElementsManagement,
                 "Metering Elements Management",
-                "manage_metering_elements",
+                "manage_usage_meters",
             )
 
             from ..tools_decomposed.metering_management import MeteringManagement
@@ -193,7 +194,7 @@ class IntrospectionIntegration:
             await self._register_tool_with_ucm(
                 BusinessAnalyticsManagement,
                 "Business Analytics Management",
-                "business_analytics_management",
+                "get_business_analytics",
             )
 
             from ..tools_decomposed.subscriber_credentials_management import (
@@ -203,29 +204,29 @@ class IntrospectionIntegration:
             await self._register_tool_with_ucm(
                 SubscriberCredentialsManagement,
                 "Subscriber Credentials Management",
-                "manage_subscriber_credentials",
+                "manage_credentials",
             )
 
             # Register Slack tools
-            # Register the unified slack_management tool (primary tool for agents)
+            # Register the unified manage_slack tool (primary tool for agents)
             try:
                 from ..tools_decomposed.slack_management import SlackManagement
 
                 await self._register_tool_with_ucm(
                     SlackManagement,
                     "Slack Management",
-                    "slack_management",
+                    "manage_slack",
                 )
-                logger.info("Registered slack_management for introspection")
+                logger.info("Registered manage_slack for introspection")
             except Exception as e:
-                logger.warning(f"Could not register slack_management for introspection: {e}")
+                logger.warning(f"Could not register manage_slack for introspection: {e}")
 
-            # NOTE: slack_configuration_management is now part of the unified slack_management tool
+            # NOTE: slack_configuration_management is now part of the unified manage_slack tool
             # and should not be registered separately to avoid duplicate tool listings
 
-            # NOTE: slack_oauth_workflow and slack_setup_assistant are sub-tools of slack_management
+            # NOTE: slack_oauth_workflow and slack_setup_assistant are sub-tools of manage_slack
             # They should not be registered as standalone tools since they're internal implementation details
-            # The unified slack_management tool handles all Slack-related functionality
+            # The unified manage_slack tool handles all Slack-related functionality
 
             # Register customer management with UCM integration
             try:
@@ -241,16 +242,16 @@ class IntrospectionIntegration:
             # Register Group 5 tools for introspection
             # Note: performance_dashboard removed - infrastructure monitoring handled externally
 
-            # Register manage_capabilities with introspection engine
+            # Register get_capabilities with introspection engine
             try:
                 from ..tools_decomposed.manage_capabilities import ManageCapabilities
 
                 await self._register_tool_with_ucm(
-                    ManageCapabilities, "Manage Capabilities", "manage_capabilities"
+                    ManageCapabilities, "Manage Capabilities", "get_capabilities"
                 )
-                logger.info("Registered manage_capabilities for introspection")
+                logger.info("Registered get_capabilities for introspection")
             except Exception as e:
-                logger.warning(f"Could not register manage_capabilities for introspection: {e}")
+                logger.warning(f"Could not register get_capabilities for introspection: {e}")
 
             # Register tool_introspection with introspection engine
             try:
@@ -302,10 +303,15 @@ class IntrospectionIntegration:
                 metadata = await self.engine.get_tool_metadata(tool_name)
                 if metadata:
                     success = True
+                    summary = (
+                        await provider._get_agent_summary()
+                        if isinstance(provider, ToolBase)
+                        else metadata.agent_summary
+                    )
                     return [
                         TextContent(
                             type="text",
-                            text=f"🔍 **Tool Metadata: {metadata.name}**\n\n{metadata.agent_summary}",
+                            text=f"🔍 **Tool Metadata: {presented_name(metadata.name)}**\n\n{summary}",
                         )
                     ]
 
@@ -353,49 +359,30 @@ class IntrospectionIntegration:
             )
 
     async def add_introspection_tool_to_server(self, server_instance) -> None:
-        """Add introspection tool to the MCP server using dynamic description system.
+        """Publish the tool_introspection tool on the MCP server.
 
         Args:
             server_instance: FastMCP server instance
         """
-        # Import dynamic description system
-        from ..tools_decomposed.tool_registry import get_tool_description
+        from ..tool_configuration.tool_publishing import publish_tools
+        from ..tools_decomposed.tool_introspection import ToolIntrospection
 
-        # Get dynamic description from single source of truth BEFORE creating function
-        dynamic_description = get_tool_description("tool_introspection")
-
-        # Create function with dynamic docstring set BEFORE decoration
+        @publish_tools(server_instance, "tool_introspection")
         async def tool_introspection(
             action: str = "get_capabilities",  # Context7: Smart default for zero-knowledge agents
             tool_name: Optional[str] = None,
             tool_type: Optional[str] = None,
         ) -> str:
             arguments = {"action": action, "tool_name": tool_name, "tool_type": tool_type}
-
-            # Use the tool class following single source of truth architecture
-            from ..tools_decomposed.tool_introspection import ToolIntrospection
-
-            tool_instance = ToolIntrospection()
-            result = await tool_instance.handle_action(action, arguments)
+            result = await ToolIntrospection().handle_action(action, arguments)
             if result and len(result) > 0:
                 first_result = result[0]
                 if isinstance(first_result, TextContent):
                     return first_result.text
             return "No result"
 
-        # Set dynamic description BEFORE applying decorator
-        tool_introspection.__doc__ = dynamic_description
-
-        # Now apply the decorator to the function with correct docstring and name
-        server_instance.tool()(tool_introspection)
-
-        # Register metadata with introspection engine
-        from ..tools_decomposed.tool_introspection import ToolIntrospection
         await self.engine.register_tool("tool_introspection", ToolIntrospection())
-
-        logger.info(
-            f"Added tool_introspection tool to MCP server with dynamic description: {dynamic_description}"
-        )
+        logger.info("Added tool_introspection tool to MCP server")
 
     async def get_server_summary(self) -> Dict[str, Any]:
         """Get a summary of the server's introspection capabilities.

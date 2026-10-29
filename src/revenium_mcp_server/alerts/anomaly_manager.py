@@ -46,10 +46,11 @@ from .notification_recipients import (
 )
 from .update_fidelity import (
     ordered_periods_for,
+    refuse_negative_threshold,
     refuse_platform_rule_breach,
     refuse_unknown_data_source,
     refuse_update_rule_breach,
-    refuse_unsupported_update_fields,
+    refuse_unsupported_alert_fields,
     resolve_update_period,
     threshold_number,
     verify_update_applied,
@@ -227,7 +228,7 @@ async def _refuse_unknown_slack_configuration(
         value=missing,
         expected="The id of a Slack configuration this organization has",
         suggestion=(
-            "Run slack_management(action='list_configurations') to see this "
+            "Run get_slack(action='list_configurations') to see this "
             "organization's Slack configurations, then retry with one of those ids"
         ),
     )
@@ -612,9 +613,6 @@ class AnomalyManager:
                 anomaly_data["description"]
             )
 
-        if "tags" in anomaly_data:
-            validated_data["tags"] = InputValidator.validate_tags(anomaly_data["tags"])
-
         # Handle both detection_rules format AND direct API format
         if "detection_rules" in anomaly_data:
             # User provided detection_rules format - validate and convert
@@ -719,6 +717,8 @@ class AnomalyManager:
         Shared by create_anomaly and the validate / create dry-run preview, so a preview
         cannot approve what the create refuses. Undecorated: refusals reach the caller as raised.
         """
+        if isinstance(anomaly_data, dict):
+            refuse_unsupported_alert_fields(anomaly_data, "created")
         # Before the shape check, whose periodDuration list would otherwise answer
         # TEN_MINUTES with an unflagged "invalid value" instead of the period rule.
         # A detection_rules payload names its metric only after conversion, so the
@@ -774,6 +774,7 @@ class AnomalyManager:
 
         # The detection_rules conversion picks the period from time_window (15m when blank).
         refuse_platform_rule_breach(api_data)
+        refuse_negative_threshold(api_data.get("threshold"))
         return api_data
 
     @handle_alert_tool_errors("create_anomaly")
@@ -890,7 +891,7 @@ class AnomalyManager:
                 expected="Dictionary with update fields",
             )
 
-        refuse_unsupported_update_fields(update_data)
+        refuse_unsupported_alert_fields(update_data, "updated")
         refuse_unknown_data_source(update_data)
 
         logger.info(f"Updating anomaly: {anomaly_id}")
@@ -1047,6 +1048,7 @@ class AnomalyManager:
                     # Pass through as-is if already in API format
                     converted_updates["periodDuration"] = str(value)
             elif key == "threshold":
+                refuse_negative_threshold(value)
                 converted_updates["threshold"] = _as_number(value)
             elif key == "webhook_configurations":
                 # Convert 'webhook_configurations' to 'webhookConfigurations'

@@ -380,7 +380,7 @@ class TestFilterOptionsReviewHardening:
     async def test_tool_provider_guidance_names_the_tool_cost_filter(self, dimension):
         engine = self._engine_with_values(["brave"])
         text = await engine.get_filter_options(dimension=dimension)
-        assert "the provider argument on manage_tools get_cost_by_provider" in text
+        assert "the provider argument on get_tools get_cost_by_provider" in text
         assert "No cost report filters by" not in text
 
     @pytest.mark.asyncio

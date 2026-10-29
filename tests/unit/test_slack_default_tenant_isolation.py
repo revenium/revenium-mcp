@@ -1,6 +1,6 @@
 """BACK-4633: a default Slack configuration chosen by one hosted customer never reaches another.
 
-Drives the registered ``slack_management`` and ``manage_alerts`` tools the way
+Drives the registered ``manage_slack`` and ``manage_alerts`` tools the way
 the hosted server does: the tenant context lives in the ContextVar the auth
 middleware sets and the call goes through the introspection provider.
 """
@@ -32,6 +32,7 @@ from src.revenium_mcp_server.tool_configuration.registry import ToolConfiguratio
 from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
 from src.revenium_mcp_server.tools_decomposed.configuration_status import ConfigurationStatus
 from src.revenium_mcp_server.tools_decomposed.slack_management import SlackManagement
+from tests.unit._registered_tool_harness import serving_tool
 
 CUSTOMER_A = TenantContext(team_id="TeamAAAA", tenant_id="tenant-a", api_key="key-of-customer-a")
 CUSTOMER_B = TenantContext(team_id="TeamBBBB", tenant_id="tenant-b", api_key="key-of-customer-b")
@@ -86,10 +87,10 @@ async def _hosted_dispatch(monkeypatch):
     monkeypatch.setenv("REVENIUM_DEFAULT_EMAIL", "ops@example.com")
     default_slack_configuration.clear_hosted_defaults()
     registry = introspection_integration.engine.registry
-    await registry.register_provider("slack_management", SlackManagement())
+    await registry.register_provider("manage_slack", SlackManagement())
     await registry.register_provider("manage_alerts", AlertManagement())
     yield
-    await registry.unregister_provider("slack_management")
+    await registry.unregister_provider("manage_slack")
     await registry.unregister_provider("manage_alerts")
     default_slack_configuration.clear_hosted_defaults()
 
@@ -113,13 +114,13 @@ async def _signed_in_as(mcp: FastMCP, customer: TenantContext) -> AsyncIterator[
 
 
 async def _text(client: Client, tool: str, arguments: Dict[str, Any]) -> str:
-    result = await client.call_tool(tool, arguments)
+    result = await client.call_tool(serving_tool(tool, arguments), arguments)
     return result.content[0].text
 
 
 async def _choose_default(mcp: FastMCP, customer: TenantContext, action: str, config_id: str) -> None:
     async with _signed_in_as(mcp, customer) as client:
-        await _text(client, "slack_management", {"action": action, "config_id": config_id})
+        await _text(client, "manage_slack", {"action": action, "config_id": config_id})
 
 
 async def _create_alert_without_slack(client: Client) -> None:
@@ -137,7 +138,7 @@ async def test_another_customer_is_never_told_the_default(platform, action):
     await _choose_default(mcp, CUSTOMER_A, action, SLACK_OF_A)
 
     async with _signed_in_as(mcp, CUSTOMER_B) as client:
-        answer = await _text(client, "slack_management", {"action": "get_default_configuration"})
+        answer = await _text(client, "manage_slack", {"action": "get_default_configuration"})
 
     assert SLACK_OF_A not in answer
     assert "No Default Slack Configuration" in answer
@@ -172,7 +173,7 @@ async def test_each_hosted_customer_keeps_its_own_default_for_its_alerts(platfor
     await _choose_default(mcp, CUSTOMER_B, "select_default_configuration", SLACK_OF_B)
 
     async with _signed_in_as(mcp, CUSTOMER_A) as client:
-        answer = await _text(client, "slack_management", {"action": "get_default_configuration"})
+        answer = await _text(client, "manage_slack", {"action": "get_default_configuration"})
         await _create_alert_without_slack(client)
 
     assert SLACK_OF_A in answer
@@ -186,8 +187,8 @@ async def test_local_server_remembers_its_default_for_new_alerts(platform, monke
     monkeypatch.setenv("REVENIUM_TEAM_ID", "TeamLOCAL")
     mcp = await _registered_server()
     async with Client(mcp) as client:
-        await _text(client, "slack_management", {"action": "set_default_configuration", "config_id": SLACK_OF_A})
-        answer = await _text(client, "slack_management", {"action": "get_default_configuration"})
+        await _text(client, "manage_slack", {"action": "set_default_configuration", "config_id": SLACK_OF_A})
+        answer = await _text(client, "manage_slack", {"action": "get_default_configuration"})
         await _create_alert_without_slack(client)
 
     assert os.environ[DEFAULT_SLACK_CONFIG_ENV] == SLACK_OF_A

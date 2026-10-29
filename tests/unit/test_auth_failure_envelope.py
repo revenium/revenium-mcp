@@ -5,8 +5,8 @@ the failure as an exception that escapes standardized_tool_execution.
 That is what makes FastMCP set the response envelope's `isError: true` flag,
 which protocol-conformant clients branch on.
 
-Pre-fix several tools (business_analytics_management, manage_sources,
-manage_metering_elements, manage_subscriber_credentials, slack_management)
+Pre-fix several tools (get_business_analytics, manage_sources,
+manage_usage_meters, manage_credentials, manage_slack)
 let the auth ValueError bubble through paths that were swallowed by the
 dispatch layer's catch-all and converted into a TextContent body without
 the isError flag. Clients that rely on the flag would treat the response
@@ -59,14 +59,14 @@ def no_api_key(monkeypatch):
 
 AUTH_FAILURE_CASES = [
     pytest.param(
-        "business_analytics_management",
+        "get_business_analytics",
         BusinessAnalyticsManagement,
         "get_provider_costs",
         {"period": "SEVEN_DAYS"},
-        id="business_analytics_management",
+        id="get_business_analytics",
     ),
     pytest.param(
-        "business_analytics_management",
+        "get_business_analytics",
         BusinessAnalyticsManagement,
         "analyze_cost_anomalies",
         {"period": "SEVEN_DAYS"},
@@ -80,25 +80,25 @@ AUTH_FAILURE_CASES = [
         id="manage_sources",
     ),
     pytest.param(
-        "manage_metering_elements",
+        "manage_usage_meters",
         MeteringElementsManagement,
         "list",
         {},
-        id="manage_metering_elements",
+        id="manage_usage_meters",
     ),
     pytest.param(
-        "manage_subscriber_credentials",
+        "manage_credentials",
         SubscriberCredentialsManagement,
         "list",
         {},
-        id="manage_subscriber_credentials",
+        id="manage_credentials",
     ),
     pytest.param(
-        "slack_management",
+        "manage_slack",
         SlackManagement,
         "list_configurations",
         {},
-        id="slack_management",
+        id="manage_slack",
     ),
 ]
 

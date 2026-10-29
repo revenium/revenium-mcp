@@ -13,6 +13,9 @@ from .alert_operators import (
     FILTER_IN_OPERATOR_NOTE,
     FILTER_OPERATORS,
 )
+from .common.customer_filters import CUSTOMER_FILTERS_DESCRIPTION
+from .common.subscription_create_fields import UNAPPLIED_DATES_RULE, UNSTORED_FIELDS_RULE
+from .plan_contract import platform_plan_currencies
 
 # Using custom validation logic for MCP tool parameters
 # This provides better error messages and agent-friendly feedback
@@ -356,7 +359,7 @@ class JSONSchemaValidator:
                                 },
                                 "currency": {
                                     "type": "string",
-                                    "enum": ["USD", "EUR", "GBP", "CAD", "AUD", "JPY"],
+                                    "enum": list(platform_plan_currencies()),
                                     "description": "Currency code",
                                 },
                             },
@@ -588,14 +591,26 @@ class JSONSchemaValidator:
                             "minLength": 1,
                             "description": "Product ID for the subscription",
                         },
-                        "customer_id": {
+                        "name": {
                             "type": "string",
                             "minLength": 1,
-                            "description": "Customer ID",
+                            "maxLength": 255,
+                            "description": "Subscription name",
                         },
-                        "plan_id": {"type": "string", "minLength": 1, "description": "Plan ID"},
+                        "clientEmailAddress": {
+                            "type": "string",
+                            "format": "email",
+                            "description": "Address the subscription's invoices go to",
+                        },
+                        "expiration": {
+                            "type": "string",
+                            "description": "When the subscription ends (ISO 8601 date-time)",
+                        },
+                        "tags": {"type": "array", "description": "Labels for the subscription"},
                     },
-                    "description": "Subscription data",
+                    "description": (
+                        f"Subscription data. {UNAPPLIED_DATES_RULE}. {UNSTORED_FIELDS_RULE}."
+                    ),
                 },
                 "page": {
                     "type": "integer",
@@ -875,16 +890,7 @@ class JSONSchemaValidator:
                     "maximum": 100,
                     "description": "Number of items per page",
                 },
-                # Bounded by _CUSTOMER_FILTER_MAPS in
-                # tools_decomposed/customer_management.py.
-                "filters": {
-                    "type": "object",
-                    "description": (
-                        "Filters for list and analyze, for every resource_type. "
-                        "Valid keys: query, sort, type. Any other key is rejected "
-                        "rather than silently ignored."
-                    ),
-                },
+                "filters": {"type": "object", "description": CUSTOMER_FILTERS_DESCRIPTION},
             },
             "required": ["action"],
         }
@@ -1187,10 +1193,6 @@ class JSONSchemaValidator:
                     "type": "array",
                     "items": {"type": "string", "pattern": "^[a-zA-Z0-9_-]+$"},
                     "description": "List of anomaly IDs for bulk operations",
-                },
-                "confirm": {
-                    "type": "boolean",
-                    "description": "Confirmation flag for bulk operations (enable_all, disable_all)",
                 },
                 "text": {
                     "type": "string",

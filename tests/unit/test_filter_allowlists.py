@@ -204,7 +204,7 @@ _TOOL_CASES = [
     ("list_cost_controls", _list_cost_controls, {"query": "monthly"}, {"query": "monthly"}),
     ("list_subscriptions", _list_subscriptions, {"query": "ent"}, {"query": "ent"}),
     ("list_users", _list_users, {"query": "acme"}, {"query": "acme"}),
-    ("list_teams", _list_teams, {"query": "acme"}, {"query": "acme"}),
+    ("list_teams", _list_teams, {"sort": "name,asc"}, {"sort": "name,asc"}),
     (
         "list_jobs",
         _list_jobs,

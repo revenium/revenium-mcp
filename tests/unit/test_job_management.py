@@ -3521,14 +3521,11 @@ class TestManageJobsJsonArgumentsRaiseOnBadInput:
         captured = {}
 
         class _CapturingMCP:
-            def tool(self, *args, **kwargs):
-                def decorator(fn):
-                    captured["fn"] = fn
-                    return fn
+            def tool(self, fn, **kwargs):
+                captured.setdefault("fn", fn.__wrapped__)
+                return fn
 
-                return decorator
-
-        registry = ToolConfigurationRegistry(ToolConfig())
+        registry = ToolConfigurationRegistry(ToolConfig.create_for_testing(profile="business"))
         await registry._register_manage_jobs(_CapturingMCP())
         return captured["fn"]
 

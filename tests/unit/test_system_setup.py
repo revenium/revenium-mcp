@@ -89,12 +89,12 @@ class TestSystemSetupRouting:
 
     @pytest.mark.asyncio
     async def test_unknown_action_returns_error(self, setup_tool):
-        """Unknown action raises a structured error with valid actions."""
+        """Unknown action raises the shared refusal; the caller's message adds the valid actions."""
         with pytest.raises(ToolError) as exc_info:
             await setup_tool.handle_action("bogus_action", {})
-        text = exc_info.value.message
-        assert "bogus_action" in text or "Unknown" in text
-        assert "valid_actions" in text
+        assert exc_info.value.message.startswith("Unknown action 'bogus_action'.")
+        assert exc_info.value.error_code == ErrorCodes.ACTION_NOT_SUPPORTED
+        assert exc_info.value.field == "action"
 
     @pytest.mark.asyncio
     async def test_exception_from_sub_tool_propagates(self, setup_tool):
@@ -150,7 +150,7 @@ async def test_update_email_on_the_hosted_server_is_refused_through_system_setup
     monkeypatch,
 ):
     """BACK-4679: the hosted server cannot store a notification email, so
-    system_setup update_email raises instead of claiming success."""
+    manage_system_setup update_email raises instead of claiming success."""
     monkeypatch.setenv("AUTH_MODE", "api_key")
     with pytest.raises(ToolError) as exc_info:
         await SystemSetup().handle_action(
@@ -161,7 +161,7 @@ async def test_update_email_on_the_hosted_server_is_refused_through_system_setup
 
 
 class TestGetExamplesNamesTheCallsThisServerAccepts:
-    """get_examples never sends a hosted caller to update_email, and names system_setup calls."""
+    """get_examples never sends a hosted caller to update_email, and names manage_system_setup calls."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("auth_mode", ["api_key", "clerk"])
@@ -177,9 +177,9 @@ class TestGetExamplesNamesTheCallsThisServerAccepts:
         monkeypatch.delenv("AUTH_MODE", raising=False)
         text = (await setup_tool.handle_action("get_examples", {}))[0].text
         assert '"action": "update_email"' in text
-        assert "system_setup(action='update_email', email='" in text
+        assert "manage_system_setup(action='update_email', email='" in text
         assert "`setup_checklist()`" not in text
-        assert "system_setup(action='setup_checklist')" in text
+        assert "get_system_setup(action='setup_checklist')" in text
 
 
 def _email_examples_section(text):
@@ -187,7 +187,7 @@ def _email_examples_section(text):
 
 
 class TestHelpHeadingsAndCalls:
-    """system_setup's help keeps the email example inside its section and names working calls."""
+    """manage_system_setup's help keeps the email example inside its section and names working calls."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -211,8 +211,8 @@ class TestHelpHeadingsAndCalls:
     @pytest.mark.asyncio
     async def test_the_workflow_completes_setup_with_its_confirmation(self, setup_tool):
         text = (await setup_tool.handle_action("get_examples", {}))[0].text
-        assert "`system_setup(action='complete_setup', confirm_completion=True)`" in text
-        assert "`system_setup(action='complete_setup')`" not in text
+        assert "`get_system_setup(action='complete_setup', confirm_completion=True)`" in text
+        assert "`get_system_setup(action='complete_setup')`" not in text
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("auth_mode", ["env", "api_key"])
@@ -232,8 +232,8 @@ class TestHelpHeadingsAndCalls:
         ]
         for text in texts:
             assert not bare_setup_calls_in(text), text
-        assert "system_setup(action='complete_setup', confirm_completion=True)" in texts[0]
-        assert "system_setup(action='get_examples')" in texts[0]
+        assert "get_system_setup(action='complete_setup', confirm_completion=True)" in texts[0]
+        assert "get_system_setup(action='get_examples')" in texts[0]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("auth_mode", ["api_key", "clerk"])
@@ -243,7 +243,7 @@ class TestHelpHeadingsAndCalls:
         monkeypatch.setenv("AUTH_MODE", auth_mode)
         text = (await setup_tool.handle_action("get_capabilities", {}))[0].text
         assert "`update_email` - Not available on this server" in text
-        assert "system_setup(action='update_email'" not in text
+        assert "manage_system_setup(action='update_email'" not in text
         email_capability = await _email_capability(setup_tool)
         assert "update_email" not in email_capability.parameters
 
@@ -251,6 +251,6 @@ class TestHelpHeadingsAndCalls:
     async def test_local_capabilities_offer_update_email(self, setup_tool, monkeypatch):
         monkeypatch.delenv("AUTH_MODE", raising=False)
         text = (await setup_tool.handle_action("get_capabilities", {}))[0].text
-        assert "system_setup(action='update_email', email='your@email.com')" in text
+        assert "manage_system_setup(action='update_email', email='your@email.com')" in text
         email_capability = await _email_capability(setup_tool)
         assert "update_email" in email_capability.parameters

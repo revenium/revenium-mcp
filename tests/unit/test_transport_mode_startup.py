@@ -144,6 +144,8 @@ async def test_main_runs_http_with_env_auth_and_warns(env_mode_env, monkeypatch)
     assert run_kwargs["host"] == "127.0.0.1"
     assert run_kwargs["port"] == 9876
     assert "middleware" in run_kwargs
+    assert run_kwargs["host_origin_protection"] == "auto"
+    assert "https://claude.ai" in run_kwargs["allowed_origins"]
     assert any("without authentication" in m.lower() for m in warnings)
 
 

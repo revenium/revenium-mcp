@@ -96,43 +96,43 @@ async def test_tools_list_returns_registered_tools(stdio_client: Any) -> None:
 async def test_manage_products_list(stdio_client: Any) -> None:
     """manage_products list dispatches and returns a non-error envelope (AC #2 call path)."""
     result = await stdio_client.call_tool(
-        "manage_products", {"action": "list"}
+        "get_products", {"action": "list"}
     )
-    assert_mcp_success(result, tool_name="manage_products")
-    assert_text_contains(result, "product", tool_name="manage_products")
+    assert_mcp_success(result, tool_name="get_products")
+    assert_text_contains(result, "product", tool_name="get_products")
 
 
 @pytest.mark.asyncio
 async def test_manage_subscriptions_list(stdio_client: Any) -> None:
     """manage_subscriptions list dispatches and returns a non-error envelope."""
     result = await stdio_client.call_tool(
-        "manage_subscriptions", {"action": "list"}
+        "get_subscriptions", {"action": "list"}
     )
-    assert_mcp_success(result, tool_name="manage_subscriptions")
-    assert_text_contains(result, "subscription", tool_name="manage_subscriptions")
+    assert_mcp_success(result, tool_name="get_subscriptions")
+    assert_text_contains(result, "subscription", tool_name="get_subscriptions")
 
 
 @pytest.mark.asyncio
 async def test_manage_customers_list(stdio_client: Any) -> None:
     """manage_customers list (default resource_type=organizations) dispatches."""
     result = await stdio_client.call_tool(
-        "manage_customers", {"action": "list"}
+        "get_customers", {"action": "list"}
     )
-    assert_mcp_success(result, tool_name="manage_customers")
-    assert_text_contains(result, "organization", tool_name="manage_customers")
+    assert_mcp_success(result, tool_name="get_customers")
+    assert_text_contains(result, "organization", tool_name="get_customers")
 
 
 @pytest.mark.asyncio
 async def test_manage_alerts_list(stdio_client: Any) -> None:
     """manage_alerts list dispatches; hits /sources/ai/anomaly via mock."""
     result = await stdio_client.call_tool(
-        "manage_alerts", {"action": "list"}
+        "get_alerts", {"action": "list"}
     )
-    assert_mcp_success(result, tool_name="manage_alerts")
+    assert_mcp_success(result, tool_name="get_alerts")
     # The tool surfaces either anomaly listings or "No AI anomalies found"
     # depending on canned content; "anomal" matches both success paths. Use the
     # shared helper (iterates all content blocks, guards non-text blocks).
-    assert_text_contains(result, "anomal", tool_name="manage_alerts")
+    assert_text_contains(result, "anomal", tool_name="get_alerts")
 
 
 @pytest.mark.asyncio
@@ -142,13 +142,13 @@ async def test_manage_metering_get_capabilities(stdio_client: Any) -> None:
     Proves the dispatch + capabilities path works without depending on the mock.
     """
     result = await stdio_client.call_tool(
-        "manage_metering", {"action": "get_capabilities"}
+        "get_metering", {"action": "get_capabilities"}
     )
-    assert_mcp_success(result, tool_name="manage_metering")
+    assert_mcp_success(result, tool_name="get_metering")
     assert_text_contains(
         result,
         "metering",
-        tool_name="manage_metering",
+        tool_name="get_metering",
     )
 
 
