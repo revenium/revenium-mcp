@@ -5,6 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from src.revenium_mcp_server.common.subscription_create_fields import (
+    REQUIRED_SUBSCRIPTION_CREATE_FIELDS,
+)
 from src.revenium_mcp_server.common.tool_surface import domain_for, public_tool_for
 from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
 from src.revenium_mcp_server.tools_decomposed.product_management import ProductValidator
@@ -152,6 +155,66 @@ def test_every_context_field_a_step_uses_is_declared_by_its_template(name):
     )
 
     assert used - declared == set()
+
+
+_SUBSCRIPTION_CREATE_CASES = [
+    pytest.param(
+        "customer_onboarding",
+        {
+            "customer_email": "ana@example.com",
+            "organization_name": "Acme",
+            "product_id": "prod_123",
+        },
+        "Acme subscription",
+        id="customer_onboarding names it after the organization",
+    ),
+    pytest.param(
+        "subscription_setup",
+        {
+            "product_id": "prod_123",
+            "customer_email": "ana@example.com",
+            "subscription_name": "Starter",
+        },
+        "Starter",
+        id="subscription_setup uses the subscription_name the caller gives",
+    ),
+]
+
+
+def _subscription_create_index(template_name: str) -> int:
+    steps = _TEMPLATES[template_name]["steps"]
+    (index,) = [
+        i
+        for i, step in enumerate(steps)
+        if step["tool"] == "manage_subscriptions" and step["action"] == "create"
+    ]
+    return index
+
+
+@pytest.mark.parametrize("name, context, expected_name", _SUBSCRIPTION_CREATE_CASES)
+def test_a_subscription_create_step_carries_every_required_field_once_filled(
+    name, context, expected_name
+):
+    """manage_subscriptions create refuses a missing name, product_id or clientEmailAddress."""
+    subscription_data = _filled_arguments(
+        name, _subscription_create_index(name), context
+    )["subscription_data"]
+
+    assert subscription_data["name"] == expected_name
+    assert subscription_data["product_id"] == "prod_123"
+    assert subscription_data["clientEmailAddress"] == "ana@example.com"
+    assert set(REQUIRED_SUBSCRIPTION_CREATE_FIELDS) <= set(subscription_data)
+
+
+def test_subscription_setup_without_a_name_leaves_the_placeholder_to_fill():
+    index = _subscription_create_index("subscription_setup")
+    subscription_data = _filled_arguments(
+        "subscription_setup",
+        index,
+        {"product_id": "prod_123", "customer_email": "ana@example.com"},
+    )["subscription_data"]
+
+    assert subscription_data["name"] == "<subscription name>"
 
 
 def test_the_product_setup_payload_passes_product_validation_once_filled():

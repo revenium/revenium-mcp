@@ -20,7 +20,9 @@ from src.revenium_mcp_server.models import BillingPeriod, TrialPeriod
 from src.revenium_mcp_server.tools_decomposed.product_management import (
     ProductManagement,
 )
-from tests.unit.test_openapi_contract import HYPERCURRENT
+from tests.unit.openapi_snapshot import hypercurrent_or_skip_module
+
+HYPERCURRENT = hypercurrent_or_skip_module()
 
 _PLAN_PROPERTIES = HYPERCURRENT["components"]["schemas"]["Plan"]["properties"]
 SPEC_PLAN_PERIODS: List[str] = list(_PLAN_PROPERTIES["period"]["enum"])

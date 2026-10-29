@@ -110,6 +110,7 @@ def _customer_onboarding() -> Dict[str, Any]:
                 "create",
                 "Subscribe the customer to a product so usage is billed",
                 subscription_data={
+                    "name": "{organization_name} subscription",
                     "product_id": "{product_id}",
                     "clientEmailAddress": "{customer_email}",
                 },
@@ -249,6 +250,7 @@ def _subscription_setup() -> Dict[str, Any]:
                 "create",
                 "Create the subscription",
                 subscription_data={
+                    "name": "{subscription_name}",
                     "product_id": "{product_id}",
                     "clientEmailAddress": "{customer_email}",
                 },
@@ -261,6 +263,7 @@ def _subscription_setup() -> Dict[str, Any]:
             ),
         ],
         "required_context": ["product_id", "customer_email"],
+        "optional_context": {"subscription_name": "<subscription name>"},
     }
 
 
