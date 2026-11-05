@@ -332,6 +332,7 @@ class ToolConfigurationRegistry:
             # and would silently outrank a value sent inside params.
             page: Optional[Union[int, str]] = None,
             size: Optional[Union[int, str]] = None,
+            top_models_per_user: Optional[Union[int, str]] = None,
             threshold: Optional[Union[float, str]] = None,
             min_impact_threshold: Optional[Union[float, str]] = None,
             include_dimensions: Optional[Union[List[str], str]] = None,
@@ -391,6 +392,9 @@ class ToolConfigurationRegistry:
             assisted_only: Optional[Union[bool, str]] = None,
             # Provider metering-coverage report: get_coverage_ratio
             provider: Optional[str] = None,
+            # Coding-assistant savings findings: get_ai_assistant_savings
+            level: Optional[str] = None,
+            assistant: Optional[str] = None,
             # Coding-assistant team medians: get_ai_assistant_team_medians
             window: Optional[str] = None,
             # Claude Enterprise seat census: get_seat_utilization. Named
@@ -417,6 +421,7 @@ class ToolConfigurationRegistry:
                 "filters": filters,
                 "page": page,
                 "size": size,
+                "top_models_per_user": top_models_per_user,
                 "threshold": threshold,
                 "min_impact_threshold": min_impact_threshold,
                 "include_dimensions": include_dimensions,
@@ -469,6 +474,9 @@ class ToolConfigurationRegistry:
                 "assisted_only": assisted_only,
                 # Provider metering-coverage report
                 "provider": provider,
+                # Coding-assistant savings findings
+                "level": level,
+                "assistant": assistant,
                 # Coding-assistant team medians
                 "window": window,
                 # Claude Enterprise seat census
@@ -483,6 +491,7 @@ class ToolConfigurationRegistry:
             numeric_params = {
                 'page': int,
                 'size': int,
+                'top_models_per_user': int,
                 'threshold': float,
                 'min_impact_threshold': float,
                 'min_new_entity_threshold': float,
@@ -1659,8 +1668,13 @@ class ToolConfigurationRegistry:
             # Team attribution-identity-policy and verified-domain actions
             policy: Optional[str] = None,
             domain: Optional[str] = None,
-            # Department membership removals (delete_department_person, clear_department_assignment)
+            # Department membership removals and department admins
             person_id: Optional[Union[int, str]] = None,
+            department_id: Optional[Union[int, str]] = None,
+            # Team Claude organization links (list_cowork_org_links, link_cowork_org, unlink_cowork_org)
+            claude_org_uuid: Optional[str] = None,
+            credential_id: Optional[str] = None,
+            link_id: Optional[str] = None,
             page: Union[int, str] = 0,
             size: Union[int, str] = 20,
             filters: Optional[dict] = None,
@@ -1700,6 +1714,10 @@ class ToolConfigurationRegistry:
                 "policy": policy,
                 "domain": domain,
                 "person_id": person_id,
+                "department_id": department_id,
+                "claude_org_uuid": claude_org_uuid,
+                "credential_id": credential_id,
+                "link_id": link_id,
                 "page": page,
                 "size": size,
                 "filters": filters or {},

@@ -141,7 +141,10 @@ class TestCustomerListsRefuseType:
         with pytest.raises(ToolError) as refused:
             await getattr(manager(_paged_client()), method)({"filters": {"label": "x"}})
 
-        valid_keys = "sort" if resource_type == "teams" else "query, sort"
+        valid_keys = {
+            "users": "query, roles, sort",
+            "teams": "sort",
+        }.get(resource_type, "query, sort")
         assert refused.value.message.endswith(
             f"Valid filter keys for '{method}': {valid_keys}"
         )
@@ -195,6 +198,81 @@ class TestCustomerListsRefuseType:
 
         assert result.is_error is True, text
         assert "cannot be filtered by type" in text
+
+
+class TestUsersListFiltersByRole:
+    @pytest.mark.asyncio
+    async def test_roles_reach_get_users_unchanged(self):
+        client = _paged_client()
+
+        await UserManager(client).list_users({"filters": {"roles": ["ROLE_ORG_ADMIN"]}})
+
+        assert client.get_users.call_args.kwargs["roles"] == ["ROLE_ORG_ADMIN"]
+
+    @pytest.mark.asyncio
+    async def test_a_comma_separated_string_is_sent_as_a_list(self):
+        client = _paged_client()
+
+        await UserManager(client).list_users(
+            {"filters": {"roles": "ROLE_ORG_ADMIN, ROLE_TENANT_ADMIN"}}
+        )
+
+        assert client.get_users.call_args.kwargs["roles"] == [
+            "ROLE_ORG_ADMIN",
+            "ROLE_TENANT_ADMIN",
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "roles", [[], "", "  ", ["", "ROLE_ORG_ADMIN"], [" "], [1]], ids=repr
+    )
+    async def test_an_empty_or_blank_role_is_refused_before_any_read(self, roles):
+        client = _paged_client()
+
+        with pytest.raises(ToolError) as refused:
+            await UserManager(client).list_users({"filters": {"roles": roles}})
+
+        assert refused.value.field == "filters.roles"
+        assert "Nothing was read" in refused.value.message
+        client.get_users.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_analyze_refuses_an_empty_roles_list_before_any_read(self):
+        client = _paged_client()
+
+        with pytest.raises(ToolError):
+            await CustomerAnalytics(client).analyze_customers(
+                {"resource_type": "users", "filters": {"roles": []}}
+            )
+
+        client.get_users.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "resource_type,manager,method,read",
+        [c for c in _CUSTOMER_LISTS if c[0] != "users"],
+        ids=[c[0] for c in _CUSTOMER_LISTS if c[0] != "users"],
+    )
+    async def test_roles_are_refused_on_every_other_customer_list(
+        self, resource_type, manager, method, read
+    ):
+        client = _paged_client()
+
+        with pytest.raises(ToolError) as refused:
+            await getattr(manager(client), method)(
+                {"filters": {"roles": ["ROLE_ORG_ADMIN"]}}
+            )
+
+        assert "Unknown filter key 'roles'" in refused.value.message
+        getattr(client, read).assert_not_called()
+
+    def test_the_filters_text_names_roles_as_users_only(self):
+        from src.revenium_mcp_server.common.customer_filters import (
+            CUSTOMER_FILTERS_DESCRIPTION,
+        )
+
+        assert "roles is users only" in CUSTOMER_FILTERS_DESCRIPTION
+        assert "ROLE_API_CONSUMER returns an empty page" in CUSTOMER_FILTERS_DESCRIPTION
 
 
 class TestAdvertisedFiltersMatchTheRefusal:

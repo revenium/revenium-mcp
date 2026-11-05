@@ -1611,7 +1611,7 @@ class TestHandleGetBudgetPortfolio:
             "metricType": "TOTAL_COST",
             "threshold": 1000,
             "currentValue": 250,
-            "percentUsed": 25,
+            "percentUsed": 0.25,
             "aheadBehindVsLinear": {"status": "ON_TRACK"},
         }
         base.update(over)
@@ -1633,7 +1633,7 @@ class TestHandleGetBudgetPortfolio:
         assert "a1" in text
         assert "TOTAL_COST" in text
         assert "ON_TRACK" in text
-        assert "25" in text  # percentUsed
+        assert "25% used" in text
 
     @staticmethod
     def _grouped_entry(**over):
@@ -1674,7 +1674,7 @@ class TestHandleGetBudgetPortfolio:
         over the threshold, which is what the per-group alert acts on."""
         text = await self._render_portfolio(alert_mgmt, mock_client, [self._grouped_entry()])
         line = next(ln for ln in text.splitlines() if "`g1`" in ln)
-        assert "460.0/500.0 summed across groups" in line
+        assert "460/500 summed across groups" in line
         assert "92% used summed across groups" in line
         assert "highest group 60% used (the figure the per-group alert uses)" in line
         assert "risk LOW (from the highest group)" in line
@@ -1714,6 +1714,44 @@ class TestHandleGetBudgetPortfolio:
             "- Monthly Budget (`a1`) · metric TOTAL_COST · 250/1000 · 25% used"
             " · vs-linear ON_TRACK"
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("current", "threshold", "share", "expected"),
+        [
+            (
+                1988.0135082699,
+                20000.0,
+                0.0994006754,
+                "1988.01/20000 · 9.9% used · vs-linear ON_TRACK",
+            ),
+            (
+                638.2451313514,
+                250.0,
+                2.5529805254,
+                "638.25/250 · 255.3% used (over budget) · vs-linear ON_TRACK",
+            ),
+            (250.0, 250.0, 1.0, "250/250 · 100% used · vs-linear ON_TRACK"),
+            (0.0042, 0.5, 0.0084, "0.0042/0.5 · 0.8% used · vs-linear ON_TRACK"),
+            (0, 1000, 0.0, "0/1000 · 0% used · vs-linear ON_TRACK"),
+        ],
+        ids=["below-limit", "over-limit", "at-limit", "sub-cent-spend", "no-spend"],
+    )
+    async def test_portfolio_renders_the_fraction_as_a_percentage(
+        self, alert_mgmt, mock_client, current, threshold, share, expected
+    ):
+        """BACK-5439: percentUsed is a fraction (0.75 means 75%). Prod showed
+        638.25 of 250 as "2.5529805254% used"."""
+        entry = self._entry(currentValue=current, threshold=threshold, percentUsed=share)
+        text = await self._render_portfolio(alert_mgmt, mock_client, [entry])
+        line = next(ln for ln in text.splitlines() if "`a1`" in ln)
+        assert line == f"- Monthly Budget (`a1`) · metric TOTAL_COST · {expected}"
+
+    @pytest.mark.asyncio
+    async def test_portfolio_grouped_totals_print_two_decimals(self, alert_mgmt, mock_client):
+        entry = self._grouped_entry(currentValue=460.123456, threshold=500.0)
+        text = await self._render_portfolio(alert_mgmt, mock_client, [entry])
+        assert "460.12/500 summed across groups" in text
 
     @pytest.mark.asyncio
     async def test_portfolio_empty_state(self, alert_mgmt, mock_client):
@@ -1783,7 +1821,7 @@ class TestHandleGetBudgetProgress:
             "threshold": 1000,
             "currentValue": 400,
             "remaining": 600,
-            "percentUsed": 40,
+            "percentUsed": 0.4,
             "aheadBehindVsLinear": {"status": "ON_TRACK"},
         }
         base.update(over)
@@ -1797,7 +1835,7 @@ class TestHandleGetBudgetProgress:
             "threshold": 1000,
             "currentValue": 400,
             "remaining": 600,
-            "percentUsed": 40,
+            "percentUsed": 0.4,
             "window": {"start": "2026-07-01", "now": "2026-07-10", "endExpected": "2026-07-31"},
             "aheadBehindVsLinear": {"expectedByNow": 300, "delta": 100, "status": "AHEAD"},
         }
@@ -1910,6 +1948,28 @@ class TestHandleGetBudgetProgress:
         assert mock_client.get_anomaly_budget_progress.call_args[0][0] == "a9"
 
     @pytest.mark.asyncio
+    async def test_single_shows_the_same_percentage_as_the_portfolio_row(
+        self, alert_mgmt, mock_client
+    ):
+        """BACK-5439: both reads render the same budget-progress fraction."""
+        figures = {"currentValue": 638.2451313514, "threshold": 250.0, "percentUsed": 2.5529805254}
+        mock_client.get_anomaly_budget_progress = AsyncMock(
+            return_value=self._progress(anomalyId=178302, **figures)
+        )
+        single = _text(
+            await alert_mgmt._handle_get_budget_progress(mock_client, {"anomaly_id": "a1"})
+        )
+        mock_client.get_budget_portfolio = AsyncMock(return_value={"_embedded": {}})
+        mock_client._extract_embedded_data = MagicMock(
+            return_value=[self._progress_bulk(name="Daily", **figures)]
+        )
+        mock_client._extract_pagination_info = MagicMock(return_value={})
+        portfolio = _text(await alert_mgmt._handle_get_budget_portfolio(mock_client, {}))
+        usage = "638.25/250 · 255.3% used (over budget)"
+        assert usage in single
+        assert usage in portfolio
+
+    @pytest.mark.asyncio
     async def test_bulk_forwards_ids_and_renders_each(self, alert_mgmt, mock_client):
         mock_client.get_budget_progress_bulk = AsyncMock(return_value={
             "items": [self._progress_bulk(alertId="a1"), self._progress_bulk(alertId="a2")]
@@ -1937,6 +1997,33 @@ class TestHandleGetBudgetProgress:
         text = _text(result)
         assert "400/1000 · 40% used" in text
         assert "summed across groups" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("group_shares", "over"),
+        [([0.6, 0.6], False), ([1.1, 0.1], True)],
+        ids=["summed-over-no-group-over", "one-group-over"],
+    )
+    async def test_bulk_grouped_item_is_over_budget_only_when_a_group_is(
+        self, alert_mgmt, mock_client, group_shares, over
+    ):
+        """BACK-5439: the threshold applies per group, so a summed share above 1
+        with every group under its limit is not over budget."""
+        item = self._progress_bulk(
+            threshold=500.0,
+            currentValue=600.0,
+            percentUsed=1.2,
+            groups=[
+                {"groupValue": f"g{i}", "currentValue": share * 500, "percentUsed": share}
+                for i, share in enumerate(group_shares)
+            ],
+        )
+        mock_client.get_budget_progress_bulk = AsyncMock(return_value={"items": [item]})
+        text = _text(
+            await alert_mgmt._handle_get_budget_progress(mock_client, {"anomaly_ids": ["a1"]})
+        )
+        assert "120% used" in text
+        assert ("over budget" in text) is over
 
     @pytest.mark.asyncio
     async def test_bulk_degrades_entry_without_numeric_fields(self, alert_mgmt, mock_client):

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from loguru import logger
 
@@ -11,6 +11,34 @@ from ..config_store import get_config_value
 from ..constants import DEFAULT_BASE_URL
 from .api_key_scope import APIKeyScope
 from .tenant_context import TenantContext
+
+
+class TenantClaimsRejected(PermissionError):
+    """The verified token lacks usable tenant claims.
+
+    ``missing`` names claims that are absent or blank; ``malformed`` names
+    claims present with a value that is not a non-empty string.
+    """
+
+    def __init__(self, missing: Sequence[str], malformed: Sequence[str]) -> None:
+        self.missing = tuple(missing)
+        self.malformed = tuple(malformed)
+        problems = []
+        if self.missing:
+            problems.append(f"JWT is missing required claim(s): {', '.join(self.missing)}")
+        if self.malformed:
+            problems.append(
+                f"JWT has malformed claim(s): {', '.join(self.malformed)} "
+                "(expected a non-empty string)"
+            )
+        super().__init__("; ".join(problems))
+
+
+class NoForwardableToken(PermissionError):
+    """No verified access token is available to forward downstream."""
+
+    def __init__(self) -> None:
+        super().__init__("No verified access token available to forward downstream")
 
 
 class TenantResolver(ABC):
@@ -51,18 +79,15 @@ class ClerkTenantResolver(TenantResolver):
         self, claims: dict, *, clerk_jwt: Optional[str] = None
     ) -> TenantContext:
         resolved = {c: _get_claim(claims, c) for c in self.REQUIRED_CLAIMS}
-        missing = [
+        missing = [c for c in self.REQUIRED_CLAIMS if _is_blank(resolved[c])]
+        malformed = [
             c for c in self.REQUIRED_CLAIMS
-            if not (isinstance(resolved[c], str) and resolved[c].strip())
+            if c not in missing and not isinstance(resolved[c], str)
         ]
-        if missing:
-            raise PermissionError(
-                f"JWT is missing required claim(s): {', '.join(missing)}"
-            )
+        if missing or malformed:
+            raise TenantClaimsRejected(missing=missing, malformed=malformed)
         if not clerk_jwt or not clerk_jwt.strip():
-            raise PermissionError(
-                "No verified access token available to forward downstream"
-            )
+            raise NoForwardableToken()
 
         # ConfigManager requires REVENIUM_API_KEY, which clerk mode no longer
         # has — resolve the downstream base URL directly (same pattern as
@@ -95,6 +120,10 @@ def _get_claim(claims: dict, name: str) -> Any:
     if isinstance(pm, dict):
         return pm.get(name)
     return None
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
 
 
 def _parse_scopes(scope_claim) -> Optional[list[str]]:

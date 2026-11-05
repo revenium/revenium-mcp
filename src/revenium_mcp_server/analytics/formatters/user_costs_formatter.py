@@ -5,10 +5,12 @@ Dedicated formatter for user cost analysis responses (cost-by-user endpoint).
 Returns cost, request count, and token usage per subscriber email.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..paging import PageInfo, counted, pagination_lines, past_last_page_sentence
 from .base_formatter import AnalyticsResponseFormatter
+
+UNNAMED_MODEL = "(unnamed)"
 
 
 class UserCostsFormatter(AnalyticsResponseFormatter):
@@ -148,7 +150,40 @@ cover this page, not the whole team: add every page's totals for the team figure
             else:
                 entry += f"   - Tokens: {tokens:,}\n"
 
+        if "top_models" in user:
+            entry += self._format_top_models(user["top_models"], user["model_count"])
+
         return entry + "\n"
+
+    def _format_top_models(
+        self, models: List[Dict[str, Any]], model_count: Optional[int]
+    ) -> str:
+        if not models:
+            return "   - Top models by cost: none listed\n"
+        if model_count is None:
+            heading = (
+                f"   - Top models by cost ({len(models)} listed; the platform did not say how "
+                "many models the user used, so their costs may not add up to the user's cost)\n"
+            )
+        elif len(models) < model_count:
+            heading = (
+                f"   - Top models by cost ({len(models)} of {model_count} models listed; "
+                "their costs do not add up to the user's cost)\n"
+            )
+        else:
+            heading = f"   - Models by cost (all {model_count} listed)\n"
+        lines = "".join(
+            f"     - {self._model_label(model['model'])}: "
+            f"{self.utilities.format_currency(model['cost'])}\n"
+            for model in models
+        )
+        return heading + lines
+
+    @staticmethod
+    def _model_label(name: str) -> str:
+        if name and name != UNNAMED_MODEL:
+            return name
+        return f"{UNNAMED_MODEL} (calls that carried no model name)"
 
     def _format_user_costs_footer(self, params: Dict[str, Any]) -> str:
         period = params.get("period", "Unknown")

@@ -1,7 +1,9 @@
 """The HAL ``page`` block of an analytics envelope, and the lines a report renders from it."""
 
 from dataclasses import dataclass
-from typing import Any, List, Mapping, Optional
+from typing import Any, List, Mapping, Optional, Sequence, Tuple, TypeVar
+
+Row = TypeVar("Row")
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,18 @@ class PageInfo:
     @property
     def size_hint(self) -> str:
         return f" size={self.size}" if self.size else ""
+
+
+def page_of_rows(rows: Sequence[Row], number: int, size: int) -> Tuple[List[Row], PageInfo]:
+    """One page of a report the platform answered whole, and where that page sits in it."""
+    start = number * size
+    paging = PageInfo(
+        number=number,
+        size=size,
+        total_pages=-(-len(rows) // size),
+        total_elements=len(rows),
+    )
+    return list(rows[start : start + size]), paging
 
 
 def counted(count: int, singular: str, plural: str) -> str:

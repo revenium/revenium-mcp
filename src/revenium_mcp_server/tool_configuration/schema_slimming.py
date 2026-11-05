@@ -81,6 +81,7 @@ THIN_TOOL_PARAMETERS_WITHOUT_DEFAULT: Dict[str, Sequence[str]] = {
 THIN_ACTION_DEFAULTS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "get_business_analytics": {
         "get_user_costs": {"size": USER_COSTS_DEFAULT_PAGE_SIZE},
+        "get_agent_costs": {"size": USER_COSTS_DEFAULT_PAGE_SIZE},
     },
 }
 

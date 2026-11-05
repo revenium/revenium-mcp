@@ -49,6 +49,7 @@ _TOP_LEVEL_NARROWING = [
     ("model", "gpt-4o"),
     ("customer", "acme"),
     ("agents", ["agent-1"]),
+    ("assistant", "cursor-ide"),
 ]
 
 # Cost actions outside the engine, with the one narrowing argument each applies.
@@ -64,6 +65,7 @@ _DISPATCH_COST_ACTIONS = {
     "get_token_vs_tool_cost": None,
     "get_trace_cost_distribution": None,
     "get_ai_assistant_team_medians": None,
+    "get_ai_assistant_savings": "assistant",
     "get_transaction_count": None,
     "get_coverage_ratio": "provider",
     "analyze_cost_anomalies": None,
@@ -95,6 +97,7 @@ _NARROWING_VALUES = {
     "provider": "openai",
     "providers": ["openai"],
     "agents": ["agent-1"],
+    "assistant": "cursor-ide",
 }
 
 

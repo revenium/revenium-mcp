@@ -499,6 +499,13 @@ PREVIEW_ARGUMENTS: Dict[Tuple[str, str], Dict[str, Any]] = {
     ("manage_slack", "get_configuration"): {"config_id": "vqSlack1"},
     ("manage_customers", "delete_department_person"): {"person_id": 97},
     ("manage_customers", "clear_department_assignment"): {"email": "vq@example.com"},
+    ("manage_customers", "link_cowork_org"): {
+        "team_id": "team_abc",
+        "claude_org_uuid": "0f8e1a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b",
+    },
+    ("manage_customers", "unlink_cowork_org"): {"team_id": "team_abc", "link_id": "vqLink1"},
+    ("manage_customers", "name_department_admin"): {"department_id": 173, "email": "vq@example.com"},
+    ("manage_customers", "remove_department_admin"): {"department_id": 173, "person_id": 97},
     ("manage_system_settings", "set_strict_ingestion_mode"): {"enabled": True},
     ("manage_system_settings", "set_usage_billing"): {"enabled": False},
 }

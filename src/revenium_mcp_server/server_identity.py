@@ -8,13 +8,21 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from importlib import resources
+from typing import TYPE_CHECKING
 
 from mcp.types import Icon
+from starlette.requests import Request
+from starlette.responses import Response
 
-DEFAULT_ICON_URL = (
-    "https://cdn.prod.website-files.com/69009dc20087fff97b33545b/"
-    "6992f9e3bf7e07286d1f56f5_Revenium%20-%20Webclip.png"
-)
+if TYPE_CHECKING:
+    from fastmcp import FastMCP
+
+ICON_PATH = "/icon.png"
+# The hosted server serves its own icon (``register_icon_endpoint``), so the
+# Connectors Directory listing and serverInfo point at a URL engineering owns.
+DEFAULT_ICON_URL = "https://mcp.revenium.ai" + ICON_PATH
+_ICON_CACHE_CONTROL = "public, max-age=86400"
 DEFAULT_WEBSITE_URL = "https://www.revenium.ai"
 DEFAULT_PRIVACY_URL = "https://www.revenium.ai/privacy-policy"
 DEFAULT_TERMS_URL = "https://www.revenium.ai/terms-of-service"
@@ -46,3 +54,25 @@ def load_server_identity() -> ServerIdentity:
         privacy_url=_read_https_url("REVENIUM_PRIVACY_URL", DEFAULT_PRIVACY_URL),
         terms_url=_read_https_url("REVENIUM_TERMS_URL", DEFAULT_TERMS_URL),
     )
+
+
+def icon_png() -> bytes:
+    """The packaged icon, the same file the hosted server serves at ``ICON_PATH``."""
+    return resources.files("revenium_mcp_server").joinpath("static/icon.png").read_bytes()
+
+
+def register_icon_endpoint(mcp: "FastMCP") -> None:
+    """Serve ``ICON_PATH`` so a deployment can be its own ``REVENIUM_ICON_URL``.
+
+    Auth-exempt like ``/health``: custom routes are appended outside
+    ``RequireAuthMiddleware``. Inert in stdio mode.
+    """
+    icon = icon_png()
+
+    @mcp.custom_route(ICON_PATH, methods=["GET"])
+    async def serve_icon(request: Request) -> Response:
+        return Response(
+            content=icon,
+            media_type="image/png",
+            headers={"Cache-Control": _ICON_CACHE_CONTROL},
+        )

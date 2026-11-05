@@ -679,6 +679,73 @@ class TestClientReportedCostRendering:
         assert "**Total Cost**: $0.000000" in result
 
 
+class TestListCostRendering:
+    """BACK-5426: listCost is the pre-discount figure, set only when a
+    negotiated provider discount priced the call; totalCost stays billed."""
+
+    def setup_method(self):
+        self.mm = make_mm()
+
+    def test_list_cost_and_total_cost_both_render(self):
+        result = self.mm._format_cost_breakdown({"totalCost": 0.02, "listCost": 0.024})
+        assert "**Total Cost**: $0.020000" in result
+        assert "**List Cost**: $0.024000" in result
+
+    def test_list_cost_is_labelled_pre_discount_not_billed(self):
+        result = self.mm._format_cost_breakdown({"totalCost": 0.02, "listCost": 0.024})
+        list_line = next(line for line in result.splitlines() if "List Cost" in line)
+        assert "pre-discount" in list_line
+        assert "Total Cost above is the billed figure" in list_line
+
+    def test_list_cost_follows_total_cost(self):
+        result = self.mm._format_cost_breakdown({"totalCost": 0.02, "listCost": 0.024})
+        assert result.index("Total Cost") < result.index("List Cost")
+
+    def test_null_list_cost_omits_the_line(self):
+        result = self.mm._format_cost_breakdown({"totalCost": 0.02, "listCost": None})
+        assert "List Cost" not in result
+        assert "pre-discount" not in result
+
+    def test_list_cost_alone_opens_the_section(self):
+        result = self.mm._format_cost_breakdown({"listCost": 0.0})
+        assert "Cost Breakdown" in result
+        assert "**List Cost**: $0.000000" in result
+
+    def test_full_details_carry_list_cost(self):
+        data = {**FULL_TRANSACTION, "listCost": 0.024}
+        result = self.mm._format_full_transaction_details(data)
+        assert "**List Cost**: $0.024000" in result
+
+
+class TestCcrSessionIdRendering:
+    """BACK-5426: the Claude Code cloud session id renders under Session
+    Tracking, labelled as client-reported, and only when present."""
+
+    def setup_method(self):
+        self.mm = make_mm()
+
+    def test_ccr_session_id_renders_under_session_tracking(self):
+        result = self.mm._format_session_tracking({"ccrSessionId": "cse_01HZX"})
+        assert result == (
+            "- **Session Tracking**:\n"
+            "  - **Claude Code Cloud Session (client-reported)**: cse_01HZX\n"
+        )
+
+    def test_null_ccr_session_id_omits_the_line(self):
+        result = self.mm._format_session_tracking(
+            {"traceId": "t1", "ccrSessionId": None}
+        )
+        assert "Claude Code Cloud Session" not in result
+
+    def test_full_details_carry_ccr_session_id(self):
+        data = {**FULL_TRANSACTION, "ccrSessionId": "cse_01HZX"}
+        result = self.mm._format_full_transaction_details(data)
+        assert "**Claude Code Cloud Session (client-reported)**: cse_01HZX" in result
+
+    def test_presence_diagnostic_measures_ccr_session_id(self):
+        assert "ccrSessionId" in _COMPLETIONS_REPORTED_FIELDS
+
+
 class TestModelExecutionRendering:
     """modelHost and effort render on the detail path."""
 
@@ -1217,6 +1284,26 @@ class TestPromptContextHelpText:
             line for line in text.splitlines() if line.strip().startswith('- "full":')
         )
         for field in PROMPT_CONTEXT_WIRE_NAMES:
+            assert field in full_line, field
+
+
+class TestSessionTrackingHelpText:
+    """PR #571 review: the lookup help names every Session Tracking field
+    full detail renders, so a field added to the table reaches the help."""
+
+    async def test_lookup_capabilities_name_every_session_tracking_field(self):
+        from src.revenium_mcp_server.tools_decomposed.metering_management import (
+            _SESSION_TRACKING_LABELS,
+        )
+
+        text = await make_mm()._build_lookup_capabilities_content(None)
+        section = text.split("### **Session Tracking (full detail only)**", 1)[1]
+        section = section.split("###", 1)[0]
+        full_line = next(
+            line for line in text.splitlines() if line.strip().startswith('- "full":')
+        )
+        for field, _ in _SESSION_TRACKING_LABELS:
+            assert f"`{field}`" in section, field
             assert field in full_line, field
 
 

@@ -58,6 +58,8 @@ from ..common.money import (
 )
 from ..analytics.formatters.base_formatter import COST_SOURCE_RULE
 from ..analytics.formatters.department_costs_formatter import DepartmentCostsFormatter
+from ..analytics.formatters.savings_findings_formatter import PERSON_ROWS_SHOWN, SavingsFindingsFormatter
+from ..analytics.savings_findings import SAVINGS_ASSISTANTS, SAVINGS_LEVELS, parse_savings_findings
 from ..analytics.formatters.user_costs_formatter import UserCostsFormatter
 from ..analytics.formatters.base_formatter import BaseFormattingUtilities
 from ..analytics.simple_analytics_engine import COST_SUMMARY_RETRY_ADVICE, SimpleAnalyticsEngine
@@ -75,11 +77,14 @@ from ..analytics.statistical_anomaly_detector import (
     format_bucket_start,
 )
 from ..analytics.validation import (
+    SAVINGS_USAGE,
     AnalyticsValidator,
     ValidationError,
     known_names,
     listed_names,
+    top_models_refusal,
     unread_narrowing_refusal,
+    validate_savings_findings_params,
 )
 from ..analytics_window import (
     CALENDAR_RANGE_MAX_DAYS,
@@ -89,7 +94,11 @@ from ..analytics_window import (
 )
 from ..auth import AuthenticationError
 from ..client import SEAT_UTILIZATION_MAX_RANGE_DAYS, ReveniumAPIError
-from ..constants import ANALYTICS_MAX_PAGE_SIZE, USER_COSTS_DEFAULT_PAGE_SIZE
+from ..constants import (
+    ANALYTICS_MAX_PAGE_SIZE,
+    USER_COSTS_DEFAULT_PAGE_SIZE,
+    USER_COSTS_MAX_TOP_MODELS,
+)
 from ..endpoint_registry import NewApiRequiredError, requires_new_api_flag
 from ..introspection.metadata import ToolCapability
 from .unified_tool_base import ToolBase
@@ -233,7 +242,7 @@ class BusinessAnalyticsManagement(ToolBase):
 
     tool_name: ClassVar[str] = "get_business_analytics"
     tool_description: ClassVar[str] = (
-        "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_user_costs, get_department_costs, get_tool_costs, get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider, get_ai_assistant_team_medians, get_transaction_count, get_filter_options, get_unpaid_invoice_totals, get_seat_utilization, list_invoices, list_refunds, list_period_charges, list_skills, get_skill, get_pr_health, get_pr_health_engineers, get_pr_health_prs, get_pr_health_pull_requests, get_pr_health_repositories, get_pr_health_breakdown, get_pr_health_queue, get_pr_health_trend, get_pr_health_follow_through, get_merged_prs, get_coverage_ratio, get_task_costs, get_task_completion, get_task_performance, get_profit_margins, get_top_movers, get_token_breakdown, get_team_costs, get_vendor_costs, get_token_vs_tool_cost, get_trace_cost_distribution, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_filter_options(dimension=...) to discover valid filter values. Use get_examples() for parameter guidance and get_capabilities() for status."
+        "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_user_costs, get_department_costs, get_tool_costs, get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider, get_ai_assistant_team_medians, get_ai_assistant_savings, get_transaction_count, get_filter_options, get_unpaid_invoice_totals, get_seat_utilization, list_invoices, list_refunds, list_period_charges, list_skills, get_skill, get_pr_health, get_pr_health_engineers, get_pr_health_prs, get_pr_health_pull_requests, get_pr_health_repositories, get_pr_health_breakdown, get_pr_health_queue, get_pr_health_trend, get_pr_health_follow_through, get_merged_prs, get_coverage_ratio, get_task_costs, get_task_completion, get_task_performance, get_profit_margins, get_top_movers, get_token_breakdown, get_team_costs, get_vendor_costs, get_token_vs_tool_cost, get_trace_cost_distribution, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_filter_options(dimension=...) to discover valid filter values. Use get_examples() for parameter guidance and get_capabilities() for status."
     )
     business_category: ClassVar[str] = "Metering and Analytics Tools"
     tool_type: ClassVar[ToolType] = ToolType.ANALYTICS
@@ -346,7 +355,9 @@ class BusinessAnalyticsManagement(ToolBase):
             # error envelope consistent with manage_tools.
             arguments = validate_pagination_params(arguments, action=action)
 
-            refusal = unread_narrowing_refusal(action, arguments)
+            refusal = top_models_refusal(action, arguments) or unread_narrowing_refusal(
+                action, arguments
+            )
             if refusal is not None:
                 raise_refusal(
                     ResponseFormatter().format_error_response(refusal.message, refusal.suggestions)
@@ -383,6 +394,8 @@ class BusinessAnalyticsManagement(ToolBase):
                 return await self._handle_get_tool_costs_by_provider(arguments, ctx=ctx)
             elif action == "get_ai_assistant_team_medians":
                 return await self._handle_get_ai_assistant_team_medians(arguments, ctx=ctx)
+            elif action == "get_ai_assistant_savings":
+                return await self._handle_get_ai_assistant_savings(arguments, ctx=ctx)
 
             elif action == "get_transaction_count":
                 return await self._handle_get_transaction_count(arguments, ctx=ctx)
@@ -562,10 +575,17 @@ If you're seeing this error, please report it as it indicates a reliability issu
 5. **get_agent_costs**
    - Analyze costs by agent/application
    - Optional filters.costSources: revenium_metered, provider_billing
+   - Paged with page (zero-based) and size (1 to """ + str(ANALYTICS_MAX_PAGE_SIZE) + """, default """ + str(USER_COSTS_DEFAULT_PAGE_SIZE) + """); the
+     answer ends with "Page X of Y, N agents in all" and the call for the next page, and when the
+     ranking has more than one page it states this page's cost and every agent's
 
 6. **get_user_costs**
    - Analyze costs by user email (subscriber)
    - Returns cost, request count, and token usage per user
+   - top_models_per_user (1 to """ + str(USER_COSTS_MAX_TOP_MODELS) + """, omitted by default) lists each
+     user's top models by cost, highest first, and how many models the user used. Say "by cost"
+     when answering; the listed costs add up to the user's cost only when every model is listed,
+     and (unnamed) is calls that carried no model name. Every other action refuses it
    - Paged with page (zero-based) and size (1 to """ + str(ANALYTICS_MAX_PAGE_SIZE) + """, default """ + str(USER_COSTS_DEFAULT_PAGE_SIZE) + """); the answer ends with
      "Page X of Y, N users in all" and the call for the next page, and when the report has more
      than one page its totals are labelled as this page's only
@@ -725,6 +745,12 @@ If you're seeing this error, please report it as it indicates a reliability issu
    - Optional window: 14d (default, the last 14 days) or completed-weeks:N for the last N completed weeks, N from 1 to 4
    - Fewer than five people who made a call in the window means 'not enough people to compare': the medians are withheld, never zero
    - A rate limit or server error means no figures right now, not a zero
+
+7g. **get_ai_assistant_savings**
+   - What the team can save on its coding assistants, ranked, with the platform's own totals (copied, never summed from rows), spend to inspect and the latest AI Insights savings
+   - level: department (default, one row per top-level department, paged with page and size, size at most """ + str(ANALYTICS_MAX_PAGE_SIZE) + """, names nobody) or person (each saving with the people it comes from; not paged, so the answer shows the first """ + str(PERSON_ROWS_SHOWN) + """ rows and says how many it left out)
+   - Optional assistant (""" + ", ".join(SAVINGS_ASSISTANTS) + """) and start_date/end_date (default: the 30 days before now, at most """ + str(CALENDAR_RANGE_MAX_DAYS) + """ days)
+   - A team without the feature (not yet enabled in every region) is told so, never shown a zero saving; a 503 means the findings could not be read right now
 
 8. **analyze_cost_anomalies** (Phase 1)
    - Enhanced statistical anomaly detection using z-score analysis
@@ -966,6 +992,8 @@ metricType (sum, avg, max, min).
 - `filters` (optional): `{"costSources": [...]}` restricts results to specific cost sources.
   Valid values: `revenium_metered` (costs metered by Revenium), `provider_billing`
   (costs imported from provider billing). Omit to include the platform default cost picture.
+- `page` (optional, zero-based) and `size` (optional, 1 to """ + str(ANALYTICS_MAX_PAGE_SIZE) + """, default """ + str(USER_COSTS_DEFAULT_PAGE_SIZE) + """): the agents
+  are ranked over the whole team, then one page of the ranking is shown
 
 ```json
 // Agent costs from provider billing imports only
@@ -1420,6 +1448,21 @@ returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED 
 - with fewer than five people who made a call in the window the platform withholds every median, and the answer says "not enough people to compare" instead of showing zeros
 - a measure the platform could not compute reads "unavailable", never 0
 - a rate limit or server error is reported as no figures right now, not as a zero
+
+### get_ai_assistant_savings
+```json
+{
+  "action": "get_ai_assistant_savings",
+  "level": "department",
+  "size": 20
+}
+```
+**Purpose**: what the team can save on its coding assistants, ranked, with totals already worked out by the platform, spend to inspect and the latest AI Insights savings items.
+**Parameters** (all optional): `level` is `department` (the default: one row per top-level department, paged with `page` and `size`, size at most """ + str(ANALYTICS_MAX_PAGE_SIZE) + """) or `person` (each saving with up to five people it comes from); `assistant` narrows to one of """ + ", ".join(SAVINGS_ASSISTANTS) + """; `start_date`/`end_date` as yyyy-MM-dd or ISO 8601 (the default window is the 30 days before now, at most """ + str(CALENDAR_RANGE_MAX_DAYS) + """ days).
+**Reading the answer**:
+- copy the totals; never add the rows up. Department figures are monthly floors that do not add up to the totals
+- level=person is not paged: the answer shows the first """ + str(PERSON_ROWS_SHOWN) + """ rows, largest first, and states how many it left out
+- a team without the feature (not yet enabled in every region) is told so instead of seeing a zero; a 503 means the findings could not be read right now, try again later
 
 ### get_cost_summary
 ```json
@@ -6551,6 +6594,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
 - **aggregation**: TOTAL, MEAN, MAXIMUM, MINIMUM (optional, defaults to TOTAL)
 - **filters**: Optional dict with array keys `agents`, `providers`, `models`, `users`, `costSources`
 - **page** (zero-based) and **size** (1 to {ANALYTICS_MAX_PAGE_SIZE}, default {USER_COSTS_DEFAULT_PAGE_SIZE}): one page of users per call
+- **top_models_per_user** (0 to {USER_COSTS_MAX_TOP_MODELS}, omitted by default): each user's top models by cost
 - **costSources**: Defaults to `["coding_assistant", "revenium_metered", "provider_billing"]`
   (every source); pass a subset to narrow the report to one classification
 
@@ -6867,6 +6911,32 @@ If you're seeing this error, please report it as it indicates a reliability issu
                 error_code=ErrorCodes.API_ERROR,
             )
         return [TextContent(type="text", text="\n".join(self._render_team_medians(report)))]
+
+    async def _handle_get_ai_assistant_savings(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Handle get_ai_assistant_savings — ranked coding-assistant savings for the team."""
+        try:
+            query = validate_savings_findings_params(arguments)
+        except ValidationError as e:
+            raise create_structured_validation_error(
+                message=e.message,
+                field=e.field,
+                value=arguments.get(e.field) if e.field else None,
+                suggestions=e.suggestions,
+                examples={"usage": SAVINGS_USAGE},
+            )
+        formatter = SavingsFindingsFormatter()
+        try:
+            client = await self.get_client(ctx=ctx)
+            report = await client.get_ai_assistant_savings_findings(**query.request_params())
+        except (AuthenticationError, ToolError):
+            raise
+        except ReveniumAPIError as e:
+            logger.warning(f"get_ai_assistant_savings failed: {e}")
+            raise_refusal(formatter.format_failure(e, query), error_code=ErrorCodes.API_ERROR)
+        text = formatter.format(parse_savings_findings(report, query.level), query)
+        return [TextContent(type="text", text=text)]
 
     async def _handle_get_tool_costs_by_agent(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
@@ -7461,6 +7531,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
             "get_tool_costs_by_agent",
             "get_tool_costs_by_provider",
             "get_ai_assistant_team_medians",
+            "get_ai_assistant_savings",
             "get_transaction_count",
             "get_filter_options",
             "get_unpaid_invoice_totals",
@@ -7753,6 +7824,17 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "type": "integer",
                     "description": "Offset into the ranked people of get_merged_prs per-person grouping (default 0). Not with group_by",
                 },
+                # Coding-assistant savings findings
+                "level": {
+                    "type": "string",
+                    "enum": list(SAVINGS_LEVELS),
+                    "description": f"Level of get_ai_assistant_savings: department (default, paged, size at most {ANALYTICS_MAX_PAGE_SIZE}) or person (not paged; the answer shows the first {PERSON_ROWS_SHOWN} rows and states how many it left out)",
+                },
+                "assistant": {
+                    "type": "string",
+                    "enum": list(SAVINGS_ASSISTANTS),
+                    "description": "Only this coding assistant on get_ai_assistant_savings. Omit for every assistant with usage in the window",
+                },
                 # Coding-assistant team medians
                 "window": {
                     "type": "string",
@@ -7777,7 +7859,17 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "description": "Per-action filter object, most commonly {\"costSources\": [...]}. The per-user and per-department cost reports take arrays under agents, providers, models, users and costSources; get_agent_costs takes costSources. get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_cost_summary, the tool cost reports and every other cost action take no filters and refuse them",
                 },
                 "page": {"type": "integer", "description": "Zero-based page index (default 0)"},
-                "size": {"type": "integer", "description": f"Page size (default 20; {USER_COSTS_DEFAULT_PAGE_SIZE} on get_user_costs)"},
+                "size": {"type": "integer", "description": f"Page size (default 20; {USER_COSTS_DEFAULT_PAGE_SIZE} on get_user_costs and get_agent_costs)"},
+                "top_models_per_user": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": USER_COSTS_MAX_TOP_MODELS,
+                    "description": (
+                        f"get_user_costs only: 1 to {USER_COSTS_MAX_TOP_MODELS} lists each user's "
+                        "top models by cost, highest first, with how many models the user used; "
+                        "omitted or 0 lists none. Ask for 1 to name the model a person spent most on"
+                    ),
+                },
                 "dry_run": {
                     "type": "boolean",
                     "description": (
@@ -7805,7 +7897,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "get_model_costs": {"period": "str", "group": "str"},
                     "get_customer_costs": {"period": "str", "group": "str"},
                     "get_api_key_costs": {"period": "str", "group": "str"},
-                    "get_agent_costs": {"period": "str", "group": "str"},
+                    "get_agent_costs": {"period": "str", "group": "str", "page": "int", "size": "int"},
                     "get_cost_summary": {"period": "str", "group": "str"},
                 },
                 examples=[
@@ -7879,6 +7971,33 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "Covers the team the caller's credentials resolve to and Claude Code only",
                     "Every figure is coarsened by the platform and nothing about any person is returned",
                     "A rate limit or server error means no figures right now, not a zero",
+                ],
+            ),
+            ToolCapability(
+                name="Coding-Assistant Savings",
+                description=(
+                    "What the team can save on its coding assistants, ranked, with the platform's "
+                    "own totals, spend to inspect and the latest AI Insights savings. A team without "
+                    "the feature is told so, never shown a zero saving."
+                ),
+                parameters={
+                    "get_ai_assistant_savings": {
+                        "level": "str (optional, department (default) or person)",
+                        "page": "int (optional, department level only)",
+                        "size": f"int (optional, department level only, at most {ANALYTICS_MAX_PAGE_SIZE})",
+                        "assistant": "str (optional, one of " + ", ".join(SAVINGS_ASSISTANTS) + ")",
+                        "start_date": "str (optional, yyyy-MM-dd or ISO 8601)",
+                        "end_date": "str (optional, yyyy-MM-dd or ISO 8601)",
+                    },
+                },
+                examples=[
+                    "get_ai_assistant_savings()",
+                    "get_ai_assistant_savings(level='person', assistant='claude-code')",
+                ],
+                limitations=[
+                    "Totals are copied from the platform; department figures are monthly floors that do not add up to them",
+                    f"level=person is not paged, so the answer shows the first {PERSON_ROWS_SHOWN} rows and states how many it left out",
+                    "Not yet enabled in every region (answered as not enabled); API keys with metering scope are refused",
                 ],
             ),
             ToolCapability(

@@ -5123,6 +5123,8 @@ class TestCustomerManagementDepartmentRemovalActions:
             "list_departments",
             "delete_department_person",
             "clear_department_assignment",
+            "name_department_admin",
+            "remove_department_admin",
         ]
 
     @pytest.mark.asyncio

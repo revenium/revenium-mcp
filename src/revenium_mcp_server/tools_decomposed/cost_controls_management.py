@@ -74,6 +74,53 @@ NOTIFICATION_EMAILS_PATCH_NOTE = (
     "them unchanged."
 )
 
+# The platform creates a control with shadowMode true unless the caller sets
+# it, so a newly created limit observes and does not enforce, and a disabled
+# control is never evaluated at all; the written control must say so, or a
+# caller who asked for a limit is told it exists and never learns it blocks
+# nobody.
+SHADOW_MODE_NOTE = (
+    "This control is in shadow mode: crossings of its warn threshold and hard "
+    "limit are evaluated and recorded as enforcement events, and its notification "
+    "addresses receive a preview, but the {action} action is not applied{held}. "
+    "To apply it, update(control_id='{control_id}', control_data={{'shadowMode': False}})."
+)
+DISABLED_NOTE = (
+    "This control is disabled: it is not evaluated, records no enforcement events "
+    "and sends no notice{shadow_clause}. To turn it on{apply_clause}, "
+    "update(control_id='{control_id}', control_data={update})."
+)
+
+
+def written_control_note(control: Any) -> Optional[str]:
+    """The note for a written control that is disabled or in shadow mode, else None."""
+    if not isinstance(control, dict):
+        return None
+    action = control.get("action") or "enforcement"
+    control_id = control.get("id") or "<id>"
+    shadow = control.get("shadowMode") is True
+    if control.get("enabled") is False:
+        return DISABLED_NOTE.format(
+            shadow_clause=", and it is also in shadow mode" if shadow else "",
+            apply_clause=f" and apply its {action} action" if shadow else "",
+            control_id=control_id,
+            update="{'enabled': True, 'shadowMode': False}" if shadow else "{'enabled': True}",
+        )
+    if shadow:
+        return SHADOW_MODE_NOTE.format(
+            action=action,
+            held=", so nobody is blocked by it" if action == "BLOCK" else "",
+            control_id=control_id,
+        )
+    return None
+
+
+def _written_control_text(heading: str, control: Any) -> str:
+    text = f"{heading}:\n{json.dumps(control, indent=2)}"
+    note = written_control_note(control)
+    return f"{text}\n\n{note}" if note else text
+
+
 # snake_case filter name -> camelCase query parameter, bounded to what the
 # endpoint applies. CostControlController.list (hypercurrent origin/develop,
 # re-read 2026-10-28) declares query / teamId / a hidden type plus a Pageable
@@ -1866,11 +1913,11 @@ class CostControlsManagement(ToolBase):
 
             elif action == "create":
                 result = await manager.create_cost_control(arguments)
-                return [TextContent(type="text", text=f"Cost control created:\n{json.dumps(result, indent=2)}")]
+                return [TextContent(type="text", text=_written_control_text("Cost control created", result))]
 
             elif action == "update":
                 result = await manager.update_cost_control(arguments)
-                return [TextContent(type="text", text=f"Cost control updated:\n{json.dumps(result, indent=2)}")]
+                return [TextContent(type="text", text=_written_control_text("Cost control updated", result))]
 
             elif action == "delete":
                 result = await manager.delete_cost_control(arguments)

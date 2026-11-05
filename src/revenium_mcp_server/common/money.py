@@ -2,7 +2,8 @@
 
 Every analytics dollar figure follows one rule: two decimals from a cent up,
 two significant digits below a cent. ``render_usd`` prints it as "X USD" and
-``render_dollars`` as "$X".
+``render_dollars`` as "$X". ``render_plain_amount`` prints it without a unit,
+for a figure such as a budget's spend that may not be dollars.
 
 A unit price or a per-call cost is quoted back to a user verbatim, so
 ``render_exact_dollars`` keeps every significant digit at any magnitude and
@@ -67,6 +68,14 @@ def render_usd(amount: Any) -> str:
     if not is_finite_number(amount):
         return "n/a"
     return f"{_usd_amount(amount)} USD"
+
+
+def render_plain_amount(amount: Any) -> str:
+    """The render_usd rule without the unit or separators, trailing zeros trimmed; n/a when missing."""
+    if not is_finite_number(amount):
+        return "n/a"
+    digits = _usd_amount(amount).replace(",", "")
+    return digits.rstrip("0").rstrip(".") if "." in digits else digits
 
 
 def render_dollars(amount: Any) -> str:

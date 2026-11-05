@@ -594,6 +594,82 @@ class TestCostControlsManagementActions:
     """handle_action dispatch."""
 
     @pytest.mark.asyncio
+    async def test_a_control_created_in_shadow_mode_says_it_enforces_nobody(self, cc_mgmt, mock_client):
+        """BACK-5055: the platform creates in shadow mode unless told otherwise, and the answer says so."""
+        mock_client.create_cost_control.return_value = {
+            "id": "5jgNND",
+            "name": "Platform monthly",
+            "action": "BLOCK",
+            "shadowMode": True,
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("create", {"control_data": _valid_control_data()})
+
+        text = result[0].text
+        assert text.startswith("Cost control created:\n{")
+        assert "This control is in shadow mode" in text
+        assert "the BLOCK action is not applied, so nobody is blocked by it" in text
+        assert "To apply it, update(control_id='5jgNND', control_data={'shadowMode': False})" in text
+
+    @pytest.mark.asyncio
+    async def test_an_enforcing_control_carries_no_shadow_note(self, cc_mgmt, mock_client):
+        mock_client.create_cost_control.return_value = {"id": "x1", "action": "BLOCK", "shadowMode": False}
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("create", {"control_data": _valid_control_data()})
+
+        assert "shadow mode" not in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_an_update_that_leaves_shadow_mode_on_still_says_so(self, cc_mgmt, mock_client):
+        mock_client.update_cost_control.return_value = {"id": "x1", "action": "NOTIFY", "shadowMode": True}
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("update", {"control_id": "x1", "control_data": {"hardLimit": 750}})
+
+        text = result[0].text
+        assert text.startswith("Cost control updated:\n{")
+        assert "the NOTIFY action is not applied. To apply it" in text
+        assert "nobody is blocked" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_control_in_shadow_mode_is_not_said_to_be_evaluated(self, cc_mgmt, mock_client):
+        mock_client.update_cost_control.return_value = {
+            "id": "x1", "action": "BLOCK", "shadowMode": True, "enabled": False,
+        }
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("update", {"control_id": "x1", "control_data": {"enabled": False}})
+
+        text = result[0].text
+        assert "This control is disabled: it is not evaluated" in text
+        assert "also in shadow mode" in text
+        assert "update(control_id='x1', control_data={'enabled': True, 'shadowMode': False})" in text
+        assert "are evaluated and recorded" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_enforcing_control_says_how_to_turn_it_on(self, cc_mgmt, mock_client):
+        mock_client.create_cost_control.return_value = {"id": "x2", "action": "BLOCK", "shadowMode": False, "enabled": False}
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("create", {"control_data": _valid_control_data()})
+
+        text = result[0].text
+        assert "This control is disabled" in text
+        assert "shadow mode" not in text
+        assert "update(control_id='x2', control_data={'enabled': True})" in text
+
+    @pytest.mark.asyncio
+    async def test_a_control_without_a_shadow_flag_carries_no_note(self, cc_mgmt, mock_client):
+        mock_client.update_cost_control.return_value = {"id": "x1", "action": "BLOCK"}
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        result = await cc_mgmt.handle_action("update", {"control_id": "x1", "control_data": {"hardLimit": 750}})
+
+        assert "shadow mode" not in result[0].text
+
+    @pytest.mark.asyncio
     async def test_get_capabilities_returns_text(self, cc_mgmt):
         result = await cc_mgmt.handle_action("get_capabilities", {})
         assert isinstance(result[0], TextContent)

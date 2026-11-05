@@ -755,6 +755,29 @@ class BulkDeleteResponseRead(BaseModel):
     requestedCount: Optional[int] = None
 
 
+class Membership(StrEnum):
+    """
+    RESOLVED: the rules' appliesToCaller answers are present, except where that field lists a reason to leave one out. UNAVAILABLE: Revenium could not read which departments the caller belongs to, so they are absent. NOT_NEEDED: the answer has no department rule, so nothing was looked up.
+    """
+
+    RESOLVED = 'RESOLVED'
+    UNAVAILABLE = 'UNAVAILABLE'
+    NOT_NEEDED = 'NOT_NEEDED'
+
+
+class CallerScope(BaseModel):
+    identities: Optional[list[str]] = Field(
+        None,
+        description="The caller's addresses as Revenium used them, from subscriber and from a VERIFIED session: trimmed, lower-cased, duplicates removed, sorted. Whenever callerScope is present, departmentBudgetBlocks, departmentBudgetWarnings, departmentBudgetBlockUnits, departmentBudgetBlockBalances and departmentBudgetCandidates hold only entries keyed by one of these, so a department verdict found under the caller's own address is the caller's.",
+        examples=[['alice@example.com']],
+    )
+    membership: Optional[Membership] = Field(
+        None,
+        description="RESOLVED: the rules' appliesToCaller answers are present, except where that field lists a reason to leave one out. UNAVAILABLE: Revenium could not read which departments the caller belongs to, so they are absent. NOT_NEEDED: the answer has no department rule, so nothing was looked up.",
+        examples=['RESOLVED'],
+    )
+
+
 class ApiRateProvider(StrEnum):
     ClaudeCode = 'ClaudeCode'
     ClaudeCowork = 'ClaudeCowork'
@@ -1183,6 +1206,46 @@ class DataSourceConnectionResourceRead(BaseModel):
 
 class Source3(StrEnum):
     """
+    How the person was named
+    """
+
+    SYNCED = 'SYNCED'
+    MANUAL = 'MANUAL'
+    CSV = 'CSV'
+
+
+class DepartmentAdminResponseRead(BaseModel):
+    """
+    A person named as an admin of a department
+    """
+
+    email: Optional[str] = Field(
+        None,
+        description="The person's primary email, when known",
+        examples=['ash@weyland-yutani.io'],
+    )
+    hasLogin: Optional[bool] = Field(
+        None,
+        description="True when one of the person's emails belongs to a Revenium user of this tenant who can sign in; false when the admin has no login yet",
+        examples=[True],
+    )
+    personId: Optional[int] = Field(
+        None, description='ID of the person in your directory', examples=[97]
+    )
+    source: Optional[Source3] = Field(
+        None, description='How the person was named', examples=['MANUAL']
+    )
+
+
+class DepartmentBudgetCandidate(BaseModel):
+    balance: Optional[float] = None
+    departmentId: Optional[int] = None
+    ruleId: Optional[int] = None
+    tier: Optional[str] = None
+
+
+class Source4(StrEnum):
+    """
     How this department was created
     """
 
@@ -1196,6 +1259,9 @@ class DepartmentResponseRead(BaseModel):
     A node in the department tree (surfaced in the UI as "Department" / "Department")
     """
 
+    admins: Optional[list[DepartmentAdminResponseRead]] = Field(
+        None, description='The people named as admins of this department'
+    )
     externalRef: Optional[str] = Field(
         None,
         description='External reference ID (set when the department came from directory sync)',
@@ -1213,7 +1279,7 @@ class DepartmentResponseRead(BaseModel):
         description='IDs of the departments from the top of the tree down to this department, including it',
         examples=['/12/40/173/'],
     )
-    source: Optional[Source3] = Field(
+    source: Optional[Source4] = Field(
         None, description='How this department was created', examples=['MANUAL']
     )
 
@@ -1327,7 +1393,7 @@ class EnforcementGroupEntry(BaseModel):
     )
     displayName: Optional[str] = Field(
         None,
-        description="Readable label for the group, never empty. Equals groupValue except for the unattributed bucket and for a department, where it is the department's name. A department that cannot be resolved repeats groupValue.",
+        description="Readable label for the group, never empty. Equals groupValue except for the unattributed bucket, for a department, where it is the department's name, and for a person keyed by a subscriber id, where it is that person's email when the active users of the team's tenant who hold the id share exactly one email. When the request names a caller, only the caller's own row gets the email and other people's id-keyed rows repeat the id; when it names none, every such row gets the email. A department that cannot be resolved, or an id with no single email, repeats groupValue.",
     )
     groupValue: Optional[str] = Field(
         None,
@@ -1336,6 +1402,10 @@ class EnforcementGroupEntry(BaseModel):
     usagePercent: Optional[float] = Field(
         None,
         description='currentValue / threshold ratio, same convention as the rule-level percentUsed.',
+    )
+    warnBreached: Optional[bool] = Field(
+        None,
+        description="True when this group's balance has crossed the rule's warning threshold. Always false for a rule with no separate warning threshold and for the unattributed bucket.",
     )
 
 
@@ -1498,7 +1568,7 @@ class StopReason(StrEnum):
     TOOL_CALL = 'TOOL_CALL'
 
 
-class Source4(Enum):
+class Source5(Enum):
     """
     How the agent record was created
     """
@@ -1606,7 +1676,7 @@ class MetricType11(Enum):
     CREDITS_CONSUMED = 'CREDITS_CONSUMED'
 
 
-class Source5(Enum):
+class Source6(Enum):
     """
     How the registered agent record was created, when registered
     """
@@ -1776,7 +1846,7 @@ class OutcomeType(Enum):
     CUSTOM = 'CUSTOM'
 
 
-class Source6(StrEnum):
+class Source7(StrEnum):
     """
     How the job was created. TELEMETRY: detected from your usage data. UI: created with POST /v2/api/jobs from the Revenium app. API: created with POST /v2/api/jobs using an API key.
     """
@@ -2657,6 +2727,87 @@ class Type6(StrEnum):
 
     STRING = 'STRING'
     NUMBER = 'NUMBER'
+
+
+class NavCustomization(BaseModel):
+    """
+    The user's sidebar layout and chosen landing page
+    """
+
+    hiddenSections: Optional[list[str]] = Field(
+        None,
+        description='Sidebar section labels the user chose to hide',
+        examples=[['Billing']],
+    )
+    homepage: Optional[str] = Field(
+        None,
+        description='The app path the user lands on after signing in',
+        examples=['/analytics/spend'],
+    )
+    itemOrder: Optional[dict[str, list[str]]] = Field(
+        None,
+        description='Per section label, the item titles in the order the user arranged them',
+        examples=[{'Analytics': ['Spend', 'Usage']}],
+    )
+    sectionOrder: Optional[list[str]] = Field(
+        None,
+        description='Sidebar section labels in the order the user arranged them',
+        examples=[['Analytics', 'Cost Controls']],
+    )
+
+
+class NavCustomizationRead(BaseModel):
+    """
+    The user's sidebar layout and chosen landing page
+    """
+
+    hiddenSections: Optional[list[str]] = Field(
+        None,
+        description='Sidebar section labels the user chose to hide',
+        examples=[['Billing']],
+    )
+    homepage: Optional[str] = Field(
+        None,
+        description='The app path the user lands on after signing in',
+        examples=['/analytics/spend'],
+    )
+    itemOrder: Optional[dict[str, list[str]]] = Field(
+        None,
+        description='Per section label, the item titles in the order the user arranged them',
+        examples=[{'Analytics': ['Spend', 'Usage']}],
+    )
+    sectionOrder: Optional[list[str]] = Field(
+        None,
+        description='Sidebar section labels in the order the user arranged them',
+        examples=[['Analytics', 'Cost Controls']],
+    )
+
+
+class NavCustomizationWrite(BaseModel):
+    """
+    The user's sidebar layout and chosen landing page
+    """
+
+    hiddenSections: Optional[list[str]] = Field(
+        None,
+        description='Sidebar section labels the user chose to hide',
+        examples=[['Billing']],
+    )
+    homepage: Optional[str] = Field(
+        None,
+        description='The app path the user lands on after signing in',
+        examples=['/analytics/spend'],
+    )
+    itemOrder: Optional[dict[str, list[str]]] = Field(
+        None,
+        description='Per section label, the item titles in the order the user arranged them',
+        examples=[{'Analytics': ['Spend', 'Usage']}],
+    )
+    sectionOrder: Optional[list[str]] = Field(
+        None,
+        description='Sidebar section labels in the order the user arranged them',
+        examples=[['Analytics', 'Cost Controls']],
+    )
 
 
 class Currency4(Enum):
@@ -3560,7 +3711,7 @@ class SeatUtilizationResponseRead(BaseModel):
     days: Optional[list[SeatUtilizationDayRead]] = None
 
 
-class Source9(Enum):
+class Source10(Enum):
     """
     Source coding assistant. Omit to leave the stored source unchanged; a brand-new interval with no source recorded defaults to 'other'.
     """
@@ -3572,6 +3723,33 @@ class Source9(Enum):
     copilot = 'copilot'
     other = 'other'
     NoneType_None = None
+
+
+class Status1(StrEnum):
+    """
+    VERIFIED: one to five signed-in accounts sent telemetry for this session, listed in identities. CONFLICTED: more than five did, so none is named. UNKNOWN: none has been seen yet, or sessionId is not a session id. UNAVAILABLE: the answer could not be read now, or this caller cannot be identified.
+    """
+
+    VERIFIED = 'VERIFIED'
+    CONFLICTED = 'CONFLICTED'
+    UNKNOWN = 'UNKNOWN'
+    UNAVAILABLE = 'UNAVAILABLE'
+
+
+class SessionIdentityResource(BaseModel):
+    identities: Optional[list[str]] = Field(
+        None,
+        description='Lower-cased email addresses, sorted. Empty unless status is VERIFIED.',
+    )
+    sessionId: Optional[str] = Field(
+        None,
+        description='The session id the caller asked about, as sent.',
+        examples=['0c1f8f3e-6a52-4c0e-9f6a-2d3b1c9e7a10'],
+    )
+    status: Optional[Status1] = Field(
+        None,
+        description='VERIFIED: one to five signed-in accounts sent telemetry for this session, listed in identities. CONFLICTED: more than five did, so none is named. UNKNOWN: none has been seen yet, or sessionId is not a session id. UNAVAILABLE: the answer could not be read now, or this caller cannot be identified.',
+    )
 
 
 class Type15(StrEnum):
@@ -4505,6 +4683,88 @@ class SubscriptionPatchResource(BaseModel):
     )
 
 
+class Kind(StrEnum):
+    """
+    TEAM: the whole team. DEPARTMENTS: departmentIds plus the user's own emails. SELF: only the user's own emails.
+    """
+
+    TEAM = 'TEAM'
+    DEPARTMENTS = 'DEPARTMENTS'
+    SELF = 'SELF'
+
+
+class TeamAccessResource(BaseModel):
+    """
+    What the signed-in user may see in one of their teams
+    """
+
+    departmentIds: Optional[list[int]] = Field(
+        None,
+        description='For DEPARTMENTS, the numeric IDs of every department the user may see: the ones they are named an admin of and all below them. Empty otherwise.',
+        examples=[[253, 254]],
+    )
+    emails: Optional[list[str]] = Field(
+        None,
+        description="For DEPARTMENTS and SELF, the email addresses whose usage is the user's own: their login email and every email the directory links to them, lower-cased and sorted. Empty for TEAM.",
+        examples=[['ash@weyland-yutani.io']],
+    )
+    kind: Optional[Kind] = Field(
+        None,
+        description="TEAM: the whole team. DEPARTMENTS: departmentIds plus the user's own emails. SELF: only the user's own emails.",
+    )
+    teamId: Optional[str] = Field(
+        None, description='The team this entry applies to', examples=['a91XJp']
+    )
+
+
+class TeamAccessResourceRead(BaseModel):
+    """
+    What the signed-in user may see in one of their teams
+    """
+
+    departmentIds: Optional[list[int]] = Field(
+        None,
+        description='For DEPARTMENTS, the numeric IDs of every department the user may see: the ones they are named an admin of and all below them. Empty otherwise.',
+        examples=[[253, 254]],
+    )
+    emails: Optional[list[str]] = Field(
+        None,
+        description="For DEPARTMENTS and SELF, the email addresses whose usage is the user's own: their login email and every email the directory links to them, lower-cased and sorted. Empty for TEAM.",
+        examples=[['ash@weyland-yutani.io']],
+    )
+    kind: Optional[Kind] = Field(
+        None,
+        description="TEAM: the whole team. DEPARTMENTS: departmentIds plus the user's own emails. SELF: only the user's own emails.",
+    )
+    teamId: Optional[str] = Field(
+        None, description='The team this entry applies to', examples=['a91XJp']
+    )
+
+
+class TeamAccessResourceWrite(BaseModel):
+    """
+    What the signed-in user may see in one of their teams
+    """
+
+    departmentIds: Optional[list[int]] = Field(
+        None,
+        description='For DEPARTMENTS, the numeric IDs of every department the user may see: the ones they are named an admin of and all below them. Empty otherwise.',
+        examples=[[253, 254]],
+    )
+    emails: Optional[list[str]] = Field(
+        None,
+        description="For DEPARTMENTS and SELF, the email addresses whose usage is the user's own: their login email and every email the directory links to them, lower-cased and sorted. Empty for TEAM.",
+        examples=[['ash@weyland-yutani.io']],
+    )
+    kind: Optional[Kind] = Field(
+        None,
+        description="TEAM: the whole team. DEPARTMENTS: departmentIds plus the user's own emails. SELF: only the user's own emails.",
+    )
+    teamId: Optional[str] = Field(
+        None, description='The team this entry applies to', examples=['a91XJp']
+    )
+
+
 class TeamMetadata(BaseModel):
     """
     Metadata of a team resource with logo
@@ -5424,6 +5684,10 @@ class UserResource(BaseModel):
     """
 
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
+    access: Optional[list[TeamAccessResource]] = Field(
+        None,
+        description='What the signed-in user may see in each of their teams. Present only on the current user (GET /v2/api/users/me).',
+    )
     canViewPromptData: Optional[bool] = Field(
         None,
         description='Whether the user can view captured prompt data (system prompts, messages, and responses). This flag only affects non-admin users; Account Administrators (ROLE_TENANT_ADMIN) have implicit access regardless of this setting. Only modifiable by Account Administrators.',
@@ -5459,6 +5723,7 @@ class UserResource(BaseModel):
     lastName: Optional[str] = Field(
         None, description='The last name of the user', examples=['Williams']
     )
+    navCustomization: Optional[NavCustomization] = None
     persona: Optional[Persona] = Field(
         None,
         description="The user's role-based UI persona (cxo_finance, product_leaders or platform_engineering)",
@@ -5518,6 +5783,10 @@ class UserResourceRead(BaseModel):
     """
 
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
+    access: Optional[list[TeamAccessResourceRead]] = Field(
+        None,
+        description='What the signed-in user may see in each of their teams. Present only on the current user (GET /v2/api/users/me).',
+    )
     canViewPromptData: Optional[bool] = Field(
         None,
         description='Whether the user can view captured prompt data (system prompts, messages, and responses). This flag only affects non-admin users; Account Administrators (ROLE_TENANT_ADMIN) have implicit access regardless of this setting. Only modifiable by Account Administrators.',
@@ -5553,6 +5822,7 @@ class UserResourceRead(BaseModel):
     lastName: Optional[str] = Field(
         None, description='The last name of the user', examples=['Williams']
     )
+    navCustomization: Optional[NavCustomizationRead] = None
     persona: Optional[Persona] = Field(
         None,
         description="The user's role-based UI persona (cxo_finance, product_leaders or platform_engineering)",
@@ -5612,6 +5882,10 @@ class UserResourceWrite(BaseModel):
     """
 
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
+    access: Optional[list[TeamAccessResourceWrite]] = Field(
+        None,
+        description='What the signed-in user may see in each of their teams. Present only on the current user (GET /v2/api/users/me).',
+    )
     canViewPromptData: Optional[bool] = Field(
         None,
         description='Whether the user can view captured prompt data (system prompts, messages, and responses). This flag only affects non-admin users; Account Administrators (ROLE_TENANT_ADMIN) have implicit access regardless of this setting. Only modifiable by Account Administrators.',
@@ -5647,6 +5921,7 @@ class UserResourceWrite(BaseModel):
     lastName: Optional[str] = Field(
         None, description='The last name of the user', examples=['Williams']
     )
+    navCustomization: Optional[NavCustomizationWrite] = None
     persona: Optional[Persona] = Field(
         None,
         description="The user's role-based UI persona (cxo_finance, product_leaders or platform_engineering)",
@@ -6506,7 +6781,7 @@ class JoinPolicy(StrEnum):
     OFF = 'OFF'
 
 
-class Source10(StrEnum):
+class Source11(StrEnum):
     """
     How the domain mapping was established
     """
@@ -6529,7 +6804,7 @@ class VerifiedDomainResource(BaseModel):
         description='Signup behavior for users on this domain',
         examples=['REQUEST'],
     )
-    source: Optional[Source10] = Field(
+    source: Optional[Source11] = Field(
         None, description='How the domain mapping was established', examples=['ADMIN']
     )
 
@@ -6589,6 +6864,7 @@ class V2ApiAiAlertsBudgetsProgressGetParametersQuery(BaseModel):
 class V2ApiAiAlertsAnomalyIdBudgetProgressGetParametersQuery(BaseModel):
     now: Optional[str] = None
     includeTrend: Optional[bool] = None
+    spend: Optional[float] = None
 
 
 class V2ApiAiCostControlsGetParametersQuery(BaseModel):
@@ -6678,6 +6954,8 @@ class V2ApiAiEnforcementEventsSummaryGetParametersQuery(BaseModel):
 class V2ApiAiEnforcementRulesTeamIdGetParametersQuery(BaseModel):
     ruleId: Optional[str] = None
     include: Optional[str] = None
+    subscriber: Optional[list[str]] = None
+    sessionId: Optional[str] = None
 
 
 class V2ApiAiEnforcementRulesTeamIdRosterGetParametersQuery(BaseModel):
@@ -6738,6 +7016,7 @@ class Provider3(StrEnum):
     fal = 'fal'
     cursor = 'cursor'
     github_copilot = 'github_copilot'
+    openai_enterprise = 'openai_enterprise'
 
 
 class UsageType(StrEnum):
@@ -7952,6 +8231,7 @@ class V2ApiToolsByToolIdToolIdGetParametersQuery(BaseModel):
 class V2ApiUsersGetParametersQuery(BaseModel):
     query: Optional[str] = None
     teamId: str
+    roles: Optional[list[str]] = None
     page: Optional[conint(ge=0)] = 0
     size: Optional[conint(ge=1)] = 10
     sort: Optional[list[str]] = None
@@ -7980,7 +8260,7 @@ class AIAnomalyResource(BaseModel):
     )
     createdBy: Optional[str] = Field(
         None,
-        description='The email address of the user who created this alert rule',
+        description='Who created this alert rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Alert rules created earlier keep the email recorded then.',
         examples=['user@example.com'],
     )
     dataSource: Optional[DataSource] = Field(
@@ -8043,8 +8323,8 @@ class AIAnomalyResource(BaseModel):
     )
     modifiedBy: Optional[str] = Field(
         None,
-        description='The email address of the user who last modified this alert rule',
-        examples=['user@example.com'],
+        description='Who last created, changed or deleted this alert rule, in the same form as createdBy.',
+        examples=['user@example.com via API key 5jW1GD (ci-bot)'],
     )
     name: str = Field(
         ..., description='The name of the alert rule', examples=['High Cost Alert']
@@ -8120,7 +8400,7 @@ class AIAnomalyResourceRead(BaseModel):
     )
     createdBy: Optional[str] = Field(
         None,
-        description='The email address of the user who created this alert rule',
+        description='Who created this alert rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Alert rules created earlier keep the email recorded then.',
         examples=['user@example.com'],
     )
     dataSource: Optional[DataSource] = Field(
@@ -8183,8 +8463,8 @@ class AIAnomalyResourceRead(BaseModel):
     )
     modifiedBy: Optional[str] = Field(
         None,
-        description='The email address of the user who last modified this alert rule',
-        examples=['user@example.com'],
+        description='Who last created, changed or deleted this alert rule, in the same form as createdBy.',
+        examples=['user@example.com via API key 5jW1GD (ci-bot)'],
     )
     name: str = Field(
         ..., description='The name of the alert rule', examples=['High Cost Alert']
@@ -8260,7 +8540,7 @@ class AIAnomalyResourceWrite(BaseModel):
     )
     createdBy: Optional[str] = Field(
         None,
-        description='The email address of the user who created this alert rule',
+        description='Who created this alert rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Alert rules created earlier keep the email recorded then.',
         examples=['user@example.com'],
     )
     dataSource: Optional[DataSource] = Field(
@@ -8318,8 +8598,8 @@ class AIAnomalyResourceWrite(BaseModel):
     )
     modifiedBy: Optional[str] = Field(
         None,
-        description='The email address of the user who last modified this alert rule',
-        examples=['user@example.com'],
+        description='Who last created, changed or deleted this alert rule, in the same form as createdBy.',
+        examples=['user@example.com via API key 5jW1GD (ci-bot)'],
     )
     name: str = Field(
         ..., description='The name of the alert rule', examples=['High Cost Alert']
@@ -9009,10 +9289,16 @@ class ApiError(BaseModel):
     Error response from the API
     """
 
-    details: Optional[dict[str, str]] = Field(
+    details: Optional[dict[str, Any]] = Field(
         None,
-        description='Additional error details',
-        examples=[{'field': 'error message'}],
+        description='Additional error details, including messages, missing permission lists and upstream HTTP status when available',
+        examples=[
+            {
+                'error': 'Permission required',
+                'missingScopes': ['read:analytics'],
+                'upstreamStatus': 403,
+            }
+        ],
     )
     docsUrl: Optional[str] = Field(
         None,
@@ -9054,10 +9340,16 @@ class ApiErrorRead(BaseModel):
     Error response from the API
     """
 
-    details: Optional[dict[str, str]] = Field(
+    details: Optional[dict[str, Any]] = Field(
         None,
-        description='Additional error details',
-        examples=[{'field': 'error message'}],
+        description='Additional error details, including messages, missing permission lists and upstream HTTP status when available',
+        examples=[
+            {
+                'error': 'Permission required',
+                'missingScopes': ['read:analytics'],
+                'upstreamStatus': 403,
+            }
+        ],
     )
     docsUrl: Optional[str] = Field(
         None,
@@ -9201,7 +9493,17 @@ class CompiledEnforcementRule(BaseModel):
         description='What the rule does once crossed: BLOCK refuses calls, WARN_ONLY warns. NOTIFY: advisory, never blocks, present only with include=advisory.',
         examples=['BLOCK'],
     )
+    appliesToCaller: Optional[bool] = Field(
+        None,
+        description="Whether this department rule covers the caller named by the subscriber parameter or by a sessionId whose session is VERIFIED. True when at least one of the caller's addresses belongs to a department the rule covers and is not left out by the rule's subscriber filters. False when none is covered and no verdict for the caller names the rule. Absent when a verdict for the caller names a rule its directory now places the caller outside, when callerScope.membership is not RESOLVED, on a department rule whose stored department path cannot be read, and on every rule that is not a department rule. It never decides a block: the caller's own entry in departmentBudgetBlocks does.",
+        examples=[True],
+    )
     breached: Optional[bool] = None
+    callerGroupValues: Optional[list[str]] = Field(
+        None,
+        description="For a rule split by department (groupBy DEPARTMENT with no department filter) that applies to the caller: the IDs of the caller's departments, each the same identifier as a groupBreakdown row's groupValue, sorted. Absent otherwise, including on a department-filtered rule, which is one pooled cap.",
+        examples=[['mN3xpQz']],
+    )
     compiledAt: Optional[AwareDatetime] = None
     currentValue: Optional[float] = Field(
         None,
@@ -9289,7 +9591,7 @@ class CostControlResource(BaseModel):
     )
     createdBy: Optional[str] = Field(
         None,
-        description='The email address of the user who created this rule',
+        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded.',
         examples=['user@example.com'],
     )
     denyMessage: Optional[constr(max_length=2000)] = Field(
@@ -9340,8 +9642,8 @@ class CostControlResource(BaseModel):
     )
     modifiedBy: Optional[str] = Field(
         None,
-        description='The email address of the user who last modified this rule',
-        examples=['user@example.com'],
+        description='Who last created, changed or deleted this rule, in the same form as createdBy.',
+        examples=['user@example.com via API key 5jW1GD (ci-bot)'],
     )
     name: Optional[str] = Field(
         ..., description='Display name for this rule', examples=['Monthly OpenAI Cap']
@@ -9406,7 +9708,7 @@ class CostControlResourceRead(BaseModel):
     )
     createdBy: Optional[str] = Field(
         None,
-        description='The email address of the user who created this rule',
+        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded.',
         examples=['user@example.com'],
     )
     denyMessage: Optional[constr(max_length=2000)] = Field(
@@ -9457,8 +9759,8 @@ class CostControlResourceRead(BaseModel):
     )
     modifiedBy: Optional[str] = Field(
         None,
-        description='The email address of the user who last modified this rule',
-        examples=['user@example.com'],
+        description='Who last created, changed or deleted this rule, in the same form as createdBy.',
+        examples=['user@example.com via API key 5jW1GD (ci-bot)'],
     )
     name: Optional[str] = Field(
         ..., description='Display name for this rule', examples=['Monthly OpenAI Cap']
@@ -9523,7 +9825,7 @@ class CostControlResourceWrite(BaseModel):
     )
     createdBy: Optional[str] = Field(
         None,
-        description='The email address of the user who created this rule',
+        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded.',
         examples=['user@example.com'],
     )
     denyMessage: Optional[constr(max_length=2000)] = Field(
@@ -9574,8 +9876,8 @@ class CostControlResourceWrite(BaseModel):
     )
     modifiedBy: Optional[str] = Field(
         None,
-        description='The email address of the user who last modified this rule',
-        examples=['user@example.com'],
+        description='Who last created, changed or deleted this rule, in the same form as createdBy.',
+        examples=['user@example.com via API key 5jW1GD (ci-bot)'],
     )
     name: Optional[str] = Field(
         ..., description='Display name for this rule', examples=['Monthly OpenAI Cap']
@@ -10013,12 +10315,17 @@ class EnforcementRuleRosterResource(BaseModel):
 
 
 class EnforcementRulesPayload(BaseModel):
+    callerScope: Optional[CallerScope] = None
     compiledAt: Optional[AwareDatetime] = None
     departmentBudgetBlockBalances: Optional[dict[str, float]] = None
     departmentBudgetBlockUnits: Optional[dict[str, int]] = None
     departmentBudgetBlocks: Optional[dict[str, int]] = None
+    departmentBudgetCandidates: Optional[dict[str, list[DepartmentBudgetCandidate]]] = (
+        None
+    )
     departmentBudgetWarnings: Optional[dict[str, int]] = None
     rules: Optional[list[CompiledEnforcementRule]] = None
+    session: Optional[SessionIdentityResource] = None
 
 
 class EntityModelAIAnomalyResourceRead(BaseModel):
@@ -10035,7 +10342,7 @@ class EntityModelAIAnomalyResourceRead(BaseModel):
     )
     createdBy: Optional[str] = Field(
         None,
-        description='The email address of the user who created this alert rule',
+        description='Who created this alert rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Alert rules created earlier keep the email recorded then.',
         examples=['user@example.com'],
     )
     dataSource: Optional[DataSource] = Field(
@@ -10098,8 +10405,8 @@ class EntityModelAIAnomalyResourceRead(BaseModel):
     )
     modifiedBy: Optional[str] = Field(
         None,
-        description='The email address of the user who last modified this alert rule',
-        examples=['user@example.com'],
+        description='Who last created, changed or deleted this alert rule, in the same form as createdBy.',
+        examples=['user@example.com via API key 5jW1GD (ci-bot)'],
     )
     name: str = Field(
         ..., description='The name of the alert rule', examples=['High Cost Alert']
@@ -10208,6 +10515,11 @@ class EntityModelAICompletionMetricResourceRead(BaseModel):
     cachedTokenCount: Optional[int] = Field(
         None, description='The number of tokens retrieved from cache', examples=[20]
     )
+    ccrSessionId: Optional[str] = Field(
+        None,
+        description="Id of the Claude Code cloud session that made this call (claude.ai/code, the Claude desktop and mobile apps, claude --cloud, cloud scheduled tasks, Claude Tag), as the client reported it in ccr.session.id; a label, not proof. Null for calls from the developer's own machine, for cloud sessions with OTEL_METRICS_INCLUDE_SESSION_ID=false, and for calls recorded before this field was added.",
+        examples=['cse_01HZX3W9QK2M7N4P5R6S8T0V1Y'],
+    )
     clientReportedCost: Optional[float] = Field(
         None,
         description="The cost your client reported, kept when Revenium replaced it with its own price for Claude Code or Claude Cowork usage, including a negotiated provider discount. Null when the client's figure was kept or no repricing happened.",
@@ -10240,6 +10552,11 @@ class EntityModelAICompletionMetricResourceRead(BaseModel):
         None,
         description="Reasoning/thinking effort level requested for this completion, as reported by the coding assistant (e.g. 'low', 'medium', 'high', 'xhigh', 'max'). Null when the source or model does not report an effort level.",
         examples=['high'],
+    )
+    entrypoint: Optional[str] = Field(
+        None,
+        description="How the coding assistant was launched, as the client reported it. Claude Code: 'cli', 'sdk-cli', 'sdk-ts', 'sdk-py', 'claude-vscode' or 'claude-in-slack', sent when OTEL_METRICS_INCLUDE_ENTRYPOINT=true. Null when not reported or recorded before this field was added.",
+        examples=['sdk-cli'],
     )
     environment: Optional[str] = Field(
         None,
@@ -10280,6 +10597,11 @@ class EntityModelAICompletionMetricResourceRead(BaseModel):
         ...,
         description="The AI completion metric's label (automatically set to the transaction ID for display purposes)",
         examples=['123e4567-e89b-12d3-a456-426614174000'],
+    )
+    listCost: Optional[float] = Field(
+        None,
+        description='The cost before a negotiated provider discount was applied. Set only when a discount rule priced the call; null otherwise, so read totalCost when it is null.',
+        examples=[0.024],
     )
     mediationLatency: Optional[int] = Field(
         None,
@@ -10699,7 +11021,7 @@ class EntityModelAgentResourceRead(BaseModel):
     resourceType: Optional[str] = Field(
         None, description='The type of object', examples=['agent']
     )
-    source: Optional[Source4] = Field(
+    source: Optional[Source5] = Field(
         None, description='How the agent record was created', examples=['API']
     )
     team: Optional[ResourceMetadataRead] = None
@@ -10796,7 +11118,7 @@ class EntityModelCostControlResourceRead(BaseModel):
     )
     createdBy: Optional[str] = Field(
         None,
-        description='The email address of the user who created this rule',
+        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded.',
         examples=['user@example.com'],
     )
     denyMessage: Optional[constr(max_length=2000)] = Field(
@@ -10847,8 +11169,8 @@ class EntityModelCostControlResourceRead(BaseModel):
     )
     modifiedBy: Optional[str] = Field(
         None,
-        description='The email address of the user who last modified this rule',
-        examples=['user@example.com'],
+        description='Who last created, changed or deleted this rule, in the same form as createdBy.',
+        examples=['user@example.com via API key 5jW1GD (ci-bot)'],
     )
     name: Optional[str] = Field(
         ..., description='Display name for this rule', examples=['Monthly OpenAI Cap']
@@ -11090,7 +11412,7 @@ class EntityModelDiscoveredAgentResourceRead(BaseModel):
         description='Whether an agent registry record exists for this telemetry value',
         examples=[False],
     )
-    source: Optional[Source5] = Field(
+    source: Optional[Source6] = Field(
         None,
         description='How the registered agent record was created, when registered',
         examples=['TELEMETRY'],
@@ -11488,7 +11810,7 @@ class EntityModelJobResourceRead(BaseModel):
         description='The type of object (automatically set by the system)',
         examples=['job'],
     )
-    source: Source6 = Field(
+    source: Source7 = Field(
         ...,
         description='How the job was created. TELEMETRY: detected from your usage data. UI: created with POST /v2/api/jobs from the Revenium app. API: created with POST /v2/api/jobs using an API key.',
         examples=['TELEMETRY'],
@@ -12186,6 +12508,10 @@ class EntityModelToolEventResourceRead(BaseModel):
 
 class EntityModelUserResourceRead(BaseModel):
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
+    access: Optional[list[TeamAccessResourceRead]] = Field(
+        None,
+        description='What the signed-in user may see in each of their teams. Present only on the current user (GET /v2/api/users/me).',
+    )
     canViewPromptData: Optional[bool] = Field(
         None,
         description='Whether the user can view captured prompt data (system prompts, messages, and responses). This flag only affects non-admin users; Account Administrators (ROLE_TENANT_ADMIN) have implicit access regardless of this setting. Only modifiable by Account Administrators.',
@@ -12221,6 +12547,7 @@ class EntityModelUserResourceRead(BaseModel):
     lastName: Optional[str] = Field(
         None, description='The last name of the user', examples=['Williams']
     )
+    navCustomization: Optional[NavCustomizationRead] = None
     persona: Optional[Persona] = Field(
         None,
         description="The user's role-based UI persona (cxo_finance, product_leaders or platform_engineering)",
@@ -12397,7 +12724,7 @@ class JobResource(BaseModel):
         description='The type of object (automatically set by the system)',
         examples=['job'],
     )
-    source: Source6 = Field(
+    source: Source7 = Field(
         ...,
         description='How the job was created. TELEMETRY: detected from your usage data. UI: created with POST /v2/api/jobs from the Revenium app. API: created with POST /v2/api/jobs using an API key.',
         examples=['TELEMETRY'],
@@ -12510,7 +12837,7 @@ class JobResourceRead(BaseModel):
         description='The type of object (automatically set by the system)',
         examples=['job'],
     )
-    source: Source6 = Field(
+    source: Source7 = Field(
         ...,
         description='How the job was created. TELEMETRY: detected from your usage data. UI: created with POST /v2/api/jobs from the Revenium app. API: created with POST /v2/api/jobs using an API key.',
         examples=['TELEMETRY'],
@@ -13554,7 +13881,7 @@ class SessionAttributionRequest(BaseModel):
         description='Repository name or URL, ≤ 255 characters. Omit to leave the stored value unchanged; send explicit null to clear it.',
         examples=['acme/web-app'],
     )
-    source: Optional[Source9] = Field(
+    source: Optional[Source10] = Field(
         None,
         description="Source coding assistant. Omit to leave the stored source unchanged; a brand-new interval with no source recorded defaults to 'other'.",
         examples=['claude-code'],
@@ -14883,33 +15210,33 @@ class V2ApiAiAlertsAnomalyIdBudgetResetPostResponse(
 
 
 class V2ApiSourcesAiAnomalyProviderDimensionsApiKeysGetResponse(
-    RootModel[Union[dict[str, Any], ApiError]]
+    RootModel[Union[ApiError, dict[str, Any]]]
 ):
-    root: Union[dict[str, Any], ApiError]
+    root: Union[ApiError, dict[str, Any]]
 
 
-class V2ApiToolsGetResponse(RootModel[Union[dict[str, Any], ApiError]]):
-    root: Union[dict[str, Any], ApiError]
+class V2ApiToolsGetResponse(RootModel[Union[ApiError, dict[str, Any]]]):
+    root: Union[ApiError, dict[str, Any]]
 
 
-class V2ApiToolsPostResponse(RootModel[Union[dict[str, Any], ApiError]]):
-    root: Union[dict[str, Any], ApiError]
+class V2ApiToolsPostResponse(RootModel[Union[ApiError, dict[str, Any]]]):
+    root: Union[ApiError, dict[str, Any]]
 
 
-class V2ApiToolsByToolIdToolIdGetResponse(RootModel[Union[dict[str, Any], ApiError]]):
-    root: Union[dict[str, Any], ApiError]
+class V2ApiToolsByToolIdToolIdGetResponse(RootModel[Union[ApiError, dict[str, Any]]]):
+    root: Union[ApiError, dict[str, Any]]
 
 
-class V2ApiToolsIdDeleteResponse(RootModel[Union[dict[str, Any], ApiError]]):
-    root: Union[dict[str, Any], ApiError]
+class V2ApiToolsIdDeleteResponse(RootModel[Union[ApiError, dict[str, Any]]]):
+    root: Union[ApiError, dict[str, Any]]
 
 
-class V2ApiToolsIdGetResponse(RootModel[Union[dict[str, Any], ApiError]]):
-    root: Union[dict[str, Any], ApiError]
+class V2ApiToolsIdGetResponse(RootModel[Union[ApiError, dict[str, Any]]]):
+    root: Union[ApiError, dict[str, Any]]
 
 
-class V2ApiToolsIdPutResponse(RootModel[Union[dict[str, Any], ApiError]]):
-    root: Union[dict[str, Any], ApiError]
+class V2ApiToolsIdPutResponse(RootModel[Union[ApiError, dict[str, Any]]]):
+    root: Union[ApiError, dict[str, Any]]
 
 
 class AIAlertResource(BaseModel):

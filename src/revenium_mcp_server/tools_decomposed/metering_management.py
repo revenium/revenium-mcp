@@ -880,6 +880,7 @@ _SESSION_TRACKING_LABELS: Tuple[Tuple[str, str], ...] = (
     ("agenticJobType", "Agentic Job Type"),
     ("agenticJobVersion", "Agentic Job Version"),
     ("ticketId", "Ticket ID"),
+    ("ccrSessionId", "Claude Code Cloud Session (client-reported)"),
 )
 
 # The prompt-context attributes as (submission argument, wire name, label).
@@ -967,6 +968,7 @@ _COMPLETIONS_REPORTED_FIELDS: Tuple[str, ...] = (
     "traceType",
     "traceName",
     "clientSurface",
+    "ccrSessionId",
     "responseQualityScore",
     "skillName",
     "skillSource",
@@ -5138,7 +5140,9 @@ class MeteringManagement(ToolBase):
         to free - and a truthy gate would silently drop the whole section for
         exactly the transactions a user is asking about.
         """
-        cost_fields = ['inputTokenCost', 'outputTokenCost', 'totalCost', 'clientReportedCost']
+        cost_fields = [
+            'inputTokenCost', 'outputTokenCost', 'totalCost', 'listCost', 'clientReportedCost'
+        ]
         if not any(data.get(field) is not None for field in cost_fields):
             return ""
 
@@ -5161,6 +5165,14 @@ class MeteringManagement(ToolBase):
 
         if data.get('totalCost') is not None:
             details += f"  - **Total Cost**: {_format_cost(data.get('totalCost'))}\n"
+
+        list_cost = data.get('listCost')
+        if list_cost is not None:
+            details += (
+                f"  - **List Cost**: {_format_cost(list_cost)} "
+                "(pre-discount: the cost before a negotiated provider discount; "
+                "Total Cost above is the billed figure)\n"
+            )
 
         # clientReportedCost is populated only when the platform re-rated the
         # transaction against the tenant's own rate card, replacing what the
@@ -6117,9 +6129,11 @@ record, not the summary.
 carrying every trace, operation and job identifier the transaction holds:
 `traceId`, `traceType`, `traceName`, `parentTransactionId`, `operationType`,
 `operationSubtype`, `clientSurface`, `agenticJobId`, `agenticJobName`,
-`agenticJobType`, `agenticJobVersion` and `ticketId`. `clientSurface` names the
+`agenticJobType`, `agenticJobVersion`, `ticketId` and `ccrSessionId`. `clientSurface` names the
 first-party app that sent a coding-assistant call (`claude-code` for the
-terminal CLI, `claude-code-desktop` for the desktop app). A field the
+terminal CLI, `claude-code-desktop` for the desktop app). `ccrSessionId` is the
+client-reported Claude Code cloud session that made the call, absent for calls
+made on the developer's own machine. A field the
 transaction does not carry is omitted rather than shown as 0 or N/A.
 `traceType` also appears in the summary rendering whenever the transaction
 carries one.
@@ -6172,7 +6186,7 @@ lookup_transactions(transaction_ids=["tx_abc123"], max_retries=5)
 - `return_transaction_data` (string|boolean) - Transaction data detail level:
   - "no": Show only verification status (✅ Found/❌ Not Found) - default
   - "summary": Show core fields (Model, Provider, Input/Output Tokens, plus Trace Type when the transaction carries one)
-  - "full": Show comprehensive details including metadata, costs, attribution, cache tokens, reasoning tokens, session tracking (traceId, traceType, traceName, parentTransactionId, operationType, operationSubtype, clientSurface, agenticJobId, agenticJobName, agenticJobType, agenticJobVersion, ticketId) and prompt context (promptId, promptLength, querySource, speed, subagentType)
+  - "full": Show comprehensive details including metadata, costs, attribution, cache tokens, reasoning tokens, session tracking (traceId, traceType, traceName, parentTransactionId, operationType, operationSubtype, clientSurface, agenticJobId, agenticJobName, agenticJobType, agenticJobVersion, ticketId, ccrSessionId) and prompt context (promptId, promptLength, querySource, speed, subagentType)
   - Boolean support: true="full", false="no"
 - `wait_seconds` (integer) - Most seconds a lookup spends waiting between searches for a transaction not visible yet; turns polling on (0-300):
   - Sent alone, it also sets how many searches fit in it at retry_interval (default 15 s)

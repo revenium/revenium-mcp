@@ -10,6 +10,9 @@ from fastmcp import Client
 from src.revenium_mcp_server import enhanced_server
 from src.revenium_mcp_server.server_identity import (
     DEFAULT_ICON_URL,
+    ICON_PATH,
+    icon_png,
+    register_icon_endpoint,
     DEFAULT_PRIVACY_URL,
     DEFAULT_TERMS_URL,
     DEFAULT_WEBSITE_URL,
@@ -77,3 +80,54 @@ def test_a_plain_http_url_fails_startup(monkeypatch, name):
 
     with pytest.raises(ValueError, match=name):
         load_server_identity()
+
+
+class TestTheServerServesItsOwnIcon:
+    """The hosted deployment is its own icon host (BACK-5054): the listing and
+    serverInfo point at a URL engineering owns, and the file ships in the wheel."""
+
+    @staticmethod
+    def _client():
+        import httpx
+        from fastmcp import FastMCP
+        from httpx import ASGITransport
+
+        mcp = FastMCP(name="test-server")
+        register_icon_endpoint(mcp)
+        return httpx.AsyncClient(transport=ASGITransport(app=mcp.http_app()), base_url="http://test")
+
+    async def test_get_icon_png_answers_the_packaged_png_with_a_day_of_caching(self):
+        async with self._client() as client:
+            response = await client.get(ICON_PATH)
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/png"
+        assert response.headers["cache-control"] == "public, max-age=86400"
+        assert response.content == icon_png()
+        assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_the_default_icon_url_is_the_hosted_server_route(self):
+        assert DEFAULT_ICON_URL == "https://mcp.revenium.ai" + ICON_PATH
+        assert load_server_identity().icon_url == DEFAULT_ICON_URL
+
+    async def test_the_icon_skips_auth_while_mcp_under_the_same_server_requires_it(self):
+        """The Connectors Directory fetches the icon with no token, so the route must sit
+        outside RequireAuthMiddleware on an authenticated server, like /health does."""
+        import httpx
+        from fastmcp.server.auth.auth import AuthProvider
+        from httpx import ASGITransport
+
+        auth = MagicMock(spec=AuthProvider)
+        auth.required_scopes = []
+        auth.get_middleware.return_value = []
+        auth.get_routes.return_value = []
+        auth._get_resource_url.return_value = None
+
+        app = enhanced_server.create_enhanced_server(auth=auth).http_app()
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            mcp_response = await client.post("/mcp", json={})
+            icon_response = await client.get(ICON_PATH)
+
+        assert mcp_response.status_code == 401, mcp_response.text
+        assert icon_response.status_code == 200
+        assert icon_response.content == icon_png()

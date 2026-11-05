@@ -130,21 +130,34 @@ class ResponseFormatter:
         period: str,
         aggregation: str,
         endpoint_key: Optional[str] = None,
+        paging: Optional[PageInfo] = None,
+        all_agents_cost: Optional[float] = None,
+        ranking_complete: bool = True,
     ) -> str:
         """
         Format agent costs response using dedicated formatter.
 
         Args:
-            data: Agent cost data from API
+            data: The agents on one page of the ranking
             period: Time period used
             aggregation: Aggregation type used
             endpoint_key: Registry key the rows were read with, so the scope
                 note follows the route; the formatter's own key when omitted
+            paging: Where that page sits in the ranking
+            all_agents_cost: The summed cost of every agent in the ranking
+            ranking_complete: False when the read stopped before the platform's
+                last page, so the ranking covers only the agents read
 
         Returns:
             Formatted response string
         """
-        params: Dict[str, Any] = {"period": period, "aggregation": aggregation}
+        params: Dict[str, Any] = {
+            "period": period,
+            "aggregation": aggregation,
+            "paging": paging or PageInfo(),
+            "all_agents_cost": all_agents_cost,
+            "ranking_complete": ranking_complete,
+        }
         if endpoint_key:
             params["endpoint_key"] = endpoint_key
         return self.agent_costs_formatter.format(data, params)

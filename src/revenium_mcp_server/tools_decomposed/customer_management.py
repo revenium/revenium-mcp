@@ -61,6 +61,40 @@ from .coding_assistant_billing_fields import (
     CODING_ASSISTANT_CONFIRMATION_NOTE,
     present_billing_fields,
 )
+from .cowork_org_links import (
+    COWORK_ORG_FEATURE_GATE_NOTE,
+    COWORK_ORG_LINK_EFFECT_NOTE,
+    COWORK_ORG_LINK_MODES_NOTE,
+    COWORK_ORG_LINK_STATES_NOTE,
+    COWORK_ORG_TEAM_SCOPE_NOTE,
+    COWORK_ORG_UNLINK_EFFECT_NOTE,
+    COWORK_ORG_UNLINK_PREVIEW_NOTE,
+    CoworkOrgLinkManager,
+    format_cowork_org_links_text,
+    format_link_result_text,
+    format_unlink_result_text,
+)
+from .department_admins import (
+    DEPARTMENT_ADMIN_ID_NOTE,
+    DEPARTMENT_ADMIN_NAME_EFFECT_NOTE,
+    DEPARTMENT_ADMIN_PREVIEW_NOTE,
+    DEPARTMENT_ADMIN_REMOVE_EFFECT_NOTE,
+    DEPARTMENT_ADMIN_VISIBILITY_NOTE,
+    NAME_ACTION as NAME_DEPARTMENT_ADMIN,
+    REMOVE_ACTION as REMOVE_DEPARTMENT_ADMIN,
+    DepartmentTree,
+    department_entry_id,
+    format_name_admin_text,
+    format_remove_admin_text,
+    name_preview,
+    name_result,
+    raise_department_admin_error,
+    remove_preview,
+    remove_result,
+    resolve_admin_person_id,
+    unknown_department_error,
+    validate_department_id,
+)
 from .pr_health_digest_fields import (
     PR_HEALTH_DIGEST_ALERT_NOTE,
     PR_HEALTH_DIGEST_FIELDS,
@@ -1150,17 +1184,17 @@ def _normalize_department(unit: Any) -> Optional[Dict[str, Any]]:
     """
     if not isinstance(unit, dict):
         return None
-    unit_id = department_id_to_filter_value(unit.get("id"))
     # The whole point of this listing is handing an agent a value it can paste
     # into a DEPARTMENT filter. The server contract types id as a number, so an
     # entry whose id is missing or does not read as one is malformed — rendering
     # it (as id=None or an arbitrary string) would invite copying an unusable
     # value. parentId stays permissive: None is legitimate on a root unit.
-    if unit_id is None or not unit_id.isdigit():
+    unit_id = department_entry_id(unit.get("id"))
+    if unit_id is None:
         return None
     return {
         "name": unit.get("name"),
-        "id": unit_id,
+        "id": department_id_to_filter_value(unit_id),
         "parentId": department_id_to_filter_value(unit.get("parentId")),
         "path": unit.get("path"),
         "source": unit.get("source"),
@@ -2966,8 +3000,9 @@ class DepartmentManager(BaseManager):
     """Internal manager for departments and their memberships.
 
     Departments themselves are created and CSV-imported in the Revenium UI; the MCP
-    lists them (BACK-2767) and detaches people from them (BACK-3353); a detach
-    with dry_run=true previews what would change and sends nothing.
+    lists them (BACK-2767), detaches people from them (BACK-3353) and names or
+    removes their admins (BACK-5501); each of those writes previews with
+    dry_run=true and sends nothing.
     """
 
     async def list_departments(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -3073,6 +3108,81 @@ class DepartmentManager(BaseManager):
         except ReveniumAPIError as e:
             _raise_department_removal_error(e, action, team_id, result)
         return {**result, "cleared": True}
+
+    async def name_department_admin(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Name the directory person with this email an admin of one department."""
+        action = NAME_DEPARTMENT_ADMIN
+        team_id = _removal_team_id(arguments, action)
+        department_id = validate_department_id(arguments.get("department_id"), action)
+        email = _validate_lookup_email(arguments.get("email"), action)
+        tree = await self._read_department_tree(team_id, action)
+        if arguments.get("dry_run"):
+            return name_preview(tree, team_id, department_id, email)
+        self._require_known_department(tree, team_id, department_id)
+
+        try:
+            response = await self.client.add_department_admin(department_id, email, team_id)
+        except ReveniumAPIError as e:
+            self._raise_admin_write_error(e, action, team_id, department_id, email=email)
+        return name_result(tree, team_id, department_id, email, response)
+
+    async def remove_department_admin(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """End one person's naming as a department admin, then re-read whether they still are."""
+        action = REMOVE_DEPARTMENT_ADMIN
+        team_id = _removal_team_id(arguments, action)
+        department_id = validate_department_id(arguments.get("department_id"), action)
+        person = self._person_identifier(arguments, action)
+        person_id, email = (person, None) if isinstance(person, int) else (None, person)
+        tree = await self._read_department_tree(team_id, action)
+        if arguments.get("dry_run"):
+            return remove_preview(tree, team_id, department_id, person_id, email)
+        self._require_known_department(tree, team_id, department_id)
+        if person_id is None:
+            person_id = resolve_admin_person_id(tree, team_id, department_id, cast(str, email))
+
+        try:
+            await self.client.remove_department_admin(department_id, person_id, team_id)
+        except ReveniumAPIError as e:
+            self._raise_admin_write_error(e, action, team_id, department_id, person_id=person_id)
+
+        try:
+            after = DepartmentTree.from_response(await self.client.get_departments(team_id))
+        except ReveniumAPIError as e:
+            return remove_result(
+                tree, None, team_id, department_id, person_id, email, reread_error=str(e.message)
+            )
+        return remove_result(tree, after, team_id, department_id, person_id, email)
+
+    async def _read_department_tree(self, team_id: Optional[str], action: str) -> DepartmentTree:
+        try:
+            return DepartmentTree.from_response(await self.client.get_departments(team_id))
+        except ReveniumAPIError as e:
+            if e.status_code == 403:
+                raise _department_feature_disabled_error(team_id, action)
+            raise
+
+    @staticmethod
+    def _require_known_department(
+        tree: DepartmentTree, team_id: Optional[str], department_id: int
+    ) -> None:
+        if tree.readable and tree.get(department_id) is None:
+            raise unknown_department_error(team_id, department_id)
+
+    @staticmethod
+    def _raise_admin_write_error(
+        error: ReveniumAPIError,
+        action: str,
+        team_id: Optional[str],
+        department_id: int,
+        *,
+        email: Optional[str] = None,
+        person_id: Optional[int] = None,
+    ) -> NoReturn:
+        if error.status_code == 403:
+            raise _department_removal_forbidden_error(error, team_id, action)
+        raise_department_admin_error(
+            error, action, team_id, department_id, email=email, person_id=person_id
+        )
 
     @staticmethod
     def _person_identifier(
@@ -3545,6 +3655,7 @@ class CustomerManagement(ToolBase):
             organization_manager = OrganizationManager(client)
             team_manager = TeamManager(client)
             department_manager = DepartmentManager(client)
+            cowork_org_link_manager = CoworkOrgLinkManager(client)
             analytics_processor = CustomerAnalytics(client)
 
             # Handle introspection actions
@@ -3583,7 +3694,7 @@ class CustomerManagement(ToolBase):
                                 "teams",
                             ],
                             "usage": "list(resource_type='organizations')",
-                            "departments": "Departments have their own actions: list_departments(), delete_department_person(), clear_department_assignment()",
+                            "departments": "Departments have their own actions: list_departments(), delete_department_person(), clear_department_assignment(), name_department_admin(), remove_department_admin()",
                             "example_calls": [
                                 "list(resource_type='organizations')",
                                 "list(resource_type='subscribers')",
@@ -4080,6 +4191,18 @@ class CustomerManagement(ToolBase):
                     )
                 ]
 
+            elif action == "list_cowork_org_links":
+                result = await cowork_org_link_manager.list_links(arguments)
+                return [TextContent(type="text", text=format_cowork_org_links_text(result))]
+
+            elif action == "link_cowork_org":
+                result = await cowork_org_link_manager.link(arguments)
+                return [TextContent(type="text", text=format_link_result_text(result))]
+
+            elif action == "unlink_cowork_org":
+                result = await cowork_org_link_manager.unlink(arguments)
+                return [TextContent(type="text", text=format_unlink_result_text(result))]
+
             elif action == "list_departments":
                 result = await department_manager.list_departments(arguments)
                 return [TextContent(type="text", text=_format_departments_text(result))]
@@ -4091,6 +4214,14 @@ class CustomerManagement(ToolBase):
             elif action == "clear_department_assignment":
                 result = await department_manager.clear_department_assignment(arguments)
                 return [TextContent(type="text", text=_format_department_removal_text(result))]
+
+            elif action == NAME_DEPARTMENT_ADMIN:
+                result = await department_manager.name_department_admin(arguments)
+                return [TextContent(type="text", text=format_name_admin_text(result))]
+
+            elif action == REMOVE_DEPARTMENT_ADMIN:
+                result = await department_manager.remove_department_admin(arguments)
+                return [TextContent(type="text", text=format_remove_admin_text(result))]
 
             # Analytics operations
             elif action == "analyze":
@@ -4184,10 +4315,17 @@ class CustomerManagement(ToolBase):
                             "add_verified_domain",
                             "remove_verified_domain",
                         ],
+                        "cowork_org_link_actions": [
+                            "list_cowork_org_links",
+                            "link_cowork_org",
+                            "unlink_cowork_org",
+                        ],
                         "department_actions": [
                             "list_departments",
                             "delete_department_person",
                             "clear_department_assignment",
+                            NAME_DEPARTMENT_ADMIN,
+                            REMOVE_DEPARTMENT_ADMIN,
                         ],
                         "analysis_actions": ["analyze"],
                         "discovery_actions": [
@@ -4207,6 +4345,8 @@ class CustomerManagement(ToolBase):
                             "list_departments": "list_departments()",
                             "delete_department_person": "delete_department_person(person_id=97)",
                             "clear_department_assignment": "clear_department_assignment(email='ash@acme.com')",
+                            NAME_DEPARTMENT_ADMIN: "name_department_admin(department_id=173, email='ash@acme.com', dry_run=true)",
+                            REMOVE_DEPARTMENT_ADMIN: "remove_department_admin(department_id=173, person_id=97, dry_run=true)",
                             "get_marketplace_settings": "get_marketplace_settings(team_id='jR2kmLs')",
                             "update_marketplace_settings": "update_marketplace_settings(team_id='jR2kmLs', marketplace_names=['acme-internal'], operation='add')",
                             "get_pr_health_settings": "get_pr_health_settings(team_id='jR2kmLs')",
@@ -4219,6 +4359,9 @@ class CustomerManagement(ToolBase):
                             "list_verified_domains": "list_verified_domains(team_id='jR2kmLs')",
                             "add_verified_domain": "add_verified_domain(team_id='jR2kmLs', domain='acme.com')",
                             "remove_verified_domain": "remove_verified_domain(team_id='jR2kmLs', domain='acme.com')",
+                            "list_cowork_org_links": "list_cowork_org_links()",
+                            "link_cowork_org": "link_cowork_org(claude_org_uuid='0f8e1a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b', dry_run=true)",
+                            "unlink_cowork_org": "unlink_cowork_org(link_id='aB3dE5f', dry_run=true)",
                         },
                     },
                 )
@@ -4381,6 +4524,20 @@ class CustomerManagement(ToolBase):
         result_text += f"- **Permissions (add)**: {VERIFIED_DOMAIN_ADD_PLATFORM_ADMIN_NOTE}\n"
         result_text += f"- **Together**: {ATTRIBUTION_POLICY_DOMAIN_LINK_NOTE}\n\n"
 
+        result_text += "## **Team Claude Organization Links (Cowork)**\n"
+        result_text += "The Claude organizations whose Cowork activity routes to the team.\n\n"
+        result_text += "- `list_cowork_org_links()` - every organization the team knows, with its `state` and, when linked, its link id\n"
+        result_text += "- `link_cowork_org(claude_org_uuid='0f8e1a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b')` or `link_cowork_org(credential_id='cred_123')` - link ONE organization\n"
+        result_text += "- `unlink_cowork_org(link_id='aB3dE5f')` - remove ONE link\n"
+        result_text += "- **Preview**: with `dry_run=true` both writes only show what would change; no write is sent\n"
+        result_text += f"- **States**: {COWORK_ORG_LINK_STATES_NOTE}\n"
+        result_text += f"- **Link modes**: {COWORK_ORG_LINK_MODES_NOTE}\n"
+        result_text += f"- **Link**: {COWORK_ORG_LINK_EFFECT_NOTE}\n"
+        result_text += f"- **Unlink**: {COWORK_ORG_UNLINK_EFFECT_NOTE}\n"
+        result_text += f"- **Before unlinking**: {COWORK_ORG_UNLINK_PREVIEW_NOTE}\n"
+        result_text += f"- **Team**: {COWORK_ORG_TEAM_SCOPE_NOTE}\n"
+        result_text += f"- **Availability**: {COWORK_ORG_FEATURE_GATE_NOTE}\n\n"
+
         result_text += "## **Departments**\n"
         result_text += "Resolve a department name to the id the `DEPARTMENT` filter dimension expects, and detach people from departments.\n\n"
         result_text += "- `list_departments()` - every active department for the caller's team/organization\n"
@@ -4393,6 +4550,13 @@ class CustomerManagement(ToolBase):
         result_text += f"- **Delete**: {DEPARTMENT_PERSON_DELETE_NOTE}\n"
         result_text += f"- **Clear**: {DEPARTMENT_ASSIGNMENT_CLEAR_NOTE}\n"
         result_text += f"- **Budgets**: {DEPARTMENT_REMOVAL_BUDGET_NOTE}\n"
+        result_text += "- `name_department_admin(department_id=173, email='ash@acme.com')` - name ONE person an admin of a department\n"
+        result_text += "- `remove_department_admin(department_id=173, person_id=97)` or `remove_department_admin(department_id=173, email='ash@acme.com')` - remove ONE admin\n"
+        result_text += f"- **Admin access**: {DEPARTMENT_ADMIN_VISIBILITY_NOTE}\n"
+        result_text += f"- **Before naming or removing**: {DEPARTMENT_ADMIN_PREVIEW_NOTE}\n"
+        result_text += f"- **Name**: {DEPARTMENT_ADMIN_NAME_EFFECT_NOTE}\n"
+        result_text += f"- **Remove**: {DEPARTMENT_ADMIN_REMOVE_EFFECT_NOTE}\n"
+        result_text += f"- **Ids**: {DEPARTMENT_ADMIN_ID_NOTE}\n"
         result_text += "- Departments are created, renamed and deleted in the Revenium UI; this tool cannot change the departments themselves\n"
         result_text += f"- **CSV import**: {DEPARTMENT_CSV_IMPORT_EXCLUSION_NOTE}\n"
         result_text += f"- **Renamed**: {DEPARTMENT_ACTION_ALIASES_NOTE}\n\n"
@@ -4691,6 +4855,11 @@ class CustomerManagement(ToolBase):
                 "example": "list_verified_domains(team_id='jR2kmLs')",
             },
             {
+                "title": "See Which Claude Organizations Route Cowork Activity to the Team",
+                "description": "List every Claude organization the team knows and whether its Cowork activity routes to this team",
+                "example": "list_cowork_org_links()",
+            },
+            {
                 "title": "Customer Analytics",
                 "description": "Count one page of customers and the teams, organizations or parents they reference",
                 "example": "analyze(resource_type='users', filters={'query': 'acme'})",
@@ -4974,6 +5143,42 @@ class CustomerManagement(ToolBase):
                 ],
             ),
             ToolCapability(
+                name="Team Claude Organization Links (Cowork)",
+                description=(
+                    "List, link and unlink the Claude organizations whose Cowork "
+                    "activity routes to the team. Both writes preview with "
+                    "dry_run=true."
+                ),
+                parameters={
+                    "list_cowork_org_links": {"team_id": "str (optional)"},
+                    "link_cowork_org": {
+                        "team_id": "str (optional)",
+                        "claude_org_uuid": "str (one of claude_org_uuid or credential_id)",
+                        "credential_id": "str (one of claude_org_uuid or credential_id)",
+                    },
+                    "unlink_cowork_org": {
+                        "team_id": "str (optional)",
+                        "link_id": "str (required - the link id list_cowork_org_links reports)",
+                    },
+                },
+                examples=[
+                    "list_cowork_org_links()",
+                    "link_cowork_org(claude_org_uuid='0f8e1a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b', dry_run=true)",
+                    "link_cowork_org(credential_id='cred_123')",
+                    "unlink_cowork_org(link_id='aB3dE5f', dry_run=true)",
+                    "unlink_cowork_org(link_id='aB3dE5f')",
+                ],
+                limitations=[
+                    COWORK_ORG_FEATURE_GATE_NOTE,
+                    COWORK_ORG_TEAM_SCOPE_NOTE,
+                    COWORK_ORG_LINK_STATES_NOTE,
+                    COWORK_ORG_LINK_MODES_NOTE,
+                    COWORK_ORG_LINK_EFFECT_NOTE,
+                    COWORK_ORG_UNLINK_EFFECT_NOTE,
+                    COWORK_ORG_UNLINK_PREVIEW_NOTE,
+                ],
+            ),
+            ToolCapability(
                 name="Department Lookup and Membership Removal",
                 description=(
                     "List the organization's active departments to resolve a "
@@ -4981,8 +5186,9 @@ class CustomerManagement(ToolBase):
                     "accepted as a filter dimension by insight runs, department cost "
                     "controls and group previews, and this is the only action that produces "
                     "the id those filters take. Detach a person from their department by "
-                    "deleting the directory person or clearing only their assignment; both "
-                    "removals take dry_run=true to preview what would change."
+                    "deleting the directory person or clearing only their assignment, and "
+                    "name or remove a department's admins; every one of these writes takes "
+                    "dry_run=true to preview what would change."
                 ),
                 parameters={
                     "list_departments": {
@@ -4999,6 +5205,19 @@ class CustomerManagement(ToolBase):
                         "team_id": "str (optional - defaults to the ambient team)",
                         "dry_run": "bool (optional - true previews the change and sends nothing)",
                     },
+                    NAME_DEPARTMENT_ADMIN: {
+                        "department_id": "int (required - the id list_departments returns)",
+                        "email": "str (required - a person in the team's directory)",
+                        "team_id": "str (optional - defaults to the ambient team)",
+                        "dry_run": "bool (optional - true names the subtree the person would see and sends nothing)",
+                    },
+                    REMOVE_DEPARTMENT_ADMIN: {
+                        "department_id": "int (required - the id list_departments returns)",
+                        "person_id": "int (the admin's directory person id) - or email, not both",
+                        "email": "str (resolved against the department's admins) - or person_id",
+                        "team_id": "str (optional - defaults to the ambient team)",
+                        "dry_run": "bool (optional - true lists the admins and the subtree the person would lose)",
+                    },
                 },
                 examples=[
                     "list_departments()",
@@ -5006,6 +5225,8 @@ class CustomerManagement(ToolBase):
                     "delete_department_person(person_id=97)",
                     "delete_department_person(email='ash@acme.com')",
                     "clear_department_assignment(email='ash@acme.com')",
+                    "name_department_admin(department_id=173, email='ash@acme.com', dry_run=true)",
+                    "remove_department_admin(department_id=173, person_id=97, dry_run=true)",
                 ],
                 limitations=[
                     "Departments themselves are created, renamed and deleted in the Revenium UI, not through this tool",
@@ -5013,6 +5234,10 @@ class CustomerManagement(ToolBase):
                     DEPARTMENT_PERSON_DELETE_NOTE,
                     DEPARTMENT_ASSIGNMENT_CLEAR_NOTE,
                     DEPARTMENT_REMOVAL_BUDGET_NOTE,
+                    DEPARTMENT_ADMIN_VISIBILITY_NOTE,
+                    DEPARTMENT_ADMIN_PREVIEW_NOTE,
+                    DEPARTMENT_ADMIN_NAME_EFFECT_NOTE,
+                    DEPARTMENT_ADMIN_REMOVE_EFFECT_NOTE,
                     "Only active departments are returned",
                     DEPARTMENT_ID_STRING_NOTE,
                     DEPARTMENT_ACTION_ALIASES_NOTE,
@@ -5136,9 +5361,14 @@ class CustomerManagement(ToolBase):
             "list_verified_domains",
             "add_verified_domain",
             "remove_verified_domain",
+            "list_cowork_org_links",
+            "link_cowork_org",
+            "unlink_cowork_org",
             "list_departments",
             "delete_department_person",
             "clear_department_assignment",
+            NAME_DEPARTMENT_ADMIN,
+            REMOVE_DEPARTMENT_ADMIN,
             "analyze",
             "get_capabilities",
             "get_examples",
@@ -5180,9 +5410,11 @@ class CustomerManagement(ToolBase):
                     "type": "string",
                     "description": (
                         "Optional team scope for list_departments, "
-                        "delete_department_person and clear_department_assignment; "
-                        "omitted, the ambient team from the auth config (or, for "
-                        "the listing, the caller's own organization) is used. "
+                        "delete_department_person, clear_department_assignment, "
+                        "name_department_admin, remove_department_admin and "
+                        "the three Claude organization link actions; omitted, the "
+                        "ambient team from the auth config (or, for list_departments, "
+                        "the caller's own organization) is used. "
                         "Required by every team-settings action, which addresses "
                         "the team explicitly"
                     ),
@@ -5190,16 +5422,26 @@ class CustomerManagement(ToolBase):
                 "email": {
                     "type": "string",
                     "description": (
-                        "Email for lookup_user / lookup_subscriber, and the person "
+                        "Email for lookup_user / lookup_subscriber, the person "
                         "to remove for delete_department_person (instead of "
-                        "person_id) and clear_department_assignment"
+                        "person_id) and clear_department_assignment, the person to "
+                        "name for name_department_admin, and the admin to remove for "
+                        "remove_department_admin (instead of person_id)"
                     ),
                 },
                 "person_id": {
                     "type": "integer",
                     "description": (
-                        "Numeric directory person id for delete_department_person; "
-                        "pass either person_id or email, not both"
+                        "Numeric directory person id for delete_department_person "
+                        "and remove_department_admin; pass either person_id or "
+                        "email, not both"
+                    ),
+                },
+                "department_id": {
+                    "type": "integer",
+                    "description": (
+                        "Numeric department id, as list_departments returns it, for "
+                        "name_department_admin and remove_department_admin"
                     ),
                 },
                 "policy": {
@@ -5218,6 +5460,27 @@ class CustomerManagement(ToolBase):
                         "One bare email domain (e.g. 'acme.com') for "
                         "add_verified_domain / remove_verified_domain. Each call "
                         "carries a single domain; the add is not a list replacement"
+                    ),
+                },
+                "claude_org_uuid": {
+                    "type": "string",
+                    "description": (
+                        "Claude organization uuid (8-4-4-4-12) for link_cowork_org. "
+                        + COWORK_ORG_LINK_MODES_NOTE
+                    ),
+                },
+                "credential_id": {
+                    "type": "string",
+                    "description": (
+                        "Id of one of the team's Claude Enterprise credentials for "
+                        "link_cowork_org, instead of claude_org_uuid"
+                    ),
+                },
+                "link_id": {
+                    "type": "string",
+                    "description": (
+                        "The link id list_cowork_org_links reports for a LINKED "
+                        "organization; required by unlink_cowork_org"
                     ),
                 },
                 "filters": {"type": "object", "description": CUSTOMER_FILTERS_DESCRIPTION},
