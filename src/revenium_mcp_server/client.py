@@ -4042,6 +4042,46 @@ class ReveniumClient:
             params=params,
         ))
 
+    async def list_team_cowork_org_links(self, team_id: str) -> List[Dict[str, Any]]:
+        """List every Claude organization the team knows, each with its link state.
+
+        Answers a bare JSON array of ``{claudeOrgUuid, id, source, state}``, where
+        ``id`` is the link id and is null for an organization that is not linked.
+        """
+        return cast(
+            List[Dict[str, Any]],
+            await self.get(
+                f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/cowork-org-links",
+                params=self._add_tenant_id_to_params(),
+            ),
+        )
+
+    async def link_team_cowork_org(
+        self, team_id: str, request: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """Link one Claude organization to the team, by ``credentialId`` or ``claudeOrgUuid``.
+
+        Linking an organization the team already linked answers with that link.
+        """
+        return cast(
+            Dict[str, Any],
+            await self.post(
+                f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/cowork-org-links",
+                data=request,
+                params=self._add_tenant_id_to_params(),
+            ),
+        )
+
+    async def unlink_team_cowork_org(self, team_id: str, link_id: str) -> Dict[str, Any]:
+        """Remove one Claude organization link; answers 204, so the result is ``{}``."""
+        return cast(
+            Dict[str, Any],
+            await self.delete(
+                f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/cowork-org-links/{self._quote_path_segment(link_id)}",
+                params=self._add_tenant_id_to_params(),
+            ),
+        )
+
     # Organizational Unit (department) API methods
     async def get_departments(self, team_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get the active departments for a team.
@@ -4061,7 +4101,7 @@ class ReveniumClient:
                 to the caller's own organization when no teamId reaches it.
 
         Returns:
-            List of departments, each ``{id, name, parentId, path, source, externalRef}``
+            List of departments, each ``{id, name, parentId, path, source, externalRef, admins}``
             where ``path`` is the materialized ancestor-id path including the unit
             itself (e.g. ``/12/40/173/``) and ``id``/``parentId`` are JSON numbers.
         """
@@ -4129,6 +4169,44 @@ class ReveniumClient:
             Dict[str, Any],
             await self.delete(
                 "/profitstream/v2/api/departments/assignments", params=params, use_retry=False
+            ),
+        )
+
+    async def add_department_admin(
+        self, department_id: int, email: str, team_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Name the directory person with ``email`` an admin of one department.
+
+        Runs once (``use_retry=False``) like the department deletes. Naming someone
+        who is already an admin changes nothing, except that a CSV-named admin
+        becomes named by hand. Answers the department's admins, each
+        ``{personId, email, hasLogin, source}``.
+        """
+        return cast(
+            List[Dict[str, Any]],
+            await self.put(
+                f"/profitstream/v2/api/departments/{self._quote_path_segment(str(department_id))}/admins",
+                data={"email": email},
+                params=self._department_team_params(team_id),
+                use_retry=False,
+            ),
+        )
+
+    async def remove_department_admin(
+        self, department_id: int, person_id: int, team_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """End one directory person's naming as an admin of one department.
+
+        Answers 204 whether or not the person was an admin, so the result is ``{}``
+        and only a fresh ``get_departments`` read tells whether they still are.
+        """
+        return cast(
+            Dict[str, Any],
+            await self.delete(
+                f"/profitstream/v2/api/departments/{self._quote_path_segment(str(department_id))}"
+                f"/admins/{self._quote_path_segment(str(person_id))}",
+                params=self._department_team_params(team_id),
+                use_retry=False,
             ),
         )
 
@@ -5421,6 +5499,29 @@ class ReveniumClient:
         return cast(Dict[str, Any], await self.get(
             "/api/v2/analytics/ai-assistants/team-medians",
             params=params,
+            base_url=self._get_app_base_url(),
+            use_bearer=True,
+            unwrap_hal_embedded=False,
+        ))
+
+    async def get_ai_assistant_savings_findings(self, **params: Any) -> Dict[str, Any]:
+        """Ranked savings a team can get back from its coding assistants.
+
+        GET /api/v2/analytics/ai-assistants/savings-findings (operation
+        ``get_savings_findings``) on the analytics host. ``params`` are the
+        endpoint's own query names (level, page, size, assistant, startDate,
+        endDate); ``teamId`` is the resolved team. level=department is paged
+        (size at most 100); level=person ignores page and size and returns every
+        row. Both levels carry the platform's own ``totals``, which callers copy
+        rather than sum. A team without the feature, or an assistant not enabled
+        for it, is refused with 403 FORBIDDEN ("not enabled"), as are API keys with
+        metering scope; 503 (FLAGS_UNREADABLE or NOT_READY) is a read the platform
+        could not finish in time. The body is flat with an ``_embedded`` member beside the
+        totals, so it is not unwrapped as a HAL collection.
+        """
+        return cast(Dict[str, Any], await self.get(
+            "/api/v2/analytics/ai-assistants/savings-findings",
+            params={**params, **self._resolved_team_param()},
             base_url=self._get_app_base_url(),
             use_bearer=True,
             unwrap_hal_embedded=False,

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.auth import AccessToken, TokenVerifier
 from fastmcp.server.dependencies import get_access_token, get_http_headers
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
@@ -161,8 +162,11 @@ class ApiKeyAuthMiddleware(Middleware):
                 tenant_id=claims.get("tenant_id"),
                 reason="team_override_rejected",
             )
-            raise PermissionError(
-                f"Team '{requested}' is not available to this API key"
+            # Only FastMCP's own ToolError reaches the client with its text;
+            # any other exception from middleware becomes "Internal server error".
+            raise ToolError(
+                f"Team '{requested}' is not available to this API key. Remove the "
+                "X-Revenium-Team-Id header, or set it to a team this key belongs to."
             )
 
         # api_key mode has no server-wide REVENIUM_API_KEY, so ConfigManager

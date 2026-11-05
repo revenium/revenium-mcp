@@ -167,33 +167,27 @@ async def test_wrong_issuer_returns_401(mcp_http_server, mint_jwt):
 #
 # Design note: HTTP 401/403 is produced by the Bearer auth middleware
 # (Starlette layer) for missing/invalid tokens.  Claim-level enforcement
-# (revenium_team_id, tenant_id) runs inside TenantContextMiddleware which
-# sits at the MCP protocol layer — errors there become JSON-RPC errors
-# wrapped in HTTP 200.  We assert HTTP 200 + JSON-RPC error code here
-# because that is the actual FastMCP behaviour; the original spec called
-# for 403 before the OIDCProxy architecture was understood.
+# (revenium_team_id, tenant_id) runs inside TenantContextMiddleware at the
+# MCP protocol layer, which refuses with FastMCP's ToolError: the answer is
+# HTTP 200 carrying a tool result with isError true and the refusal text
+# (BACK-5441). The original spec called for 403 before the OIDCProxy
+# architecture was understood.
 
 @pytest.mark.asyncio
 async def test_missing_required_claim_returns_error(mcp_http_server, mint_jwt):
+    from tests.integration._envelope_assertions import parse_jsonrpc_response
+
     token = mint_jwt(revenium_team_id=None)  # drop the claim
     resp = await _call_tool(mcp_http_server["base_url"], token)
-    # JWT is cryptographically valid (passes HTTP Bearer auth → 200), but
-    # TenantContextMiddleware rejects it at the MCP layer → JSON-RPC error.
     assert resp.status_code == 200
-    # The MCP transport returns SSE or JSON; check both formats.
-    content_type = resp.headers.get("content-type", "")
-    if "text/event-stream" in content_type:
-        body_text = resp.text
-        assert "error" in body_text.lower()
-        assert "revenium_team_id" in body_text
-        assert "user_abc" not in body_text
-    else:
-        body = resp.json()
-        assert "error" in body
-        # The error message must mention the missing claim name.
-        assert "revenium_team_id" in body["error"]["message"]
-        # The subject of the JWT must NOT leak into the error message.
-        assert "user_abc" not in body["error"]["message"]
+    payload = parse_jsonrpc_response(resp)
+    assert "error" not in payload, payload
+    assert payload["result"]["isError"] is True
+    text = payload["result"]["content"][0]["text"]
+    assert text.startswith("Your sign-in is not linked to a Revenium team yet.")
+    assert "revenium_team_id" in text
+    # The subject of the JWT must NOT leak into the error message.
+    assert "user_abc" not in text
 
 
 # ── Scenario 5: two tenants on one deployment resolve independently ──

@@ -229,3 +229,32 @@ async def test_jwt_team_id_propagates_to_revenium_api_request(
         f"(env fallback would have been team_default). "
         f"full query args: {dict(captured[0].args)!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_unlinked_sign_in_is_told_what_to_do_inside_http_200(
+    mcp_http_server_with_revenium_mock, mint_jwt
+) -> None:
+    """BACK-5441: a JWT without team claims reads the remedy, not "Internal server error"."""
+    token = mint_jwt(revenium_team_id=None, tenant_id=None)
+    resp = await _call_tool(
+        mcp_http_server_with_revenium_mock["base_url"],
+        token,
+        tool_name="get_products",
+        arguments={"action": "list"},
+    )
+    assert resp.status_code == 200, (
+        f"status={resp.status_code} body={resp.text!r}"
+    )
+    payload = parse_jsonrpc_response(resp)
+    assert "error" not in payload, f"unexpected JSON-RPC error: {payload!r}"
+    result = payload["result"]
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert text.startswith(
+        "Your sign-in is not linked to a Revenium team yet. Open "
+    ), text
+    assert "once with the same email, then reconnect the connector." in text
+    assert text.endswith(
+        "For support: JWT is missing required claim(s): revenium_team_id, tenant_id."
+    ), text

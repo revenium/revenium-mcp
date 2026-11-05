@@ -4,6 +4,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastmcp.exceptions import ToolError
 from loguru import logger
 
 from src.revenium_mcp_server.auth.auth_events import emit_auth_event
@@ -213,7 +214,7 @@ async def test_tenant_resolution_failure_emits_event(monkeypatch):
     records = []
     sink_id = logger.add(lambda msg: records.append(msg.record), level="INFO")
     try:
-        with pytest.raises(PermissionError):
+        with pytest.raises(ToolError):
             await mw.on_call_tool(MagicMock(), AsyncMock())
     finally:
         logger.remove(sink_id)

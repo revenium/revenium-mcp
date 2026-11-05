@@ -69,6 +69,7 @@ from ..common.error_handling import (
     raise_refusal,
     raise_structured_error,
 )
+from ..common.money import render_plain_amount
 from ..common.pagination_performance import validate_pagination_with_performance
 from ..common.validation import apply_filter_allowlist, validate_pagination_params
 from ..common.ucm_config import log_ucm_status
@@ -217,6 +218,28 @@ def _format_budget_share(share: float) -> str:
     return f"{share * 100:.1f}".rstrip("0").rstrip(".") + "%"
 
 
+def _format_budget_spend(entry: Dict[str, Any]) -> str:
+    return (
+        f"{render_plain_amount(entry.get('currentValue'))}"
+        f"/{render_plain_amount(entry.get('threshold'))}"
+    )
+
+
+def _is_over_budget(entry: Dict[str, Any], share: float) -> bool:
+    """A grouped budget's threshold applies to each group, so its summed share cannot say it is over."""
+    groups = entry.get("groups")
+    if not (isinstance(groups, list) and groups):
+        return share > 1
+    group_shares = (g.get("percentUsed") for g in groups if isinstance(g, dict))
+    return any(isinstance(s, (int, float)) and s > 1 for s in group_shares)
+
+
+def _format_budget_usage(entry: Dict[str, Any], share: float) -> str:
+    """Render percentUsed, a fraction per the BudgetProgressResource schema, as "N% used"."""
+    usage = f"{_format_budget_share(share)} used"
+    return f"{usage} (over budget)" if _is_over_budget(entry, share) else usage
+
+
 def _grouped_budget_parts(entry: Dict[str, Any], group_count: int) -> List[str]:
     """Render a grouped budget's figures, leading with the totals' scope.
 
@@ -225,7 +248,7 @@ def _grouped_budget_parts(entry: Dict[str, Any], group_count: int) -> List[str]:
     together) can read as safe while one group is over. worstPercentUsed and
     risk come from the highest group.
     """
-    parts = [f"{entry.get('currentValue')}/{entry.get('threshold')} summed across groups"]
+    parts = [f"{_format_budget_spend(entry)} summed across groups"]
     percent = entry.get("percentUsed")
     if isinstance(percent, (int, float)):
         parts.append(f"{_format_budget_share(percent)} used summed across groups")
@@ -4338,10 +4361,10 @@ create(resource_type="anomalies", anomaly_data={
         if isinstance(group_count, int):
             parts.extend(_grouped_budget_parts(entry, group_count))
         else:
-            parts.append(f"{current}/{threshold}")
+            parts.append(_format_budget_spend(entry))
             percent = entry.get("percentUsed")
             if isinstance(percent, (int, float)):
-                parts.append(f"{percent}% used")
+                parts.append(_format_budget_usage(entry, percent))
 
         if status:
             parts.append(f"vs-linear {status}")

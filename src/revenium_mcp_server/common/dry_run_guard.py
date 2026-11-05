@@ -24,7 +24,14 @@ DRY_RUN_PREVIEW_ACTIONS: Mapping[str, FrozenSet[str]] = MappingProxyType(
     {
         "manage_alerts": frozenset({"create", "update", "create_simple", "validate"}),
         "manage_customers": _CRUD_PREVIEWS
-        | {"delete_department_person", "clear_department_assignment"},
+        | {
+            "delete_department_person",
+            "clear_department_assignment",
+            "link_cowork_org",
+            "unlink_cowork_org",
+            "name_department_admin",
+            "remove_department_admin",
+        },
         "manage_subscriptions": frozenset({"create", "update", "validate"}),
         "manage_credentials": frozenset({"create", "validate"}),
         "manage_products": _CRUD_PREVIEWS,

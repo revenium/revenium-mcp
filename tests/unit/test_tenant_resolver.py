@@ -94,6 +94,29 @@ class TestClerkResolverMultiTenant:
         with pytest.raises(PermissionError, match="revenium_team_id"):
             resolver.resolve(claims, clerk_jwt=JWT)
 
+    def test_absent_and_blank_claims_are_reported_missing(self, monkeypatch):
+        from src.revenium_mcp_server.auth.tenant_resolver import TenantClaimsRejected
+
+        resolver = _make_clerk_resolver()
+        claims = _claims(revenium_team_id="   ")
+        del claims["tenant_id"]
+        with pytest.raises(TenantClaimsRejected) as excinfo:
+            resolver.resolve(claims, clerk_jwt=JWT)
+        assert excinfo.value.missing == ("revenium_team_id", "tenant_id")
+        assert excinfo.value.malformed == ()
+        assert str(excinfo.value) == (
+            "JWT is missing required claim(s): revenium_team_id, tenant_id"
+        )
+
+    def test_non_string_claim_is_reported_malformed(self, monkeypatch):
+        from src.revenium_mcp_server.auth.tenant_resolver import TenantClaimsRejected
+
+        resolver = _make_clerk_resolver()
+        with pytest.raises(TenantClaimsRejected) as excinfo:
+            resolver.resolve(_claims(tenant_id=42), clerk_jwt=JWT)
+        assert excinfo.value.missing == ()
+        assert excinfo.value.malformed == ("tenant_id",)
+
     def test_missing_jwt_rejected(self, monkeypatch):
         monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.example.com")
         resolver = _make_clerk_resolver()

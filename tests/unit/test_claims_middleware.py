@@ -5,6 +5,7 @@ import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastmcp.exceptions import ToolError
 
 from src.revenium_mcp_server.auth.tenant_context import TenantContext
 
@@ -105,11 +106,129 @@ async def test_middleware_resets_context_var_on_exception():
     assert current_tenant_context() is None
 
 
+@pytest.fixture(autouse=True)
+def _production_app_host(monkeypatch):
+    monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
+    monkeypatch.delenv("REVENIUM_BASE_URL", raising=False)
+
+
+async def _refusal_for(claims: dict, token: str = "jwt_token_value") -> ToolError:
+    """Drive on_call_tool through the real Clerk resolver and return its refusal."""
+    from src.revenium_mcp_server.auth.claims_middleware import TenantContextMiddleware
+    from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
+
+    mw = TenantContextMiddleware(ClerkTenantResolver())
+
+    async def call_next(context):
+        raise AssertionError("a refused caller must not reach the tool")
+
+    with patch(
+        "src.revenium_mcp_server.auth.claims_middleware.get_access_token"
+    ) as mock_get:
+        mock_get.return_value = _mock_token(claims, token=token)
+        with pytest.raises(ToolError) as excinfo:
+            await mw.on_call_tool(context=MagicMock(), call_next=call_next)
+    assert isinstance(excinfo.value.__cause__, PermissionError)
+    return excinfo.value
+
+
 @pytest.mark.asyncio
-async def test_middleware_propagates_permission_error():
-    from src.revenium_mcp_server.auth.claims_middleware import (
-        TenantContextMiddleware,
+async def test_unlinked_sign_in_is_told_to_open_the_app_and_reconnect():
+    error = await _refusal_for({"sub": "user_1"})
+
+    assert str(error) == (
+        "Your sign-in is not linked to a Revenium team yet. Open "
+        "https://app.revenium.ai once with the same email, then reconnect the "
+        "connector. For support: JWT is missing required claim(s): "
+        "revenium_team_id, tenant_id."
     )
+    assert "Internal server error" not in str(error)
+
+
+@pytest.mark.asyncio
+async def test_blank_team_id_counts_as_not_linked():
+    error = await _refusal_for(
+        {"sub": "user_1", "revenium_team_id": "  ", "tenant_id": "tenant_1"}
+    )
+
+    assert str(error).startswith("Your sign-in is not linked to a Revenium team yet.")
+    assert str(error).endswith("missing required claim(s): revenium_team_id.")
+
+
+@pytest.mark.asyncio
+async def test_malformed_tenant_id_names_an_unreadable_sign_in():
+    error = await _refusal_for(
+        {"sub": "user_1", "revenium_team_id": "team_1", "tenant_id": 42}
+    )
+
+    assert str(error) == (
+        "Your sign-in carries Revenium team details this server cannot read. "
+        "Open https://app.revenium.ai once with the same email, then reconnect "
+        "the connector. If it keeps happening, contact Revenium support. For "
+        "support: JWT has malformed claim(s): tenant_id (expected a non-empty "
+        "string)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_and_malformed_claims_lead_with_not_linked_and_list_both():
+    error = await _refusal_for({"sub": "user_1", "tenant_id": ["t"]})
+
+    assert str(error).startswith("Your sign-in is not linked to a Revenium team yet.")
+    assert str(error).endswith(
+        "For support: JWT is missing required claim(s): revenium_team_id; "
+        "JWT has malformed claim(s): tenant_id (expected a non-empty string)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_sign_in_without_a_forwardable_token_is_told_to_reconnect():
+    error = await _refusal_for(
+        {"sub": "user_1", "revenium_team_id": "team_1", "tenant_id": "tenant_1"},
+        token="   ",
+    )
+
+    assert str(error) == (
+        "Your sign-in reached the server without an access token it can use. "
+        "Reconnect the connector to sign in again. For support: No verified "
+        "access token available to forward downstream."
+    )
+
+
+@pytest.mark.asyncio
+async def test_remedy_names_the_app_this_deployment_pairs_with(monkeypatch):
+    monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
+    monkeypatch.setenv("REVENIUM_BASE_URL", "https://api.dev.hcapp.io")
+
+    error = await _refusal_for({"sub": "user_1"})
+
+    assert str(error).startswith(
+        "Your sign-in is not linked to a Revenium team yet. Open "
+        "https://ai.dev.hcapp.io once with the same email, then reconnect the "
+        "connector."
+    )
+
+
+@pytest.mark.asyncio
+async def test_refusal_keeps_the_rejection_warning_in_the_log():
+    from loguru import logger
+
+    records: list[str] = []
+    sink_id = logger.add(lambda msg: records.append(msg.record["message"]), level="WARNING")
+    try:
+        await _refusal_for({"sub": "user_1"})
+    finally:
+        logger.remove(sink_id)
+
+    assert (
+        "Tenant resolution rejected: JWT is missing required claim(s): "
+        "revenium_team_id, tenant_id"
+    ) in records
+
+
+@pytest.mark.asyncio
+async def test_refusal_from_a_bare_permission_error_still_names_the_remedy():
+    from src.revenium_mcp_server.auth.claims_middleware import TenantContextMiddleware
 
     resolver = MagicMock()
     resolver.resolve.side_effect = PermissionError("missing claim")
@@ -122,8 +241,14 @@ async def test_middleware_propagates_permission_error():
         "src.revenium_mcp_server.auth.claims_middleware.get_access_token"
     ) as mock_get:
         mock_get.return_value = _mock_token({})
-        with pytest.raises(PermissionError, match="missing claim"):
+        with pytest.raises(ToolError) as excinfo:
             await mw.on_call_tool(context=MagicMock(), call_next=call_next)
+
+    assert str(excinfo.value) == (
+        "Your sign-in is not linked to a Revenium team yet. Open "
+        "https://app.revenium.ai once with the same email, then reconnect the "
+        "connector. For support: missing claim."
+    )
 
 
 @pytest.mark.asyncio
@@ -204,3 +329,33 @@ async def test_concurrent_requests_have_isolated_context():
     for tid, ctx in observed:
         assert ctx is not None
         assert ctx.team_id == tid
+
+
+@pytest.mark.asyncio
+async def test_refusal_reaches_the_client_as_an_error_result_with_its_text():
+    from fastmcp import Client, FastMCP
+
+    from src.revenium_mcp_server.auth.claims_middleware import TenantContextMiddleware
+    from src.revenium_mcp_server.auth.tenant_resolver import ClerkTenantResolver
+
+    mcp = FastMCP("clerk-refusal-boundary")
+
+    @mcp.tool
+    def get_products() -> str:
+        raise AssertionError("a refused caller must not reach the tool")
+
+    mcp.add_middleware(TenantContextMiddleware(ClerkTenantResolver()))
+
+    with patch(
+        "src.revenium_mcp_server.auth.claims_middleware.get_access_token"
+    ) as mock_get:
+        mock_get.return_value = _mock_token({"sub": "user_1"})
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "get_products", {}, raise_on_error=False
+            )
+
+    assert result.is_error is True
+    text = result.content[0].text
+    assert text.startswith("Your sign-in is not linked to a Revenium team yet.")
+    assert "Internal server error" not in text

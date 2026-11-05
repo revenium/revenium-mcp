@@ -16,6 +16,7 @@ from ..endpoint_registry import CalendarRangeNeedsNewApiError, NewApiRequiredErr
 from .formatters.base_formatter import BaseFormattingUtilities
 from .response_formatter import ResponseFormatter
 from .envelope_reads import with_unread_pages_notice
+from .paging import page_of_rows
 from .report_reads import fails_whole_call, is_server_configuration_error, read_failure_reason
 from .simple_cost_analyzer import (
     COST_SUMMARY_PARTS,
@@ -199,7 +200,7 @@ class RankedCostsProcessor(AnalyticsProcessor):
         return with_unread_pages_notice(self.format_ranked_rows(data, params), data.unread)
 
     @abstractmethod
-    def format_ranked_rows(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
+    def format_ranked_rows(self, data: RankedCosts, params: Dict[str, Any]) -> str:
         """Render the ranked rows."""
 
 
@@ -371,13 +372,21 @@ class AgentCostsProcessor(RankedCostsProcessor):
             filters=params.get("filters"),
         )
 
-    def format_ranked_rows(self, data: List[Dict[str, Any]], params: Dict[str, Any]) -> str:
-        """Format agent costs response."""
+    def format_ranked_rows(self, data: RankedCosts, params: Dict[str, Any]) -> str:
+        """Format the requested page of the agent ranking.
+
+        Neither agent route pages by agent: the legacy one answers every agent at
+        once and the analytics one pages time buckets, so the ranking is paged here.
+        """
+        agents, paging = page_of_rows(data, params["page"], params["size"])
         return self.formatter.format_agent_costs_response(
-            data=data,
+            data=agents,
             period=params["period"],
             aggregation=params["aggregation"],
             endpoint_key=agent_costs_endpoint_key(params.get("filters")),
+            paging=paging,
+            all_agents_cost=sum(agent.get("cost", 0) for agent in data),
+            ranking_complete=data.unread is None,
         )
 
     def _handle_general_error(self, error: Exception, operation_type: str) -> str:
@@ -408,6 +417,7 @@ class UserCostsProcessor(AnalyticsProcessor):
             filters=params.get("filters"),
             page=params["page"],
             size=params["size"],
+            top_models_per_user=params["top_models_per_user"],
         )
 
     def format_response(self, data: Any, params: Dict[str, Any]) -> str:

@@ -815,6 +815,7 @@ class SimpleCostAnalyzer:
         filters: Optional[Dict[str, Any]] = None,
         page: int = 0,
         size: int = USER_COSTS_DEFAULT_PAGE_SIZE,
+        top_models_per_user: int = 0,
     ) -> UserCostsPage:
         """One page of cost, requests and tokens per subscriber email (new analytics API).
 
@@ -825,6 +826,8 @@ class SimpleCostAnalyzer:
                 users, costSources (DEFAULT_USER_COST_SOURCES when omitted)
             page: Zero-based page number
             size: Users per page, at most the platform's maximum of 100
+            top_models_per_user: How many of each user's top models by cost to
+                list, 0 to list none; 0 is not sent, so the request stays as before
 
         Returns:
             The users on the requested page and where that page sits in the report
@@ -838,6 +841,8 @@ class SimpleCostAnalyzer:
         extra_new.update(self._metric_type_param(aggregation))
         extra_new["page"] = page
         extra_new["size"] = size
+        if top_models_per_user > 0:
+            extra_new["topModelsPerUser"] = top_models_per_user
         path, params, call_kwargs = resolve_analytics_request(
             "cost_metric_by_user_aggregated",
             self._get_team_id(),
@@ -1292,8 +1297,32 @@ class SimpleCostAnalyzer:
                 "cost": cost,
                 "requests": requests,
                 "tokens": tokens,
+                **self._extract_top_models(group),
             }
         return None
+
+    @staticmethod
+    def _extract_top_models(group: Dict[str, Any]) -> Dict[str, Any]:
+        """The user's topModels and modelCount, present only when topModelsPerUser was sent."""
+        top_models = group.get("topModels")
+        if not isinstance(top_models, list):
+            return {}
+        priced = [
+            entry
+            for entry in top_models
+            if isinstance(entry, dict)
+            and isinstance(entry.get("cost"), (int, float))
+            and not isinstance(entry.get("cost"), bool)
+        ]
+        ranked = sorted(priced, key=lambda entry: float(entry["cost"]), reverse=True)
+        models = [
+            {"model": str(entry.get("model") or ""), "cost": float(entry["cost"])}
+            for entry in ranked
+        ]
+        model_count = group.get("modelCount")
+        if not isinstance(model_count, int) or isinstance(model_count, bool):
+            return {"top_models": models, "model_count": None}
+        return {"top_models": models, "model_count": max(model_count, len(models))}
 
     def _get_team_id(self) -> str:
         """Get team_id from client or environment. Raises if unavailable."""

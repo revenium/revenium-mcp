@@ -57,7 +57,7 @@ from .transport_mode import (
 )
 from .health_endpoints import register_health_endpoints
 from .http_transport import build_http_middleware, build_uvicorn_config
-from .server_identity import load_server_identity
+from .server_identity import load_server_identity, register_icon_endpoint
 
 
 def _check_app_base_url_drift() -> Optional[str]:
@@ -362,9 +362,10 @@ def create_enhanced_server(auth: Optional[Any] = None) -> FastMCP:
     from .middleware.framework_leak_guard import FrameworkLeakGuardMiddleware
     mcp.add_middleware(FrameworkLeakGuardMiddleware())
 
-    # /health and /ready are auth-exempt by FastMCP design (custom routes
-    # are appended outside RequireAuthMiddleware) and inert in stdio mode.
+    # /health, /ready and /icon.png are auth-exempt by FastMCP design (custom
+    # routes are appended outside RequireAuthMiddleware) and inert in stdio mode.
     register_health_endpoints(mcp)
+    register_icon_endpoint(mcp)
 
     return mcp
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastmcp.exceptions import ToolError
 
 from src.revenium_mcp_server.auth.api_key_validator import (
     ApiKeyIdentity,
@@ -336,7 +337,7 @@ async def test_invalid_team_override_rejected_tool_not_called():
         "src.revenium_mcp_server.auth.api_key_middleware.get_access_token",
         return_value=_multi_team_access_token(),
     ):
-        with pytest.raises(PermissionError, match="not available"):
+        with pytest.raises(ToolError, match="not available"):
             await mw.on_call_tool(MagicMock(), call_next)
 
     assert called == []
@@ -384,7 +385,7 @@ async def test_override_with_missing_team_ids_claim_fails_closed():
         "src.revenium_mcp_server.auth.api_key_middleware.get_access_token",
         return_value=_multi_team_access_token(include_team_ids=False),
     ):
-        with pytest.raises(PermissionError, match="not available"):
+        with pytest.raises(ToolError, match="not available"):
             await mw.on_call_tool(MagicMock(), call_next)
 
 
@@ -458,7 +459,7 @@ async def test_override_with_none_team_ids_claim_fails_closed():
         "src.revenium_mcp_server.auth.api_key_middleware.get_access_token",
         return_value=fake,
     ):
-        with pytest.raises(PermissionError, match="not available"):
+        with pytest.raises(ToolError, match="not available"):
             await mw.on_call_tool(MagicMock(), call_next)
 
 

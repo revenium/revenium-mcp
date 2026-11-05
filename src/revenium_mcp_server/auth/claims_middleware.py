@@ -4,12 +4,14 @@ from __future__ import annotations
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Optional
 
+from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from loguru import logger
 
 from .auth_events import emit_auth_event
 from .tenant_context import TenantContext
+from .tenant_refusals import tenant_refusal_message
 from .tenant_resolver import TenantResolver
 
 if TYPE_CHECKING:
@@ -60,7 +62,10 @@ class TenantContextMiddleware(Middleware):
                 user_id=(claims or {}).get("sub"),
                 reason="tenant_resolution_rejected",
             )
-            raise  # FastMCP wraps it as a JSON-RPC error inside HTTP 200
+            # FastMCP answers its own ToolError as an isError result carrying
+            # this text; any other exception escaping middleware reaches the
+            # client as a JSON-RPC "Internal server error" with the reason lost.
+            raise ToolError(tenant_refusal_message(e)) from e
 
         if self._profile_lookup is not None:
             tenant_ctx = await self._profile_lookup.with_profile(tenant_ctx)

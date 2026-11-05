@@ -226,6 +226,8 @@ class TestAgentCostsProcessorFilters:
                 "period": "SEVEN_DAYS",
                 "aggregation": "TOTAL",
                 "filters": {"costSources": ["provider_billing"]},
+                "page": 0,
+                "size": 100,
             }
         )
         processor = AgentCostsProcessor(deps, _logger)

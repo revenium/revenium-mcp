@@ -12,15 +12,29 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Union
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple, Union
 
 from ..analytics_window import (
     CALENDAR_RANGE_MAX_DAYS,
     AnalyticsWindow,
     CalendarRange,
     CalendarRangeError,
+    capped_utc_instant_bounds,
+    utc_instant_bounds,
 )
-from ..constants import ANALYTICS_MAX_PAGE_SIZE, USER_COSTS_DEFAULT_PAGE_SIZE
+from ..constants import (
+    ANALYTICS_MAX_PAGE_SIZE,
+    USER_COSTS_DEFAULT_PAGE_SIZE,
+    USER_COSTS_MAX_TOP_MODELS,
+)
+from .savings_findings import (
+    DEFAULT_SAVINGS_LEVEL,
+    DEFAULT_SAVINGS_PAGE,
+    DEFAULT_SAVINGS_SIZE,
+    SAVINGS_ASSISTANTS,
+    SAVINGS_LEVELS,
+    SavingsFindingsQuery,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,16 +119,21 @@ _TOOL_REPORT_FILTERS = (
 )
 
 
+TOP_MODELS_PER_USER = "top_models_per_user"
+
+
 # Top-level arguments a caller can send to narrow a report. The tool schema
 # declares provider, providers and agents for the actions that read them and
 # accepts any other key, so a report that does not read one must refuse it.
-TOP_LEVEL_NARROWING = ("provider", "providers", "model", "models", "customer", "customers", "agents")
+TOP_LEVEL_NARROWING = (
+    "provider", "providers", "model", "models", "customer", "customers", "agents", "assistant",
+)
 
 WHERE_NARROWING_APPLIES = (
     "Narrowing that applies: filters on get_user_costs and get_department_costs "
     "(agents, providers, models, users, costSources) and on get_agent_costs "
     "(costSources); providers on get_token_breakdown; agents on get_task_completion; "
-    "provider on get_coverage_ratio"
+    "provider on get_coverage_ratio; assistant on get_ai_assistant_savings"
 )
 
 
@@ -350,6 +369,7 @@ NARROWING_READ_BY_ACTION: Mapping[str, FrozenSet[str]] = {
     "get_token_vs_tool_cost": frozenset(),
     "get_trace_cost_distribution": frozenset(),
     "get_ai_assistant_team_medians": frozenset(),
+    "get_ai_assistant_savings": frozenset({"assistant"}),
     "get_transaction_count": frozenset(),
     "get_coverage_ratio": frozenset({"provider"}),
     "analyze_cost_anomalies": frozenset(),
@@ -375,6 +395,21 @@ def unread_narrowing_refusal(action: str, params: Dict[str, Any]) -> Optional["V
         suggestions=[
             f"Call {action} again without {unread}; it covers every row in the window",
             WHERE_NARROWING_APPLIES,
+        ],
+    )
+
+
+def top_models_refusal(action: str, params: Dict[str, Any]) -> Optional["ValidationError"]:
+    """The refusal for top_models_per_user on any action but get_user_costs, or None."""
+    if action == "get_user_costs" or params.get(TOP_MODELS_PER_USER) is None:
+        return None
+    return ValidationError(
+        f"{action} does not take {TOP_MODELS_PER_USER}, which only get_user_costs reads. "
+        "Nothing was read.",
+        field=TOP_MODELS_PER_USER,
+        suggestions=[
+            f"Call {action} again without {TOP_MODELS_PER_USER}",
+            f"get_user_costs with {TOP_MODELS_PER_USER} lists each person's top models by cost",
         ],
     )
 
@@ -631,6 +666,10 @@ class AnalyticsValidator:
                 context="agent costs",
             )
 
+        validated["page"] = self._validate_whole_number(params.get("page"), "page", 0, None, 0)
+        validated["size"] = self._validate_whole_number(
+            params.get("size"), "size", 1, ANALYTICS_MAX_PAGE_SIZE, USER_COSTS_DEFAULT_PAGE_SIZE
+        )
         logger.info(f"Validated agent costs params: {validated}")
         return validated
 
@@ -732,6 +771,9 @@ class AnalyticsValidator:
         validated["page"] = self._validate_whole_number(params.get("page"), "page", 0, None, 0)
         validated["size"] = self._validate_whole_number(
             params.get("size"), "size", 1, ANALYTICS_MAX_PAGE_SIZE, USER_COSTS_DEFAULT_PAGE_SIZE
+        )
+        validated[TOP_MODELS_PER_USER] = self._validate_whole_number(
+            params.get(TOP_MODELS_PER_USER), TOP_MODELS_PER_USER, 0, USER_COSTS_MAX_TOP_MODELS, 0
         )
         return validated
 
@@ -950,3 +992,72 @@ class AnalyticsValidator:
             )
 
         return aggregation_upper
+
+
+SAVINGS_USAGE = f"get_ai_assistant_savings(level='department', size={DEFAULT_SAVINGS_SIZE})"
+
+
+def validate_savings_findings_params(params: Dict[str, Any]) -> SavingsFindingsQuery:
+    """The get_ai_assistant_savings arguments, refused where the endpoint would 400 on them."""
+    start_date, end_date = _savings_window(params)
+    return SavingsFindingsQuery(
+        level=_savings_choice(params, "level", SAVINGS_LEVELS) or DEFAULT_SAVINGS_LEVEL,
+        page=_page_or_default(params.get("page")),
+        size=_savings_size(params.get("size")),
+        assistant=_savings_choice(params, "assistant", SAVINGS_ASSISTANTS),
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
+def _savings_choice(params: Dict[str, Any], name: str, allowed: Tuple[str, ...]) -> Optional[str]:
+    value = params.get(name)
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in allowed:
+        return value.strip().lower()
+    raise ValidationError(
+        f"Unsupported {name} for get_ai_assistant_savings: {value!r}",
+        field=name,
+        suggestions=[f"Use one of: {', '.join(allowed)}", SAVINGS_USAGE],
+    )
+
+
+def _page_or_default(page: Any) -> int:
+    return DEFAULT_SAVINGS_PAGE if page is None else int(page)
+
+
+def _savings_size(size: Any) -> int:
+    if size is None:
+        return DEFAULT_SAVINGS_SIZE
+    if int(size) > ANALYTICS_MAX_PAGE_SIZE:
+        raise ValidationError(
+            f"size {size} is above the {ANALYTICS_MAX_PAGE_SIZE} departments a page can return",
+            field="size",
+            suggestions=[
+                f"Pass size between 1 and {ANALYTICS_MAX_PAGE_SIZE} and read further departments with page",
+                SAVINGS_USAGE,
+            ],
+        )
+    return int(size)
+
+
+def _savings_window(params: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        start, end = params.get("start_date"), params.get("end_date")
+        if start is None or end is None:
+            return utc_instant_bounds(start, end)
+        bounds = capped_utc_instant_bounds(start, end)
+        if bounds[0] == bounds[1]:
+            raise CalendarRangeError("start_date must be before end_date", "start_date")
+        return bounds
+    except CalendarRangeError as error:
+        raise ValidationError(
+            str(error),
+            field=error.field,
+            suggestions=[
+                "Pass start_date and end_date as yyyy-MM-dd (whole UTC days) or ISO 8601 instants; "
+                "either may be omitted (the platform defaults to the 30 days before now)",
+                f"The window may span at most {CALENDAR_RANGE_MAX_DAYS} days",
+            ],
+        ) from None

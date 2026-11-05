@@ -5,6 +5,24 @@ All notable changes to the Revenium MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-11-05
+
+### Added
+- `manage_customers` names a person an admin of a department (`name_department_admin`, by email) and removes one (`remove_department_admin`, by `person_id` or email). A department admin may see the department and every department below it, so `dry_run=true` previews name that subtree by path and list the department's current admins. Because the platform answers a removal the same way whether or not the person was an admin, the removal re-reads the admins afterwards and says whether the person is still listed; naming someone who is already an admin is reported as such, not as a new grant (BACK-5501)
+- Transaction lookups with full detail show `listCost`, the pre-discount cost of a call priced by a negotiated provider discount, after Total Cost (which stays the billed figure), and `ccrSessionId`, the client-reported Claude Code cloud session that made the call, under Session Tracking; `analyze_recent_transactions` measures `ccrSessionId` presence like the other submission fields (BACK-5426)
+- `get_customers` lists only the users holding a given role: `filters.roles` on the users listing takes a list of role names such as `ROLE_ORG_ADMIN` and returns users who hold any of them. An empty or blank list is refused before any read, the platform rejects a name that is not a role, and the key is refused on subscribers, organizations and teams (BACK-5427)
+- `get_customers` lists the Claude organizations a team knows and whether each one's Cowork activity routes to the team (`list_cowork_org_links`), and `manage_customers` links one by uuid or by one of the team's Claude Enterprise credentials (`link_cowork_org`) and removes a link (`unlink_cowork_org`). Both writes preview with `dry_run=true`; the unlink preview names the organization that would stop routing to the team. All three use the caller's own team unless `team_id` is given
+- `get_business_analytics` `get_user_costs` takes `top_models_per_user` (1 to 5, omitted by default) and lists each person's top models by cost, highest first, with how many models the person used; a cut list says so and that its costs do not add up to the person's total. every other action refuses the argument (BACK-5424)
+- `get_business_analytics`: get_ai_assistant_savings answers what the team can save on its coding assistants, ranked, with the platform's own totals (copied, never summed from rows), spend to inspect and the latest AI Insights savings. It reads by department by default (paged, size at most 100); level=person is not paged, so the answer shows the first 50 rows and says how many it left out. A team without the feature (not yet enabled in every region) is told so rather than shown a zero, a 503 reads as unavailable right now, and an API key with metering scope is told which credential the read needs (BACK-5423)
+- The hosted server serves its own icon at `/icon.png` and uses that URL as the default `serverInfo` icon, so the default needs no CDN; `REVENIUM_ICON_URL` still overrides it (BACK-5054)
+
+### Fixed
+- `manage_cost_controls` `create` and `update` say when the written control is in shadow mode: the platform creates a control with `shadowMode` true unless the caller sets it, so a limit asked for in chat observed and enforced nobody while its answer read as a limit. The answer now says the warn threshold and hard limit are evaluated and recorded, that the enforcement action is not applied, and gives the `update` call that applies it; a disabled control is answered with a note that it is not evaluated at all and the `update` that turns it on (BACK-5055).
+- On the hosted server, a sign-in not yet linked to a Revenium team gets a message saying so, and to open the Revenium app (https://app.revenium.ai in production) once with the same email and reconnect the connector, instead of "Internal server error" on every tool call. A team claim in an unreadable form and a missing access token get their own messages; the missing or malformed claim names follow for support (BACK-5441)
+- In api_key mode, an `X-Revenium-Team-Id` naming a team the key does not belong to is refused with that reason instead of "Internal server error" (BACK-5441)
+- `get_alerts` `get_budget_portfolio` and `get_budget_progress` show a budget's real percentage used: the platform's `percentUsed` is a fraction (0.75 means 75%) and was printed as a percent, so a budget at 638.25 of 250 read "2.55% used". It now reads "255.3% used (over budget)", and spend and threshold print with at most two decimals, or two significant digits below a cent (BACK-5439)
+- `get_business_analytics` `get_agent_costs` honours `page` and `size` (default 100, as on `get_user_costs`) for a named period and for a `start_date`/`end_date` range: it prints one page of the ranking, ends with "Page X of Y, N agents in all" and the call for the next page, and when the ranking spans several pages states this page's cost beside every agent's. It used to print every agent on the team whatever size was asked for (BACK-5440)
+
 ## [0.10.0] - 2026-10-29
 
 ### Added
@@ -763,6 +781,7 @@ No functional changes. Changelog formatting update only.
 - Configuration via environment variables
 - System diagnostics and transaction verification tools
 
+[0.11.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.11.0
 [0.10.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.10.0
 [0.9.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.9.0
 [0.8.1]: https://github.com/revenium/revenium-mcp/releases/tag/v0.8.1

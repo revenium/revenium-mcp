@@ -52,3 +52,6 @@ ANALYTICS_MAX_PAGE_SIZE = 100
 # get_user_costs is read as a complete per-person report, so its page holds the
 # platform's maximum page size unless the caller asks for a smaller one.
 USER_COSTS_DEFAULT_PAGE_SIZE = ANALYTICS_MAX_PAGE_SIZE
+
+# cost-by-user-aggregated refuses topModelsPerUser above 5.
+USER_COSTS_MAX_TOP_MODELS = 5
