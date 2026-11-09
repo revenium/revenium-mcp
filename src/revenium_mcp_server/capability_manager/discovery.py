@@ -5,7 +5,7 @@ and existing schema definitions.
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from ..alert_metrics import (
     QUALITY_RATE,
@@ -48,17 +48,36 @@ from ..tool_configuration.profiles import PROFILE_DEFINITIONS, PROFILE_TOOL_COUN
 
 logger = logging.getLogger(__name__)
 
+FALLBACK_SUBSCRIPTION_TYPES = ("monthly", "yearly")
+METERING_REQUIRED_FIELDS = ("model", "provider", "input_tokens", "output_tokens", "duration_ms")
+METERING_OPTIONAL_FIELDS = (
+    "organization_name",
+    "subscriber_email",
+    "task_type",
+    "agent",
+    "trace_id",
+    "product_name",
+    "subscription_id",
+    "subscriber_credential",
+    "subscriber_credential_name",
+    "task_id",
+    "response_quality_score",
+    "stop_reason",
+    "is_streamed",
+)
+
 
 class CapabilityDiscovery:
     """Discovers capabilities from API metadata and schema definitions."""
 
-    def __init__(self, client: ReveniumClient):
+    def __init__(self, client: Optional[ReveniumClient] = None):
         """Initialize the capability discovery engine.
 
         Args:
-            client: Revenium API client for discovery
+            client: Revenium API client for discovery; without one only
+                ``static_capabilities`` can answer.
         """
-        self.client = client
+        self._client = client
 
         # Map resource types to discovery methods
         self.discovery_methods = {
@@ -71,6 +90,21 @@ class CapabilityDiscovery:
             "metering_elements": self._discover_metering_element_capabilities,
             "metering": self._discover_metering_capabilities,
         }
+
+    @property
+    def client(self) -> ReveniumClient:
+        if self._client is None:
+            raise RuntimeError("Capability discovery has no platform client")
+        return self._client
+
+    async def static_capabilities(self, resource_type: str) -> Dict[str, Any]:
+        """Return the built-in capability table for a resource type, with no platform call."""
+        static_methods: Dict[str, Callable[[], Coroutine[Any, Any, Dict[str, Any]]]] = {
+            **self.discovery_methods,
+            "subscriptions": self._static_subscription_capabilities,
+            "metering": self._static_metering_capabilities,
+        }
+        return await static_methods[resource_type]()
 
     async def discover_capabilities(self, resource_type: str) -> Dict[str, Any]:
         """Discover capabilities for a resource type.
@@ -212,10 +246,17 @@ class CapabilityDiscovery:
             currencies = await self._discover_currencies_from_api()
         except Exception as e:
             logger.warning(f"API discovery failed for subscriptions, using fallback: {e}")
-            # Provide fallback capabilities when API discovery fails
-            subscription_types = ["monthly", "quarterly", "yearly"]
-            currencies = list(platform_plan_currencies())
+            return await self._static_subscription_capabilities()
+        return self._subscription_capabilities(subscription_types, currencies)
 
+    async def _static_subscription_capabilities(self) -> Dict[str, Any]:
+        return self._subscription_capabilities(
+            list(FALLBACK_SUBSCRIPTION_TYPES), list(platform_plan_currencies())
+        )
+
+    def _subscription_capabilities(
+        self, subscription_types: List[str], currencies: List[str]
+    ) -> Dict[str, Any]:
         return {
             "billing_periods": [period.value for period in BillingPeriod],
             "trial_periods": [trial.value for trial in TrialPeriod],
@@ -541,63 +582,27 @@ class CapabilityDiscovery:
 
         except Exception as e:
             logger.error(f"Failed to discover AI metering capabilities: {e}")
-            # Return fallback AI transaction capabilities
             return {
-                "transaction_fields": {
-                    "required": [
-                        "model",
-                        "provider",
-                        "input_tokens",
-                        "output_tokens",
-                        "duration_ms",
-                    ],
-                    "optional": [
-                        "organization_name",
-                        "subscriber_email",
-                        "task_type",
-                        "agent",
-                        "trace_id",
-                        "product_name",
-                        "subscription_id",
-                        "subscriber_credential",
-                        "subscriber_credential_name",
-                        "task_id",
-                        "response_quality_score",
-                        "stop_reason",
-                        "is_streamed",
-                    ],
-                },
-                "sample_providers": [],
-                "sample_models": [],
-                "total_providers": 0,
+                **await self._static_metering_capabilities(),
                 "error": f"Failed to discover AI metering capabilities: {str(e)}",
-                "schema": {
-                    "transaction_data": {
-                        "required": [
-                            "model",
-                            "provider",
-                            "input_tokens",
-                            "output_tokens",
-                            "duration_ms",
-                        ],
-                        "optional": [
-                            "organization_name",
-                            "subscriber_email",
-                            "task_type",
-                            "agent",
-                            "trace_id",
-                            "product_name",
-                            "subscription_id",
-                            "subscriber_credential",
-                            "subscriber_credential_name",
-                            "task_id",
-                            "response_quality_score",
-                            "stop_reason",
-                            "is_streamed",
-                        ],
-                    }
-                },
             }
+
+    async def _static_metering_capabilities(self) -> Dict[str, Any]:
+        return {
+            "transaction_fields": {
+                "required": list(METERING_REQUIRED_FIELDS),
+                "optional": list(METERING_OPTIONAL_FIELDS),
+            },
+            "sample_providers": [],
+            "sample_models": [],
+            "total_providers": 0,
+            "schema": {
+                "transaction_data": {
+                    "required": list(METERING_REQUIRED_FIELDS),
+                    "optional": list(METERING_OPTIONAL_FIELDS),
+                }
+            },
+        }
 
     async def _discover_ai_transaction_fields(self) -> Dict[str, Any]:
         """Discover AI transaction field capabilities from AI completions endpoint."""

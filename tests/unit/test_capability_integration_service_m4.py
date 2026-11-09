@@ -421,9 +421,12 @@ class TestGetHealthStatus:
         assert result["ucm_health"] == {}
 
     @pytest.mark.asyncio
-    async def test_not_initialized_clerk_mode_reports_static_capabilities(self, monkeypatch):
-        """In clerk mode an uninitialized UCM is expected, not an error."""
-        monkeypatch.setenv("AUTH_MODE", "clerk")
+    @pytest.mark.parametrize("auth_mode", ["clerk", "api_key"])
+    async def test_not_initialized_multi_customer_mode_reports_static_capabilities(
+        self, monkeypatch, auth_mode
+    ):
+        """In the multi-customer modes an uninitialized UCM is expected, not an error."""
+        monkeypatch.setenv("AUTH_MODE", auth_mode)
         svc = _make_service()
         result = await svc.get_health_status()
         assert result["status"] == "static_capabilities"
@@ -431,8 +434,8 @@ class TestGetHealthStatus:
         assert "static capabilities" in result["detail"].lower()
 
     @pytest.mark.asyncio
-    async def test_not_initialized_api_key_mode_unchanged(self, monkeypatch):
-        monkeypatch.setenv("AUTH_MODE", "api_key")
+    async def test_not_initialized_env_mode_unchanged(self, monkeypatch):
+        monkeypatch.setenv("AUTH_MODE", "env")
         svc = _make_service()
         result = await svc.get_health_status()
         assert result["status"] == "not_initialized"

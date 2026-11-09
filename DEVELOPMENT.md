@@ -509,8 +509,9 @@ curl -H "x-api-key: YOUR_KEY" \
 
 1. Update version in `pyproject.toml`
 2. Run `uv lock` so the lockfile records the new version (the Docker build's `uv sync --locked` fails otherwise)
-3. Update `CHANGELOG.md` with changes (the runtime version is read dynamically from package metadata — never edit it in code)
-4. Create release commit:
+3. Set the same version in `server.json` (top-level `version` and every `packages[].version`); `tests/unit/test_mcp_registry_manifest.py` fails when they differ from `pyproject.toml`
+4. Update `CHANGELOG.md` with changes (the runtime version is read dynamically from package metadata — never edit it in code)
+5. Create release commit:
    ```bash
    git commit -m "chore: bump version to X.Y.Z"
    ```

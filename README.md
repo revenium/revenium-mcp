@@ -864,3 +864,5 @@ Built by the Revenium team with contributions from the community.
 Special thanks to:
 - Anthropic for the Model Context Protocol specification
 - The open-source community for MCP tooling and support
+
+<!-- mcp-name: io.github.revenium/revenium-mcp -->

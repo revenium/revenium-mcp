@@ -2040,8 +2040,8 @@ class ToolConfigurationRegistry:
             job_type: Optional[str] = None,
             economics: Optional[Union[dict, str]] = None,
             baseline: Optional[Union[dict, str]] = None,
-            facts: Optional[Union[list, str]] = None,
-            metrics: Optional[Union[list, str]] = None,
+            facts: Optional[Union[List[Dict[str, Any]], str]] = None,
+            metrics: Optional[Union[List[Dict[str, Any]], str]] = None,
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
             # Map arguments
             arguments = {

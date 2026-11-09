@@ -10,9 +10,9 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List
 
 from ..client import ReveniumClient
-from ..exceptions import ValidationError
 from .cache import CapabilityCache
 from .discovery import CapabilityDiscovery
+from .static_capabilities import SUPPORTED_RESOURCE_TYPES, require_supported_resource_type
 from .verification import CapabilityVerifier
 
 logger = logging.getLogger(__name__)
@@ -38,16 +38,7 @@ class UnifiedCapabilityManager:
         self.discovery = CapabilityDiscovery(client)
 
         # Track supported resource types
-        self.supported_resource_types = {
-            "system",
-            "products",
-            "subscriptions",
-            "customers",
-            "alerts",
-            "sources",
-            "metering_elements",
-            "metering",
-        }
+        self.supported_resource_types = set(SUPPORTED_RESOURCE_TYPES)
 
         # Capability change listeners for MCP notifications
         self._change_listeners: List[Callable] = []
@@ -71,12 +62,7 @@ class UnifiedCapabilityManager:
         Raises:
             ValidationError: If resource type is not supported
         """
-        if resource_type not in self.supported_resource_types:
-            raise ValidationError(
-                message=f"Unsupported resource type: {resource_type}",
-                field="resource_type",
-                expected=f"One of: {', '.join(self.supported_resource_types)}",
-            )
+        require_supported_resource_type(resource_type, self.supported_resource_types)
 
         # Check cache first
         cached_capabilities = await self.cache.get(resource_type)
@@ -261,12 +247,7 @@ class UnifiedCapabilityManager:
         Raises:
             ValidationError: If resource type is not supported
         """
-        if resource_type not in self.supported_resource_types:
-            raise ValidationError(
-                message=f"Unsupported resource type: {resource_type}",
-                field="resource_type",
-                expected=f"One of: {', '.join(self.supported_resource_types)}",
-            )
+        require_supported_resource_type(resource_type, self.supported_resource_types)
 
         async with self._lock:
             try:
