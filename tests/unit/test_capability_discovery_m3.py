@@ -113,7 +113,7 @@ class TestDiscoverSubscriptionCapabilities:
 
         result = await discovery._discover_subscription_capabilities()
 
-        assert result["subscription_types"] == ["monthly", "quarterly", "yearly"]
+        assert result["subscription_types"] == ["monthly", "yearly"]
         assert "subscription_statuses" in result
         assert "payment_methods" in result
 

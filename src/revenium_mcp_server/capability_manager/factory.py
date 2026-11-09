@@ -5,7 +5,7 @@ configuration and integration with the MCP server.
 """
 
 import os
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -15,6 +15,16 @@ from ..config_store import get_config_value
 from .cache import CapabilityCacheManager
 from .core import UnifiedCapabilityManager
 from .mcp_integration import MCPCapabilityIntegration
+from .static_capabilities import static_verdict
+
+
+def ucm_verdict(
+    capabilities: Dict[str, Any], resource_type: str, capability_name: str, value: str
+) -> Optional[bool]:
+    """UCM's lenient verdict: a dict-valued capability is accepted unchecked, None is undecided."""
+    if isinstance(capabilities.get(capability_name), dict):
+        return True
+    return static_verdict(capabilities, resource_type, capability_name, value)
 
 
 class UCMFactory:
@@ -191,31 +201,9 @@ class UCMIntegrationHelper:
         """
         try:
             capabilities = await self.ucm.get_capabilities(resource_type)
-
-            # Handle different capability structures for metering
-            if resource_type == "metering":
-                if capability_name == "providers" and "provider_summary" in capabilities:
-                    provider_samples = capabilities["provider_summary"].get("samples", [])
-                    return value in provider_samples
-                elif capability_name == "models" and "model_summary" in capabilities:
-                    model_samples = capabilities["model_summary"].get("samples", [])
-                    # Extract model names from "provider/model" format
-                    model_names = []
-                    for model_entry in model_samples:
-                        if "/" in model_entry:
-                            model_names.append(model_entry.split("/", 1)[1])
-                        else:
-                            model_names.append(model_entry)
-                    return value in model_names
-
-            # Standard capability structure
-            if capability_name in capabilities:
-                valid_values = capabilities[capability_name]
-                if isinstance(valid_values, list):
-                    return value in valid_values
-                elif isinstance(valid_values, dict):
-                    # For complex capability structures, assume valid for now
-                    return True
+            verdict = ucm_verdict(capabilities, resource_type, capability_name, value)
+            if verdict is not None:
+                return verdict
 
             # If capability not found in capabilities, use direct verification
             # Call the verifier directly with the correct parameters

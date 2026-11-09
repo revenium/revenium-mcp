@@ -1,0 +1,35 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.revenium/revenium-mcp",
+  "title": "Revenium",
+  "description": "AI cost tracking, alerts, analytics and usage-based billing for Revenium accounts",
+  "repository": {
+    "url": "https://github.com/revenium/revenium-mcp",
+    "source": "github"
+  },
+  "version": "0.11.1",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.revenium.ai/mcp"
+    }
+  ],
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "revenium-mcp",
+      "version": "0.11.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "REVENIUM_API_KEY",
+          "description": "Revenium account API key from the API Keys page in Revenium",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

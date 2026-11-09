@@ -5,6 +5,17 @@ All notable changes to the Revenium MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.11.1] - 2026-11-09
+
+### Added
+- `server.json` and `PUBLISH.md` describe the server for the official MCP registry (registry.modelcontextprotocol.io); the README carries the registry's package-ownership comment (BACK-5587).
+
+### Fixed
+- On the hosted connector, `get_capabilities` with a `resource_type`, `get_capability` and `verify_capability` answer from the server's built-in capability table, with a note saying so, instead of failing with "UCM integration service not initialized" and advice to check connectivity. An unknown `resource_type` is refused as "Unsupported resource type" on every server, with no mention of connectivity. Without a running capability service, subscription types no longer list `quarterly`, a period the platform refuses (BACK-5581).
+- The jobs tools declare `facts` and `metrics` as lists of objects, so no tool advertises an array parameter that accepts anything; MCP Inspector's strict schema check passes on every listed tool (BACK-3132).
+
 ## [0.11.0] - 2026-11-05
 
 ### Added
@@ -781,6 +792,7 @@ No functional changes. Changelog formatting update only.
 - Configuration via environment variables
 - System diagnostics and transaction verification tools
 
+[0.11.1]: https://github.com/revenium/revenium-mcp/releases/tag/v0.11.1
 [0.11.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.11.0
 [0.10.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.10.0
 [0.9.0]: https://github.com/revenium/revenium-mcp/releases/tag/v0.9.0

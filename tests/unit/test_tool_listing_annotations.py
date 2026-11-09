@@ -128,3 +128,29 @@ async def test_a_deprecated_alias_is_refused_on_the_tool_its_target_is_not_on(cl
 
     assert result.is_error
     assert "get_customers(action='list_org_units')" in result.content[0].text
+
+
+def _schemas_under(schema, path=""):
+    """Every (path, schema) pair under a JSON schema, depth first."""
+    yield path, schema
+    for key in ("properties",):
+        for name, sub in (schema.get(key) or {}).items():
+            yield from _schemas_under(sub, f"{path}.{name}" if path else name)
+    for key in ("items",):
+        if isinstance(schema.get(key), dict):
+            yield from _schemas_under(schema[key], f"{path}.{key}")
+    for key in ("anyOf", "oneOf", "allOf"):
+        for i, sub in enumerate(schema.get(key) or []):
+            yield from _schemas_under(sub, f"{path}.{key}[{i}]")
+
+
+async def test_no_array_parameter_publishes_an_empty_items_schema(listed):
+    """MCP Inspector's strict check flags an array whose items schema is `{}` as accepting
+    anything; the directory review runs that check, so every array names its item type."""
+    offenders = [
+        (name, path)
+        for name, wire in listed.items()
+        for path, schema in _schemas_under(wire["inputSchema"])
+        if schema.get("type") == "array" and schema.get("items") == {}
+    ]
+    assert offenders == []

@@ -4,14 +4,16 @@ This module provides the integration service that initializes UCM and integrates
 it with existing MCP tools to replace hardcoded validation layers.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import AbstractSet, Any, Dict, List, Optional
 
 from loguru import logger
 
+from ..auth.auth_mode import credentials_are_per_request
 from ..client import ReveniumClient
 from .core import UnifiedCapabilityManager
 from .factory import UCMFactory, UCMIntegrationHelper
 from .mcp_integration import MCPCapabilityIntegration
+from .static_capabilities import SUPPORTED_RESOURCE_TYPES
 
 
 class UCMIntegrationService:
@@ -163,6 +165,20 @@ class UCMIntegrationService:
             else:
                 logger.debug(f"No resource type mapping for tool: {tool_name}")
 
+    def serves_static_capabilities(self) -> bool:
+        """True where UCM is not started by design, so capability reads use the static table.
+
+        A multi-customer server has no process-wide API key at startup, so UCM never
+        initializes there.
+        """
+        return not self._initialized and credentials_are_per_request()
+
+    def supported_resource_types(self) -> AbstractSet[str]:
+        """Resource types a capability read accepts in the current mode."""
+        if self._initialized and self.ucm:
+            return self.ucm.supported_resource_types
+        return SUPPORTED_RESOURCE_TYPES
+
     async def get_ucm_capabilities(self, resource_type: str) -> Dict[str, Any]:
         """Get capabilities for a resource type via UCM.
 
@@ -216,16 +232,12 @@ class UCMIntegrationService:
             Dictionary containing health metrics
         """
         if not self._initialized:
-            from ..auth.auth_mode import read_auth_mode
-
-            # In clerk/OAuth mode there is no static API key at startup, so UCM never
-            # initializes — expected, not an error: tools run on static capabilities.
-            if read_auth_mode() == "clerk":
+            if self.serves_static_capabilities():
                 return {
                     "status": "static_capabilities",
                     "detail": (
                         "UCM dynamic capabilities are unavailable by design in Clerk/OAuth "
-                        "mode; tools use static capabilities and operate normally."
+                        "and api_key modes; tools use static capabilities and operate normally."
                     ),
                 }
             return {"status": "not_initialized", "error": "UCM integration service not initialized"}
@@ -279,6 +291,8 @@ class UCMIntegrationService:
         Returns:
             List of available resource type names
         """
+        if self.serves_static_capabilities():
+            return sorted(SUPPORTED_RESOURCE_TYPES)
         if not self._initialized or not self.ucm:
             return ["system"]  # Return basic default
 

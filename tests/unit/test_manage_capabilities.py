@@ -14,6 +14,16 @@ from src.revenium_mcp_server.tools_decomposed.manage_capabilities import (
 )
 from mcp.types import TextContent
 
+from src.revenium_mcp_server.capability_manager.static_capabilities import (
+    SUPPORTED_RESOURCE_TYPES,
+)
+
+
+def _ucm_running(mock_ucm):
+    """Configure a patched integration service as a running UCM (api_key mode)."""
+    mock_ucm.serves_static_capabilities.return_value = False
+    mock_ucm.supported_resource_types.return_value = SUPPORTED_RESOURCE_TYPES
+
 
 @pytest.fixture
 def capabilities_tool():
@@ -70,6 +80,7 @@ class TestManageCapabilitiesActions:
     @patch("src.revenium_mcp_server.tools_decomposed.manage_capabilities.ucm_integration_service")
     async def test_get_capabilities_with_resource_type(self, mock_ucm, capabilities_tool):
         """get_capabilities with resource_type shows specific capabilities."""
+        _ucm_running(mock_ucm)
         mock_ucm.get_ucm_capabilities = AsyncMock(
             return_value={"currencies": ["USD", "EUR"], "billing_models": ["subscription"]}
         )
@@ -89,6 +100,7 @@ class TestManageCapabilitiesActions:
     @patch("src.revenium_mcp_server.tools_decomposed.manage_capabilities.ucm_integration_service")
     async def test_verify_capability_valid(self, mock_ucm, capabilities_tool):
         """verify_capability with valid value returns Valid status."""
+        _ucm_running(mock_ucm)
         mock_ucm.validate_capability_value = AsyncMock(return_value=True)
         result = await capabilities_tool.handle_action("verify_capability", {
             "resource_type": "products",
@@ -108,6 +120,7 @@ class TestManageCapabilitiesActions:
     @patch("src.revenium_mcp_server.tools_decomposed.manage_capabilities.ucm_integration_service")
     async def test_verify_capability_invalid(self, mock_ucm, capabilities_tool):
         """verify_capability with invalid value returns Invalid status."""
+        _ucm_running(mock_ucm)
         mock_ucm.validate_capability_value = AsyncMock(return_value=False)
         result = await capabilities_tool.handle_action("verify_capability", {
             "resource_type": "products",
@@ -207,7 +220,10 @@ class TestManageCapabilitiesActions:
     @patch("src.revenium_mcp_server.tools_decomposed.manage_capabilities.ucm_integration_service")
     async def test_get_capability_specific(self, mock_ucm, capabilities_tool):
         """get_capability with capability_name returns specific value."""
-        mock_ucm.get_capability_value = AsyncMock(return_value="USD,EUR,GBP")
+        _ucm_running(mock_ucm)
+        mock_ucm.get_ucm_capabilities = AsyncMock(
+            return_value={"currencies": ["USD", "EUR", "GBP"]}
+        )
         result = await capabilities_tool.handle_action("get_capability", {
             "resource_type": "products",
             "capability_name": "currencies",
@@ -218,12 +234,13 @@ class TestManageCapabilitiesActions:
         assert "Capability Value" in text
         assert "products" in text
         assert "currencies" in text
-        assert "USD,EUR,GBP" in text
+        assert '["USD", "EUR", "GBP"]' in text
 
     @pytest.mark.asyncio
     @patch("src.revenium_mcp_server.tools_decomposed.manage_capabilities.ucm_integration_service")
     async def test_get_capability_all_for_type(self, mock_ucm, capabilities_tool):
         """get_capability without capability_name returns all for resource type."""
+        _ucm_running(mock_ucm)
         mock_ucm.get_ucm_capabilities = AsyncMock(
             return_value={"currencies": ["USD"]}
         )

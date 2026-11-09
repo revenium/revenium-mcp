@@ -18,6 +18,13 @@ from ..common.error_handling import ErrorCodes, ToolError, raise_refusal
 from ..exceptions import ValidationError
 from ..introspection.metadata import ToolCapability
 from ..capability_manager.integration_service import ucm_integration_service
+from ..capability_manager.static_capabilities import (
+    STATIC_CAPABILITIES_NOTE,
+    checkable_capability_names,
+    require_supported_resource_type,
+    static_capabilities,
+    static_verdict,
+)
 from .manage_capabilities_errors import (
     create_execution_error,
     create_missing_verify_params_error,
@@ -36,6 +43,22 @@ def _validation_refusal(error: ValidationError) -> ToolError:
         value=error.details.get("provided_value"),
         suggestions=[f"Use a supported value. {expected}"] if expected else [],
     )
+
+
+def _static_note(is_static: bool) -> str:
+    return f"{STATIC_CAPABILITIES_NOTE}\n\n" if is_static else ""
+
+
+@dataclass
+class CapabilityTable:
+    """A capability table and whether it is the static set rather than a UCM answer."""
+
+    capabilities: Dict[str, Any]
+    is_static: bool
+
+    @property
+    def note(self) -> str:
+        return _static_note(self.is_static)
 
 
 @dataclass
@@ -245,11 +268,40 @@ Get specific capabilities for any resource type:
 **💡 Tip**: Start with any resource type above to see detailed capabilities, validation rules, and supported values.
 """
 
-        capabilities = await ucm_integration_service.get_ucm_capabilities(request.resource_type)
+        table = await self._read_capabilities(request.resource_type)
         return (
             f"# **Capabilities for {request.resource_type}**\n\n"
-            f"```json\n{json.dumps(capabilities, indent=2)}\n```"
+            f"{table.note}"
+            f"```json\n{json.dumps(table.capabilities, indent=2)}\n```"
         )
+
+    async def _read_capabilities(self, resource_type: str) -> CapabilityTable:
+        require_supported_resource_type(
+            resource_type, ucm_integration_service.supported_resource_types()
+        )
+        if ucm_integration_service.serves_static_capabilities():
+            return CapabilityTable(await static_capabilities(resource_type), is_static=True)
+        capabilities = await ucm_integration_service.get_ucm_capabilities(resource_type)
+        return CapabilityTable(capabilities, is_static=False)
+
+    async def _verify_from_static_table(
+        self, resource_type: str, capability_name: str, value: str
+    ) -> bool:
+        capabilities = await static_capabilities(resource_type)
+        verdict = static_verdict(capabilities, resource_type, capability_name, value)
+        if verdict is None:
+            raise ValidationError(
+                message=(
+                    f"Capability '{capability_name}' is not in the static capability "
+                    f"set for {resource_type}"
+                ),
+                field="capability_name",
+                value=capability_name,
+                expected=(
+                    f"One of: {', '.join(checkable_capability_names(capabilities, resource_type))}"
+                ),
+            )
+        return verdict
 
     async def _handle_verify_capability(self, request: CapabilityRequest) -> str:
         """Handle verify_capability action.
@@ -273,13 +325,23 @@ Get specific capabilities for any resource type:
         assert request.capability_name is not None
         assert request.value is not None
 
-        is_valid = await ucm_integration_service.validate_capability_value(
-            request.resource_type, request.capability_name, request.value
+        require_supported_resource_type(
+            request.resource_type, ucm_integration_service.supported_resource_types()
         )
+        is_static = ucm_integration_service.serves_static_capabilities()
+        if is_static:
+            is_valid = await self._verify_from_static_table(
+                request.resource_type, request.capability_name, request.value
+            )
+        else:
+            is_valid = await ucm_integration_service.validate_capability_value(
+                request.resource_type, request.capability_name, request.value
+            )
         status = "✅ Valid" if is_valid else "❌ Invalid"
 
         return (
             f"# **Capability Verification**\n\n"
+            f"{_static_note(is_static)}"
             f"**Resource Type**: {request.resource_type}\n"
             f"**Capability**: {request.capability_name}\n"
             f"**Value**: {request.value}\n"
@@ -367,26 +429,22 @@ Get specific capabilities for any resource type:
         Returns:
             Formatted get capability response
         """
+        resource_type = request.resource_type or "system"
+        table = await self._read_capabilities(resource_type)
         if request.capability_name:
-            # Get specific capability
-            capability_value = await ucm_integration_service.get_capability_value(
-                request.resource_type or "system", request.capability_name
-            )
+            capability_value = table.capabilities.get(request.capability_name, "Not found")
             return (
                 f"# **Capability Value**\n\n"
-                f"**Resource Type**: {request.resource_type or 'system'}\n"
+                f"{table.note}"
+                f"**Resource Type**: {resource_type}\n"
                 f"**Capability**: {request.capability_name}\n"
-                f"**Current Value**: {capability_value}\n"
+                f"**Current Value**: {json.dumps(capability_value)}\n"
             )
-        else:
-            # Get all capabilities for resource type
-            capabilities = await ucm_integration_service.get_ucm_capabilities(
-                request.resource_type or "system"
-            )
-            return (
-                f"# **All Capabilities for {request.resource_type or 'system'}**\n\n"
-                f"```json\n{json.dumps(capabilities, indent=2)}\n```"
-            )
+        return (
+            f"# **All Capabilities for {resource_type}**\n\n"
+            f"{table.note}"
+            f"```json\n{json.dumps(table.capabilities, indent=2)}\n```"
+        )
 
     async def _get_input_schema(self) -> Dict[str, Any]:
         """Context7 single source of truth for get_capabilities schema."""
